@@ -1,0 +1,15 @@
+{
+  "name": "@mavis/skills",
+  "version": "0.2.1",
+  "description": "Filesystem-backed skill registry core for Mavis runtimes.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "js-yaml": "^4"
+  }
+}

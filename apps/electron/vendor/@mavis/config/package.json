@@ -1,0 +1,26 @@
+{
+  "name": "@mavis/config",
+  "version": "0.2.1",
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./data-dir": {
+      "import": "./dist/data-dir.js",
+      "default": "./dist/data-dir.js"
+    },
+    "./sandbox-settings": {
+      "import": "./dist/sandbox-settings.js",
+      "default": "./dist/sandbox-settings.js"
+    }
+  },
+  "dependencies": {
+    "@mavis/shared": "file:../shared",
+    "js-yaml": "^4",
+    "proper-lockfile": "^4",
+    "yaml": "^2.9.0"
+  }
+}

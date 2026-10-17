@@ -1,0 +1,89 @@
+import { decodeCronModel } from '@mavis/shared/cron-model';
+import { createCronSessionPurpose, formatCronRunTitle } from '@mavis/shared/cron-purpose';
+import { createHostCronSessionCreation } from './adapters/session-creation.adapter.js';
+import { deliverRuntimeCron } from './runtime-delivery.js';
+/** Binds Cron's session ports to the V2 Agent, Session, and Turn capabilities. */
+export function createRuntimeCronSessionPorts(options) {
+    const { agentSessionPorts, sessions, turns, reportFailure, lifecycle, deletion } = options;
+    const sessionCreation = createHostCronSessionCreation({
+        getAgent: async (agentName) => {
+            const defaults = await agentSessionPorts.directory.get(agentName);
+            return defaults
+                ? {
+                    agentName,
+                    ...(defaults.defaultWorkspaceDir
+                        ? { defaultWorkspaceDir: defaults.defaultWorkspaceDir }
+                        : {}),
+                }
+                : undefined;
+        },
+        getSession: async (sessionId) => {
+            const session = await sessions.sessions.repository.get(sessionId);
+            return session
+                ? { sessionId, agentName: session.agentName, archived: session.archived }
+                : undefined;
+        },
+        resolveAgentWriteTarget: agentSessionPorts.resolveWriteTarget,
+        createSession: async (request) => {
+            const session = await sessions.sessions.records.createInternalSession({
+                agentName: request.agentName,
+                workspaceDir: request.workspaceDir,
+                isDefaultWorkspace: request.isDefaultWorkspace,
+                ...(request.model?.trim() ? sessionModelFields(request.model) : {}),
+                sessionType: 'branch',
+                sessionKind: 'cron',
+                originCronId: request.cronId,
+                purpose: createCronSessionPurpose(request.agentName, request.cronName),
+                title: formatCronRunTitle(request.cronName, request.runCreatedAtMs),
+            });
+            return { sessionId: session.sessionId, agentName: session.agentName };
+        },
+        renameSession: async (sessionId, title) => {
+            const session = await sessions.sessions.repository.get(sessionId);
+            if (!session || session.title?.trim())
+                return;
+            await lifecycle.renameSession(sessionId, title, session.title ?? null);
+        },
+        discardSession: async (sessionId) => {
+            await deletion.deleteTaskOwnedSessionById(sessionId);
+        },
+        detachCronSessions: async (cronId, targetSessionId) => {
+            await sessions.sessions.repository.detachCronSessions(cronId, targetSessionId);
+        },
+        resolveDefaultWorkspaceDir: options.resolveDefaultWorkspaceDir,
+    });
+    return {
+        sessionCreation: {
+            ...sessionCreation,
+            async create(request) {
+                const result = await sessionCreation.create(request);
+                const model = request.model?.trim();
+                if (request.sessionTarget.mode === 'sessionId' &&
+                    request.sessionTarget.sessionId &&
+                    model) {
+                    const session = await sessions.sessions.repository.get(result.sessionId);
+                    const decoded = decodeCronModel(model);
+                    if (decoded.selection || session?.effectiveModel !== decoded.modelKey) {
+                        await lifecycle.mutateSession(result.sessionId, sessionModelFields(model));
+                    }
+                }
+                return result;
+            },
+        },
+        delivery: {
+            deliver: (request) => deliverRuntimeCron(turns, request, reportFailure),
+        },
+    };
+}
+/** New configurations replace all parameters; legacy keys keep the previous same-model policy. */
+function sessionModelFields(model) {
+    const { modelKey, selection } = decodeCronModel(model);
+    return {
+        effectiveModel: modelKey,
+        effectiveModelVariant: selection?.variant ?? null,
+        effectiveModelThinking: selection?.thinking ?? null,
+        effectiveModelContextWindow: selection?.contextLimit ?? null,
+        effectiveModelMaxOutputTokens: null,
+    };
+}
+//# sourceMappingURL=runtime-session-ports.js.map

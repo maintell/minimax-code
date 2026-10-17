@@ -1,0 +1,12 @@
+{
+  "name": "@mavis/thrift-gen-client",
+  "version": "0.2.1",
+  "description": "Renderer-safe generated thrift HTTP clients for Mavis desktop contracts.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  }
+}

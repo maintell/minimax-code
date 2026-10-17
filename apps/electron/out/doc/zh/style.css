@@ -1,0 +1,271 @@
+:root {
+  --bg-color: #ffffff;
+  --text-color: #333333;
+}
+
+html {
+  font-size: 16px;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  line-height: 1.6;
+}
+
+#write {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 30px;
+  padding-bottom: 100px;
+  color: #222;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+@media only screen and (min-width: 1400px) {
+  #write {
+    max-width: 1024px;
+  }
+}
+
+#write h1, #write h2, #write h3, #write h4, #write h5, #write h6 {
+  margin-top: 1.2em;
+  margin-bottom: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+#write h1 { font-size: 21px; }
+#write h2 { font-size: 19px; }
+#write h3 { font-size: 17px; }
+#write h4, #write h5, #write h6 { font-size: 17px; font-weight: 500; }
+
+#write p {
+  margin-bottom: 12px;
+  line-height: 1.7;
+}
+
+#write strong {
+  font-weight: 600;
+  line-height: 1.7;
+  /* display: inline-block; */
+}
+
+#write a {
+  color: #1677ff;
+  text-decoration: none;
+}
+
+
+#write p{
+ max-width: 100%;
+ overflow: hidden;
+word-wrap: break-word;
+}
+
+
+#write a:hover {
+  text-decoration: underline;
+}
+
+#write a.normal {
+  text-decoration-line: underline;
+  text-underline-offset: 3px;
+}
+
+#write a.tooltipA {
+  color: #5d6373;
+}
+
+#write table {
+  max-width: 100%;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 1.5em 0;
+  border: none;
+}
+
+#write table th,
+#write table td {
+  max-width: 200px;
+  word-wrap: break-word;
+  padding: 12px 16px;
+  border: 1px solid #e5e7eb;
+}
+
+#write table th {
+  min-width: 60px !important;
+  background-color: #f6f7f9;
+  font-weight: 600;
+  text-align: left;
+  border-bottom-width: 1px;
+  border-left-width: 1px;
+  border-top-width: 1px;
+}
+
+#write table th:first-child {
+  border-top-left-radius: 16px;
+}
+
+#write table th:last-child {
+  border-right-width: 1px;
+  border-top-right-radius: 16px;
+}
+
+#write table td {
+  border-bottom-width: 1px;
+  border-left-width: 1px;
+}
+
+#write table td:last-child {
+  border-right-width: 1px;
+}
+
+#write table tbody tr:last-child td:first-child {
+  border-bottom-left-radius: 16px;
+}
+
+#write table tbody tr:last-child td:last-child {
+  border-bottom-right-radius: 16px;
+}
+
+#write blockquote {
+  border-style: solid;
+  border-color: #ddd;
+  border-left-width: 2px;
+  color: #798196;
+  margin-bottom: 12px;
+  padding-left: 16px;
+}
+
+#write blockquote p {
+  margin-bottom: 0 !important;
+}
+
+#write hr {
+  border-style: solid;
+  border-color: #a9a9a9;
+  margin-top: 16px;
+  margin-bottom: 16px;
+}
+
+#write ol {
+  margin-bottom: 12px;
+  counter-reset: item;
+  list-style-type: decimal;
+  display: flex;
+  flex-direction: column;
+  padding-left: 2em;
+}
+
+#write ul {
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  padding-left: 2px;
+  list-style-type: disc;
+}
+
+#write ol ul,
+#write ol ol,
+#write ul ul,
+#write ul ol {
+  padding-left: 2px;
+}
+
+#write ul li::marker {
+  color: #a9a9a9;
+  unicode-bidi: isolate;
+  font-variant-numeric: tabular-nums;
+  text-transform: none;
+  text-indent: 0 !important;
+  text-align: start !important;
+  text-align-last: start !important;
+}
+
+#write ul li,
+#write ol li {
+  margin: 0 0 6px 12px;
+  padding-left: 0;
+}
+
+#write ul li:last-of-type,
+#write ol li:last-of-type {
+  margin-bottom: 0;
+}
+
+#write ul li > p,
+#write ol li > p {
+  margin-bottom: 0;
+}
+
+#write ul li > p + li,
+#write ul li > p + ul,
+#write ol li > p + li,
+#write ol li > p + ul {
+  margin-top: 6px;
+}
+
+#write ul ul {
+  list-style-type: circle;
+  margin-block-start: 0;
+  margin-block-end: 0;
+}
+
+#write ul ul ul {
+  list-style-type: square;
+}
+
+#write p:last-child,
+#write ul:last-child,
+#write ol:last-child,
+#write h1:last-child,
+#write h2:last-child,
+#write h3:last-child,
+#write h4:last-child,
+#write h5:last-child,
+#write h6:last-child,
+#write blockquote:last-child,
+#write .table-out-box:last-child {
+  margin-bottom: 0;
+}
+
+#write pre:last-child .code-block-wrapper {
+  margin-bottom: 0;
+}
+
+@media screen and (max-width: 768px) {
+  #write {
+    padding: 15px;
+  }
+
+  #write h1 { font-size: 1.75em; }
+  #write h2 { font-size: 1.5em; }
+  #write h3 { font-size: 1.25em; }
+  #write table { font-size: 0.9em; }
+}
+
+
+#write .center {
+  text-align: center;
+  display: flex;
+  justify-content: center;
+}
+/* 下划线 */
+
+#write .underline {
+  text-decoration-line: underline;
+  text-underline-offset: 3px;
+}
+
+.table-figure {
+  margin: 0 !important;
+  max-width: 100%;
+  overflow-x: auto;
+}

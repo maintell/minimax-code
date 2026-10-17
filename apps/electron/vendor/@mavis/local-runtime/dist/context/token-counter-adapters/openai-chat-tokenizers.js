@@ -1,0 +1,150 @@
+import { convertMessages as convertOpenAICompletionsMessages } from '@earendil-works/pi-ai/openai-completions';
+import { toProviderMessages } from '../messages-count-tokens-messages.js';
+import { isManagedLoginTokenPlan } from './managed-login.js';
+import { parseDataTotalTokens, parseUsageTotalTokens } from './parse.js';
+const ZHIPU_HOSTS = new Set(['open.bigmodel.cn', 'api.z.ai']);
+const KIMI_HOSTS = new Set(['api.moonshot.ai', 'api.moonshot.cn']);
+const ZHIPU_PATHS = new Set([
+    '/api/paas/v4',
+    '/api/paas/v4/chat/completions',
+    '/api/paas/v4/tokenizer',
+    '/api/coding/paas/v4',
+    '/api/coding/paas/v4/chat/completions',
+    '/api/coding/paas/v4/tokenizer',
+]);
+const KIMI_PATHS = new Set(['/v1', '/v1/chat/completions', '/v1/tokenizers/estimate-token-count']);
+// Mirrors Pi's resolved compat for the official Zhipu and Moonshot hosts.
+// Pi exports the message converter but keeps its compat resolver private.
+const BASE_CHAT_COMPAT = {
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsReasoningEffort: false,
+    supportsUsageInStreaming: true,
+    maxTokensField: 'max_tokens',
+    requiresToolResultName: false,
+    requiresAssistantAfterToolResult: false,
+    requiresThinkingAsText: false,
+    requiresReasoningContentOnAssistantMessages: false,
+    thinkingFormat: 'openai',
+    openRouterRouting: {},
+    vercelGatewayRouting: {},
+    zaiToolStream: false,
+    supportsStrictMode: false,
+    cacheControlFormat: undefined,
+    sendSessionAffinityHeaders: false,
+    supportsLongCacheRetention: true,
+};
+const ZHIPU_CHAT_COMPAT = {
+    ...BASE_CHAT_COMPAT,
+    maxTokensField: 'max_completion_tokens',
+    thinkingFormat: 'zai',
+    supportsStrictMode: true,
+};
+const KIMI_CHAT_COMPAT = BASE_CHAT_COMPAT;
+export const zhipuTokenizerTokenCounterAdapter = {
+    id: 'zhipu-tokenizer',
+    counterKind: 'openai-chat-tokenizer',
+    matches: (ctx) => matchesOfficialOpenAIChatProvider(ctx, ZHIPU_HOSTS, ZHIPU_PATHS),
+    buildRequest: (ctx) => buildOpenAIChatTokenizerRequest(ctx, zhipuTokenizerEndpointPath(ctx.model.baseUrl), 'zhipu-tokenizer', ZHIPU_CHAT_COMPAT),
+    parseTokens: parseUsageTotalTokens,
+};
+export const kimiEstimateTokenCountAdapter = {
+    id: 'kimi-estimate-token-count',
+    counterKind: 'openai-chat-tokenizer',
+    matches: (ctx) => matchesOfficialOpenAIChatProvider(ctx, KIMI_HOSTS, KIMI_PATHS),
+    buildRequest: (ctx) => buildOpenAIChatTokenizerRequest(ctx, '/v1/tokenizers/estimate-token-count', 'kimi-estimate-token-count', KIMI_CHAT_COMPAT),
+    parseTokens: parseDataTotalTokens,
+};
+/**
+ * Zhipu exposes the same surface under two plan roots: `/api/paas/v4` (general
+ * API plan) and `/api/coding/paas/v4` (coding plan). The tokenizer endpoint
+ * lives under the same root as the configured base URL, so keep the request on
+ * the caller's plan instead of hardcoding the general-plan path.
+ */
+function zhipuTokenizerEndpointPath(baseUrl) {
+    const url = parseUrl(baseUrl);
+    const pathname = url ? normalizePathname(url.pathname) : '';
+    return pathname === '/api/coding/paas/v4' || pathname.startsWith('/api/coding/paas/v4/')
+        ? '/api/coding/paas/v4/tokenizer'
+        : '/api/paas/v4/tokenizer';
+}
+function matchesOfficialOpenAIChatProvider(ctx, allowedHosts, allowedPaths) {
+    if (ctx.model.api !== 'openai-completions' || isManagedLoginTokenPlan(ctx))
+        return false;
+    const url = parseUrl(ctx.model.baseUrl);
+    return url
+        ? url.protocol === 'https:' &&
+            url.port === '' &&
+            allowedHosts.has(url.hostname.toLowerCase()) &&
+            allowedPaths.has(normalizePathname(url.pathname))
+        : false;
+}
+function buildOpenAIChatTokenizerRequest(ctx, endpointPath, adapterId, compat) {
+    const baseUrl = parseUrl(ctx.model.baseUrl);
+    if (!baseUrl)
+        return undefined;
+    baseUrl.pathname = endpointPath;
+    baseUrl.search = '';
+    baseUrl.hash = '';
+    const url = baseUrl.toString();
+    const body = buildOpenAIChatTokenizerBody(ctx, compat);
+    return {
+        url,
+        unsupportedCacheKey: `${adapterId}:${url}`,
+        body,
+        headers: {
+            authorization: `Bearer ${ctx.apiKey ?? ''}`,
+            ...(ctx.headers ?? {}),
+            'Content-Type': 'application/json',
+        },
+        hasImages: openAIChatTokenizerBodyHasMedia(body),
+    };
+}
+function buildOpenAIChatTokenizerBody(ctx, compat) {
+    const model = ctx.model;
+    const context = {
+        systemPrompt: ctx.systemPrompt,
+        messages: toProviderMessages(ctx.messages, ctx.model),
+        tools: ctx.tools,
+    };
+    const body = {
+        model: model.id,
+        messages: convertOpenAICompletionsMessages(model, context, compat),
+    };
+    if (ctx.tools && ctx.tools.length > 0)
+        body.tools = convertTools(ctx.tools, compat);
+    return body;
+}
+function convertTools(tools, compat) {
+    return tools.map((tool) => ({
+        type: 'function',
+        function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            ...(compat.supportsStrictMode !== false && { strict: false }),
+        },
+    }));
+}
+function openAIChatTokenizerBodyHasMedia(value) {
+    if (!value || typeof value !== 'object')
+        return false;
+    if (Array.isArray(value))
+        return value.some((item) => openAIChatTokenizerBodyHasMedia(item));
+    const record = value;
+    if (record.type === 'image_url')
+        return true;
+    return Object.values(record).some((item) => openAIChatTokenizerBodyHasMedia(item));
+}
+function parseUrl(value) {
+    try {
+        return new URL(value.trim());
+    }
+    catch {
+        return undefined;
+    }
+}
+function normalizePathname(pathname) {
+    return pathname.replace(/\/+$/, '') || '/';
+}
+//# sourceMappingURL=openai-chat-tokenizers.js.map

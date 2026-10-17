@@ -1,0 +1,45 @@
+import { resolveShortcutBindings, matchesKeyboardEvent, keyboardEventToAccelerator } from "@mavis/shared/keyboard-shortcuts";
+/** Native page key events do not bubble into the host renderer. */
+export function forwardEmbeddedBrowserHostShortcut(event, input, host, overrides, platform = process.platform) {
+    if (input.type !== 'keyDown' || input.isAutoRepeat || input.isComposing)
+        return false;
+    const shortcutPlatform = platform === 'darwin' ? 'mac' : 'windows';
+    // Electron's before-input-event Input has no getModifierState. Some
+    // Electron versions surface an 'altgr' entry in Input.modifiers — honor it
+    // so AltGr typing on Windows layouts is never treated as a shortcut (the
+    // shared matcher applies its Windows AltGraph guard). When the entry is
+    // absent this stays fail-open, which is acceptable: the forwarded surface
+    // is only Ctrl+W/T/P and default bindings carry no Alt, so plain AltGr
+    // combinations (Ctrl+Alt) cannot match them anyway. Needs real-Windows
+    // verification for the exact modifiers payload.
+    const altGr = input.modifiers?.some((modifier) => modifier.toLowerCase() === 'altgr') ?? false;
+    const keyboardEvent = {
+        code: input.code,
+        key: input.key,
+        ctrlKey: input.control,
+        metaKey: input.meta,
+        altKey: input.alt,
+        shiftKey: input.shift,
+        getModifierState: (state) => state === 'AltGraph' && altGr,
+    };
+    const matches = ['workspacePanel.closeCurrentTab', 'browser.open', 'files.open'].some((action) => resolveShortcutBindings(action, overrides, shortcutPlatform).some((binding) => matchesKeyboardEvent(binding, keyboardEvent, shortcutPlatform)));
+    const contents = host?.webContents;
+    if (!matches || !host || host.isDestroyed() || !contents || contents.isDestroyed())
+        return false;
+    const modifiers = [];
+    if (input.control)
+        modifiers.push('control');
+    if (input.meta)
+        modifiers.push('meta');
+    if (input.alt)
+        modifiers.push('alt');
+    if (input.shift)
+        modifiers.push('shift');
+    event.preventDefault();
+    contents.focus();
+    // Send a balanced pair; the host owns action routing and modal/dirty guards.
+    const keyCode = keyboardEventToAccelerator(keyboardEvent, shortcutPlatform)?.split('+').at(-1) ?? input.key;
+    contents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
+    contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+    return true;
+}

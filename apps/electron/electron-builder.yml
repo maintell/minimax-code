@@ -1,0 +1,62 @@
+# electron-builder configuration for the restored desktop client.
+#
+# The runtime layout mirrors the shipped installation:
+#   resources/app.asar            <- package.json, dist/**, out/**, .env.local, node_modules/**
+#   resources/app.asar.unpacked   <- native modules (see asarUnpack)
+#   resources/resources/**        <- resources/ (prebuilt extras + build resources)
+appId: com.minimax.agent.cn
+productName: MiniMax Code
+copyright: Copyright © MiniMax
+
+directories:
+  buildResources: resources
+  output: dist/installers
+
+files:
+  # `.env.local` is written by scripts/package.mjs for the duration of the
+  # packaging run (the repository never stores a `.env*` file).
+  - .env.local
+  - dist/main/**
+  - dist/model-menu/**
+  - out/**
+  # `public/**` is served alongside `out/`, and the main process reads the
+  # prompt-config key carriers from `public/assets/img/*.png` at runtime.
+  - public/**
+  - "!**/*.map"
+
+# Native modules are shipped prebuilt for Electron 42 (extracted from the
+# installed client); the rebuild step is therefore disabled.
+npmRebuild: false
+asarUnpack:
+  - node_modules/@earendil-works/**
+  - node_modules/@mariozechner/**
+  - node_modules/@minimax/**
+  - node_modules/@trycua/**
+  - node_modules/@ubjs/**
+  - node_modules/@vscode/**
+  - node_modules/better-sqlite3/**
+  - node_modules/jszip/**
+  - node_modules/node-pty/**
+  - node_modules/node-screenshots-win32-x64-msvc/**
+
+extraResources:
+  - from: resources
+    to: resources
+
+win:
+  icon: resources/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  include: installer-zh-prod.nsh
+
+publish:
+  provider: generic
+  url: https://filecdn.minimax.chat/public/minimax-agent/release

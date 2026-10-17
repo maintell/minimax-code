@@ -1,0 +1,19 @@
+{
+  "name": "@mavis/context-manager",
+  "version": "0.2.1",
+  "description": "Shared context compaction lifecycle hook for Mavis agent runtimes.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
+    "@mavis/agent-core": "file:../agent-core",
+    "gpt-tokenizer": "^3.4.0"
+  }
+}

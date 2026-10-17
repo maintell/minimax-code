@@ -1,0 +1,12 @@
+{
+  "name": "@trycua/cua-driver-win32-x64-msvc",
+  "version": "0.22.1",
+  "description": "Native Cua Driver SDK library for win32-x64-msvc",
+  "license": "MIT AND MPL-2.0",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ]
+}

@@ -1,0 +1,1876 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width initial-scale=1'>
+
+    <style type='text/css'>
+        html {
+            overflow-x: initial !important;
+        }
+
+        :root {
+            --bg-color: #ffffff;
+            --text-color: #333333;
+            --select-text-bg-color: #B5D6FC;
+            --select-text-font-color: auto;
+            --monospace: "Lucida Console", Consolas, "Courier", monospace;
+            --title-bar-height: 20px;
+        }
+
+        .mac-os-11 {
+            --title-bar-height: 28px;
+        }
+
+        html {
+            font-size: 14px;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        body {
+            margin: 0px;
+            padding: 0px;
+            height: auto;
+            inset: 0px;
+            font-size: 1rem;
+            line-height: 1.428571;
+            overflow-x: hidden;
+            background: inherit;
+            tab-size: 4;
+        }
+
+        iframe {
+            margin: auto;
+        }
+
+        a.url {
+            word-break: break-all;
+        }
+
+        a:active,
+        a:hover {
+            outline: 0px;
+        }
+
+        .in-text-selection,
+        ::selection {
+            text-shadow: none;
+            background: var(--select-text-bg-color);
+            color: var(--select-text-font-color);
+        }
+
+        #write {
+            margin: 0px auto;
+            height: auto;
+            width: inherit;
+            word-break: normal;
+            overflow-wrap: break-word;
+            position: relative;
+            white-space: normal;
+            overflow-x: visible;
+            padding-top: 36px;
+        }
+
+        #write.first-line-indent p {
+            text-indent: 2em;
+        }
+
+        #write.first-line-indent li p,
+        #write.first-line-indent p * {
+            text-indent: 0px;
+        }
+
+        #write.first-line-indent li {
+            margin-left: 2em;
+        }
+
+        .for-image #write {
+            padding-left: 8px;
+            padding-right: 8px;
+        }
+
+        body.typora-export {
+            padding-left: 30px;
+            padding-right: 30px;
+        }
+
+        /* .typora-export .footnote-line, .typora-export li, .typora-export p { white-space: pre-wrap; } */
+        .typora-export .task-list-item input {
+            pointer-events: none;
+        }
+
+        @media screen and (max-width: 500px) {
+            body.typora-export {
+                padding-left: 0px;
+                padding-right: 0px;
+            }
+
+            #write {
+                padding-left: 20px;
+                padding-right: 20px;
+            }
+
+            .CodeMirror-sizer {
+                margin-left: 0px !important;
+            }
+
+            .CodeMirror-gutters {
+                display: none !important;
+            }
+        }
+
+        #write li>figure:last-child {
+            margin-bottom: 0.5rem;
+        }
+
+        #write ol,
+        #write ul {
+            position: relative;
+        }
+
+        img {
+            max-width: 100%;
+            vertical-align: middle;
+            image-orientation: from-image;
+        }
+
+        button,
+        input,
+        select,
+        textarea {
+            color: inherit;
+            font-style: inherit;
+            font-variant-caps: inherit;
+            font-weight: inherit;
+            font-stretch: inherit;
+            font-size: inherit;
+            line-height: inherit;
+            font-family: inherit;
+            font-size-adjust: inherit;
+            font-kerning: inherit;
+            font-variant-alternates: inherit;
+            font-variant-ligatures: inherit;
+            font-variant-numeric: inherit;
+            font-variant-east-asian: inherit;
+            font-variant-position: inherit;
+            font-variant-emoji: inherit;
+            font-feature-settings: inherit;
+            font-optical-sizing: inherit;
+            font-variation-settings: inherit;
+        }
+
+        input[type="checkbox"],
+        input[type="radio"] {
+            line-height: normal;
+            padding: 0px;
+        }
+
+        *,
+        ::after,
+        ::before {
+            box-sizing: border-box;
+        }
+
+        #write h1,
+        #write h2,
+        #write h3,
+        #write h4,
+        #write h5,
+        #write h6,
+        #write p,
+        #write pre {
+            width: inherit;
+        }
+
+        #write h1,
+        #write h2,
+        #write h3,
+        #write h4,
+        #write h5,
+        #write h6,
+        #write p {
+            position: relative;
+        }
+
+        p {
+            line-height: inherit;
+        }
+
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6 {
+            break-after: avoid-page;
+            break-inside: avoid;
+            orphans: 4;
+        }
+
+        p {
+            orphans: 4;
+        }
+
+        h1 {
+            font-size: 2rem;
+        }
+
+        h2 {
+            font-size: 1.8rem;
+        }
+
+        h3 {
+            font-size: 1.6rem;
+        }
+
+        h4 {
+            font-size: 1.4rem;
+        }
+
+        h5 {
+            font-size: 1.2rem;
+        }
+
+        h6 {
+            font-size: 1rem;
+        }
+
+        .md-math-block,
+        .md-rawblock,
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6,
+        p {
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .md-blockmeta {
+            color: rgb(204, 204, 204);
+            font-weight: 700;
+            font-style: italic;
+        }
+
+        a {
+            cursor: pointer;
+        }
+
+        sup.md-footnote {
+            padding: 2px 4px;
+            background-color: rgba(238, 238, 238, 0.7);
+            color: rgb(85, 85, 85);
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        sup.md-footnote a,
+        sup.md-footnote a:hover {
+            color: inherit;
+            text-transform: inherit;
+            text-decoration: inherit;
+        }
+
+        #write input[type="checkbox"] {
+            cursor: pointer;
+            width: inherit;
+            height: inherit;
+        }
+
+        figure {
+            overflow-x: auto;
+            margin: 1.2em 0px;
+            max-width: calc(100% + 16px);
+            padding: 0px;
+        }
+
+        figure>table {
+            margin: 0px;
+        }
+
+        tr {
+            break-inside: avoid;
+            break-after: auto;
+        }
+
+        thead {
+            display: table-header-group;
+        }
+
+        table {
+            border-collapse: collapse;
+            border-spacing: 0px;
+            width: 100%;
+            overflow: auto;
+            break-inside: auto;
+            text-align: left;
+        }
+
+        table.md-table td {
+            min-width: 32px;
+        }
+
+        .CodeMirror-gutters {
+            border-right-width: 0px;
+            border-right-style: none;
+            border-right-color: currentcolor;
+            background-color: inherit;
+        }
+
+        .CodeMirror-linenumber {}
+
+        .CodeMirror {
+            text-align: left;
+        }
+
+        .CodeMirror-placeholder {
+            opacity: 0.3;
+        }
+
+        .CodeMirror pre {
+            padding: 0px 4px;
+        }
+
+        .CodeMirror-lines {
+            padding: 0px;
+        }
+
+        div.hr:focus {
+            cursor: none;
+        }
+
+        #write pre {
+            white-space: pre-wrap;
+        }
+
+        #write.fences-no-line-wrapping pre {
+            white-space: pre;
+        }
+
+        #write pre.ty-contain-cm {
+            white-space: normal;
+        }
+
+        .CodeMirror-gutters {
+            margin-right: 4px;
+        }
+
+        .md-fences {
+            font-size: 0.9rem;
+            display: block;
+            break-inside: avoid;
+            text-align: left;
+            overflow: visible;
+            white-space: pre;
+            background: inherit;
+            position: relative !important;
+        }
+
+        .md-fences-adv-panel {
+            width: 100%;
+            margin-top: 10px;
+            text-align: center;
+            padding-top: 0px;
+            padding-bottom: 8px;
+            overflow-x: auto;
+        }
+
+        #write .md-fences.mock-cm {
+            white-space: pre-wrap;
+        }
+
+        .md-fences.md-fences-with-lineno {
+            padding-left: 0px;
+        }
+
+        #write.fences-no-line-wrapping .md-fences.mock-cm {
+            white-space: pre;
+            overflow-x: auto;
+        }
+
+        .md-fences.mock-cm.md-fences-with-lineno {
+            padding-left: 8px;
+        }
+
+        .CodeMirror-line,
+        twitterwidget {
+            break-inside: avoid;
+        }
+
+        .footnotes {
+            opacity: 0.8;
+            font-size: 0.9rem;
+            margin-top: 1em;
+            margin-bottom: 1em;
+        }
+
+        .footnotes+.footnotes {
+            margin-top: 0px;
+        }
+
+        .md-reset {
+            margin: 0px;
+            padding: 0px;
+            border: 0px;
+            outline: 0px;
+            vertical-align: top;
+            background: 0px 0px;
+            text-decoration: none;
+            text-shadow: none;
+            float: none;
+            position: static;
+            width: auto;
+            height: auto;
+            white-space: nowrap;
+            cursor: inherit;
+            line-height: normal;
+            font-weight: 400;
+            text-align: left;
+            box-sizing: content-box;
+            direction: ltr;
+        }
+
+        li div {
+            padding-top: 0px;
+        }
+
+        blockquote {
+            margin: 1rem 0px;
+        }
+
+        li .mathjax-block,
+        li p {
+            margin: 0.5rem 0px;
+        }
+
+        li blockquote {
+            margin: 1rem 0px;
+        }
+
+        li {
+            margin: 0px;
+            position: relative;
+        }
+
+        blockquote> :last-child {
+            margin-bottom: 0px;
+        }
+
+        blockquote> :first-child,
+        li> :first-child {
+            margin-top: 0px;
+        }
+
+        .footnotes-area {
+            color: rgb(136, 136, 136);
+            margin-top: 0.714rem;
+            padding-bottom: 0.143rem;
+            white-space: normal;
+        }
+
+        #write .footnote-line {
+            white-space: pre-wrap;
+        }
+
+        @media print {
+
+            body,
+            html {
+                border: 1px solid transparent;
+                height: 99%;
+                break-after: avoid;
+                break-before: avoid;
+                font-variant-ligatures: no-common-ligatures;
+            }
+
+            #write {
+                margin-top: 0px;
+                padding-top: 0px;
+                border-color: transparent !important;
+            }
+
+            .typora-export * {
+                print-color-adjust: exact;
+            }
+
+            .typora-export #write {
+                break-after: avoid;
+            }
+
+            .typora-export #write::after {
+                height: 0px;
+            }
+
+            .is-mac table {
+                break-inside: avoid;
+            }
+
+            .typora-export-show-outline .typora-export-sidebar {
+                display: none;
+            }
+        }
+
+        .footnote-line {
+            margin-top: 0.714em;
+            font-size: 0.7em;
+        }
+
+        a img,
+        img a {
+            cursor: pointer;
+        }
+
+        pre.md-meta-block {
+            font-size: 0.8rem;
+            min-height: 0.8rem;
+            white-space: pre-wrap;
+            background: rgb(204, 204, 204);
+            display: block;
+            overflow-x: hidden;
+        }
+
+        p>.md-image:only-child:not(.md-img-error) img,
+        p>img:only-child {
+            display: block;
+            margin: auto;
+        }
+
+        #write.first-line-indent p>.md-image:only-child:not(.md-img-error) img {
+            left: -2em;
+            position: relative;
+        }
+
+        p>.md-image:only-child {
+            display: inline-block;
+            width: 100%;
+        }
+
+        #write .MathJax_Display {
+            margin: 0.8em 0px 0px;
+        }
+
+        .md-math-block {
+            width: 100%;
+        }
+
+        .md-math-block:not(:empty)::after {
+            display: none;
+        }
+
+        .MathJax_ref {
+            fill: currentcolor;
+        }
+
+        [contenteditable="true"]:active,
+        [contenteditable="true"]:focus,
+        [contenteditable="false"]:active,
+        [contenteditable="false"]:focus {
+            outline: 0px;
+            box-shadow: none;
+        }
+
+        .md-task-list-item {
+            position: relative;
+            list-style-type: none;
+        }
+
+        .task-list-item.md-task-list-item {
+            padding-left: 0px;
+        }
+
+        .md-task-list-item>input {
+            position: absolute;
+            top: 0px;
+            left: 0px;
+            margin-left: -1.2em;
+            margin-top: calc(1em - 10px);
+            border: medium;
+        }
+
+        .math {
+            font-size: 1rem;
+        }
+
+        .md-toc {
+            min-height: 3.58rem;
+            position: relative;
+            font-size: 0.9rem;
+            border-radius: 10px;
+        }
+
+        .md-toc-content {
+            position: relative;
+            margin-left: 0px;
+        }
+
+        .md-toc-content::after,
+        .md-toc::after {
+            display: none;
+        }
+
+        .md-toc-item {
+            display: block;
+            color: rgb(65, 131, 196);
+        }
+
+        .md-toc-item a {
+            text-decoration: none;
+        }
+
+        .md-toc-inner:hover {
+            text-decoration: underline;
+        }
+
+        .md-toc-inner {
+            display: inline-block;
+            cursor: pointer;
+        }
+
+        .md-toc-h1 .md-toc-inner {
+            margin-left: 0px;
+            font-weight: 700;
+        }
+
+        .md-toc-h2 .md-toc-inner {
+            margin-left: 2em;
+        }
+
+        .md-toc-h3 .md-toc-inner {
+            margin-left: 4em;
+        }
+
+        .md-toc-h4 .md-toc-inner {
+            margin-left: 6em;
+        }
+
+        .md-toc-h5 .md-toc-inner {
+            margin-left: 8em;
+        }
+
+        .md-toc-h6 .md-toc-inner {
+            margin-left: 10em;
+        }
+
+        @media screen and (max-width: 48em) {
+            .md-toc-h3 .md-toc-inner {
+                margin-left: 3.5em;
+            }
+
+            .md-toc-h4 .md-toc-inner {
+                margin-left: 5em;
+            }
+
+            .md-toc-h5 .md-toc-inner {
+                margin-left: 6.5em;
+            }
+
+            .md-toc-h6 .md-toc-inner {
+                margin-left: 8em;
+            }
+        }
+
+        a.md-toc-inner {
+            font-size: inherit;
+            font-style: inherit;
+            font-weight: inherit;
+            line-height: inherit;
+        }
+
+        .footnote-line a:not(.reversefootnote) {
+            color: inherit;
+        }
+
+        .md-attr {
+            display: none;
+        }
+
+        .md-fn-count::after {
+            content: ".";
+        }
+
+        code,
+        pre,
+        samp,
+        tt {
+            font-family: var(--monospace);
+        }
+
+        kbd {
+            margin: 0px 0.1em;
+            padding: 0.1em 0.6em;
+            font-size: 0.8em;
+            color: rgb(36, 39, 41);
+            background: rgb(255, 255, 255);
+            border: 1px solid rgb(173, 179, 185);
+            border-radius: 3px;
+            box-shadow: rgba(12, 13, 14, 0.2) 0px 1px 0px, rgb(255, 255, 255) 0px 0px 0px 2px inset;
+            white-space: nowrap;
+            vertical-align: middle;
+        }
+
+        .md-comment {
+            color: rgb(162, 127, 3);
+            opacity: 0.6;
+            font-family: var(--monospace);
+        }
+
+        code {
+            text-align: left;
+            vertical-align: initial;
+        }
+
+        a.md-print-anchor {
+            white-space: pre !important;
+            border-width: medium !important;
+            border-style: none !important;
+            border-color: currentcolor !important;
+            display: inline-block !important;
+            position: absolute !important;
+            width: 1px !important;
+            right: 0px !important;
+            outline: 0px !important;
+            background: 0px 0px !important;
+            text-decoration: initial !important;
+            text-shadow: initial !important;
+        }
+
+        .os-windows.monocolor-emoji .md-emoji {
+            font-family: "Segoe UI Symbol", sans-serif;
+        }
+
+        .md-diagram-panel>svg {
+            max-width: 100%;
+        }
+
+        [lang="flow"] svg,
+        [lang="mermaid"] svg {
+            max-width: 100%;
+            height: auto;
+        }
+
+        [lang="mermaid"] .node text {
+            font-size: 1rem;
+        }
+
+        table tr th {
+            border-bottom-width: 0px;
+            border-bottom-style: none;
+            border-bottom-color: currentcolor;
+        }
+
+        video {
+            max-width: 100%;
+            display: block;
+            margin: 0px auto;
+        }
+
+        iframe {
+            max-width: 100%;
+            width: 100%;
+            border: medium;
+        }
+
+        .highlight td,
+        .highlight tr {
+            border: 0px;
+        }
+
+        mark {
+            background: rgb(255, 255, 0);
+            color: rgb(0, 0, 0);
+        }
+
+        .md-html-inline .md-plain,
+        .md-html-inline strong,
+        mark .md-inline-math,
+        mark strong {
+            color: inherit;
+        }
+
+        .md-expand mark .md-meta {
+            opacity: 0.3 !important;
+        }
+
+        mark .md-meta {
+            color: rgb(0, 0, 0);
+        }
+
+        @media print {
+
+            .typora-export h1,
+            .typora-export h2,
+            .typora-export h3,
+            .typora-export h4,
+            .typora-export h5,
+            .typora-export h6 {
+                break-inside: avoid;
+            }
+        }
+
+        .md-diagram-panel .messageText {
+            stroke: none !important;
+        }
+
+        .md-diagram-panel .start-state {
+            fill: var(--node-fill);
+        }
+
+        .md-diagram-panel .edgeLabel rect {
+            opacity: 1 !important;
+        }
+
+        .md-fences.md-fences-math {
+            font-size: 1em;
+        }
+
+        .md-fences-advanced:not(.md-focus) {
+            padding: 0px;
+            white-space: nowrap;
+            border: 0px;
+        }
+
+        .md-fences-advanced:not(.md-focus) {
+            background: inherit;
+        }
+
+        .typora-export-show-outline .typora-export-content {
+            max-width: 1440px;
+            margin: auto;
+            display: flex;
+            flex-direction: row;
+        }
+
+        .typora-export-sidebar {
+            width: 300px;
+            font-size: 0.8rem;
+            margin-top: 80px;
+            margin-right: 18px;
+        }
+
+        .typora-export-show-outline #write {
+            --webkit-flex: 2;
+            flex: 2 1 0%;
+        }
+
+        .typora-export-sidebar .outline-content {
+            position: fixed;
+            top: 0px;
+            max-height: 100%;
+            overflow: hidden auto;
+            padding-bottom: 30px;
+            padding-top: 60px;
+            width: 300px;
+        }
+
+        @media screen and (max-width: 1024px) {
+
+            .typora-export-sidebar,
+            .typora-export-sidebar .outline-content {
+                width: 240px;
+            }
+        }
+
+        @media screen and (max-width: 800px) {
+            .typora-export-sidebar {
+                display: none;
+            }
+        }
+
+        .outline-content li,
+        .outline-content ul {
+            margin-left: 0px;
+            margin-right: 0px;
+            padding-left: 0px;
+            padding-right: 0px;
+            list-style: none;
+        }
+
+        .outline-content ul {
+            margin-top: 0px;
+            margin-bottom: 0px;
+        }
+
+        .outline-content strong {
+            font-weight: 400;
+        }
+
+        .outline-expander {
+            width: 1rem;
+            height: 1.428571rem;
+            position: relative;
+            display: table-cell;
+            vertical-align: middle;
+            cursor: pointer;
+            padding-left: 4px;
+        }
+
+        .outline-expander::before {
+            content: "";
+            position: relative;
+            font-family: Ionicons;
+            display: inline-block;
+            font-size: 8px;
+            vertical-align: middle;
+        }
+
+        .outline-item {
+            padding-top: 3px;
+            padding-bottom: 3px;
+            cursor: pointer;
+        }
+
+        .outline-expander:hover::before {
+            content: "";
+        }
+
+        .outline-h1>.outline-item {
+            padding-left: 0px;
+        }
+
+        .outline-h2>.outline-item {
+            padding-left: 1em;
+        }
+
+        .outline-h3>.outline-item {
+            padding-left: 2em;
+        }
+
+        .outline-h4>.outline-item {
+            padding-left: 3em;
+        }
+
+        .outline-h5>.outline-item {
+            padding-left: 4em;
+        }
+
+        .outline-h6>.outline-item {
+            padding-left: 5em;
+        }
+
+        .outline-label {
+            cursor: pointer;
+            display: table-cell;
+            vertical-align: middle;
+            text-decoration: none;
+            color: inherit;
+        }
+
+        .outline-label:hover {
+            text-decoration: underline;
+        }
+
+        .outline-item:hover {
+            border-color: rgb(245, 245, 245);
+            background-color: var(--item-hover-bg-color);
+        }
+
+        .outline-item:hover {
+            margin-left: -28px;
+            margin-right: -28px;
+            border-left-width: 28px;
+            border-left-style: solid;
+            border-left-color: transparent;
+            border-right-width: 28px;
+            border-right-style: solid;
+            border-right-color: transparent;
+        }
+
+        .outline-item-single .outline-expander::before,
+        .outline-item-single .outline-expander:hover::before {
+            display: none;
+        }
+
+        .outline-item-open>.outline-item>.outline-expander::before {
+            content: "";
+        }
+
+        .outline-children {
+            display: none;
+        }
+
+        .info-panel-tab-wrapper {
+            display: none;
+        }
+
+        .outline-item-open>.outline-children {
+            display: block;
+        }
+
+        .typora-export .outline-item {
+            padding-top: 1px;
+            padding-bottom: 1px;
+        }
+
+        .typora-export .outline-item:hover {
+            margin-right: -8px;
+            border-right-width: 8px;
+            border-right-style: solid;
+            border-right-color: transparent;
+        }
+
+        .typora-export .outline-expander::before {
+            content: "+";
+            font-family: inherit;
+            top: -1px;
+        }
+
+        .typora-export .outline-expander:hover::before,
+        .typora-export .outline-item-open>.outline-item>.outline-expander::before {
+            content: "−";
+        }
+
+        .typora-export-collapse-outline .outline-children {
+            display: none;
+        }
+
+        .typora-export-collapse-outline .outline-item-open>.outline-children,
+        .typora-export-no-collapse-outline .outline-children {
+            display: block;
+        }
+
+        .typora-export-no-collapse-outline .outline-expander::before {
+            content: "" !important;
+        }
+
+        .typora-export-show-outline .outline-item-active>.outline-item .outline-label {
+            font-weight: 700;
+        }
+
+        .md-inline-math-container mjx-container {
+            zoom: 0.95;
+        }
+
+
+        :root {
+            --side-bar-bg-color: #fafafa;
+            --control-text-color: #777;
+        }
+
+        html {
+            font-size: 16px;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        body {
+            font-family: "Open Sans", "Clear Sans", "Helvetica Neue", Helvetica, Arial, 'Segoe UI Emoji', sans-serif;
+            color: rgb(51, 51, 51);
+            line-height: 1.6;
+        }
+
+        #write {
+            max-width: 860px;
+            margin: 0 auto;
+            padding: 30px;
+            padding-bottom: 100px;
+        }
+
+        @media only screen and (min-width: 1400px) {
+            #write {
+                max-width: 1024px;
+            }
+        }
+
+        @media only screen and (min-width: 1800px) {
+            #write {
+                max-width: 1200px;
+            }
+        }
+
+        #write>ul:first-child,
+        #write>ol:first-child {
+            margin-top: 30px;
+        }
+
+        a {
+            color: #4183C4;
+        }
+
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6 {
+            position: relative;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            font-weight: bold;
+            line-height: 1.4;
+            cursor: text;
+        }
+
+        h1:hover a.anchor,
+        h2:hover a.anchor,
+        h3:hover a.anchor,
+        h4:hover a.anchor,
+        h5:hover a.anchor,
+        h6:hover a.anchor {
+            text-decoration: none;
+        }
+
+        h1 tt,
+        h1 code {
+            font-size: inherit;
+        }
+
+        h2 tt,
+        h2 code {
+            font-size: inherit;
+        }
+
+        h3 tt,
+        h3 code {
+            font-size: inherit;
+        }
+
+        h4 tt,
+        h4 code {
+            font-size: inherit;
+        }
+
+        h5 tt,
+        h5 code {
+            font-size: inherit;
+        }
+
+        h6 tt,
+        h6 code {
+            font-size: inherit;
+        }
+
+        h1 {
+            font-size: 2.25em;
+            line-height: 1.2;
+        }
+
+        h2 {
+            font-size: 1.75em;
+            line-height: 1.225;
+        }
+
+        h3 {
+            font-size: 1.5em;
+            line-height: 1.43;
+        }
+
+        h4 {
+            font-size: 1.25em;
+        }
+
+        h5 {
+            font-size: 1em;
+        }
+
+        h6 {
+            font-size: 1em;
+            color: #777;
+        }
+
+        p,
+        blockquote,
+        ul,
+        ol,
+        dl,
+        table {
+            margin: 0.8em 0;
+        }
+
+        li>ol,
+        li>ul {
+            margin: 0 0;
+        }
+
+        hr {
+            height: 2px;
+            padding: 0;
+            margin: 16px 0;
+            background-color: #e7e7e7;
+            border: 0 none;
+            overflow: hidden;
+            box-sizing: content-box;
+        }
+
+        li p.first {
+            display: inline-block;
+        }
+
+        ul,
+        ol {
+            padding-left: 30px;
+        }
+
+        ul:first-child,
+        ol:first-child {
+            margin-top: 0;
+        }
+
+        ul:last-child,
+        ol:last-child {
+            margin-bottom: 0;
+        }
+
+        blockquote {
+            border-left: 4px solid #dfe2e5;
+            padding: 0 15px;
+            color: #777777;
+        }
+
+        blockquote blockquote {
+            padding-right: 0;
+        }
+
+        table {
+            padding: 0;
+            word-break: initial;
+        }
+
+        table tr {
+            border: 1px solid #dfe2e5;
+            margin: 0;
+            padding: 0;
+        }
+
+        table tr:nth-child(2n),
+        thead {
+            background-color: #f8f8f8;
+        }
+
+        table th {
+            font-weight: bold;
+            border: 1px solid #dfe2e5;
+            border-bottom: 0;
+            margin: 0;
+            padding: 6px 13px;
+        }
+
+        table td {
+            border: 1px solid #dfe2e5;
+            margin: 0;
+            padding: 6px 13px;
+        }
+
+        table th:first-child,
+        table td:first-child {
+            margin-top: 0;
+        }
+
+        table th:last-child,
+        table td:last-child {
+            margin-bottom: 0;
+        }
+
+        .CodeMirror-lines {
+            padding-left: 4px;
+        }
+
+        .code-tooltip {
+            box-shadow: 0 1px 1px 0 rgba(0, 28, 36, .3);
+            border-top: 1px solid #eef2f2;
+        }
+
+        .md-fences,
+        code,
+        tt {
+            border: 1px solid #e7eaed;
+            background-color: #f8f8f8;
+            border-radius: 3px;
+            padding: 0;
+            padding: 2px 4px 0px 4px;
+            font-size: 0.9em;
+        }
+
+        code {
+            background-color: #f3f4f4;
+            padding: 0 2px 0 2px;
+        }
+
+        .md-fences {
+            margin-bottom: 15px;
+            margin-top: 15px;
+            padding-top: 8px;
+            padding-bottom: 6px;
+        }
+
+
+        .md-task-list-item>input {
+            margin-left: -1.3em;
+        }
+
+        @media print {
+            html {
+                font-size: 13px;
+            }
+
+            pre {
+                page-break-inside: avoid;
+                word-wrap: break-word;
+            }
+        }
+
+        .md-fences {
+            background-color: #f8f8f8;
+        }
+
+        #write pre.md-meta-block {
+            padding: 1rem;
+            font-size: 85%;
+            line-height: 1.45;
+            background-color: #f7f7f7;
+            border: 0;
+            border-radius: 3px;
+            color: #777777;
+            margin-top: 0 !important;
+        }
+
+        .mathjax-block>.code-tooltip {
+            bottom: .375rem;
+        }
+
+        .md-mathjax-midline {
+            background: #fafafa;
+        }
+
+        #write>h3.md-focus:before {
+            left: -1.5625rem;
+            top: .375rem;
+        }
+
+        #write>h4.md-focus:before {
+            left: -1.5625rem;
+            top: .285714286rem;
+        }
+
+        #write>h5.md-focus:before {
+            left: -1.5625rem;
+            top: .285714286rem;
+        }
+
+        #write>h6.md-focus:before {
+            left: -1.5625rem;
+            top: .285714286rem;
+        }
+
+        .md-image>.md-meta {
+            /*border: 1px solid #ddd;*/
+            border-radius: 3px;
+            padding: 2px 0px 0px 4px;
+            font-size: 0.9em;
+            color: inherit;
+        }
+
+        .md-tag {
+            color: #a7a7a7;
+            opacity: 1;
+        }
+
+        .md-toc {
+            margin-top: 20px;
+            padding-bottom: 20px;
+        }
+
+        .sidebar-tabs {
+            border-bottom: none;
+        }
+
+        #typora-quick-open {
+            border: 1px solid #ddd;
+            background-color: #f8f8f8;
+        }
+
+        #typora-quick-open-item {
+            background-color: #FAFAFA;
+            border-color: #FEFEFE #e5e5e5 #e5e5e5 #eee;
+            border-style: solid;
+            border-width: 1px;
+        }
+
+        /** focus mode */
+        .on-focus-mode blockquote {
+            border-left-color: rgba(85, 85, 85, 0.12);
+        }
+
+        header,
+        .context-menu,
+        .megamenu-content,
+        footer {
+            font-family: "Segoe UI", "Arial", sans-serif;
+        }
+
+        .file-node-content:hover .file-node-icon,
+        .file-node-content:hover .file-node-open-state {
+            visibility: visible;
+        }
+
+        .mac-seamless-mode #typora-sidebar {
+            background-color: #fafafa;
+            background-color: var(--side-bar-bg-color);
+        }
+
+        .md-lang {
+            color: #b4654d;
+        }
+
+        #md-notification .btn {
+            border: 0;
+        }
+
+        .dropdown-menu .divider {
+            border-color: #e5e5e5;
+            opacity: 0.4;
+        }
+
+        .ty-preferences .window-content {
+            background-color: #fafafa;
+        }
+
+        .ty-preferences .nav-group-item.active {
+            color: white;
+            background: #999;
+        }
+
+        .menu-item-container a.menu-style-btn {
+            background-color: #f5f8fa;
+            background-image: linear-gradient(180deg, hsla(0, 0%, 100%, 0.8), hsla(0, 0%, 100%, 0));
+        }
+
+        #terms-of-service {
+            text-align: center;
+        }
+    </style>
+    <title>MiniMax AI App and Web Terms of Service</title>
+    <link rel="icon" href="/assets/logo/favicon_v2.png">
+</head>
+
+<body class='typora-export'>
+    <div class='typora-export-content'>
+        <div id="write">
+            <p>
+            <h1>MiniMax AI App and Web Terms of Service</h1>
+            </p>
+            <p><strong>Terms of Service</strong></p>
+            <p>Last Modified: 11/25/2024</p>
+            <p><strong>Acceptance of the Terms of Use</strong></p>
+            <p>These terms of use are entered into by and between you and Nanonoble Pte. Ltd.
+                (&quot;<strong>Company</strong>,&quot; &quot;<strong>we</strong>,&quot; or
+                &quot;<strong>us</strong>&quot;). The following terms and conditions (&quot;<strong>Terms of
+                    Use</strong>&quot;) govern your access to and use of our websites and software applications,
+                including any content, functionality, and services offered on or through the hailuo.ai/audio,
+                hailuoai.video, and hailuo.ai (collectively, the &quot;<strong>Services Website</strong>&quot;).</p>
+            <p>Please read the Terms of Use carefully before you start to use the Services. <strong>By using the
+                    Services, you accept and agree to be bound and abide by these Terms of Use.</strong> If you do not
+                want to agree to these Terms of Use, you must not access or use the Services. </p>
+            <p>This Services is offered and available to users who are 16 years of age or older. By using this Services,
+                you represent and warrant that you are of legal age to form a binding contract with the Company and meet
+                all of the foregoing eligibility requirements. If you do not meet all of these requirements, you must
+                not access or use the Services.</p>
+            <p><strong>Changes to the Terms of Use</strong></p>
+            <p>We may revise and update these Terms of Use from time to time in our sole discretion. All changes are
+                effective immediately when we post them. </p>
+            <p>Your continued use of the Services following the posting of revised Terms of Use means that you accept
+                and agree to the changes. You are expected to check this page from time to time so you are aware of any
+                changes, as they are binding on you. </p>
+            <p><strong>Accessing the Services and Account Security</strong></p>
+            <p>We reserve the right to withdraw or amend this Services, and any service or material we provide on the
+                Services, in our sole discretion without notice. We will not be liable if for any reason all or any part
+                of the Services is unavailable at any time or for any period. From time to time, we may restrict user
+                access, including registered user access, to some parts of the Services or the entire Services.</p>
+            <p>You are responsible for both:</p>
+            <ul>
+                <li>Making all arrangements necessary for you to have access to the Services.</li>
+                <li>
+                    <p>Ensuring that all persons who access the Services through your internet connection are aware of
+                        these Terms of Use and comply with them.</p>
+                    <p>To access the Services or some of the resources it offers, you may be asked to provide certain
+                        registration details or other information. It is a condition of your use of the Services that
+                        all the information you provide on the Services is correct, current, and complete. You agree
+                        that all information you provide to register with this Services or otherwise, including, but not
+                        limited to, through the use of any interactive features on the Services, is governed by our
+                        Privacy Policy, and you consent to all actions we take with respect to your information
+                        consistent with our Privacy Policy.</p>
+                    <p>If you choose, or are provided with, a username, password, or any other piece of information as
+                        part of our security procedures, you must treat such information as confidential, and you must
+                        not disclose it to any other person or entity. You also acknowledge that your account is
+                        personal to you and agree not to provide any other person with access to this Services or
+                        portions of it using your username, password, or other security information. You agree to notify
+                        us immediately of any unauthorized access to or use of your username or password or any other
+                        breach of security. You also agree to ensure that you log off your account at the end of each
+                        session. You should use particular caution when accessing your account from a public or shared
+                        computer so that others are not able to view or record your password or other personal
+                        information.</p>
+                    <p>We have the right to disable any username, password, or other identifier, whether chosen by you
+                        or provided by us, at any time in our sole discretion for any or no reason, including if, in our
+                        opinion, you have violated any provision of these Terms of Use.</p>
+                </li>
+            </ul>
+            <p><strong>Prohibited Uses</strong></p>
+            <p> You may use the Services only for lawful purposes and in accordance with these Terms of Use. You agree
+                not to use the Services:</p>
+            <ul>
+                <li>In any way that violates any applicable federal, state, local, or international law or regulation
+                    (including, without limitation, any laws regarding the export of data or software to and from the US
+                    or other countries). </li>
+                <li>For the purpose of exploiting, harming, or attempting to exploit or harm minors in any way by
+                    exposing them to inappropriate content, asking for personally identifiable information, or
+                    otherwise.</li>
+                <li>To send, knowingly receive, upload, download, use, or re-use any material that does not comply with
+                    the Content Standards set out in these Terms of Use.</li>
+                <li>To transmit, or procure the sending of, any advertising or promotional material, including any
+                    &quot;junk mail,&quot; &quot;chain letter,&quot; &quot;spam,&quot; or any other similar
+                    solicitation.</li>
+                <li>To impersonate or attempt to impersonate the Company, a Company employee, another user, or any other
+                    person or entity (including, without limitation, by using email addresses or screen names associated
+                    with any of the foregoing).</li>
+                <li>
+                    <p>To engage in any other conduct that restricts or inhibits anyone&#39;s use or enjoyment of the
+                        Services, or which, as determined by us, may harm the Company or users of the Services, or
+                        expose them to liability.</p>
+                    <p>Additionally, you agree not to:</p>
+                </li>
+                <li>
+                    <p>Use the Services in any manner that could disable, overburden, damage, or impair the site or
+                        interfere with any other party&#39;s use of the Services.</p>
+                </li>
+                <li>Use any robot, spider, or other automatic device, process, or means to access the Services for any
+                    purpose, including monitoring or copying any of the material on the Services.</li>
+                <li>Use any manual process to monitor or copy any of the material on the Services, or for any other
+                    purpose not expressly authorized in these Terms of Use, without our prior written consent.</li>
+                <li>Use any device, software, or routine that interferes with the proper working of the Services.</li>
+                <li>Introduce any viruses, Trojan horses, worms, logic bombs, or other material that is malicious or
+                    technologically harmful.</li>
+                <li>Attempt to gain unauthorized access to, interfere with, damage, or disrupt any parts of the
+                    Services, the server on which the Services is stored, or any server, computer, or database connected
+                    to the Services. </li>
+                <li>Attack the Services via a denial-of-service attack or a distributed denial-of-service attack.</li>
+                <li>Otherwise attempt to interfere with the proper working of the Services.</li>
+            </ul>
+            <p><strong>User Contributions and</strong> <strong>User Generated Content</strong></p>
+            <p> The Services contains interactive features (collectively, &quot;<strong>Interactive
+                    Services</strong>&quot;) that allow users to post, submit, publish, display, or transmit
+                (hereinafter, &quot;<strong>submit</strong>&quot;) content or materials (collectively,
+                &quot;<strong>User Contributions</strong>&quot;) on or through the Services to generate data content in
+                the forms of text, audio or video according to the instructions you provide in your User Contributions
+                (“<strong>User Generated Content</strong>”).</p>
+            <p> All User Contributions and User Generated Content must comply with the Content Standards set out in
+                these Terms of Use. </p>
+            <p> We do not claim ownership of User Contributions or User Generated Content. By using the Services, you
+                grant to us, our affiliates, successors, and assigns a royalty-free, perpetual, irrevocable, worldwide,
+                non-exclusive right (including any moral rights) and license to use, license, reproduce, modify, adapt,
+                publish, translate, create derivative works from, distribute, derive revenue or other remuneration from,
+                and communicate to the public, perform and display your User Contributions and User Generated Content
+                (in whole or in part) worldwide and/or to incorporate it in other works in any form, media or technology
+                now known or later developed, for the full term of any worldwide intellectual property right that may
+                exist in your User Contributions and User Generated Content. This license survives termination of this
+                Agreement by any party, for any reason.</p>
+            <p> You represent and warrant that: </p>
+            <ul>
+                <li>You own or control all rights in and to the User Contributions and User Generated Content and have
+                    the right to grant the license granted above to us and our affiliates and service providers, and
+                    each of their and our respective licensees, successors, and assigns.</li>
+                <li>
+                    <p>All of your User Contributions and User Generated Content do and will comply with these Terms of
+                        Use. </p>
+                    <p>You understand and acknowledge that you are responsible for any User Contributions and User
+                        Generated Content you submit or generate, and you, not the Company, have full responsibility for
+                        such content, including its legality, reliability, accuracy, and appropriateness. </p>
+                    <p>If any User Generated Content violates these Terms of Use, whether intentionally or
+                        unintentionally, you must immediately cease all use of such content. You are expressly
+                        prohibited from viewing, copying, downloading, storing, transmitting, sharing, or otherwise
+                        using such content in any manner. Please report the existence of such content to Customer
+                        Service using the contact information provided on the Services.</p>
+                    <p>We are not responsible or liable to any third party for the content or accuracy of any User
+                        Contributions or any User Generated Content submitted or generated by you or any other user of
+                        the Services. </p>
+                </li>
+            </ul>
+            <p><strong>Monitoring and Enforcement; Termination</strong></p>
+            <p> We have the right to:</p>
+            <ul>
+                <li>Remove or refuse to process any User Contributions or User Generated Content for any or no reason in
+                    our sole discretion.</li>
+                <li>Take any action with respect to any User Contributions or User Generated Content that we deem
+                    necessary or appropriate in our sole discretion, including if we believe that such content violates
+                    the Terms of Use, including the Content Standards, infringes any intellectual property right or
+                    other right of any person or entity, threatens the personal safety of users of the Services or the
+                    public, or could create liability for the Company.</li>
+                <li>Disclose your identity or other information about you to any third party who claims that material
+                    submitted by you violates their rights, including but not limited to their intellectual property
+                    rights or their right to privacy.</li>
+                <li>Take appropriate legal action, including without limitation, referral to law enforcement, for any
+                    illegal or unauthorized use of the Services. </li>
+                <li>
+                    <p>Terminate or suspend your access to all or part of the Services for any or no reason, including
+                        without limitation, any violation of these Terms of Use.</p>
+                    <p>Without limiting the foregoing, we have the right to cooperate fully with any law enforcement
+                        authorities or court order requesting or directing us to disclose the identity or other
+                        information of anyone submitting any materials on or through the Services. YOU WAIVE AND HOLD
+                        HARMLESS THE COMPANY AND ITS AFFILIATES, LICENSEES, AND SERVICE PROVIDERS FROM ANY CLAIMS
+                        RESULTING FROM ANY ACTION TAKEN BY ANY OF THE FOREGOING PARTIES DURING, OR TAKEN AS A
+                        CONSEQUENCE OF, INVESTIGATIONS BY EITHER SUCH PARTIES OR LAW ENFORCEMENT AUTHORITIES.</p>
+                    <p>We automatically block some content on this Services. However, we cannot review all material
+                        before it is submitted or generated on the Services and cannot ensure prompt removal of
+                        objectionable material after it has been submitted or generated. Accordingly, we assume no
+                        liability for any action or inaction regarding transmissions, communications, or content
+                        provided or generated by any user or third party. We have no liability or responsibility to
+                        anyone for performance or nonperformance of the activities described in this section. </p>
+                </li>
+            </ul>
+            <p><strong>Content Standards</strong></p>
+            <p> These content standards apply to any and all User Contributions, User Generated Content, and your use of
+                Interactive Services. User Contributions and User Generated Content must in their entirety comply with
+                all applicable federal, state, local, and international laws and regulations. Without limiting the
+                foregoing, User Contributions and User Generated Content must not:</p>
+            <ul>
+                <li>Contain any material that is defamatory, obscene, indecent, abusive, offensive, harassing, violent,
+                    hateful, inflammatory, or otherwise objectionable.</li>
+                <li>Promote sexually explicit or pornographic material, violence, or discrimination based on race, sex,
+                    religion, nationality, disability, sexual orientation, or age.</li>
+                <li>Infringe any patent, trademark, trade secret, copyright, or other intellectual property or other
+                    rights of any other person.</li>
+                <li>Violate the legal rights (including the rights of publicity and privacy) of others or contain any
+                    material that could give rise to any civil or criminal liability under applicable laws or
+                    regulations or that otherwise may be in conflict with these Terms of Use and our Privacy Policy.
+                </li>
+                <li>Be likely to deceive any person.</li>
+                <li>Promote any illegal activity, or advocate, promote, or assist any unlawful act.</li>
+                <li>Cause annoyance, inconvenience, or needless anxiety or be likely to upset, embarrass, alarm, or
+                    annoy any other person.</li>
+                <li>Impersonate any person or misrepresent your identity or affiliation with any person or organization.
+                </li>
+                <li>Involve commercial activities or sales, such as contests, sweepstakes, and other sales promotions,
+                    barter, or advertising.</li>
+                <li>Give the impression that they emanate from or are endorsed by us or any other person or entity, if
+                    this is not the case.</li>
+                <li>Be intended for use in political campaigns or for influencing the outcome of an election. </li>
+            </ul>
+            <p><strong>Copyright Infringement</strong></p>
+            <p> If you believe that any User Contributions or User Generated Content violate your copyright, please send
+                us a notice of copyright infringement to the contact information listed below. It is the policy of the
+                Company to suspend or terminate the user accounts of repeat infringers. </p>
+            <p><strong>Reliance on Information Submitted</strong></p>
+            <p> The information presented on or through the Services is made available solely for general information
+                purposes. We do not warrant the accuracy, completeness, or usefulness of this information. Any reliance
+                you place on such information is strictly at your own risk. We disclaim all liability and responsibility
+                arising from any reliance placed on such materials by you or any other visitor to the Services, or by
+                anyone who may be informed of any of its contents.</p>
+            <p> This Services may include content provided by third parties, including materials provided by other
+                users, bloggers, and third-party licensors, syndicators, aggregators, and/or reporting services. All
+                statements and/or opinions expressed in these materials, and all articles and responses to questions and
+                other content, other than the content provided by the Company, are solely the opinions and the
+                responsibility of the person or entity providing those materials. These materials do not necessarily
+                reflect the opinion of the Company. We are not responsible, or liable to you or any third party, for the
+                content or accuracy of any materials provided by any third parties.</p>
+            <p><strong>Intellectual Property Rights of the Services</strong></p>
+            <p> This Section applies solely to the content existing on the Services at the time of your visit. For
+                information regarding intellectual property rights of User Generated Content, please refer to the
+                section titled “User Contributions and User Generated Content.”</p>
+            <p> The Services and its entire contents, features, and functionality (including but not limited to all
+                information, software, text, displays, images, video, and audio, and the design, selection, and
+                arrangement thereof) are owned by the Company, its licensors, or other providers of such material and
+                are protected by United States and international copyright, trademark, patent, trade secret, and other
+                intellectual property or proprietary rights laws.</p>
+            <p> These Terms of Use permit you to use the Services for your personal, non-commercial use only. You must
+                not reproduce, distribute, modify, create derivative works of, publicly display, publicly perform,
+                republish, download, store, or transmit any of the material on our Services, except as follows:</p>
+            <ul>
+                <li>Your computer may temporarily store copies of such materials in RAM incidental to your accessing and
+                    viewing those materials.</li>
+                <li>You may store files that are automatically cached by your Web browser for display enhancement
+                    purposes.</li>
+                <li>You may print or download one copy of a reasonable number of pages of the Services for your own
+                    personal, non-commercial use and not for further reproduction, publication, or distribution.</li>
+                <li>If we provide desktop, mobile, or other applications for download, you may download a single copy to
+                    your computer or mobile device solely for your own personal, non-commercial use, provided you agree
+                    to be bound by our end user license agreement for such applications.</li>
+                <li>
+                    <p>If we provide social media features with certain content, you may take such actions as are
+                        enabled by such features.</p>
+                    <p>You must not:</p>
+                </li>
+                <li>
+                    <p>Modify copies of any materials from this site.</p>
+                </li>
+                <li>Use any illustrations, photographs, video or audio sequences, or any graphics separately from the
+                    accompanying text.</li>
+                <li>
+                    <p>Delete or alter any copyright, trademark, watermark, or other proprietary rights notices from
+                        copies of materials from this site.</p>
+                    <p>You must not access or use for any commercial purposes any part of the Services or any services
+                        or materials available through the Services. </p>
+                    <p>If you wish to make any use of material on the Services other than that set out in this section,
+                        please address your request to the contact information listed below.</p>
+                    <p>If you print, copy, modify, download, or otherwise use or provide any other person with access to
+                        any part of the Services in breach of the Terms of Use, your right to use the Services will stop
+                        immediately and you must, at our option, return or destroy any copies of the materials you have
+                        made. No right, title, or interest in or to the Services or any content on the Services is
+                        transferred to you, and all rights not expressly granted are reserved by the Company. Any use of
+                        the Services not expressly permitted by these Terms of Use is a breach of these Terms of Use and
+                        may violate copyright, trademark, and other laws.</p>
+                </li>
+            </ul>
+            <p><strong>Trademarks</strong></p>
+            <p> The Company name, logo, and all related names, logos, product and service names, designs, and slogans
+                are trademarks of the Company or its affiliates or licensors. You must not use such marks without the
+                prior written permission of the Company. All other names, logos, product and service names, designs, and
+                slogans in the Services are the trademarks of their respective owners.</p>
+            <p><strong>Changes to the Services</strong></p>
+            <p> We may update the content on this Services from time to time, but its content is not necessarily
+                complete or up-to-date. Any of the material on the Services may be out of date at any given time, and we
+                are under no obligation to update such material. </p>
+            <p><strong>Information About You and Your Visits to the Services</strong></p>
+            <p> All information we collect through the Services is subject to our Privacy Policy. By using the Services,
+                you consent to all actions taken by us with respect to your information in compliance with the Privacy
+                Policy. </p>
+            <p><strong>Other Terms and Conditions</strong></p>
+            <p> Additional terms and conditions may also apply to specific portions, services, or features of the
+                Services. All such additional terms and conditions are hereby incorporated by this reference into these
+                Terms of Use.</p>
+            <p><strong>Linking to the Services and Social Media Features</strong></p>
+            <p> You may link to our homepage, provided you do so in a way that is fair and legal and does not damage our
+                reputation or take advantage of it, but you must not establish a link in such a way as to suggest any
+                form of association, approval, or endorsement on our part without our express written consent. </p>
+            <p> The Services may provide certain social media features that enable you to:</p>
+            <ul>
+                <li>Link from your own or certain third-party websites to certain content on this Services.</li>
+                <li>Send emails or other communications with certain content, or links to certain content, on this
+                    Services.</li>
+                <li>
+                    <p>Cause limited portions of content of the Services to be displayed or appear to be displayed on
+                        your own or certain third-party websites.</p>
+                    <p>You may use these features solely as they are provided by us. Subject to the foregoing, you must
+                        not:</p>
+                </li>
+                <li>
+                    <p>Establish a link from any website that is not owned by you.</p>
+                </li>
+                <li>Cause the Services or portions of it to be displayed on, or appear to be displayed by, any other
+                    site, for example, framing, deep linking, or in-line linking.</li>
+                <li>Link to any part of the Services other than the homepage.</li>
+                <li>
+                    <p>Otherwise take any action with respect to the materials in the Services that is inconsistent with
+                        any other provision of these Terms.</p>
+                    <p>The website from which you are linking, or on which you make certain content accessible, must
+                        comply in all respects with the Content Standards set out in these Terms of Use.</p>
+                    <p>You agree to cooperate with us in causing any unauthorized framing or linking immediately to
+                        stop. We reserve the right to withdraw linking permission without notice.</p>
+                    <p>We may disable all or any social media features and any links at any time without notice in our
+                        discretion. </p>
+                </li>
+            </ul>
+            <p><strong>Links from the Services</strong></p>
+            <p> If the Services contains links to other sites and resources provided by third parties, these links are
+                provided for your convenience only. This includes links contained in advertisements, including banner
+                advertisements and sponsored links. We have no control over the contents of those sites or resources and
+                accept no responsibility for them or for any loss or damage that may arise from your use of them. If you
+                decide to access any of the third-party websites linked to this Services, you do so entirely at your own
+                risk and subject to the terms and conditions of use for such websites.</p>
+            <p><strong>Geographic Restrictions</strong></p>
+            <p> The Services is owned and operated by a Singapore company. We make no representation that the Services
+                or its content is accessible or appropriate for use in all jurisdictions. Access to the Services may be
+                unlawful for certain individuals or in specific countries. If you choose to access the Services from
+                outside Singapore, you do so at your own initiative and are solely responsible for ensuring compliance
+                with applicable local laws.</p>
+            <p><strong>Disclaimer of Warranties</strong></p>
+            <p> You understand that we cannot and do not guarantee or warrant that files available for downloading from
+                the internet or the Services will be free of viruses or other destructive code. You are responsible for
+                implementing sufficient procedures and checkpoints to satisfy your particular requirements for
+                anti-virus protection and accuracy of data input and output, and for maintaining a means external to our
+                site for any reconstruction of any lost data. TO THE FULLEST EXTENT PROVIDED BY LAW, WE WILL NOT BE
+                LIABLE FOR ANY LOSS OR DAMAGE CAUSED BY A DISTRIBUTED DENIAL-OF-SERVICE ATTACK, VIRUSES, OR OTHER
+                TECHNOLOGICALLY HARMFUL MATERIAL THAT MAY INFECT YOUR COMPUTER EQUIPMENT, COMPUTER PROGRAMS, DATA, OR
+                OTHER PROPRIETARY MATERIAL DUE TO YOUR USE OF THE WEBSITE OR ANY SERVICES OR ITEMS OBTAINED THROUGH THE
+                WEBSITE OR YOUR DOWNLOADING OF ANY MATERIAL SUBMITED ON IT, OR ON ANY WEBSITE LINKED TO IT.</p>
+            <p> YOUR USE OF THE WEBSITE, ITS CONTENT, AND ANY SERVICES OR ITEMS OBTAINED THROUGH THE WEBSITE IS AT YOUR
+                OWN RISK. THE WEBSITE, ITS CONTENT, AND ANY SERVICES OR ITEMS OBTAINED THROUGH THE WEBSITE ARE PROVIDED
+                ON AN &quot;AS IS&quot; AND &quot;AS AVAILABLE&quot; BASIS, WITHOUT ANY WARRANTIES OF ANY KIND, EITHER
+                EXPRESS OR IMPLIED. NEITHER THE COMPANY NOR ANY PERSON ASSOCIATED WITH THE COMPANY MAKES ANY WARRANTY OR
+                REPRESENTATION WITH RESPECT TO THE COMPLETENESS, SECURITY, RELIABILITY, QUALITY, ACCURACY, OR
+                AVAILABILITY OF THE WEBSITE. WITHOUT LIMITING THE FOREGOING, NEITHER THE COMPANY NOR ANYONE ASSOCIATED
+                WITH THE COMPANY REPRESENTS OR WARRANTS THAT THE WEBSITE, ITS CONTENT, OR ANY SERVICES OR ITEMS OBTAINED
+                THROUGH THE WEBSITE WILL BE ACCURATE, RELIABLE, ERROR-FREE, OR UNINTERRUPTED, THAT DEFECTS WILL BE
+                CORRECTED, THAT OUR SITE OR THE SERVER THAT MAKES IT AVAILABLE ARE FREE OF VIRUSES OR OTHER HARMFUL
+                COMPONENTS, OR THAT THE WEBSITE OR ANY SERVICES OR ITEMS OBTAINED THROUGH THE WEBSITE WILL OTHERWISE
+                MEET YOUR NEEDS OR EXPECTATIONS. </p>
+            <p> TO THE FULLEST EXTENT PROVIDED BY LAW, THE COMPANY HEREBY DISCLAIMS ALL WARRANTIES OF ANY KIND, WHETHER
+                EXPRESS OR IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+                MERCHANTABILITY, NON-INFRINGEMENT, AND FITNESS FOR PARTICULAR PURPOSE.</p>
+            <p> THE FOREGOING DOES NOT AFFECT ANY WARRANTIES THAT CANNOT BE EXCLUDED OR LIMITED UNDER APPLICABLE LAW.
+            </p>
+            <p><strong>Limitation on Liability</strong></p>
+            <p> TO THE FULLEST EXTENT PROVIDED BY LAW, IN NO EVENT WILL THE COMPANY, ITS AFFILIATES, OR THEIR LICENSORS,
+                SERVICE PROVIDERS, EMPLOYEES, AGENTS, OFFICERS, OR DIRECTORS BE LIABLE FOR DAMAGES OF ANY KIND, UNDER
+                ANY LEGAL THEORY, ARISING OUT OF OR IN CONNECTION WITH YOUR USE, OR INABILITY TO USE, THE WEBSITE, ANY
+                WEBSITES LINKED TO IT, ANY CONTENT ON THE WEBSITE OR SUCH OTHER WEBSITES, INCLUDING ANY DIRECT,
+                INDIRECT, SPECIAL, INCIDENTAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, INCLUDING BUT NOT LIMITED TO,
+                PERSONAL INJURY, PAIN AND SUFFERING, EMOTIONAL DISTRESS, LOSS OF REVENUE, LOSS OF PROFITS, LOSS OF
+                BUSINESS OR ANTICIPATED SAVINGS, LOSS OF USE, LOSS OF GOODWILL, LOSS OF DATA, AND WHETHER CAUSED BY TORT
+                (INCLUDING NEGLIGENCE), BREACH OF CONTRACT, OR OTHERWISE, EVEN IF FORESEEABLE. </p>
+            <p> THE FOREGOING DOES NOT AFFECT ANY LIABILITY THAT CANNOT BE EXCLUDED OR LIMITED UNDER APPLICABLE LAW.</p>
+            <p><strong>Indemnification</strong></p>
+            <p> You agree to defend, indemnify, and hold harmless the Company, its affiliates, licensors, and service
+                providers, and its and their respective officers, directors, employees, contractors, agents, licensors,
+                suppliers, successors, and assigns from and against any claims, liabilities, damages, judgments, awards,
+                losses, costs, expenses, or fees (including reasonable attorneys&#39; fees) arising out of or relating
+                to your violation of these Terms of Use or your use of the Services, including, but not limited to, your
+                User Contributions and User Generated Content, any use of the Services&#39; content, services, and
+                products other than as expressly authorized in these Terms of Use, or your use of any information
+                obtained from the Services.</p>
+            <p><strong>Governing Law and Jurisdiction</strong></p>
+            <p> All matters relating to the Services and these Terms of Use, and any dispute or claim arising therefrom
+                or related thereto (in each case, including non-contractual disputes or claims), shall be governed by
+                and construed in accordance with the internal laws of Singapore without giving effect to any choice or
+                conflict of law provision or rule (whether of Singapore or any other jurisdiction).</p>
+            <p> Any legal suit, action, or proceeding arising out of, or related to, these Terms of Use or the Services
+                shall be instituted exclusively in the federal courts of the United States or the courts of the
+                Singapore, although we retain the right to bring any suit, action, or proceeding against you for breach
+                of these Terms of Use in your country of residence or any other relevant country. You waive any and all
+                objections to the exercise of jurisdiction over you by such courts and to venue in such courts.</p>
+            <p><strong>Arbitration</strong></p>
+            <p> At Company&#39;s sole discretion, it may require you to submit any disputes arising from these Terms of
+                Use or use of the Services, including disputes arising from or concerning their interpretation,
+                violation, invalidity, non-performance, or termination, to final and binding arbitration administered by
+                the Singapore International Arbitration Centre (“SIAC”) in accordance with the Arbitration Rules of the
+                Singapore International Arbitration Centre (“SIAC Rules”) for the time being in force, which rules are
+                deemed to be incorporated by reference in this clause applying Singapore law.</p>
+            <p><strong>Limitation on Time to File Claims</strong></p>
+            <p> ANY CAUSE OF ACTION OR CLAIM YOU MAY HAVE ARISING OUT OF OR RELATING TO THESE TERMS OF USE OR THE
+                WEBSITE MUST BE COMMENCED WITHIN ONE (1) YEAR AFTER THE CAUSE OF ACTION ACCRUES; OTHERWISE, SUCH CAUSE
+                OF ACTION OR CLAIM IS PERMANENTLY BARRED.</p>
+            <p><strong>Waiver and Severability</strong></p>
+            <p> No waiver by the Company of any term or condition set out in these Terms of Use shall be deemed a
+                further or continuing waiver of such term or condition or a waiver of any other term or condition, and
+                any failure of the Company to assert a right or provision under these Terms of Use shall not constitute
+                a waiver of such right or provision.</p>
+            <p> If any provision of these Terms of Use is held by a court or other tribunal of competent jurisdiction to
+                be invalid, illegal, or unenforceable for any reason, such provision shall be eliminated or limited to
+                the minimum extent such that the remaining provisions of the Terms of Use will continue in full force
+                and effect. </p>
+            <p><strong>Entire Agreement</strong></p>
+            <p> The Terms of Use constitute the sole and entire agreement between you and Nanonoble Pte. Ltd. regarding
+                the Services and supersede all prior and contemporaneous understandings, agreements, representations,
+                and warranties, both written and oral, regarding the Services. </p>
+            <p><strong>Your Comments and Concerns</strong></p>
+            <p> This website is operated by Nanonoble Pte. Ltd.</p>
+            <p> All feedback, comments, requests for technical support, and other communications relating to the
+                Services should be directed to: <a href="mailto:MiniMaxCode@minimax.io">MiniMaxCode@minimax.io</a>.</p>
+            <p> Version History</p>
+            <p> <span style="display: inline-block; width: 210px;">November 28, 2024 update: </span> Additional services
+                are now covered by these Terms.</p>
+            <p> <span style="display: inline-block; width: 210px;">November 14, 2024 update:</span> Updated website URL;
+                forms of data generated; clarification on intellectual property rights of the Services.</p>
+            <p> <span style="display: inline-block; width: 210px;">September 16, 2024 update:</span> Clarified
+                intellectual property rights related to User-Generated Content.</p>
+
+        </div>
+</body>
+
+</html>

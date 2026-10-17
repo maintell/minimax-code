@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "allowJs": false,
+    "strict": true,
+    "noImplicitAny": false,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "rootDir": "main",
+    "outDir": "dist/main",
+    "sourceMap": false,
+    "declaration": false,
+    "removeComments": false,
+    "importHelpers": false,
+    "useDefineForClassFields": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["main/**/*.ts"]
+}

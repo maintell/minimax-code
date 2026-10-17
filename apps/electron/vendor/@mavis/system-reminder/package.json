@@ -1,0 +1,15 @@
+{
+  "name": "@mavis/system-reminder",
+  "version": "0.2.1",
+  "description": "Framework-agnostic system-reminder assembly for Mavis agents; never imports runtime packages.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@mavis/shared": "file:../shared"
+  }
+}

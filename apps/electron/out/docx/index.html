@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html style="height: 100%;">
+
+<head>
+  <!-- 引入样式 -->
+  <link rel="stylesheet" href="https://unpkg.com/docx-preview@latest/dist/docx-preview.min.css">
+  <!-- 引入JSZip库，docx-preview依赖此库 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+
+<style>
+  .docx-container {
+    height: 100% !important;
+    width: 100% !important;
+  }
+
+  .docx-wrapper {
+    height: 100% !important;
+    width: 100% !important;
+    padding: 0px !important;
+    background-color: transparent !important;
+  }
+
+  .docx-wrapper section {
+    height: 100% !important;
+    width: 100% !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
+
+  .docx-wrapper div {
+    max-height: 100% !important;
+    max-width: 100% !important;
+  }
+
+  .docx-wrapper img {
+    max-height: 100% !important;
+    max-width: 100% !important;
+  }
+</style>
+
+<body style="max-height: 100%;">
+  <div id="docx-container" style="width: 100%; height: 100%;"></div>
+
+  <!-- 引入库 -->
+  <script src="https://unpkg.com/docx-preview@latest/dist/docx-preview.min.js"></script>
+
+  <script>
+    const container = document.getElementById('docx-container');
+
+    // 从URL参数获取文件URL
+    const urlParams = new URLSearchParams(window.location.search);
+    const fileUrl = urlParams.get('url');
+
+    if (fileUrl) {
+      // 添加加载指示器
+      container.innerHTML = "<div style='text-align: center; padding-top: 50px;'>Loading...</div>";
+
+      // 从URL获取文件并渲染
+      fetch(fileUrl)
+        .then(response => {
+          if (!response.ok) {
+            throw new Error(`HTTP error! Status: ${response.status}`);
+          }
+          return response.blob();
+        })
+        .then(blob => {
+          // 确保docx和JSZip都已加载
+          if (typeof docx === 'undefined') {
+            throw new Error('docx-preview library not loaded');
+          }
+          if (typeof JSZip === 'undefined') {
+            throw new Error('JSZip library not loaded');
+          }
+
+          return docx.renderAsync(blob, container, null, {
+            inWrapper: true,
+            ignoreWidth: true,
+            ignoreHeight: true
+          });
+        })
+        .then(() => console.log("DOCX 渲染完成"))
+        .catch(err => {
+          console.error("Rendering failed:", err);
+          container.innerHTML = `<div style='color: red; text-align: center; padding-top: 50px;'>
+            Document loading failed: ${err.message || 'Unknown error'}
+          </div>`;
+        });
+    } else {
+      container.innerHTML = "<p>未提供文件URL</p>";
+    }
+  </script>
+</body>
+
+</html>

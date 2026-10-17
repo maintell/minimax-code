@@ -1,0 +1,6 @@
+github.com/bytedance/gopkg v0.1.4 h1:oZnQwnX82KAIWb7033bEwtxvTqXcYMxDBaQxo5JJHWM=
+github.com/bytedance/gopkg v0.1.4/go.mod h1:v1zWfPm21Fb+OsyXN2VAHdL6TBb2L88anLQgdyje6R4=
+github.com/cloudwego/gopkg v0.2.0 h1:EU8Ahrj0rCfKZQdah50zKnlrQ1o2AdPYM87UclIqLME=
+github.com/cloudwego/gopkg v0.2.0/go.mod h1:WjQPYI8PesfQalIVcLzVJBb1EAopioZ+D+3UGJ+dNBs=
+github.com/cloudwego/thriftgo v0.4.5 h1:Htm0lcftvSPEmnPzE+nWccVhOB13A/GAWfA4kQXTzVw=
+github.com/cloudwego/thriftgo v0.4.5/go.mod h1:Oqr3KTSBNhfnAIsU/wzDFEp5Kltfvxld8tmYwa+avhY=

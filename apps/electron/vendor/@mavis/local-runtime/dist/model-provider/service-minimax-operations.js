@@ -1,0 +1,142 @@
+import { probeProviderCredential } from '@mavis/config';
+import { maskSecret } from '../api/host-helpers.js';
+import { MINIMAX_API_PROVIDER_ID } from '../config/model-key.js';
+import { cacheStatusView, minimaxApiModels } from './list-models.js';
+import { modelCacheStatusFor } from './model-cache.js';
+import { buildMinimaxProviderView } from './provider-views.js';
+import { LocalModelProviderError } from './service-contract.js';
+import { asLocalModelProviderError, contextChangedError, enqueueProviderMutation, minimaxContextBaselineFingerprint, requireCacheStatusView, } from './service-helpers.js';
+import { assertValidRawApiKey } from './service-input.js';
+export function getMinimaxApiKeyStatus(context) {
+    const apiKey = probeProviderCredential({
+        field: 'minimax_api.apiKey',
+        provider: 'minimax_api',
+        value: context.deps.configGetter().minimax_api?.apiKey,
+    }).secret;
+    if (!apiKey)
+        return { hasApiKey: false };
+    const cache = context.deps.cache.load();
+    const target = context.resolveTestTarget(MINIMAX_API_PROVIDER_ID, undefined);
+    return {
+        hasApiKey: true,
+        maskedApiKey: maskSecret(apiKey),
+        cachedStatus: cacheStatusView(modelCacheStatusFor(cache, MINIMAX_API_PROVIDER_ID, target.target.modelId, target.fingerprint)),
+    };
+}
+export function getMinimaxModelSource(context) {
+    return context.deps.configGetter().minimaxModelSource ?? 'token_plan';
+}
+export async function setMinimaxModelSource(context, source) {
+    if (source !== 'token_plan' && source !== 'minimax_api_key') {
+        throw new LocalModelProviderError(400, 'Invalid MiniMax model source', 'VALIDATION_ERROR');
+    }
+    let blocked;
+    await context.deps.updateByokConfig((draft, currentConfig) => {
+        if (source === 'minimax_api_key') {
+            try {
+                context.resolveMinimaxTestTarget(currentConfig, undefined);
+            }
+            catch (error) {
+                blocked = asLocalModelProviderError(error);
+                return;
+            }
+        }
+        draft.minimaxModelSource = source;
+    });
+    if (blocked)
+        throw blocked;
+    return source;
+}
+export async function updateMinimaxModelContext(context, input) {
+    return enqueueProviderMutation(context.minimaxMutationKey(), () => updateMinimaxModelContextTransaction(context, input));
+}
+async function updateMinimaxModelContextTransaction(context, input) {
+    const modelId = input.modelId?.trim();
+    if (!modelId || !Number.isSafeInteger(input.contextLimit) || input.contextLimit <= 0) {
+        throw new LocalModelProviderError(400, 'Invalid MiniMax model context selection', 'INVALID_CONTEXT_LIMIT');
+    }
+    if (!Number.isSafeInteger(input.expectedContextLimit) || input.expectedContextLimit <= 0) {
+        throw new LocalModelProviderError(400, 'expected_context_limit must be a positive integer', 'VALIDATION_ERROR');
+    }
+    const baselineConfig = context.deps.configGetter();
+    const source = baselineConfig.minimaxModelSource ?? 'token_plan';
+    const currentModel = source === 'token_plan'
+        ? baselineConfig.provider?.minimax?.models?.[modelId]
+        : minimaxApiModels(baselineConfig)[modelId];
+    if (!currentModel) {
+        throw new LocalModelProviderError(404, 'Model not found', 'MODEL_NOT_FOUND');
+    }
+    if (!currentModel.contextWindowOptions?.includes(input.contextLimit)) {
+        throw new LocalModelProviderError(400, 'Invalid MiniMax model context selection', 'INVALID_CONTEXT_LIMIT');
+    }
+    const compareAndSet = context.deps.compareAndSetModelContext;
+    if (!compareAndSet) {
+        throw new LocalModelProviderError(503, 'Model context selection is unavailable', 'MODEL_CONTEXT_UNAVAILABLE');
+    }
+    if ((currentModel.limit?.context ?? 0) !== input.expectedContextLimit) {
+        throw new LocalModelProviderError(409, 'Model context changed before the update started', 'CONFIG_CHANGED');
+    }
+    const baselineFingerprint = minimaxContextBaselineFingerprint(baselineConfig, modelId);
+    if (source === 'token_plan') {
+        const updated = await compareAndSet({
+            providerId: 'minimax',
+            modelId,
+            expectedContextLimit: input.expectedContextLimit,
+            contextLimit: input.contextLimit,
+        }, async (latestConfig) => minimaxContextBaselineFingerprint(latestConfig, modelId) === baselineFingerprint);
+        if (!updated)
+            throw contextChangedError();
+        return { ok: true };
+    }
+    const candidateModel = {
+        ...currentModel,
+        limit: { ...currentModel.limit, context: input.contextLimit },
+    };
+    const target = context.resolveTestTarget(MINIMAX_API_PROVIDER_ID, modelId, undefined, undefined, candidateModel);
+    const result = await context.deps.tester.test(`${target.cacheKey}@${target.fingerprint}`, target.target);
+    const entry = context.toCacheEntry(result, target.fingerprint);
+    const status = requireCacheStatusView(entry);
+    if (!result.ok)
+        return { ok: false, status };
+    let previousCacheEntry;
+    let candidateCacheWritten = false;
+    try {
+        const updated = await compareAndSet({
+            providerId: MINIMAX_API_PROVIDER_ID,
+            modelId,
+            expectedContextLimit: input.expectedContextLimit,
+            contextLimit: input.contextLimit,
+        }, async (latestConfig) => {
+            const latestFingerprint = minimaxContextBaselineFingerprint(latestConfig, modelId);
+            if (latestFingerprint !== baselineFingerprint)
+                return false;
+            previousCacheEntry = await context.deps.cache.replaceModelStatus(target.cacheKey, entry);
+            candidateCacheWritten = true;
+            return true;
+        });
+        if (!updated)
+            throw contextChangedError();
+    }
+    catch (error) {
+        if (candidateCacheWritten) {
+            try {
+                await context.deps.cache.restoreModelStatusIfCurrent(target.cacheKey, entry, previousCacheEntry);
+            }
+            catch {
+                throw new LocalModelProviderError(500, 'Failed to restore model test status after the config write failed', 'CACHE_ROLLBACK_FAILED');
+            }
+        }
+        throw error;
+    }
+    return { ok: true, status };
+}
+export async function upsertMinimaxApiKey(context, input) {
+    const apiKey = assertValidRawApiKey(input.apiKey);
+    await context.deps.updateByokConfig((draft) => {
+        draft.minimax_api = { ...(draft.minimax_api ?? {}), apiKey };
+        if (input.saveAndUse)
+            draft.minimaxModelSource = 'minimax_api_key';
+    });
+    return buildMinimaxProviderView(context.deps.configGetter(), context.deps.cache.load());
+}
+//# sourceMappingURL=service-minimax-operations.js.map

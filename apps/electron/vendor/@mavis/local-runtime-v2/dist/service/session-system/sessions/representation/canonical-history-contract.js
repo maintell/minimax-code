@@ -1,0 +1,2 @@
+export { canonicalActiveHistoryRevision, canonicalHistoryRevision, inspectCanonicalHistorySequence, JsonlAppendCommitUncertainError, selectCanonicalHistorySource, } from '../../../../infra/file/canonical-history.js';
+//# sourceMappingURL=canonical-history-contract.js.map

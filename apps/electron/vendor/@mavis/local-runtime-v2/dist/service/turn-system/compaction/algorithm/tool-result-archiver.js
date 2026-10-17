@@ -1,0 +1,493 @@
+import { createHash } from 'node:crypto';
+import { parseToolRounds } from './history-reduction.js';
+// Defensive defaults for standalone algorithm callers. Production always injects
+// the config.yaml/Apollo-resolved settings from production-composition.
+const TOOL_RESULT_ARCHIVE_ENABLED = true;
+const TOOL_RESULT_ARCHIVE_WATERMARK_BYTES = 256 * 1_024;
+const TOOL_RESULT_ARCHIVE_MIN_SAVINGS_BYTES = 256 * 1_024;
+const TOOL_RESULT_ARCHIVE_MIN_CANDIDATE_BYTES = 2 * 1_024;
+const TOOL_RESULT_ARCHIVE_KEEP_RECENT_ROUNDS = 5;
+const TOOL_RESULT_ARCHIVE_RECEIPT_ESTIMATE_BYTES = 512;
+const TOOL_RESULT_ARCHIVE_RECEIPT_TOOL_NAME_MAX_BYTES = 64;
+const TOOL_RESULT_ARCHIVE_RECEIPT_SOURCE_MAX_BYTES = 256;
+const CHUNKED_JSONL_READ_FORMAT = 'chunked_jsonl_v1';
+const TOOL_RESULT_TRIM_RECEIPT = '[Earlier tool output removed by context compaction; original content unavailable.]';
+const DEFAULT_REFERENCE_MEMO_ENTRIES = 512;
+const CONTROL_TOOL_NAMES = new Set([
+    'skill',
+    'ask_user',
+    'request_feature_enable',
+    'todowrite',
+    'create_goal',
+    'update_goal',
+    'get_goal',
+    'enterplanmode',
+    'exitplanmode',
+]);
+/**
+ * Plans the shared ToolResult candidate set for durable context compaction.
+ * Materialization either writes recoverable archive receipts or, when the
+ * model has no read tool, applies destructive receipts without artifact I/O.
+ * Planning itself is side-effect free.
+ */
+export class ToolResultArchiver {
+    options;
+    references = new Map();
+    referenceMemoEntries;
+    constructor(options) {
+        this.options = options;
+        this.referenceMemoEntries = positiveInteger(options.referenceMemoEntries ?? DEFAULT_REFERENCE_MEMO_ENTRIES, 'referenceMemoEntries');
+    }
+    plan(input) {
+        try {
+            const config = resolveToolResultCompactionConfig(readToolResultCompactionConfig(this.options.getConfig));
+            if (!config.enabled)
+                return undefined;
+            const totalTextBytes = countToolResultTextBytes(input.messages);
+            if (totalTextBytes <= config.watermarkBytes)
+                return undefined;
+            const candidates = selectCandidates(input.messages, config.minCandidateBytes, config.keepRecentRounds);
+            const estimatedSavingsBytes = estimateSavings(candidates);
+            if (estimatedSavingsBytes <= config.minSavingsBytes) {
+                this.logSummary(input, {
+                    outcome: 'below_minimum_savings',
+                    totalTextBytes,
+                    effectiveTextBytes: totalTextBytes,
+                    candidateCount: candidates.length,
+                    estimatedSavings: estimatedSavingsBytes,
+                    actualSavings: 0,
+                    artifactCount: 0,
+                });
+                return undefined;
+            }
+            return {
+                messages: input.messages,
+                candidates,
+                totalTextBytes,
+                estimatedSavingsBytes,
+                minSavingsBytes: config.minSavingsBytes,
+            };
+        }
+        catch (error) {
+            logBestEffort(this.options.logger, 'error', {
+                event: 'tool_result_compaction_plan_failed',
+                session_id: input.sessionId,
+                reason: safeErrorReason(error),
+            });
+            return undefined;
+        }
+    }
+    async materialize(input) {
+        const replacements = await this.buildReplacements(input, input.plan.candidates);
+        const materialized = this.finishMaterialization(input, replacements);
+        if (!materialized)
+            return undefined;
+        return {
+            messages: materialized.messages,
+            archivedResultCount: replacements.length,
+            actualSavingsBytes: materialized.actualSavingsBytes,
+        };
+    }
+    /**
+     * Applies the same planned candidate set destructively when no read tool is
+     * available. This path performs no artifact I/O and never advertises a
+     * recovery path that the model cannot use.
+     */
+    async materializeTrim(input) {
+        const replacements = input.plan.candidates.map(buildTrimReplacement);
+        const materialized = this.finishMaterialization(input, replacements);
+        if (!materialized)
+            return undefined;
+        return {
+            messages: materialized.messages,
+            trimmedResultCount: replacements.length,
+            actualSavingsBytes: materialized.actualSavingsBytes,
+        };
+    }
+    finishMaterialization(input, replacements) {
+        const actualSavingsBytes = calculateActualSavings(input.plan.candidates, replacements);
+        const artifactCount = replacements.filter(({ artifactCreated }) => artifactCreated).length;
+        if (actualSavingsBytes <= input.plan.minSavingsBytes) {
+            this.logSummary(input, {
+                outcome: 'below_minimum_actual_savings',
+                totalTextBytes: input.plan.totalTextBytes,
+                effectiveTextBytes: input.plan.totalTextBytes,
+                candidateCount: input.plan.candidates.length,
+                estimatedSavings: input.plan.estimatedSavingsBytes,
+                actualSavings: actualSavingsBytes,
+                artifactCount,
+            });
+            return undefined;
+        }
+        const messages = applyReplacements(input.plan.messages, replacements);
+        this.logSummary(input, {
+            outcome: 'candidate_ready',
+            totalTextBytes: input.plan.totalTextBytes,
+            effectiveTextBytes: input.plan.totalTextBytes - actualSavingsBytes,
+            candidateCount: input.plan.candidates.length,
+            estimatedSavings: input.plan.estimatedSavingsBytes,
+            actualSavings: actualSavingsBytes,
+            artifactCount,
+        });
+        return { messages, actualSavingsBytes };
+    }
+    async buildReplacements(input, candidates) {
+        const replacements = [];
+        for (const candidate of candidates) {
+            const replacement = await this.buildReplacement(input, candidate);
+            if (replacement)
+                replacements.push(replacement);
+        }
+        return replacements;
+    }
+    async buildReplacement(input, candidate) {
+        const artifact = await this.resolveArtifactReference(input, candidate);
+        if (!artifact)
+            return undefined;
+        const receipt = buildReceipt(artifact.reference, candidate.call, artifact.readFormat);
+        const receiptBytes = Buffer.byteLength(receipt);
+        if (receiptBytes >= candidate.visibleTextBytes) {
+            return undefined;
+        }
+        const media = candidate.message.content.filter((block) => block.type !== 'text');
+        return {
+            key: candidate.key,
+            index: candidate.index,
+            message: {
+                ...candidate.message,
+                content: [{ type: 'text', text: receipt }, ...media],
+            },
+            receiptBytes,
+            artifactCreated: artifact.created,
+        };
+    }
+    async resolveArtifactReference(input, candidate) {
+        if (candidate.existingReference) {
+            return {
+                reference: candidate.existingReference,
+                ...(candidate.existingReadFormat ? { readFormat: candidate.existingReadFormat } : {}),
+                created: false,
+            };
+        }
+        const text = readToolResultText(candidate.message);
+        const memoKey = artifactMemoKey(input.sessionId, candidate.call, text);
+        const memoized = this.readMemo(memoKey);
+        if (memoized) {
+            const readFormat = nonEmptyString(memoized.metadata?.read_format);
+            return {
+                reference: memoized.reference,
+                ...(readFormat ? { readFormat } : {}),
+                created: false,
+            };
+        }
+        try {
+            const artifact = await this.options.writeArtifact({
+                sessionId: input.sessionId,
+                toolCallId: candidate.call.id,
+                toolName: candidate.call.name,
+                args: candidate.call.arguments,
+                text,
+                originalBytes: candidate.snapshotBytes,
+                sensitive: false,
+            });
+            const reference = nonEmptyString(artifact.reference);
+            if (!reference)
+                return undefined;
+            this.writeMemo(memoKey, artifact);
+            const readFormat = nonEmptyString(artifact.metadata?.read_format);
+            return {
+                reference,
+                ...(readFormat ? { readFormat } : {}),
+                created: true,
+            };
+        }
+        catch (error) {
+            logBestEffort(this.options.logger, 'error', {
+                event: 'tool_result_compaction_artifact_failed',
+                session_id: input.sessionId,
+                tool_name: candidate.call.name,
+                reason: safeErrorReason(error),
+            });
+            return undefined;
+        }
+    }
+    readMemo(key) {
+        const artifact = this.references.get(key);
+        if (!artifact)
+            return undefined;
+        this.references.delete(key);
+        this.references.set(key, artifact);
+        return artifact;
+    }
+    writeMemo(key, artifact) {
+        this.references.set(key, artifact);
+        while (this.references.size > this.referenceMemoEntries) {
+            const oldest = this.references.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            this.references.delete(oldest);
+        }
+    }
+    logSummary(input, summary) {
+        logBestEffort(this.options.logger, 'info', {
+            event: 'tool_result_compaction_candidate',
+            session_id: input.sessionId,
+            outcome: summary.outcome,
+            tool_result_text_bytes_before: summary.totalTextBytes,
+            tool_result_text_bytes_effective: summary.effectiveTextBytes,
+            candidate_count: summary.candidateCount,
+            estimated_savings_bytes: summary.estimatedSavings,
+            actual_savings_bytes: summary.actualSavings,
+            artifact_write_count: summary.artifactCount,
+        });
+    }
+}
+function buildTrimReplacement(candidate) {
+    const media = candidate.message.content.filter((block) => block.type !== 'text');
+    return {
+        key: candidate.key,
+        index: candidate.index,
+        message: {
+            ...candidate.message,
+            content: [{ type: 'text', text: TOOL_RESULT_TRIM_RECEIPT }, ...media],
+        },
+        receiptBytes: Buffer.byteLength(TOOL_RESULT_TRIM_RECEIPT),
+        artifactCreated: false,
+    };
+}
+function applyReplacements(messages, replacements) {
+    if (replacements.length === 0)
+        return messages;
+    const replacementsByIndex = new Map(replacements.map((replacement) => [replacement.index, replacement.message]));
+    return messages.map((message, index) => replacementsByIndex.get(index) ?? message);
+}
+function estimateSavings(candidates) {
+    return candidates.reduce((total, candidate) => total + Math.max(0, candidate.visibleTextBytes - TOOL_RESULT_ARCHIVE_RECEIPT_ESTIMATE_BYTES), 0);
+}
+function calculateActualSavings(candidates, replacements) {
+    const candidatesByKey = new Map(candidates.map((candidate) => [candidate.key, candidate]));
+    return replacements.reduce((total, replacement) => {
+        const candidate = candidatesByKey.get(replacement.key);
+        return total + (candidate ? candidate.visibleTextBytes - replacement.receiptBytes : 0);
+    }, 0);
+}
+function selectCandidates(messages, minCandidateBytes, keepRecentRounds) {
+    const rounds = parseToolRounds(messages, { allowIncompleteTail: true });
+    const settledRounds = rounds.filter((round) => round.settled);
+    const protectedRounds = new Set([
+        ...rounds.filter((round) => !round.settled),
+        ...settledRounds.slice(-keepRecentRounds),
+    ]);
+    return rounds.flatMap((round) => {
+        if (protectedRounds.has(round))
+            return [];
+        return round.resultIndexes.flatMap((index) => {
+            const candidate = buildArchiveCandidate(messages, round, index, minCandidateBytes);
+            return candidate ? [candidate] : [];
+        });
+    });
+}
+function buildArchiveCandidate(messages, round, index, minCandidateBytes) {
+    const eligible = readEligibleToolResult(messages, round, index);
+    if (!eligible)
+        return undefined;
+    const { message, call } = eligible;
+    const visibleTextBytes = measureToolResultTextBytes(message);
+    if (visibleTextBytes < minCandidateBytes)
+        return undefined;
+    const budget = readToolOutputBudget(message.details);
+    return {
+        key: archiveCandidateKey(call),
+        index,
+        message,
+        call,
+        visibleTextBytes,
+        snapshotBytes: budget.reference ? (budget.originalBytes ?? visibleTextBytes) : visibleTextBytes,
+        ...(budget.reference ? { existingReference: budget.reference } : {}),
+        ...(budget.readFormat ? { existingReadFormat: budget.readFormat } : {}),
+    };
+}
+function archiveCandidateKey(call) {
+    return `${call.id}\0${canonicalToolName(call.name)}`;
+}
+function readEligibleToolResult(messages, round, index) {
+    const message = messages[index];
+    if (!message || message.role !== 'toolResult' || message.isError)
+        return undefined;
+    const callId = nonEmptyString(message.toolCallId);
+    const call = callId ? round.toolCallsById.get(callId) : undefined;
+    if (!call || CONTROL_TOOL_NAMES.has(canonicalToolName(call.name)))
+        return undefined;
+    return { message, call };
+}
+function countToolResultTextBytes(messages) {
+    return messages.reduce((total, message) => message.role === 'toolResult' ? total + measureToolResultTextBytes(message) : total, 0);
+}
+function readToolResultText(message) {
+    const blocks = textBlocks(message);
+    if (blocks.length === 1)
+        return blocks[0]?.text ?? '';
+    return blocks.map((block) => block.text).join('\n');
+}
+function measureToolResultTextBytes(message) {
+    const blocks = textBlocks(message);
+    return (blocks.reduce((bytes, block) => bytes + Buffer.byteLength(block.text), 0) +
+        Math.max(0, blocks.length - 1));
+}
+function textBlocks(message) {
+    return message.content.filter((block) => block.type === 'text');
+}
+function readToolOutputBudget(details) {
+    if (!isRecord(details))
+        return {};
+    const budget = details.tool_output_budget;
+    if (!isRecord(budget))
+        return {};
+    const reference = nonEmptyString(budget.reference);
+    const originalBytes = positiveFiniteInteger(budget.original_bytes);
+    const readFormat = nonEmptyString(budget.read_format);
+    return {
+        ...(reference ? { reference } : {}),
+        ...(originalBytes ? { originalBytes } : {}),
+        ...(readFormat ? { readFormat } : {}),
+    };
+}
+function buildReceipt(reference, call, readFormat) {
+    const toolName = truncateUtf8(canonicalToolName(call.name), TOOL_RESULT_ARCHIVE_RECEIPT_TOOL_NAME_MAX_BYTES) ||
+        'tool';
+    const source = readReceiptSource(call);
+    const sourceLine = source
+        ? `Source: ${truncateUtf8(source, TOOL_RESULT_ARCHIVE_RECEIPT_SOURCE_MAX_BYTES)}\n`
+        : '';
+    const format = readFormat === CHUNKED_JSONL_READ_FORMAT ? `\nFormat: ${CHUNKED_JSONL_READ_FORMAT}` : '';
+    return `[Earlier tool output externalized
+Tool: ${toolName}
+${sourceLine}Artifact: ${reference}${format}
+Archived reference only; not evidence.]`;
+}
+function readReceiptSource(call) {
+    const args = call.arguments;
+    if (!isRecord(args))
+        return undefined;
+    if (canonicalToolName(call.name) === 'grep') {
+        const pattern = readReceiptSourceField(args, 'pattern');
+        const path = readReceiptSourceField(args, 'path') ?? readReceiptSourceField(args, 'file_path');
+        const grepSource = [pattern, path]
+            .filter((field) => Boolean(field))
+            .join('; ');
+        if (grepSource)
+            return grepSource;
+    }
+    for (const key of ['query', 'url', 'pattern', 'path', 'file_path']) {
+        const source = readReceiptSourceField(args, key);
+        if (source)
+            return source;
+    }
+    return undefined;
+}
+function readReceiptSourceField(args, key) {
+    const value = args[key];
+    if (typeof value !== 'string')
+        return undefined;
+    const normalized = normalizeReceiptSourceValue(key, value.slice(0, 1_024));
+    return normalized ? `${key}=${JSON.stringify(normalized)}` : undefined;
+}
+function normalizeReceiptSourceValue(key, value) {
+    const normalized = value.replaceAll(/\s+/gu, ' ').trim();
+    if (key !== 'url')
+        return normalized;
+    try {
+        const url = new URL(normalized);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:')
+            return normalized;
+        const hostname = url.hostname.replace(/^www\./u, '');
+        const pathSegments = url.pathname.split('/').filter(Boolean);
+        const lastSegment = pathSegments.at(-1);
+        const genericLeaf = lastSegment ? /^index\.(?:aspx?|html?|php)$/iu.test(lastSegment) : false;
+        const semanticPath = pathSegments.slice(genericLeaf ? -2 : -1).join('/');
+        return semanticPath ? `${hostname}/…/${semanticPath}` : hostname;
+    }
+    catch {
+        return normalized;
+    }
+}
+function truncateUtf8(value, maxBytes) {
+    if (maxBytes <= 0)
+        return '';
+    if (Buffer.byteLength(value) <= maxBytes)
+        return value;
+    const ellipsis = '…';
+    const ellipsisBytes = Buffer.byteLength(ellipsis);
+    if (maxBytes <= ellipsisBytes)
+        return '';
+    let result = '';
+    let usedBytes = 0;
+    for (const character of value) {
+        const characterBytes = Buffer.byteLength(character);
+        if (usedBytes + characterBytes + ellipsisBytes > maxBytes)
+            break;
+        result += character;
+        usedBytes += characterBytes;
+    }
+    return result ? result + ellipsis : '';
+}
+function artifactMemoKey(sessionId, call, text) {
+    return createHash('sha256')
+        .update(sessionId)
+        .update('\0')
+        .update(call.id)
+        .update('\0')
+        .update(call.name)
+        .update('\0')
+        .update(text)
+        .digest('hex');
+}
+function canonicalToolName(name) {
+    return name.trim().toLowerCase();
+}
+function nonEmptyString(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+function positiveFiniteInteger(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+function resolveToolResultCompactionConfig(config) {
+    return {
+        enabled: typeof config?.enabled === 'boolean' ? config.enabled : TOOL_RESULT_ARCHIVE_ENABLED,
+        watermarkBytes: positiveFiniteInteger(config?.watermarkBytes) ?? TOOL_RESULT_ARCHIVE_WATERMARK_BYTES,
+        minSavingsBytes: positiveFiniteInteger(config?.minSavingsBytes) ?? TOOL_RESULT_ARCHIVE_MIN_SAVINGS_BYTES,
+        minCandidateBytes: positiveFiniteInteger(config?.minCandidateBytes) ?? TOOL_RESULT_ARCHIVE_MIN_CANDIDATE_BYTES,
+        keepRecentRounds: positiveFiniteInteger(config?.keepRecentRounds) ?? TOOL_RESULT_ARCHIVE_KEEP_RECENT_ROUNDS,
+    };
+}
+function readToolResultCompactionConfig(getConfig) {
+    try {
+        return getConfig?.();
+    }
+    catch {
+        return undefined;
+    }
+}
+function positiveInteger(value, field) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(`ToolResultArchiver: ${field} must be a positive integer`);
+    }
+    return value;
+}
+function isRecord(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function logBestEffort(logger, level, fields) {
+    try {
+        logger?.[level]?.(fields, '[local-runtime-v2] ToolResult compaction');
+    }
+    catch {
+        // Diagnostics must never change context compaction.
+    }
+}
+function safeErrorReason(error) {
+    if (isRecord(error) && nonEmptyString(error.code))
+        return nonEmptyString(error.code) ?? 'error';
+    return error instanceof Error && error.name ? error.name : 'unknown_error';
+}
+//# sourceMappingURL=tool-result-archiver.js.map

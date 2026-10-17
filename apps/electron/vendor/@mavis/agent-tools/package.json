@@ -1,0 +1,60 @@
+{
+  "name": "@mavis/agent-tools",
+  "version": "0.2.1",
+  "description": "Platform-owned runtime tool definitions and helpers for Mavis hosts.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "mavis-matrix-mcp-stdio": "./dist/desktop/matrix-mcp-stdio.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./cloud": {
+      "import": "./dist/cloud/index.js"
+    },
+    "./desktop": {
+      "import": "./dist/desktop/index.js"
+    },
+    "./desktop/subagent-roles": {
+      "import": "./dist/desktop/subagent-roles.js"
+    },
+    "./desktop/managed-routing": {
+      "import": "./dist/desktop/managed-routing.js"
+    },
+    "./read-contract": {
+      "import": "./dist/shared/read-contract.js"
+    },
+    "./desktop/matrix-mcp-stdio": {
+      "import": "./dist/desktop/matrix-mcp-stdio.js"
+    },
+    "./plugin-hooks": {
+      "import": "./dist/plugin-hooks/index.js"
+    }
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
+    "@mavis/agent-core": "file:../agent-core",
+    "@mavis/plugin-hooks": "file:../plugin-hooks",
+    "@mavis/background-task": "file:../background-task",
+    "@mavis/context-manager": "file:../context-manager",
+    "@mavis/protocol": "file:../protocol",
+    "@mavis/shared": "file:../shared",
+    "@mavis/system-reminder": "file:../system-reminder",
+    "@mavis/team": "file:../team",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@sinclair/typebox": "^0.34.0",
+    "@vscode/ripgrep": "file:../../@vscode/ripgrep",
+    "diff": "8.0.4",
+    "jszip": "file:../../jszip",
+    "js-yaml": "^4",
+    "minimatch": "10.2.6",
+    "shell-quote": "^1.8.1",
+    "tar": "^7.5.22",
+    "undici": "^6.28.0",
+    "unpdf": "^1.6.2",
+    "zod": "^3"
+  }
+}

@@ -1,0 +1,1144 @@
+import { join } from 'node:path';
+import { applyLocalRunLocation, LocalRunLocationError, readLocalRunLocationInput, } from '../../runtime/run-location.js';
+import { isAgentNotFoundError } from '../../agent/runtime-port.js';
+import { logger } from '../../common/logger.js';
+import { LegacyOpencodeMigrationError, } from '../../legacy-opencode/legacy-opencode-migrator.js';
+import { readLocalSessionListOptions } from '../../sessions/list-options.js';
+import { buildArchivedRootSessionTitle } from '../../sessions/archived-session-title.js';
+import { canUseRunLocationForAppMode, resolveLocalAppMode, } from '../../runtime/app-mode.js';
+import { timeRouteDuration } from '../../common/metrics.js';
+import { buildGeneratedAgentName, isValidLocalAgentName, json, notFound, readFirstString, readJsonBody, readRequestedFramework, readString, readVisibility, } from '../host-helpers.js';
+import { buildFailedLegacyMigrationStub, migrateLegacySessionsForList, presentLegacyStubAsPiAgent, presentLegacyStubsAsPiAgent, } from '../host-support.js';
+import { readPersistedLocalModelThinkingSelection, } from '../../model-provider/model-selection.js';
+import { isAgentInternalDefaultWorkspaceDir, normalizeAbsolutePath, } from '../../project/canonical-workspace.js';
+const DEFAULT_LOCAL_AGENT_AVATAR_URL = 'https://filecdn.minimax.chat/public/d92edcbe-2404-417b-a133-b770b0b9bf61.svg';
+const LEGACY_PRIMARY_AGENT_NAME = 'main';
+export class LocalApiAgentRoutes {
+    ctx;
+    rootSessionId;
+    constructor(ctx) {
+        this.ctx = ctx;
+    }
+    clearRootSessionIf(sessionId) {
+        if (this.rootSessionId === sessionId)
+            this.rootSessionId = undefined;
+    }
+    get controller() {
+        return this.ctx.controller;
+    }
+    get conversation() {
+        if (!this.ctx.conversation) {
+            throw new Error('Runtime Conversation is unavailable for Agent Session operations');
+        }
+        return this.ctx.conversation;
+    }
+    // Reads and owned-session updates stay tolerant of a missing Runtime
+    // Conversation: `replaceRootSession` still keeps a `!ctx.conversation`
+    // branch for hosts booted without Local Runtime V2, and that branch is the
+    // only caller of `updateOwnedSession`. Session *creation* stays V2-only —
+    // its former V1 fallback depended on `initMessageState`, which the Agent
+    // cutover removed along with V1 message-state ownership.
+    querySession(sessionId) {
+        return this.ctx.conversation
+            ? this.ctx.conversation.query.getSession(sessionId)
+            : this.controller.getSession(sessionId);
+    }
+    querySessions(options) {
+        return this.ctx.conversation
+            ? this.ctx.conversation.query.listSessions(options)
+            : this.controller.listSessions(options);
+    }
+    updateOwnedSession(sessionId, fields) {
+        if (!this.ctx.conversation)
+            return this.controller.updateSession(sessionId, fields);
+        return this.conversation.lifecycle.updateSession(sessionId, {
+            ...(fields.title !== undefined ? { title: fields.title } : {}),
+            ...(fields.sessionType !== undefined ? { sessionType: fields.sessionType } : {}),
+            ...(fields.parentSessionId !== undefined ? { parentSessionId: fields.parentSessionId } : {}),
+            ...(fields.archived !== undefined ? { archived: fields.archived } : {}),
+            ...(fields.effectiveModel !== undefined ? { effectiveModel: fields.effectiveModel } : {}),
+            ...(fields.effectiveModelVariant !== undefined
+                ? { effectiveModelVariant: fields.effectiveModelVariant }
+                : {}),
+        });
+    }
+    get agentService() {
+        return this.ctx.agentRuntimePort;
+    }
+    get legacyMigrator() {
+        return this.ctx.legacyMigrator;
+    }
+    get runtimeMode() {
+        return this.ctx.runtimeMode;
+    }
+    get agentName() {
+        return this.ctx.agentName;
+    }
+    get agentDisplayName() {
+        return this.ctx.agentDisplayName;
+    }
+    configGetter() {
+        return this.ctx.configGetter();
+    }
+    nowMs() {
+        return this.ctx.nowMs();
+    }
+    resolveDefaultWorkspaceDir() {
+        return this.ctx.resolveDefaultWorkspaceDir();
+    }
+    proxyLegacyDaemonApi(request, apiPath, url, root, fallback) {
+        return this.ctx.proxyLegacyDaemonApi(request, apiPath, url, root, fallback);
+    }
+    getLegacyRuntime() {
+        return this.ctx.getLegacyRuntime();
+    }
+    getSessionById(sessionId) {
+        return this.ctx.getSessionById(sessionId);
+    }
+    listAllSessions(agentName, options) {
+        return this.ctx.listAllSessions(agentName, options);
+    }
+    serializeSessions(sessions) {
+        return this.ctx.serializeSessions(sessions);
+    }
+    serializeSessionTree(sessions, url, agentName, getSessionById) {
+        return this.ctx.serializeSessionTree(sessions, url, agentName, getSessionById);
+    }
+    serializeSession(session) {
+        return this.ctx.serializeSession(session);
+    }
+    markMigratedLegacySessionDeleted(sessionId) {
+        return this.ctx.markMigratedLegacySessionDeleted(sessionId);
+    }
+    abortLocalSessionTurn(sessionId) {
+        this.ctx.abortLocalSessionTurn(sessionId);
+    }
+    normalizeCleanLocalSession(session) {
+        return this.ctx.normalizeCleanLocalSession(session);
+    }
+    publishGlobalEvent(event) {
+        this.ctx.publishGlobalEvent(event);
+    }
+    async routeAgentApi(request, parts, url) {
+        const method = request.method.toUpperCase();
+        const tail = parts.slice(2).join('/');
+        // List latency is user-perceived: timing starts before agent pre-resolution
+        // (legacy discovery / root-session ensure), not at the list branch itself.
+        if (method === 'GET' && (tail === 'session' || tail === 'session/tree')) {
+            return timeRouteDuration(this.ctx.metricsReporter, 'session_list_duration_ms', () => this.routeAgentApiInner(request, parts, url));
+        }
+        return this.routeAgentApiInner(request, parts, url);
+    }
+    async routeCustomAgentAvatar(agentName) {
+        try {
+            const avatar = await this.agentService.readCustomAgentAvatar(agentName);
+            if (!avatar)
+                return notFound(`/agent/${agentName}/identity/avatar`);
+            // Node 22's generic Uint8Array<ArrayBufferLike> is broader than the
+            // DOM Response BodyInit type. Copy only at this boundary; wire bytes
+            // remain unchanged.
+            return new Response(new Uint8Array(avatar.bytes), {
+                headers: {
+                    'Content-Type': avatar.contentType,
+                    'Cache-Control': 'private, no-store',
+                    'X-Content-Type-Options': 'nosniff',
+                },
+            });
+        }
+        catch (error) {
+            if (isAgentNotFoundError(error))
+                return notFound(`/agent/${agentName}/identity/avatar`);
+            const candidate = Object(error);
+            if (typeof candidate.status === 'number' &&
+                typeof candidate.code === 'string' &&
+                candidate.code.startsWith('AGENT_')) {
+                return json({
+                    error: error instanceof Error ? error.message : 'Agent avatar is unavailable.',
+                    code: candidate.code,
+                }, { status: candidate.status });
+            }
+            throw error;
+        }
+    }
+    async routeAgentApiInner(request, parts, url) {
+        const method = request.method.toUpperCase();
+        const agentName = parts[1];
+        const tail = parts.slice(2).join('/');
+        // Custom canonical avatars are local files, so they must go through the
+        // V2 Agent port before any legacy/session fallback or root-session work.
+        // Builtin and remote avatar URLs remain direct UI values and intentionally
+        // have no local file fallback here.
+        if (method === 'GET' && tail === 'identity/avatar') {
+            return this.routeCustomAgentAvatar(agentName);
+        }
+        const primaryAgent = agentName === this.agentName;
+        let localAgent = primaryAgent ? undefined : await this.getLocalAgent(agentName);
+        let legacyAgent = false;
+        let sessionBackedAgent = false;
+        if (!primaryAgent && !localAgent) {
+            const foundLegacyAgent = await this.hasLegacyAgent(agentName);
+            localAgent = await this.getLocalAgent(agentName);
+            legacyAgent = !localAgent && foundLegacyAgent;
+            sessionBackedAgent =
+                !localAgent &&
+                    !legacyAgent &&
+                    (await this.getPreferredSessionForAgent(agentName)) !== undefined;
+        }
+        if (!primaryAgent && !localAgent && !legacyAgent && !sessionBackedAgent) {
+            return notFound(`/agent/${agentName}`);
+        }
+        if (primaryAgent)
+            await this.ensureRootSession();
+        if (localAgent)
+            await this.ensureLocalAgentRootSession(localAgent);
+        if (method === 'GET' && tail === 'im') {
+            if (this.ctx.routeAgentIm)
+                return this.ctx.routeAgentIm(agentName, method);
+            return json({ channel: null, activeBindings: [], localRuntime: true });
+        }
+        if (method === 'DELETE' && tail === 'im') {
+            if (this.ctx.routeAgentIm)
+                return this.ctx.routeAgentIm(agentName, method);
+            return json({ ok: true, deleted: false, deletedCount: 0, localRuntime: true });
+        }
+        if (method === 'GET' && tail === '') {
+            if (this.runtimeMode === 'clean' && legacyAgent && !localAgent && !primaryAgent) {
+                return json(await this.buildCleanLegacyAgentInfo(agentName));
+            }
+            return json(await this.buildAgentInfo(agentName));
+        }
+        if (method === 'GET' && tail === 'session/root') {
+            const session = primaryAgent
+                ? await this.ensureRootSession()
+                : localAgent
+                    ? await this.ensureLocalAgentRootSession(localAgent)
+                    : await this.getPreferredSessionForAgent(agentName);
+            if (!session)
+                return notFound(`/agent/${agentName}/session/root`);
+            return json({ session: await this.serializeSession(session) });
+        }
+        if (method === 'PUT' && tail === 'session/root') {
+            if (legacyAgent) {
+                return json({ error: 'Legacy opencode root replacement is not managed by local-runtime.' }, { status: 501 });
+            }
+            const body = await readJsonBody(request);
+            const sessionId = readString(body, 'sessionId') ?? readString(body, 'session_id');
+            if (!sessionId) {
+                return json({ error: 'Missing sessionId' }, { status: 400 });
+            }
+            const replaced = await this.replaceRootSession(agentName, sessionId);
+            if (!replaced)
+                return notFound(`/agent/${agentName}/session/root`);
+            return json({ ok: true });
+        }
+        if (method === 'GET' && tail === 'session') {
+            const sessions = await this.listAgentSessions(url, agentName);
+            return json({ sessions: await this.serializeSessions(sessions) });
+        }
+        if (method === 'POST' && tail === 'session') {
+            if (legacyAgent) {
+                return json({
+                    error: 'New legacy opencode sessions are disabled; create a pi-agent session instead.',
+                }, { status: 403 });
+            }
+            const body = await readJsonBody(request);
+            const requestedFramework = readRequestedFramework(body);
+            if (requestedFramework === 'opencode') {
+                return json({ error: 'New opencode sessions are disabled; create a pi-agent session instead.' }, { status: 403 });
+            }
+            const parentSessionId = readString(body, 'parentSessionId') ?? null;
+            // Parent identity still controls lineage and inherited app mode. Workspace
+            // selection is owned independently by explicit input, Agent config, or the
+            // v2 per-Session Runtime fallback.
+            const parentSession = parentSessionId
+                ? await this.getSessionById(parentSessionId)
+                : undefined;
+            const explicitWorkspaceDir = readString(body, 'workspaceDir') ?? readString(body, 'workspace_dir');
+            const runLocationBaseDir = explicitWorkspaceDir ??
+                localAgent?.defaultWorkspaceDir ??
+                this.resolveDefaultWorkspaceDir();
+            let workspaceDir = explicitWorkspaceDir;
+            let runLocation;
+            const requestedAppMode = readString(body, 'appMode') ?? readString(body, 'app_mode');
+            const inheritedAppMode = requestedAppMode === undefined ? parentSession?.appMode : undefined;
+            const appMode = resolveLocalAppMode(requestedAppMode ?? inheritedAppMode);
+            try {
+                const runLocationInput = canUseRunLocationForAppMode(appMode)
+                    ? readLocalRunLocationInput(body.runLocation)
+                    : undefined;
+                if (runLocationInput) {
+                    runLocation = await applyLocalRunLocation(runLocationInput, runLocationBaseDir, () => this.nowMs());
+                    workspaceDir = runLocation.resolvedDir;
+                }
+            }
+            catch (err) {
+                if (err instanceof LocalRunLocationError) {
+                    return json({ error: err.message, code: err.code }, { status: err.status });
+                }
+                throw err;
+            }
+            const modelInput = body.model && typeof body.model === 'object' && !Array.isArray(body.model)
+                ? body.model
+                : undefined;
+            const providerId = modelInput ? readString(modelInput, 'provider_id') : undefined;
+            const modelId = modelInput ? readString(modelInput, 'model_id') : undefined;
+            const modelSelection = providerId && modelId
+                ? {
+                    effectiveModel: `${providerId}/${modelId}`,
+                    effectiveModelVariant: modelInput
+                        ? (readString(modelInput, 'variant') ?? null)
+                        : null,
+                    ...(modelInput && Object.prototype.hasOwnProperty.call(modelInput, 'thinking')
+                        ? {
+                            effectiveModelThinking: readPersistedLocalModelThinkingSelection(modelInput.thinking),
+                        }
+                        : {}),
+                }
+                : {};
+            const session = await this.createSession({
+                agentName,
+                ...(workspaceDir ? { workspaceDir } : {}),
+                parentSessionId,
+                title: readString(body, 'title') ?? null,
+                visibility: readVisibility(body),
+                purpose: readString(body, 'purpose'),
+                runLocation,
+                appMode,
+                isDefaultWorkspace: explicitWorkspaceDir === undefined && runLocation === undefined,
+                ...modelSelection,
+            });
+            return json({ sessionId: session.sessionId, session: await this.serializeSession(session) }, { status: 201 });
+        }
+        if (method === 'GET' && tail === 'session/tree') {
+            const sessions = await this.listSessionsForTree();
+            const byId = new Map(sessions.map((session) => [session.sessionId, session]));
+            return json({
+                sessions: await this.serializeSessionTree(sessions, url, agentName, (sessionId) => Promise.resolve(byId.get(sessionId))),
+            });
+        }
+        if (method === 'POST' && tail.endsWith('/request-compaction')) {
+            const sessionId = parts[3];
+            if (!sessionId || tail !== `session/${sessionId}/request-compaction`) {
+                return notFound(`/agent/${agentName}/${tail}`);
+            }
+            return this.requestLocalCompaction(agentName, sessionId, await readJsonBody(request));
+        }
+        return notFound(`/agent/${agentName}/${tail}`);
+    }
+    async routeAgentSessionLookup(sessionId) {
+        const session = await this.getSessionById(sessionId);
+        if (!session)
+            return notFound(`/agent/session/${sessionId}`);
+        return json({
+            session: await this.serializeSession(session),
+            agent: await this.buildAgentInfoForSession(session),
+        });
+    }
+    async ensureRootSession() {
+        let cachedRoot;
+        if (this.rootSessionId) {
+            const existing = await this.querySession(this.rootSessionId);
+            if (existing && isActivePiRootSession(existing, this.agentName))
+                return existing;
+            if (existing && isPiRootSession(existing, this.agentName))
+                cachedRoot = existing;
+            this.rootSessionId = undefined;
+        }
+        const sessions = await this.querySessions();
+        const existingRoot = sessions.find((session) => isActivePiRootSession(session, this.agentName)) ??
+            cachedRoot ??
+            sessions.find((session) => isPiRootSession(session, this.agentName));
+        if (existingRoot) {
+            this.rootSessionId = existingRoot.sessionId;
+            return existingRoot;
+        }
+        // In clean mode, discovery-only migration deliberately does NOT create
+        // pi-agent rows in the controller for legacy sessions until the user
+        // touches them. If a legacy root session exists for this agent we must
+        // materialize it right here — otherwise we would silently create a
+        // brand-new empty root while a legacy root (potentially with hundreds
+        // of messages) stays undiscoverable behind the compat boundary. The
+        // legacy migrator handles primary-agent aliasing (main ↔ this.agentName)
+        // inside listLegacySessions, so we do not need to double-check aliases.
+        if (this.runtimeMode === 'clean' && this.legacyMigrator) {
+            const legacySessions = await this.legacyMigrator.listLegacySessions(this.agentName);
+            const legacyRoot = legacySessions.find((session) => session.sessionType === 'root');
+            if (legacyRoot) {
+                try {
+                    const result = await this.legacyMigrator.migrateSession(legacyRoot.sessionId, {
+                        materialize: true,
+                    });
+                    if (result?.session) {
+                        this.rootSessionId = result.session.sessionId;
+                        return result.session;
+                    }
+                }
+                catch {
+                    // Fall through to fresh root creation — the migration failure
+                    // will already be surfaced via the legacy migration telemetry
+                    // and the record.status='failed' stub. We don't want to leave
+                    // the agent without any root, so we still create a fresh one.
+                }
+            }
+        }
+        const session = await this.createSession({
+            workspaceDir: this.resolveDefaultWorkspaceDir(),
+            sessionType: 'root',
+            title: 'Main',
+            parentSessionId: null,
+            isDefaultWorkspace: true,
+            origin: 'root-repair',
+        });
+        this.rootSessionId = session.sessionId;
+        return session;
+    }
+    async ensureLocalAgentRootSession(record) {
+        const existing = await this.querySession(record.rootSessionId);
+        if (existing &&
+            existing.agentName === record.name &&
+            existing.runtime === 'pi-agent' &&
+            existing.sessionType === 'root') {
+            return (await this.getMigrationAwareLocalAgentRoot(existing)) ?? existing;
+        }
+        const root = (await this.querySessions()).find((session) => session.agentName === record.name &&
+            session.runtime === 'pi-agent' &&
+            session.sessionType === 'root');
+        if (root) {
+            const checkedRoot = (await this.getMigrationAwareLocalAgentRoot(root)) ?? root;
+            if (root.sessionId !== record.rootSessionId) {
+                await this.updateLocalAgentRoot(record, checkedRoot.sessionId);
+            }
+            return checkedRoot;
+        }
+        // Legacy root fallback for custom (non-primary) agents.
+        // seeds `record.rootSessionId` with the legacy id — but under discovery-only
+        // migration no pi-agent row is created for that root until the user touches it,
+        // so the two lookups above both return undefined. Without this branch we would
+        // `createSession()` a fresh empty root and `updateLocalAgentRoot()` would rewrite
+        // the agent's rootSessionId, orphaning the legacy history behind the pointer.
+        // Materialize the legacy root instead, then keep the agent pointer pointing at
+        // its (unchanged) session id.
+        if (this.runtimeMode === 'clean' && this.legacyMigrator) {
+            const legacyRootId = await this.pickLegacyRootIdForAgent(record);
+            if (legacyRootId) {
+                try {
+                    const result = await this.legacyMigrator.migrateSession(legacyRootId, {
+                        materialize: true,
+                    });
+                    if (result?.session) {
+                        if (result.session.sessionId !== record.rootSessionId) {
+                            await this.updateLocalAgentRoot(record, result.session.sessionId);
+                        }
+                        return result.session;
+                    }
+                }
+                catch {
+                    // Fall through to a fresh empty root — the migration failure is already
+                    // surfaced via legacy migration telemetry and the record.status='failed'
+                    // stub. Leaving the agent without any root would hang the UI.
+                }
+            }
+        }
+        const workspaceDir = record.defaultWorkspaceDir ?? this.resolveDefaultWorkspaceDir();
+        const created = await this.createSession({
+            agentName: record.name,
+            workspaceDir,
+            sessionType: 'root',
+            title: 'Main',
+            parentSessionId: null,
+            isDefaultWorkspace: this.isDefaultLocalAgentRootWorkspace(record, workspaceDir),
+            origin: 'root-repair',
+        });
+        await this.updateLocalAgentRoot(record, created.sessionId);
+        return created;
+    }
+    isDefaultLocalAgentRootWorkspace(record, workspaceDir) {
+        const workspace = normalizeAbsolutePath(workspaceDir);
+        const runtimeDefault = normalizeAbsolutePath(this.resolveDefaultWorkspaceDir());
+        if (!workspace || workspace === runtimeDefault)
+            return true;
+        const agentWorkspace = isValidLocalAgentName(record.name)
+            ? join(this.configGetter().dataDir, 'agents', record.name, 'workspace')
+            : undefined;
+        return isAgentInternalDefaultWorkspaceDir(workspaceDir, agentWorkspace, record.name);
+    }
+    async pickLegacyRootIdForAgent(record) {
+        if (!this.legacyMigrator)
+            return undefined;
+        // `listLegacySessions` already handles the primary agent alias
+        // (main ↔ this.agentName) internally, but for custom agents the record
+        // name is authoritative.
+        const legacySessions = await this.legacyMigrator.listLegacySessions(record.name);
+        if (legacySessions.length === 0)
+            return undefined;
+        const preferred = resolvePreferredLegacyRootSession(legacySessions, record.rootSessionId || undefined);
+        return preferred?.sessionType === 'root' ? preferred.sessionId : undefined;
+    }
+    async getMigrationAwareLocalAgentRoot(session) {
+        if (this.runtimeMode !== 'clean')
+            return session;
+        const checked = await this.getSessionById(session.sessionId);
+        if (checked &&
+            checked.agentName === session.agentName &&
+            checked.runtime === 'pi-agent' &&
+            checked.sessionType === 'root') {
+            return checked;
+        }
+        return undefined;
+    }
+    async replaceRootSession(agentName, sessionId) {
+        if (this.ctx.conversation) {
+            return this.replaceConversationRootSession(agentName, sessionId);
+        }
+        const baseLog = { scope: 'agent-routes', op: 'replaceRootSession', agentName, sessionId };
+        const nextRoot = await this.querySession(sessionId);
+        if (!nextRoot) {
+            logger.warn({ ...baseLog, reason: 'next_root_not_found' }, 'replaceRootSession bailed');
+            return undefined;
+        }
+        if (nextRoot.agentName !== agentName) {
+            logger.warn({ ...baseLog, reason: 'agent_name_mismatch', actualAgent: nextRoot.agentName }, 'replaceRootSession bailed');
+            return undefined;
+        }
+        if (nextRoot.runtime !== 'pi-agent') {
+            logger.warn({ ...baseLog, reason: 'unsupported_runtime', runtime: nextRoot.runtime }, 'replaceRootSession bailed');
+            return undefined;
+        }
+        // Pull the current root from the sessions table (not the agent record).
+        // The agent record's `main_session_id` might be stale or point at a
+        // demoted branch — the source of truth for "what session is currently
+        // root for this agent" is `sessionType='root'` in the sessions table.
+        let oldRoot;
+        let oldRootFallbackName;
+        if (agentName === this.agentName) {
+            oldRoot = await this.ensureRootSession();
+            oldRootFallbackName = this.agentDisplayName || agentName;
+        }
+        else {
+            const preferred = await this.getPreferredSessionForAgent(agentName);
+            if (preferred && isActivePiRootSession(preferred, agentName)) {
+                oldRoot = preferred;
+            }
+            else {
+                const sessions = await this.controller.listSessions({ agentName });
+                oldRoot =
+                    sessions.find((session) => isActivePiRootSession(session, agentName)) ??
+                        (preferred && isPiRootSession(preferred, agentName) ? preferred : undefined) ??
+                        sessions.find((session) => isPiRootSession(session, agentName));
+            }
+            if (!oldRoot && !isPiRootSession(nextRoot, agentName)) {
+                logger.error({
+                    ...baseLog,
+                    reason: 'no_existing_root',
+                    preferredSessionId: preferred?.sessionId,
+                    preferredSessionType: preferred?.sessionType,
+                }, 'replaceRootSession bailed: cannot find existing root session for agent');
+                return undefined;
+            }
+            // Display name is a best-effort UX detail — a lookup failure must
+            // NOT abort the promote. Fall back to `agentName` so the archive
+            // title still renders.
+            const detail = await this.getLocalAgent(agentName).catch((err) => {
+                logger.warn({
+                    ...baseLog,
+                    err: err instanceof Error ? err.message : String(err),
+                }, 'replaceRootSession: getLocalAgent for display name failed (non-fatal)');
+                return undefined;
+            });
+            oldRootFallbackName = detail?.displayName || agentName;
+        }
+        const rootSessionsToDemote = (await this.controller.listSessions({ agentName }))
+            .filter((session) => isPiRootSession(session, agentName))
+            .filter((session) => session.sessionId !== nextRoot.sessionId);
+        for (const root of rootSessionsToDemote) {
+            // Abort the old root's in-flight foreground turn BEFORE archiving it.
+            // Mirrors `main`'s `/new`, which runs `cleanupForegroundSession({
+            // abortDaemon: true })` ahead of the archive: a `startTurn` on an
+            // `archived` session throws `LocalSessionResumeError`, so the demote must
+            // first end any active turn (e.g. a thread-goal loop) rather than leave a
+            // live turn to crash on its next resume. Best-effort + synchronous.
+            try {
+                this.abortLocalSessionTurn(root.sessionId);
+            }
+            catch (err) {
+                logger.warn({
+                    ...baseLog,
+                    oldRootId: root.sessionId,
+                    err: err instanceof Error ? err.message : String(err),
+                }, 'replaceRootSession: aborting old root turn failed (non-fatal)');
+            }
+            // Demote the old root to a normal (archived) task session so it aligns
+            // with `main`'s `/new` semantics: the previous connect-phone / IM root
+            // moves into "已归档" with a localized `记忆归档：…` title instead of
+            // lingering in the normal sidebar still titled "Main" (the reported
+            // preview_train `/clean`-like divergence). The synchronous fallback
+            // The display-name fallback lands synchronously. V2 owns any later
+            // model-generated archive title.
+            const fallbackTitle = buildArchivedRootSessionTitle({
+                oldTitle: root.title,
+                fallbackName: oldRootFallbackName,
+                locale: this.ctx.resolveLocale?.(),
+            });
+            try {
+                await this.updateOwnedSession(root.sessionId, {
+                    sessionType: 'branch',
+                    archived: true,
+                    title: fallbackTitle,
+                });
+            }
+            catch (err) {
+                logger.error({
+                    ...baseLog,
+                    oldRootId: root.sessionId,
+                    err: err instanceof Error ? err.message : String(err),
+                }, 'replaceRootSession: demoting old root failed');
+                return undefined;
+            }
+        }
+        let updated;
+        try {
+            updated = await this.updateOwnedSession(nextRoot.sessionId, {
+                sessionType: 'root',
+                parentSessionId: null,
+                archived: false,
+                title: 'Main',
+            });
+        }
+        catch (err) {
+            logger.error({
+                ...baseLog,
+                err: err instanceof Error ? err.message : String(err),
+            }, 'replaceRootSession: promoting new root failed');
+            return undefined;
+        }
+        await this.setRootSessionId(agentName, nextRoot.sessionId);
+        if (oldRoot && oldRoot.sessionId !== nextRoot.sessionId) {
+            // Notify the desktop UI that this agent's root session changed. The IM
+            // `/new` command promotes a fresh Main here, but the daemon otherwise only
+            // mutates in-memory/session state and emits no event the UI consumes. The
+            // UI's `agent.updated` handler refetches agent info and updates
+            // primaryAgent.root_session_id, so "手机操控" follows the new Main session
+            // in real time instead of only after a restart / full refetch.
+            try {
+                this.publishGlobalEvent({ type: 'agent.updated', payload: { agentName } });
+            }
+            catch (err) {
+                logger.warn({
+                    ...baseLog,
+                    err: err instanceof Error ? err.message : String(err),
+                }, 'replaceRootSession: publishGlobalEvent(agent.updated) failed (non-fatal)');
+            }
+        }
+        logger.info({
+            ...baseLog,
+            oldRootId: oldRoot?.sessionId,
+            newRootId: nextRoot.sessionId,
+            outcome: 'ok',
+        }, 'replaceRootSession completed');
+        return updated ?? nextRoot;
+    }
+    async replaceConversationRootSession(agentName, sessionId) {
+        const conversation = this.conversation;
+        try {
+            const replacement = await conversation.lifecycle.replaceRootSession(agentName, sessionId);
+            if (agentName === this.agentName)
+                this.rootSessionId = replacement.nextRoot.sessionId;
+            return replacement.nextRoot;
+        }
+        catch (error) {
+            logger.warn({ agentName, sessionId, err: error instanceof Error ? error.message : String(error) }, 'v2-owned root Session replacement failed');
+            return undefined;
+        }
+    }
+    async createSession(input) {
+        const session = await this.conversation.lifecycle.createSession({
+            ...input,
+            agentName: input.agentName ?? this.agentName,
+            sessionType: input.sessionType ?? 'branch',
+            sessionKind: input.sessionKind ?? 'conversation',
+            origin: input.origin ?? 'user',
+        });
+        logger.info({
+            sessionId: session.sessionId,
+            agentName: session.agentName,
+            sessionType: session.sessionType,
+            appMode: session.appMode ?? null,
+        }, 'local session created');
+        return session;
+    }
+    async requestLocalCompaction(agentName, sessionId, body) {
+        const session = await this.getSessionById(sessionId);
+        if (!session || session.agentName !== agentName) {
+            return json({
+                error: 'sessionId does not belong to this agent',
+                code: 'FORBIDDEN',
+            }, { status: 403 });
+        }
+        if (await this.ctx.isReadOnlyLegacySession(session))
+            return readOnlyLegacySessionResponse();
+        return this.ctx.requestCompaction(session, body);
+    }
+    async getLocalAgent(name) {
+        try {
+            const resp = await this.agentService.getAgent({
+                name,
+                include: 'identity,persona,system_prompt',
+            });
+            if (!resp.agent)
+                return undefined;
+            return this.detailToRecord(resp.agent);
+        }
+        catch (err) {
+            if (isAgentNotFoundError(err)) {
+                return undefined;
+            }
+            logger.error({
+                scope: 'agent-routes',
+                op: 'getLocalAgent',
+                agentName: name,
+                err: err instanceof Error ? err.message : String(err),
+            }, 'getLocalAgent via Agent runtime port failed');
+            throw err;
+        }
+    }
+    detailToRecord(detail) {
+        // thrift AgentCreationSource enum: 1=manual, 2=auto, 3=builtin, 0=unknown.
+        // LocalAgentRecord only carries 'manual' | 'auto'; builtin projects to
+        // 'auto' because builtin templates aren't user-managed IM records.
+        const creationSource = detail.creationSource === 1 ? 'manual' : 'auto';
+        return {
+            name: detail.name ?? '',
+            displayName: detail.displayName ?? detail.name ?? '',
+            ...(detail.description ? { description: detail.description } : {}),
+            ...(detail.avatar ? { avatar: detail.avatar } : {}),
+            ...(detail.persona ? { persona: detail.persona } : {}),
+            ...(detail.systemPrompt ? { systemPrompt: detail.systemPrompt } : {}),
+            ...(detail.defaultWorkspaceDir ? { defaultWorkspaceDir: detail.defaultWorkspaceDir } : {}),
+            creationSource,
+            rootSessionId: detail.rootSessionId ?? '',
+            createdAtMs: detail.createdAt ?? 0,
+            updatedAtMs: detail.updatedAt ?? 0,
+        };
+    }
+    async ensurePrimaryAgentRecord() {
+        const existing = await this.getLocalAgent(this.agentName);
+        if (existing)
+            return existing;
+        const root = await this.ensureRootSession();
+        return {
+            name: this.agentName,
+            displayName: this.agentDisplayName,
+            creationSource: 'manual',
+            rootSessionId: root.sessionId,
+            createdAtMs: root.createdAtMs,
+            updatedAtMs: this.nowMs(),
+            defaultWorkspaceDir: this.resolveDefaultWorkspaceDir(),
+        };
+    }
+    async listLocalAgents() {
+        // `excludePrimary: true` matches the pre-refactor behaviour of only
+        // enumerating user-created agents (the primary agent is composed
+        // separately via `buildAgentInfo(this.agentName)`).
+        const resp = await this.agentService.listAgents({
+            include: 'identity',
+            excludePrimary: true,
+        });
+        return (resp.agents ?? []).map((detail) => this.detailToRecord(detail));
+    }
+    /**
+     * Create a brand-new local Pi agent and persist its root session.
+     *
+     * Used by `POST /mavis/api/agent` (with body). Without a body, the host
+     *'s `ensureRootSession()` path returns the primary agent. With a body
+     * (e.g. `{displayName, defaultWorkspaceDir, ...}`), this method mints a
+     * fresh `agent-<hex12>` name (or uses the requested name), creates its
+     * root session, and writes the local agent record. Returns 201 with
+     * `{name, rootSessionId}`.
+     */
+    async createLocalAgent(body) {
+        const requestedName = readString(body, 'name');
+        const agentName = requestedName ?? buildGeneratedAgentName();
+        if (!isValidLocalAgentName(agentName)) {
+            return json({
+                error: `Invalid agent name: "${agentName}"`,
+                code: 'INVALID_AGENT_NAME',
+                errorCode: 40001,
+            }, { status: 400 });
+        }
+        // Preserve the legacy endpoint's read-only collision guard. The V2 Agent
+        // owner is the sole writer; this check only prevents a requested key from
+        // shadowing the primary Agent or an OpenCode-only legacy Agent.
+        if (agentName === this.agentName ||
+            (await this.getLocalAgent(agentName)) ||
+            (await this.hasLegacyAgent(agentName))) {
+            return json({
+                error: `Agent name "${agentName}" already exists`,
+                code: 'AGENT_NAME_CONFLICT',
+                errorCode: 40901,
+            }, { status: 409 });
+        }
+        const displayName = readFirstString(body, ['displayName', 'display_name']) ?? requestedName ?? agentName;
+        const defaultWorkspaceDir = readFirstString(body, ['defaultWorkspaceDir', 'default_workspace_dir']) ??
+            this.resolveDefaultWorkspaceDir();
+        const request = {
+            name: agentName,
+            displayName,
+            ...(readString(body, 'description') ? { description: readString(body, 'description') } : {}),
+            ...(readString(body, 'avatar') ? { avatar: readString(body, 'avatar') } : {}),
+            ...(readFirstString(body, ['persona'])
+                ? { persona: readFirstString(body, ['persona']) }
+                : {}),
+            ...(readFirstString(body, ['systemPrompt', 'system_prompt'])
+                ? { systemPrompt: readFirstString(body, ['systemPrompt', 'system_prompt']) }
+                : {}),
+            ...(defaultWorkspaceDir ? { defaultWorkspaceDir } : {}),
+        };
+        try {
+            const created = await this.agentService.createAgent(request);
+            return json({ name: created.name, rootSessionId: created.rootSessionId }, { status: 201 });
+        }
+        catch (error) {
+            if (isAgentNotFoundError(error))
+                return notFound('/agent');
+            const status = typeof Object(error).status === 'number' ? Object(error).status : 500;
+            const code = typeof Object(error).code === 'string' ? Object(error).code : 'INTERNAL_ERROR';
+            return json({ error: error instanceof Error ? error.message : String(error), code }, { status });
+        }
+    }
+    async updateLocalAgentRoot(record, rootSessionId) {
+        // Persist the Agent Main pointer through the owning runtime port.
+        await this.setRootSessionId(record.name, rootSessionId);
+    }
+    async setRootSessionId(agentName, rootSessionId) {
+        if (agentName === this.agentName) {
+            this.rootSessionId = rootSessionId;
+        }
+        // Primary agent is also present in the `agents` table (built-in mavis
+        // seed); flip its `main_session_id` too so the desktop sidebar sees the
+        // new root without waiting for a full refetch.
+        const ok = await this.agentService.setMainSession(agentName, rootSessionId);
+        if (!ok) {
+            logger.warn({
+                scope: 'agent-routes',
+                op: 'setRootSessionId',
+                agentName,
+                rootSessionId,
+            }, 'setMainSession: agent not found in agents store');
+        }
+    }
+    async listAgentSessions(url, agentName = this.agentName) {
+        return this.listAllSessions(agentName, readLocalSessionListOptions(url, { agentName }));
+    }
+    async listAgentInfos(options = {}) {
+        await this.ensureRootSession();
+        const localAgents = (await this.listLocalAgents()).filter((agent) => agent.name !== this.agentName);
+        const sessionAgentNames = new Set((await this.listAllSessions())
+            .map((session) => session.agentName)
+            .filter((agentName) => agentName &&
+            agentName !== this.agentName &&
+            !localAgents.some((agent) => agent.name === agentName)));
+        const legacyNames = this.runtimeMode === 'clean' && options.includeLegacy === false
+            ? new Set()
+            : this.runtimeMode === 'clean'
+                ? new Set(((await this.legacyMigrator?.listLegacySessions()) ?? [])
+                    .map((session) => session.agentName)
+                    .filter((agentName) => agentName &&
+                    agentName !== this.agentName &&
+                    agentName !== LEGACY_PRIMARY_AGENT_NAME &&
+                    !localAgents.some((agent) => agent.name === agentName) &&
+                    !sessionAgentNames.has(agentName)))
+                : new Set((await this.getLegacyRuntime().listSessions())
+                    .map((session) => session.agentName)
+                    .filter((agentName) => agentName &&
+                    agentName !== this.agentName &&
+                    !localAgents.some((agent) => agent.name === agentName) &&
+                    !sessionAgentNames.has(agentName)));
+        return [
+            await this.buildAgentInfo(this.agentName),
+            ...(await Promise.all(localAgents.map((agent) => this.buildLocalAgentInfo(agent)))),
+            ...(await Promise.all([...sessionAgentNames].map((agentName) => this.buildAgentInfo(agentName)))),
+            ...(await Promise.all([...legacyNames].map((agentName) => this.runtimeMode === 'clean'
+                ? this.buildCleanLegacyAgentInfo(agentName)
+                : this.buildAgentInfo(agentName)))),
+        ];
+    }
+    async buildAgentInfo(agentName = this.agentName) {
+        if (agentName !== this.agentName) {
+            const localAgent = await this.getLocalAgent(agentName);
+            if (localAgent)
+                return this.buildLocalAgentInfo(localAgent);
+            const sessionBacked = await this.buildSessionBackedAgentInfo(agentName);
+            if (sessionBacked)
+                return sessionBacked;
+            return this.buildLegacyAgentInfo(agentName);
+        }
+        const root = await this.ensureRootSession();
+        const sessions = await this.listAgentInfoSessions(this.agentName);
+        const override = await this.getLocalAgent(this.agentName);
+        const now = this.nowMs();
+        return {
+            name: this.agentName,
+            displayName: this.agentDisplayName,
+            agentRole: 1,
+            frameworkType: 'pi-agent',
+            rootSessionId: root.sessionId,
+            defaultWorkspaceDir: override?.defaultWorkspaceDir ?? this.resolveDefaultWorkspaceDir(),
+            userDefaultWorkspaceDir: override?.defaultWorkspaceDir,
+            sessionCount: sessions.filter((session) => session.agentName === this.agentName).length,
+            createdAt: root.createdAtMs,
+            updatedAt: Math.max(now, override?.updatedAtMs ?? 0),
+            creationSource: 'builtin',
+            isBuiltin: true,
+            identity: {
+                display_name: this.agentDisplayName,
+                avatar: override?.avatar ?? DEFAULT_LOCAL_AGENT_AVATAR_URL,
+            },
+            description: override?.description ?? 'Local Pi runtime agent',
+            ...(override?.persona ? { persona: override.persona } : {}),
+            ...(override?.systemPrompt ? { systemPrompt: override.systemPrompt } : {}),
+            channel: await this.ctx.getAgentChannelConfig?.(this.agentName),
+        };
+    }
+    async buildLocalAgentInfo(record) {
+        const root = await this.ensureLocalAgentRootSession(record);
+        const sessions = await this.listAgentInfoSessions(record.name);
+        const updatedAt = Math.max(record.updatedAtMs, ...sessions.map((session) => session.updatedAtMs));
+        return {
+            name: record.name,
+            displayName: record.displayName,
+            agentRole: 0,
+            frameworkType: 'pi-agent',
+            rootSessionId: root.sessionId,
+            defaultWorkspaceDir: record.defaultWorkspaceDir ?? this.resolveDefaultWorkspaceDir(),
+            userDefaultWorkspaceDir: record.defaultWorkspaceDir,
+            sessionCount: sessions.filter((session) => session.agentName === record.name).length,
+            createdAt: record.createdAtMs,
+            updatedAt,
+            creationSource: record.creationSource,
+            isBuiltin: false,
+            identity: {
+                display_name: record.displayName,
+                avatar: record.avatar ?? DEFAULT_LOCAL_AGENT_AVATAR_URL,
+            },
+            description: record.description ?? '',
+            ...(record.persona ? { persona: record.persona } : {}),
+            ...(record.systemPrompt ? { systemPrompt: record.systemPrompt } : {}),
+            channel: await this.ctx.getAgentChannelConfig?.(record.name),
+        };
+    }
+    async buildSessionBackedAgentInfo(agentName) {
+        const sessions = await this.listAgentInfoSessions(agentName);
+        if (sessions.length === 0)
+            return undefined;
+        const root = sessions.find((session) => session.sessionType === 'root') ?? sessions[0];
+        const updatedAt = Math.max(...sessions.map((session) => session.updatedAtMs));
+        return {
+            name: agentName,
+            displayName: agentName,
+            agentRole: 0,
+            frameworkType: 'pi-agent',
+            rootSessionId: root.sessionId,
+            defaultWorkspaceDir: root.workspaceDir ?? this.resolveDefaultWorkspaceDir(),
+            sessionCount: sessions.filter((session) => session.agentName === agentName).length,
+            createdAt: root.createdAtMs,
+            updatedAt,
+            creationSource: 'manual',
+            isBuiltin: false,
+            identity: {
+                display_name: agentName,
+                avatar: DEFAULT_LOCAL_AGENT_AVATAR_URL,
+            },
+            description: '',
+        };
+    }
+    async buildCleanLegacyAgentInfo(agentName) {
+        const sessions = (await this.legacyMigrator?.listLegacySessions(agentName)) ?? [];
+        const legacyAgent = await this.legacyMigrator?.getLegacyAgent(agentName);
+        const root = resolvePreferredLegacyRootSession(sessions, legacyAgent?.rootSessionId);
+        const now = this.nowMs();
+        return {
+            name: agentName,
+            displayName: legacyAgent?.displayName ?? agentName,
+            agentRole: 1,
+            frameworkType: 'pi-agent',
+            rootSessionId: root?.sessionId ?? null,
+            defaultWorkspaceDir: legacyAgent?.defaultWorkspaceDir ?? root?.workspaceDir ?? this.resolveDefaultWorkspaceDir(),
+            userDefaultWorkspaceDir: legacyAgent?.defaultWorkspaceDir,
+            sessionCount: sessions.length,
+            createdAt: legacyAgent?.createdAtMs ?? root?.createdAtMs ?? now,
+            updatedAt: Math.max(legacyAgent?.updatedAtMs ?? 0, root?.updatedAtMs ?? now),
+            creationSource: 'legacy-import',
+            isBuiltin: true,
+            identity: {
+                display_name: legacyAgent?.displayName ?? agentName,
+                avatar: legacyAgent?.avatar ?? DEFAULT_LOCAL_AGENT_AVATAR_URL,
+            },
+            description: legacyAgent?.description ?? 'Legacy opencode sessions pending local Pi migration',
+            ...(legacyAgent?.persona ? { persona: legacyAgent.persona } : {}),
+            ...(legacyAgent?.systemPrompt ? { systemPrompt: legacyAgent.systemPrompt } : {}),
+        };
+    }
+    async listAgentInfoSessions(agentName) {
+        if (this.runtimeMode !== 'clean')
+            return this.listAllSessions(agentName);
+        const local = await Promise.all((await this.querySessions({ agentName })).map((session) => this.normalizeCleanLocalSession(session)));
+        const legacy = (await this.legacyMigrator?.listLegacySessions(agentName)) ?? [];
+        const legacyAlias = agentName === this.agentName && agentName !== LEGACY_PRIMARY_AGENT_NAME
+            ? ((await this.legacyMigrator?.listLegacySessions(LEGACY_PRIMARY_AGENT_NAME)) ?? [])
+            : [];
+        const byId = new Map();
+        // Legacy discovery-only stubs land here with `runtime === 'opencode'`.
+        // Present them as pi-agent so the wire `frameworkType` reflects the
+        // clean-mode "no legacy concept" invariant — otherwise the UI hides
+        // the composer input on every session the user has never opened. See
+        // `presentLegacyStubAsPiAgent` docs for the full rationale.
+        for (const session of legacy) {
+            byId.set(session.sessionId, presentLegacyStubAsPiAgent(session));
+        }
+        for (const session of legacyAlias) {
+            byId.set(session.sessionId, presentLegacyStubAsPiAgent(session, {
+                primaryAgentName: this.agentName,
+                legacyPrimaryAgentName: LEGACY_PRIMARY_AGENT_NAME,
+            }));
+        }
+        for (const session of local) {
+            if (session)
+                byId.set(session.sessionId, session);
+        }
+        return [...byId.values()];
+    }
+    async listSessionsForTree() {
+        if (this.runtimeMode !== 'clean')
+            return this.listAllSessions();
+        const local = await Promise.all((await this.querySessions()).map((session) => this.normalizeCleanLocalSession(session)));
+        const legacy = (await this.legacyMigrator?.listLegacySessions()) ?? [];
+        // Discovery-only migration pass — mirrors what `GET /agent/:name/session`
+        // does. Keeps the two entry points (tree + flat list) aligned: both
+        // upsert a cheap `local_runtime_legacy_migrations` row per legacy
+        // session, and neither builds a local pi-agent session row / agent row
+        // until the user actually opens the session (`resolveLocalSessionById`
+        // → materialize:true) or sends a message. Failed discoveries surface
+        // via the existing `failedRecords` branch below so we intentionally
+        // swallow the telemetry emit here (tree renders don't need per-session
+        // failure fan-out — the sidebar just shows the failed stub).
+        if (this.legacyMigrator && legacy.length > 0) {
+            await migrateLegacySessionsForList({
+                sessions: legacy,
+                legacyMigrator: this.legacyMigrator,
+                controller: this.controller,
+                normalizeStalePiSession: async (session) => session,
+                emitLegacyMigrationTelemetry: () => { },
+            });
+        }
+        const byId = new Map();
+        for (const session of legacy)
+            byId.set(session.sessionId, session);
+        for (const session of local) {
+            if (session)
+                byId.set(session.sessionId, session);
+        }
+        const failedRecords = (await this.legacyMigrator?.listMigrationRecords())?.filter((record) => record.status === 'failed') ?? [];
+        for (const record of failedRecords) {
+            const session = byId.get(record.localSessionId) ?? byId.get(record.legacySessionId);
+            if (!session)
+                continue;
+            byId.set(record.localSessionId, buildFailedLegacyMigrationStub(session, new LegacyOpencodeMigrationError(record, record.error ?? new Error('Previous legacy opencode session migration failed.')), record));
+            if (record.legacySessionId !== record.localSessionId)
+                byId.delete(record.legacySessionId);
+        }
+        const results = [...byId.values()];
+        // Fold legacy `main` alias into the current primary agent name AND
+        // present `runtime === 'opencode'` discovery stubs as pi-agent so the
+        // wire `frameworkType` reflects the clean-mode invariant. Both concerns
+        // live in the same helper so they cannot drift out of sync — see
+        // `presentLegacyStubAsPiAgent` docs in `host-support.ts`. Successfully
+        // materialized pi-agent rows and failed stubs (already
+        // `runtime === 'pi-agent'` via `buildFailedLegacyMigrationStub`) pass
+        // through unchanged.
+        return presentLegacyStubsAsPiAgent(results, {
+            primaryAgentName: this.agentName,
+            legacyPrimaryAgentName: LEGACY_PRIMARY_AGENT_NAME,
+        });
+    }
+    async buildAgentInfoForSession(session) {
+        if (session.runtime === 'opencode') {
+            return this.runtimeMode === 'clean'
+                ? this.buildCleanLegacyAgentInfo(session.agentName)
+                : this.buildLegacyAgentInfo(session.agentName);
+        }
+        return this.buildAgentInfo(session.agentName);
+    }
+    async buildLegacyAgentInfo(agentName) {
+        const sessions = await this.getLegacyRuntime().listSessions(agentName);
+        const root = sessions[0];
+        const now = this.nowMs();
+        return {
+            name: agentName,
+            displayName: agentName,
+            agentRole: 1,
+            frameworkType: 'opencode',
+            rootSessionId: root?.sessionId ?? null,
+            sessionCount: sessions.length,
+            createdAt: root?.createdAtMs ?? now,
+            updatedAt: root?.updatedAtMs ?? now,
+            creationSource: 'legacy',
+            isBuiltin: true,
+            identity: { display_name: agentName, avatar: DEFAULT_LOCAL_AGENT_AVATAR_URL },
+            description: 'Legacy opencode runtime agent',
+        };
+    }
+    async hasLegacyAgent(agentName) {
+        if (this.runtimeMode === 'clean') {
+            const sessions = await this.legacyMigrator?.listLegacySessions(agentName);
+            return (sessions?.length ?? 0) > 0;
+        }
+        return (await this.getLegacyRuntime().listSessions(agentName)).length > 0;
+    }
+    async getPreferredSessionForAgent(agentName) {
+        let preferredRootSessionId;
+        if (this.runtimeMode === 'clean') {
+            const legacySessions = (await this.legacyMigrator?.listLegacySessions(agentName)) ?? [];
+            const legacyAgent = await this.legacyMigrator?.getLegacyAgent(agentName);
+            preferredRootSessionId = legacyAgent?.rootSessionId;
+            const preferred = resolvePreferredLegacyRootSession(legacySessions, preferredRootSessionId);
+            const preferredMigration = preferred
+                ? await this.legacyMigrator?.getMigrationRecordForLegacySession(preferred.sessionId)
+                : undefined;
+            if (preferred && preferredMigration?.status !== 'failed')
+                return preferred;
+        }
+        const sessions = await this.listAllSessions(agentName);
+        if (this.runtimeMode === 'clean') {
+            const preferred = resolvePreferredLegacyRootSession(sessions, preferredRootSessionId);
+            if (preferred)
+                return preferred;
+        }
+        return sessions.find((session) => session.sessionType === 'root') ?? sessions[0];
+    }
+}
+function readOnlyLegacySessionResponse() {
+    return json({
+        success: false,
+        error: 'Legacy opencode sessions are read-only in clean local-runtime mode.',
+        code: 'read_only_legacy_session',
+    }, { status: 409 });
+}
+function isPiRootSession(session, agentName) {
+    return (session.agentName === agentName &&
+        session.runtime === 'pi-agent' &&
+        session.sessionType === 'root');
+}
+function isActivePiRootSession(session, agentName) {
+    return isPiRootSession(session, agentName) && !session.archived;
+}
+function resolvePreferredLegacyRootSession(sessions, preferredRootSessionId) {
+    if (preferredRootSessionId) {
+        const preferred = sessions.find((session) => session.sessionType === 'root' &&
+            (session.sessionId === preferredRootSessionId ||
+                session.legacyFrameworkSessionId === preferredRootSessionId));
+        if (preferred)
+            return preferred;
+    }
+    return sessions.find((session) => session.sessionType === 'root') ?? sessions[0];
+}
+//# sourceMappingURL=agents.js.map

@@ -1,0 +1,16 @@
+{
+  "name": "node-screenshots-win32-x64-msvc",
+  "version": "0.2.8",
+  "cpu": [
+    "x64"
+  ],
+  "main": "node-screenshots.win32-x64-msvc.node",
+  "description": "Zero-dependent. A native nodejs screenshots library for Mac、Windows、Linux.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">= 12.22.0 < 13 || >= 14.17.0 < 15 || >= 15.12.0 < 16 || >= 16.0.0"
+  },
+  "os": [
+    "win32"
+  ]
+}

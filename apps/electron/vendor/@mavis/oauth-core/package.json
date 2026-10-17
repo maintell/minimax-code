@@ -1,0 +1,20 @@
+{
+  "name": "@mavis/oauth-core",
+  "version": "0.2.1-beta.7",
+  "description": "Shared local OAuth state, credential store, and cross-process coordination for MCode hosts.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  }
+}

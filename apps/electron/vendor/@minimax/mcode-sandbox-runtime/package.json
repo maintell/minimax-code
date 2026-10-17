@@ -1,0 +1,27 @@
+{
+  "name": "@minimax/mcode-sandbox-runtime",
+  "version": "0.0.74-mcode.2",
+  "description": "MCode Sandbox Runtime for internal process isolation",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "srt": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "dependencies": {
+    "@pondwader/socks5-server": "^1.0.10",
+    "commander": "^12.1.0",
+    "node-forge": "^1.4.0",
+    "zod": "^3.24.1"
+  },
+  "author": "MiniMax",
+  "license": "Apache-2.0",
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix --cache --cache-location=node_modules/.cache/.eslintcache",
+      "prettier --write"
+    ]
+  }
+}

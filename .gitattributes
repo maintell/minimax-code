@@ -27,5 +27,14 @@ tsconfig.standalone.json linguist-generated=true
 *.dat -text
 *.bin -text
 *.pak -text
+# Prebuilt desktop-client content is a byte-for-byte recovery of the shipped
+# build (renderer bundles, resources, vendored runtime snapshots); it must not
+# be line-ending normalized. Restored sources under apps/electron/main keep the
+# repository's LF normalization.
+apps/electron/out/** -text
+apps/electron/public/** -text
+apps/electron/model-menu/** -text
+apps/electron/resources/** -text
+apps/electron/vendor/** -text
 # Preserve vendored Office schema bytes when importing the reviewed source archive.
 packages/local-runtime/assets/skills/xlsx/scripts/office/schemas/**/*.xsd -text

@@ -1,0 +1,571 @@
+import path, { join } from 'node:path';
+import { deleteLegacyDaemonSessionMessages } from '../../infra/legacy-db/cleanup.js';
+import { createLegacyOpencodeReadonlySource } from '../../infra/legacy-db/readonly-source.js';
+import { createSessionSystemAgentProjection, } from './agent-projection.js';
+import { SessionFilesService } from './files/service.js';
+import { createSessionForkDataCapability } from './fork/index.js';
+import { createSessionAssetRepository } from './files/repo/assets.js';
+import { createHistoryPersistenceRepository, createLegacyHistorySourceReader, LegacyOpencodeImporter, } from './legacy-migration/index.js';
+import { createLegacySessionMigrationRepository } from './legacy-migration/repo/migration-repository.js';
+import { createReleasedSessionHistoryReader, createSessionHistoryActivity, createSessionHistoryIoLane, createSessionHistoryLocationResolver, createSessionSystemCanonicalHistoryProvider, createSessionHistoryMutationAdapter, createSessionRewindCapability, ConversationActionProjectionService, MessageQueryService, SessionSourceQueryService, SessionInputSummaryService, UserMessageCommitService, } from './messages/index.js';
+import { createMessageRepository } from './messages/repo/drizzle.js';
+import { createSessionSourceProjectionRepository } from './messages/repo/source-query.js';
+import { createQueryCollapseProjector } from './query-collapse-projector.js';
+import { createQueryCollapseState } from './query-collapse-state.js';
+import { SidebarQueryService } from './projects/sidebar/query.js';
+import { initializeProjectDomain } from './projects/initialize.js';
+import { createProjectRepository } from './projects/repo/drizzle.js';
+import { CommittedQueueService } from './queue/committed-service.js';
+import { QueueCommittedFactHub } from './queue/committed-fact-hub.js';
+import { createQueueDispatchCapability } from './queue/dispatch-capability.js';
+import { createQueueRepository } from './queue/repo/drizzle.js';
+import { QueueService } from './queue/service.js';
+import { createQueueTurnAdmissionPriorityFence } from './queue/turn-priority-fence.js';
+import { initializeSessionDomain } from './sessions/initialize.js';
+import { createSessionInteractionModeCapability } from './sessions/interaction-mode-capability.js';
+import { createTaskExecutionAdmissionCapability } from './sessions/task-execution-admission.js';
+import { createSessionExecutionSource, createSessionStateWriter, } from './sessions/recovery/capabilities.js';
+import { createSessionRepository } from './sessions/repo/drizzle.js';
+import { SessionActivationService } from './sessions/lifecycle/activation-service.js';
+import { createNativeSessionRecordService, } from './sessions/support/native-record-factory.js';
+import { SessionArtifactService } from './sessions/support/artifact-service.js';
+import { createPlanDocumentOwner } from './sessions/support/plan-document.js';
+import { SessionDeletionGate } from './sessions/lifecycle/deletion-gate.js';
+import { createConversationMutationState, createSessionOperationIntentRepository, } from './mutation/index.js';
+import { SessionRecoveryService } from './sessions/recovery/recovery-service.js';
+import { RootSessionInvariantService, } from './sessions/root/root-invariant-service.js';
+import { SessionTitleService, } from './sessions/index.js';
+import { SessionStreamService } from './stream/session-stream-service.js';
+import { createSessionUsageRepository } from './usage/repo/drizzle.js';
+import { recordCommittedPiUsage } from './usage/pi-usage.js';
+import { SessionUsageService } from './usage/service.js';
+import { createSessionUsageCommitSignal } from './usage/commit-signal.js';
+import { SessionLlmCallReportStore, SessionReportService } from '@mavis/session-report';
+import { createSessionStorageRetention } from './storage-retention.js';
+import { repairRootProjectHistory, } from './_migration-root-project-history-repair.js';
+import { repairLegacyDefaultProjectHistory, } from './projects/legacy-default-project-history-repair.js';
+/** One production graph over the shared AppDb; repositories never own the connection. */
+export function initializeSessionSystem(options) {
+    const nowMs = options.nowMs ?? Date.now;
+    const { sessions, historyLocations, interactionMode, planDocuments } = createSessionMetadataCapabilities(options, nowMs);
+    const taskExecutionAdmission = createTaskExecutionAdmissionCapability({ db: options.db });
+    const deletionGate = new SessionDeletionGate({ db: options.db });
+    const messages = createMessageRepository({
+        db: options.db,
+        sourceProjectionEnabled: options.sourceProjectionEnabled,
+        nowMs,
+        userMessageAdmission: deletionGate.turnAdmission,
+    });
+    const usage = createSessionUsageRepository({ db: options.db });
+    const usageCommits = createSessionUsageCommitSignal();
+    const projects = createProjectRepository({ db: options.db });
+    const assets = createSessionAssets(options, sessions);
+    const operationIntents = createSessionOperationIntentRepository({ nowMs });
+    const conversationMutationState = createConversationMutationState(options.db, operationIntents);
+    const rewind = createSessionRewindCapability({ db: options.db, messages, sessions, nowMs });
+    const turnAdmission = createTurnAdmission(deletionGate, operationIntents);
+    const queueAdmission = createQueueAdmission(deletionGate, operationIntents);
+    const legacyMigrations = createLegacyMigrations(options.db, nowMs);
+    const queueRepository = createQueueRepository({
+        db: options.db,
+        nowMs,
+        enqueueAdmission: queueAdmission,
+        ...queueRuntimeOwnerOptions(options.runtimeOwnerIdentity),
+    });
+    const queueFacts = new QueueCommittedFactHub(options.queueFacts);
+    const stream = new SessionStreamService({ messages, nowMs });
+    const queryCollapseState = createQueryCollapseState({ db: options.db, nowMs });
+    const { canonicalHistory, historyMutation, historyPersistence, llmCalls, reporting } = createSessionHistoryCapabilities(options, sessions, historyLocations, nowMs);
+    const { legacy, onLegacyCleanupError } = createLegacySessionCapabilities({
+        options,
+        migrations: legacyMigrations,
+        sessions,
+        messages,
+        canonicalHistory,
+        nowMs,
+    });
+    const storageRetention = createSessionStorageRetention({
+        ...options.storageRetention,
+        nowMs,
+    });
+    const records = createSessionRecordService({
+        options,
+        sessions,
+        projects,
+        canonicalHistory,
+        nowMs,
+    });
+    const fork = createSessionForkDataCapability({
+        sessions,
+        records,
+        messages,
+        assets,
+        historyMutation,
+    });
+    const roots = new RootSessionInvariantService({
+        sessions,
+        agents: options.rootAgents,
+        creation: records,
+        legacyRoot: legacy,
+    });
+    const activation = new SessionActivationService({
+        writer: {
+            reopenArchivedSession: (sessionId) => sessions.update(sessionId, { archived: false }),
+        },
+        facts: options.facts,
+    });
+    const titles = new SessionTitleService({
+        sessions,
+        commitTitle: createTitleCommitter(records, options.facts),
+        ...options.title,
+    });
+    const sessionDomain = initializeSessionDomain({ repository: sessions, discovery: legacy });
+    const recovery = new SessionRecoveryService({ sessions });
+    const projectDomain = initializeProjectDomain({ repository: projects, sessions, nowMs });
+    const queue = new CommittedQueueService({
+        queue: new QueueService({
+            store: queueRepository,
+            sessions,
+            nowMs,
+            resolveModel: options.resolveQueueModel,
+        }),
+        facts: queueFacts,
+    });
+    const files = new SessionFilesService({ sessions, messages, assets, nowMs });
+    const inputSummaries = createInputSummaries(options, sessions, legacy, files);
+    const artifacts = new SessionArtifactService({
+        queue,
+        files,
+        usage,
+        messages,
+        history: historyPersistence,
+        onLegacyCleanupError,
+        canonicalHistory,
+        stream,
+        reports: createSessionReportsOwner(historyLocations, sessions),
+    });
+    const { agentProjection, conversationActions } = createAgentCapabilities({
+        options,
+        sessions,
+        messages,
+        stream,
+        queryCollapseState,
+        operations: operationIntents,
+        conversationMutationState,
+        llmCalls,
+        nowMs,
+    });
+    const usageProjector = createUsageProjector({ sessions, usage, usageCommits, nowMs });
+    const ready = createSessionSystemReadyHandler(options, queryCollapseState);
+    let closePromise;
+    return {
+        repositories: {
+            sessions,
+            projects,
+            messages,
+            queue: queueRepository,
+            usage,
+            assets,
+            legacyMigrations,
+            operationIntents,
+        },
+        sessions: {
+            ...sessionDomain,
+            historyMutation,
+            operationIntents,
+            records,
+            root: roots,
+            activation,
+            recovery,
+            state: createSessionStateWriter(sessions),
+            execution: createSessionExecutionSource(sessions, legacy),
+            interactionMode,
+            taskExecutionAdmission,
+            deletion: createSessionDeletionCapability(deletionGate, turnAdmission),
+        },
+        messages: {
+            repository: messages,
+            query: new MessageQueryService({ messages, sessions, readiness: legacy }),
+            sources: createSessionSourceHistory(options, messages, sessions, legacy),
+            conversationActions,
+            userMessages: new UserMessageCommitService({ messages, nowMs }),
+            inputSummaries,
+            rewind,
+        },
+        fork,
+        projects: { ...projectDomain, sidebar: new SidebarQueryService(options.db, nowMs, (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace')) },
+        files,
+        queue: {
+            repository: queueRepository,
+            committed: queue,
+            priorityFence: createQueueTurnAdmissionPriorityFence({ facts: queueFacts }),
+            submission: queue,
+            facts: queueFacts,
+            createDispatch: (acceptance) => createQueueDispatchCapability({
+                repository: queueRepository,
+                acceptance,
+                facts: queueFacts,
+            }),
+        },
+        usage: {
+            repository: usage,
+            service: new SessionUsageService(usage),
+            projector: usageProjector,
+            commits: usageCommits,
+        },
+        titles,
+        stream,
+        canonicalHistory,
+        historyLocations,
+        planDocuments,
+        conversationMutationState,
+        legacy,
+        artifacts,
+        reporting,
+        llmCalls,
+        agentProjection,
+        queryCollapse: { state: queryCollapseState },
+        ready,
+        runStorageMaintenance: () => storageRetention.run(),
+        close: () => {
+            closePromise ??= closeSessionSystem(titles, stream);
+            return closePromise;
+        },
+    };
+}
+function createSessionSystemReadyHandler(options, queryCollapseState) {
+    let rootProjectHistoryRepair;
+    let legacyDefaultProjectHistoryRepair;
+    return async () => {
+        rootProjectHistoryRepair ??= repairRootProjectHistory({
+            db: options.db,
+            dataDir: options.dataDir,
+            defaultWorkspaceDir: options.defaultWorkspaceDir,
+            rootAgents: options.rootAgents,
+            diagnostics: options.rootProjectHistoryRepairDiagnostics,
+        });
+        await rootProjectHistoryRepair;
+        legacyDefaultProjectHistoryRepair ??= repairLegacyDefaultProjectHistory({
+            db: options.db,
+            dataDir: options.dataDir,
+            defaultWorkspaceDir: options.defaultWorkspaceDir,
+            rootAgents: options.rootAgents,
+            ...(options.getAgentOwnerIdentity
+                ? { getAgentOwnerIdentity: options.getAgentOwnerIdentity }
+                : {}),
+            diagnostics: options.legacyDefaultProjectHistoryRepairDiagnostics,
+        });
+        await legacyDefaultProjectHistoryRepair;
+        await queryCollapseState.recoverUnfinished();
+    };
+}
+function createSessionRecordService(input) {
+    const { options, sessions, projects, canonicalHistory, nowMs } = input;
+    return createNativeSessionRecordService({
+        sessionRepository: sessions,
+        projectRepository: projects,
+        agentDirectory: options.agents,
+        titlePolicy: options.titlePolicy,
+        ...(options.resolveRequestedModel
+            ? { resolveRequestedModel: options.resolveRequestedModel }
+            : {}),
+        artifacts: canonicalHistory,
+        facts: options.facts,
+        defaultWorkspaceDir: options.defaultWorkspaceDir,
+        agentInternalWorkspaceDir: (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace'),
+        sessionDefaultWorkspaceDir: (sessionId) => path.join(options.dataDir, 'sessions', sessionId, 'workspace'),
+        ...(options.makeSessionId ? { makeSessionId: options.makeSessionId } : {}),
+        ...(options.backfillDiagnostics ? { backfillDiagnostics: options.backfillDiagnostics } : {}),
+        nowMs,
+    });
+}
+function createSessionSourceHistory(options, messages, sessions, readiness) {
+    return new SessionSourceQueryService({
+        enabled: options.sourceProjectionEnabled,
+        sources: createSessionSourceProjectionRepository({ db: options.db }),
+        messages,
+        sessions,
+        readiness,
+    });
+}
+function createSessionMetadataCapabilities(options, nowMs) {
+    const sessions = createSessionRepository({
+        db: options.db,
+        nowMs,
+        agentInternalWorkspaceDir: (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace'),
+    });
+    const historyLocations = createSessionHistoryLocationResolver({
+        dataDir: options.dataDir,
+        sessions,
+    });
+    const interactionMode = createSessionInteractionModeCapability({ db: options.db, nowMs });
+    const planDocuments = createPlanDocumentOwner({
+        dataDir: options.dataDir,
+        sessions,
+        modes: interactionMode,
+        locations: historyLocations,
+    });
+    return { sessions, historyLocations, interactionMode, planDocuments };
+}
+function createSessionReportsOwner(historyLocations, sessions) {
+    return {
+        ensureDirectory: async (sessionId) => {
+            const session = await sessions.get(sessionId);
+            if (!session)
+                throw new Error(`Session not found: ${sessionId}`);
+            return (await historyLocations.ensure(session)).reports;
+        },
+    };
+}
+function createLegacySessionCapabilities(input) {
+    const source = createLegacyOpencodeReadonlySource({ sourceDataDir: input.options.dataDir });
+    const onLegacyCleanupError = (error, sessionId) => input.options.storageRetention?.logger?.warn({ error, sessionId }, 'Legacy Session copy cleanup failed');
+    const legacy = new LegacyOpencodeImporter({
+        source,
+        migrations: input.migrations,
+        sessions: input.sessions,
+        messages: input.messages,
+        history: createLegacyMigrationHistory(input.canonicalHistory),
+        assets: input.options.legacyMigration.assets,
+        sourceDeletion: {
+            deleteSessionMessages: (identity) => {
+                deleteLegacyDaemonSessionMessages({ dataDir: input.options.dataDir, identity });
+            },
+            onError: onLegacyCleanupError,
+        },
+        defaultWorkspaceDir: input.options.defaultWorkspaceDir,
+        primaryAgentName: input.options.legacyMigration.primaryAgentName,
+        onPinnedSessionImported: input.options.onPinnedSessionImported ??
+            (async () => {
+                throw new Error('Imported Session Pin callback is not bound');
+            }),
+        onCanonicalRecovery: input.options.legacyMigration.onCanonicalRecovery,
+        nowMs: input.nowMs,
+    });
+    return { legacy, onLegacyCleanupError };
+}
+function createQueryCollapseAgentProjectionOptions(state, messages, stream) {
+    return {
+        queryKeyForTurn: async (sessionId, turnId) => (await state.findProcessingByCurrentTurn(sessionId, turnId))?.queryKey,
+        queryCollapse: createQueryCollapseProjector({ state, messages, stream }),
+    };
+}
+function createLegacyMigrations(db, nowMs) {
+    return createLegacySessionMigrationRepository({ db, nowMs });
+}
+function createSessionHistoryCapabilities(options, sessions, locations, nowMs) {
+    const llmCalls = new SessionLlmCallReportStore({ locations });
+    const reporting = new SessionReportService({ sessions, locations });
+    const releasedHistory = createReleasedSessionHistoryReader({
+        dataDir: options.dataDir,
+        sessions,
+        locations,
+    });
+    const ioLane = createSessionHistoryIoLane();
+    const activity = createSessionHistoryActivity();
+    const historyPersistence = createHistoryPersistenceRepository({ db: options.db });
+    const canonicalHistory = createSessionSystemCanonicalHistoryProvider({
+        dataDir: options.dataDir,
+        sessions,
+        locations,
+        legacyHistory: {
+            sources: createLegacyHistorySourceReader({
+                db: options.db,
+                readLedgerSnapshot: (sessionId) => releasedHistory.readLedgerSnapshot(sessionId),
+            }),
+            checkpoints: historyPersistence,
+        },
+        ioLane,
+        activity,
+        nowMs,
+    });
+    const historyMutation = createSessionHistoryMutationAdapter({
+        dataDir: options.dataDir,
+        sessions,
+        locations,
+        ioLane,
+        activity,
+        onRewindCommitted: (input) => llmCalls.pruneAfterRewind({ sessionId: input.sessionId }),
+        onForkCommitted: (input) => llmCalls.copySnapshotCompanions(input),
+    });
+    return { canonicalHistory, historyMutation, historyPersistence, llmCalls, reporting };
+}
+function queueRuntimeOwnerOptions(identity) {
+    if (!identity)
+        return {};
+    return {
+        claimOwnerId: identity.createOwnerId('queue-claim'),
+        isClaimOwnerAlive: (ownerId) => identity.isOwnerAlive(ownerId) !== false,
+    };
+}
+function createSessionAssets(options, sessions) {
+    return createSessionAssetRepository({
+        db: options.db,
+        resolveSessionWorkspaceRoot: async (sessionId) => (await sessions.get(sessionId))?.workspaceDir,
+        resolveLegacySessionAssetRoot: (sessionId) => join(options.dataDir, 'v2', 'session-assets', sessionId),
+    });
+}
+function createSessionDeletionCapability(deletionGate, turnAdmission) {
+    return {
+        begin: (sessionId) => deletionGate.begin(sessionId),
+        complete: (sessionId) => deletionGate.complete(sessionId),
+        turnAdmission,
+    };
+}
+function createTurnAdmission(deletionGate, operations) {
+    return {
+        rejectionInTransaction: (db, input) => deletionGate.turnAdmission.rejectionInTransaction(db, input) ??
+            (operations.blocksSessionInTransaction(db, input.sessionId)
+                ? 'session-mutating'
+                : undefined),
+    };
+}
+function createQueueAdmission(deletionGate, operations) {
+    return {
+        rejectionInTransaction: (db, input) => deletionGate.queueAdmission.rejectionInTransaction(db, input) ??
+            (operations.blocksSessionInTransaction(db, input.sessionId)
+                ? 'maintenance-active'
+                : undefined),
+    };
+}
+function createAgentCapabilities(input) {
+    const conversationActions = new ConversationActionProjectionService({
+        sessions: input.sessions,
+        messages: input.messages,
+        operations: input.operations,
+        availability: input.conversationMutationState,
+    });
+    const agentProjection = createSessionSystemAgentProjection({
+        state: createSessionStateWriter(input.sessions),
+        sessions: input.sessions,
+        messages: input.messages,
+        stream: input.stream,
+        conversationActions,
+        conversationFacts: input.options.conversationFacts,
+        ...createQueryCollapseAgentProjectionOptions(input.queryCollapseState, input.messages, input.stream),
+        ...(input.options.steeringProjection
+            ? { steeringProjection: input.options.steeringProjection }
+            : {}),
+        compactionFacts: composeCompactionFactSink(input.llmCalls, input.options.compactionFacts),
+        ...(input.options.compactionMetrics
+            ? { compactionMetrics: input.options.compactionMetrics }
+            : {}),
+        nowMs: input.nowMs,
+    });
+    return { agentProjection, conversationActions };
+}
+function composeCompactionFactSink(reports, downstream) {
+    return {
+        handle: async (fact) => {
+            if (fact.kind === 'completed') {
+                try {
+                    await reports.freezeCompletedCompaction({
+                        sessionId: fact.sessionId,
+                        compactionId: fact.snapshotId,
+                    });
+                }
+                catch {
+                    // Report projection must never replace a committed compaction.
+                }
+            }
+            await downstream?.handle(fact);
+        },
+    };
+}
+function createUsageProjector(input) {
+    return {
+        record: async (record) => {
+            const session = await input.sessions.get(record.sessionId);
+            if (!session)
+                throw new Error(`Session not found: ${record.sessionId}`);
+            const recorded = await recordCommittedPiUsage({
+                store: input.usage,
+                session,
+                turnId: record.turnId,
+                model: modelIdentity(record.model),
+                nowMs: input.nowMs,
+                messages: record.messages,
+            });
+            if (recorded > 0)
+                input.usageCommits.publish(record.sessionId);
+        },
+    };
+}
+function createInputSummaries(options, sessions, legacy, files) {
+    return new SessionInputSummaryService({
+        db: options.db,
+        sessions,
+        readiness: {
+            ensureDisplayReady: (sessionId) => legacy.ensureDisplayReady(sessionId),
+            ensureAssetsReady: (sessionId) => files.ensureSessionFilesReady(sessionId),
+        },
+        diffs: options.inputNavigationDiffs,
+    });
+}
+function createLegacyMigrationHistory(history) {
+    return {
+        getPiHistory: async (sessionId) => (await history.read(sessionId)).messages.map(assertCanonicalHistoryMessage),
+        replacePiHistory: async (sessionId, messages, options) => {
+            const replacementEntries = messages.map((message, index) => ({
+                message,
+                identity: { kind: 'new', seed: `legacy-migration:${String(index)}` },
+            }));
+            const baseChange = {
+                sessionId,
+                turnId: `legacy-migration:${sessionId}`,
+                reason: 'replaceMessages',
+                messages,
+                replacementEntries,
+            };
+            await history.replace({
+                ...baseChange,
+                operation: {
+                    id: `legacy-migration:${sessionId}${options?.snapshotId ? `:${options.snapshotId}` : ''}`,
+                    kind: 'legacy-migration',
+                },
+                ...(options?.snapshotId ? { metadata: { replacementId: options.snapshotId } } : {}),
+            });
+        },
+    };
+}
+function assertCanonicalHistoryMessage(value) {
+    if (!isCanonicalHistoryMessage(value)) {
+        throw new TypeError('Canonical history contains an invalid message');
+    }
+    return value;
+}
+function isCanonicalHistoryMessage(value) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value))
+        return false;
+    if (Reflect.get(value, 'role') === 'compactionSummary' &&
+        typeof Reflect.get(value, 'summary') === 'string' &&
+        !Object.hasOwn(value, 'timestamp') &&
+        !Object.hasOwn(value, 'tokensBefore') &&
+        Object.keys(value).every((key) => key === 'role' || key === 'summary')) {
+        return true;
+    }
+    return (typeof Reflect.get(value, 'role') === 'string' &&
+        typeof Reflect.get(value, 'timestamp') === 'number');
+}
+async function closeSessionSystem(titles, stream) {
+    const [titleResult] = await Promise.allSettled([titles.close()]);
+    stream.dispose();
+    if (titleResult?.status === 'rejected')
+        throw titleResult.reason;
+}
+function createTitleCommitter(records, facts) {
+    return async (sessionId, title, expectedTitle) => {
+        const updated = await records.mutateSession(sessionId, { title }, undefined, expectedTitle);
+        facts.handle({ kind: 'title-updated', session: updated, title });
+    };
+}
+function modelIdentity(model) {
+    if (!model || typeof model !== 'object')
+        return null;
+    const provider = Reflect.get(model, 'provider');
+    const id = Reflect.get(model, 'id');
+    if (typeof provider === 'string' && typeof id === 'string')
+        return `${provider}/${id}`;
+    return typeof id === 'string' ? id : null;
+}
+//# sourceMappingURL=owner.js.map

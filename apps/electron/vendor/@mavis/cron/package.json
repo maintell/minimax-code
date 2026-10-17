@@ -1,0 +1,16 @@
+{
+  "name": "@mavis/cron",
+  "version": "0.2.1",
+  "description": "Cron task scheduling/execution capability for Mavis agent runtimes. Depends only on @mavis/agent-core primitives; never imports runtime packages.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@mavis/agent-core": "file:../agent-core",
+    "@mavis/shared": "file:../shared"
+  }
+}

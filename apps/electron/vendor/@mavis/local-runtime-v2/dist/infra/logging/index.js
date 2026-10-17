@@ -1,0 +1,2 @@
+export { configureImLogger, configureLocalRuntimeLogging, flushImLogger, flushLocalRuntimeLogging, logger, shutdownImLogger, shutdownLocalRuntimeLogging, } from '@mavis/shared/local-runtime-logging';
+//# sourceMappingURL=index.js.map

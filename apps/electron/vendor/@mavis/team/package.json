@@ -1,0 +1,16 @@
+{
+  "name": "@mavis/team",
+  "version": "0.2.1",
+  "description": "Team plan production and verification engine for Mavis agent runtimes. Depends on no runtime package.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@mavis/agent-core": "file:../agent-core",
+    "zod": "^3"
+  }
+}

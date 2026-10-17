@@ -1,0 +1,18 @@
+{
+  "name": "@mavis/goal",
+  "version": "0.2.1",
+  "description": "Thread-goal capability (goal state, LLM goal tools, continuation/budget steering) for Mavis agent runtimes. Depends only on @mavis/agent-core primitives; never imports runtime packages.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@mavis/agent-core": "file:../agent-core",
+    "@sinclair/typebox": "^0.34.0",
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "zod": "^3"
+  }
+}

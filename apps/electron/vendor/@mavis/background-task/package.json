@@ -1,0 +1,12 @@
+{
+  "name": "@mavis/background-task",
+  "version": "0.2.1",
+  "description": "Shared background task domain model and lifecycle primitives for Mavis agent runtimes. Depends on no runtime package.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  }
+}
