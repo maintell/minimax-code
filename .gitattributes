@@ -12,5 +12,20 @@ tsconfig.standalone.json linguist-generated=true
 *.pdf -text
 *.gif -text
 *.mp4 -text
+# Binary payloads shipped with the desktop client (wasm kernels, fonts, native
+# modules, installer assets); never normalize their bytes.
+*.wasm -text
+*.br -text
+*.bcmap -text
+*.ttf -text
+*.woff -text
+*.node -text
+*.dll -text
+*.pfb -text
+*.icns -text
+*.ico -text
+*.dat -text
+*.bin -text
+*.pak -text
 # Preserve vendored Office schema bytes when importing the reviewed source archive.
 packages/local-runtime/assets/skills/xlsx/scripts/office/schemas/**/*.xsd -text
