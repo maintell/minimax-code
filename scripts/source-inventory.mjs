@@ -17,6 +17,8 @@ const skipped = new Set([
   ".pnpm-store",
   ".turbo",
   ".DS_Store",
+  // Local agent-harness tooling: never tracked, so it cannot be published.
+  ".opencode",
 ]);
 function filesIn(directory, prefix = "") {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
