@@ -74,6 +74,10 @@ const SAFE_NETWORK_CODES = new Set([
     'ERR_ADDRESS_UNREACHABLE',
     'ERR_PROXY_CONNECTION_FAILED',
     'ERR_HTTP2_PROTOCOL_ERROR',
+    // Local patch: a response body that ends early is the classic flaky-upstream
+    // shape (the server or an intermediary dropped the connection mid-stream).
+    'ERR_INCOMPLETE_CHUNKED_ENCODING',
+    'ERR_EMPTY_RESPONSE',
     // Retry this record-integrity failure, not arbitrary TLS/certificate errors.
     'ERR_SSL_BAD_RECORD_MAC_ALERT',
     'ERR_TIMED_OUT',
@@ -87,8 +91,15 @@ const ABORT_MESSAGE_RE = /\babort(?:ed|ing)?\b/i;
 const TRANSIENT_TIMEOUT_MESSAGE_RE = /\b(?:timed?\s*out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNABORTED|UND_ERR_(?:CONNECT|HEADERS|BODY)_TIMEOUT)\b/i;
 const TRANSIENT_NETWORK_MESSAGE_RE = /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed|network)\b/i;
 const SAFE_TRANSPORT_NETWORK_MESSAGE_RE = /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed)\b/i;
-const CHROMIUM_NETWORK_MESSAGE_RE = /\bnet::ERR_(?:CONNECTION_(?:RESET|CLOSED|REFUSED)|NETWORK_IO_SUSPENDED|NETWORK_CHANGED|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|PROXY_CONNECTION_FAILED|HTTP2_PROTOCOL_ERROR|SSL_BAD_RECORD_MAC_ALERT)\b/i;
+const CHROMIUM_NETWORK_MESSAGE_RE = /\bnet::ERR_(?:CONNECTION_(?:RESET|CLOSED|REFUSED)|NETWORK_IO_SUSPENDED|NETWORK_CHANGED|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|PROXY_CONNECTION_FAILED|HTTP2_PROTOCOL_ERROR|INCOMPLETE_CHUNKED_ENCODING|EMPTY_RESPONSE|SSL_BAD_RECORD_MAC_ALERT)\b/i;
 const CHROMIUM_TIMEOUT_MESSAGE_RE = /\bnet::ERR_(?:TIMED_OUT|CONNECTION_TIMED_OUT)\b/i;
+// Local patch: deterministic-rejection message shapes, mirrored from
+// `packages/shared/src/llm-error-classifier.ts`. Re-sending the same request
+// always fails again, so BYOK retry-all must treat these as terminal.
+const LLM_IMAGE_LIMIT_MESSAGE_RE = /\btoo many images\b|\b(?:max|maximum) (?:number of |of \d+ )?images\b|\bnumber of images\b[^.]{0,40}\bexceed|\bimages? (?:count |limit )?exceed(?:s|ed)?\b|\bat most \d+ images?\b/i;
+const LLM_INVALID_REQUEST_MESSAGE_RE = /\binvalid_request_error\b/i;
+const LLM_REQUEST_TOO_LARGE_MESSAGE_RE = /\brequest_too_large\b|\bREQUEST_BODY_TOO_LARGE\b|\brequest body too large\b|\brequest entity too large\b|\bpayload too large\b/i;
+const LLM_CONTEXT_OVERFLOW_MESSAGE_RE = /\bprompt is too long\b|\bcontext window exceeds limit\b|\bexceeds the context window\b|\bmaximum context length\b|\binput is too long for requested model\b|\bcontext[_ ]length[_ ]exceeded\b|\bmodel_context_window_exceeded\b/i;
 const LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODES = [2056, 2067];
 const LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODE_SET = new Set(LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODES);
 const LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODE_RE = /\b(?:2056|2067)\b/u;
@@ -132,6 +143,19 @@ export function normalizeLLMError(input) {
         facts.existingProtocolCode ??= legacy.existingProtocolCode;
         const message = legacy.message ?? visibleMessage;
         applyMessageSignals(message, facts, signals);
+        // Payload extraction keeps only the inner `message`, which drops a JSON
+        // `type` such as `invalid_request_error`; check the raw text as well.
+        if (visibleMessage && visibleMessage !== message) {
+            const boundedVisible = sanitizeMessage(visibleMessage);
+            if (LLM_IMAGE_LIMIT_MESSAGE_RE.test(boundedVisible))
+                signals.add('image_limit');
+            if (LLM_INVALID_REQUEST_MESSAGE_RE.test(boundedVisible))
+                signals.add('invalid_request');
+            if (LLM_REQUEST_TOO_LARGE_MESSAGE_RE.test(boundedVisible))
+                signals.add('request_too_large');
+            if (LLM_CONTEXT_OVERFLOW_MESSAGE_RE.test(boundedVisible))
+                signals.add('context_overflow');
+        }
         applyNumericSignals(facts, signals);
         return { facts, ...(message ? { sanitizedMessage: message } : {}) };
     }
@@ -246,6 +270,12 @@ export function toLLMRetryDecision(normalized) {
     }
     if (status === 529)
         return { retryable: true, reason: 'overloaded' };
+    // Local patch: any remaining server-side failure (5xx) and an empty provider
+    // response are upstream instability, not a rejected request: retry them.
+    if (status !== undefined && status >= 500)
+        return { retryable: true, reason: 'server_error' };
+    if (facts.signals.has('empty_response'))
+        return { retryable: true, reason: 'empty_response' };
     return { retryable: false, reason: metricKind };
 }
 export function toLLMProtocolClassification(normalized) {
@@ -410,6 +440,49 @@ function applyNumericSignals(facts, signals) {
 function effectiveHttpStatus(facts) {
     return validHttpStatus(facts.upstreamStatusCode) ?? facts.httpStatus;
 }
+/**
+ * Local patch: a provider rejection that repeats identically for the same
+ * request (image-count limit, HTTP 413 / oversized body, context-window
+ * overflow, or an HTTP 400 `invalid_request_error`). BYOK retries every
+ * pre-output failure, but re-sending these only repeats (and may re-bill) the
+ * rejection — mirrors `isLLMDeterministicRequestRejection` in
+ * `packages/shared/src/llm-error-classifier.ts`. Anything that also looks
+ * transient (timeout, network, 408/429/5xx) stays retryable.
+ */
+export function isLLMDeterministicRequestRejection(normalized) {
+    const { facts } = normalized;
+    if (facts.explicitAbort || facts.timeout || facts.signals.has('network'))
+        return false;
+    const status = effectiveHttpStatus(facts);
+    if (status !== undefined && (status === 408 || status === 429 || status >= 500))
+        return false;
+    if (facts.signals.has('image_limit')) {
+        return status === undefined || status === 400 || status === 413 || status === 422;
+    }
+    if (isLLMRequestOversized(normalized))
+        return true;
+    return status === 400 && facts.signals.has('invalid_request');
+}
+/**
+ * The request is too big to be accepted as sent: an HTTP 413, a byte-limit
+ * rejection (`request_too_large`, the local pre-send body check) or a context
+ * window overflow. Resending the same request fails again.
+ */
+function isLLMRequestOversized(normalized) {
+    const { facts } = normalized;
+    if (facts.explicitAbort || facts.timeout || facts.signals.has('network'))
+        return false;
+    if (facts.signals.has('tpm_rate_limit'))
+        return false;
+    const status = effectiveHttpStatus(facts);
+    if (status !== undefined && (status === 408 || status === 429 || status >= 500))
+        return false;
+    if (status === 413)
+        return true;
+    if (!facts.signals.has('request_too_large') && !facts.signals.has('context_overflow'))
+        return false;
+    return status === undefined || status === 400 || status === 413 || status === 422;
+}
 function applyMessageSignals(message, facts, signals) {
     if (!message)
         return;
@@ -438,6 +511,14 @@ function applyMessageSignals(message, facts, signals) {
         signals.add('network');
     if (/\bempty.?response/i.test(message))
         signals.add('empty_response');
+    if (LLM_IMAGE_LIMIT_MESSAGE_RE.test(message))
+        signals.add('image_limit');
+    if (LLM_INVALID_REQUEST_MESSAGE_RE.test(message))
+        signals.add('invalid_request');
+    if (LLM_REQUEST_TOO_LARGE_MESSAGE_RE.test(message))
+        signals.add('request_too_large');
+    if (LLM_CONTEXT_OVERFLOW_MESSAGE_RE.test(message))
+        signals.add('context_overflow');
     const hasStructuredError = facts.existingProtocolCode !== undefined || effectiveHttpStatus(facts) !== undefined;
     if (!hasStructuredError && /\b(content.?filter|content.?policy|safety|blocked)\b/i.test(message))
         signals.add('content_filter');

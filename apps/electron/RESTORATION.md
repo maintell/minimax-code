@@ -83,7 +83,10 @@ a locally installed client.
    scripts. The `asarUnpack` list mirrors `app.asar.unpacked` exactly; the
    installer artifact name uses electron-builder's default.
 6. **Vendor manifest rewrites** — see below.
-7. **`resources/resources/**` ships build resources at runtime.** The shipped
+7. **One vendored runtime file carries a deliberate local patch** — the fixed
+   three-second retry cadence in `@mavis/agent-core`'s `llm-retry.js`; see
+   "Local modifications to vendored snapshots".
+8. **`resources/resources/**` ships build resources at runtime.** The shipped
    installation contains the NSIS/DMG assets inside `resources/resources/`; the
    reconstruction preserves that layout.
 
@@ -101,7 +104,18 @@ snapshot resolves locally and contains no development-only metadata:
 - Dependencies on other vendored packages are rewritten to `file:` paths;
   `workspace:` specifiers are resolved the same way.
 
-No runtime JavaScript of a vendored package is modified.
+No runtime JavaScript of a vendored package is modified, with one deliberate
+exception documented below.
+
+## Local modifications to vendored snapshots
+
+| File | Change | Reason |
+| --- | --- | --- |
+| `vendor/@mavis/agent-core/dist/pi-turn-runner/llm-retry.js` | Provider errors retry without a practical limit (one million attempts) on the fixed `baseDelayMs` cadence (3 s), with no backoff, no jitter and no wall-clock budget. A server-directed `Retry-After` header still wins. BYOK retry-all additionally treats deterministic request rejections (413 / oversized body, context overflow, image limit, HTTP 400 `invalid_request_error`) as terminal. | Unstable upstreams must recover without user intervention; mirrors the same change in `packages/agent-core/src/pi-turn-runner/llm-retry.ts` so the desktop runtime and the CLI behave identically. The terminal carve-out matters more under the unbounded budget: without it a deterministic rejection would be re-sent roughly forever. |
+| `vendor/@mavis/shared/dist/llm-error-classifier.js` | `ERR_INCOMPLETE_CHUNKED_ENCODING` and `ERR_EMPTY_RESPONSE` join the transient-network marker set, and 5xx responses plus empty provider responses classify as retryable (`server_error` / `empty_response`). Deterministic-rejection signals (`image_limit`, `invalid_request`, `request_too_large`, `context_overflow`) and the exported `isLLMDeterministicRequestRejection` are backported. | A dropped or truncated response body is the classic flaky-upstream shape; mirrors `packages/shared/src/llm-error-classifier.ts`. |
+
+Both snapshots are otherwise byte-identical to the shipped build; each patch is
+a few lines and is marked with a `Local patch:` comment in the file.
 
 ## Dependency closure
 

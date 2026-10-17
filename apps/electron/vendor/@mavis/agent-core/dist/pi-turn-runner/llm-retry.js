@@ -1,4 +1,4 @@
-import { normalizeLLMError, toLLMMetricErrorKind, toLLMProtocolClassification, toLLMRetryDecision, } from '@mavis/shared/llm-error-classifier';
+import { normalizeLLMError, toLLMMetricErrorKind, toLLMProtocolClassification, toLLMRetryDecision, isLLMDeterministicRequestRejection, } from '@mavis/shared/llm-error-classifier';
 function isByokProvider(provider) {
     return provider === 'minimax_api' || provider.startsWith('custom_provider:');
 }
@@ -7,10 +7,14 @@ export const LLM_RETRY_CALL_IDENTITY = Symbol('mavis.llmRetryCallIdentity');
 /** Symbol-keyed observer for every physical provider request in a logical call. */
 export const LLM_RETRY_REQUEST_SETTLED_OBSERVER = Symbol('mavis.llmRetryRequestSettledObserver');
 export const DEFAULT_LLM_RETRY_POLICY = {
-    maxRetries: 5,
-    baseDelayMs: 1_000,
+    // Local patch: provider errors retry without a practical limit on a fixed
+    // three-second cadence (no backoff, no wall-clock budget). The budget stays
+    // a serialisable integer for retry events; only user cancellation, model
+    // refusals and deterministic request rejections stay terminal.
+    maxRetries: 1_000_000,
+    baseDelayMs: 3_000,
     maxDelayMs: 30_000,
-    maxRetryElapsedMs: 120_000,
+    maxRetryElapsedMs: Number.POSITIVE_INFINITY,
 };
 const PUBLIC_ERROR_MESSAGES = {
     abort: 'LLM request was cancelled',
@@ -353,11 +357,15 @@ function failureResult(input) {
         explicitAbort: input.final?.stopReason === 'aborted',
     });
     // BYOK retries every pre-output failure because custom gateways report errors
-    // inconsistently, but a model safety refusal is deterministic: retrying the
-    // same request only repeats (and may re-bill) the decline.
+    // inconsistently, but a model safety refusal and a deterministic request
+    // rejection (413 / oversized body, context overflow, image limit, HTTP 400
+    // invalid_request) are terminal: retrying the same request only repeats
+    // (and may re-bill) the decline. Local patch — mirrors the same condition in
+    // packages/agent-core/src/pi-turn-runner/llm-retry.ts.
     const decision = input.retryAllErrors &&
         !normalized.facts.explicitAbort &&
-        !normalized.facts.signals.has('refusal')
+        !normalized.facts.signals.has('refusal') &&
+        !isLLMDeterministicRequestRejection(normalized)
         ? { retryable: true, reason: 'network' }
         : toLLMRetryDecision(normalized);
     if (!decision.retryable) {
@@ -631,8 +639,10 @@ function resolvePolicy(policy) {
 function retryDelayMs(retryAfterMs, retryAttempt, policy, random) {
     if (retryAfterMs !== undefined)
         return Math.min(policy.maxDelayMs, Math.max(0, retryAfterMs));
-    const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retryAttempt - 1));
-    return Math.floor(exponential / 2 + (clampRandom(random()) * exponential) / 2);
+    // Local patch: unstable upstreams retry on the fixed `baseDelayMs` cadence
+    // (no exponential growth, no jitter); a server-directed Retry-After still
+    // wins above.
+    return policy.baseDelayMs;
 }
 function clampRandom(value) {
     return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
