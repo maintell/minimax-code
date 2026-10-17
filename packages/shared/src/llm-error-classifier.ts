@@ -128,6 +128,10 @@ const SAFE_NETWORK_CODES = new Set([
   'ERR_ADDRESS_UNREACHABLE',
   'ERR_PROXY_CONNECTION_FAILED',
   'ERR_HTTP2_PROTOCOL_ERROR',
+  // A response body that ends early is the classic flaky-upstream shape: the
+  // server (or an intermediary) dropped the connection mid-stream.
+  'ERR_INCOMPLETE_CHUNKED_ENCODING',
+  'ERR_EMPTY_RESPONSE',
   // Retry this record-integrity failure, not arbitrary TLS/certificate errors.
   'ERR_SSL_BAD_RECORD_MAC_ALERT',
   'ERR_TIMED_OUT',
@@ -144,7 +148,7 @@ const TRANSIENT_NETWORK_MESSAGE_RE =
   /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed|network)\b/i;
 const SAFE_TRANSPORT_NETWORK_MESSAGE_RE = /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed)\b/i;
 const CHROMIUM_NETWORK_MESSAGE_RE =
-  /\bnet::ERR_(?:CONNECTION_(?:RESET|CLOSED|REFUSED)|NETWORK_IO_SUSPENDED|NETWORK_CHANGED|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|PROXY_CONNECTION_FAILED|HTTP2_PROTOCOL_ERROR|SSL_BAD_RECORD_MAC_ALERT)\b/i;
+  /\bnet::ERR_(?:CONNECTION_(?:RESET|CLOSED|REFUSED)|NETWORK_IO_SUSPENDED|NETWORK_CHANGED|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|PROXY_CONNECTION_FAILED|HTTP2_PROTOCOL_ERROR|INCOMPLETE_CHUNKED_ENCODING|EMPTY_RESPONSE|SSL_BAD_RECORD_MAC_ALERT)\b/i;
 const CHROMIUM_TIMEOUT_MESSAGE_RE = /\bnet::ERR_(?:TIMED_OUT|CONNECTION_TIMED_OUT)\b/i;
 /**
  * Provider rejected the request for carrying too many images, e.g.
@@ -386,6 +390,10 @@ export function toLLMRetryDecision(normalized: NormalizedLLMError): LLMRetryDeci
     };
   }
   if (status === 529) return { retryable: true, reason: 'overloaded' };
+  // Any remaining server-side failure (5xx) and an empty provider response are
+  // upstream instability, not a rejected request: retry them.
+  if (status !== undefined && status >= 500) return { retryable: true, reason: 'server_error' };
+  if (facts.signals.has('empty_response')) return { retryable: true, reason: 'empty_response' };
   return { retryable: false, reason: metricKind };
 }
 

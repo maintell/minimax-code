@@ -36,16 +36,31 @@ export const LLM_RETRY_REQUEST_SETTLED_OBSERVER: unique symbol = Symbol(
 
 export interface LLMRetryPolicy {
   maxRetries: number;
+  /**
+   * Fixed interval between retry attempts. The framework retries unstable
+   * upstreams on this cadence and never backs off: a transient failure is
+   * retried three seconds later, every time.
+   */
   baseDelayMs: number;
+  /** Upper bound for a server-directed `Retry-After` wait. */
   maxDelayMs: number;
   maxRetryElapsedMs: number;
 }
 
+/**
+ * Provider errors are retried without a practical limit, on a fixed cadence:
+ * an unstable upstream (connection resets, incomplete chunked encoding, 5xx,
+ * overload) must recover on its own, and a three-second interval keeps a
+ * transient blip invisible. The attempt budget stays a serialisable integer
+ * for retry events (one million attempts is ~35 days at this cadence) and the
+ * wall-clock budget is unlimited. Only user cancellation, model refusals and
+ * deterministic request rejections stay terminal — see `failureResult`.
+ */
 export const DEFAULT_LLM_RETRY_POLICY: Readonly<LLMRetryPolicy> = {
-  maxRetries: 5,
-  baseDelayMs: 1_000,
+  maxRetries: 1_000_000,
+  baseDelayMs: 3_000,
   maxDelayMs: 30_000,
-  maxRetryElapsedMs: 120_000,
+  maxRetryElapsedMs: Number.POSITIVE_INFINITY,
 };
 
 export interface LLMRetryError {
@@ -131,7 +146,6 @@ export interface LLMRetryOptions {
   onCallSettled?: (event: LLMCallSettledEvent) => void | Promise<void>;
   generateCallId?: () => string;
   nowMs?: () => number;
-  random?: () => number;
   sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -191,7 +205,6 @@ const PUBLIC_ERROR_MESSAGES: Record<LLMMetricErrorKind, string> = {
 export function withLLMRetry(inner: StreamFn, input: LLMRetryOptions): StreamFn {
   const policy = resolvePolicy(input.policy);
   const nowMs = input.nowMs ?? Date.now;
-  const random = input.random ?? Math.random;
   const sleep = input.sleep ?? abortableSleep;
 
   return (async (model, context, options) => {
@@ -274,7 +287,7 @@ export function withLLMRetry(inner: StreamFn, input: LLMRetryOptions): StreamFn 
 
       lastFailure = preflight.failure;
       const retryAttempt = requestAttempt;
-      const delayMs = retryDelayMs(lastFailure.retryAfterMs, retryAttempt, policy, random);
+      const delayMs = retryDelayMs(lastFailure.retryAfterMs, policy);
       const failureAtMs = nowMs();
       retryStartedAtMs ??= failureAtMs;
       const retryDeadlineExceeded =
@@ -890,19 +903,12 @@ function resolvePolicy(policy: Partial<LLMRetryPolicy> | undefined): LLMRetryPol
   return { ...DEFAULT_LLM_RETRY_POLICY, ...(policy ?? {}) };
 }
 
-function retryDelayMs(
-  retryAfterMs: number | undefined,
-  retryAttempt: number,
-  policy: LLMRetryPolicy,
-  random: () => number,
-): number {
+function retryDelayMs(retryAfterMs: number | undefined, policy: LLMRetryPolicy): number {
+  // A server-directed wait (`Retry-After` / `Retry-After-Ms`) is an explicit
+  // provider instruction and still wins. Framework retries themselves never
+  // back off or jitter: the delay is the fixed `baseDelayMs` cadence.
   if (retryAfterMs !== undefined) return Math.min(policy.maxDelayMs, Math.max(0, retryAfterMs));
-  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retryAttempt - 1));
-  return Math.floor(exponential / 2 + (clampRandom(random()) * exponential) / 2);
-}
-
-function clampRandom(value: number): number {
-  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+  return policy.baseDelayMs;
 }
 
 function parseRetryAfterMs(

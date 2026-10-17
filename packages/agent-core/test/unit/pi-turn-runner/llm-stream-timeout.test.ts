@@ -344,7 +344,7 @@ describe("hung OpenAI-compatible provider (real HTTP transport)", () => {
           sessionId: "session-425",
           turnId: "turn-1",
           scope: "agent",
-          policy: { baseDelayMs: 10, maxDelayMs: 10 },
+          policy: { maxRetries: 1, baseDelayMs: 10, maxDelayMs: 10 },
         },
       );
       const started = Date.now();

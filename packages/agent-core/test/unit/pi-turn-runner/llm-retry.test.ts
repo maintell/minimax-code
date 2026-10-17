@@ -149,7 +149,6 @@ function retryOptions(overrides: Record<string, unknown> = {}) {
     turnId: "turn-1",
     scope: "agent" as const,
     generateCallId: () => "call-1",
-    random: () => 0,
     nowMs: () => 1_000,
     sleep: vi.fn(async () => {}),
     ...overrides,
@@ -253,22 +252,22 @@ describe("withLLMRetry", () => {
       "text_end",
       "done",
     ]);
-    expect(sleep).toHaveBeenCalledWith(500, undefined);
+    expect(sleep).toHaveBeenCalledWith(3_000, undefined);
     expect(observed).toMatchObject([
       {
         callId: "call-1",
         status: "waiting",
         retryAttempt: 1,
-        maxRetries: 5,
+        maxRetries: DEFAULT_LLM_RETRY_POLICY.maxRetries,
         requestAttempt: 2,
-        delayMs: 500,
+        delayMs: 3_000,
         error: { reason: "rate_limited" },
       },
       {
         callId: "call-1",
         status: "recovered",
         retryAttempt: 1,
-        maxRetries: 5,
+        maxRetries: DEFAULT_LLM_RETRY_POLICY.maxRetries,
         requestAttempt: 2,
       },
     ]);
@@ -470,6 +469,9 @@ describe("withLLMRetry", () => {
       const wrapped = withLLMRetry(
         inner,
         retryOptions({
+          // One retry: the second attempt is the last one, so the exhausted
+          // event must be attributed to it (a 503 is retryable on its own).
+          policy: { maxRetries: 1 },
           observer: (event: LLMRetryEvent) => observed.push(event),
           onCallSettled: (event: LLMCallSettledEvent) => settled.push(event),
         }),
@@ -516,7 +518,7 @@ describe("withLLMRetry", () => {
     expect(attempts).toBe(2);
   });
 
-  it("uses five retries by default and emits exhausted after the sixth request", async () => {
+  it("emits exhausted once an explicit retry budget is spent", async () => {
     let attempts = 0;
     const observed: LLMRetryEvent[] = [];
     const settled: LLMCallSettledEvent[] = [];
@@ -528,6 +530,7 @@ describe("withLLMRetry", () => {
     const wrapped = withLLMRetry(
       inner,
       retryOptions({
+        policy: { maxRetries: 5 },
         sleep,
         observer: (event: LLMRetryEvent) => observed.push(event),
         onCallSettled: (event: LLMCallSettledEvent) => settled.push(event),
@@ -537,10 +540,9 @@ describe("withLLMRetry", () => {
     const result = await wrapped(fakeModel(), CONTEXT, {});
     await collectEvents(result);
 
-    expect(DEFAULT_LLM_RETRY_POLICY.maxRetries).toBe(5);
     expect(attempts).toBe(6);
     expect(sleep.mock.calls.map(([delayMs]) => delayMs)).toEqual([
-      500, 1_000, 2_000, 4_000, 8_000,
+      3_000, 3_000, 3_000, 3_000, 3_000,
     ]);
     expect(observed.filter((event) => event.status === "waiting")).toHaveLength(
       5,
@@ -563,7 +565,36 @@ describe("withLLMRetry", () => {
     ]);
   });
 
-  it("limits BYOK errors to five retries regardless of error classification", async () => {
+  it("retries provider errors past five attempts by default on the fixed cadence", async () => {
+    let attempts = 0;
+    const sleep = vi.fn(async () => {});
+    const inner = (async () => {
+      attempts += 1;
+      if (attempts <= 7) {
+        return errorStream("[Error] net::ERR_INCOMPLETE_CHUNKED_ENCODING");
+      }
+      return successStream("ok");
+    }) as StreamFn;
+    const wrapped = withLLMRetry(inner, retryOptions({ sleep }));
+
+    const events = await collectEvents(
+      await wrapped(fakeModel("custom_provider:zen"), CONTEXT, {}),
+    );
+
+    // Seven failures in a row: the default budget is effectively unlimited and
+    // every wait uses the same three-second interval.
+    expect(attempts).toBe(8);
+    expect(events.map((event) => event.type)).toContain("done");
+    expect(sleep.mock.calls.map(([delayMs]) => delayMs)).toEqual([
+      3_000, 3_000, 3_000, 3_000, 3_000, 3_000, 3_000,
+    ]);
+    expect(DEFAULT_LLM_RETRY_POLICY.baseDelayMs).toBe(3_000);
+    expect(DEFAULT_LLM_RETRY_POLICY.maxRetryElapsedMs).toBe(
+      Number.POSITIVE_INFINITY,
+    );
+  });
+
+  it("limits BYOK errors to the retry budget regardless of error classification", async () => {
     let attempts = 0;
     const inner = (async () => {
       attempts += 1;
@@ -571,7 +602,7 @@ describe("withLLMRetry", () => {
     }) as StreamFn;
     const wrapped = withLLMRetry(
       inner,
-      retryOptions({ sleep: vi.fn(async () => {}) }),
+      retryOptions({ policy: { maxRetries: 5 }, sleep: vi.fn(async () => {}) }),
     );
 
     const result = await wrapped(fakeModel("minimax_api"), CONTEXT, {});
@@ -645,7 +676,10 @@ describe("withLLMRetry", () => {
       attempts += 1;
       return errorStream(message);
     }) as StreamFn;
-    const wrapped = withLLMRetry(inner, retryOptions({ sleep: vi.fn(async () => {}) }));
+    const wrapped = withLLMRetry(
+      inner,
+      retryOptions({ policy: { maxRetries: 5 }, sleep: vi.fn(async () => {}) }),
+    );
 
     await collectEvents(await wrapped(fakeModel("custom_provider:work"), CONTEXT, {}));
 
