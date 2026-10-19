@@ -1,0 +1,20 @@
+{
+  "name": "@mavis/mcode-tools-host",
+  "version": "0.1.0-beta.0",
+  "description": "Host-neutral OAuth lease broker and launcher lifecycle for embedded mcode-tools.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mavis/oauth-lease-protocol": "file:../oauth-lease-protocol"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@mavis/thrift-gen",
+  "version": "0.2.1",
+  "description": "Typed thrift-to-HTTP runtime primitives and generated desktop service base contracts.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./generated/desktop-service/types": {
+      "import": "./dist/generated/desktop-service/types.js"
+    },
+    "./generated/desktop-service/routes": {
+      "import": "./dist/generated/desktop-service/routes.js"
+    },
+    "./generated/desktop-service/client": {
+      "import": "./dist/generated/desktop-service/client.js"
+    },
+    "./generated/desktop-service/server": {
+      "import": "./dist/generated/desktop-service/server.js"
+    },
+    "./runtime": {
+      "import": "./dist/runtime/index.js"
+    }
+  },
+  "dependencies": {
+    "hono": "^4.7.11",
+    "lodash-es": "^4.17.21"
+  }
+}

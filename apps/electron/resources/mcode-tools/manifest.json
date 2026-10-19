@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 4,
+  "packageName": "@minimax/mcode-tools",
+  "version": "0.0.6",
+  "gitSha": "3c3061e4a74547d07506b98d39651a8c771bbf7a",
+  "buildEnv": "prod",
+  "bedrockLane": "",
+  "nodeRange": ">=20",
+  "entry": "cli.mjs",
+  "auth": {
+    "mode": "shared-broker",
+    "protocol": {
+      "name": "@mavis/oauth-lease-protocol",
+      "version": "0.1.0-beta.0",
+      "wireVersion": 1
+    }
+  },
+  "nativePackages": [
+    {
+      "name": "registry-js",
+      "version": "1.16.1",
+      "napiVersion": 3
+    }
+  ],
+  "resources": [
+    {
+      "path": "cli.mjs",
+      "sha256": "40ed9f6bfb30b68c3b53834d30ed9332f5f2dbab20a0086b7ae611416a429873"
+    },
+    {
+      "path": "native/registry-js.LICENSE",
+      "sha256": "371fcc6c09ada2d6103115f65cbe5e892893086c3abe837859753150fcfb808e"
+    },
+    {
+      "path": "native/win32-arm64/registry.node",
+      "sha256": "81081e71c8eaadab4d8d1c489a67ff1cddf7c876d409021e92b7cfc565bee3d5"
+    },
+    {
+      "path": "native/win32-ia32/registry.node",
+      "sha256": "30e04d544498ab1fba51dda5bf1471e74ae96bb8b6af058f17bcdd6b2e8dfd80"
+    },
+    {
+      "path": "native/win32-x64/registry.node",
+      "sha256": "c46fa65cb72a22c4ed846df91c4ca733c5ab7b6bfff711eb2510dba15b1e3033"
+    }
+  ]
+}

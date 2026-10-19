@@ -1,0 +1,113 @@
+/** Wire values from matrix/chat/chat_server.thrift; independent of V1 scenes. */
+export const SAFETY_CHECK_V2_SCENE = {
+    AssistantReply: 1,
+    GeneratedImage: 2,
+    AssistantThinking: 3,
+    DesktopAssistantReply: 11,
+    DesktopAssistantThinking: 13,
+    AppAssistantReply: 21,
+    AppAssistantThinking: 23,
+    WebAssistantReply: 31,
+    WebAssistantThinking: 33,
+    UserQuery: 100,
+    UserUploadImage: 101,
+    UserUploadFile: 102,
+    DesktopUserQuery: 110,
+    AppUserQuery: 120,
+    WebUserQuery: 130,
+    UserAvatar: 200,
+    InterfaceImage: 201,
+    AgentConfigName: 205,
+    AgentConfigAvatar: 206,
+    CronTitle: 210,
+};
+/** biz-gateway V2 HTTP verdicts; these values are not chat-server RPC actions. */
+export const GATEWAY_SAFETY_CHECK_V2_HTTP_ACTION = {
+    Allow: 1,
+    Block: 2,
+    Replace: 3,
+    Guide: 4,
+};
+/** Only allowlisted categories survive; never retain exception text, URLs or causes. */
+export function classifySafetyTransportError(error) {
+    let current = error;
+    for (let depth = 0; depth < 4 && isSafetyCheckV2Record(current); depth += 1) {
+        const { name } = current;
+        const code = typeof current.code === 'string' ? current.code : '';
+        if (name === 'TimeoutError' ||
+            [
+                'ETIMEDOUT',
+                'UND_ERR_CONNECT_TIMEOUT',
+                'UND_ERR_HEADERS_TIMEOUT',
+                'UND_ERR_BODY_TIMEOUT',
+            ].includes(code))
+            return 'timeout';
+        if (name === 'AbortError' || code === 'ABORT_ERR')
+            return 'aborted';
+        if (code === 'ENOTFOUND' || code === 'EAI_AGAIN')
+            return 'dns';
+        if (['ECONNREFUSED', 'ECONNRESET', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_SOCKET'].includes(code))
+            return 'connect';
+        if ([
+            'CERT_HAS_EXPIRED',
+            'DEPTH_ZERO_SELF_SIGNED_CERT',
+            'SELF_SIGNED_CERT_IN_CHAIN',
+            'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+            'ERR_TLS_CERT_ALTNAME_INVALID',
+            'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+        ].includes(code))
+            return 'tls';
+        current = current.cause;
+    }
+    return 'unknown';
+}
+/** A failed check has no verdict. Callers must handle it separately from Allow. */
+export class SafetyCheckV2Error extends Error {
+    kind;
+    statusCode;
+    transportKind;
+    constructor(kind, statusCode, transportKind) {
+        super(`SafetyCheckV2 ${kind} error`);
+        this.kind = kind;
+        this.statusCode = statusCode;
+        this.transportKind = transportKind;
+        this.name = 'SafetyCheckV2Error';
+    }
+}
+export function isSafetyCheckV2Record(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+/** No retry or V1 fallback: transport failures never manufacture an Allow verdict. */
+export async function postSafetyCheckV2(input) {
+    let response;
+    try {
+        const headers = new Headers(input.headers);
+        headers.set('Content-Type', 'application/json');
+        const timeout = AbortSignal.timeout(10_000);
+        response = await (input.fetchImpl ?? fetch)(input.url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(input.body),
+            signal: input.signal ? AbortSignal.any([input.signal, timeout]) : timeout,
+            redirect: 'error',
+        });
+    }
+    catch (error) {
+        throw new SafetyCheckV2Error('transport', undefined, classifySafetyTransportError(error));
+    }
+    if (!response.ok) {
+        throw new SafetyCheckV2Error(response.status === 401 || response.status === 403 ? 'auth' : 'http', response.status);
+    }
+    let body;
+    try {
+        body = await response.json();
+    }
+    catch (error) {
+        const transportKind = classifySafetyTransportError(error);
+        throw new SafetyCheckV2Error(transportKind === 'unknown' ? 'response' : 'transport', response.status, transportKind);
+    }
+    if (!isSafetyCheckV2Record(body))
+        throw new SafetyCheckV2Error('response');
+    return body;
+}
+//# sourceMappingURL=safety-check-v2.js.map

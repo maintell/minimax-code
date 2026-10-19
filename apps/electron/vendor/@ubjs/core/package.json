@@ -1,0 +1,19 @@
+{
+  "name": "@ubjs/core",
+  "version": "0.31.0-3",
+  "description": "Runtime support for uniffi-bindgen-javascript generated bindings.",
+  "license": "MPL-2.0",
+  "author": {
+    "name": "James Hugman",
+    "email": "james@hugman.tv"
+  },
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  }
+}

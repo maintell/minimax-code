@@ -1,0 +1,52 @@
+{
+  "name": "@mavis/local-runtime",
+  "version": "0.2.1",
+  "description": "Clean local runtime host for Mavis desktop and CLI product paths.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./common": {
+      "import": "./dist/common/index.js"
+    }
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
+    "@mavis/agent-core": "file:../agent-core",
+    "@mavis/agent-tools": "file:../agent-tools",
+    "@mavis/config": "file:../config",
+    "@mavis/conversation-contract": "file:../conversation-contract",
+    "@mavis/context-manager": "file:../context-manager",
+    "@mavis/cron": "file:../cron",
+    "@mavis/goal": "file:../goal",
+    "@mavis/mcp": "file:../mcp",
+    "@mavis/permission": "file:../permission",
+    "@mavis/protocol": "file:../protocol",
+    "@mavis/shared": "file:../shared",
+    "@mavis/skills": "file:../skills",
+    "@mavis/system-reminder": "file:../system-reminder",
+    "@mavis/thrift-gen": "file:../thrift-gen",
+    "@mavis/thrift-gen-client": "file:../thrift-gen-client",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "better-sqlite3": "file:../../better-sqlite3",
+    "croner": "^9",
+    "diff": "^8.0.4",
+    "handlebars": "^4.7.9",
+    "hono": "^4.7.11",
+    "jszip": "file:../../jszip",
+    "lazystream": "^1.0.1",
+    "js-yaml": "^4",
+    "jpeg-js": "0.4.4",
+    "pngjs": "6.0.0",
+    "proper-lockfile": "^4",
+    "saxes": "6.0.0",
+    "zod": "^3"
+  },
+  "optionalDependencies": {
+    "@larksuiteoapi/node-sdk": "^1.60.0"
+  }
+}

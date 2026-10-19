@@ -1,0 +1,70 @@
+{
+  "name": "@mavis/agent-core",
+  "version": "0.2.1",
+  "description": "Shared agent runtime contracts and PiTurnRunner assembly layer for Mavis local/cloud hosts.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./protocol": {
+      "import": "./dist/protocol/index.js"
+    },
+    "./protocol/agent-message": {
+      "import": "./dist/protocol/agent-message.js"
+    },
+    "./protocol/runtime-event": {
+      "import": "./dist/protocol/runtime-event.js"
+    },
+    "./event-bridge": {
+      "import": "./dist/event-bridge/index.js"
+    },
+    "./pi-turn-runner": {
+      "import": "./dist/pi-turn-runner/index.js"
+    },
+    "./tools": {
+      "import": "./dist/tools/index.js"
+    },
+    "./bash-subprocess-env": {
+      "import": "./dist/bash-subprocess-env.js"
+    },
+    "./prompt-read": {
+      "import": "./dist/prompt-read.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "protocol": [
+        "src/protocol/index.ts"
+      ],
+      "protocol/agent-message": [
+        "src/protocol/agent-message.ts"
+      ],
+      "protocol/runtime-event": [
+        "src/protocol/runtime-event.ts"
+      ],
+      "event-bridge": [
+        "src/event-bridge/index.ts"
+      ],
+      "pi-turn-runner": [
+        "src/pi-turn-runner/index.ts"
+      ],
+      "tools": [
+        "src/tools/index.ts"
+      ],
+      "prompt-read": [
+        "src/prompt-read.ts"
+      ]
+    }
+  },
+  "dependencies": {
+    "@mavis/protocol": "file:../protocol",
+    "@mavis/shared": "file:../shared",
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
+    "@sinclair/typebox": "^0.34.0",
+    "zod": "^3"
+  }
+}

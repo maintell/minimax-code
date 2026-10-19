@@ -1,0 +1,33 @@
+{
+  "name": "@mavis/agent-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Built-in adapters that connect Mavis agent modules to the host-neutral @mavis/agent-runtime SPI.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./miniapp-diagnostics": {
+      "import": "./dist/miniapp-diagnostics.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "miniapp-diagnostics": [
+        "dist/miniapp-diagnostics.d.ts"
+      ]
+    }
+  },
+  "dependencies": {
+    "@mavis/session-report": "file:../session-report",
+    "@mavis/agent-runtime": "file:../agent-runtime",
+    "@mavis/context-manager": "file:../context-manager",
+    "@mavis/permission": "file:../permission",
+    "@mavis/runaway-guard": "file:../runaway-guard",
+    "@mavis/skills": "file:../skills",
+    "@mavis/system-reminder": "file:../system-reminder",
+    "@sinclair/typebox": "^0.34.0"
+  }
+}

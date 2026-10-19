@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# mavis-session-log — create a compact, read-only diagnostic view for one
+# MiniMax Code local-runtime-v2 Session.
+#
+# Usage:
+#   mavis-session-log [--data-dir <dir>] [--log-dir <dir>] [-o <out-dir>] <session_id>
+#
+# Options:
+#   --data-dir <dir>  MiniMax Code data directory containing v2/.
+#   --log-dir <dir>   Deprecated: optional local-proxy compatibility trace directory.
+#   -o, --out-dir     New, empty, or prior bakery directory outside dataDir.
+#
+# The script reads only the v2 database, Session artifacts, runtime logs, and
+# runtime event logs. When --log-dir is supplied, it also includes a bounded
+# local-proxy compatibility trace. It never writes to the runtime data directory.
+
+set -euo pipefail
+# Session excerpts can contain private user content. Keep generated artifacts
+# readable only by the invoking user even when the host umask is permissive.
+umask 077
+SLICE_LINE_LIMIT=200
+
+usage() {
+  sed -n '2,/^set -euo pipefail/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo pipefail$/d'
+  exit "${1:-2}"
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "mavis-session-log: '$1' is required but not installed." >&2
+    exit 127
+  fi
+}
+
+require_command jq
+require_command node
+require_command sqlite3
+
+[[ $# -eq 0 || "${1:-}" == '-h' || "${1:-}" == '--help' ]] && usage 0
+
+session_id=''
+out_dir=''
+data_dir="${__MAVIS_PARENT_DATA_DIR:-${MINIMAX_DATA_DIR:-$HOME/.minimax}}"
+local_proxy_log_dir=''
+
+while (( $# )); do
+  case "$1" in
+    --data-dir)
+      [[ $# -ge 2 ]] || usage 2
+      data_dir="$2"
+      shift 2
+      ;;
+    --log-dir)
+      [[ $# -ge 2 ]] || usage 2
+      local_proxy_log_dir="$2"
+      shift 2
+      ;;
+    -o|--out-dir)
+      [[ $# -ge 2 ]] || usage 2
+      out_dir="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage 0
+      ;;
+    *)
+      if [[ -z "$session_id" ]]; then
+        session_id="$1"
+        shift
+      else
+        echo "mavis-session-log: unknown argument: $1" >&2
+        usage 2
+      fi
+      ;;
+  esac
+done
+
+[[ -n "$session_id" ]] || usage 2
+# Native IDs are generated as mvs_<uuid>; permit opaque test/import IDs too,
+# but reject characters that would make the read-only SQL lookup unsafe.
+if [[ ! "$session_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "mavis-session-log: session id must contain only letters, digits, '_' or '-'" >&2
+  exit 2
+fi
+
+db_path="$data_dir/v2/sqlite/runtime-state.sqlite"
+if [[ ! -f "$db_path" ]]; then
+  echo "mavis-session-log: v2 database not found at $db_path" >&2
+  echo "  Run 'mavis doctor --json' to identify the active dataDir." >&2
+  exit 1
+fi
+
+# The public v2 projection deliberately omits record_json and error_message:
+# both can contain private user content, while metadata is enough to locate
+# authoritative artifacts and correlate runtime events.
+row_json=$(sqlite3 -readonly -json "$db_path" "
+  SELECT session_id,
+         COALESCE(agent_name, '') AS agent_name,
+         COALESCE(status, '') AS status,
+         COALESCE(created_at_ms, 0) AS created_at_ms,
+         COALESCE(updated_at_ms, 0) AS updated_at_ms,
+         COALESCE(error_code, '') AS error_code
+  FROM local_runtime_sessions
+  WHERE session_id = '$session_id'
+  LIMIT 1;
+")
+
+if ! jq -e 'type == "array" and length > 0' >/dev/null <<< "$row_json"; then
+  echo "mavis-session-log: no v2 Session found for '$session_id' in $db_path" >&2
+  echo "  This may be a legacy Session, a different profile, or a deleted Session." >&2
+  exit 1
+fi
+
+stored_session_id=$(jq -r '.[0].session_id' <<< "$row_json")
+created_at_ms=$(jq -r '.[0].created_at_ms' <<< "$row_json")
+if [[ -z "$out_dir" ]]; then
+  out_dir="${TMPDIR:-/tmp}/mavis-session-log/$stored_session_id"
+fi
+
+assert_output_outside_data_dir() {
+  node -e '
+    const { existsSync, realpathSync } = require("node:fs");
+    const path = require("node:path");
+
+    function canonicalizeThroughExistingAncestor(candidate) {
+      let cursor = path.resolve(candidate);
+      const missingSegments = [];
+      while (!existsSync(cursor)) {
+        const parent = path.dirname(cursor);
+        if (parent === cursor) break;
+        missingSegments.unshift(path.basename(cursor));
+        cursor = parent;
+      }
+      return path.resolve(realpathSync(cursor), ...missingSegments);
+    }
+
+    try {
+      const outputDir = canonicalizeThroughExistingAncestor(process.argv[1]);
+      const dataDir = canonicalizeThroughExistingAncestor(process.argv[2]);
+      const relative = path.relative(dataDir, outputDir);
+      const isInsideDataDir =
+        relative === "" ||
+        (relative !== ".." &&
+          !relative.startsWith(`..${path.sep}`) &&
+          !path.isAbsolute(relative));
+      if (isInsideDataDir) {
+        console.error(
+          `mavis-session-log: refusing --out-dir inside runtime data directory: ${process.argv[1]}`,
+        );
+        process.exit(2);
+      }
+    } catch {
+      console.error(`mavis-session-log: cannot resolve --out-dir safely: ${process.argv[1]}`);
+      process.exit(2);
+    }
+  ' "$1" "$2"
+}
+
+# Resolve existing symlinks before any mkdir or managed-file cleanup.
+# The bakery promises not to mutate runtime state, so every output path under
+# dataDir is rejected even when the caller reaches it through a symlink.
+assert_output_outside_data_dir "$out_dir" "$data_dir"
+mkdir -p "$out_dir"
+
+# umask 077 makes newly created directories private. Never chmod an existing
+# caller-provided directory: it may be shared or have deliberate permissions.
+# Also refuse to clean a non-empty directory unless a current marker or a
+# historical bakery README proves this script owns the managed filenames.
+output_marker="$out_dir/.mavis-session-log-output"
+output_dir_owned=false
+if [[ ! -r "$out_dir" || ! -w "$out_dir" || ! -x "$out_dir" ]]; then
+  echo "mavis-session-log: output directory must be readable, writable, and searchable: $out_dir" >&2
+  exit 2
+fi
+if [[ -e "$output_marker" || -L "$output_marker" ]]; then
+  if [[ ! -f "$output_marker" || -L "$output_marker" ]] ||
+     ! grep -Fxq 'mavis-session-log:v2' "$output_marker" 2>/dev/null; then
+    echo "mavis-session-log: refusing output directory with an invalid bakery marker: $out_dir" >&2
+    exit 2
+  fi
+  output_dir_owned=true
+elif [[ -f "$out_dir/README.md" && ! -L "$out_dir/README.md" ]]; then
+  readme_header=$(head -n 1 "$out_dir/README.md" 2>/dev/null || true)
+  if [[ "$readme_header" == '# Mavis v2 Session Diagnostic — '* ||
+        "$readme_header" == '# Session Log Bakery — '* ]]; then
+    output_dir_owned=true
+  fi
+fi
+if [[ "$output_dir_owned" != true ]] &&
+   [[ -n "$(find "$out_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+  echo "mavis-session-log: refusing non-empty output directory not owned by this bakery: $out_dir" >&2
+  exit 2
+fi
+if [[ ! -e "$output_marker" ]]; then
+  printf 'mavis-session-log:v2\n' > "$output_marker"
+fi
+
+# The default output path is stable per Session, and callers can explicitly
+# reuse -o. Remove only files owned by this script so missing current artifacts
+# cannot leave stale evidence from a previous run or Session.
+managed_outputs=(
+  README.md
+  metadata.json
+  source-paths.txt
+  manifest.json
+  messages.tail.jsonl
+  ledger.tail.jsonl
+  display.tail.jsonl
+  runtime.log
+  im-runtime.log
+  events.jsonl
+  local-proxy.tail.jsonl
+  # Legacy bakery outputs can contain complete prompts, conversations, tool
+  # schemas, and daemon logs. Remove the exact historical file set when an
+  # explicit or stable output directory is reused across the v2 upgrade.
+  raw.jsonl
+  summary.jsonl
+  timeline.txt
+  errors.jsonl
+  system.txt
+  tools.json
+  conversation.txt
+  conversation.first.txt
+  daemon.log
+  plugin.log
+  opencode.log
+)
+for managed_output in "${managed_outputs[@]}"; do
+  rm -f -- "$out_dir/$managed_output"
+done
+
+jq '.[0] | {
+  sessionId: .session_id,
+  agentName: .agent_name,
+  status: .status,
+  createdAtMs: .created_at_ms,
+  updatedAtMs: .updated_at_ms,
+  errorCode: (if (.error_code | type) == "number" then .error_code else null end)
+}' <<< "$row_json" > "$out_dir/metadata.json"
+
+sessions_root="$data_dir/v2/sessions"
+format_session_day() {
+  local epoch_ms="$1"
+  local epoch_seconds=$((epoch_ms / 1000))
+  if date -r "$epoch_seconds" '+%Y/%m/%d' >/dev/null 2>&1; then
+    date -r "$epoch_seconds" '+%Y/%m/%d'
+    return 0
+  fi
+  date -d "@$epoch_seconds" '+%Y/%m/%d' 2>/dev/null
+}
+
+find_session_dir_in() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  local manifest
+  while IFS= read -r -d '' manifest; do
+    if jq -e --arg sid "$stored_session_id" '(.sessionId? // "") == $sid' "$manifest" >/dev/null 2>&1; then
+      dirname "$manifest"
+      return 0
+    fi
+  done < <(find "$root" -type f -name manifest.json -print0 2>/dev/null)
+}
+
+find_session_dir() {
+  [[ -d "$sessions_root" ]] || return 0
+  local session_day candidate
+  session_day=$(format_session_day "$created_at_ms" 2>/dev/null || true)
+  if [[ -n "$session_day" ]]; then
+    candidate=$(find_session_dir_in "$sessions_root/$session_day")
+    if [[ -n "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  # Imported or malformed records can lack a usable creation timestamp. Keep a
+  # correctness fallback, but avoid the all-history scan for normal sessions.
+  find_session_dir_in "$sessions_root"
+}
+
+session_dir=$(find_session_dir || true)
+logs_dir="$data_dir/v2/observability/logs"
+events_dir="$data_dir/v2/observability/events"
+
+copy_tail() {
+  local source="$1"
+  local destination="$2"
+  if [[ -f "$source" ]]; then
+    tail -n 200 "$source" > "$out_dir/$destination"
+  fi
+}
+
+filter_file_by_session_id() {
+  local file="$1"
+  local filter_kind="$2"
+  case "$filter_kind" in
+    runtime-text)
+      grep -F \
+        -e "\"sessionId\":\"$stored_session_id\"" \
+        -e "\"session_id\":\"$stored_session_id\"" \
+        "$file" 2>/dev/null || true
+      ;;
+    event-jsonl)
+      jq -Rr --arg sid "$stored_session_id" \
+        '. as $line | fromjson? | select((.context.sessionId? // "") == $sid) | $line' \
+        "$file" 2>/dev/null || true
+      ;;
+    local-proxy-jsonl)
+      jq -Rr --arg sid "$stored_session_id" \
+        '. as $line | fromjson? | select((.headers["x-mavis-session-id"]? // "") == $sid) | $line' \
+        "$file" 2>/dev/null || true
+      ;;
+    *)
+      echo "mavis-session-log: unknown Session filter kind: $filter_kind" >&2
+      return 2
+      ;;
+  esac
+}
+
+slice_by_session_id() {
+  local root="$1"
+  local destination="$2"
+  local name_pattern="$3"
+  local filter_kind="$4"
+  : > "$out_dir/$destination"
+  [[ -d "$root" ]] || return 0
+  local file line
+  local -a files=()
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(find "$root" -type f -name "$name_pattern" -print0 2>/dev/null)
+  (( ${#files[@]} > 0 )) || return 0
+  {
+    # Read older files first and keep a global tail. Modification time handles
+    # numeric event rotations such as .9/.10 without relying on lexical order.
+    while IFS= read -r file; do
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$filter_kind" == 'runtime-text' ]]; then
+          printf '%s\t%s\n' "$file" "$line"
+        else
+          printf '%s\n' "$line"
+        fi
+      done < <(filter_file_by_session_id "$file" "$filter_kind")
+    done < <(LC_ALL=C /bin/ls -1tr "${files[@]}")
+  } | tail -n "$SLICE_LINE_LIMIT" > "$out_dir/$destination"
+}
+
+if [[ -n "$session_dir" ]]; then
+  cp "$session_dir/manifest.json" "$out_dir/manifest.json"
+  copy_tail "$session_dir/messages.jsonl" 'messages.tail.jsonl'
+  copy_tail "$session_dir/ledger.jsonl" 'ledger.tail.jsonl'
+  copy_tail "$session_dir/display.jsonl" 'display.tail.jsonl'
+fi
+
+slice_by_session_id "$logs_dir" 'runtime.log' 'runtime-*.log' 'runtime-text'
+slice_by_session_id "$logs_dir" 'im-runtime.log' 'im-runtime-*.log' 'runtime-text'
+slice_by_session_id "$events_dir" 'events.jsonl' '*.jsonl' 'event-jsonl'
+if [[ -n "$local_proxy_log_dir" ]]; then
+  echo 'mavis-session-log: warning: --log-dir is deprecated and is used only for an optional local-proxy compatibility trace.' >&2
+  slice_by_session_id "$local_proxy_log_dir" 'local-proxy.tail.jsonl' 'local-proxy-*.jsonl' 'local-proxy-jsonl'
+fi
+
+{
+  printf 'v2 database: %s\n' "$db_path"
+  printf 'v2 Session artifacts: %s\n' "${session_dir:-not found}"
+  printf 'runtime logs root: %s\n' "$logs_dir"
+  printf 'runtime events root: %s\n' "$events_dir"
+  if [[ -n "$local_proxy_log_dir" ]]; then
+    printf 'local-proxy compatibility root: %s\n' "$local_proxy_log_dir"
+  fi
+  printf '\nThese are source paths. Read large source files narrowly; every bakery excerpt is limited to the latest 200 matching lines.\n'
+} > "$out_dir/source-paths.txt"
+
+file_row() {
+  local file="$1"
+  local description="$2"
+  if [[ -f "$out_dir/$file" ]]; then
+    local lines bytes
+    lines=$(wc -l < "$out_dir/$file" | tr -d ' ')
+    bytes=$(wc -c < "$out_dir/$file" | tr -d ' ')
+    printf '| `%s` | %s lines / %s bytes | %s |\n' "$file" "$lines" "$bytes" "$description"
+  fi
+}
+
+cat > "$out_dir/README.md" <<EOF
+# Mavis v2 Session Diagnostic — \`$stored_session_id\`
+
+This is a compact, read-only view of one local-runtime-v2 Session. It was generated from the v2 database, Session artifacts, runtime logs, and runtime events; it does **not** depend on legacy daemon/OpenCode logs or local-proxy traces. When the deprecated \`--log-dir\` option is supplied, \`local-proxy.tail.jsonl\` is included only as a bounded compatibility supplement.
+
+Start with \`metadata.json\` and \`source-paths.txt\`. Then open only the artifact that answers the question.
+
+| File | Size | When to open |
+|---|---:|---|
+$(file_row metadata.json "safe Session metadata projection")
+$(file_row source-paths.txt "authoritative source locations and safe-reading guidance")
+$(file_row manifest.json "artifact identity and layout")
+$(file_row messages.tail.jsonl "last 200 canonical history lines")
+$(file_row display.tail.jsonl "last 200 display-event lines")
+$(file_row ledger.tail.jsonl "last 200 durable ledger lines")
+$(file_row runtime.log "last 200 runtime-* matches, prefixed by source path")
+$(file_row im-runtime.log "last 200 im-runtime-* matches, prefixed by source path")
+$(file_row events.jsonl "last 200 v2 event matches, preserved as valid JSONL")
+$(file_row local-proxy.tail.jsonl "last 200 optional local-proxy matches, preserved as compatibility JSONL")
+
+## Safe inspection
+
+\`\`\`bash
+DIR="$out_dir"
+cat "\$DIR/metadata.json"
+cat "\$DIR/source-paths.txt"
+sed -n '1,120p' "\$DIR/messages.tail.jsonl"
+tail -n 80 "\$DIR/ledger.tail.jsonl"
+tail -n 120 "\$DIR/runtime.log"
+\`\`\`
+
+## Known limits
+
+- A Session may exist before its durable artifacts are created, or artifacts may have been deleted with the Session.
+- Log retention and disk logging are runtime/profile dependent; an empty log slice is not proof that no runtime action happened.
+- Runtime and event excerpts retain at most the latest 200 matching lines across the current retention window.
+- \`--log-dir\` is deprecated. Its local-proxy slice is supplementary and never replaces v2 Session artifacts, runtime logs, or events.
+- Full history and logs can contain private user content. Do not automatically attach them to a report.
+EOF
+
+total_size=$(du -sh "$out_dir" 2>/dev/null | awk '{print $1}')
+printf '[mavis-session-log] inspected v2 session %s -> %s/ (%s)\n' "$stored_session_id" "$out_dir" "$total_size"
+printf '[hint] read %s/README.md, then metadata.json and source-paths.txt\n' "$out_dir"

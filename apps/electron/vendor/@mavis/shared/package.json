@@ -1,0 +1,401 @@
+{
+  "name": "@mavis/shared",
+  "version": "0.2.1",
+  "type": "module",
+  "exports": {
+    "./memory-limits": {
+      "import": "./dist/memory-limits.js"
+    },
+    "./memory-context-budget": {
+      "import": "./dist/memory-context-budget.js"
+    },
+    "./office-preview-limits": {
+      "import": "./dist/office-preview-limits.js"
+    },
+    "./desktop-login-diagnostics": {
+      "import": "./dist/desktop-login-diagnostics.js",
+      "default": "./dist/desktop-login-diagnostics.js"
+    },
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./mavis-tags": {
+      "import": "./dist/mavis-tags.js"
+    },
+    "./llm-error-classifier": {
+      "import": "./dist/llm-error-classifier.js"
+    },
+    "./navigation-text": {
+      "import": "./dist/navigation-text.js"
+    },
+    "./source-citation-id": {
+      "import": "./dist/source-citation-id.js"
+    },
+    "./source-provenance": {
+      "import": "./dist/source-provenance.js",
+      "default": "./dist/source-provenance.js"
+    },
+    "./file-source-citation": {
+      "import": "./dist/file-source-citation.js"
+    },
+    "./shell-source-stages": {
+      "import": "./dist/shell-source-stages.js"
+    },
+    "./fetched-web-sources": {
+      "import": "./dist/fetched-web-sources.js"
+    },
+    "./models-dev": {
+      "import": "./dist/models-dev.js"
+    },
+    "./llm-retry-event": {
+      "import": "./dist/llm-retry-event.js"
+    },
+    "./questionnaire": {
+      "import": "./dist/questionnaire.js"
+    },
+    "./keyed-operation-lane": {
+      "import": "./dist/keyed-operation-lane.js"
+    },
+    "./turn-identity": {
+      "import": "./dist/turn-identity.js"
+    },
+    "./session-clio": {
+      "import": "./dist/session-clio/index.js",
+      "default": "./dist/session-clio/index.js"
+    },
+    "./global-events": {
+      "import": "./dist/global-events.js"
+    },
+    "./cron-model": {
+      "import": "./dist/cron-model.js"
+    },
+    "./cron-purpose": {
+      "import": "./dist/cron-purpose.js"
+    },
+    "./desktop-service": {
+      "import": "./dist/desktop-service.js"
+    },
+    "./metrics-proxy": {
+      "import": "./dist/metrics-proxy.js"
+    },
+    "./logging": {
+      "import": "./dist/logging/index.js"
+    },
+    "./logging/redact-log-secret": {
+      "import": "./dist/logging/redact-log-secret.js"
+    },
+    "./mavis-widget-types": {
+      "import": "./dist/mavis-widget-types.js"
+    },
+    "./asset-markup": {
+      "import": "./dist/asset-markup/index.js"
+    },
+    "./media-asset-meta": {
+      "import": "./dist/media-asset-meta.js"
+    },
+    "./nested-runtime-guard": {
+      "import": "./dist/nested-runtime-guard.js"
+    },
+    "./runtime-boundary-env": {
+      "import": "./dist/runtime-boundary-env.js"
+    },
+    "./runtime-i18n": {
+      "import": "./dist/runtime-i18n/index.js"
+    },
+    "./product-time": {
+      "import": "./dist/product-time.js"
+    },
+    "./runtime-transport": {
+      "import": "./dist/runtime-transport/index.js",
+      "default": "./dist/runtime-transport/index.js"
+    },
+    "./document-preview": {
+      "import": "./dist/document-preview.js",
+      "default": "./dist/document-preview.js"
+    },
+    "./pptx-rendering": {
+      "import": "./dist/pptx-rendering.js",
+      "default": "./dist/pptx-rendering.js"
+    },
+    "./eval-meta-info": {
+      "import": "./dist/eval-meta-info.js",
+      "default": "./dist/eval-meta-info.js"
+    },
+    "./collection-policy": {
+      "import": "./dist/collection-policy/index.js",
+      "default": "./dist/collection-policy/index.js"
+    },
+    "./collection-policy/matcher": {
+      "import": "./dist/collection-policy/matcher.js",
+      "default": "./dist/collection-policy/matcher.js"
+    },
+    "./bounded-json-stringify": {
+      "import": "./dist/bounded-json-stringify.js",
+      "default": "./dist/bounded-json-stringify.js"
+    },
+    "./comment-composer": {
+      "import": "./dist/comment-composer.js",
+      "default": "./dist/comment-composer.js"
+    },
+    "./comment-anchor": {
+      "import": "./dist/comment-anchor.js",
+      "default": "./dist/comment-anchor.js"
+    },
+    "./comment-marker": {
+      "import": "./dist/comment-marker.js",
+      "default": "./dist/comment-marker.js"
+    },
+    "./subagent-roles": {
+      "import": "./dist/subagent-roles.js"
+    },
+    "./image-dimensions": {
+      "import": "./dist/image-dimensions.js"
+    },
+    "./desktop-typography": {
+      "import": "./dist/desktop-typography.js",
+      "default": "./dist/desktop-typography.js"
+    },
+    "./desktop-appearance": {
+      "import": "./dist/desktop-appearance.js",
+      "default": "./dist/desktop-appearance.js"
+    },
+    "./daily-signin": {
+      "import": "./dist/daily-signin.js"
+    },
+    "./miniapp-surface": {
+      "import": "./dist/miniapp-surface.js",
+      "default": "./dist/miniapp-surface.js"
+    },
+    "./agent-mention": {
+      "import": "./dist/agent-mention/index.js"
+    },
+    "./agent-avatar": {
+      "import": "./dist/agent-avatar.js"
+    },
+    "./keyboard-shortcuts": {
+      "import": "./dist/keyboard-shortcuts/index.js",
+      "default": "./dist/keyboard-shortcuts/index.js"
+    },
+    "./product-build-identity": {
+      "import": "./dist/product-build-identity.js",
+      "default": "./dist/product-build-identity.js"
+    },
+    "./local-runtime-logging": {
+      "import": "./dist/local-runtime-logging/index.js"
+    },
+    "./local-runtime-logging/logger": {
+      "import": "./dist/local-runtime-logging/logger.js"
+    },
+    "./local-runtime-logging/im-logger": {
+      "import": "./dist/local-runtime-logging/im-logger.js"
+    },
+    "./local-runtime-logging/metrics": {
+      "import": "./dist/local-runtime-logging/metrics.js"
+    },
+    "./local-runtime-paths": {
+      "import": "./dist/local-runtime-paths.js"
+    },
+    "./local-runtime-diagnostics": {
+      "import": "./dist/local-runtime-diagnostics/index.js"
+    },
+    "./local-runtime-diagnostics/types": {
+      "import": "./dist/local-runtime-diagnostics/types.js"
+    },
+    "./local-runtime-diagnostics/event-sink": {
+      "import": "./dist/local-runtime-diagnostics/event-sink.js"
+    },
+    "./local-runtime-diagnostics/redaction": {
+      "import": "./dist/local-runtime-diagnostics/redaction.js"
+    },
+    "./local-runtime-diagnostics/jsonl-file-sink": {
+      "import": "./dist/local-runtime-diagnostics/jsonl-file-sink.js"
+    },
+    "./safety-check-v2": {
+      "import": "./dist/safety-check-v2.js"
+    },
+    "./plugin-mention": {
+      "import": "./dist/plugin-mention.js"
+    },
+    "./memory-version": {
+      "import": "./dist/memory-version.js",
+      "default": "./dist/memory-version.js"
+    },
+    "./local-runtime-agent-resource-instance": {
+      "import": "./dist/local-runtime-agent-resource-instance.js"
+    },
+    "./local-runtime-safety": {
+      "import": "./dist/local-runtime-safety.js"
+    },
+    "./local-runtime-skills": {
+      "import": "./dist/local-runtime-skills.js"
+    },
+    "./data-dir-variables": {
+      "import": "./dist/data-dir-variables.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "typesVersions": {
+    "*": {
+      "file-source-citation": [
+        "src/file-source-citation.ts"
+      ],
+      "shell-source-stages": [
+        "src/shell-source-stages.ts"
+      ],
+      "fetched-web-sources": [
+        "src/fetched-web-sources.ts"
+      ],
+      "logging": [
+        "src/logging/index.ts"
+      ],
+      "mavis-tags": [
+        "src/mavis-tags.ts"
+      ],
+      "llm-error-classifier": [
+        "src/llm-error-classifier.ts"
+      ],
+      "navigation-text": [
+        "src/navigation-text.ts"
+      ],
+      "models-dev": [
+        "src/models-dev.ts"
+      ],
+      "llm-retry-event": [
+        "src/llm-retry-event.ts"
+      ],
+      "questionnaire": [
+        "src/questionnaire.ts"
+      ],
+      "keyed-operation-lane": [
+        "src/keyed-operation-lane.ts"
+      ],
+      "turn-identity": [
+        "src/turn-identity.ts"
+      ],
+      "global-events": [
+        "src/global-events.ts"
+      ],
+      "cron-model": [
+        "src/cron-model.ts"
+      ],
+      "cron-purpose": [
+        "src/cron-purpose.ts"
+      ],
+      "desktop-service": [
+        "src/desktop-service.ts"
+      ],
+      "metrics-proxy": [
+        "src/metrics-proxy.ts"
+      ],
+      "mavis-widget-types": [
+        "src/mavis-widget-types.ts"
+      ],
+      "asset-markup": [
+        "src/asset-markup/index.ts"
+      ],
+      "media-asset-meta": [
+        "src/media-asset-meta.ts"
+      ],
+      "nested-runtime-guard": [
+        "src/nested-runtime-guard.ts"
+      ],
+      "runtime-boundary-env": [
+        "src/runtime-boundary-env.ts"
+      ],
+      "runtime-i18n": [
+        "src/runtime-i18n/index.ts"
+      ],
+      "product-time": [
+        "src/product-time.ts"
+      ],
+      "runtime-transport": [
+        "src/runtime-transport/index.ts"
+      ],
+      "document-preview": [
+        "src/document-preview.ts"
+      ],
+      "pptx-rendering": [
+        "src/pptx-rendering.ts"
+      ],
+      "eval-meta-info": [
+        "src/eval-meta-info.ts"
+      ],
+      "collection-policy": [
+        "src/collection-policy/index.ts"
+      ],
+      "collection-policy/matcher": [
+        "src/collection-policy/matcher.ts"
+      ],
+      "bounded-json-stringify": [
+        "src/bounded-json-stringify.ts"
+      ],
+      "comment-composer": [
+        "src/comment-composer.ts"
+      ],
+      "comment-anchor": [
+        "src/comment-anchor.ts"
+      ],
+      "comment-marker": [
+        "src/comment-marker.ts"
+      ],
+      "subagent-roles": [
+        "src/subagent-roles.ts"
+      ],
+      "image-dimensions": [
+        "src/image-dimensions.ts"
+      ],
+      "desktop-typography": [
+        "src/desktop-typography.ts"
+      ],
+      "desktop-appearance": [
+        "src/desktop-appearance.ts"
+      ],
+      "daily-signin": [
+        "src/daily-signin.ts"
+      ],
+      "miniapp-surface": [
+        "src/miniapp-surface.ts"
+      ],
+      "agent-mention": [
+        "src/agent-mention/index.ts"
+      ],
+      "agent-avatar": [
+        "src/agent-avatar.ts"
+      ],
+      "keyboard-shortcuts": [
+        "src/keyboard-shortcuts/index.ts"
+      ],
+      "product-build-identity": [
+        "src/product-build-identity.ts"
+      ],
+      "source-provenance": [
+        "src/source-provenance.ts"
+      ],
+      "safety-check-v2": [
+        "src/safety-check-v2.ts"
+      ],
+      "plugin-mention": [
+        "src/plugin-mention.ts"
+      ],
+      "local-runtime-agent-resource-instance": [
+        "src/local-runtime-agent-resource-instance.ts"
+      ],
+      "local-runtime-safety": [
+        "src/local-runtime-safety.ts"
+      ],
+      "local-runtime-skills": [
+        "src/local-runtime-skills.ts"
+      ],
+      "data-dir-variables": [
+        "src/data-dir-variables.ts"
+      ]
+    }
+  },
+  "dependencies": {
+    "@mavis/thrift-gen-client": "file:../thrift-gen-client",
+    "mdast-util-from-markdown": "^2.0.3",
+    "minimatch": "10.2.6",
+    "pino": "^9",
+    "pino-pretty": "^11"
+  }
+}

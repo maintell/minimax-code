@@ -8,7 +8,7 @@ id = "generic-api-key"
 [[rules.allowlists]]
 description = "Permission translation key, not a credential"
 condition = "AND"
-paths = ['''(^|/)packages/agent-modules/permission/src/tools/bash-checker\.ts$''']
+paths = ['''(^|/)(packages/agent-modules/permission/src/tools/bash-checker\.ts|apps/electron/vendor/@mavis/permission/dist/tools/bash-checker\.js)$''']
 regexTarget = "match"
 regexes = ['''^labelKey: 'permission\.scope\.byArgvPrefix2'$''']
 
@@ -29,7 +29,7 @@ regexes = ['''^page_token": "YhljsPiGfUgnVAg9urvRFd-BvSqRLxxxx"$''']
 [[rules.allowlists]]
 description = "PDF form field identifier, not an API key"
 condition = "AND"
-paths = ['''(^|/)(packages/local-runtime|dist)/assets/skills/pdf/templates/form-fill-acroform/cases/italy-schengen-visa-(zhangwei|example)/field_values\.case\.json$''']
+paths = ['''(^|/)(packages/local-runtime|dist|apps/electron/vendor/@mavis/local-runtime-v2)/assets/skills/pdf/templates/form-fill-acroform/cases/italy-schengen-visa-(zhangwei|example)/field_values\.case\.json$''']
 regexTarget = "match"
 regexes = ['''^key": "p1-place-of-birth"$''']
 
@@ -74,3 +74,47 @@ condition = "AND"
 paths = ['''(^|/)packages/local-runtime/test/unit/error-reporting-privacy\.test\.ts$''']
 regexTarget = "match"
 regexes = ['''^SECRET = 'SYNTHETIC_PRIVATE_4cd7'$''']
+
+[[rules.allowlists]]
+description = "Shipped renderer bundle: inert client telemetry token and minified property alias"
+condition = "AND"
+paths = ['''(^|/)apps/electron/out/_next/static/chunks/[^/]+\.js$''']
+regexTarget = "match"
+regexes = [
+  '''^clientToken:"e68bd4e5a0c245f1846d844521328e01"$''',
+  '''^t\.FourKeyMap=t\.TwoKeyMap=void $''',
+]
+
+[[rules.allowlists]]
+description = "Blazor runtime base64 alphabet table"
+condition = "AND"
+paths = ['''(^|/)apps/electron/resources/pptx-core/[^/]+/_framework/dotnet\.native\.[^/]+\.js$''']
+regexTarget = "match"
+regexes = ['''^keyStr = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\+/='$''']
+
+[[rules.allowlists]]
+description = "jszip base64 alphabet table"
+condition = "AND"
+paths = ['''(^|/)apps/electron/vendor/jszip/(lib/base64\.js|dist/jszip\.js)$''']
+regexTarget = "match"
+regexes = ['''^_keyStr = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\+/="$''']
+
+[[rules.allowlists]]
+description = "Vendored SQLite extension API table, no credential"
+condition = "AND"
+paths = ['''(^|/)apps/electron/vendor/better-sqlite3/deps/sqlite3/sqlite3(?:ext)?\.(?:c|h)$''']
+regexTarget = "match"
+regexes = [
+  '''^sqlite3_api->(?:column_bytes16|soft_heap_limit64|hard_heap_limit64)$''',
+  '''^iKey==FTS5_AVERAGES_ROWID $''',
+]
+
+[[rules]]
+id = "sourcegraph-access-token"
+
+[[rules.allowlists]]
+description = "Bundled pptx-core content hash, not a Sourcegraph token"
+condition = "AND"
+paths = ['''(^|/)apps/electron/resources/pptx-core/[^/]+/pptx-core-host\.js$''']
+regexTarget = "match"
+regexes = ['''^af42e4d6e3f54fb9b85cc9692d4e1bd6e4e91ed3"$''']

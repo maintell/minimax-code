@@ -12,5 +12,29 @@ tsconfig.standalone.json linguist-generated=true
 *.pdf -text
 *.gif -text
 *.mp4 -text
+# Binary payloads shipped with the desktop client (wasm kernels, fonts, native
+# modules, installer assets); never normalize their bytes.
+*.wasm -text
+*.br -text
+*.bcmap -text
+*.ttf -text
+*.woff -text
+*.node -text
+*.dll -text
+*.pfb -text
+*.icns -text
+*.ico -text
+*.dat -text
+*.bin -text
+*.pak -text
+# Prebuilt desktop-client content is a byte-for-byte recovery of the shipped
+# build (renderer bundles, resources, vendored runtime snapshots); it must not
+# be line-ending normalized. `!eol` clears the repository-wide `eol=lf` for
+# these paths. Restored sources under apps/electron/main keep LF normalization.
+apps/electron/out/** -text !eol
+apps/electron/public/** -text !eol
+apps/electron/model-menu/** -text !eol
+apps/electron/resources/** -text !eol
+apps/electron/vendor/** -text !eol
 # Preserve vendored Office schema bytes when importing the reviewed source archive.
 packages/local-runtime/assets/skills/xlsx/scripts/office/schemas/**/*.xsd -text

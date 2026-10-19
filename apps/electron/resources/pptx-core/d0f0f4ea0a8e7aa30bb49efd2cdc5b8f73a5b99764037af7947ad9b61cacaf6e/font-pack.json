@@ -1,0 +1,384 @@
+{
+  "schema": "mavis.pptx_font_pack_audit.v1",
+  "auditStatus": "approved",
+  "manifestVersion": "pptx-font-pack.v9",
+  "fallbackPolicyVersion": "pptx-font-fallback.v5",
+  "licenses": [
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/STIX-OFL.txt",
+      "sha256": "sha256:bec17cee6412788db45fd2644b301afbc99cc5d372ddd3345dc4a7bfdefb9f04"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/OFL.txt",
+      "sha256": "sha256:1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/Inter-LICENSE.txt",
+      "sha256": "sha256:262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/Montserrat-OFL.txt",
+      "sha256": "sha256:8b7141c03fa4f8d44e6345d5d4931709290f0f67875e452e95ac1fd3a027802e"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/RobotoCondensed-OFL.txt",
+      "sha256": "sha256:0e4cc6ece88573545be2ed25835363662a6182ba4a4c1b5c8feda52add30e8a6"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/Arvo-OFL.txt",
+      "sha256": "sha256:359671bf16c00cae69cb66d041296b2adc7a4becd73a463cb8c5e101d97c7986"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/Arimo-OFL.txt",
+      "sha256": "sha256:11cce536cd2f3864d767003af5dcd739e2e15818cf2279b6175edeadd3960992"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/NotoEmoji-OFL.txt",
+      "sha256": "sha256:500bb1ccf43df7bbb522112f9133a52b16e1c35e809632f5d8609b179152de5b"
+    }
+  ],
+  "fonts": [
+    {
+      "fontId": "stix-two-math",
+      "family": "STIX Two Math",
+      "aliases": [],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/STIXTwoMath-Regular.otf",
+      "sha256": "sha256:f2076b9f1676438439dd41e23676f5ab99056e83d6b8f8c27841591ef2ccfa72",
+      "byteLength": 838652,
+      "scripts": [
+        "Latn",
+        "Grek",
+        "Cyrl",
+        "Zmth"
+      ],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/STIX-OFL.txt"
+    },
+    {
+      "fontId": "carlito-regular",
+      "family": "Carlito",
+      "aliases": ["Calibri", "Aptos"],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Carlito-Regular.ttf",
+      "sha256": "sha256:f6418f708baede9789daef5d458c0f53d2a888af9820e8062934e504fedc6595",
+      "byteLength": 628032,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "fontId": "carlito-bold",
+      "family": "Carlito",
+      "aliases": ["Calibri", "Aptos"],
+      "style": "normal",
+      "weight": 700,
+      "stretch": 100,
+      "assetPath": "fonts/Carlito-Bold.ttf",
+      "sha256": "sha256:bb5d20f79b82599ec72983597437373a80f2d2085fa91fc144fd74e876a594db",
+      "byteLength": 682468,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "fontId": "carlito-italic",
+      "family": "Carlito",
+      "aliases": ["Calibri", "Aptos"],
+      "style": "italic",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Carlito-Italic.ttf",
+      "sha256": "sha256:0b019225e58d702bfedcbd35c21696769f8ee115cb6343f84c2f240312450d1c",
+      "byteLength": 615236,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "fontId": "carlito-bold-italic",
+      "family": "Carlito",
+      "aliases": ["Calibri", "Aptos"],
+      "style": "italic",
+      "weight": 700,
+      "stretch": 100,
+      "assetPath": "fonts/Carlito-BoldItalic.ttf",
+      "sha256": "sha256:b32928186c119599e03ca6a1ffc680fdcb7fac95772f4b95d989cf6cd3861517",
+      "byteLength": 808508,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "fontId": "noto-sans-sc-variable",
+      "family": "Noto Sans CJK SC",
+      "aliases": [
+        "Noto Sans SC",
+        "Microsoft YaHei",
+        "微软雅黑",
+        "SimHei",
+        "黑体",
+        "DengXian",
+        "等线"
+      ],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/NotoSansSC-VF.otf",
+      "sha256": "sha256:2745e9681cb9d8a5c8901b62c9e1bd98c9c774365fc3b84dd467621013b51cd3",
+      "byteLength": 30737452,
+      "scripts": ["Hans", "Hant", "Hani", "Hira", "Kana", "Hang", "Bopo", "Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "fontId": "noto-sans-symbols2-regular",
+      "family": "Noto Sans Symbols 2",
+      "aliases": ["Noto Sans Symbols2"],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/NotoSansSymbols2-Regular.ttf",
+      "sha256": "sha256:7d5fb73b7ca67a6798101741f5d280a3d016a56a197afcd4199dbb57b4b82a21",
+      "byteLength": 1233128,
+      "scripts": ["Zsym"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "fontId": "noto-color-emoji-colrv1",
+      "family": "Noto Color Emoji",
+      "aliases": ["Apple Color Emoji", "Segoe UI Emoji"],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Noto-COLRv1.ttf",
+      "sha256": "sha256:0ae57fe58645638523ba35f388d93739d292539a9acb84df5700c81b1e1a28d2",
+      "byteLength": 4991984,
+      "scripts": ["Zsye", "Zsym"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/NotoEmoji-OFL.txt"
+    },
+    {
+      "fontId": "inter-variable",
+      "family": "Inter",
+      "aliases": ["Inter Medium", "Inter SemiBold"],
+      "aliasWeights": { "Inter Medium": 500, "Inter SemiBold": 600 },
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/InterVariable.ttf",
+      "sha256": "sha256:4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf",
+      "byteLength": 879708,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Inter-LICENSE.txt"
+    },
+    {
+      "fontId": "arimo-variable",
+      "family": "Arimo",
+      "aliases": ["Arial", "Arial Unicode MS"],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Arimo-wght.ttf",
+      "sha256": "sha256:e43898b143ec826ac8cb4034816458a7047fbe0836558de2a1f8c6223ae3e0ca",
+      "byteLength": 496268,
+      "scripts": ["Latn", "Grek", "Cyrl", "Hebr"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Arimo-OFL.txt"
+    },
+    {
+      "fontId": "arimo-italic-variable",
+      "family": "Arimo",
+      "aliases": ["Arial", "Arial Unicode MS"],
+      "style": "italic",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Arimo-Italic-wght.ttf",
+      "sha256": "sha256:a80fc54fd0233c1dfe298577c4d00f5ae81d5bb83510975e473c47e699b7f4ed",
+      "byteLength": 543196,
+      "scripts": ["Latn", "Grek", "Cyrl", "Hebr"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Arimo-OFL.txt"
+    },
+    {
+      "fontId": "montserrat-variable",
+      "family": "Montserrat",
+      "aliases": [],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Montserrat-wght.ttf",
+      "sha256": "sha256:0f7b311b2f3279e4eef9b2f968bcdbab6e28f4daeb1f049f4f278a902bcd82f7",
+      "byteLength": 744936,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Montserrat-OFL.txt"
+    },
+    {
+      "fontId": "montserrat-italic-variable",
+      "family": "Montserrat",
+      "aliases": [],
+      "style": "italic",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Montserrat-Italic-wght.ttf",
+      "sha256": "sha256:51607f316bc020e59f03cbf51543eecffbea501c0b31d73e5b82927c5cca442c",
+      "byteLength": 762376,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Montserrat-OFL.txt"
+    },
+    {
+      "fontId": "roboto-condensed-variable",
+      "family": "Roboto Condensed",
+      "aliases": ["Roboto Condensed Light"],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 75,
+      "assetPath": "fonts/RobotoCondensed-wght.ttf",
+      "sha256": "sha256:dace262afcee68a5276f200d8026c57221735c0118ab5fda8c2c0d3dc409a8d0",
+      "byteLength": 371616,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/RobotoCondensed-OFL.txt"
+    },
+    {
+      "fontId": "roboto-condensed-italic-variable",
+      "family": "Roboto Condensed",
+      "aliases": ["Roboto Condensed Light"],
+      "style": "italic",
+      "weight": 400,
+      "stretch": 75,
+      "assetPath": "fonts/RobotoCondensed-Italic-wght.ttf",
+      "sha256": "sha256:78f643b1923008b00dfc9b371a2ecd4d80a017722925f1a3fac9940be56d1b7d",
+      "byteLength": 388124,
+      "scripts": ["Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/RobotoCondensed-OFL.txt"
+    },
+    {
+      "fontId": "arvo-regular",
+      "family": "Arvo",
+      "aliases": [],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Arvo-Regular.ttf",
+      "sha256": "sha256:f41bd41471ec2db7140351bdde614da5341524503598ff7fe79f3c89c13b605e",
+      "byteLength": 38780,
+      "scripts": ["Latn"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Arvo-OFL.txt"
+    },
+    {
+      "fontId": "arvo-bold",
+      "family": "Arvo",
+      "aliases": [],
+      "style": "normal",
+      "weight": 700,
+      "stretch": 100,
+      "assetPath": "fonts/Arvo-Bold.ttf",
+      "sha256": "sha256:6239b2edee762db0ab99343137c9ba15ae81fc843da2e76a0a395781748cc21f",
+      "byteLength": 37652,
+      "scripts": ["Latn"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Arvo-OFL.txt"
+    },
+    {
+      "fontId": "arvo-italic",
+      "family": "Arvo",
+      "aliases": [],
+      "style": "italic",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Arvo-Italic.ttf",
+      "sha256": "sha256:a2eb63a0771b8d13d8e54bf650a02aef813eeaa2e10f6298358e6b15d26c6686",
+      "byteLength": 35156,
+      "scripts": ["Latn"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Arvo-OFL.txt"
+    },
+    {
+      "fontId": "arvo-bold-italic",
+      "family": "Arvo",
+      "aliases": [],
+      "style": "italic",
+      "weight": 700,
+      "stretch": 100,
+      "assetPath": "fonts/Arvo-BoldItalic.ttf",
+      "sha256": "sha256:fc29e57f5558873e41ca9ff9a9c77521565f12c6972756d0fbcc592e1f0f4edb",
+      "byteLength": 36872,
+      "scripts": ["Latn"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Arvo-OFL.txt"
+    }
+  ],
+  "fallbackPolicy": {
+    "Hans": ["noto-sans-sc-variable"],
+    "Hant": ["noto-sans-sc-variable"],
+    "Hani": ["noto-sans-sc-variable"],
+    "Hira": ["noto-sans-sc-variable"],
+    "Kana": ["noto-sans-sc-variable"],
+    "Hang": ["noto-sans-sc-variable"],
+    "Bopo": ["noto-sans-sc-variable"],
+    "Latn": ["carlito-regular", "arimo-variable", "noto-sans-sc-variable", "noto-sans-symbols2-regular", "noto-color-emoji-colrv1"],
+    "Grek": ["carlito-regular", "arimo-variable", "noto-sans-sc-variable", "noto-sans-symbols2-regular", "noto-color-emoji-colrv1"],
+    "Cyrl": ["carlito-regular", "arimo-variable", "noto-sans-sc-variable", "noto-sans-symbols2-regular", "noto-color-emoji-colrv1"]
+  },
+  "defaultFontIds": ["carlito-regular", "arimo-variable", "noto-sans-sc-variable", "noto-sans-symbols2-regular", "noto-color-emoji-colrv1"],
+  "sources": [
+    {
+      "repository": "https://github.com/stipub/stixfonts",
+      "release": "v2.13",
+      "families": [
+        "STIX Two Math"
+      ],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "repository": "https://github.com/google/fonts",
+      "commit": "6a003b5eb672dc8bf5bff5937cf5863f8b175445",
+      "families": ["Carlito"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "repository": "https://github.com/notofonts/noto-cjk",
+      "commit": "f8d157532fbfaeda587e826d4cd5b21a49186f7c",
+      "families": ["Noto Sans SC"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "repository": "https://github.com/google/fonts",
+      "commit": "ade3d1533e06b2b1462ffcde8e08b129627ca360",
+      "families": [
+        "Noto Sans Symbols 2",
+        "Montserrat",
+        "Roboto Condensed",
+        "Arvo",
+        "Arimo"
+      ],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "repository": "https://github.com/googlefonts/noto-emoji",
+      "commit": "8998f5dd683424a73e2314a8c1f1e359c19e8742",
+      "families": ["Noto Color Emoji"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "repository": "https://github.com/rsms/inter",
+      "release": "v4.1",
+      "archiveSha256": "sha256:9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e",
+      "families": ["Inter"],
+      "licenseSpdx": "OFL-1.1"
+    }
+  ]
+}

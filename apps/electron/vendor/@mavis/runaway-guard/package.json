@@ -1,0 +1,16 @@
+{
+  "name": "@mavis/runaway-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Turn-local structured observation and bounded reminder policy for Mavis agents.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@mavis/agent-core": "file:../agent-core"
+  }
+}

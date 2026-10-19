@@ -1,0 +1,21 @@
+{
+  "name": "@mavis/agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pluggable extension layer on top of @mavis/agent-core: per-turn extension SPI + registry + assembleTurn assembler.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "import": "./dist/testing/index.js"
+    }
+  },
+  "dependencies": {
+    "@mavis/agent-core": "file:../agent-core",
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@sinclair/typebox": "^0.34.0"
+  }
+}

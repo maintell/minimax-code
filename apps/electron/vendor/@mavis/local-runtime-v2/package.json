@@ -1,0 +1,123 @@
+{
+  "name": "@mavis/local-runtime-v2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./process-local": {
+      "import": "./dist/local/host-contract.js"
+    },
+    "./cli-service": {
+      "import": "./dist/local/index.js"
+    },
+    "./logging": {
+      "import": "./dist/infra/logging/index.js"
+    },
+    "./wechat-sdk": {
+      "import": "./dist/service/channel-system/transport/wechat/sdk/index.js"
+    },
+    "./testing": {
+      "import": "./dist/infra/testing/index.js"
+    },
+    "./canonical-history": {
+      "import": "./dist/infra/file/canonical-history.js"
+    },
+    "./session-system": {
+      "import": "./dist/service/session-system/index.js"
+    },
+    "./turn-system": {
+      "import": "./dist/service/turn-system/index.js"
+    },
+    "./agent": {
+      "import": "./dist/service/agent/public.js"
+    }
+  },
+  "jscpd": {
+    "threshold": 5,
+    "reporters": [
+      "console"
+    ],
+    "minLines": 5,
+    "minTokens": 50,
+    "mode": "mild",
+    "format": [
+      "typescript"
+    ],
+    "ignore": [
+      "src/http/routing/bindings.gen.ts",
+      "src/http/routing/contracts.gen.ts",
+      "src/http/generated/**",
+      "src/**/*.test.ts"
+    ]
+  },
+  "knip": {
+    "entry": [
+      "src/index.ts!",
+      "scripts/memory-headless.mjs!",
+      "scripts/memory-executions.mjs!",
+      "src/local/host-contract.ts!",
+      "src/local/index.ts!",
+      "src/infra/logging/index.ts!",
+      "src/infra/testing/index.ts!",
+      "src/application/index.ts!",
+      "src/infra/file/canonical-history.ts!",
+      "src/service/session-system/index.ts!",
+      "src/service/turn-system/index.ts!",
+      "src/service/agent/public.ts!",
+      "src/service/turn-system/agent-host/index.ts!",
+      "src/service/turn-system/compaction/index.ts!",
+      "src/service/model-system/index.ts!",
+      "src/http/routing/bindings.gen.ts!",
+      "src/http/routing/contracts.gen.ts!",
+      "src/http/generated/**!",
+      "src/service/channel-system/transport/wechat/sdk/index.ts!"
+    ],
+    "project": [
+      "src/**/*.ts!",
+      "!src/**/*.test.ts!"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
+    "@mavis/agent-core": "file:../agent-core",
+    "@mavis/agent-extension": "file:../agent-extension",
+    "@mavis/agent-runtime": "file:../agent-runtime",
+    "@mavis/agent-tools": "file:../agent-tools",
+    "@mavis/config": "file:../config",
+    "@mavis/context-manager": "file:../context-manager",
+    "@mavis/conversation-contract": "file:../conversation-contract",
+    "@mavis/goal": "file:../goal",
+    "@mavis/local-runtime": "file:../local-runtime",
+    "@mavis/mcp": "file:../mcp",
+    "@mavis/permission": "file:../permission",
+    "@mavis/plugin-hooks": "file:../plugin-hooks",
+    "@mavis/protocol": "file:../protocol",
+    "@mavis/session-report": "file:../session-report",
+    "@mavis/shared": "file:../shared",
+    "@mavis/skills": "file:../skills",
+    "@mavis/system-reminder": "file:../system-reminder",
+    "@mavis/thrift-gen": "file:../thrift-gen",
+    "@minimax/mcode-sandbox-runtime": "file:../../@minimax/mcode-sandbox-runtime",
+    "@sinclair/typebox": "^0.34.0",
+    "better-sqlite3": "file:../../better-sqlite3",
+    "bmp-js": "0.1.0",
+    "croner": "^9",
+    "drizzle-orm": "^0.45.2",
+    "gpt-tokenizer": "3.4.0",
+    "handlebars": "^4.7.9",
+    "hono": "^4.7.11",
+    "js-yaml": "^4",
+    "jszip": "file:../../jszip",
+    "pngjs": "6.0.0",
+    "proper-lockfile": "^4",
+    "smol-toml": "1.7.0",
+    "typebox": "1.1.38",
+    "yaml": "^2.9.0"
+  }
+}

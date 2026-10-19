@@ -5,6 +5,7 @@ This repository is the reviewed public projection of an internal monorepo, not a
 ## Layout
 
 - `packages/` — first-party workspace packages. `packages/agent-modules/*` is a second level of packages, not a package itself.
+- `apps/` — first-party applications. `apps/electron` is the desktop client (restored from the publicly distributed build; see `docs/desktop-client.md`). It is installed standalone (`pnpm install --ignore-workspace` inside the directory), is not a workspace member, and is not part of `packageRoots`.
 - `third_party/` — vendored upstream packages (`pi-mono`, `sandbox-runtime`) with their own licenses. Their test suites are not part of this distribution's verification.
 - `release/` — machine-read release contracts. `extraction.json` pins the source baseline and package scope, `public-source.json` is the file inventory, `dependency-licenses.json` records declared dependency licenses. Build, type-check, test resolution, and source checks all read from here.
 - `docs/` — human-readable documentation and supporting media.
@@ -38,6 +39,7 @@ Never merge internal Git history or cherry-pick internal commits into this repos
 | Package export → source file | each package's `exports` via `scripts/lib/package-exports.mjs` | `tsconfig.standalone.json`, `vitest.oss.config.mjs` |
 | Vitest files per gate | `test/vitest-suites.json` | `vitest.oss.config.mjs`, `scripts/run-vitest-suite.mjs` |
 | Retired source paths | `scripts/lib/retired-sources.mjs` | `check:source` (must not exist), `check:standalone` (must not be bundled) |
+| Published-client string exceptions | `scripts/lib/published-client-exceptions.mjs` | `check:source` (internal-reference pattern) |
 | Verification pipeline | `scripts/verify.mjs` | GitHub CI, `pnpm verify` |
 | Documentation-only classification | `scripts/ci-changes.mjs` | source verification, release audit |
 | Source archive validation/extraction | `scripts/lib/source-archive.mjs` | source export, candidate validation |
@@ -45,6 +47,8 @@ Never merge internal Git history or cherry-pick internal commits into this repos
 ## Common changes
 
 Adding a workspace package: add it to `pnpm-workspace.yaml` and to `packageRoots` in `release/extraction.json`, then run `pnpm gen:tsconfig` and `node scripts/source-inventory.mjs --write`.
+
+Changing the desktop client: build and verify it inside `apps/electron` (`pnpm build`, `pnpm package`); its files are inventoried like any other published file, and any new internal-reference string it carries must be reviewed and, when it comes from the shipped build, declared in `scripts/lib/published-client-exceptions.mjs`.
 
 Changing package exports: run `pnpm gen:tsconfig` after adding or changing an export subpath.
 

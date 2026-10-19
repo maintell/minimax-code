@@ -1,0 +1,12 @@
+# The vendored dependency snapshots must ship their compiled `dist/` output —
+# that is the runtime JavaScript the client loads. The repository-root `dist/`
+# rule is unanchored, so it would otherwise drop every vendored package's
+# build output. `apps/electron/dist` (this package's own build directory)
+# stays ignored through the root rule.
+!vendor/**/dist/
+!vendor/**/dist/**
+# Nested dependency copies inside a vendored package are part of the shipped
+# resolution order (Node resolves them before the top-level copy), so they ship
+# as well. `apps/electron/node_modules` stays ignored through the root rule.
+!vendor/**/node_modules/
+!vendor/**/node_modules/**

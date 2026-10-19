@@ -5,6 +5,7 @@ import { gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
 import { inventoryPath, readExtraction } from "./lib/release-metadata.mjs";
 import { retiredSourceRoots } from "./lib/retired-sources.mjs";
+import { publishedClientExceptions } from "./lib/published-client-exceptions.mjs";
 import { readSuites, suiteInventoryViolations } from "./lib/vitest-suites.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -16,6 +17,8 @@ const skipped = new Set([
   ".pnpm-store",
   ".turbo",
   ".DS_Store",
+  // Local agent-harness tooling: never tracked, so it cannot be published.
+  ".opencode",
 ]);
 function filesIn(directory, prefix = "") {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -44,7 +47,7 @@ if (
     "LICENSE: expected MIT text with the reviewed MiniMax Code attribution",
   );
 const internalText =
-  /(?:[\w.-]+\.xaminim\.com|weaver\/idl|@mavis\/thrift-gen|\/Users\/minimax(?:\/|\b)|\/archon\/internal\/api\/)/u;
+  /(?:[\w.-]+\.xaminim\.com|weaver\/idl|@mavis\/thrift-gen|\/Users\/minimax(?:\/|\b)|\/archon\/internal\/api\/)/gu;
 const credential =
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/=\r\n]{100,}|\b(?:ghp_|github_pat_)[A-Za-z0-9_]{30,}|\bsk-[A-Za-z0-9_-]{32,}/u;
 for (const file of files) {
@@ -52,12 +55,32 @@ for (const file of files) {
     violations.push(`${file}: retired source`);
   if (/^(?:.*\/)?\.env(?:\.|$)/u.test(file) && !file.endsWith(".env.example"))
     violations.push(`${file}: environment file`);
-  if (file === "scripts/source-inventory.mjs") continue;
+  // These files necessarily contain the strings the checks detect: the check's
+  // own patterns, its exception list, and the generated inventory (a list of
+  // paths, which includes first-party package directories by name).
+  if (
+    file === "scripts/source-inventory.mjs" ||
+    file === "scripts/lib/published-client-exceptions.mjs" ||
+    file === inventoryPath
+  )
+    continue;
   let content = readFileSync(path.join(root, file));
   if (file.endsWith(".gz")) content = gunzipSync(content);
   const text = content.toString("utf8");
-  if (internalText.test(text))
-    violations.push(`${file}: internal source reference`);
+  // The published desktop client ships inert strings the pattern rejects; the
+  // exceptions list names them per file and nothing else is exempted.
+  const allowedStrings = new Set(publishedClientExceptions[file] ?? []);
+  const unexpectedInternal = [
+    ...new Set(
+      [...text.matchAll(internalText)]
+        .map((match) => match[0])
+        .filter((value) => !allowedStrings.has(value)),
+    ),
+  ];
+  if (unexpectedInternal.length)
+    violations.push(
+      `${file}: internal source reference (${unexpectedInternal.join(", ")})`,
+    );
   if (credential.test(text))
     violations.push(`${file}: possible embedded credential`);
 }

@@ -1,0 +1,14 @@
+{
+  "name": "@mavis/browser-core",
+  "version": "0.2.1",
+  "description": "Provider-neutral Browser Core shared by Electron and native headless Chrome.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}
