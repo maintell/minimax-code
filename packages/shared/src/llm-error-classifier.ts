@@ -45,6 +45,10 @@ export const LLM_RETRY_REASONS = [
   'rate_limited',
   'tpm_rate_limited',
   'overloaded',
+  // Server-side instability and an empty provider response are retried on the
+  // same fixed cadence; keep the retry event reason explicit for the UI.
+  'server_error',
+  'empty_response',
 ] as const;
 export type LLMRetryReason = (typeof LLM_RETRY_REASONS)[number];
 
