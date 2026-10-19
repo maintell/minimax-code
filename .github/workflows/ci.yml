@@ -51,7 +51,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only == 'false'
     name: verify (${{ matrix.os }}, ${{ matrix.node }})
-    timeout-minutes: 15
+    # The restored desktop client adds ~170 MB to the source scan and export
+    # gates; the full profile needs more than the previous 15-minute budget.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
