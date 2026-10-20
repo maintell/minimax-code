@@ -21,6 +21,7 @@
     ".github/workflows/ci.yml",
     ".github/workflows/cli-release.yml",
     ".github/workflows/compatibility.yml",
+    ".github/workflows/desktop-release.yml",
     ".github/workflows/label-issue-product.yml",
     ".github/workflows/performance.yml",
     ".github/workflows/security.yml",
