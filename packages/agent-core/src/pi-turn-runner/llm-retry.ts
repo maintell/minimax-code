@@ -16,10 +16,23 @@ import {
   type LLMRetryReason,
   type NormalizedLLMError,
 } from '@mavis/shared/llm-error-classifier';
+import { UNBOUNDED_RETRY_ATTEMPTS } from '@mavis/shared/llm-retry-event';
 
 function isByokProvider(provider: string): boolean {
   return provider === 'minimax_api' || provider.startsWith('custom_provider:');
 }
+
+/**
+ * Errors that stay terminal even for a retry-everything provider. Retrying them
+ * cannot succeed by waiting: the credential is wrong, or the account has no
+ * quota left. Everything else — transport, 5xx, overload, unknown shapes — keeps
+ * retrying on the fixed cadence.
+ */
+const BYOK_TERMINAL_ERROR_KINDS: ReadonlySet<LLMMetricErrorKind> = new Set([
+  'auth',
+  'usage_limit',
+  'credits_exhausted',
+]);
 
 export type LLMCallScope = 'agent' | 'compaction' | 'title';
 export type LLMRetryStatus = 'waiting' | 'recovered' | 'exhausted' | 'cancelled';
@@ -57,7 +70,7 @@ export interface LLMRetryPolicy {
  * deterministic request rejections stay terminal — see `failureResult`.
  */
 export const DEFAULT_LLM_RETRY_POLICY: Readonly<LLMRetryPolicy> = {
-  maxRetries: 1_000_000,
+  maxRetries: UNBOUNDED_RETRY_ATTEMPTS,
   baseDelayMs: 3_000,
   maxDelayMs: 30_000,
   maxRetryElapsedMs: Number.POSITIVE_INFINITY,
@@ -593,16 +606,18 @@ function failureResult(input: {
     explicitAbort: input.final?.stopReason === 'aborted',
   });
   // BYOK retries every pre-output failure because custom gateways report errors
-  // inconsistently, but some failures are deterministic: a model safety refusal,
-  // or a request the provider rejects as invalid (too many images, or an HTTP
-  // 400 `invalid_request_error`). Retrying those only re-sends the same request,
-  // repeats (and may re-bill) the rejection and delays the actionable error by
-  // the whole backoff window. The deterministic check excludes anything that
-  // also looks transient (timeout, network, 408/429/5xx).
+  // inconsistently, but three failures cannot be fixed by waiting: a wrong
+  // credential (`auth`), an exhausted usage plan or credits. Retrying those just
+  // hides the actionable error for days on the unbounded budget. A model safety
+  // refusal and a deterministic request rejection (too many images, HTTP 400
+  // `invalid_request_error`, oversized body) are terminal for the same reason.
+  // The deterministic check excludes anything that also looks transient
+  // (timeout, network, 408/429/5xx).
   const decision =
     input.retryAllErrors &&
     !normalized.facts.explicitAbort &&
     !normalized.facts.signals.has('refusal') &&
+    !BYOK_TERMINAL_ERROR_KINDS.has(toLLMMetricErrorKind(normalized.facts)) &&
     !isLLMDeterministicRequestRejection(normalized)
       ? { retryable: true, reason: 'network' as const }
       : toLLMRetryDecision(normalized);
