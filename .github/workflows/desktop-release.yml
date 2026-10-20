@@ -86,8 +86,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/assets"
-          cp "dist/installers/MiniMax Code Setup ${{ steps.meta.outputs.version }}.exe" "$RUNNER_TEMP/assets/"
-          cp "dist/installers/MiniMax Code Setup ${{ steps.meta.outputs.version }}.exe.blockmap" "$RUNNER_TEMP/assets/"
+          # The artifact name is pinned by electron-builder.yml; globbing keeps
+          # this step independent of it while still asserting a single installer.
+          exe_count=$(ls -1 dist/installers/*.exe 2>/dev/null | wc -l)
+          test "$exe_count" = "1" || { echo "expected one installer, found $exe_count" >&2; ls -l dist/installers >&2; exit 1; }
+          cp dist/installers/*.exe "$RUNNER_TEMP/assets/"
+          cp dist/installers/*.exe.blockmap "$RUNNER_TEMP/assets/"
           cp dist/installers/latest.yml "$RUNNER_TEMP/assets/"
           ls -l "$RUNNER_TEMP/assets"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
