@@ -44,6 +44,12 @@ Native modules are shipped prebuilt for Electron 42 (extracted from the
 installed client), therefore `npmRebuild` is disabled in
 `electron-builder.yml` and no local toolchain is required.
 
+`pnpm package` exists for local verification. **Releases are built by GitHub
+Actions**: run the `Desktop release` workflow (or push a `desktop-v<version>` tag
+matching `package.json`), which packages the client on `windows-latest` and
+publishes the installer, its blockmap and `latest.yml` to the release. Do not
+hand-publish a workstation build.
+
 ## Dependency policy
 
 - First-party and native dependencies are vendored from the shipped client

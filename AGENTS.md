@@ -41,6 +41,7 @@ Never merge internal Git history or cherry-pick internal commits into this repos
 | Retired source paths | `scripts/lib/retired-sources.mjs` | `check:source` (must not exist), `check:standalone` (must not be bundled) |
 | Published-client string exceptions | `scripts/lib/published-client-exceptions.mjs` | `check:source` (internal-reference pattern) |
 | Verification pipeline | `scripts/verify.mjs` | GitHub CI, `pnpm verify` |
+| Desktop packaging and release | `.github/workflows/desktop-release.yml` | GitHub Actions (tag `desktop-v*`, manual dispatch) |
 | Documentation-only classification | `scripts/ci-changes.mjs` | source verification, release audit |
 | Source archive validation/extraction | `scripts/lib/source-archive.mjs` | source export, candidate validation |
 
@@ -49,6 +50,8 @@ Never merge internal Git history or cherry-pick internal commits into this repos
 Adding a workspace package: add it to `pnpm-workspace.yaml` and to `packageRoots` in `release/extraction.json`, then run `pnpm gen:tsconfig` and `node scripts/source-inventory.mjs --write`.
 
 Changing the desktop client: build and verify it inside `apps/electron` (`pnpm build`, `pnpm package`); its files are inventoried like any other published file, and any new internal-reference string it carries must be reviewed and, when it comes from the shipped build, declared in `scripts/lib/published-client-exceptions.mjs`.
+
+Releasing the desktop client: commit the change, then let GitHub Actions package it — run the `Desktop release` workflow (or push a `desktop-v<version>` tag matching `apps/electron/package.json`). Do not hand-publish installer builds from a workstation; the workflow uploads the installer, its blockmap and `latest.yml` to the release.
 
 Changing package exports: run `pnpm gen:tsconfig` after adding or changing an export subpath.
 
