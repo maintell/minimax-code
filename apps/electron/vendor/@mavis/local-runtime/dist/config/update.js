@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { getConfig, getConfigPath, minimaxApiModels, parseConfigText, resetConfig, serializeConfigPreservingComments, } from '@mavis/config';
 import lockfile from 'proper-lockfile';
 import { LocalConfigValidationError, readLocalRawConfig } from './raw-config.js';
-import { assertMutableConfigField, assertSafeConfigRecord, DANGEROUS_CONFIG_PATH_SEGMENTS, isPlainRecord, validateLocalConfigValue, validateReviewConfigRecord, } from './update-policy.js';
+import { assertMutableConfigField, assertSafeConfigRecord, DANGEROUS_CONFIG_PATH_SEGMENTS, isPlainRecord, validateLocalConfigValue, validateReviewConfigRecord, validateSubagentConfigRecord, } from './update-policy.js';
 const LOCAL_CONFIG_WRITE_ERROR_MESSAGE = 'Local runtime failed to update config file';
 const LOCAL_CONFIG_FILE_MODE = 0o600;
 class LocalConfigWriteError extends Error {
@@ -225,14 +225,21 @@ function applyLocalConfigUpdate(raw, body) {
         if (Object.prototype.hasOwnProperty.call(body, 'put')) {
             if (field === 'review.mode' ||
                 field === 'review.turnDiffCard' ||
-                field === 'worktreeRefreshBeforeCreate') {
+                field === 'permission.nativeDelete' ||
+                field === 'worktreeRefreshBeforeCreate' ||
+                field === 'subagent.maxConcurrentPerSession') {
                 throw new LocalConfigValidationError(`Unsupported config update operation for ${field}`);
             }
             const [target, key] = resolvePath(raw, field);
             const current = isPlainRecord(target[key]) ? target[key] : {};
             const patch = isPlainRecord(body.put) ? body.put : {};
             assertSafeConfigRecord(patch);
-            target[key] = deepMergeRecord(current, field === 'review' ? validateReviewConfigRecord(patch) : patch);
+            const validatedPatch = field === 'review'
+                ? validateReviewConfigRecord(patch)
+                : field === 'subagent'
+                    ? validateSubagentConfigRecord(patch)
+                    : patch;
+            target[key] = deepMergeRecord(current, validatedPatch);
             return;
         }
         throw new LocalConfigValidationError(`Unsupported config update operation for ${field}`);

@@ -1,5 +1,6 @@
 import { PPTX_DIAGNOSTIC_POLICY_BY_CODE_V1, } from './pptx-diagnostic-policy.generated.js';
 import { PPTX_PREVIEW_LIMITS_V1, PPTX_PREVIEW_LIMITS_VERSION_V1, } from './pptx-preview-limits.generated.js';
+import { normalizePptxErrorTraceV1, normalizePptxNodeProfileV1 } from './pptx-telemetry.js';
 import { PPTX_ANIMATION_EVALUATION_SCHEMA_V1, PPTX_CORE_SESSION_SCHEMA_V1, PPTX_CORE_STREAM_CHUNK_BYTES_V1, PPTX_CORE_STREAM_MAX_UNACKNOWLEDGED_V1, PPTX_CORE_STREAM_SCHEMA_V1, PPTX_DECK_SUMMARY_SCHEMA_V1, PPTX_DIAGNOSTIC_REPORT_SCHEMA_V1, PPTX_RENDER_RESOURCE_SCHEMA_V1, PPTX_RENDER_WIRE_LIMITS_V1, PPTX_SELECTION_RESOURCE_SCHEMA_V1, PPTX_SLIDE_ANIMATION_SCHEMA_V1, PPTX_SLIDE_NOTES_SCHEMA_V1, PPTX_SLIDE_RENDER_SCHEMA_V1, PPTX_SLIDE_SELECTION_MODEL_SCHEMA_V1, PPTX_SLIDE_SELECTION_MODEL_SCHEMA_V2, PPTX_TEXT_SEARCH_SCHEMA_V1, PPTX_TRANSITION_EVALUATION_SCHEMA_V1, SAFE_PACKAGE_HANDLE_SCHEMA_V1, } from './pptx-rendering-contract.js';
 import { DIAGNOSTIC_REASON, MEDIA_TYPE, NOTES_DIAGNOSTIC_CODE, NOTES_LANGUAGE_HINT, NOTES_LIMITS_V1, PPTX_DIAGNOSTIC_STAGES_V1, PPT_DOCUMENT_HASH, PPT_DOCUMENT_ID, PPT_DOCUMENT_REVISION, PPT_NODE_ID, TEXT_SEARCH_LIMITS_V1, booleanValue, boundedNotesText, boundedSourceText, boundedStrings, boundedText, decodeNotesSourceAnchorV1, decodeRect, decodeRenderNode, decodeRenderResourceRef, deepFreezeWire, exactKeys, finiteInteger, nonNegativeInteger, opaque, partUri, pptIdentity, record, renderHash, renderNodeId, renderResourceId, sha256, } from './pptx-wire-validation.js';
 export function decodePptxCoreCreateSessionInputV1(value) {
@@ -474,7 +475,16 @@ export function decodePptxSlideRenderV1(value, expected = {}) {
     }
     const diagnostics = tree.diagnostics.map((diagnosticValue, index) => {
         const item = record(diagnosticValue, `diagnostic ${index}`);
-        exactKeys(item, ['code', 'stage', 'severity', 'disposition', 'promotionImpact', 'sourceNodeId', 'reason'], `diagnostic ${index}`);
+        exactKeys(item, [
+            'code',
+            'stage',
+            'severity',
+            'disposition',
+            'promotionImpact',
+            'sourceNodeId',
+            'reason',
+            ...DIAGNOSTIC_TELEMETRY_KEYS.filter((key) => Object.hasOwn(item, key)),
+        ], `diagnostic ${index}`);
         const code = boundedText(item.code, 'diagnostic code', 256);
         const policy = PPTX_DIAGNOSTIC_POLICY_BY_CODE_V1[code];
         if (!policy ||
@@ -494,6 +504,7 @@ export function decodePptxSlideRenderV1(value, expected = {}) {
                 ? null
                 : pptIdentity(item.sourceNodeId, PPT_NODE_ID, 'diagnostic sourceNodeId'),
             reason: boundedText(item.reason, 'diagnostic reason', 256),
+            ...decodeDiagnosticTelemetryV1(item),
         });
     });
     if (!['supported', 'supported-static-approximation', 'unsupported-terminal'].includes(String(tree.capability)))
@@ -525,6 +536,142 @@ export function decodePptxSlideRenderV1(value, expected = {}) {
         throw new TypeError('stale slide render revision');
     return decoded;
 }
+/** Telemetry-only diagnostic fields: an invalid value is dropped, never fails the slide. */
+const DIAGNOSTIC_TELEMETRY_KEYS = ['font', 'sourceNodeKind', 'sourceNodeProfile', 'errorTrace'];
+function nodeKindTokenOrUndefined(value) {
+    return typeof value === 'string' && /^[a-zA-Z]{1,32}$/u.test(value) ? value : undefined;
+}
+function decodeRenderFontSubstitutionV1(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return undefined;
+    const font = value;
+    const keys = Object.keys(font).sort().join(',');
+    if (keys !== 'requested,resolvedFontId,script' ||
+        typeof font.requested !== 'string' ||
+        typeof font.script !== 'string' ||
+        typeof font.resolvedFontId !== 'string' ||
+        !/^[A-Za-z]{1,16}$/u.test(font.script) ||
+        !/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(font.resolvedFontId)) {
+        return undefined;
+    }
+    return Object.freeze({
+        requested: [...font.requested.normalize('NFC')].slice(0, 128).join(''),
+        script: font.script,
+        resolvedFontId: font.resolvedFontId,
+    });
+}
+function decodeDiagnosticTelemetryV1(item) {
+    try {
+        const font = decodeRenderFontSubstitutionV1(item.font);
+        const sourceNodeKind = nodeKindTokenOrUndefined(item.sourceNodeKind);
+        const sourceNodeProfile = normalizePptxNodeProfileV1(item.sourceNodeProfile);
+        const errorTrace = normalizePptxErrorTraceV1(item.errorTrace);
+        return {
+            ...(font ? { font } : {}),
+            ...(sourceNodeKind ? { sourceNodeKind } : {}),
+            ...(sourceNodeProfile ? { sourceNodeProfile } : {}),
+            ...(errorTrace ? { errorTrace } : {}),
+        };
+    }
+    catch {
+        return {};
+    }
+}
+export const PPTX_SLIDE_TELEMETRY_BYTES_V1 = 8 * 1024;
+/** A malformed/oversized observation is omitted, never promoted to a rendering failure. */
+export function decodePptxSlideTelemetryV1(value) {
+    try {
+        if (!value || typeof value !== 'object' || Array.isArray(value))
+            return undefined;
+        const input = value;
+        if (!Array.isArray(input.diagnostics))
+            return undefined;
+        const diagnostics = [];
+        const diagnosticCount = Number.isSafeInteger(input.diagnosticCount) &&
+            input.diagnosticCount >= input.diagnostics.length
+            ? Math.min(input.diagnosticCount, 1_000_000)
+            : Math.min(input.diagnostics.length, 1_000_000);
+        let truncated = input.truncated === true || input.diagnostics.length > 32;
+        for (const raw of input.diagnostics.slice(0, 32)) {
+            try {
+                const item = record(raw, 'telemetry diagnostic');
+                if (typeof item.code !== 'string' ||
+                    !Object.hasOwn(PPTX_DIAGNOSTIC_POLICY_BY_CODE_V1, item.code)) {
+                    truncated = true;
+                    continue;
+                }
+                const code = item.code;
+                const policy = PPTX_DIAGNOSTIC_POLICY_BY_CODE_V1[code];
+                if (typeof item.reason !== 'string' || item.reason.length > 256) {
+                    truncated = true;
+                    continue;
+                }
+                if (item.sourceNodeId !== null &&
+                    (typeof item.sourceNodeId !== 'string' || !PPT_NODE_ID.test(item.sourceNodeId))) {
+                    truncated = true;
+                    continue;
+                }
+                const diagnostic = Object.freeze({
+                    code,
+                    stage: policy.stage,
+                    severity: policy.severity,
+                    disposition: policy.disposition,
+                    promotionImpact: policy.promotionImpact,
+                    sourceNodeId: item.sourceNodeId,
+                    reason: item.reason,
+                    ...decodeDiagnosticTelemetryV1(item),
+                });
+                const candidate = {
+                    diagnostics: [...diagnostics, diagnostic],
+                    diagnosticCount,
+                    // `false` is one byte longer than `true`; reserve the larger envelope.
+                    truncated: false,
+                };
+                if (new TextEncoder().encode(JSON.stringify(candidate)).byteLength >
+                    PPTX_SLIDE_TELEMETRY_BYTES_V1) {
+                    truncated = true;
+                    break;
+                }
+                diagnostics.push(diagnostic);
+            }
+            catch {
+                truncated = true;
+            }
+        }
+        return Object.freeze({ diagnostics: Object.freeze(diagnostics), diagnosticCount, truncated });
+    }
+    catch {
+        return undefined;
+    }
+}
+function decodeSlideTerminalReasonV1(value, diagnosticCodes) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return undefined;
+    const item = value;
+    const allowed = new Set(['code', 'reason', 'nodeKind', 'nodeProfile', 'count']);
+    if (Object.keys(item).some((key) => !allowed.has(key)))
+        return undefined;
+    const code = item.code;
+    const nodeKind = nodeKindTokenOrUndefined(item.nodeKind);
+    if (!diagnosticCodes.includes(code) ||
+        typeof item.reason !== 'string' ||
+        item.reason.length > 128 ||
+        !DIAGNOSTIC_REASON.test(item.reason) ||
+        !nodeKind ||
+        !Number.isSafeInteger(item.count) ||
+        item.count < 1 ||
+        item.count > 100_000) {
+        return undefined;
+    }
+    const nodeProfile = normalizePptxNodeProfileV1(item.nodeProfile);
+    return Object.freeze({
+        code,
+        reason: item.reason,
+        nodeKind,
+        ...(nodeProfile ? { nodeProfile } : {}),
+        count: item.count,
+    });
+}
 export function decodePptxSlideRenderOutcomeV1(value, expected = {}) {
     const input = record(value, 'slide render outcome');
     if (input.kind === 'rendered') {
@@ -537,7 +684,12 @@ export function decodePptxSlideRenderOutcomeV1(value, expected = {}) {
     if (input.kind !== 'slide-terminal') {
         throw new TypeError('slide render outcome kind is invalid');
     }
-    exactKeys(input, ['kind', 'slideIndex', 'diagnosticCodes'], 'slide render outcome');
+    exactKeys(input, [
+        'kind',
+        'slideIndex',
+        'diagnosticCodes',
+        ...['diagnosticReasons', 'errorTrace'].filter((key) => Object.hasOwn(input, key)),
+    ], 'slide render outcome');
     const slideIndex = nonNegativeInteger(input.slideIndex, 'slide terminal index', 10_000);
     if (expected.slideIndex !== undefined && slideIndex !== expected.slideIndex) {
         throw new TypeError('stale slide terminal outcome');
@@ -552,8 +704,31 @@ export function decodePptxSlideRenderOutcomeV1(value, expected = {}) {
     if (diagnosticCodes.length === 0) {
         throw new TypeError('slide terminal outcome must contain a diagnostic code');
     }
-    return Object.freeze({ kind: 'slide-terminal', slideIndex, diagnosticCodes });
+    const diagnosticReasons = Array.isArray(input.diagnosticReasons)
+        ? input.diagnosticReasons
+            .slice(0, SLIDE_TERMINAL_REASON_LIMIT_V1)
+            .map((item) => {
+            try {
+                return decodeSlideTerminalReasonV1(item, diagnosticCodes);
+            }
+            catch {
+                return undefined;
+            }
+        })
+            .filter((item) => item !== undefined)
+        : [];
+    const errorTrace = normalizePptxErrorTraceV1(input.errorTrace);
+    return Object.freeze({
+        kind: 'slide-terminal',
+        slideIndex,
+        diagnosticCodes,
+        ...(diagnosticReasons.length > 0
+            ? { diagnosticReasons: Object.freeze(diagnosticReasons) }
+            : {}),
+        ...(errorTrace ? { errorTrace } : {}),
+    });
 }
+const SLIDE_TERMINAL_REASON_LIMIT_V1 = 32;
 function diagnosticStatusV1(diagnostics) {
     if (diagnostics.some((diagnostic) => diagnostic.severity === 'terminal'))
         return 'terminal';
@@ -1571,4 +1746,5 @@ export function decodePptxTransitionEvaluationV1(value, expected = {}) {
     return decoded;
 }
 export * from './pptx-rendering-contract.js';
+export * from './pptx-telemetry.js';
 //# sourceMappingURL=pptx-rendering.js.map

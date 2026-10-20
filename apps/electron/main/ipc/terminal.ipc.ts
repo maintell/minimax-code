@@ -7,54 +7,102 @@
  * on this contract; renaming a channel here is a breaking change.
  */
 import { ipcMain } from "electron";
+import { LOCAL_DESKTOP_RUNTIME_ID, isDesktopRuntimeId, sshProjectIdFromRuntimeId } from "@mavis/shared/desktop-runtime";
 import { IPC_CHANNELS } from "../config/constants";
 import { logger } from "../utils";
 import { getTerminalManager } from "../modules/terminal";
+import { resolveSshRuntimeTarget } from "../modules/ssh-runtime/config";
+import { prepareSshAuthentication } from "../modules/ssh-runtime/ssh-authentication";
+import { buildSshTerminalSpawnSpec } from "../modules/ssh-runtime/ssh-command";
+import { sshExecution } from "../modules/ssh-runtime/ssh-execution.js";
+import { SshOutputProtocol } from "../modules/ssh-runtime/ssh-output-protocol.js";
 let registered = false;
 /**
  * Register every `terminal:*` IPC handler. Idempotent so it can be called
  * from `setupAllIPC` without guarding at the call site.
  */
-export function setupTerminalIPC() {
+export function setupTerminalIPC(options = {}) {
     if (registered)
         return;
     registered = true;
     ipcMain.handle(IPC_CHANNELS.TERMINAL_CREATE, async (_evt, params) => {
         requireString(params?.sessionId, 'sessionId');
         requireString(params?.cwd, 'cwd');
+        const runtimeId = requireRuntimeId(params.runtimeId);
+        if (runtimeId !== LOCAL_DESKTOP_RUNTIME_ID) {
+            const target = requireSshTarget(runtimeId, options);
+            if (target.workspaceDir !== params.cwd) {
+                throw new Error('terminal:create: SSH project runtime is unavailable');
+            }
+            const targetIdentity = JSON.stringify(target);
+            const spec = buildSshTerminalSpawnSpec(target);
+            const mode = await sshExecution.selectMode(target.endpoint);
+            // The connection may have been disabled while mode detection was pending.
+            const currentTarget = requireSshTarget(runtimeId, options);
+            if (JSON.stringify(currentTarget) !== targetIdentity) {
+                throw new Error('terminal:create: SSH project changed during connection');
+            }
+            const initialInput = mode === 'shell-stdin'
+                ? new SshOutputProtocol().shellInput(spec.args[spec.args.length - 1])
+                : undefined;
+            const authentication = await prepareSshAuthentication(target.endpoint);
+            try {
+                if (JSON.stringify(requireSshTarget(runtimeId, options)) !== targetIdentity) {
+                    throw new Error('terminal:create: SSH project changed during connection');
+                }
+                return await getTerminalManager().createProgram(params.sessionId, {
+                    ...spec,
+                    ...(initialInput ? { args: spec.args.slice(0, -1), initialInput } : {}),
+                    shellType: 'bash',
+                    title: target.host,
+                    runtimeId,
+                    ...(authentication
+                        ? { env: authentication.env, onDispose: authentication.dispose }
+                        : {}),
+                });
+            }
+            catch (error) {
+                authentication?.dispose();
+                throw error;
+            }
+        }
         return getTerminalManager().create({
             sessionId: params.sessionId,
             cwd: params.cwd,
             shellOverride: params.shellOverride,
+            runtimeId: LOCAL_DESKTOP_RUNTIME_ID,
         });
     });
     ipcMain.handle(IPC_CHANNELS.TERMINAL_LIST, async (_evt, params) => {
         requireString(params?.sessionId, 'sessionId');
-        return getTerminalManager().list({ sessionId: params.sessionId });
+        return getTerminalManager().list({
+            sessionId: params.sessionId,
+            runtimeId: requireAvailableRuntime(params.runtimeId, options),
+        });
     });
     ipcMain.handle(IPC_CHANNELS.TERMINAL_ATTACH, async (evt, params) => {
         requireString(params?.terminalId, 'terminalId');
         requirePositiveInt(params?.cols, 'cols');
         requirePositiveInt(params?.rows, 'rows');
         const subscriber = wrapWebContents(evt.sender);
-        return getTerminalManager().attach(params.terminalId, subscriber, params.cols, params.rows);
+        return getTerminalManager().attach(params.terminalId, subscriber, params.cols, params.rows, requireAvailableRuntime(params.runtimeId, options));
     });
     ipcMain.handle(IPC_CHANNELS.TERMINAL_INPUT, async (_evt, params) => {
         requireString(params?.terminalId, 'terminalId');
         if (typeof params?.data !== 'string') {
             throw new Error('terminal:input: data must be a string');
         }
-        getTerminalManager().write(params.terminalId, params.data);
+        getTerminalManager().write(params.terminalId, params.data, requireAvailableRuntime(params.runtimeId, options));
     });
     ipcMain.handle(IPC_CHANNELS.TERMINAL_RESIZE, async (_evt, params) => {
         requireString(params?.terminalId, 'terminalId');
         requirePositiveInt(params?.cols, 'cols');
         requirePositiveInt(params?.rows, 'rows');
-        getTerminalManager().resize(params.terminalId, params.cols, params.rows);
+        getTerminalManager().resize(params.terminalId, params.cols, params.rows, requireAvailableRuntime(params.runtimeId, options));
     });
     ipcMain.handle(IPC_CHANNELS.TERMINAL_DISPOSE, async (_evt, params) => {
         requireString(params?.terminalId, 'terminalId');
-        getTerminalManager().dispose(params.terminalId);
+        getTerminalManager().dispose(params.terminalId, requireRuntimeId(params.runtimeId));
     });
     logger.info('[TerminalIPC] handlers registered');
 }
@@ -73,6 +121,31 @@ function requirePositiveInt(value, name) {
         !Number.isInteger(value)) {
         throw new Error(`terminal:* IPC: '${name}' must be a positive integer`);
     }
+}
+function requireRuntimeId(value) {
+    const runtimeId = value ?? LOCAL_DESKTOP_RUNTIME_ID;
+    if (!isDesktopRuntimeId(runtimeId)) {
+        throw new Error("terminal:* IPC: 'runtimeId' must be a valid Desktop Runtime id");
+    }
+    return runtimeId;
+}
+function requireAvailableRuntime(value, options) {
+    const runtimeId = requireRuntimeId(value);
+    if (runtimeId !== LOCAL_DESKTOP_RUNTIME_ID)
+        requireSshTarget(runtimeId, options);
+    return runtimeId;
+}
+function requireSshTarget(runtimeId, options) {
+    const projectId = sshProjectIdFromRuntimeId(runtimeId);
+    const project = projectId ? options.sshProjects?.getRuntimeTarget(projectId) : null;
+    const connection = project ? options.sshConnections?.get(project.host) : null;
+    if (!project || !connection?.enabled) {
+        throw new Error('terminal:* IPC: SSH project runtime is unavailable');
+    }
+    const target = resolveSshRuntimeTarget(project, connection);
+    if (!target)
+        throw new Error('terminal:* IPC: SSH project runtime is unavailable');
+    return target;
 }
 // ---------------------------------------------------------------------------
 // WebContents adapter

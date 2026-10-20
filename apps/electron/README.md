@@ -2,7 +2,7 @@
 
 This package is the desktop client of MiniMax Code: the Electron application
 whose shell, main process, renderer bundle and runtime resources were restored
-from the publicly distributed Windows build (`MiniMax Code` 3.1.1, Electron
+from the publicly distributed Windows build (`MiniMax Code` 3.1.4, Electron
 42.8.0). See [RESTORATION.md](./RESTORATION.md) for exactly what was recovered,
 how, and which parts are shipped as prebuilt artifacts.
 

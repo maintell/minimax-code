@@ -6,7 +6,7 @@ import { PluginCapabilityGenerationRegistry } from './mcp/generation-registry.js
 import { PluginMcpRuntime } from './mcp/runtime.js';
 import { PluginMiniAppPublicationController } from './plugin/runtime/miniapp/controller.js';
 import { prepareMiniAppTurn } from './plugin/runtime/miniapp/turn-preparation.js';
-import { deferred, assertOfficialMutationScope, revokeOfficialPluginSelection, assertPluginSystemPublicationAttached, capturePluginSystemTurnCapabilities, findLocalPlugin, ignoreFailure, normalizedPluginName, preparePluginSystemTurnCapabilities, runAfter, scopeKey, resolvePluginRepositoryScope, settleInBackground, waitForScopedOperation, } from './plugin-system-helpers.js';
+import { deferred, assertOfficialMutationScope, assertPluginNameAvailable, revokeOfficialPluginSelection, assertPluginSystemPublicationAttached, capturePluginSystemTurnCapabilities, findLocalPlugin, ignoreFailure, normalizedPluginName, preparePluginSystemTurnCapabilities, runAfter, scopeKey, resolvePluginRepositoryScope, settleInBackground, waitForScopedOperation, } from './plugin-system-helpers.js';
 import { LocalPluginDirectoryWatcher, } from './plugin/runtime/local-directory-watcher.js';
 import { MarketplacePreviewCache, PluginMarketplacePreview, } from './plugin/runtime/marketplace-preview.js';
 import { decidePreparedOfficialSync, handleIncompleteOfficialSync, OfficialPluginRecovery, prepareOfficialFullState, prepareOfficialMutation, waitForOfficialPublication, } from './plugin/runtime/official-operations.js';
@@ -222,10 +222,10 @@ export class PluginSystem {
         }
         return scope ? { ...scope } : undefined;
     }
-    async revokeOfficialSelection(pluginName, scope) {
+    async revokeOfficialSelection(pluginName, scope, reason) {
         this.assertUsable();
         assertOfficialMutationScope(scope, this.desiredScopeKey, this.readScope());
-        await this.options.onOfficialPluginRevoked?.({ pluginName, scope });
+        await this.options.onOfficialPluginRevoked?.({ pluginName, scope, ...(reason ? { reason } : {}) });
     }
     requestOfficialRecovery(expectedScope) {
         if (this.disposed ||
@@ -378,10 +378,7 @@ export class PluginSystem {
                 const currentInputs = await this.readSnapshotBuildInputs(this.readScope(), false, {});
                 const current = this.marketplacePreview.buildFromInputs(currentInputs);
                 const key = normalizedPluginName(prepared.plugin.name);
-                if (officialInstallations.some((item) => item.installed && normalizedPluginName(item.name) === key) ||
-                    current.localPlugins.some((item) => normalizedPluginName(item.name) === key)) {
-                    throw new PluginSystemError('PLUGIN_ALREADY_EXISTS', 'Plugin name is already installed');
-                }
+                assertPluginNameAvailable(prepared.plugin.name, officialInstallations, current);
                 const accepted = await this.packageStorage.acceptImportedLocalRoot(prepared.stagingRoot, prepared.plugin.name);
                 try {
                     const nextInputs = await this.readSnapshotBuildInputs(this.readScope(), false, {});
@@ -836,6 +833,7 @@ export class PluginSystem {
                         this.options.onCapabilitiesChanged?.(this.snapshot.turnCapabilities);
                     this.desiredSnapshot = adopted;
                     this.capabilityGenerations.replaceRevision(adopted.revision);
+                    settleInBackground(this.capabilityGenerations.adoptManagedServers(adopted.mcpServers));
                 },
             });
             if (!recovered && !prepared?.preparedRuntime) {
@@ -857,6 +855,7 @@ export class PluginSystem {
             this.options.onCapabilitiesChanged?.(this.snapshot.turnCapabilities);
         this.desiredSnapshot = published;
         this.capabilityGenerations.replace(published.revision, preparedRuntime, preparedPluginPublicationFinalizer(prepared));
+        await this.capabilityGenerations.adoptManagedServers(published.mcpServers);
         pending.completion?.resolve();
     }
     async publishWithCurrentRuntime(pending, prepared) {
@@ -878,6 +877,7 @@ export class PluginSystem {
             this.options.onCapabilitiesChanged?.(this.snapshot.turnCapabilities);
         this.desiredSnapshot = adopted;
         this.capabilityGenerations.replaceRevision(adopted.revision);
+        await this.capabilityGenerations.adoptManagedServers(adopted.mcpServers);
         pending.completion?.resolve();
         const finalize = preparedPluginPublicationFinalizer(prepared);
         if (finalize)

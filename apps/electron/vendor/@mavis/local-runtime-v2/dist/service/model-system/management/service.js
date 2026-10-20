@@ -6,7 +6,7 @@ import { assertModelSelectable as assertModelSelectableOperation, discoverModels
 import { ModelProviderServiceContext } from './service-context.js';
 import { parseProviderId } from '../resolution/model-key.js';
 import { createUserProvider as createUserProviderOperation, deleteUserProvider as deleteUserProviderOperation, duplicateUserProvider as duplicateUserProviderOperation, updateUserProvider as updateUserProviderOperation, } from './service-custom-provider-operations.js';
-import { getMinimaxApiKeyStatus as getMinimaxApiKeyStatusOperation, getMinimaxModelSource as getMinimaxModelSourceOperation, setMinimaxModelSource as setMinimaxModelSourceOperation, updateMinimaxModelContext as updateMinimaxModelContextOperation, upsertMinimaxApiKey as upsertMinimaxApiKeyOperation, } from './service-minimax-operations.js';
+import { deleteMinimaxApiKey as deleteMinimaxApiKeyOperation, getMinimaxApiKeyStatus as getMinimaxApiKeyStatusOperation, getMinimaxModelSource as getMinimaxModelSourceOperation, setMinimaxModelSource as setMinimaxModelSourceOperation, updateMinimaxModelContext as updateMinimaxModelContextOperation, upsertMinimaxApiKey as upsertMinimaxApiKeyOperation, } from './service-minimax-operations.js';
 import {} from '../contracts.js';
 import { buildBuiltinProviderView, buildCustomProviderView, } from '../catalog/provider-views.js';
 export { LocalModelProviderError } from '../contracts.js';
@@ -99,6 +99,9 @@ export class LocalModelProviderService {
         return updateUserModelParametersOperation(this.context, input);
     }
     async deleteUserProvider(input) {
+        if (input.providerId === MINIMAX_API_PROVIDER_ID) {
+            return deleteMinimaxApiKeyOperation(this.context);
+        }
         return deleteUserProviderOperation(this.context, input);
     }
     async testProvider(providerId, opts) {

@@ -1,5 +1,8 @@
+import { homedir } from 'node:os';
 import path from 'node:path';
-import { isRmCommand, parseRmTargets, parseWindowsNativeDelete, unwrapCommandWrappers, } from '@mavis/permission';
+import { isRmCommand, parseRmTargets, parseScriptPlainCommands, parseWindowsNativeDelete, resolvePermissionPath, splitCommand, splitShellSourceSegments, unwrapCommandWrappers, unwrapBashCommandWrappers, } from '@mavis/permission';
+import { shellSourceStages } from '@mavis/shared/shell-source-stages';
+import { gitBashPathSafetyReason } from './git-bash-path-safety.js';
 function parseDirectTrashTargets(command) {
     const [program, ...tokens] = tokenizeWindowsCommand(command);
     if (!program || normalizeWindowsProgramName(program) !== 'mavis-trash')
@@ -17,30 +20,36 @@ function parseDirectTrashTargets(command) {
     }
     return targets;
 }
-function resolveRecursiveWindowsTargets(command, workspaceDir) {
-    const rawTargets = readWindowsWriteTargets(command);
+function resolveWindowsTargets(rawTargets, workspaceDir) {
     if (!rawTargets)
         return { resolved: [], hasDynamicTarget: true };
     const resolved = [];
     let hasDynamicTarget = false;
+    const workspace = workspaceDir && /^[A-Za-z]:[\\/]/.test(workspaceDir) ? workspaceDir : undefined;
     for (const rawTarget of rawTargets) {
-        if (/[%$*?`]/.test(rawTarget)) {
+        // A rooted path such as `\Windows` still depends on the current drive.
+        // Never let win32.resolve use the host process cwd as an implicit fallback.
+        const fullyQualified = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(rawTarget);
+        if (/[%$*?`]/.test(rawTarget) || /^~/.test(rawTarget) || (!fullyQualified && !workspace)) {
             hasDynamicTarget = true;
             continue;
         }
-        resolved.push(path.win32.isAbsolute(rawTarget)
-            ? path.win32.normalize(rawTarget)
-            : path.win32.resolve(workspaceDir, rawTarget));
+        resolved.push(fullyQualified ? path.win32.normalize(rawTarget) : path.win32.resolve(workspace, rawTarget));
     }
     return { resolved, hasDynamicTarget };
 }
-function isRecursiveWindowsWriteCommand(command) {
-    const [program, ...args] = tokenizeWindowsCommand(command);
+function isRecursiveWindowsWriteCommand(command, shellFamily) {
+    const [program, ...args] = tokenizeWindowsCommand(command, shellFamily);
     if (!program)
         return false;
     const name = normalizeWindowsProgramName(program);
     if (name === 'rm')
         return args.some((arg) => /^-\S*r/i.test(arg));
+    // PowerShell resolves del/erase/rd/rmdir to Remove-Item, so recursion is
+    // -Recurse there; `/s` is kept as a conservative signal.
+    if (shellFamily === 'powershell' && WINDOWS_NATIVE_DELETE_COMMANDS.has(name)) {
+        return args.some((arg) => /^(?:-recurse|-r|\/s)$/i.test(arg));
+    }
     if (['rmdir', 'rd'].includes(name))
         return args.some((arg) => /^\/s$/i.test(arg));
     if (['remove-item', 'ri', 'remove'].includes(name)) {
@@ -59,14 +68,22 @@ function isRecursiveWindowsWriteCommand(command) {
     return (['cp', 'copy-item'].includes(name) &&
         args.some((arg) => /^-[A-Za-z]*[rR][A-Za-z]*$/.test(arg) || /^(?:--recursive|-recurse)$/i.test(arg)));
 }
+const WINDOWS_NATIVE_DELETE_COMMANDS = new Set([
+    'del',
+    'erase',
+    'rd',
+    'rmdir',
+    'remove-item',
+    'ri',
+    'remove',
+]);
 const WINDOWS_WRITE_OR_DELETE_COMMANDS = new Set([
+    ...WINDOWS_NATIVE_DELETE_COMMANDS,
     'ac',
     'add-content',
     'cp',
     'copy',
     'copy-item',
-    'del',
-    'erase',
     'mavis-trash',
     'md',
     'move',
@@ -76,12 +93,7 @@ const WINDOWS_WRITE_OR_DELETE_COMMANDS = new Set([
     'new-item',
     'ni',
     'out-file',
-    'rd',
-    'remove',
-    'remove-item',
-    'ri',
     'rm',
-    'rmdir',
     'robocopy',
     'sc',
     'set-content',
@@ -91,12 +103,12 @@ const WINDOWS_WRITE_OR_DELETE_COMMANDS = new Set([
     'unlink',
     'xcopy',
 ]);
-function isWindowsWriteOrDeleteCommand(command) {
-    const [program] = tokenizeWindowsCommand(command);
+function isWindowsWriteOrDeleteCommand(command, shellFamily) {
+    const [program] = tokenizeWindowsCommand(command, shellFamily);
     return !!program && WINDOWS_WRITE_OR_DELETE_COMMANDS.has(normalizeWindowsProgramName(program));
 }
-export function hasWindowsWriteOrDeleteCommand(command) {
-    return expandWindowsCommandSurfaces(command).some(isWindowsWriteOrDeleteCommand);
+export function hasWindowsWriteOrDeleteCommand(command, shellFamily) {
+    return expandWindowsCommandSurfacesWithShell(command, shellFamily).some((surface) => isWindowsWriteOrDeleteCommand(surface.command, surface.shellFamily));
 }
 /**
  * Fully expand a shell surface into the individual executable-command
@@ -111,38 +123,129 @@ export function hasWindowsWriteOrDeleteCommand(command) {
 export function expandWindowsCommandSurfaces(command) {
     return splitWindowsCommandSegments(command).flatMap((segment) => unwrapCommandWrappers(segment).flatMap(splitWindowsCommandSegments));
 }
-/**
- * Return only the destination that a recursive copy/write command mutates.
- * An unrecognized shape deliberately returns undefined so the caller fails
- * closed instead of treating the command as an in-workspace operation.
- */
-function readWindowsWriteTargets(command) {
-    if (isRmCommand(command))
-        return parseRmTargets(command, 'win32');
-    const nativeDelete = parseWindowsNativeDelete(command, undefined);
-    if (nativeDelete)
-        return nativeDelete.targets;
-    const trashTargets = parseDirectTrashTargets(command);
-    if (trashTargets.length > 0)
-        return trashTargets;
-    const [program, ...args] = tokenizeWindowsCommand(command);
+export function parseWindowsShellFamily(command) {
+    const [program] = tokenizeWindowsCommand(command);
     if (!program)
         return undefined;
     const name = normalizeWindowsProgramName(program);
-    if (![
-        'copy',
-        'xcopy',
-        'robocopy',
-        'cp',
-        'copy-item',
-        'move',
-        'mv',
-        'move-item',
-        'remove-item',
-        'ri',
-        'remove',
-    ].includes(name)) {
+    if (name === 'cmd')
+        return 'cmd';
+    if (name === 'powershell' || name === 'pwsh')
+        return 'powershell';
+    return undefined;
+}
+function isWindowsCwdChange(command, shellFamily) {
+    const tokens = tokenizeWindowsCommand(command, shellFamily);
+    // Unlike process wrappers, POSIX `command cd` runs the builtin in this shell.
+    while (tokens[0] === 'command') {
+        tokens.shift();
+        while (/^(?:-p|--)$/.test(tokens[0] ?? ''))
+            tokens.shift();
+    }
+    return /^(?:(?:cd|chdir)(?:$|[.\\/])|pushd$|popd$|set-location$|sl$|push-location$|pop-location$|[A-Za-z]:$)/i.test(tokens[0] ?? '');
+}
+function expandWindowsCommandSurfacesWithShell(command, shellFamily, recoverableRm = false, depth = 0, cwdChanged = false) {
+    const sourceStages = shellFamily === 'posix'
+        ? splitShellSourceSegments(command)
+        : splitWindowsCommandSource(command, true);
+    const stages = shellFamily === 'posix' ? splitCommand(command) : sourceStages;
+    // A loop or jump can execute an earlier write again after a later cd. Scan
+    // inside unquoted blocks too, while quoted text and wrapper payloads stay
+    // opaque. This only selects a conservative cwd fallback, not an execution AST.
+    const controlStages = sourceStages.flatMap((stage) => splitWindowsCommandSource(stage, true, true));
+    const mayRepeat = controlStages.some((stage) => /^(?:for|foreach|while|until|do|goto)\b/i.test(stage));
+    let previousCwdChange = cwdChanged ||
+        (mayRepeat && controlStages.some((stage) => isWindowsCwdChange(stage, shellFamily)));
+    return stages.flatMap((stage) => {
+        const stageCwdChanged = previousCwdChange;
+        const segments = shellFamily === 'posix' ? [stage] : splitWindowsCommandSegments(stage);
+        // Redirects use the cwd before the command executes. A filename after `>`
+        // is not a command and must not itself be interpreted as a location change.
+        previousCwdChange ||= isWindowsCwdChange(segments[0] ?? '', shellFamily);
+        return segments.flatMap((segment, index) => {
+            const rewritableRm = recoverableRm && isRmCommand(segment);
+            const surface = {
+                command: segment,
+                shellFamily,
+                recoverableRm: rewritableRm,
+                cwdChanged: stageCwdChanged,
+                redirectionTargets: index === 0 ? readWindowsRedirectionTargets(stage) : [],
+            };
+            // Peel one layer at a time, splitting its payload before the next unwrap.
+            // Each alternative payload inherits this stage's entry cwd independently;
+            // child-shell location changes never leak into its parent or siblings.
+            if (depth >= 8)
+                return [surface];
+            const innerShell = parseWindowsShellFamily(segment) ?? (isRmCommand(segment) ? shellFamily : 'unknown');
+            const surfaces = [surface];
+            const candidates = new Set(unwrapCommandWrappers(segment).slice(1));
+            for (const inner of candidates) {
+                // The existing unwrap also includes descendants and alternative decoded
+                // payloads. Visit descendants through their parent so their shell is kept.
+                for (const descendant of unwrapCommandWrappers(inner).slice(1)) {
+                    candidates.delete(descendant);
+                }
+                surfaces.push(...expandWindowsCommandSurfacesWithShell(inner, innerShell, rewritableRm, depth + 1, stageCwdChanged));
+            }
+            return surfaces;
+        });
+    });
+}
+/** Parse deletion using the executing shell, before applying Windows path policy. */
+function parseWindowsDeleteTargets(command, shellFamily) {
+    // CMD can execute a native rm.exe from PATH. Reuse the same Windows argv
+    // parsing as the write-target check so home protection sees those operands too.
+    if (shellFamily === 'cmd' && isRmCommand(command)) {
+        const targets = parseRmTargets(command, 'win32');
+        return targets.length > 0
+            ? { targets, recursive: isRecursiveWindowsWriteCommand(command, shellFamily) }
+            : undefined;
+    }
+    if (shellFamily !== 'posix') {
+        return parseWindowsNativeDelete(command, shellFamily === 'cmd' || shellFamily === 'powershell' ? shellFamily : undefined);
+    }
+    if (!isRmCommand(command))
         return undefined;
+    // The shared rm parser has Windows backslash preservation, and the static
+    // tokenizer does not model every double-quoted POSIX escape. Refuse these
+    // spellings instead of checking a different target from the executed argv.
+    if (command.includes('\\') || parseScriptPlainCommands(command)?.length !== 1)
+        return undefined;
+    const targets = parseRmTargets(command, 'linux');
+    if (targets.length === 0 ||
+        targets.some(
+        // Git Bash/MSYS mount roots (/c, /usr, ...) are not current-drive roots.
+        // Without the executor's mount mapping, no POSIX absolute path is proven.
+        // Residual quotes mean rm's Windows-path preservation kept source text
+        // such as C:/Win"dows" instead of the POSIX argv. Do not trust that path.
+        (target) => path.posix.isAbsolute(target) || /[[\]{}*?"']/.test(target) || /^~/.test(target)))
+        return undefined;
+    return { targets, recursive: isRecursiveWindowsWriteCommand(command, shellFamily) };
+}
+/**
+ * Return the targets that a write/delete command mutates.
+ * An unrecognized shape deliberately returns undefined so the caller fails
+ * closed instead of treating the command as an in-workspace operation.
+ */
+function readWindowsWriteTargets(command, shellFamily, recoverableRm) {
+    const nativeDelete = parseWindowsDeleteTargets(command, shellFamily);
+    if (nativeDelete)
+        return nativeDelete.targets;
+    if (shellFamily === 'posix' && !recoverableRm && isRmCommand(command))
+        return undefined;
+    if (isRmCommand(command) &&
+        (recoverableRm || shellFamily === 'cmd' || shellFamily === undefined)) {
+        return parseRmTargets(command, 'win32');
+    }
+    const trashTargets = parseDirectTrashTargets(command);
+    if (trashTargets.length > 0)
+        return trashTargets;
+    const [program, ...args] = tokenizeWindowsCommand(command, shellFamily);
+    if (!program)
+        return undefined;
+    const name = normalizeWindowsProgramName(program);
+    if (!['copy', 'xcopy', 'robocopy', 'cp', 'copy-item', 'move', 'mv', 'move-item'].includes(name)) {
+        return readWindowsSimpleWriteTargets(name, args, shellFamily);
     }
     const explicitDestination = readExplicitWindowsDestination(program, args);
     if (explicitDestination.explicit) {
@@ -156,6 +259,87 @@ function readWindowsWriteTargets(command) {
     // positional argument is the only reliable write target.
     const destination = ['xcopy', 'robocopy'].includes(name) ? positional.at(1) : positional.at(-1);
     return destination ? [destination] : undefined;
+}
+/** Literal operand forms of directory creation and PowerShell content/item writes. */
+function readWindowsSimpleWriteTargets(name, args, shellFamily) {
+    // Do not interpret expansions, arrays, escaped/concatenated quotes, or unknown
+    // options as a literal path. The caller keeps its existing fail-closed result.
+    if (args.length === 0 || args.some((arg) => /[%!$`*?[\]^{}(),"']/.test(arg)))
+        return undefined;
+    if (['mkdir', 'md', 'unlink', 'shred'].includes(name) && shellFamily !== 'powershell') {
+        if (shellFamily === 'unknown')
+            return undefined;
+        const targets = [];
+        let pastDoubleDash = false;
+        for (const arg of args) {
+            if (shellFamily === 'posix' && !pastDoubleDash && arg === '--') {
+                pastDoubleDash = true;
+            }
+            else if (!pastDoubleDash && /^[-/]/.test(arg)) {
+                if (shellFamily !== 'posix' ||
+                    !/^(?:-[pfuvz]+|--parents|--verbose|--zero|--remove)$/.test(arg)) {
+                    return undefined;
+                }
+            }
+            else {
+                targets.push(arg);
+            }
+        }
+        return targets.length > 0 ? targets : undefined;
+    }
+    if (shellFamily !== 'powershell' ||
+        ![
+            'mkdir',
+            'md',
+            'new-item',
+            'ni',
+            'set-content',
+            'sc',
+            'add-content',
+            'ac',
+            'set-item',
+            'si',
+            'out-file',
+        ].includes(name))
+        return undefined;
+    let target;
+    const positional = [];
+    let hasValue = false;
+    const operands = args.values();
+    for (const arg of operands) {
+        if (!arg.startsWith('-')) {
+            positional.push(arg);
+            continue;
+        }
+        if (/^-(?:force|append|noclobber|nonewline|verbose|debug|whatif|confirm)$/i.test(arg))
+            continue;
+        const pathOption = /^-(?:path|literalpath|filepath)$/i.test(arg);
+        const valueOption = /^-(?:value|inputobject)$/i.test(arg);
+        if (!pathOption &&
+            !valueOption &&
+            !/^-(?:itemtype|encoding|width|erroraction|warningaction)$/i.test(arg)) {
+            return undefined;
+        }
+        const value = operands.next().value;
+        if (!value || value.startsWith('-'))
+            return undefined;
+        if (pathOption) {
+            if (target !== undefined)
+                return undefined;
+            target = value;
+        }
+        if (valueOption)
+            hasValue = true;
+    }
+    target ??= positional.shift();
+    // Content/item cmdlets can take one positional value after their path. mkdir
+    // accepts only paths; keep every one so relative siblings cannot disappear.
+    if (name === 'mkdir' || name === 'md')
+        return target ? [target, ...positional] : undefined;
+    const acceptsPositionalValue = !hasValue && ['set-content', 'sc', 'add-content', 'ac', 'set-item', 'si'].includes(name);
+    if (positional.length > (acceptsPositionalValue ? 1 : 0))
+        return undefined;
+    return target ? [target] : undefined;
 }
 function readWindowsMoveSourceTargets(command) {
     const [program, ...args] = tokenizeWindowsCommand(command);
@@ -200,8 +384,8 @@ function readWindowsMoveSourceTargets(command) {
  * protected source to be read into the workspace, but move/robocopy /MOVE
  * must protect both sides of the operation.
  */
-function readWindowsPathSafetyTargets(command) {
-    const writeTargets = readWindowsWriteTargets(command);
+function readWindowsPathSafetyTargets(command, shellFamily, recoverableRm) {
+    const writeTargets = readWindowsWriteTargets(command, shellFamily, recoverableRm);
     if (!writeTargets)
         return undefined;
     const moveSourceTargets = readWindowsMoveSourceTargets(command);
@@ -216,6 +400,10 @@ function readWindowsPathSafetyTargets(command) {
  * literal so normal quoted paths are preserved.
  */
 export function splitWindowsCommandSegments(command) {
+    return splitWindowsCommandSource(command, false);
+}
+/** Keep redirects attached for cwd tracking; optionally expose block control words. */
+function splitWindowsCommandSource(command, preserveRedirections, splitBlocks = false) {
     const segments = [];
     let start = 0;
     let quote;
@@ -230,17 +418,29 @@ export function splitWindowsCommandSegments(command) {
             continue;
         }
         // CMD's caret and PowerShell's backtick quote the immediately following
-        // character, so an escaped separator is not a command boundary.
+        // character. Consume a complete CRLF continuation so its LF cannot become
+        // a separate command boundary and detach the real destination.
         if (character === '^' || character === '`') {
-            index += 1;
+            index += command[index + 1] === '\r' && command[index + 2] === '\n' ? 2 : 1;
             continue;
         }
         if (!quote &&
-            (character === '&' || character === '|' || character === ';' || character === '>')) {
+            ((character === '&' && !(preserveRedirections && command[index - 1] === '>')) ||
+                character === '|' ||
+                character === ';' ||
+                (character === '>' && !preserveRedirections) ||
+                (splitBlocks && /[(){}]/.test(character ?? '')) ||
+                character === '\n' ||
+                character === '\r')) {
             const segment = command.slice(start, index).trim();
             if (segment)
                 segments.push(segment);
-            start = index + 1;
+            // Treat CRLF as one command boundary. A backtick/caret immediately before
+            // the newline was already consumed above, so shell continuations remain
+            // part of the same surface.
+            start = character === '\r' && command[index + 1] === '\n' ? index + 2 : index + 1;
+            if (character === '\r' && command[index + 1] === '\n')
+                index += 1;
         }
     }
     const trailing = command.slice(start).trim();
@@ -301,8 +501,8 @@ function readWindowsRedirectionTargets(command) {
     return targets;
 }
 export function hasWindowsWriteRedirection(command) {
-    // Same rationale as `buildWindowsPathSafetyDenyReason`: scan the raw
-    // command's wrapper unwraps AND each top-level segment's wrapper unwraps.
+    // Scan the raw command's wrapper unwraps AND each top-level segment's
+    // wrapper unwraps to detect writes hidden inside chained wrappers.
     // Redirect target extraction depends on `>` being present in the surface,
     // so we cannot feed it post-split surfaces (which discard `>`).
     const scanTargets = new Set([
@@ -315,7 +515,15 @@ export function hasWindowsWriteRedirection(command) {
     }
     return false;
 }
-function tokenizeWindowsCommand(command) {
+function tokenizeWindowsCommand(command, shellFamily) {
+    if (shellFamily === 'posix') {
+        const parsed = parseScriptPlainCommands(command);
+        if (parsed?.length === 1)
+            return parsed[0] ?? [];
+        // Keep an rm with dynamic operands visible to the fail-closed target parser.
+        if (isRmCommand(command))
+            return ['rm'];
+    }
     const tokens = [];
     const tokenPattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
     for (const match of command.matchAll(tokenPattern)) {
@@ -477,56 +685,89 @@ function buildWindowsPathSafetyDenyReason(input) {
         return undefined;
     if (['read', 'glob', 'grep', 'list'].includes(input.toolName))
         return undefined;
-    const command = readPermissionCommand(input.input);
-    const surfaces = command ? [...new Set(expandWindowsCommandSurfaces(command))] : [];
+    const rawCommand = readPermissionCommand(input.input);
+    // A trusted Git Bash session owns POSIX decoding and MSYS path mapping.
+    // Native wrapper payloads are delegated below with their own shell syntax.
+    // trustedShellFamily is only set from the session snapshot / resolver path,
+    // never from tool input, OS detection or fresh preference reads.
+    if (input.trustedShellFamily === 'posix' && rawCommand) {
+        const checkNative = (surface, nesting, uncertainCwd) => {
+            // Only the native invocation belongs to the Windows parser. Re-tokenizing
+            // the surrounding Bash script would discard /c/... operands as switches.
+            const nativeReason = buildWindowsPathSafetyDenyReason({
+                ...input,
+                input: { ...input.input, command: surface },
+                trustedShellFamily: undefined,
+                uncertainWorkingDirectory: uncertainCwd,
+            });
+            if (nativeReason)
+                return nativeReason;
+            for (const nested of expandWindowsCommandSurfaces(surface)) {
+                if (unwrapBashCommandWrappers(nested).length <= 1)
+                    continue;
+                const reason = gitBashPathSafetyReason(nested, input.workspaceDir, undefined, nesting + 1, checkNative, uncertainCwd);
+                if (reason)
+                    return reason;
+            }
+            return undefined;
+        };
+        const reason = gitBashPathSafetyReason(rawCommand, input.workspaceDir, undefined, 0, checkNative);
+        // This parser owns the complete Bash script, including redirects and native
+        // wrapper callbacks. Re-parsing that script as Windows argv would discard
+        // MSYS operands and reject safe mixed-shell commands.
+        return reason ? `Local hard safety policy blocked ${input.toolName}: ${reason}` : undefined;
+    }
+    const command = rawCommand;
+    // Native-delete aware surface expansion: pass shellFamily and recoverableRm so
+    // each surface carries enough metadata for the dynamic-POSIX checks below.
+    const surfaces = command
+        ? expandWindowsCommandSurfacesWithShell(command, input.shellFamily, input.recoverableRm)
+        : [];
     const directPath = input.input.path ?? input.input.filePath ?? input.input.file_path;
-    // Redirect scanning must see every wrapper layer's PRE-split payload,
-    // not the raw command alone. Without that, a chained wrapper like
-    //   echo ok && cmd /c "echo x > C:\Windows\Temp\pwn.txt"
-    // hides the `>` inside the second `&&` segment: unwrapCommandWrappers on
-    // the raw command refuses to peel `cmd /c "..."` because the top of the
-    // string is `echo`, so the wrapper payload is never scanned for redirect
-    // targets and the write slips through in off mode.
-    //
-    // We must NOT feed post-split surfaces to `readWindowsRedirectionTargets`
-    // because `splitWindowsCommandSegments` treats `>` as a command boundary
-    // and discards the operator, so a plain `echo ok > C:\Windows\...` would
-    // split into `[echo ok, C:\Windows\...]` with no `>` left for the redirect
-    // scanner to see. Instead, unwrap wrappers on both the raw command AND on
-    // each top-level `&&`/`|`/`;` segment individually; run the redirect
-    // scanner on those pre-split payloads.
-    const redirectionScanTargets = command
-        ? [
-            ...new Set([
-                ...unwrapCommandWrappers(command),
-                ...splitWindowsCommandSegments(command).flatMap(unwrapCommandWrappers),
-            ]),
-        ]
-        : [];
-    const redirectionTargets = command
-        ? [...new Set(redirectionScanTargets.flatMap(readWindowsRedirectionTargets))]
-        : [];
-    const writeOrDeleteSurfaces = surfaces.filter(isWindowsWriteOrDeleteCommand);
+    // Expansion extracts redirects before dropping `>`, at every wrapper layer,
+    // and keeps the owning stage's entry cwd alongside each destination.
+    const redirectionTargets = surfaces.flatMap((surface) => surface.redirectionTargets);
+    const writeOrDeleteSurfaces = surfaces.filter((surface) => isWindowsWriteOrDeleteCommand(surface.command, surface.shellFamily));
     if (command && writeOrDeleteSurfaces.length === 0 && redirectionTargets.length === 0) {
         return undefined;
     }
     const values = command
         ? [
-            ...writeOrDeleteSurfaces.flatMap((surface) => readWindowsPathSafetyTargets(surface) ?? [surface]),
+            ...writeOrDeleteSurfaces.flatMap(({ command: surfaceCommand, shellFamily, recoverableRm }) => readWindowsPathSafetyTargets(surfaceCommand, shellFamily, recoverableRm) ?? [
+                surfaceCommand,
+            ]),
             ...redirectionTargets,
         ]
         : typeof directPath === 'string'
             ? [directPath]
             : [];
-    const commandSegments = writeOrDeleteSurfaces;
-    const recursiveSurfaces = commandSegments.filter(isRecursiveWindowsWriteCommand);
+    // Check the original POSIX source: both splitters replace line continuations
+    // with spaces, while Bash joins the adjacent characters. Once split, target
+    // checks cannot detect that loss (even inside a Windows wrapper payload).
+    // Keep the whole source for dynamic cwd/assignment/header checks as well.
+    if (command &&
+        input.shellFamily === 'posix' &&
+        ((/\\\r?\n/.test(command) && writeOrDeleteSurfaces.some((surface) => !surface.recoverableRm)) ||
+            (!parseScriptPlainCommands(command) &&
+                writeOrDeleteSurfaces.some((surface) => surface.shellFamily === 'posix' &&
+                    !surface.recoverableRm &&
+                    isRmCommand(surface.command))))) {
+        return `Local hard safety policy blocked ${input.toolName}: native delete targets cannot be verified safely in a dynamic POSIX command.`;
+    }
+    // Distinct guard from the MR (b2) facade: a cd / pushd / source earlier in the
+    // same script can shift the entry cwd, in which case non-absolute write
+    // targets cannot be resolved safely even when shellFamily metadata is set.
+    if (input.uncertainWorkingDirectory && values.some((value) => !/^[A-Za-z]:[\\/]/.test(value))) {
+        return 'Native shell write after a directory change cannot be resolved safely; use absolute paths in a separate command.';
+    }
+    const recursiveSurfaces = writeOrDeleteSurfaces.filter((surface) => isRecursiveWindowsWriteCommand(surface.command, surface.shellFamily));
     const recursive = recursiveSurfaces.length > 0;
     const protectedPath = values.map(findProtectedWindowsPath).find(Boolean);
     if (protectedPath) {
         return `Local hard safety policy blocked ${input.toolName}: protected Windows path "${protectedPath}" cannot be written or deleted.`;
     }
     const ambiguousProgramFilesTarget = writeOrDeleteSurfaces
-        .map(findAmbiguousProgramFilesWriteTarget)
+        .map((surface) => findAmbiguousProgramFilesWriteTarget(surface.command))
         .find(Boolean);
     if (ambiguousProgramFilesTarget) {
         return `Local hard safety policy blocked ${input.toolName}: protected Windows path "${ambiguousProgramFilesTarget}" cannot be written or deleted.`;
@@ -535,9 +776,46 @@ function buildWindowsPathSafetyDenyReason(input) {
     if (driveRelativePath) {
         return `Local hard safety policy blocked ${input.toolName}: protected Windows path "${driveRelativePath}" cannot be written or deleted because drive-relative paths cannot be verified safely.`;
     }
+    // Delete operands cannot fall back to copy's last positional destination:
+    // a trailing option value (for example `-ErrorAction Stop`) is not a target.
+    // Unknown syntax or shell must remain fail-closed even without -Recurse.
+    const nativeTargets = [];
+    for (const { command: surfaceCommand, shellFamily, recoverableRm, cwdChanged, } of writeOrDeleteSurfaces) {
+        const [program] = tokenizeWindowsCommand(surfaceCommand, shellFamily);
+        const name = program ? normalizeWindowsProgramName(program) : undefined;
+        const nativeDeleteCommand = !!name &&
+            (WINDOWS_NATIVE_DELETE_COMMANDS.has(name) ||
+                (name === 'rm' &&
+                    (shellFamily === 'posix' ||
+                        shellFamily === 'powershell' ||
+                        shellFamily === 'cmd' ||
+                        shellFamily === 'unknown')));
+        if (!nativeDeleteCommand || recoverableRm)
+            continue;
+        const nativeDelete = parseWindowsDeleteTargets(surfaceCommand, shellFamily);
+        if (!nativeDelete) {
+            return `Local hard safety policy blocked ${input.toolName}: native delete targets cannot be verified safely. Use literal targets with supported delete options.`;
+        }
+        const resolved = resolveWindowsTargets(nativeDelete.targets, cwdChanged ? undefined : input.workspaceDir);
+        if (resolved.hasDynamicTarget) {
+            return `Local hard safety policy blocked ${input.toolName}: native delete targets cannot be verified safely because the workspace or command working directory is unavailable.`;
+        }
+        if (nativeDelete.recursive &&
+            resolved.resolved.some((target) => normalizeWindowsPath(target) === normalizeWindowsPath(homedir()))) {
+            return 'Refused: recursive deletion targets a root or home directory. This can cause unrecoverable data loss; choose a specific sub-path instead.';
+        }
+        nativeTargets.push(...resolved.resolved);
+    }
+    if (writeOrDeleteSurfaces.some((surface) => surface.cwdChanged &&
+        resolveWindowsTargets(readWindowsPathSafetyTargets(surface.command, surface.shellFamily, surface.recoverableRm), undefined).hasDynamicTarget) ||
+        surfaces.some((surface) => surface.cwdChanged &&
+            resolveWindowsTargets(surface.redirectionTargets, undefined).hasDynamicTarget)) {
+        return `Local hard safety policy blocked ${input.toolName}: write/delete targets cannot be verified safely after a command working directory change.`;
+    }
     const targets = values
         .flatMap((value) => value.match(/(?:\\\\\?\\)?[A-Za-z]:[\\/][^\s"';&|<>]*/gi) ?? [])
         .map(canonicalizeWindowsAbsolutePath);
+    targets.push(...nativeTargets);
     const recursiveTargets = [];
     let hasDynamicRecursiveTarget = false;
     if (recursive) {
@@ -546,7 +824,7 @@ function buildWindowsPathSafetyDenyReason(input) {
             return `Local hard safety policy blocked ${input.toolName}: recursive write/delete target cannot be verified because the workspace is unavailable.`;
         }
         for (const surface of recursiveSurfaces) {
-            const resolved = resolveRecursiveWindowsTargets(surface, workspaceDir);
+            const resolved = resolveWindowsTargets(readWindowsWriteTargets(surface.command, surface.shellFamily, surface.recoverableRm), surface.cwdChanged ? undefined : input.workspaceDir);
             recursiveTargets.push(...resolved.resolved);
             hasDynamicRecursiveTarget ||= resolved.hasDynamicTarget;
         }
@@ -610,7 +888,7 @@ export function evaluateLocalPermissionCheck(input) {
     const immune = buildLocalBypassImmuneDenyReason(input.toolName, input.input, input.workspaceDir);
     if (immune)
         return { behavior: 'deny', reason: immune, denyKind: 'bypass-immune' };
-    const windowsPathSafety = evaluateWindowsPathSafetyCheck(input);
+    const windowsPathSafety = input.skipWindowsHardSafetyChecks === true ? undefined : evaluateWindowsPathSafetyCheck(input);
     if (windowsPathSafety)
         return windowsPathSafety;
     const policy = buildLocalPolicyDenyReason(input.toolName, input.input);
@@ -647,7 +925,7 @@ export function buildLocalBypassImmuneDenyReason(toolName, input, workspaceDir) 
     }
     if (toolName === 'bash') {
         const command = readPermissionCommand(input);
-        if (command && isRootRecursiveDelete(command)) {
+        if (command && isRootRecursiveDelete(command, workspaceDir)) {
             return (`Local hard safety policy blocked ${toolName}: recursive deletion targets a root or home ` +
                 `directory, which is unrecoverable. Target a specific sub-path instead of "/", a drive ` +
                 `root, or the home directory.`);
@@ -969,39 +1247,72 @@ function sensitivePathVariants(value) {
     }
     return [...variants];
 }
-function isRootRecursiveDelete(command, depth = 0) {
-    const tokens = tokenizeShellLike(command.toLowerCase());
-    if (depth < 4) {
-        for (let i = 0; i < tokens.length - 2; i += 1) {
-            if (!isShellEvalCommand(tokens[i]))
-                continue;
-            if (!isShellEvalOption(tokens[i + 1]))
-                continue;
-            if (isRootRecursiveDelete(tokens[i + 2], depth + 1))
-                return true;
-        }
+function isRootRecursiveDelete(command, workspaceDir, depth = 0) {
+    const stages = shellSourceStages(command, workspaceDir, resolveLiteralDeletePath);
+    // Dynamic shell flow has no trustworthy cwd. Still inspect each command
+    // separately so options (including --) cannot leak across command boundaries.
+    if (stages.length === 0) {
+        stages.push(...splitShellSourceSegments(command).map((segment) => ({
+            command: segment,
+            directory: undefined,
+        })));
     }
-    for (let i = 0; i < tokens.length; i += 1) {
-        if (commandBasename(tokens[i]) !== 'rm')
-            continue;
-        let recursive = false;
-        for (let j = i + 1; j < tokens.length; j += 1) {
-            const token = tokens[j];
-            if (token === '--')
-                continue;
-            if (token.startsWith('-') && token.length > 1) {
-                recursive ||= token.includes('r') || token.includes('R');
-                if (recursive && containsShellWhitespaceExpansion(token))
+    for (const stage of stages) {
+        const tokens = tokenizeShellLike(stage.command);
+        const commandIndex = tokens.length - unwrapCommand(tokens).length;
+        if (depth < 4) {
+            for (let i = 0; i < tokens.length - 2; i += 1) {
+                if (!isShellEvalCommand(tokens[i]))
+                    continue;
+                if (!isShellEvalOption(tokens[i + 1]))
+                    continue;
+                // Login shells and unsupported wrapper options may change cwd.
+                const directory = i === commandIndex && tokens[i + 1] === '-c' ? stage.directory : undefined;
+                if (isRootRecursiveDelete(tokens[i + 2], directory, depth + 1))
                     return true;
-                continue;
             }
+        }
+        for (let i = 0; i < tokens.length; i += 1) {
+            if (commandBasename(tokens[i]).toLowerCase() !== 'rm')
+                continue;
+            const directory = i === commandIndex ? stage.directory : undefined;
+            let recursive = false;
+            let pastDoubleDash = false;
+            let hasWhitespaceExpansion = false;
+            const targets = [];
+            for (let j = i + 1; j < tokens.length; j += 1) {
+                const token = tokens[j];
+                if (!pastDoubleDash && token === '--') {
+                    pastDoubleDash = true;
+                    continue;
+                }
+                hasWhitespaceExpansion ||= containsShellWhitespaceExpansion(token);
+                if (!pastDoubleDash && token.startsWith('-') && token.length > 1) {
+                    recursive ||= token.includes('r') || token.includes('R');
+                    continue;
+                }
+                targets.push(token);
+            }
+            // rm accepts options after operands, but never after its -- delimiter.
             if (recursive &&
-                (isRootOrHomeDeleteTarget(token) || containsShellWhitespaceExpansion(token))) {
+                (hasWhitespaceExpansion ||
+                    targets.some((target) => isRootOrHomeDeleteTarget(target, directory)))) {
                 return true;
             }
         }
     }
     return false;
+}
+function resolveLiteralDeletePath(target, workspaceDir) {
+    // Brace expansion and escaped shell syntax are not literal path identities.
+    if (/[{}\\]/.test(target) ||
+        (target.startsWith('~') && target !== '~' && !target.startsWith('~/'))) {
+        return undefined;
+    }
+    return resolvePermissionPath(target, {
+        workingDirectory: workspaceDir && path.isAbsolute(workspaceDir) ? workspaceDir : undefined,
+        homeDir: homedir(),
+    }).resolved;
 }
 function containsShellWhitespaceExpansion(token) {
     return /\$\{?ifs(?:\b|[:}])/i.test(token);
@@ -1018,7 +1329,22 @@ function tokenizeShellLike(command) {
 function commandBasename(token) {
     return token.replaceAll('\\', '/').split('/').pop() || token;
 }
-function isRootOrHomeDeleteTarget(target) {
+function isRootOrHomeDeleteTarget(target, workspaceDir) {
+    // A glob has no single resolved path. Resolve its literal parent instead,
+    // preserving the existing top-level home rule without blocking child globs.
+    const globIndex = /[$`\\]/.test(target) ? -1 : target.search(/[*?[{]/);
+    const literalTarget = globIndex < 0 ? target : target.slice(0, target.lastIndexOf('/', globIndex) + 1) || '.';
+    const resolved = resolveLiteralDeletePath(literalTarget, workspaceDir);
+    if (resolved && path.isAbsolute(resolved)) {
+        const normalized = path.resolve(resolved);
+        const home = path.resolve(homedir());
+        if (normalized === path.parse(normalized).root ||
+            (process.platform === 'win32'
+                ? normalized.toLowerCase() === home.toLowerCase()
+                : normalized === home)) {
+            return true;
+        }
+    }
     const bracedHome = ['$', '{home}'].join('');
     const bracedHomeOpen = ['$', '{home'].join('');
     const raw = target.toLowerCase().replaceAll('\\', '/');

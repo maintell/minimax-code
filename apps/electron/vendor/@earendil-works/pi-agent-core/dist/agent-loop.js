@@ -226,7 +226,7 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
                 break;
             case "done":
             case "error": {
-                const finalMessage = await response.result();
+                const finalMessage = normalizeUnexpectedToolCall(await response.result(), config);
                 if (addedPartial) {
                     context.messages[context.messages.length - 1] = finalMessage;
                 }
@@ -241,7 +241,7 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
             }
         }
     }
-    const finalMessage = await response.result();
+    const finalMessage = normalizeUnexpectedToolCall(await response.result(), config);
     if (addedPartial) {
         context.messages[context.messages.length - 1] = finalMessage;
     }
@@ -251,6 +251,34 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
     }
     await emit({ type: "message_end", message: finalMessage });
     return finalMessage;
+}
+function normalizeUnexpectedToolCall(message, config) {
+    const fallback = config.unexpectedToolCallFallback?.trim();
+    if (!fallback ||
+        message.stopReason === "error" ||
+        message.stopReason === "aborted" ||
+        !message.content.some((block) => block.type === "toolCall")) {
+        return message;
+    }
+    const content = message.content.filter((block) => block.type !== "toolCall");
+    const existingFallback = content.some((block) => block.type === "text" && block.text.includes(fallback));
+    if (!existingFallback) {
+        let textIndex = content.length - 1;
+        while (textIndex >= 0 && content[textIndex]?.type !== "text")
+            textIndex--;
+        const textBlock = content[textIndex];
+        if (textBlock?.type === "text" && textBlock.text.trim()) {
+            content[textIndex] = { ...textBlock, text: `${textBlock.text.trimEnd()}\n\n${fallback}` };
+        }
+        else {
+            content.push({ type: "text", text: fallback });
+        }
+    }
+    return {
+        ...message,
+        content,
+        stopReason: "stop",
+    };
 }
 /**
  * Execute tool calls from an assistant message.

@@ -157,6 +157,16 @@ export function getExtraLogSources() {
             match: (name) => name.endsWith('.json'),
             prefix: 'mavis-cli-incidents/',
         },
+        ...(process.platform === 'win32' && process.env.LOCALAPPDATA
+            ? [
+                {
+                    dir: path.join(process.env.LOCALAPPDATA, 'MiniMax', 'installer-logs'),
+                    match: (name) => /^nsis-[A-Za-z0-9.+_-]+-\d+\.log$/.test(name),
+                    prefix: 'windows-installer/',
+                    maxBytesPerFile: 1024 * 1024,
+                },
+            ]
+            : []),
     ];
 }
 /**

@@ -525,6 +525,7 @@ function toAgentInput(claim, item) {
             : claim.message.attachments).map(toAttachment),
         ...computerUseInput(claim, item),
         ...(origin ? { origin } : {}),
+        ...(claim.message.computerUse ? { computerUse: claim.message.computerUse } : {}),
         ...(channelContext ? { channelContext } : {}),
         ...(claim.message.quotedMessage ? { quotedMessage: claim.message.quotedMessage } : {}),
         ...(model ? { model } : {}),

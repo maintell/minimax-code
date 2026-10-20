@@ -6,6 +6,8 @@ import { registerTransparentWindow } from "../../../windows/utils";
 const logger = getCategoryLogger('main', 'computer-use');
 // Navigation is intercepted locally; this is an action marker, not a network endpoint.
 const STOP_URL = 'https://computer-use.invalid/stop';
+// Coalesce adjacent actions without keeping supervision visible during model/tool work.
+const OPERATION_IDLE_HIDE_DELAY_MS = 300;
 const escapeHtml = (value) => value.replace(/[&<>"']/g, (character) => `&#${character.charCodeAt(0)};`);
 /** Static, script-free contents. Theme tokens mirror packages/ui/src/configs/tailwind/colorPlugin.ts. */
 export function overlayHtml(kind, icon, english, failed = false) {
@@ -36,6 +38,7 @@ export class CuaDesktopOverlay {
         this.stopping = false;
         this.failed = false;
         this.watchingDisplays = false;
+        this.activeRequests = new Set();
         this.rebuild = () => {
             this.destroyWindows();
             if (!this.turn)
@@ -56,13 +59,19 @@ export class CuaDesktopOverlay {
             }
         };
     }
-    show(turn) {
+    show(turn, requestId) {
         if (!['win32', 'darwin'].includes(process.platform))
             return;
-        if (this.turn?.sessionId === turn.sessionId && this.turn.turnId === turn.turnId)
+        if (this.hideTimer)
+            clearTimeout(this.hideTimer);
+        this.hideTimer = undefined;
+        if (this.turn?.sessionId === turn.sessionId && this.turn.turnId === turn.turnId) {
+            this.activeRequests.add(requestId);
             return;
+        }
         this.clear();
         this.turn = turn;
+        this.activeRequests.add(requestId);
         logger.info('overlay_started', turn);
         this.rebuild();
         screen.on('display-added', this.rebuild);
@@ -70,11 +79,29 @@ export class CuaDesktopOverlay {
         screen.on('display-metrics-changed', this.rebuild);
         this.watchingDisplays = true;
     }
+    finish(turn, requestId) {
+        if (this.turn?.sessionId !== turn.sessionId ||
+            this.turn.turnId !== turn.turnId ||
+            !this.activeRequests.delete(requestId) ||
+            this.activeRequests.size > 0)
+            return;
+        this.hideTimer = setTimeout(() => {
+            this.hideTimer = undefined;
+            // Keep cancellation progress and a failed stop's retry affordance available.
+            if (!this.stopping && !this.failed)
+                this.clear(turn.sessionId, turn.turnId);
+        }, OPERATION_IDLE_HIDE_DELAY_MS);
+        this.hideTimer.unref?.();
+    }
     clear(sessionId, turnId) {
         if (sessionId && this.turn?.sessionId !== sessionId)
             return;
         if (turnId && this.turn?.turnId !== turnId)
             return;
+        if (this.hideTimer)
+            clearTimeout(this.hideTimer);
+        this.hideTimer = undefined;
+        this.activeRequests.clear();
         this.turn = undefined;
         this.stopping = false;
         this.failed = false;

@@ -1,8 +1,11 @@
+import { withMiniMaxCodeUserAgent } from '@mavis/shared';
 import { managedBackendRoutingHeaders, } from '@mavis/agent-tools/desktop';
 const MANAGED_PROVIDER_USER_AGENT = 'MiniMaxAgent';
 export function buildLocalProviderHeaders(input) {
+    // Third-party providers see MiniMax Code instead of the SDK default unless the
+    // user configured a User-Agent; managed routes keep their own identity below.
     const headers = {
-        ...(input.headers ?? {}),
+        ...(input.managedProvider ? input.headers : withMiniMaxCodeUserAgent(input.headers)),
         'X-Mavis-Session-Id': input.sessionId,
         'X-Mavis-Agent-Id': input.agentId,
         'X-Mavis-Timezone-Offset': String(new Date().getTimezoneOffset() * -60),

@@ -1,9 +1,13 @@
 import { SessionServiceError } from '../errors.js';
 import { applySessionMemoryPolicyPatch, effectiveSessionMemoryPolicy } from '../memory-policy.js';
-export function normalizeMemoryPolicyMutation(current, fields) {
+export function normalizeSessionMutation(current, fields) {
     const { memoryPolicy, ...rest } = fields;
+    const normalized = {
+        ...rest,
+        ...(fields.title !== undefined ? { titleSource: fields.titleSource ?? 'manual' } : {}),
+    };
     if (memoryPolicy === undefined)
-        return rest;
+        return normalized;
     const policy = effectiveSessionMemoryPolicy(current.memoryPolicy);
     if (policy.recallLocked &&
         memoryPolicy.recallEnabled !== undefined &&
@@ -11,9 +15,19 @@ export function normalizeMemoryPolicyMutation(current, fields) {
         throw new SessionServiceError('memory-recall-locked', 'Memory recall cannot be changed after the conversation starts');
     }
     return {
-        ...rest,
+        ...normalized,
         memoryPolicy: applySessionMemoryPolicyPatch(current.memoryPolicy, memoryPolicy),
     };
+}
+export function metadataSessionKind(input) {
+    const requestedKind = input.sessionKind ?? 'conversation';
+    if (requestedKind === 'unknown') {
+        throw new SessionServiceError('invalid-session-kind', `Unsupported Session kind: ${requestedKind}`);
+    }
+    if ((requestedKind === 'task' || requestedKind === 'peek') && !input.parentSessionId) {
+        throw new SessionServiceError('parent-required', `${requestedKind} Session requires a parent Session`);
+    }
+    return requestedKind;
 }
 export function assertTaskParent(sessionKind, parent) {
     if (sessionKind === 'task' && !parent) {
@@ -67,6 +81,15 @@ export function modelKey(providerId, modelId) {
     const provider = nonEmpty(providerId);
     const model = nonEmpty(modelId);
     return provider && model ? `${provider}/${model}` : undefined;
+}
+export function modelFieldsFromDefinition(definition) {
+    return {
+        effectiveModel: `${definition.model.providerId}/${definition.model.modelId}`,
+        ...whenDefined('effectiveModelVariant', definition.model.variant),
+        ...whenDefined('effectiveModelThinking', definition.model.thinking),
+        ...whenDefined('effectiveModelContextWindow', definition.model.contextWindow),
+        ...whenDefined('effectiveModelMaxOutputTokens', definition.model.maxOutputTokens),
+    };
 }
 export function internalExplicitWorkspaceDir(input) {
     if (input.workspaceDir !== undefined && !nonEmpty(input.workspaceDir)) {

@@ -3,5 +3,6 @@ export { InstalledPluginSource, PluginInstallationPolicy, MarketplaceCategory, S
 export { PermissionReply, BatchPermissionDecision } from './generated/desktop-service/types.js';
 export { QuestionnairePurpose } from './generated/desktop-service/types.js';
 export { SandboxFilesystemMode, SandboxNetworkMode, SandboxLocalAccess, SandboxState, SandboxActivation, } from './generated/desktop-service/types.js';
+export { AgentShellFamily, AgentShellPreference } from './generated/desktop-service/types.js';
 export { HTTP_SERVICE_BIZ_ID_HEADER, HttpServiceTimeoutError, HttpStatusError, } from './runtime/index.js';
 //# sourceMappingURL=index.js.map

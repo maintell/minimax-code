@@ -4,10 +4,10 @@ import { startBackgroundLocalTask } from '../background-task/runner.js';
 import { createLocalSubagentTaskRow } from '../background-task/subagent-task-row.js';
 import { persistLocalSubagentTaskTerminal } from '../background-task/terminal.js';
 import { taskTurnId } from '../background-task/turn-id.js';
-import { localTaskAdmissionFailure, runInjectedConversationTaskTurn, } from './injected-conversation-task-turn.js';
+import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, readTaskOccupancy, runInjectedConversationTaskTurn, } from './injected-conversation-task-turn.js';
 import { requireTaskConversation } from './local-task-host.js';
 import { normalizeLocalTaskInput, taskModelSelectionFor } from './local-task-input.js';
-import { resolveLocalTaskAgentTarget } from './local-task-subagents.js';
+import { resolveLocalTaskAgentTarget, taskSessionOwner } from './local-task-subagents.js';
 import { resolveV2SessionArtifactPathsSync } from '../persistence/layout/v2-session-artifacts.js';
 export function buildLocalTaskAdapter(host, parentSession) {
     return {
@@ -20,7 +20,7 @@ export async function runForegroundLocalTask(input) {
         throw new Error('Operation aborted');
     const taskInput = normalizeLocalTaskInput(input.taskInput);
     const conversation = requireTaskConversation(input.host);
-    const target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name);
+    const target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name, input.toolCtx.pluginAgents);
     if (!target) {
         // No runnable target, so there is nothing to track: the failure carries no
         // task handle because no task row was ever created.
@@ -57,7 +57,7 @@ export async function runForegroundLocalTask(input) {
     let releaseOwnerWaitEdge;
     try {
         childSession = await input.host.agentRoutes.createSession({
-            agentName,
+            ...taskSessionOwner(target),
             workspaceDir: input.parentSession.workspaceDir || input.host.resolveDefaultWorkspaceDir(),
             sessionType: 'branch',
             sessionKind: 'task',
@@ -75,6 +75,11 @@ export async function runForegroundLocalTask(input) {
             startedAt: input.host.nowMs(),
             metadata: { childSessionId: childSession.sessionId, subTurnId: turnId, agentName },
         });
+        if (input.prepareChild) {
+            await input.prepareChild({ subSessionId: childSession.sessionId, subTurnId: turnId });
+            if (input.signal?.aborted)
+                throw new Error('Operation aborted');
+        }
         releaseOwnerWaitEdge = input.host.sessionSendWaitGraph?.register(input.parentSession.sessionId, childSession.sessionId);
         try {
             input.onChildStarted?.({ subSessionId: childSession.sessionId, subTurnId: turnId });
@@ -114,13 +119,16 @@ export async function runForegroundLocalTask(input) {
     catch (error) {
         if (childSession)
             input.toolCtx.pluginSubagentLifecycle?.cancel(childSession.sessionId);
+        const occupancy = isSubagentConcurrencyLimitRejection(error)
+            ? await readTaskOccupancy(input.host.runtimeConversation, input.parentSession.sessionId)
+            : undefined;
         const failure = {
             status: 'failed',
             requestedAgentName: target.requestedName,
             resolvedAgentName: agentName,
             ...(childSession ? { subSessionId: childSession.sessionId } : {}),
             subTurnId: turnId,
-            ...localTaskAdmissionFailure(error),
+            ...localTaskAdmissionFailure(error, occupancy),
             taskId,
         };
         await finalizeForegroundTask(input.host, taskId, failure, turnId);

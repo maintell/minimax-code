@@ -18,6 +18,8 @@ export const EXPECTED_TABLES = {
         'agent_name',
         'name',
         'prompt',
+        'project',
+        'model',
         'session_target_mode',
         'target_session_id',
         'revision',
@@ -268,4 +270,14 @@ export const MEMORY_CHECKS = {
     local_runtime_v2_memory_scopes: ['reset_epoch >= 0', 'reset_at_ms >= 0'],
     local_runtime_v2_memory_session_states: ['last_used_at_ms IS NULL OR last_used_at_ms >= 0'],
 };
+export const SESSION_QUERY_INDEX_NAMES = new Set([
+    'idx_local_runtime_queue_items_session_status_id',
+    'idx_local_runtime_queue_items_session_client_request',
+    'idx_local_runtime_queue_items_session_dedupe',
+    'idx_local_runtime_queue_items_session_claim_id',
+    'idx_local_runtime_queue_items_session_routing_id',
+    'idx_local_runtime_token_usage_model_ts',
+    'idx_local_runtime_token_usage_day_ts',
+    'idx_local_runtime_session_assets_session_key_time',
+]);
 //# sourceMappingURL=schema-consistency.contracts.js.map

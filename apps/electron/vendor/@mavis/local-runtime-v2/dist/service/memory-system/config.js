@@ -11,7 +11,8 @@ export function resolveMemoryV2Config(overrides = {}) {
 }
 /** 保留持久偏好，领域服务只消费当前有效权限。 */
 export function resolveMemorySystemConfig(memory = {}) {
-    const active = memory.enabled !== false && isMemoryV2Enabled(memory);
+    // `memory.enabled` 只控制 V1 注入；V2 启用引导选择"放弃旧记忆"时会把它写成 false。
+    const active = isMemoryV2Enabled(memory);
     const preferences = resolveMemoryV2Config(memory.v2);
     return {
         ...preferences,

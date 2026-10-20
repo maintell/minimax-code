@@ -14,10 +14,10 @@ const GOAL_VERIFIER_DENIED_TOOLS = new Set(['web_fetch', 'web_search']);
  *
  * The child runs on the ordinary delegation path under the builtin `verifier`
  * role, so this holds no authority: a Turn that claims a run id gains a
- * reminder, a two-tool denylist, and a hard turn/token ceiling — all of them
+ * reminder, a two-tool denylist, cumulative usage admission and output caps — all
  * restrictions. There is nothing here worth forging.
  *
- * The ceiling still has to live somewhere: `pi-turn-runner` has no generic
+ * Admission still has to live somewhere: `pi-turn-runner` has no generic
  * iteration limit, so `beforeLlm` below is the only thing standing between a
  * looping child and the provider's context window.
  */
@@ -32,8 +32,8 @@ export class GoalVerifierChildCoordinator {
         });
     }
     reminder(runId) {
-        const hostContext = this.runs.get(runId)?.hostContext;
-        return hostContext ? renderGoalVerifierReminder(hostContext) : undefined;
+        const state = this.runs.get(runId);
+        return state ? renderGoalVerifierReminder(state.hostContext, state.objective) : undefined;
     }
     release(runId) {
         const state = this.runs.get(runId);
@@ -50,14 +50,15 @@ export class GoalVerifierChildCoordinator {
     /**
      * Host-clamped output cap for one provider request of this child run.
      *
-     * `beforeLlm` / `afterLlm` can only compare what the child has already spent,
-     * so a single response is free to blow past the run's cap before anything
-     * notices. Binding the same clamp to each request is what makes that
-     * impossible. An unknown run reports no cap; `beforeLlm` already aborts it
-     * before a request is ever made.
+     * Remaining reported total usage limits the controllable output of the next
+     * request. Input/reasoning and missing usage cannot be hard-capped by this
+     * output setting; afterLlm still accounts for their actual reported usage.
+     * Unknown runs report no cap and are rejected by beforeLlm. A host already
+     * bound to a budgeted run treats a disappearing cap as exhausted.
      */
     outputTokenCap(runId) {
-        return this.runs.get(runId)?.maxTokens;
+        const state = this.runs.get(runId);
+        return state?.maxTokens === undefined ? undefined : Math.max(0, state.maxTokens - state.tokens);
     }
     beforeLlm(runId, resolvedProvider) {
         const state = this.runs.get(runId);

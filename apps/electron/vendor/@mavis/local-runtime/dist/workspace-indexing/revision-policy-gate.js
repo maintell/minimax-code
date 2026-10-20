@@ -43,6 +43,7 @@ export class WorkspaceRevisionPolicyGate {
      * policy allows it again.
      */
     async assertCompliant(record, signal) {
+        signal.throwIfAborted();
         const binding = resolveWorkspaceCollectionPolicy(this.getCollectionPolicy);
         const visited = new Set();
         let current = record;
@@ -73,6 +74,7 @@ export class WorkspaceRevisionPolicyGate {
             current = current.baseRevisionId
                 ? await this.store.getRevision(current.baseRevisionId)
                 : undefined;
+            signal.throwIfAborted();
         }
     }
 }

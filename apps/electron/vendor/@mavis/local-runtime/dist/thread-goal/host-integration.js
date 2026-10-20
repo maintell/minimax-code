@@ -62,6 +62,9 @@ export class LocalThreadGoalIntegration {
     deleteGoal(sessionId) {
         return this.modules.lifecycle.deleteGoal(sessionId);
     }
+    dismissGoal(sessionId, goalId) {
+        return this.modules.lifecycle.dismissGoal(sessionId, goalId);
+    }
     pauseActiveGoalForAbort(sessionId) {
         return this.modules.lifecycle.pauseActiveGoalForAbort(sessionId);
     }

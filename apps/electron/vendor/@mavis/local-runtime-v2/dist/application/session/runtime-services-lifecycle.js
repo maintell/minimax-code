@@ -1,5 +1,6 @@
 import { settleInBackground, } from '../../service/plugin-system/index.js';
 import { abortLocalPluginHookSessionTurn, endLocalPluginHookSession, } from '../../service/turn-system/index.js';
+import { createRuntimeGlobalEventWriter, } from '../events.js';
 import { describeError } from './turn-message-delivery.js';
 export async function closeRuntimeServiceOwnersAfterFailure(input) {
     for (const close of [
@@ -19,6 +20,15 @@ export async function closeRuntimeServiceOwnersAfterFailure(input) {
             // The original startup failure remains authoritative after best-effort reverse drain.
         }
     }
+}
+export function createRuntimeServicesGlobalEventWriter(options, state, nowMs) {
+    return createRuntimeGlobalEventWriter({
+        isClosed: () => state.closed,
+        nowMs,
+        notifyContextReset: (sessionId) => options.compatibility.contextLifecycle.notifyContextReset(sessionId),
+        notifyGreetingTurnTerminal: (turnId, status) => state.agentApplication?.notifyGreetingTurnTerminal?.(turnId, status),
+        write: (event) => options.eventBus.write(event),
+    });
 }
 export function createRuntimePluginSessionLifecycle(turnSystem, plugin) {
     return {
@@ -96,6 +106,7 @@ export function createRuntimeServicesLifecycle(input) {
         await backgroundAgentRecovery?.settled;
         const failures = [];
         const closeSteps = [
+            () => input.applications.session.sideChat.close(),
             () => Promise.resolve(input.applications.session.handoff.close()),
             () => Promise.resolve(input.workspaceHtmlPreview.close()),
             () => Promise.resolve(input.plan.lifecycleReconciler.close()),
@@ -110,6 +121,8 @@ export function createRuntimeServicesLifecycle(input) {
             () => Promise.resolve(input.skillSystem.close()),
             () => Promise.resolve(input.mcp.close()),
             () => Promise.resolve(input.agentApplication.close()),
+            () => Promise.resolve(input.workspaceFile.close()),
+            () => Promise.resolve(input.workspaceIndexing.close()),
             () => Promise.resolve(input.workspaceGit.close()),
             () => Promise.resolve(input.sessionSystem.close()),
             () => Promise.resolve(input.sandbox.close()),

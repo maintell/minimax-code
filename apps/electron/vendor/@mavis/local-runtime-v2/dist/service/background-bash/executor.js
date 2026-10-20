@@ -1,7 +1,7 @@
 import { StringDecoder } from 'node:string_decoder';
 import { createBashTool } from '@earendil-works/pi-coding-agent/tools';
 import { createBashEnvSpawnHook } from '@mavis/agent-core/bash-subprocess-env';
-import { localBashResultFromError, localBashResultFromPi, DESKTOP_BASH_PREVIEW_BYTES, } from '@mavis/agent-tools/desktop';
+import { localBashResultFromError, localBashResultFromPi, DESKTOP_BASH_PREVIEW_BYTES, resolvePermissionBashEnvPolicy, } from '@mavis/agent-tools/desktop';
 export function createLocalBackgroundBashExecutor(operationsFactory, 
 /**
  * Supplied by the runtime so background bash inherits the same PATH shims as
@@ -21,6 +21,9 @@ envPolicy) {
             const localOperations = operationsFactory.create({
                 identity: input.identity,
                 workspaceRoot: input.workspaceRoot,
+                ...(input.permissionExecutionPlan
+                    ? { permissionExecutionPlan: input.permissionExecutionPlan }
+                    : {}),
                 ...(input.onPreflightComplete ? { onPreflightComplete: input.onPreflightComplete } : {}),
             });
             const decoders = {
@@ -60,7 +63,7 @@ envPolicy) {
                     persistOutput: false,
                 },
                 operations,
-                spawnHook: createBashEnvSpawnHook(envPolicy, (removed) => {
+                spawnHook: createBashEnvSpawnHook(() => resolvePermissionBashEnvPolicy(envPolicy, input.permissionExecutionPlan), (removed) => {
                     envSanitized = removed;
                     if (removed.length > 0)
                         input.onDetails?.({ envSanitized: removed });

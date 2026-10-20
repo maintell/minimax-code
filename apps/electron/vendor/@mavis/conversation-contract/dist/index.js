@@ -90,6 +90,9 @@ export class DeferredRuntimeConversation {
     maintenance = {
         compact: (input) => this.use((conversation) => conversation.maintenance.compact(input)),
     };
+    taskConcurrency = {
+        occupancy: (parentSessionId) => this.use(async (conversation) => conversation.taskConcurrency?.occupancy(parentSessionId)),
+    };
     constructor() {
         this.readiness = new Promise((resolve, reject) => {
             this.resolveReady = resolve;

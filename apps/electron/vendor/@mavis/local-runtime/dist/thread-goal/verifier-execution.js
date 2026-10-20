@@ -31,6 +31,7 @@ export function createLocalGoalVerifierExecution(host, registry, observer) {
                 ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
                 workerRouteProvider,
                 hostContext: input.attempt.hostContext,
+                objective: input.attempt.objective,
             });
             // Released on every exit so a crashed run cannot leave its caps behind
             // for the next one; the outcome below is read from that same release.
@@ -72,6 +73,10 @@ export function createLocalGoalVerifierExecution(host, registry, observer) {
                             parentTurnId: input.attempt.turnId,
                         },
                     },
+                    prepareChild: ({ subSessionId }) => host.inheritSessionPermissionRestrictions({
+                        sourceSessionId: parent.sessionId,
+                        targetSessionId: subSessionId,
+                    }),
                     onChildStarted: (child) => {
                         const traceRef = { sessionId: child.subSessionId, turnId: child.subTurnId };
                         try {

@@ -1,5 +1,9 @@
+import { withPermissionExecutionPlan } from '@mavis/agent-tools';
 import { assertAgentHostCapabilityAvailable } from '../../empty-dependencies.js';
 import { SIDE_SESSION_APPROVAL_REASON, sideSessionRequiresApproval, } from './side-session-approval.js';
+function miniAppDeniedApprovalReason(toolName) {
+    return `Nobody can answer this permission request: the Mini App that owns this Session registered no event listener for this run and has not opened the Session in a chat side panel. Continue without ${toolName} or explain what you need.`;
+}
 /**
  * V2-owned permission hook orchestration. The injected decision source owns
  * policy/rules and the approval port owns pending lifecycle, dedupe, UI and
@@ -163,7 +167,7 @@ export class LocalTurnPermissionGate {
             }
         }
         if (pluginDecision.updatedInput || pluginDecision.updatedPermissions?.length) {
-            return this.resolveRewrittenPermission(input, pluginDecision);
+            return this.resolveRewrittenPermission(input, pluginDecision, executionPlan);
         }
         return this.resolveApproval({
             input,
@@ -197,10 +201,10 @@ export class LocalTurnPermissionGate {
             return permissionBlock(request.toolName, `Plugin Hook permission update was rejected: ${boundedPermissionError(error)}`, 'policy');
         }
     }
-    async resolveRewrittenPermission(input, pluginDecision) {
+    async resolveRewrittenPermission(input, pluginDecision, previousPlan) {
         applyHookUpdatedInput(input.toolContext, pluginDecision.updatedInput);
         const request = readPermissionToolRequest(input.toolContext, this.options.executionPlans?.snapshotInput);
-        const policyDecision = await checkPermissionDecision(this.options.decisions, input, request);
+        const policyDecision = await checkPermissionDecision(this.options.decisions, input, request, previousPlan?.nativeDelete);
         const executionPlan = readDecisionExecutionPlan(policyDecision, request.toolInput, this.options.executionPlans?.validate);
         if (policyDecision.behavior === 'deny') {
             this.logEnforcement(input, request, {
@@ -247,6 +251,9 @@ export class LocalTurnPermissionGate {
             });
             return undefined;
         }
+        const miniAppBlock = await this.resolveMiniAppApproval(input, request);
+        if (miniAppBlock)
+            return miniAppBlock;
         const approval = await this.requestApproval(input, request, decision);
         if (approval === 'deny') {
             this.logEnforcement(input, request, {
@@ -270,8 +277,48 @@ export class LocalTurnPermissionGate {
         });
         return undefined;
     }
-    logEnforcement(input, request, fields) {
-        this.options.logger?.info?.({
+    /** Looked up only when a tool would actually prompt; a Mini App ask nobody can answer is denied. */
+    async resolveMiniAppApproval(input, request) {
+        const miniAppApprovals = this.options.miniAppApprovals;
+        const lineage = input.sessionLineage;
+        if (!miniAppApprovals || isOrdinaryRootSession(lineage))
+            return undefined;
+        try {
+            if (!(await miniAppApprovals.shouldDenyApproval(input.sessionId, lineage)))
+                return undefined;
+        }
+        catch {
+            return this.resolveMiniAppLookupFailure(input, request);
+        }
+        this.logEnforcement(input, request, {
+            policy_behavior: 'ask',
+            gate_result: 'blocked',
+            decision_source: 'approval_or_abort',
+            approval_decision: 'deny',
+            rewrite_applied: false,
+            miniapp_denied: true,
+        });
+        return permissionBlock(request.toolName, miniAppDeniedApprovalReason(request.toolName), 'policy');
+    }
+    resolveMiniAppLookupFailure(input, request) {
+        if (input.sessionLineage?.miniApp !== true) {
+            // Not known to be a Mini App root: a transient lookup failure must not deny an
+            // ordinary Session's tool, so the normal approval flow asks the user.
+            this.logEnforcement(input, request, { policy_behavior: 'ask', gate_result: 'proceed', miniapp_lookup_failed: true }, 'warn');
+            return undefined;
+        }
+        // Fail closed. A prompt nobody can answer would hang the Mini App Turn.
+        this.logEnforcement(input, request, {
+            policy_behavior: 'deny',
+            gate_result: 'blocked',
+            decision_source: 'policy',
+            rewrite_applied: false,
+            miniapp_denied: true,
+        });
+        return permissionBlock(request.toolName, `Could not verify whether this Session can answer a permission request; ${request.toolName} was blocked instead of waiting for approval.`, 'policy');
+    }
+    logEnforcement(input, request, fields, level = 'info') {
+        this.options.logger?.[level]?.({
             session_id: input.sessionId,
             turn_id: input.turnId,
             tool_call_id: request.toolCallId,
@@ -304,12 +351,16 @@ export class LocalTurnPermissionGate {
 function preToolHookAllowsWithoutApproval(input, decision) {
     return (input.preToolPermission?.behavior === 'allow' && decision.hookAutoApprovalEligible === true);
 }
+/** An ordinary root session or a SideChat (`parentSessionId: null`) can never be a Mini App ask. */
+function isOrdinaryRootSession(lineage) {
+    return lineage !== undefined && !lineage.miniApp && !lineage.parentSessionId;
+}
 function shouldSkipPermissionCheck(options, input) {
     return (options.enforceBuiltinTools !== true &&
         isBuiltinTool(input.toolContext.toolCall) &&
         input.preToolPermission?.behavior !== 'ask');
 }
-async function checkPermissionDecision(source, input, request) {
+async function checkPermissionDecision(source, input, request, nativeDeleteSnapshot) {
     return validatePermissionDecision(await source.check({
         sessionId: input.sessionId,
         turnId: input.turnId,
@@ -318,6 +369,7 @@ async function checkPermissionDecision(source, input, request) {
         toolName: request.toolName,
         toolInput: request.toolInput,
         trustedExactWritePaths: [...(input.trustedExactWritePaths ?? [])],
+        ...(nativeDeleteSnapshot !== undefined ? { nativeDeleteSnapshot } : {}),
         ...(input.signal ? { signal: input.signal } : {}),
         ...(input.channelContext ? { channelContext: input.channelContext } : {}),
     }));
@@ -484,6 +536,7 @@ function applyExecutionPlan(context, plan) {
         }
     }
     Object.assign(target, plan.effectiveInput);
+    withPermissionExecutionPlan(target, plan);
     if (context.args !== target)
         Object.assign(context, { args: target });
 }

@@ -24,6 +24,7 @@ import { prepareLocalRuntimeTestDataIsolation } from "./test-data-clone";
 import { resolveLocalRuntimeLaunchPlan } from "./test-data-isolation";
 import { pcm16LeToWav, consumeAmadeusAsrSse } from "./amadeus-asr";
 import { resolveAmadeusProxyBaseURL, issueAmadeusProxySessionToken, postAmadeusProxyWav } from "./asr-proxy-http";
+import { routeProjectRuntimeMediaRequest } from "../protocol/project-runtime-media";
 import { setUtilityRuntimeRoutingContext, ensureUtilityRuntimeStarted, getUtilityRuntimeStartupToken, stopUtilityRuntime, isUtilityRuntimeReady, getUtilityRuntimeTerminalFailure, getUtilityRuntimeFailReason, fetchViaUtilityRuntime, setUtilityRuntimeAuthContext, setUtilityRuntimeContextWindowUsageEnabled, setUtilityRuntimeRunawayGuardConfig, setUtilityRuntimeToolResultCompactionConfig, setUtilityRuntimeCollectionPolicy, registerUtilityRuntimeMainHooks } from "./utility";
 export { ensureComputerUseUtilityStarted } from "./utility";
 
@@ -36,6 +37,7 @@ let localRuntimeStartupToken = null;
 let localRuntimeSidecarFailReason = null;
 let localAsrWebSocketServer = null;
 let authContext = { authState: 'logged_out' };
+const authContextListeners = new Set();
 let authContextRevision = 0;
 let activeLocalRuntimeDataDir = null;
 let sourceLocalRuntimeDataDir = null;
@@ -342,7 +344,9 @@ async function handleHttpRequest(req, res) {
         // The diagnostic listener is main-owned, but the business runtime is
         // always hosted by the utility process. Keep this sidecar as a transport
         // adapter only; it must never instantiate a second local-runtime host.
-        const response = await handleLocalRuntimeRequest(new Request(mapLocalRuntimeUrl(req.url), init));
+        const request = new Request(mapLocalRuntimeUrl(req.url), init);
+        const response = (await routeProjectRuntimeMediaRequest(request)) ??
+            (await handleLocalRuntimeRequest(request));
         await writeWebResponse(response, res);
     }
     finally {
@@ -878,22 +882,31 @@ export async function stopLocalRuntime() {
 }
 export async function setLocalRuntimeAuthContext(data, options = {}) {
     const nextAuthContext = normalizeAuthContext(data);
+    const sameAuthenticatedLogin = authContext.authState === 'authenticated' &&
+        nextAuthContext.authState === 'authenticated' &&
+        Boolean(authContext.realUserID) &&
+        authContext.realUserID === nextAuthContext.realUserID &&
+        Boolean(authContext.loginEpoch) &&
+        authContext.loginEpoch === nextAuthContext.loginEpoch;
     authContextPersistence = options.persistence ?? 'persistent';
     const authContextChanged = JSON.stringify(authContext) !== JSON.stringify(nextAuthContext);
     authContext = nextAuthContext;
+    if (authContextChanged)
+        publishDesktopRuntimeAuthContext(nextAuthContext);
     const nextAuthContextRevision = authContextChanged
         ? (authContextRevision += 1)
         : authContextRevision;
     if (authContextChanged) {
         clearLocalAsrRuntimeSecrets();
-        const transitionContext = nextAuthContext.authState === 'logged_out'
-            ? nextAuthContext
-            : { authState: 'pending' };
-        // Invalidate the old Utility identity before policy refresh or runtime
-        // warmup can take noticeable time. This post is ordered ahead of the full
-        // snapshot below; Utility handles the credential-free pending state
-        // without repeating greeting retries.
-        void setUtilityRuntimeAuthContext(transitionContext).catch((error) => logger.warn(`[LocalRuntime] Failed to publish pending auth context: ${String(error)}`));
+        if (!sameAuthenticatedLogin) {
+            const transitionContext = nextAuthContext.authState === 'logged_out'
+                ? nextAuthContext
+                : { authState: 'pending' };
+            // Invalidate the old Utility identity before policy refresh or runtime
+            // warmup can take noticeable time. A refresh within the same authenticated
+            // login keeps its identity so account-owned MiniApps are not retired.
+            void setUtilityRuntimeAuthContext(transitionContext).catch((error) => logger.warn(`[LocalRuntime] Failed to publish pending auth context: ${String(error)}`));
+        }
     }
     if (options.prepare !== false) {
         await prepareLocalRuntime();
@@ -1044,6 +1057,21 @@ function kibToPositiveSafeBytes(value) {
     const bytes = value * 1024;
     return Number.isSafeInteger(bytes) ? bytes : undefined;
 }
+export function subscribeDesktopRuntimeAuthContext(listener) {
+    authContextListeners.add(listener);
+    listener({ ...authContext });
+    return () => authContextListeners.delete(listener);
+}
+function publishDesktopRuntimeAuthContext(context) {
+    for (const listener of [...authContextListeners]) {
+        try {
+            listener({ ...context });
+        }
+        catch {
+            // Auth propagation observers are isolated from the canonical local update.
+        }
+    }
+}
 function normalizeAuthContext(data) {
     const identity = {
         ...(readOptionalString(data.loginEpoch)
@@ -1065,6 +1093,13 @@ function normalizeAuthContext(data) {
     };
     return {
         ...identity,
+        ...(identity.accessToken &&
+            identity.realUserID &&
+            typeof data.expiresAtMs === 'number' &&
+            Number.isSafeInteger(data.expiresAtMs) &&
+            data.expiresAtMs > 0
+            ? { expiresAtMs: data.expiresAtMs }
+            : {}),
         authState: identity.accessToken && identity.realUserID
             ? 'authenticated'
             : identity.accessToken || identity.realUserID

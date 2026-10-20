@@ -1,7 +1,7 @@
 /**
  * Migration copy (MR1) of v1 `channels/primary-agent-session-model-repair.ts`.
  */
-import { getRuntimePresetKey, resolveModelAvailability } from '@mavis/config';
+import { getRuntimePresetKey, resolveModelReplacement } from '@mavis/config';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 /** Bounded repair event (plan §13): session / source / preset / from / to model. */
 const MODEL_REPAIR_EVENT = 'session_model_repaired';
@@ -13,11 +13,11 @@ const MODEL_REPAIR_EVENT = 'session_model_repaired';
  * is repaired lazily by the same rule at its first Turn, so a large install
  * does not pay a full-table scan at startup.
  *
- * The rule itself is the one MR A fixed and is NOT re-decided here: an invalid
- * Session override falls back to the currently valid `defaultModel`, the
- * variant is cleared (it belonged to the retired model), the change is
- * persisted through the existing lifecycle, and `session_model_repaired` is
- * logged. A VALID override that merely differs from the default is preserved —
+ * The rule is the shared replacement rule (`resolveModelReplacement`): an
+ * official Session model the catalog no longer lists falls back to the
+ * callable `defaultModel`, else the delivered default; the variant is cleared
+ * (it belonged to the retired model), the change is persisted through the
+ * existing lifecycle, and `session_model_repaired` is logged. A VALID override that merely differs from the default is preserved —
  * boot must not force every Root onto the default model.
  */
 export async function repairPrimaryFamilySessionModels(input, sessionIds) {
@@ -48,31 +48,24 @@ async function repairOne(scope) {
         logger.info({ session_id: sessionId, reason: 'no_session_override' }, MODEL_REPAIR_EVENT);
         return false;
     }
-    const availability = resolveModelAvailability({
+    const outcome = resolveModelReplacement({
         config,
         providerId: override.providerId,
         modelId: override.modelId,
         preset,
-        source: 'session_override',
+        fallbacks: [parseModelKey(config.defaultModel)],
     });
-    if (availability.available) {
-        logger.info({ session_id: sessionId, reason: 'session_override_valid', route: availability.route }, MODEL_REPAIR_EVENT);
+    if (outcome.kind !== 'replaced') {
+        // Valid, or not ours to replace (non-official route / empty catalog):
+        // boot never fails over a Session model; the Turn sends it unchanged.
+        logger.info({
+            session_id: sessionId,
+            reason: outcome.kind === 'available' ? 'session_override_valid' : outcome.reason,
+            route: outcome.route,
+        }, MODEL_REPAIR_EVENT);
         return false;
     }
-    const fallback = parseModelKey(config.defaultModel);
-    const fallbackAvailability = fallback
-        ? resolveModelAvailability({
-            config,
-            providerId: fallback.providerId,
-            modelId: fallback.modelId,
-            preset,
-            source: 'config_default',
-        })
-        : undefined;
-    if (!fallback || !fallbackAvailability?.available) {
-        throw unavailableModelError(fallbackAvailability, 'DEFAULT_MODEL_NOT_AVAILABLE_FOR_ROUTE');
-    }
-    const repairedModel = `${fallback.providerId}/${fallback.modelId}`;
+    const repairedModel = `${outcome.model.providerId}/${outcome.model.modelId}`;
     await input.sessions.updateSession(sessionId, {
         effectiveModel: repairedModel,
         effectiveModelVariant: null,
@@ -81,15 +74,11 @@ async function repairOne(scope) {
         session_id: sessionId,
         source: 'session_override',
         preset,
+        tier: outcome.tier,
         from_model: `${override.providerId}/${override.modelId}`,
         to_model: repairedModel,
     }, MODEL_REPAIR_EVENT);
     return true;
-}
-function unavailableModelError(availability, fallbackCode) {
-    const error = new Error(availability?.available ? fallbackCode : (availability?.message ?? fallbackCode));
-    error.code = availability?.available ? fallbackCode : (availability?.code ?? fallbackCode);
-    return error;
 }
 function parseModelKey(value) {
     const raw = value?.trim();

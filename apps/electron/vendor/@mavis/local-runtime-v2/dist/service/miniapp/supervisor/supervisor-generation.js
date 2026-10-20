@@ -14,10 +14,15 @@ export function publishedView(candidate, miniAppGeneration, runtime) {
         packageDigest: candidate.packageDigest,
         clientDigest: candidate.clientDigest,
         surfacePath: candidate.surfacePath,
+        ...(candidate.surfaceWindow ? { surfaceWindow: candidate.surfaceWindow } : {}),
         nodeDigest: candidate.nodeDigest,
         lifecycle: candidate.lifecycle,
         ...(runtime ? { processGeneration: runtime.processGeneration, origin: runtime.origin } : {}),
     };
+}
+/** Keeps the loopback credential beside, never inside, the published view. */
+export function runtimeLoopbackToken(runtime) {
+    return runtime ? { loopbackToken: runtime.loopbackToken } : {};
 }
 export function persistedState(candidate, runtime, updatedAtMs) {
     return {
@@ -70,7 +75,8 @@ function sameProcessContract(current, candidate) {
     return (current.nodeDigest === candidate.nodeDigest &&
         current.nodeEntry === candidate.nodeEntry &&
         canonicalMcpEndpoints(current) === canonicalMcpEndpoints(candidate) &&
-        canonicalHostConnectorPolicy(current) === canonicalHostConnectorPolicy(candidate));
+        canonicalHostConnectorPolicy(current) === canonicalHostConnectorPolicy(candidate) &&
+        canonicalAgentPolicy(current) === canonicalAgentPolicy(candidate));
 }
 function hasRuntimeTransition(generation) {
     return Boolean(generation.startPromise ||
@@ -88,5 +94,11 @@ function canonicalHostConnectorPolicy(candidate) {
     return policy.kind === 'deny-all'
         ? policy.kind
         : JSON.stringify([policy.kind, [...policy.providers].sort()]);
+}
+function canonicalAgentPolicy(candidate) {
+    const policy = candidate.agentPolicy ?? { kind: 'deny-all' };
+    return policy.kind === 'deny-all'
+        ? policy.kind
+        : JSON.stringify([policy.kind, [...policy.capabilities].sort(), policy.maxConcurrent]);
 }
 //# sourceMappingURL=supervisor-generation.js.map

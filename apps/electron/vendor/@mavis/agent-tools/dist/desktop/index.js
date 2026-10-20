@@ -27,6 +27,7 @@ export * from './local-bash-result.js';
 export * from './local-bash-timing.js';
 export * from './local-bash-input.js';
 export * from './local-bash-contract.js';
+export * from './permission-execution.js';
 export { executeLocalHostTrashIfRequested } from './host-trash-executor.js';
 export * from './local-glob.js';
 export * from './local-grep.js';
@@ -124,5 +125,5 @@ export function buildLocalToolRegistry(deps) {
 export { CloudSessionReader, CloudSessionReadError, } from './cloud-session-reader.js';
 export { buildLocalCronTools } from './local-cron-tools.js';
 export { CRON_TOOL_NAMES, LocalSelfReminderToolDef, LocalSelfReminderToolDef as SelfReminderToolDef, cronToolDefinitions, selfReminderIntervalMinutes, } from '../cron/tool-defs.js';
-export { DESKTOP_BASH_PREVIEW_BYTES } from './output-limit.js';
+export { DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, } from './output-limit.js';
 //# sourceMappingURL=index.js.map

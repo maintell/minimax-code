@@ -10,9 +10,13 @@
 import { createHash } from 'node:crypto';
 import { Type } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
+import { normalizeLLMError, toLLMMetricErrorKind, } from '@mavis/shared/llm-error-classifier';
 import { redactMemorySecrets } from '../secret-redactor.js';
+import { MANAGED_MINIMAX_PROVIDER_ID } from '../../model-system/index.js';
 import { createConsolidationWorkdirTools, } from './consolidation-workdir-tools.js';
 const MAX_CACHED_CONTRACTS = 16;
+// Leave headroom between the model's generation target and publication limits.
+const CONSOLIDATION_PROMPT_BUDGET_RATIO = 0.8;
 export class MemoryV2ModelGateway {
     options;
     contracts = new Map();
@@ -129,8 +133,19 @@ export class MemoryV2ModelGateway {
             }),
         });
     }
-    async quotaRemainingPercent() {
-        return this.options.quotaRemainingPercent?.();
+    async readQuota(kind) {
+        const config = this.options.config();
+        const model = await this.options.completion.resolveModel({
+            kind,
+            modelName: configuredModel(kind, config),
+            reasoningEffort: configuredEffort(kind, config),
+        });
+        if (!model.managedProvider || !model.modelName.startsWith(`${MANAGED_MINIMAX_PROVIDER_ID}/`)) {
+            return { status: 'not-applicable', reason: 'unmanaged-model' };
+        }
+        return this.options.readSubscriptionQuota
+            ? this.options.readSubscriptionQuota(model.modelName)
+            : { status: 'unknown', reason: 'quota-reader-unavailable' };
     }
     async invoke(options) {
         const { kind, contractId, callerSignal, parse, buildPayload } = options;
@@ -197,6 +212,7 @@ function contractInputLimit(kind, config) {
 function contractConfigFields(kind, config) {
     if (kind === 'consolidation') {
         return {
+            artifactPromptBudgetRatio: CONSOLIDATION_PROMPT_BUDGET_RATIO,
             maxSelectedSessions: config.maxSelectedSessions,
             maxMemoryMarkdownBytes: config.maxMemoryMarkdownBytes,
             maxSummaryInjectionTokens: config.maxSummaryInjectionTokens,
@@ -204,6 +220,21 @@ function contractConfigFields(kind, config) {
     }
     return { maxSessionDocBytes: config.maxSessionDocBytes };
 }
+/**
+ * 与会话内容无关的模型服务故障：稍后重发同一请求即可能成功，归为 model-unavailable，
+ * 由 Reconciler 停止本批且不消耗该会话的重试次数（§10）。其余类别归为 model-request-failed。
+ */
+const ENVIRONMENT_FAILURE_KINDS = new Set([
+    'abort',
+    'timeout',
+    'network',
+    'server_error',
+    'overloaded',
+    'credits_exhausted',
+    'usage_limit',
+    'auth',
+    'not_found',
+]);
 function classifyFailure(error) {
     if (error instanceof SyntaxError || error instanceof InvalidModelOutputError) {
         return { status: 'failed', reason: 'model-invalid-output' };
@@ -212,7 +243,16 @@ function classifyFailure(error) {
     if (retryAtMs !== undefined) {
         return retryAtMs > 0 ? { status: 'rate-limited', retryAtMs } : { status: 'rate-limited' };
     }
-    return { status: 'failed', reason: 'model-unavailable' };
+    const kind = toLLMMetricErrorKind(normalizeLLMError({
+        raw: error,
+        ...(typeof error === 'string' ? { errorMessage: error } : {}),
+    }).facts);
+    if (kind === 'rate_limited' || kind === 'tpm_rate_limited')
+        return { status: 'rate-limited' };
+    return {
+        status: 'failed',
+        reason: ENVIRONMENT_FAILURE_KINDS.has(kind) ? 'model-unavailable' : 'model-request-failed',
+    };
 }
 /** 识别上游限流并取出 retryAtMs;拿不到具体时刻时返回 0 表示「限流但无重试时刻」。 */
 function rateLimitRetryAtMs(error) {
@@ -248,6 +288,8 @@ const CONSOLIDATION_AGENT_HARNESS = [
 /** 首条用户简报：程序合成的变更事实与预算；逐行 diff 在工作目录 changes.md。 */
 function renderConsolidationBriefing(input) {
     const { changes } = input;
+    const indexBudget = consolidationPromptBudget(input.maxIndexBytes);
+    const summaryBudget = consolidationPromptBudget(input.maxSummaryTokens);
     const lines = [
         `本轮 ${input.mode} 整理；通过文件工具维护两份产物：`,
         `- 新增会话文档：${changes.addedSessionIds.length}`,
@@ -255,11 +297,14 @@ function renderConsolidationBriefing(input) {
         `- 已退出选集（条目已由程序删除，勿恢复）：${changes.removedSessionIds.length}`,
         `- 产物存在用户权威修改：${changes.artifactsModified ? '是（尊重现有产物内容）' : '否'}`,
         '',
-        `MEMORY.md 字节上限 ${input.maxIndexBytes}；memory_summary.md 生成预算 ${input.maxSummaryTokens} token，首行必须是 v2。`,
+        `MEMORY.md 生成目标预算 ${indexBudget} 字节；memory_summary.md 生成目标预算 ${summaryBudget} token，首行必须是 v2。`,
         `- note 变化：新增 ${changes.addedNotePaths.length}，修改 ${changes.updatedNotePaths.length}，移除 ${changes.removedNotePaths.length}。`,
         '请从 changes.md 开始，按 next_line_offset 读完整清单；差异截断时按路径补读。旧 note 按需读取，禁止修改或删除 note 文件。',
     ];
     return lines.join('\n');
+}
+function consolidationPromptBudget(hardLimit) {
+    return Math.max(1, Math.floor(hardLimit * CONSOLIDATION_PROMPT_BUDGET_RATIO));
 }
 const CAPTURE_OUTPUT_TOOL = {
     name: 'submit_memory_extraction',

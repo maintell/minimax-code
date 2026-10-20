@@ -8,7 +8,7 @@ import { AgentHostCommittedHistoryWriter } from '../history/committed-history-wr
 import { captureSemanticSnapshot } from '../history/semantic-identity.js';
 import { captureContextCompactionResult, ContextCompactionAttemptFactory, ContextCompactionResultValidationError, createCompactionTokenUsageAccumulator, describeUnknownError, logCheckpointGeneratedBestEffort, logCompactionFailureBestEffort, observeCompactionBestEffort, recordCheckpointAttemptBestEffort, } from './context-compaction.js';
 import { createCompactionLifecycleMetadata, createManualCompactionChange, } from './compaction-history.js';
-import { joinPrompt, readPreparedSystemPrompt } from '../execution/prompt.js';
+import { joinPrompt, readPreparedSystemPrompt, resolveProviderContextMode, } from '../execution/prompt.js';
 import { localPluginHookCoordinator } from '../assembly/local-turn-plugin-hooks.js';
 import { createAgentHostPluginHookTranscript, } from '../tools/index.js';
 export class AgentHostCompactionLeaseError extends Error {
@@ -102,50 +102,56 @@ export class AgentHostCompactionExecutor {
         const compactionDependencies = this.requireCompaction();
         const context = createCompactionContext(input);
         const attemptId = this.compactionAttempts.create(context, input.lease.leaseId, 'manual');
-        const state = {
-            thinkingLevel: 'off',
-            tokenUsage: createCompactionTokenUsageAccumulator(),
-        };
-        if (input.lease.signal.aborted) {
-            return this.failPrepared({
+        await compactionDependencies.barrier?.begin(context.sessionId, attemptId, context.turnId);
+        try {
+            const state = {
+                thinkingLevel: 'off',
+                tokenUsage: createCompactionTokenUsageAccumulator(),
+            };
+            if (input.lease.signal.aborted) {
+                return await this.failPrepared({
+                    context,
+                    attemptId,
+                    error: abortError(input.lease.signal),
+                    abortedReason: abortReason(input),
+                });
+            }
+            const captured = await capture(async () => {
+                const session = captureSession(input.lease.sessionId, await this.dependencies.sessions.get(input.lease.sessionId));
+                const history = captureSemanticSnapshot(await this.dependencies.history.read(input.lease.sessionId)).value;
+                validateHistory(history);
+                const piHistory = captureSemanticSnapshot(copyCanonicalHistoryForPiCompatibility(history.messages)).value;
+                return { session, history, piHistory };
+            });
+            if (!captured.ok) {
+                logCompactionFailureBestEffort(this.dependencies.logger, {
+                    context,
+                    attemptId,
+                    phase: 'manual',
+                    thinkingLevel: state.thinkingLevel,
+                    checkpoint: state.checkpoint,
+                    error: captured.error,
+                });
+                return await this.failPrepared({
+                    context,
+                    attemptId,
+                    error: captured.error,
+                    tokenUsage: state.tokenUsage,
+                });
+            }
+            return await this.runManualCompaction({
+                input,
+                ...captured.value,
+                desktopCapabilities,
                 context,
                 attemptId,
-                error: abortError(input.lease.signal),
-                abortedReason: abortReason(input),
+                state,
+                compactionDependencies,
             });
         }
-        const captured = await capture(async () => {
-            const session = captureSession(input.lease.sessionId, await this.dependencies.sessions.get(input.lease.sessionId));
-            const history = captureSemanticSnapshot(await this.dependencies.history.read(input.lease.sessionId)).value;
-            validateHistory(history);
-            const piHistory = captureSemanticSnapshot(copyCanonicalHistoryForPiCompatibility(history.messages)).value;
-            return { session, history, piHistory };
-        });
-        if (!captured.ok) {
-            logCompactionFailureBestEffort(this.dependencies.logger, {
-                context,
-                attemptId,
-                phase: 'manual',
-                thinkingLevel: state.thinkingLevel,
-                checkpoint: state.checkpoint,
-                error: captured.error,
-            });
-            return this.failPrepared({
-                context,
-                attemptId,
-                error: captured.error,
-                tokenUsage: state.tokenUsage,
-            });
+        finally {
+            compactionDependencies.barrier?.end(context.sessionId, attemptId);
         }
-        return this.runManualCompaction({
-            input,
-            ...captured.value,
-            desktopCapabilities,
-            context,
-            attemptId,
-            state,
-            compactionDependencies,
-        });
     }
     async runManualCompaction(plan) {
         const { input, session, history, piHistory, desktopCapabilities, context, attemptId, state, compactionDependencies, } = plan;
@@ -270,6 +276,14 @@ export class AgentHostCompactionExecutor {
                 sessionId: input.lease.sessionId,
                 signal: input.lease.signal,
             });
+            const providerContext = resolveProviderContextMode(session, {
+                systemPrompt: joinPrompt(assembly.systemPromptPrefix, readPreparedSystemPrompt(preparation.agentConfig)),
+                tools: assembly.tools.map(({ def }) => ({
+                    name: def.name,
+                    description: def.description,
+                    parameters: def.schema,
+                })),
+            }, 'compaction');
             const compaction = captureContextCompactionResult(await compactionDependencies.manual.compactManual(createManualCompactionRequest({
                 input,
                 messages: piHistory,
@@ -277,12 +291,8 @@ export class AgentHostCompactionExecutor {
                 thinkingLevel,
                 streamFn,
                 payloadTransform,
-                systemPrompt: joinPrompt(assembly.systemPromptPrefix, readPreparedSystemPrompt(preparation.agentConfig)),
-                tools: assembly.tools.map(({ def }) => ({
-                    name: def.name,
-                    description: def.description,
-                    parameters: def.schema,
-                })),
+                systemPrompt: providerContext.systemPrompt,
+                tools: [...providerContext.tools],
             }), {
                 onStarted: () => observeCompactionBestEffort(compactionDependencies.observer, {
                     context,

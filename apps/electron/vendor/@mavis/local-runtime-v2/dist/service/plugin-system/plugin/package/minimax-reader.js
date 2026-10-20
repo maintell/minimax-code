@@ -3,8 +3,9 @@ import { readOfficialAppReference } from '../../app/reader.js';
 import { readOfficialMcpFile } from '../../mcp/config.js';
 import { readPluginSkill } from '../../skill/reader.js';
 import { canonicalizePluginRoot, readPluginJsonObject, resolvePluginFile, } from './filesystem.js';
+import { readMiniMaxPluginAgents } from './agent/minimax.js';
 import { readOptionalMiniAppContribution } from './miniapp/reader.js';
-import { readerFail } from './reader-errors.js';
+import { ignoredManifestFieldDiagnostics, readerFail } from './reader-errors.js';
 import { readPluginHooks } from './hook/reader.js';
 import { MARKETPLACE_CATEGORY_NAMES, } from './types.js';
 const MANIFEST_PATH = '.minimax-plugin/plugin.json';
@@ -14,6 +15,7 @@ const ICON_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:png|jpe?g|webp)$/u
 const APP_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.app\.json$/u;
 const MCP_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.mcp\.json$/u;
 const SKILL_PATH = /^skills\/[A-Za-z0-9._-]+\/SKILL\.md$/u;
+const AGENT_PATH = /^agents\/[a-z][a-z0-9_-]*\.md$/u;
 const HOOK_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.json$/u;
 const HOST_BINDING_PATH = /^bindings\/[A-Za-z0-9._-]+\.binding\.json$/u;
 const HOST_BINDING_IDENTIFIER = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/u;
@@ -46,12 +48,14 @@ const MANIFEST_FIELDS = new Set([
     'hooks',
     'hostBindings',
 ]);
+/** The official package contract has no subagents; OFFICIAL keeps ignoring `agents`. */
+const LOCAL_MANIFEST_FIELDS = new Set([...MANIFEST_FIELDS, 'agents']);
 export async function readMiniMaxPluginPackage(packageRoot, options) {
     const root = await canonicalizePluginRoot(packageRoot, { rejectSymlink: true });
     const { path: manifestPath, value } = await readPluginJsonObject(root, MANIFEST_PATH, {
         portable: true,
     });
-    const manifest = readManifest(value);
+    const manifest = readManifest(value, options.source);
     const iconPath = await resolvePluginFile(root, manifest.icon, { portable: true });
     const darkIconPath = manifest.darkIcon
         ? await resolvePluginFile(root, manifest.darkIcon, { portable: true })
@@ -78,13 +82,19 @@ export async function readMiniMaxPluginPackage(packageRoot, options) {
         declared: manifest.hooks,
         sourceFormat: 'MINIMAX',
     });
+    const agentResult = await readMiniMaxPluginAgents(root, {
+        pluginName: manifest.name,
+        declared: manifest.agents,
+        skills,
+    });
     const miniapp = await readOptionalMiniAppContribution(root.path, mcpServers.map((server) => server.name));
     assertRequiredMiniApp(miniapp, options.requireMiniApp);
     if (apps.length +
         mcpServers.length +
         skills.length +
         hostBindings.length +
-        hookResult.hooks.length ===
+        hookResult.hooks.length +
+        agentResult.agents.length ===
         0 &&
         !miniapp) {
         readerFail('MANIFEST_SCHEMA_INVALID', 'MiniMax Plugin has no executable capability');
@@ -109,9 +119,17 @@ export async function readMiniMaxPluginPackage(packageRoot, options) {
         skills,
         hostBindings,
         hooks: hookResult.hooks,
+        ...(agentResult.agents.length > 0 ? { agents: agentResult.agents } : {}),
         ...(miniapp ? { miniapp } : {}),
-        diagnostics: hookResult.diagnostics,
+        diagnostics: [
+            ...hookResult.diagnostics,
+            ...agentResult.diagnostics,
+            ...ignoredManifestFieldDiagnostics(value, manifestFields(options.source)),
+        ],
     };
+}
+function manifestFields(source) {
+    return source === 'LOCAL_MINIMAX' ? LOCAL_MANIFEST_FIELDS : MANIFEST_FIELDS;
 }
 function assertRequiredMiniApp(miniapp, required) {
     if (required && !miniapp) {
@@ -198,7 +216,7 @@ function assertUniqueHostBindingValues(values, label) {
 function isRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
-function readManifest(value) {
+function readManifest(value, source) {
     assertManifestEnvelope(value);
     const identity = readManifestIdentity(value);
     const icon = readManifestIcon(value.icon);
@@ -206,6 +224,9 @@ function readManifest(value) {
     const category = readManifestCategory(value.category);
     const exampleQueries = readExampleQueries(value.exampleQueries);
     const capabilities = readManifestCapabilities(value);
+    const agents = source === 'LOCAL_MINIMAX' && value.agents !== undefined
+        ? referenceArray(value.agents, 'agents', AGENT_PATH)
+        : [];
     return {
         ...identity,
         icon,
@@ -213,11 +234,13 @@ function readManifest(value) {
         category,
         exampleQueries,
         ...capabilities,
+        agents,
     };
 }
 function assertManifestEnvelope(value) {
-    if (Object.keys(value).some((key) => !MANIFEST_FIELDS.has(key))) {
-        readerFail('MANIFEST_SCHEMA_INVALID', 'MiniMax manifest contains an unknown field');
+    // Host capabilities are granted only through Host Bindings, never by a manifest claim.
+    if (Object.hasOwn(value, 'hostCapabilities')) {
+        readerFail('MANIFEST_SCHEMA_INVALID', 'MiniMax manifest cannot declare host capabilities');
     }
     if ((value.$schema !== undefined && typeof value.$schema !== 'string') ||
         value.schemaVersion !== 1) {

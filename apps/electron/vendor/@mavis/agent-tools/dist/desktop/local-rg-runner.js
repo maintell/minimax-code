@@ -6,7 +6,7 @@
  * (PATH `rg` fallback) directly on the user machine.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, statSync } from '../shared/physical-fs.js';
 import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';

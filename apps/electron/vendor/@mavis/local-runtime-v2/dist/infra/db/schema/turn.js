@@ -1,5 +1,15 @@
 import { desc, sql } from 'drizzle-orm';
 import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex, } from 'drizzle-orm/sqlite-core';
+export const SESSION_DELETION_OWNER_KIND = 'session-deletion';
+export const MAINTENANCE_DELETING_OWNER_KIND = 'maintenance-deleting';
+export const TURN_DELETING_OWNER_KIND = 'turn-deleting';
+export const COMPACTION_DELETING_OWNER_KIND = 'compaction-deleting';
+export function isDeletionOwnerKind(ownerKind) {
+    return (ownerKind === SESSION_DELETION_OWNER_KIND ||
+        ownerKind === TURN_DELETING_OWNER_KIND ||
+        ownerKind === COMPACTION_DELETING_OWNER_KIND ||
+        ownerKind === MAINTENANCE_DELETING_OWNER_KIND);
+}
 export const sessionLocks = sqliteTable('local_runtime_session_locks', {
     sessionId: text('session_id').primaryKey(),
     ownerId: text('owner_id').notNull(),

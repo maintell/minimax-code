@@ -6,6 +6,10 @@ export class SessionArtifactService {
     async ensureReportsDirectory(sessionId) {
         return this.owners.reports.ensureDirectory(sessionId);
     }
+    /** Where each compaction keeps the full history it replaced. */
+    async resolveSnapshotsDirectory(sessionId) {
+        return this.owners.snapshots.resolveDirectory(sessionId);
+    }
     async deleteSession(sessionId, options = {}) {
         const operations = [
             () => this.owners.queue.deleteSession(sessionId),

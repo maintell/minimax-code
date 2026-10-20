@@ -1,6 +1,6 @@
 import { waitForChildBashTaskChange } from './child-bash-lifecycle.js';
 import { performTaskStop } from './task-stop.js';
-import { createTaskLifecycleEventId, InvalidTaskStatusTransitionError, isTerminalTaskStatus, } from './domain.js';
+import { InvalidTaskStatusTransitionError, TaskNotFoundError, isTerminalTaskStatus, } from './domain.js';
 import { StartupTaskRecovery } from './startup-recovery.js';
 import { captureBackgroundTaskCheckpointSnapshot } from './checkpoint-snapshot.js';
 import { logger } from '../common/logger.js';
@@ -32,7 +32,7 @@ export class LocalBackgroundTaskService {
         this.startupRecovery = new StartupTaskRecovery({
             nowMs: this.nowMs,
             patchLost: (task, patch) => this.patchStatusIfNotTerminal(task, 'lost', patch),
-            emitCompleted: (task, reason) => this.emit(task, 'completed', { status: 'lost', reason }),
+            onStatusChanged: (task) => this.notifyTaskStatusChanged(task),
         });
     }
     async create(task) {
@@ -42,7 +42,7 @@ export class LocalBackgroundTaskService {
                 metadata: { ...task.metadata, runtimeOwnerId: this.runtimeOwner.ownerId },
             }
             : task);
-        await this.emit(created, 'created');
+        this.notifyTaskChange(created);
         return created;
     }
     async get(ctxOrTaskId, maybeTaskId) {
@@ -190,7 +190,7 @@ export class LocalBackgroundTaskService {
             return task;
         // Two callers can both observe `running`. Install one shared stop promise
         // after the visibility check but before the first state mutation, then
-        // make every concurrent caller reuse its settled terminal result.
+        // make every concurrent caller reuse the attempt and its observed status.
         const pendingAfterRead = this.stopRequests.get(taskId);
         if (pendingAfterRead)
             return pendingAfterRead;
@@ -199,7 +199,7 @@ export class LocalBackgroundTaskService {
             nowMs: this.nowMs,
             stopRuntime: this.stopRuntime,
             patchStatusIfNotTerminal: (current, status, patch) => this.patchStatusIfNotTerminal(current, status, patch),
-            emit: (current, type, payload) => this.emit(current, type, payload),
+            onStatusChanged: (current) => this.notifyTaskStatusChanged(current),
         }, task, reason);
         this.stopRequests.set(taskId, stopping);
         try {
@@ -213,9 +213,7 @@ export class LocalBackgroundTaskService {
     async patch(taskId, patch) {
         const task = await this.store.patch(taskId, patch);
         if (patch.status) {
-            await this.emit(task, isTerminalTaskStatus(patch.status) ? 'completed' : 'status_changed', {
-                status: patch.status,
-            });
+            this.notifyTaskStatusChanged(task);
         }
         return task;
     }
@@ -230,13 +228,18 @@ export class LocalBackgroundTaskService {
             throw error;
         }
     }
-    async appendOutput(chunk) {
+    async appendOutput(chunk, options = {}) {
+        const deferredTask = options.persistProgress === false ? await this.store.get(chunk.taskId) : undefined;
+        if (options.persistProgress === false && !deferredTask) {
+            throw new TaskNotFoundError(chunk.taskId);
+        }
         const outputRef = await this.outputStore.append(chunk);
-        const task = await this.store.patch(chunk.taskId, {
-            outputRef,
-            updatedAt: chunk.timestamp ?? this.nowMs(),
-        });
-        await this.emit(task, 'output_updated', { outputRef });
+        const task = deferredTask ??
+            (await this.store.patch(chunk.taskId, {
+                outputRef,
+                updatedAt: chunk.timestamp ?? this.nowMs(),
+            }));
+        this.notifyTaskChange(task);
         return outputRef;
     }
     async finalizeOutput(taskId, summary) {
@@ -262,46 +265,15 @@ export class LocalBackgroundTaskService {
         const current = await this.store.get(taskId);
         return current && isTerminalTaskStatus(current.status) ? current : undefined;
     }
-    async emit(task, type, payload) {
-        try {
-            try {
-                await this.store.appendEvent({
-                    eventId: createTaskLifecycleEventId(),
-                    taskId: task.taskId,
-                    ownerSessionId: task.ownerSessionId,
-                    type,
-                    timestamp: this.nowMs(),
-                    payload,
-                });
-            }
-            catch (error) {
-                try {
-                    logger.warn({
-                        event: 'background_task_lifecycle_event_persist_failed',
-                        taskId: task.taskId,
-                        ownerSessionId: task.ownerSessionId,
-                        lifecycleType: type,
-                        error: error instanceof Error ? error.message : String(error),
-                    }, 'Failed to persist background task lifecycle event');
-                }
-                catch {
-                    // The lifecycle state is already durable. Logging must not prevent
-                    // task_stop or terminal completion from progressing.
-                }
-            }
-        }
-        finally {
-            this.taskWaiters.notify(task.taskId);
-            this.taskWaiters.notify(`session:${task.ownerSessionId}`);
-            if (type === 'completed' && isTerminalTaskStatus(task.status))
-                this.notifyTerminal(task);
-        }
+    notifyTaskChange(task) {
+        this.taskWaiters.notify(task.taskId);
+        this.taskWaiters.notify(`session:${task.ownerSessionId}`);
     }
-    /**
-     * `emit('completed')` is the one path every terminal writer funnels through —
-     * `patch`, `performStop` and the startup reconcile all reach it — so hooking
-     * here means no terminal outcome can silently skip the wake.
-     */
+    notifyTaskStatusChanged(task) {
+        this.notifyTaskChange(task);
+        if (isTerminalTaskStatus(task.status))
+            this.notifyTerminal(task);
+    }
     notifyTerminal(task) {
         if (!this.onTerminal)
             return;

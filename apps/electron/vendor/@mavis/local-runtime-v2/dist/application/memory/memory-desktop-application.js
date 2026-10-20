@@ -121,6 +121,22 @@ export class MemoryDesktopApplication {
         }
         return { discarded: true };
     }
+    async getOnboarding(_req) {
+        const state = await this.deps.onboarding.inspect();
+        return {
+            ...(state.record ? { record: state.record } : {}),
+            needsOnboarding: state.needsOnboarding,
+        };
+    }
+    async completeOnboarding(req) {
+        const result = this.deps.onboarding.complete({
+            legacyChoice: req.legacyChoice,
+            backfillChoice: req.backfillChoice,
+        });
+        if (result.status !== 'completed')
+            return err(result.status);
+        return { record: result.record };
+    }
 }
 function mapForgetResult(result) {
     if (result.status === 'accepted-for-rebuild')
@@ -138,6 +154,7 @@ export function memoryDesktopApplicationFor(memory) {
             recall: memory.recall,
             governance: memory.governance,
             legacyMigration: memory.legacyMigration,
+            onboarding: memory.onboarding,
         }),
     };
 }

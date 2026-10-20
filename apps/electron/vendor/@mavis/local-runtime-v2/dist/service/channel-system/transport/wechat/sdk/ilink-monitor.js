@@ -34,6 +34,8 @@ export class ILinkMonitor extends EventEmitter {
     botId;
     /** Server-suggested timeout for next long-poll; undefined = use client default. */
     nextPollTimeoutMs;
+    /** Last emitted `status` — lets a success after `reconnecting` announce recovery. */
+    lastStatus;
     constructor(opts) {
         super();
         this.client = opts.client;
@@ -64,7 +66,7 @@ export class ILinkMonitor extends EventEmitter {
         if (this.externalAbortSignal) {
             this.externalAbortSignal.addEventListener('abort', () => this.stop(), { once: true });
         }
-        this.emit('status', 'polling');
+        this.emitStatus('polling');
         this.emit('connected');
         let consecutiveFailures = 0;
         while (this.running && !this.abortController.signal.aborted) {
@@ -78,7 +80,7 @@ export class ILinkMonitor extends EventEmitter {
             // outcome === 'failed' — shared backoff ladder for API and transport errors.
             consecutiveFailures++;
             if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                this.emit('status', 'reconnecting');
+                this.emitStatus('reconnecting');
                 consecutiveFailures = 0;
                 await this.sleep(BACKOFF_DELAY_MS);
             }
@@ -87,7 +89,7 @@ export class ILinkMonitor extends EventEmitter {
             }
         }
         this.running = false;
-        this.emit('status', 'stopped');
+        this.emitStatus('stopped');
         this.emit('disconnected', 'stopped');
     }
     /**
@@ -96,22 +98,41 @@ export class ILinkMonitor extends EventEmitter {
      * session_expired without retry, or an abort).
      */
     async pollOnce() {
+        // Set once getUpdates settled: anything thrown after it comes from a
+        // listener of this round, not from the request, so it is no verdict.
+        let answered = false;
         try {
             const resp = await this.client.getUpdates(this.getUpdatesBuf, this.nextPollTimeoutMs);
+            answered = true;
             const isApiError = (resp.ret !== undefined && resp.ret !== 0) ||
                 (resp.errcode !== undefined && resp.errcode !== 0);
             if (isApiError)
                 return this.handleApiError(resp);
             this.adoptPollState(resp);
+            this.onPollSucceeded();
             this.emitFilteredMessages(resp.msgs ?? []);
             return 'ok';
         }
         catch (err) {
             if (this.abortController.signal.aborted)
                 return 'stop';
-            this.emit('error', err instanceof Error ? err : new Error(String(err)));
+            const error = err instanceof Error ? err : new Error(String(err));
+            if (!answered)
+                this.emit('poll', { outcome: 'request_failed', error });
+            this.emit('error', error);
             return 'failed';
         }
+    }
+    /**
+     * The server answered with ret / errcode 0. After a failure streak the
+     * loop announced `reconnecting` but nothing ever announced the way back,
+     * so the status stayed `reconnecting` for the rest of the loop; announce
+     * `polling` again on the first success.
+     */
+    onPollSucceeded() {
+        this.emit('poll', { outcome: 'ok' });
+        if (this.lastStatus === 'reconnecting')
+            this.emitStatus('polling');
     }
     /**
      * A `session_expired` (-14) means the iLink bot login session is dead —
@@ -126,7 +147,8 @@ export class ILinkMonitor extends EventEmitter {
     async handleApiError(resp) {
         const isSessionExpired = resp.errcode === SESSION_EXPIRED_ERRCODE || resp.ret === SESSION_EXPIRED_ERRCODE;
         if (isSessionExpired) {
-            this.emit('status', 'session_expired');
+            this.emit('poll', { outcome: 'session_expired' });
+            this.emitStatus('session_expired');
             const shouldRetry = this.onSessionExpired ? await this.onSessionExpired() : false;
             if (!shouldRetry) {
                 this.emit('disconnected', 'session_expired');
@@ -135,6 +157,7 @@ export class ILinkMonitor extends EventEmitter {
             await this.sleep(this.sessionExpiredPauseMs);
             return 'ok';
         }
+        this.emit('poll', { outcome: 'api_error' });
         this.emit('error', new Error(`getUpdates failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ''}`));
         return 'failed';
     }
@@ -179,6 +202,10 @@ export class ILinkMonitor extends EventEmitter {
     // -------------------------------------------------------------------------
     // Internal
     // -------------------------------------------------------------------------
+    emitStatus(status) {
+        this.lastStatus = status;
+        this.emit('status', status);
+    }
     sleep(ms) {
         return new Promise((resolve) => {
             const timer = setTimeout(resolve, ms);

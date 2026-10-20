@@ -87,8 +87,8 @@ const MINIAPP_FAILURE_CATALOG = {
         lifecycleCode: 'PREPARATION_FAILED',
         stage: 'workspace',
         recovery: 'edit_workspace',
-        message: 'The Mini App surface path is invalid.',
-        hint: 'Use a canonical Host-relative path such as /dashboard.',
+        message: 'The Mini App surface declaration is invalid.',
+        hint: 'Use a canonical Host-relative path such as /dashboard and, if present, a window block with only the documented whitelisted keys.',
     },
     MINIAPP_MCP_ENDPOINTS_INVALID: {
         lifecycleCode: 'PREPARATION_FAILED',
@@ -103,6 +103,20 @@ const MINIAPP_FAILURE_CATALOG = {
         recovery: 'edit_workspace',
         message: 'The Mini App Host Connector access declaration is invalid.',
         hint: 'Use unique lowercase provider identifiers in hostConnectorAccess.providers.',
+    },
+    MINIAPP_AGENT_ACCESS_INVALID: {
+        lifecycleCode: 'PREPARATION_FAILED',
+        stage: 'workspace',
+        recovery: 'edit_workspace',
+        message: 'The Mini App Agent access declaration is invalid.',
+        hint: 'Declare agentAccess as a string array that contains only session.run.',
+    },
+    MINIAPP_AGENT_CONCURRENCY_INVALID: {
+        lifecycleCode: 'PREPARATION_FAILED',
+        stage: 'workspace',
+        recovery: 'edit_workspace',
+        message: 'The Mini App Agent concurrency declaration is invalid.',
+        hint: 'Declare agentConcurrency as an integer from 1 to 32, or omit it for the default of 4.',
     },
     WORKSPACE_CHANGED: {
         lifecycleCode: 'PREPARATION_FAILED',

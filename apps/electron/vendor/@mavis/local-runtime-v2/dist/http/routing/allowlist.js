@@ -53,6 +53,8 @@ const CRON_OWNER_METHODS = new Set([
     'deliverCron',
 ]);
 const PREFERENCE_OWNER_METHODS = new Set([
+    'getComputerUseDefaultPreference',
+    'putComputerUseDefaultPreference',
     'getComposerSendBehavior',
     'putComposerSendBehavior',
     'getComposerEnterBehavior',
@@ -133,7 +135,6 @@ const MODEL_PROVIDER_METHODS = new Set([
 ]);
 const WORKSPACE_GIT_METHODS = new Set([
     'suggestCommitMessage',
-    'saveWorkspaceFile',
     'getWorkspaceFileDiff',
     'listWorkspaceFileDiffs',
     'getWorkspaceDiffContext',
@@ -161,6 +162,49 @@ const WORKSPACE_GIT_METHODS = new Set([
     'invalidateWorkspaceGitSnapshot',
     'invalidateAllWorkspaceGitSnapshots',
     'listWorkspaceGitWorktrees',
+]);
+/**
+ * Runtime-owned filesystem surface used by Remote Control and Desktop.
+ * `previewWorkspaceFile`, `listFsDirs`, and `getFsGitInfo` are host-scope by
+ * design (attachment previews and the workspace picker predate any workspace
+ * root); the caller is the authenticated same-user client behind SSH.
+ */
+const WORKSPACE_FILE_METHODS = new Set([
+    'getWorkspaceFileMetadata',
+    'listWorkspaceFileTree',
+    'readWorkspaceFile',
+    'saveWorkspaceFile',
+    'searchWorkspaceFiles',
+    'previewWorkspaceFile',
+    'createWorkspaceGitWorktree',
+    'removeWorkspaceGitWorktree',
+    'listFsDirs',
+    'getFsGitInfo',
+]);
+/** Actions whose side effect targets the caller's desktop rather than the remote workspace. */
+const WORKSPACE_LOCAL_ACTION_METHODS = new Set([
+    'openWorkspaceApp',
+    'listIdeApps',
+    'openWorkspaceFile',
+    'revealWorkspaceFile',
+    'openWorkspaceFileInIde',
+]);
+/** Permission and AskUser request/response routes. */
+const INTERACTION_METHODS = new Set([
+    'beginQuestionnaire',
+    'replyQuestionnaire',
+    'dismissQuestionnaire',
+    'getPendingQuestionnaire',
+    'getQuestionnaire',
+    'getLatestPlanReview',
+    'getPermissionMode',
+    'setPermissionMode',
+    'replyPermission',
+    'replyQuestion',
+    'rejectQuestion',
+    'listPendingPermissions',
+    'dismissPermission',
+    'batchReplyPermissions',
 ]);
 /**
  * Inspector 读取面与设置。挂载条件是宿主真的组装了 Inspector service，因此不会
@@ -207,6 +251,8 @@ const MEMORY_V2_METHODS = new Set([
     'prepareLegacyMemoryMigration',
     'acceptLegacyMemoryMigration',
     'discardLegacyMemoryMigration',
+    'getMemoryV2Onboarding',
+    'completeMemoryV2Onboarding',
 ]);
 const OWNER_METHOD_GROUPS = {
     agent: AGENT_OWNER_METHODS,
@@ -217,9 +263,13 @@ const OWNER_METHOD_GROUPS = {
     session: SESSION_TURN_METHODS,
     plugin: PLUGIN_SERVICE_METHODS,
     workspaceGit: WORKSPACE_GIT_METHODS,
+    workspaceFile: WORKSPACE_FILE_METHODS,
+    workspaceLocalActions: WORKSPACE_LOCAL_ACTION_METHODS,
     workspaceIndexing: WORKSPACE_INDEXING_METHODS,
+    interaction: INTERACTION_METHODS,
     llmContextInspector: LLM_CONTEXT_INSPECTOR_METHODS,
     preference: PREFERENCE_OWNER_METHODS,
+    agentShell: new Set(['getAgentShellStatus', 'putAgentShellPreference']),
     sandbox: SANDBOX_METHODS,
     globalInstructions: GLOBAL_INSTRUCTIONS_METHODS,
     channel: CHANNEL_OWNER_METHODS,
@@ -308,6 +358,9 @@ const SESSION_APPLICATION_METHODS = new Set([
     'overwriteSessionResult',
 ]);
 const SESSION_APPLICATION_MUTATION_METHODS = new Set([
+    'createSideChat',
+    'createSideChatFromQueue',
+    'promoteSideChat',
     'getSessionForkOptions',
     'forkSession',
     'getSessionRewindPreview',

@@ -1,3 +1,4 @@
+import { normalizeWindowsShellBase } from '../../agent-shell/index.js';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -186,7 +187,7 @@ export class BuiltinAgentCatalog {
             if (templates.core === undefined)
                 throw new Error(`Mandatory local-runtime-v2 base prompt is missing: ${file}.md.hbs.`);
             const parts = this.renderLayerParts(input, `${root}/${file}`, templates);
-            core.push(parts.core);
+            core.push(file === 'prompt-base-windows' ? normalizeWindowsShellBase(parts.core) : parts.core);
         }
         return {
             core: core

@@ -455,6 +455,14 @@ const MIGRATIONS = [
         version: 33,
         sql: `SELECT 1;`,
     },
+    {
+        // Goal completion dismissal originally reused version 32 on the SSH branch.
+        // Keep an append-only repair marker; guarded compatibility below installs the
+        // column and also recreates Turn Diff retention for databases that saw that
+        // earlier version-32 marker first.
+        version: 34,
+        sql: `SELECT 1;`,
+    },
 ];
 export function withLocalRuntimeDb(dataDir, fn) {
     return fn(openLocalRuntimeDb(dataDir));
@@ -633,6 +641,7 @@ function ensureThreadGoalTableCompatibility(db) {
     addColumn('last_verification', 'TEXT');
     addColumn('last_worker_proposal', 'TEXT');
     addColumn('status_reason', 'TEXT');
+    addColumn('dismissed_at_ms', 'INTEGER');
     // Execution wait projection. Deliberately separate from `status_reason`:
     // these columns describe why an `active` Goal has not started its next Turn,
     // and are written WITHOUT touching `updated_at_ms` (the admission epoch).

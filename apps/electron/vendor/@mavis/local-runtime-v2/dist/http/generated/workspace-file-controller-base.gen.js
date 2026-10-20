@@ -5,6 +5,11 @@ export class WorkspaceFileControllerBase {
         void req;
         throw new NotImplementedError('listWorkspaceFileTree');
     }
+    async getWorkspaceFileMetadata(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getWorkspaceFileMetadata');
+    }
     async readWorkspaceFile(ctx, req) {
         void ctx;
         void req;

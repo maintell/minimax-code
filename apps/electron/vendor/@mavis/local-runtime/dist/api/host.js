@@ -1,5 +1,5 @@
 import { createDeferredPluginHookPermissionCapability, } from '@mavis/permission';
-import { CloudSessionReader, managedBackendRoutingHeaders } from '@mavis/agent-tools/desktop';
+import { CloudSessionReader, managedBackendRoutingHeaders, resolveLocalBashShell, } from '@mavis/agent-tools/desktop';
 import { closeLocalBackgroundTaskDelivery } from '../background-task/delivery.js';
 import { join } from 'node:path';
 import { getConfig } from '@mavis/config';
@@ -88,7 +88,7 @@ import { createDeferredSkillRuntimeCapability, } from '@mavis/shared/local-runti
 import { initSessionFilesService } from '../session-assets/session-files-service.js';
 import { initSessionInputSummaryService } from '../session-navigation/service.js';
 import { stopBackgroundLocalBashTask } from '../background-task/bash-runner.js';
-import { beginBackgroundTaskShutdown, drainBackgroundTasks } from '../background-task/lifecycle.js';
+import { abortAdmittedBackgroundTask, beginBackgroundTaskShutdown, drainBackgroundTasks, } from '../background-task/lifecycle.js';
 import { createGlobalEventSource } from '../events/global-events.js';
 import { toAgentMessages } from './conversation-message-adapter.js';
 import { createWorkspaceIndexingHostSubsystem, hostCaptureWorkspaceRevisionAfterTurn, hostLogWorkspaceSemanticSearchUnavailable, hostPrewarmWorkspaceIndexingForWorkspace, hostPrepareWorkspaceIndexingForSessionStart, } from '../workspace-indexing/index.js';
@@ -97,7 +97,7 @@ const DEFAULT_LOCAL_AGENT_DISPLAY_NAME = 'Mavis';
 export class LocalRuntimeApiHost {
     controller;
     runtimeConversation;
-    /** Trusted Desktop-only gate for direct new-task Turn admission. */
+    /** Trusted Desktop / embedded CLI / TUI / app-server gate for direct Task admission. */
     useImmediateTaskAdmission;
     reviewPromptDir;
     /**
@@ -119,6 +119,8 @@ export class LocalRuntimeApiHost {
     metricsClient;
     configGetter;
     shellFamily;
+    /** TUI-only opt-out, frozen at startup rather than read from tool/session input. */
+    skipWindowsHardSafetyChecks;
     authContextGetter;
     authContextInvalidator;
     routingContextGetter;
@@ -142,6 +144,7 @@ export class LocalRuntimeApiHost {
     observeLLMRequest;
     errorReporter;
     configUpdater;
+    permissionModeUpdate = Promise.resolve();
     modelResolver;
     greetingSystemReminderSender;
     agentName;
@@ -255,8 +258,7 @@ export class LocalRuntimeApiHost {
         // routes with the stable legacy 404 (same body the CLI profile always
         // produced), and agent routes skip the IM wiring below.
         this.channelCapabilityEnabled =
-            (options.channelComposition ?? 'internal') === 'external' &&
-                this.capabilityProfile !== 'cli';
+            (options.channelComposition ?? 'internal') === 'external' && this.capabilityProfile !== 'cli';
         const questionnaireRecoveryDeferred = options.deferQuestionnaireRecovery === true;
         this.mavisCronAdapterProvider = options.mavisCronAdapterProvider;
         this.deleteAgentCronTasksOverride = options.deleteAgentCronTasks;
@@ -264,7 +266,21 @@ export class LocalRuntimeApiHost {
         this.capabilities = buildLocalRuntimeCapabilities(this.runtimeMode, options.capabilities);
         this.surfaces = buildLocalRuntimeSurfaceCapabilities(this.runtimeMode);
         this.configGetter = options.configGetter ?? (() => getConfig());
-        this.shellFamily = options.shellFamily;
+        // Use the executor's shell selection when the product entrypoint supplies no override.
+        // Keep POSIX provenance on Windows (Git Bash / sh) as well as native shells.
+        this.shellFamily =
+            options.shellFamily ??
+                (() => {
+                    const shell = resolveLocalBashShell();
+                    if (shell === 'powershell' || shell === 'pwsh')
+                        return 'powershell';
+                    if (shell === 'bash' || shell === 'sh')
+                        return 'posix';
+                    return undefined;
+                })();
+        this.skipWindowsHardSafetyChecks =
+            options.runtimeOwnerKind === 'tui' &&
+                this.configGetter().skipWindowsHardSafetyChecks === true;
         this.authContextGetter = options.authContextGetter;
         this.authContextInvalidator = options.authContextInvalidator;
         this.routingContextGetter = options.routingContextGetter;
@@ -290,12 +306,14 @@ export class LocalRuntimeApiHost {
         if (!hasCompletedV2LayoutMigrationReceipt(options, () => this.configGetter().dataDir)) {
             ensureCurrentLocalRuntimeDataMigratedToV2OrThrow(() => this.configGetter().dataDir, this.nowMs, this.metricsReporter);
         }
-        const runtimeDataDir = this.configGetter().dataDir;
+        const runtimeConfig = this.configGetter();
+        const runtimeDataDir = runtimeConfig.dataDir;
+        const nativeDelete = runtimeConfig.permission?.nativeDelete === true;
         try {
+            // Keep explicit mavis-trash available in either mode.
             ensureTrashScript(runtimeDataDir);
-            // Seeded alongside the trash script: the shim is the execution-layer
-            // entry point that makes `rm` recoverable regardless of how it is reached.
-            ensureRmShim(runtimeDataDir);
+            if (!nativeDelete)
+                ensureRmShim(runtimeDataDir);
         }
         catch (error) {
             const nodeError = error instanceof Error ? error : undefined;
@@ -314,9 +332,11 @@ export class LocalRuntimeApiHost {
                 // PATH integration remains best-effort; deletion safety is gated separately above.
             }
         }
-        const trashRuntime = inspectTrashRuntime(runtimeDataDir);
-        if (!trashRuntime.available) {
-            logger.error({ reason: trashRuntime.reason, ...trashRuntime.diagnostics }, 'local_runtime.trash_unavailable');
+        if (!nativeDelete) {
+            const trashRuntime = inspectTrashRuntime(runtimeDataDir);
+            if (!trashRuntime.available) {
+                logger.error({ reason: trashRuntime.reason, ...trashRuntime.diagnostics }, 'local_runtime.trash_unavailable');
+            }
         }
         this.messageStore = options.messageStore;
         const sessionStoreOptions = { nowMs: this.nowMs, metricsClient: options.metricsClient };
@@ -424,6 +444,7 @@ export class LocalRuntimeApiHost {
             reportFailure: (sessionId, message) => this.reportPiTurnFailure(sessionId, message),
         });
         this.backgroundTaskService = createLocalBackgroundTaskService(() => this.configGetter().dataDir, this.nowMs, async (task, reason) => {
+            abortAdmittedBackgroundTask(this, task.taskId, reason ?? (task.kind === 'bash' ? 'Background bash stopped' : 'Background task stopped'));
             await stopBackgroundLocalBashTask(task, reason);
             const childSessionId = task.metadata?.childSessionId;
             const subTurnId = task.metadata?.subTurnId;
@@ -453,7 +474,9 @@ export class LocalRuntimeApiHost {
             ownerKind: options.runtimeOwnerKind ?? 'runtime',
         };
         this.useImmediateTaskAdmission =
-            this.lockOwner.ownerKind === 'electron' && this.capabilities.electronHost === true;
+            (this.lockOwner.ownerKind === 'electron' && this.capabilities.electronHost === true) ||
+                isCliRestrictedRuntime(this.lockOwner.ownerKind, this.capabilities.cliEmbedded) ||
+                (this.lockOwner.ownerKind === 'app-server' && this.capabilities.cliEmbedded === true);
         this.threadGoalKickoffQueue = new LocalThreadGoalKickoffQueue({
             ...(this.runtimeConversation ? { conversation: this.runtimeConversation } : {}),
             getIntegration: () => this.threadGoal,
@@ -462,6 +485,7 @@ export class LocalRuntimeApiHost {
         });
         this.threadGoal = new LocalThreadGoalIntegration({
             dataDir: () => this.configGetter().dataDir,
+            sessionExists: async (sessionId) => Boolean(await this.getSessionById(sessionId)),
             nowMs: this.nowMs,
             turnTimingReader: this.controller.activeTurnTimingReader,
             publishGlobalEvent: (event) => this.publishGlobalEvent(event),
@@ -721,10 +745,11 @@ export class LocalRuntimeApiHost {
         }), options.metricsReporter, this.runtimeConversation ? options.cronConsumerEnabled : false, options.startupExecutionPolicy);
         this.desktopServiceHandler = buildDesktopHandler(this, {
             store: this.threadGoal.store,
-            createGoal: (input) => this.threadGoal.createGoal(input),
+            createGoal: (input, createOptions) => this.threadGoal.createGoal(input, createOptions),
             patchGoal: (sessionId, patch) => this.threadGoal.patchGoal(sessionId, patch),
             pauseGoalByUser: (sessionId) => this.threadGoal.pauseGoalByUser(sessionId),
             deleteGoal: (sessionId) => this.threadGoal.deleteGoal(sessionId),
+            dismissGoal: (sessionId, goalId) => this.threadGoal.dismissGoal(sessionId, goalId),
             isReadOnlyLegacySession: (sessionId) => this.isReadOnlyLegacySession(sessionId),
         });
         if (this.startupExecutionEnabled && this.cronRuntime.cronConsumerEnabled) {
@@ -897,6 +922,9 @@ export class LocalRuntimeApiHost {
     copyPermissionStateForFork(input) {
         return this.permissionRules.copySession(input.sourceSessionId, input.targetSessionId);
     }
+    inheritSessionPermissionRestrictions(input) {
+        return this.permissionRules.inheritSessionRestrictions(input.sourceSessionId, input.targetSessionId);
+    }
     async deleteThreadGoalForSession(sessionId) {
         const goal = await this.threadGoal.store.getBySession(sessionId);
         if (!goal)
@@ -1045,14 +1073,31 @@ export class LocalRuntimeApiHost {
     updateConfig(body) {
         return this.configUpdater(body);
     }
+    bindPermissionShellResolver(resolve) {
+        resolveLocalPermissionService(this).bindShellResolver(resolve);
+    }
     /** Applies the process-local permission mode and preserves acceptEdits rule seeding. */
-    async setProcessLocalPermissionMode(mode) {
+    setProcessLocalPermissionMode(mode) {
+        const update = this.permissionModeUpdate.then(() => this.applyProcessLocalPermissionMode(mode));
+        // Serialise profile-mode writes so each committed transition has the
+        // preceding effective value, including concurrent writes from clients.
+        this.permissionModeUpdate = update.then(() => undefined, () => undefined);
+        return update;
+    }
+    async applyProcessLocalPermissionMode(mode) {
+        const previousMode = this.configGetter().permissionMode;
         const { config } = await this.configUpdater({
             field: 'permissionMode',
             set: mode,
         });
         if (mode === 'acceptEdits') {
             await resolveLocalPermissionService(this).syncAcceptEditsSeed();
+        }
+        if (config.permissionMode && previousMode !== config.permissionMode) {
+            this.publishGlobalEvent({
+                type: 'config.permission_mode.changed',
+                payload: { permissionMode: config.permissionMode },
+            });
         }
         return config.permissionMode;
     }
@@ -1339,13 +1384,11 @@ export class LocalRuntimeApiHost {
      * Run the channel subsystem startup once: legacy IM credential import →
      * ordered pre-restore steps → exactly one `restoreInboundLoops()`.
      *
-     * Idempotent — concurrent and repeat callers await the first execution, so a
-     * host never imports twice or restores twice. With
-     * `deferChannelStartup: false` (default) the constructor already triggered
-     * it and this returns that same promise; Local Runtime V2 defers and calls it
-     * explicitly once Session, Agent and Conversation services are ready.
-     * A rejection is a startup failure and must fail the owner's startup rather
-     * than degrade into two live transports.
+     * The V2 composition owns construction, startup and shutdown; this host only
+     * delegates through the bound port. Concurrent starts share one execution.
+     * Owner runtimes trigger it after builtin Agent definitions become ready and
+     * report failures as detached Channel recovery errors. Non-owner runtimes
+     * still await it and fail startup on rejection (see runtime.ts).
      */
     startChannelSubsystem() {
         return this.requireChannelPort('channel startup').startChannelSubsystem();

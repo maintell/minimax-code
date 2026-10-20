@@ -1,20 +1,41 @@
+import { POSIX_TRASH_EXECUTION, readPosixTrashExecution, rewritePosixRm, } from './tools/rm-shell-rewrite.js';
 import { snapshotPermissionEffectiveInput, snapshotPermissionInput } from './effective-input.js';
 import { resolvePermissionPath } from './path-resolver.js';
-import { readWindowsTrashExecution } from './windows-trash-execution.js';
-import { isRmCommand, parseRmTargets } from './tools/bash-permission.js';
+import { isNonRecursiveWindowsRm, readWindowsTrashExecution } from './windows-trash-execution.js';
+import { isRmCommand, parseRmTargets, resolveRmCommandPaths } from './tools/bash-permission.js';
 import { splitCommand } from './tools/bash-split.js';
-import { shellTokenize } from './tools/shell-tokenize.js';
+import { shellTokenize, shellTokenizeWithMetadata } from './tools/shell-tokenize.js';
 import { parseWindowsNativeDelete } from './tools/windows-native-delete.js';
 const SHELL_FAMILIES = new Set(['posix', 'cmd', 'powershell', 'unknown']);
 const FILESYSTEM_ACTIONS = new Set(['read', 'write', 'delete']);
 /** Build the complete immutable plan consumed by production permission gates. */
 export function createPermissionExecutionPlan(input) {
     const originalInput = snapshotPermissionInput(input.input);
-    const intents = inferPermissionCommandIntents(input);
+    const intents = input.rewrittenInput && readPosixTrashExecution(input.rewrittenInput)
+        ? [
+            {
+                kind: 'opaque',
+                shell: 'posix',
+                raw: String(originalInput.command),
+                reason: 'Shell expands recoverable-delete arguments at execution time.',
+            },
+        ]
+        : inferPermissionCommandIntents(input);
     const effectiveInput = snapshotPermissionEffectiveInput(originalInput, input.rewrittenInput) ?? originalInput;
     const targets = collectRecoverableDeleteTargets(intents);
-    const transforms = input.rewrittenInput && targets.length > 0 ? [{ type: 'recoverable-delete', targets }] : [];
-    return validatePermissionExecutionPlan({ originalInput, effectiveInput, intents, transforms }, originalInput);
+    const posixTrash = readPosixTrashExecution(effectiveInput);
+    const transforms = posixTrash
+        ? [{ type: 'recoverable-shell-delete', launcher: posixTrash.launcher }]
+        : input.rewrittenInput && targets.length > 0
+            ? [{ type: 'recoverable-delete', targets }]
+            : [];
+    return validatePermissionExecutionPlan({
+        originalInput,
+        effectiveInput,
+        intents,
+        transforms,
+        nativeDelete: input.nativeDelete === true,
+    }, originalInput);
 }
 /** Shared intent inference used by the production plan builder and legacy parity adapter. */
 export function inferPermissionCommandIntents(input) {
@@ -22,7 +43,9 @@ export function inferPermissionCommandIntents(input) {
     if (input.toolName === 'bash' && typeof input.input.command === 'string') {
         const command = input.input.command;
         const segments = splitCommand(command);
-        if (segments.length > 1) {
+        // A leading inert assignment/control-flow header may leave only one
+        // executable segment. Infer from that segment, not the unsplit script.
+        if (segments.length > 0) {
             return segments.flatMap((segment) => inferBashSegmentIntent(segment, input, shell));
         }
         return inferBashSegmentIntent(command, input, shell);
@@ -79,11 +102,13 @@ export function validatePermissionExecutionPlan(value, expectedOriginalInput) {
     }
     validateTransformConsistency(originalSnapshot, effectiveSnapshot, intents, transforms);
     const metadata = snapshotPermissionInput({ intents, transforms });
+    const nativeDelete = readDataProperty(plan, 'nativeDelete');
     return Object.freeze({
         originalInput: originalSnapshot,
         effectiveInput: effectiveSnapshot,
         intents: metadata.intents,
         transforms: metadata.transforms,
+        ...(nativeDelete === undefined ? {} : { nativeDelete: nativeDelete === true }),
     });
 }
 function inferBashSegmentIntent(command, input, shell) {
@@ -91,25 +116,32 @@ function inferBashSegmentIntent(command, input, shell) {
     const nativeDelete = effectiveShell === 'cmd' || effectiveShell === 'powershell'
         ? parseWindowsNativeDelete(command, effectiveShell)
         : undefined;
+    const rmPaths = isRmCommand(command)
+        ? resolveRmCommandPaths(command, input.context, shell)
+        : undefined;
     if (nativeDelete && nativeDelete.shell === effectiveShell) {
         return [
             {
                 kind: 'filesystem',
                 action: 'delete',
-                paths: nativeDelete.targets.map((raw) => toPathValue(raw, input)),
+                // A PowerShell rm alias can also produce the recoverable rm rewrite.
+                // Its marker follows the rm parser's literal quoting contract.
+                paths: rmPaths && readWindowsTrashExecution(input.rewrittenInput)
+                    ? rmPaths
+                    : nativeDelete.targets.map((raw) => toPathValue(raw, input)),
                 ...(nativeDelete.recursive ? { recursive: true } : {}),
                 ...(nativeDelete.force ? { force: true } : {}),
                 shell: effectiveShell,
             },
         ];
     }
-    if (isRmCommand(command)) {
+    if (rmPaths) {
         return [
             {
                 kind: 'filesystem',
                 action: 'delete',
-                paths: parseRmTargets(command).map((raw) => toPathValue(raw, input)),
-                shell: effectiveShell,
+                paths: rmPaths,
+                shell,
             },
         ];
     }
@@ -194,18 +226,41 @@ function extractPathCandidates(input) {
     return [];
 }
 function validateTransformConsistency(originalInput, effectiveInput, intents, transforms) {
+    const shellTransform = transforms.find((item) => item.type === 'recoverable-shell-delete');
+    if (shellTransform?.type === 'recoverable-shell-delete') {
+        const marker = readPosixTrashExecution(effectiveInput);
+        const originalCommand = originalInput.command;
+        const expected = typeof originalCommand === 'string'
+            ? rewritePosixRm(originalCommand, shellTransform.launcher)
+            : undefined;
+        if (transforms.length !== 1 ||
+            !shellTransform.launcher.endsWith('/mavis-trash') ||
+            !marker ||
+            marker.launcher !== shellTransform.launcher ||
+            !expected ||
+            expected.dynamic !== marker.dynamic ||
+            expected.command !== effectiveInput.command ||
+            intents.some((intent) => intent.shell !== 'posix')) {
+            throw new TypeError('Recoverable shell delete must preserve the original shell arguments and sequence.');
+        }
+        const originalFields = { ...originalInput, command: expected.command };
+        const effectiveFields = { ...effectiveInput };
+        Reflect.deleteProperty(effectiveFields, POSIX_TRASH_EXECUTION);
+        if (!permissionValuesEqual(originalFields, effectiveFields)) {
+            throw new TypeError('Recoverable shell delete must preserve other tool arguments.');
+        }
+        return;
+    }
     const changed = !permissionValuesEqual(originalInput, effectiveInput);
     const deleteIntents = intents.filter((intent) => intent.kind === 'filesystem' && intent.action === 'delete');
-    if (deleteIntents.length > 0 && transforms.length === 0) {
-        throw new TypeError('Delete execution plan requires a recoverable-delete transform.');
-    }
     if (changed && transforms.length === 0) {
         throw new TypeError('Permission execution plan changed input without a declared transform.');
     }
     if (transforms.length === 0)
         return;
-    const recoverableTargets = transforms.flatMap((transform) => transform.targets);
-    const executedTargets = readRecoverableDeleteTargets(effectiveInput);
+    const recoverableTargets = transforms.flatMap((transform) => transform.type === 'recoverable-delete' ? transform.targets : []);
+    const shell = deleteIntents.every((intent) => intent.shell === 'posix') ? 'posix' : 'unknown';
+    const executedTargets = readRecoverableDeleteTargets(effectiveInput, shell);
     if (!executedTargets) {
         throw new TypeError('Recoverable-delete execution plan must execute mavis-trash.');
     }
@@ -218,7 +273,10 @@ function validateTransformConsistency(originalInput, effectiveInput, intents, tr
     }
     const windowsTrash = readWindowsTrashExecution(effectiveInput);
     if (windowsTrash) {
-        if (!sameStringSet(windowsTrash.targets, recoverableTargets)) {
+        if (!sameStringSet(windowsTrash.targets, recoverableTargets) ||
+            (windowsTrash.allowOutsideWorkspaceFiles === true &&
+                (typeof originalInput.command !== 'string' ||
+                    !isNonRecursiveWindowsRm(originalInput.command)))) {
             throw new TypeError('Windows recoverable-delete plan requires the targets-only trash marker.');
         }
         return;
@@ -231,7 +289,7 @@ function validateTransformConsistency(originalInput, effectiveInput, intents, tr
         throw new TypeError('Recoverable-delete effective input targets do not match delete intents.');
     }
 }
-function readRecoverableDeleteTargets(input) {
+function readRecoverableDeleteTargets(input, shell) {
     const command = readDataProperty(input, 'command');
     if (typeof command !== 'string')
         return undefined;
@@ -240,7 +298,10 @@ function readRecoverableDeleteTargets(input) {
         const executable = readExecutableBasename(segment, tokens[0]);
         if (executable !== 'mavis-trash' && executable !== 'mavis-trash.cmd')
             return [];
-        return tokens.slice(tokens[1] === '--' ? 2 : 1);
+        const executableToken = shellTokenizeWithMetadata(segment)[0];
+        return executableToken
+            ? parseRmTargets(`rm ${segment.slice(executableToken.end)}`, undefined, shell)
+            : [];
     });
     return targets.length > 0 || readWindowsTrashExecution(input) ? targets : undefined;
 }
@@ -262,7 +323,11 @@ function hasEveryInputField(effectiveInput, originalInput) {
     return enumerableDataKeys(originalInput).every((key) => Object.prototype.hasOwnProperty.call(effectiveInput, key));
 }
 function isExecutionTransform(value) {
-    if (!isRecord(value) || readDataProperty(value, 'type') !== 'recoverable-delete')
+    if (!isRecord(value))
+        return false;
+    if (readDataProperty(value, 'type') === 'recoverable-shell-delete')
+        return isNonBlankString(readDataProperty(value, 'launcher'));
+    if (readDataProperty(value, 'type') !== 'recoverable-delete')
         return false;
     const targets = readDataProperty(value, 'targets');
     return Array.isArray(targets) && targets.length > 0 && targets.every(isNonBlankString);

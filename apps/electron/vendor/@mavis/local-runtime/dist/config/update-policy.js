@@ -20,6 +20,7 @@ const LOCAL_CONFIG_MUTABLE_FIELDS = new Set([
     'worktreeRefreshBeforeCreate',
     'agents',
     'dataContribution',
+    'subagent',
 ]);
 // Roots whose child keys are open-ended (model ids, agent names, beta flags…).
 // A dotted write only has to name the root; the leaf key cannot be enumerated.
@@ -36,11 +37,12 @@ const LOCAL_CONFIG_DOTTED_MUTABLE_ROOTS = new Set([
 // Roots whose children are a closed, known set. Whitelisting only the root
 // would let any `<root>.<anything>` land in config.yaml, so dotted writes here
 // must match the full field path.
-const EXACT_DOTTED_MUTABLE_ROOTS = new Set(['review', 'dataContribution']);
+const EXACT_DOTTED_MUTABLE_ROOTS = new Set(['review', 'dataContribution', 'subagent']);
 const EXACT_DOTTED_MUTABLE_FIELDS = new Set([
     'review.mode',
     'review.turnDiffCard',
     'dataContribution.enabled',
+    'subagent.maxConcurrentPerSession',
 ]);
 const LOCAL_PERMISSION_MODES = new Set([
     'default',
@@ -54,7 +56,9 @@ export function isPlainRecord(value) {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 export function assertMutableConfigField(field) {
-    if (field === 'permission.policyOwner' || field === 'permission.storageWriteVersion')
+    if (field === 'permission.policyOwner' ||
+        field === 'permission.storageWriteVersion' ||
+        field === 'permission.nativeDelete')
         return;
     const parts = field.split('.');
     const [root, ...children] = parts;
@@ -87,6 +91,11 @@ export function validateLocalConfigValue(field, value) {
         if (value === 1 || value === 2)
             return value;
         throw new LocalConfigValidationError(`Invalid permission.storageWriteVersion "${String(value)}"`);
+    }
+    if (field === 'permission.nativeDelete') {
+        if (typeof value === 'boolean')
+            return value;
+        throw new LocalConfigValidationError('Invalid permission.nativeDelete: expected a boolean');
     }
     if (field === 'permissionMode') {
         if (typeof value === 'string' && LOCAL_PERMISSION_MODES.has(value))
@@ -121,6 +130,15 @@ export function validateLocalConfigValue(field, value) {
         }
         return validateDataContributionConfigRecord(value);
     }
+    if (field === 'subagent.maxConcurrentPerSession') {
+        return validateSubagentMaxConcurrentPerSession(value);
+    }
+    if (field === 'subagent') {
+        if (!isPlainRecord(value)) {
+            throw new LocalConfigValidationError('Invalid subagent config');
+        }
+        return validateSubagentConfigRecord(value);
+    }
     if (field === 'defaultModelVariant' && typeof value !== 'string') {
         throw new LocalConfigValidationError(`Invalid defaultModelVariant "${String(value)}"`);
     }
@@ -136,6 +154,24 @@ function validateDataContributionConfigRecord(value) {
         throw new LocalConfigValidationError(`Invalid dataContribution.enabled "${String(value.enabled)}"`);
     }
     return { ...value };
+}
+// Runtime reads fall back to the default for invalid values; writes reject them
+// so config.yaml never stores a limit that would silently be ignored.
+export function validateSubagentConfigRecord(value) {
+    const invalidKey = Object.keys(value).find((key) => key !== 'maxConcurrentPerSession');
+    if (invalidKey) {
+        throw new LocalConfigValidationError(`Local runtime cannot update config field "subagent.${invalidKey}"`);
+    }
+    return Object.prototype.hasOwnProperty.call(value, 'maxConcurrentPerSession')
+        ? {
+            maxConcurrentPerSession: validateSubagentMaxConcurrentPerSession(value.maxConcurrentPerSession),
+        }
+        : {};
+}
+function validateSubagentMaxConcurrentPerSession(value) {
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
+        return value;
+    throw new LocalConfigValidationError(`Invalid subagent.maxConcurrentPerSession "${String(value)}": expected a positive integer`);
 }
 export function validateReviewConfigRecord(value) {
     const keys = Object.keys(value);

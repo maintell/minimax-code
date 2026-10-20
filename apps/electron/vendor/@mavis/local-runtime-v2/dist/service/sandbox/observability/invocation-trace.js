@@ -86,7 +86,7 @@ export class SandboxInvocationTrace {
             reason_code: outcome.reasonCode,
             error_code: outcome.errorCode ?? null,
             error_stage: outcome.errorStage ?? null,
-            cleanup_result: outcome.cleanup ?? 'success',
+            cleanup_result: outcome.cleanup ?? 'unknown',
             duration_ms: durationMs,
             stages: this.#stages,
             ...this.violationSummary(),

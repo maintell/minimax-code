@@ -114,15 +114,6 @@ export class SqliteLocalBackgroundTaskStore {
         }
         return this.patch(taskId, patch);
     }
-    async appendEvent(event) {
-        this.withDb((db) => {
-            db.prepare(`
-        INSERT OR IGNORE INTO local_runtime_background_task_events (
-          event_id, task_id, owner_session_id, type, timestamp_ms, sequence, payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(event.eventId, event.taskId, event.ownerSessionId, event.type, event.timestamp, event.sequence ?? null, event.payload ? JSON.stringify(event.payload) : null);
-        });
-    }
     readMatchingInDb(db, query) {
         const selection = buildListSelection(query);
         return db

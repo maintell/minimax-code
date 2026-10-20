@@ -2,6 +2,7 @@ import { logger } from '../common/logger.js';
 import { isTerminalTaskStatus, } from './domain.js';
 import { isBackgroundTaskAdmittedHere } from './lifecycle.js';
 import { collectCascadeTargets, collectReadSubagents, readChildSessionId, readSubTurnId, scopeToOwnerTurn, } from './session-cascade-targets.js';
+import { applyRootStopPolicy } from './user-stop-policy.js';
 /** Deeper nesting than this is pathological; stop descending and say so. */
 const MAX_CASCADE_DEPTH = 5;
 /** Per-task stop budget; a hung runner must not consume the whole cascade. */
@@ -26,11 +27,16 @@ export async function stopSessionBackgroundWork(input) {
         return { targets: [] };
     }
     ctx.visited.add(visitKey);
+    // A child sweep is never filtered by kind, whatever a caller passes: see
+    // `sweepChildSession`.
+    const rootPolicy = childScope ? undefined : input.rootPolicy;
     const [collectedTargets, collectedReadSubagents] = await Promise.all([
         collectCascadeTargets(host, sessionId, boundaryMs),
-        collectReadSubagents(host, sessionId, boundaryMs),
+        // Subagents off: a read subagent's child Session belongs to that subagent, so
+        // it is not swept either, and the rows are not even listed.
+        rootPolicy?.stopSubAgent === false ? [] : collectReadSubagents(host, sessionId, boundaryMs),
     ]);
-    const scopedTargets = scopeToOwnerTurn(collectedTargets, childScope);
+    const scopedTargets = scopeToOwnerTurn(applyRootStopPolicy(sessionId, collectedTargets, rootPolicy), childScope);
     const scopedReadSubagents = scopeToOwnerTurn(collectedReadSubagents, childScope);
     if (childScope) {
         // One summary per child sweep; per-task lines would drown the stop in noise.
@@ -109,9 +115,8 @@ async function stopOneTarget(input) {
             event: 'cascade_target_already_terminal',
         });
     }
-    // Only this process can actually stop its own runners. `performStop` would write
-    // `canceled` regardless, so stopping a row owned by another client process (shared
-    // data directory) would lie about a task that keeps running there.
+    // Only this process can control its own runners. Leave tasks admitted by
+    // another runtime sharing this data directory to their owning process.
     if (!isBackgroundTaskAdmittedHere(host, task.taskId)) {
         // The snapshot may be stale: a runner of ours can finish after collection, and
         // its admission is dropped as soon as it settles. Both runners settle only after
@@ -215,6 +220,11 @@ async function sweepChildSession(input) {
         return;
     }
     try {
+        // Deliberately no `rootPolicy`: a subagent and everything in its child
+        // Session are one unit, owned by the subagent switch, and reaching this sweep
+        // means that switch let the subagent be stopped (or it had already ended). The
+        // bash switch only covers bash the stopped conversation started itself;
+        // keeping this child's bash alive would leave processes nobody owns any more.
         await stopSessionBackgroundWork({
             host,
             sessionId: childSessionId,

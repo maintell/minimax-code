@@ -68,6 +68,7 @@ export function initializePlanService(options) {
                 exit: (input) => application.exitFromAgent(input),
             },
             agentEntryEnabled: options.agentEntryEnabled,
+            onReviewFallbackFailed: options.reportReviewFallbackFailure ?? options.reportFailure,
         }),
         questionnaireActionHandler,
         lifecycleReconciler,

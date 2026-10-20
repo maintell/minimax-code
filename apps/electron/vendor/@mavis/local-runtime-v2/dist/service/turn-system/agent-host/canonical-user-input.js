@@ -11,6 +11,7 @@ export class AgentHostUserInputValidationError extends TypeError {
     }
 }
 const MESSAGE_FIELDS = [
+    'computerUse',
     'text',
     'attachments',
     'origin',
@@ -295,12 +296,17 @@ function snapshotMessage(input) {
     if (typeof input.text !== 'string') {
         throw new AgentHostUserInputValidationError('invalid-text');
     }
+    const computerUse = input.computerUse;
+    if (computerUse !== undefined &&
+        (!isRecord(computerUse) || typeof computerUse.enable !== 'boolean'))
+        throw new AgentHostUserInputValidationError('invalid-structure');
     const attachments = snapshotAttachments(input.attachments);
     const origin = snapshotOrigin(input.origin);
     const quotedMessage = snapshotQuotedMessage(input.quotedMessage);
     const channelContext = snapshotChannelContext(input.channelContext);
     return {
         text: input.text,
+        ...(computerUse ? { computerUse: structuredClone(computerUse) } : {}),
         ...(attachments ? { attachments } : {}),
         ...(origin ? { origin } : {}),
         ...(quotedMessage ? { quotedMessage } : {}),

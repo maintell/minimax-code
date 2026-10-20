@@ -1,23 +1,35 @@
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { canonicalActiveHistoryRevision, canonicalHistoryRevision, inspectCanonicalHistorySequence, } from '../../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../../sessions/representation/canonical-history.js';
 import { CanonicalHistoryIndexWriteError, createCanonicalHistoryIndexAdapter, } from './canonical-history-index.js';
+import { ensureCanonicalHistoryMaterialized, } from '../canonical-history-materializer.js';
 import { scanCanonicalHistoryArtifacts } from './canonical-history-scanner.js';
 import { createSessionHistoryLocationResolver, } from '../session-history-location.js';
+import { ensureResolvedSessionHistoryPaths, resolveSessionHistoryPaths, utcSessionHistoryRelativeDir, } from '../session-history-paths.js';
 import { decodeHistoryMutationStagingManifest, historyMutationStagingPaths, toHistoryMutationStagingManifest, } from './session-history-staging.js';
-import { createSessionHistoryIoLane, } from './session-history-coordination.js';
+import { createSessionHistoryIoLane, createSessionHistoryCompactionBarrier, } from './session-history-coordination.js';
 import { planRetractTurn, planSettleTurnTail, toTurnHistoryMutationCommit, validateRetractTurnInput, } from './session-turn-history-mutation.js';
 const SNAPSHOT_NAME = /^g(\d{12})--[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$/u;
 /** SessionSystem owns validated publication of the physical canonical-history bundle. */
 export function createSessionHistoryMutationAdapter(options) {
     const files = createCanonicalHistoryFileAdapter();
     const ioLane = options.ioLane ?? createSessionHistoryIoLane();
+    const compactionBarrier = createSessionHistoryCompactionBarrier();
     const locations = options.locations ??
         createSessionHistoryLocationResolver({ dataDir: options.dataDir, sessions: options.sessions });
     const context = { files, ioLane, locations, options };
+    const read = (sessionId, cleanupOrphans = true) => readHistory(context, sessionId, cleanupOrphans);
     return {
+        compactionBarrier,
         read: (sessionId) => ioLane.run(sessionId, () => read(sessionId)),
+        readFrozen: (sessionId, capture, signal) => compactionBarrier.run(sessionId, () => ioLane.run(sessionId, async () => {
+            signal?.throwIfAborted();
+            const frozen = await read(sessionId, false);
+            signal?.throwIfAborted();
+            return capture(frozen);
+        }), signal),
+        stageUnpersisted: (input) => ioLane.run(input.target.sessionId, () => stageUnpersisted(context, input)),
         settleTurnTail: (input) => ioLane.run(input.sessionId, () => settleTurnTail(input)),
         retractTurn: (input) => ioLane.run(input.sessionId, () => retractTurn(input)),
         readForUserMessage: (input) => readForUserMessageBoundary(context, read, input),
@@ -49,29 +61,6 @@ export function createSessionHistoryMutationAdapter(options) {
         }),
         resumeRewind: (input) => ioLane.run(input.sessionId, () => resumeStagedRewind(context, input)),
     };
-    async function read(sessionId) {
-        const session = await requireSession(options, sessionId);
-        const paths = await locations.ensure(session);
-        const scanned = await scan(paths, sessionId);
-        await cleanupOrphansBestEffort(paths, scanned.orphans);
-        const active = await files.readActiveStrict(paths.messages);
-        const snapshots = await Promise.all(scanned.catalog.artifacts
-            .filter((artifact) => artifact.kind === 'snapshot')
-            .sort((left, right) => left.generation - right.generation)
-            .map(async (artifact) => ({
-            generation: artifact.generation,
-            fileName: artifact.fileName,
-            revision: artifact.revision,
-            records: await files.readStrict(join(paths.snapshots, artifact.fileName)),
-        })));
-        return {
-            activeGeneration: scanned.catalog.activeGeneration,
-            active,
-            snapshots,
-            revision: canonicalActiveHistoryRevision(active),
-            activeSettled: inspectCanonicalHistorySequence(active).status === 'settled',
-        };
-    }
     async function settleTurnTail(input) {
         const history = await read(input.sessionId);
         const plan = planSettleTurnTail(history.active, input);
@@ -185,6 +174,88 @@ export function createSessionHistoryMutationAdapter(options) {
             }),
         };
     }
+}
+async function readHistory({ files, locations, options }, sessionId, cleanupOrphans = true) {
+    const session = await requireSession(options, sessionId);
+    const paths = await locations.ensure(session);
+    let active = await files.readTargetStrict(paths.messages);
+    if (active === undefined) {
+        if ((await readDirectoryIfPresent(paths.snapshots)).length > 0) {
+            throw new Error('Canonical history active file is missing while snapshots exist');
+        }
+        if (options.legacyHistory) {
+            await ensureCanonicalHistoryMaterialized({
+                sessionId,
+                paths,
+                files,
+                legacyHistory: options.legacyHistory,
+                nowMs: Date.now,
+            });
+            active = await files.readActiveStrict(paths.messages);
+        }
+        else {
+            return {
+                activeGeneration: 0,
+                active: [],
+                snapshots: [],
+                revision: canonicalActiveHistoryRevision([]),
+                activeSettled: true,
+            };
+        }
+    }
+    const scanned = await scan(paths, sessionId);
+    if (cleanupOrphans)
+        await cleanupOrphansBestEffort(paths, scanned.orphans);
+    const snapshots = await Promise.all(scanned.catalog.artifacts
+        .filter((artifact) => artifact.kind === 'snapshot')
+        .sort((left, right) => left.generation - right.generation)
+        .map(async (artifact) => ({
+        generation: artifact.generation,
+        fileName: artifact.fileName,
+        revision: artifact.revision,
+        records: await files.readStrict(join(paths.snapshots, artifact.fileName)),
+    })));
+    return {
+        activeGeneration: scanned.catalog.activeGeneration,
+        active,
+        snapshots,
+        revision: canonicalActiveHistoryRevision(active),
+        activeSettled: inspectCanonicalHistorySequence(active).status === 'settled',
+    };
+}
+async function stageUnpersisted({ ioLane, options }, input) {
+    validatePlan(input.generation, input.active, input.snapshots);
+    if (await options.sessions.get(input.target.sessionId)) {
+        throw new Error('Unpersisted history target Session already exists');
+    }
+    const historyRelativeDir = input.target.historyRelativeDir ??
+        utcSessionHistoryRelativeDir(input.target.sessionId, input.target.createdAtMs);
+    const target = {
+        ...input.target,
+        historyRelativeDir,
+        updatedAtMs: input.target.createdAtMs,
+    };
+    const paths = resolveSessionHistoryPaths(options.dataDir, target);
+    await mkdir(dirname(paths.sessionDir), { recursive: true, mode: 0o700 });
+    // Exclusive creation establishes ownership; never overwrite or clean up an existing directory.
+    await mkdir(paths.sessionDir, { mode: 0o700 });
+    try {
+        ensureResolvedSessionHistoryPaths(paths, target);
+        await writeBundle(paths, input.active, input.snapshots);
+        await validatePublished(paths, target.sessionId, input.generation, true);
+    }
+    catch (error) {
+        await cleanup(paths);
+        throw error;
+    }
+    return {
+        historyRelativeDir,
+        rollback: () => ioLane.run(target.sessionId, async () => {
+            if (await options.sessions.get(target.sessionId))
+                return;
+            await cleanup(paths);
+        }),
+    };
 }
 async function readForUserMessageBoundary(context, read, input) {
     const activity = context.options.activity;

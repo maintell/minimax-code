@@ -6,13 +6,21 @@ export function createContentSafetyChecker(deps) {
     return async (content, scene) => {
         try {
             const authContext = deps.authContextGetter?.();
+            const loginEpoch = authContext?.loginEpoch;
             const rejectedToken = authContext?.accessToken?.trim() || process.env.MAVIS_ACCESS_TOKEN?.trim();
             const request = createRequest(deps, content, scene, authContext);
             const result = await callApi(request);
             if (result.errorKind !== 'auth_error' || !rejectedToken || !deps.authContextInvalidator) {
                 return result;
             }
-            return await retryAfterAuthRefresh({ deps, rejectedToken, request, result, callApi });
+            return await retryAfterAuthRefresh({
+                deps,
+                rejectedToken,
+                loginEpoch,
+                request,
+                result,
+                callApi,
+            });
         }
         catch {
             // callSafetyApi is designed never to throw (it maps transport / parse
@@ -36,10 +44,15 @@ function createRequest(deps, content, scene, authContext) {
         ...(deps.testBaseURLGetter ? { testBaseURL: deps.testBaseURLGetter() } : {}),
     };
 }
-async function retryAfterAuthRefresh({ deps, rejectedToken, request, result, callApi, }) {
+async function retryAfterAuthRefresh({ deps, rejectedToken, loginEpoch, request, result, callApi, }) {
     try {
-        await deps.authContextInvalidator?.(rejectedToken);
+        // A review belongs to the login that submitted its content, even across refresh.
+        if (deps.authContextGetter?.()?.loginEpoch !== loginEpoch)
+            return result;
+        await deps.authContextInvalidator?.(rejectedToken, loginEpoch);
         const freshAuth = deps.authContextGetter?.();
+        if (freshAuth?.loginEpoch !== loginEpoch)
+            return result;
         const freshToken = freshAuth?.accessToken?.trim() || process.env.MAVIS_ACCESS_TOKEN?.trim();
         if (!freshToken || freshToken === rejectedToken)
             return result;

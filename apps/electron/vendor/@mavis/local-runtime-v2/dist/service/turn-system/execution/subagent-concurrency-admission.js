@@ -22,25 +22,28 @@ const TASK_EXECUTION_OWNER_KINDS = [
  * transaction. There is intentionally no process-local occupancy counter.
  */
 export function createDesktopSubagentConcurrency(options) {
-    const { maxConcurrentPerSession } = parseSubagentConfig({
-        maxConcurrentPerSession: options.maxConcurrentPerSession,
-    });
+    const currentLimit = () => parseSubagentConfig({
+        maxConcurrentPerSession: options.readMaxConcurrentPerSession?.(),
+    }).maxConcurrentPerSession;
+    const activeChildCount = (db, parentSessionId) => options.tasks.taskChildIdsForCandidatesInTransaction(db, {
+        parentSessionId,
+        candidateSessionIds: executionSessionIdsInTransaction(db),
+    }).length;
     return {
         admissionPolicy: {
             applyInTransaction(db, input) {
                 const parentSessionId = options.tasks.taskParentIdInTransaction(db, input.sessionId);
                 if (!parentSessionId)
                     return undefined;
-                const executionSessionIds = executionSessionIdsInTransaction(db);
-                const activeChildIds = options.tasks.taskChildIdsForCandidatesInTransaction(db, {
-                    parentSessionId,
-                    candidateSessionIds: executionSessionIds,
-                });
-                return activeChildIds.length >= maxConcurrentPerSession
+                return activeChildCount(db, parentSessionId) >= currentLimit()
                     ? DESKTOP_SUBAGENT_CONCURRENCY_REJECTION
                     : undefined;
             },
         },
+        occupancy: (parentSessionId) => ({
+            active: activeChildCount(options.db, parentSessionId),
+            limit: currentLimit(),
+        }),
         wakeQueuedSiblings: async ({ releasedSessionId, queue, dispatch }) => {
             const pendingSessionIds = await queue.listPendingSessionIds();
             const siblingSessionIds = await options.tasks.taskSiblingIdsForCandidates(releasedSessionId, pendingSessionIds);

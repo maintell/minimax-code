@@ -2,25 +2,19 @@
  * Power Management Module
  *
  * Owns the lifecycle of Electron's `powerSaveBlocker` assertion(s). The
- * effective assertion is derived from two independent inputs:
+ * effective assertion is derived from four independent inputs:
  *
  * - `keepAwakeEnabled` — user-controlled toggle (`config.keepAwake`).
+ * - `remoteAccessEnabled` — this computer currently has an RC producer binding.
+ * - `onExternalPower` — the OS reports that this computer is connected to AC power.
  * - `computerUseActive` — true while an eligible Turn may drive the screen,
  *   so the display must NOT sleep.
  *
- * Effective mode table (see `computeMode`):
+ * Effective mode summary (see `computeMode`):
  *
- *   keepAwake | cuActive | mode
- *   ----------|----------|-------------------------
- *   false     |  false   | 'off'           (no assertion)
- *   false     |  true    | 'display-sleep' (CU must keep screen awake;
- *                                          user's keepAwake=false
- *                                          intent is overridden while
- *                                          CU is steering the desktop)
- *   true      |  false   | 'app-suspension' (background agent / IM;
- *                                            screen may still dim/sleep)
- *   true      |  true    | 'display-sleep'  (both keep app awake AND
- *                                            prevent screen sleep)
+ * - CU active → `display-sleep`, regardless of the other inputs.
+ * - keep-awake + RC producer binding + AC power → `app-suspension`.
+ * - every other combination → `off`.
  *
  * Invariants enforced by `reconcile`:
  *   1. Mode switches start the new assertion BEFORE stopping the old one
@@ -32,22 +26,33 @@
  *      fresh id.
  *
  * Callers MUST NOT touch `electron.powerSaveBlocker` directly — go
- * through `setKeepAwakeEnabled` / `setComputerUseActive`. The legacy
+ * through the setters in this module. The legacy
  * `start/stop/isActive` helpers have been removed; there is no
  * compatibility wrapper.
  */
 
-import { powerSaveBlocker } from "electron";
+import { powerSaveBlocker, powerMonitor } from "electron";
 import logger from "../../utils/logger";
 // Module-level state — single source of truth for the reconciler.
 const state = {
     keepAwakeEnabled: false,
+    remoteAccessEnabled: false,
+    onExternalPower: false,
     computerUseActive: false,
 };
 let currentMode = 'off';
 let currentBlockerId = null;
+let monitoringPowerSource = false;
+const handleAcPower = () => {
+    state.onExternalPower = true;
+    reconcile();
+};
+const handleBatteryPower = () => {
+    state.onExternalPower = false;
+    reconcile();
+};
 /**
- * Derive the effective `powerSaveBlocker` mode from the two inputs.
+ * Derive the effective `powerSaveBlocker` mode from the current inputs.
  *
  * CU active forces `'display-sleep'` regardless of `keepAwakeEnabled`,
  * because CU is actively driving the mouse/keyboard/screen — letting
@@ -57,8 +62,9 @@ let currentBlockerId = null;
 function computeMode(input) {
     if (input.computerUseActive)
         return 'display-sleep';
-    if (input.keepAwakeEnabled)
+    if (input.keepAwakeEnabled && input.remoteAccessEnabled && input.onExternalPower) {
         return 'app-suspension';
+    }
     return 'off';
 }
 /**
@@ -120,6 +126,30 @@ export function setKeepAwakeEnabled(enabled) {
     reconcile();
 }
 /**
+ * Start observing the power source. Unknown power state fails closed so an
+ * unavailable OS query cannot unexpectedly drain a laptop battery.
+ */
+export function startPowerSourceMonitoring() {
+    if (monitoringPowerSource)
+        return;
+    try {
+        state.onExternalPower = !powerMonitor.isOnBatteryPower();
+    }
+    catch (error) {
+        state.onExternalPower = false;
+        logger.error(`[Power] Failed to read power source: ${error}`);
+    }
+    powerMonitor.on('on-ac', handleAcPower);
+    powerMonitor.on('on-battery', handleBatteryPower);
+    monitoringPowerSource = true;
+    reconcile();
+}
+/** Keep-awake applies only while this computer is available as an RC producer. */
+export function setRemoteAccessEnabled(enabled) {
+    state.remoteAccessEnabled = enabled;
+    reconcile();
+}
+/**
  * Set the Computer Use active flag.
  *
  * Called only from Electron main's CUA utility lifecycle. The sibling driver
@@ -137,7 +167,14 @@ export function setComputerUseActive(active) {
  * being explicit makes shutdown traces easier to read).
  */
 export function stopPowerSaveBlocker() {
+    if (monitoringPowerSource) {
+        powerMonitor.removeListener('on-ac', handleAcPower);
+        powerMonitor.removeListener('on-battery', handleBatteryPower);
+        monitoringPowerSource = false;
+    }
     state.keepAwakeEnabled = false;
+    state.remoteAccessEnabled = false;
+    state.onExternalPower = false;
     state.computerUseActive = false;
     reconcile();
 }

@@ -36,6 +36,7 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
         const attemptId = attempts.create(trustedContext, leaseId, input.phase);
         const attemptState = { started: false };
         const providerTokenUsage = createCompactionTokenUsageAccumulator();
+        let awaitingHistoryCommit = false;
         try {
             const automaticInput = automaticContextCompactionInput(input, options.maxSerializedInputBytes);
             const probe = dependencies.automatic.probeBeforeLlm?.(automaticInput);
@@ -55,6 +56,9 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 messages,
             }, {
                 onStarted: async () => {
+                    if (dependencies.barrier) {
+                        await dependencies.barrier.begin(trustedContext.sessionId, attemptId, trustedContext.turnId);
+                    }
                     const admission = await options.beforeCompaction?.();
                     if (admission === false)
                         throw new AutomaticContextCompactionDeferredError();
@@ -88,7 +92,7 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 onProviderRequestSettled: providerTokenUsage.observe,
                 getProviderTokenUsage: providerTokenUsage.snapshot,
             }), messages.length);
-            return resolveAutomaticCompactionResult({
+            const decision = resolveAutomaticCompactionResult({
                 dependencies,
                 context: trustedContext,
                 attemptId,
@@ -96,6 +100,8 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 messages,
                 result,
             });
+            awaitingHistoryCommit = decision.type === 'replaceMessages';
+            return decision;
         }
         catch (error) {
             if (error instanceof AutomaticContextCompactionDeferredError) {
@@ -142,12 +148,20 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                     : 'context_compaction_failed',
             };
         }
+        finally {
+            endAutomaticCompactionBarrier(dependencies.barrier, trustedContext, attemptId, awaitingHistoryCommit);
+        }
     };
+}
+function endAutomaticCompactionBarrier(barrier, context, attemptId, awaitingHistoryCommit) {
+    if (!awaitingHistoryCommit)
+        barrier?.end(context.sessionId, attemptId);
 }
 function automaticContextCompactionInput(input, maxSerializedInputBytes) {
     return {
         sessionId: input.sessionId,
         phase: input.phase,
+        ...(input.recovery ? { recovery: input.recovery } : {}),
         messages: input.messages,
         model: input.model,
         ...(maxSerializedInputBytes === undefined ? {} : { maxSerializedInputBytes }),
@@ -675,35 +689,40 @@ export function readCompactionCommitMetadata(value) {
     const summary = Reflect.get(value, 'summary');
     if (typeof summary !== 'string')
         return undefined;
-    const currentUserSourceIndex = readOptionalCurrentUserSourceIndex(value, lifecycle);
-    if (currentUserSourceIndex === null)
+    const tail = readOptionalCurrentUserTail(value, lifecycle);
+    if (tail === null)
         return undefined;
     return lifecycle.method === 'llm_checkpoint'
-        ? readCheckpointCommitMetadata(lifecycle, summary, currentUserSourceIndex)
-        : readToolResultCommitMetadata(value, lifecycle, summary, currentUserSourceIndex);
+        ? readCheckpointCommitMetadata(lifecycle, summary, tail)
+        : readToolResultCommitMetadata(value, lifecycle, summary, tail);
 }
-function readCheckpointCommitMetadata(lifecycle, summary, currentUserSourceIndex) {
-    if (currentUserSourceIndex !== undefined && lifecycle.messagesAfter !== 3)
+function readCheckpointCommitMetadata(lifecycle, summary, tail) {
+    // Native summary, optional owned mode, then the exact markers + external user tail.
+    if (tail !== undefined &&
+        lifecycle.messagesAfter !== 2 + tail.placedMarkerCount &&
+        lifecycle.messagesAfter !== 3 + tail.placedMarkerCount)
         return undefined;
     return Object.freeze({
         compactionId: lifecycle.compactionId,
         method: 'llm_checkpoint',
         summary,
-        ...(currentUserSourceIndex === undefined ? {} : { currentUserSourceIndex }),
+        ...currentUserTailFields(tail),
     });
 }
-function readToolResultCommitMetadata(value, lifecycle, summary, currentUserSourceIndex) {
+function readToolResultCommitMetadata(value, lifecycle, summary, tail) {
     if (lifecycle.method === 'llm_checkpoint')
         return undefined;
     const replacementSourceIndexes = Reflect.get(value, 'replacementSourceIndexes');
-    const expectedSourceCount = currentUserSourceIndex === undefined ? lifecycle.messagesAfter : lifecycle.messagesAfter - 2;
+    const expectedSourceCount = tail === undefined
+        ? lifecycle.messagesAfter
+        : lifecycle.messagesAfter - 1 - tail.placedMarkerCount;
     if (!Array.isArray(replacementSourceIndexes) ||
         expectedSourceCount < 0 ||
         replacementSourceIndexes.length !== expectedSourceCount ||
         !replacementSourceIndexes.every((index, position) => Number.isSafeInteger(index) &&
             index >= 0 &&
             index < lifecycle.messagesBefore &&
-            index !== currentUserSourceIndex &&
+            index !== tail?.currentUserSourceIndex &&
             (position === 0 || index > replacementSourceIndexes[position - 1]))) {
         return undefined;
     }
@@ -712,19 +731,41 @@ function readToolResultCommitMetadata(value, lifecycle, summary, currentUserSour
         method: lifecycle.method,
         summary,
         replacementSourceIndexes: Object.freeze([...replacementSourceIndexes]),
-        ...(currentUserSourceIndex === undefined ? {} : { currentUserSourceIndex }),
+        ...currentUserTailFields(tail),
     });
 }
-function readOptionalCurrentUserSourceIndex(value, lifecycle) {
+function currentUserTailFields(tail) {
+    return tail === undefined
+        ? {}
+        : {
+            currentUserSourceIndex: tail.currentUserSourceIndex,
+            placedMarkerCount: tail.placedMarkerCount,
+        };
+}
+/**
+ * Reads the placement-owned tail lineage. `placedMarkerCount` defaults to 1 so
+ * metadata persisted before multi-marker placement stays readable; it is
+ * invalid without `currentUserSourceIndex`. Returns null for invalid input.
+ */
+function readOptionalCurrentUserTail(value, lifecycle) {
+    const hasMarkerCount = Object.hasOwn(value, 'placedMarkerCount');
     if (!Object.hasOwn(value, 'currentUserSourceIndex'))
-        return undefined;
+        return hasMarkerCount ? null : undefined;
     const index = Reflect.get(value, 'currentUserSourceIndex');
-    return typeof index === 'number' &&
-        Number.isSafeInteger(index) &&
-        index >= 0 &&
-        index < lifecycle.messagesBefore
-        ? index
+    if (!isSourceIndexInRange(index, lifecycle.messagesBefore))
+        return null;
+    if (!hasMarkerCount)
+        return { currentUserSourceIndex: index, placedMarkerCount: 1 };
+    const count = Reflect.get(value, 'placedMarkerCount');
+    return isPositiveSafeInteger(count)
+        ? { currentUserSourceIndex: index, placedMarkerCount: count }
         : null;
+}
+function isSourceIndexInRange(value, messagesBefore) {
+    return (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value < messagesBefore);
+}
+function isPositiveSafeInteger(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 export function readCompactionAttemptId(value) {
     return isRecord(value) ? readNonEmpty(value, 'compactionAttemptId') : undefined;

@@ -8,7 +8,7 @@ const NOOP_LOGGER = {
     warn: () => undefined,
 };
 export async function startMcodeToolsAuthLeaseBroker(options) {
-    const endpoint = await allocateBrokerEndpoint(options.dataDir);
+    const endpoint = await allocateBrokerEndpoint(options.dataDir, process.platform, options.isolateInstance);
     const capability = randomBytes(32).toString('base64url');
     const now = options.now ?? Date.now;
     const brokerLogger = options.logger ?? NOOP_LOGGER;

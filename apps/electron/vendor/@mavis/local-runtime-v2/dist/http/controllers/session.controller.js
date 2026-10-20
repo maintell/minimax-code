@@ -14,6 +14,15 @@ export class SessionController extends SessionControllerBase {
         if (options.conversation)
             this.conversation = options.conversation;
     }
+    createSideChat(ctx, req) {
+        return this.requireApplications().session.sideChat.createSideChat(ctx, req);
+    }
+    createSideChatFromQueue(ctx, req) {
+        return this.requireApplications().session.sideChat.createSideChatFromQueue(ctx, req);
+    }
+    promoteSideChat(ctx, req) {
+        return this.requireApplications().session.sideChat.promoteSideChat(ctx, req);
+    }
     async getRootSession(ctx, req) {
         return this.requireApplications().session.root.getRootSession(ctx, req);
     }

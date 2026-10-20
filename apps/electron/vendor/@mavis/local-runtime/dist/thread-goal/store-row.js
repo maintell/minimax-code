@@ -16,6 +16,11 @@ export function rowToThreadGoalState(row) {
         status,
         createdAt: row.created_at_ms ?? 0,
         updatedAt: row.updated_at_ms ?? 0,
+        ...(typeof row.dismissed_at_ms === 'number' &&
+            Number.isSafeInteger(row.dismissed_at_ms) &&
+            row.dismissed_at_ms >= 0
+            ? { dismissedAt: row.dismissed_at_ms }
+            : {}),
         // Migration 14 backfills these to 0; a legacy row with a `null`
         // coming from a partial / failed migration would still surface as
         // 0 here so the banner doesn't show NaN.
@@ -139,6 +144,7 @@ function readLastWorkerProposal(value, goalId) {
             type: parsed.type,
             turnId: parsed.turnId,
             ...(parsed.summary ? { summary: parsed.summary } : {}),
+            ...(parsed.resultDelivery ? { resultDelivery: parsed.resultDelivery } : {}),
             at: parsed.at,
         };
     }
@@ -156,6 +162,9 @@ function isLastWorkerProposalV1(value) {
         (item.type === 'complete' || item.type === 'blocked') &&
         typeof item.turnId === 'string' &&
         optionalString(item.summary) &&
+        (item.resultDelivery === undefined ||
+            item.resultDelivery === 'pending' ||
+            item.resultDelivery === 'queued') &&
         (typeof item.summary !== 'string' ||
             item.summary.length <= THREAD_GOAL_WORKER_PROPOSAL_SUMMARY_MAX_CHARS) &&
         Number.isInteger(item.at) &&

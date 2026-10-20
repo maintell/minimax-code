@@ -21,6 +21,11 @@ class GoalController extends GoalControllerBase {
         void req;
         throw new NotImplementedError('deleteGoal');
     }
+    async dismissGoal(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('dismissGoal');
+    }
 }
 export const goalController = new GoalController();
 //# sourceMappingURL=goal.controller.js.map

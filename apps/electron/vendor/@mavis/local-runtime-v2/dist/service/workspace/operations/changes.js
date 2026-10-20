@@ -2,7 +2,7 @@ import { createReadStream } from 'node:fs';
 import { resolve } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { git } from './git-process.js';
-import { isKnownBinaryExtension, resolveWorkspacePath } from './workspace-path.js';
+import { isKnownBinaryExtension, resolveWorkspacePath } from './filesystem/workspace-path.js';
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 4;
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024;
 const MAX_RECENT_BRANCHES = 100;

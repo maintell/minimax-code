@@ -216,6 +216,7 @@ function compactionTokenUsage(value) {
 }
 function threadGoalUpdated(payload, tsMs) {
     const goal = rec(payload.goal);
+    const executionWait = rec(goal?.executionWait);
     return {
         type: evt('thread_goal.updated'),
         payload: prune({
@@ -243,8 +244,15 @@ function threadGoalUpdated(payload, tsMs) {
                     created_at: num(goal.createdAt),
                     updated_at: num(goal.updatedAt),
                     tokens_used: num(goal.tokensUsed),
+                    turns_used: num(goal.turnsUsed),
                     time_used_seconds: num(goal.timeUsedSeconds),
                     token_budget: num(goal.tokenBudget),
+                    execution: executionWait
+                        ? prune({
+                            wait_reason: str(executionWait.reason),
+                            wait_since: num(executionWait.sinceMs),
+                        })
+                        : null,
                 })
                 : undefined,
             ts_ms: tsMs,

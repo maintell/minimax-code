@@ -30,6 +30,7 @@ import { decodeWeChatAttachmentKey, resolveWeChatAttachments, writeWeChatAttachm
 import { decodeAttachmentKey, extractFileName, extractWeChatAttachmentRefs, guessMimeFromKind, readMediaBuffer, } from './inbound/wechat-attachments.js';
 import { readContextTokenFromCtx, readString, WECHAT_CDN_BASE_URL, } from './wechat-adapter-helpers.js';
 import { LocalWeChatMonitorWire } from './inbound/wechat-monitor-wire.js';
+import { IDLE_CHANNEL_TRANSPORT, } from '../../ingress/channel-transport-status.js';
 import { formatPermissionText, parsePermissionCommand } from './wechat-permission.js';
 import { formatQuestionnaireText, parseNumberedReply, pendingShellRequest, } from './wechat-questionnaire.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
@@ -179,6 +180,17 @@ export class LocalWeChatChannelAdapter {
             running: this.monitorWire?.isRunning() ?? false,
             status: this.monitorWire?.liveStatus() ?? null,
         };
+    }
+    /**
+     * Live receive-channel state for the Connection list and the legacy
+     * status overlay; `undefined` when this adapter's SDK has no monitor
+     * (inbound not wired, so there is nothing to report). No wire means
+     * nothing was started (or it was stopped by us): `idle`.
+     */
+    inboundTransportStatus() {
+        if (!this.sdk.createMonitor)
+            return undefined;
+        return this.monitorWire?.transportStatus() ?? IDLE_CHANNEL_TRANSPORT;
     }
     /**
      * Stop the iLink monitor and outstanding typing refreshes without clearing

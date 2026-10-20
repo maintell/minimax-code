@@ -56,6 +56,7 @@ export function createGlobalMemoryModelCompletion(input) {
             const maxOutputTokens = Math.min(request.kind === 'consolidation' ? 16_384 : 8_192, resolved.model.maxTokens);
             return {
                 modelName: `${resolved.model.provider}/${resolved.model.id}`,
+                managedProvider: resolved.managedProvider === true,
                 parameters: { reasoning: resolved.thinkingLevel ?? 'off' },
                 maxInputTokens: Math.max(1, resolved.model.contextWindow - maxOutputTokens),
                 maxOutputTokens,

@@ -3,7 +3,7 @@
 import { HTTPException } from 'hono/http-exception';
 import { WorkspaceFileControllerBase } from '../generated/workspace-file-controller-base.gen.js';
 import { AppError, NotImplementedError } from '../errors.js';
-import { WorkspaceGitGraphError, WorkspaceGitCommandError, WorkspaceReviewSearchTooLargeError, WorkspaceGitSnapshotChangedError, } from '../../service/workspace/index.js';
+import { WorkspaceGitGraphError, WorkspaceGitCommandError, WorkspaceReviewSearchTooLargeError, WorkspaceGitSnapshotChangedError, WorkspaceLocalActionError, WorkspaceLocalActionsUnavailableError, WorkspaceFileError, } from '../../service/workspace/index.js';
 class WorkspaceFileController extends WorkspaceFileControllerBase {
     services;
     constructor(services = {}) {
@@ -12,33 +12,80 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
     }
     async listWorkspaceFileTree(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('listWorkspaceFileTree');
+        const service = this.requireWorkspaceFile();
+        try {
+            return await service.listFileTree(req);
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
     }
     async readWorkspaceFile(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('readWorkspaceFile');
+        try {
+            const options = {
+                ...(req.offset !== undefined ? { offset: Number(req.offset) } : {}),
+                ...(req.length !== undefined ? { length: Number(req.length) } : {}),
+                ...(req.maxBytes !== undefined ? { maxBytes: Number(req.maxBytes) } : {}),
+                ...(req.raw !== undefined ? { raw: req.raw } : {}),
+            };
+            const service = this.requireWorkspaceFile();
+            return await (Object.keys(options).length > 0
+                ? service.readFile(req.workspace, req.path, options)
+                : service.readFile(req.workspace, req.path));
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
+    }
+    async getWorkspaceFileMetadata(ctx, req) {
+        void ctx;
+        try {
+            return await this.requireWorkspaceFile().getFileMetadata(req.workspace, req.path);
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
     }
     async saveWorkspaceFile(ctx, req) {
         void ctx;
         try {
-            await this.requireWorkspaceGit().saveFile(req.workspace, req.path, req.content);
-            return { ok: true };
+            return await this.requireWorkspaceFile().saveFile({
+                workspace: req.workspace,
+                filePath: req.path,
+                ...(req.content !== undefined ? { content: req.content } : {}),
+                ...(req.contentBase64 !== undefined ? { contentBase64: req.contentBase64 } : {}),
+                ...(req.encoding !== undefined ? { encoding: req.encoding } : {}),
+                ...(req.expectedRevision !== undefined ? { expectedRevision: req.expectedRevision } : {}),
+            });
         }
         catch (error) {
+            if (error instanceof AppError)
+                throw error;
+            if (error instanceof WorkspaceFileError)
+                throw mapWorkspaceFileError(error);
             throw new AppError(422, 'FILE_SAVE_FAILED', describeError(error));
         }
     }
     async searchWorkspaceFiles(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('searchWorkspaceFiles');
+        try {
+            return {
+                paths: await this.requireWorkspaceFile().searchFiles(req.workspace, req.query, req.limit, req.includeDirectories),
+            };
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
     }
     async previewWorkspaceFile(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('previewWorkspaceFile');
+        try {
+            return await this.requireWorkspaceFile().previewFile(req.path);
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
     }
     async getWorkspaceFileDiff(ctx, req) {
         void ctx;
@@ -141,28 +188,63 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
     }
     async openWorkspaceApp(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('openWorkspaceApp');
+        try {
+            await this.requireWorkspaceLocalActions('openWorkspaceApp').openApp({
+                ...(req.workspace !== undefined ? { workspace: req.workspace } : {}),
+                ...(req.path !== undefined ? { path: req.path } : {}),
+            });
+            return {};
+        }
+        catch (error) {
+            throw mapWorkspaceLocalActionError(error, 'openWorkspaceApp');
+        }
     }
     async listIdeApps(ctx, req) {
         void ctx;
         void req;
-        throw new NotImplementedError('listIdeApps');
+        try {
+            return { apps: [...(await this.requireWorkspaceLocalActions('listIdeApps').listIdeApps())] };
+        }
+        catch (error) {
+            throw mapWorkspaceLocalActionError(error, 'listIdeApps');
+        }
     }
     async openWorkspaceFile(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('openWorkspaceFile');
+        try {
+            return await this.requireWorkspaceLocalActions('openWorkspaceFile').openFile({
+                workspace: req.workspace,
+                path: req.path,
+            });
+        }
+        catch (error) {
+            throw mapWorkspaceLocalActionError(error, 'openWorkspaceFile');
+        }
     }
     async revealWorkspaceFile(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('revealWorkspaceFile');
+        try {
+            return await this.requireWorkspaceLocalActions('revealWorkspaceFile').revealFile({
+                workspace: req.workspace,
+                path: req.path,
+            });
+        }
+        catch (error) {
+            throw mapWorkspaceLocalActionError(error, 'revealWorkspaceFile');
+        }
     }
     async openWorkspaceFileInIde(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('openWorkspaceFileInIde');
+        try {
+            return await this.requireWorkspaceLocalActions('openWorkspaceFileInIde').openFileInIde({
+                ideId: req.ideId,
+                ...(req.workspace !== undefined ? { workspace: req.workspace } : {}),
+                ...(req.path !== undefined ? { path: req.path } : {}),
+            });
+        }
+        catch (error) {
+            throw mapWorkspaceLocalActionError(error, 'openWorkspaceFileInIde');
+        }
     }
     async suggestCommitMessage(ctx, req) {
         void ctx;
@@ -260,18 +342,49 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
     }
     async createWorkspaceGitWorktree(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('createWorkspaceGitWorktree');
+        try {
+            const { status, ...result } = await this.requireWorkspaceGit().createWorktree(req.workspace, req.options);
+            if (status !== undefined && status >= 400) {
+                throw new AppError(status, 'WORKTREE_CREATE_FAILED', result.error ?? 'Failed to create worktree');
+            }
+            return result;
+        }
+        catch (error) {
+            if (error instanceof AppError)
+                throw error;
+            throw new AppError(422, 'WORKTREE_CREATE_FAILED', describeError(error));
+        }
     }
     async removeWorkspaceGitWorktree(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('removeWorkspaceGitWorktree');
+        const result = await this.requireWorkspaceGit().removeWorktree(req.workspace, req.worktreeDir);
+        const body = toRemoveWorktreeResponse(result);
+        if (result.status >= 400)
+            throw managedWorktreeRemovalError({ status: result.status, body });
+        await releaseWorkspaceQuietly(this.services.workspaceGit, req.worktreeDir);
+        return body;
     }
     async listManagedWorkspaceGitWorktrees(_ctx, req) {
-        return this.requireManagedWorktrees().list(req.workspace);
+        if (this.services.managedWorktrees)
+            return this.services.managedWorktrees.list(req.workspace);
+        if (!this.services.workspaceGit)
+            return this.requireManagedWorktrees().list(req.workspace);
+        return this.requireWorkspaceGit().listWorktrees(req.workspace);
     }
     async removeManagedWorkspaceGitWorktree(_ctx, req) {
+        if (!this.services.managedWorktrees && !this.services.workspaceGit) {
+            throw this.requireManagedWorktreesUnavailable();
+        }
+        if (!this.services.managedWorktrees && this.services.workspaceGit) {
+            const result = await this.services.workspaceGit.removeManagedWorktree(req.workspace, req.worktreeDir, req.activeWorktreeDir);
+            if (result.status >= 400)
+                throw managedWorktreeRemovalError({
+                    status: result.status,
+                    body: toRemoveWorktreeResponse(result),
+                });
+            await releaseWorkspaceQuietly(this.services.workspaceGit, req.worktreeDir);
+            return toRemoveWorktreeResponse(result);
+        }
         const workspaceIdentity = this.services.workspaceGit
             ? await this.services.workspaceGit.resolveWorkspaceIdentity(req.worktreeDir)
             : req.worktreeDir;
@@ -284,6 +397,13 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
     async removeManagedWorkspaceGitWorktreesBatch(_ctx, req) {
         if (req.items.length === 0) {
             throw new AppError(400, 'WORKTREE_ITEMS_REQUIRED', 'At least one worktree item is required');
+        }
+        if (!this.services.managedWorktrees && this.services.workspaceGit) {
+            const result = await this.services.workspaceGit.removeManagedWorktreesBatch(req.items.map((item) => ({ workspace: item.workspace, worktreeDir: item.worktreeDir })), req.activeWorktreeDir);
+            for (const workspace of result.removedPaths) {
+                await releaseWorkspaceQuietly(this.services.workspaceGit, workspace);
+            }
+            return result;
         }
         const identities = new Map(await Promise.all(req.items.map(async (item) => [
             item.worktreeDir,
@@ -301,6 +421,9 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
         if (this.services.managedWorktrees)
             return this.services.managedWorktrees;
         throw new AppError(503, 'WORKTREE_UNAVAILABLE', 'Managed worktree service is not available');
+    }
+    requireManagedWorktreesUnavailable() {
+        return new AppError(503, 'WORKTREE_UNAVAILABLE', 'Managed worktree service is not available');
     }
     requireWorkspaceGit() {
         if (this.services.workspaceGit)
@@ -337,13 +460,31 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
     }
     async listFsDirs(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('listFsDirs');
+        try {
+            return await this.requireWorkspaceFile().listFsDirs(req);
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
     }
     async getFsGitInfo(ctx, req) {
         void ctx;
-        void req;
-        throw new NotImplementedError('getFsGitInfo');
+        try {
+            return await this.requireWorkspaceFile().getFsGitInfo(req.path);
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
+    }
+    requireWorkspaceFile() {
+        if (this.services.workspaceFile)
+            return this.services.workspaceFile;
+        throw new AppError(503, 'WORKSPACE_FILE_UNAVAILABLE', 'Workspace file service is not available');
+    }
+    requireWorkspaceLocalActions(operation = 'workspaceLocalActions') {
+        if (this.services.workspaceLocalActions)
+            return this.services.workspaceLocalActions;
+        throw new NotImplementedError(operation);
     }
 }
 export const workspaceFileController = new WorkspaceFileController();
@@ -358,6 +499,14 @@ function managedWorktreeRemovalError(result) {
             headers: { 'Content-Type': 'application/json' },
         }),
     });
+}
+function toRemoveWorktreeResponse(result) {
+    return {
+        success: result.success,
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.output ? { output: result.output } : {}),
+    };
 }
 function workspaceGitSnapshotChangedError(snapshotId) {
     return new HTTPException(409, {
@@ -433,5 +582,58 @@ function resolveChangeActionPaths(req) {
 }
 function describeError(error) {
     return error instanceof Error ? error.message : String(error);
+}
+function mapWorkspaceFileError(error) {
+    if (error instanceof AppError)
+        return error;
+    if (error instanceof WorkspaceFileError) {
+        const status = workspaceFileErrorStatus(error.code);
+        return new AppError(status, error.code, error.message);
+    }
+    return new AppError(500, 'WORKSPACE_FILE_FAILED', describeError(error));
+}
+function mapWorkspaceLocalActionError(error, operation) {
+    if (error instanceof NotImplementedError)
+        return error;
+    if (error instanceof WorkspaceLocalActionsUnavailableError) {
+        return new NotImplementedError(operation);
+    }
+    if (error instanceof WorkspaceLocalActionError) {
+        return new AppError(error.status, error.code ?? 'WORKSPACE_LOCAL_ACTION_FAILED', error.message);
+    }
+    if (error instanceof AppError)
+        return error;
+    return new AppError(500, 'WORKSPACE_LOCAL_ACTION_FAILED', describeError(error));
+}
+function workspaceFileErrorStatus(code) {
+    switch (code) {
+        case 'PATH_TRAVERSAL':
+        case 'FILE_ACCESS_DENIED':
+            return 403;
+        case 'FILE_NOT_FOUND':
+        case 'WORKSPACE_NOT_FOUND':
+            return 404;
+        case 'REVISION_CONFLICT':
+            return 409;
+        case 'FILE_TOO_LARGE':
+        case 'OFFICE_PREVIEW_TOO_LARGE':
+            return 413;
+        case 'NOT_A_FILE':
+        case 'NOT_A_DIRECTORY':
+            return 422;
+        default:
+            return 400;
+    }
+}
+async function releaseWorkspaceQuietly(workspaceGit, workspace) {
+    if (!workspaceGit)
+        return;
+    try {
+        await workspaceGit.releaseWorkspace(workspace);
+    }
+    catch {
+        // Releasing a stale workspace must not turn a successful removal into an
+        // HTTP failure. The next request can rebuild the Git snapshot if needed.
+    }
 }
 //# sourceMappingURL=workspace-file.controller.js.map

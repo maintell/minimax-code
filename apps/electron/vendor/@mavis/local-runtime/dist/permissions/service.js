@@ -93,6 +93,7 @@ export function createLocalPermissionService(deps) {
         getLocalAgent: deps.getLocalAgent,
         messageStore: deps.messageStore,
         shellFamily: deps.shellFamily,
+        skipWindowsHardSafetyChecks: deps.skipWindowsHardSafetyChecks,
         metricsClient: deps.metricsClient,
     });
     // Fire-and-forget: when the persisted permissionMode is `acceptEdits`, seed
@@ -177,6 +178,7 @@ export function resolveLocalPermissionService(host) {
             messageStore: resolvePermissionMessageSource(host),
             configUpdater: (body) => host.configUpdater(body),
             shellFamily: host.shellFamily,
+            skipWindowsHardSafetyChecks: host.skipWindowsHardSafetyChecks,
             metricsClient: host.metricsClient,
         });
         _serviceCache.set(host.permissionRules, service);

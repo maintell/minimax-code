@@ -1,4 +1,4 @@
-import { effectiveGoalBudgetLimits, firstGoalSettlementDependency, } from './settlement-gates.js';
+import { effectiveGoalBudgetLimits, firstGoalSettlementDependency } from './settlement-gates.js';
 import { goalFailureTransition, settlementTransitionDecision, } from './settlement-transitions.js';
 import { sanitizeUsageCounter, threadGoalTurnToolActivity } from './turn-work-signals.js';
 import { normalizeVerificationResult, ThreadGoalVerificationSettlement, } from './verification-settlement.js';
@@ -96,6 +96,8 @@ export class GoalSettlement {
     }
     async settleInjectedTurn(input) {
         const decision = await this.runDecisionPipeline(input);
+        // Verification usage settles before the result-only Turn.
+        await this.deps.continuation.enqueueCompletionSummary(input);
         // An out-of-band decision epoch advance — a user PATCH, or the breaker
         // reset this very Turn committed when it is an explicit user Turn — left
         // the Goal without a runner: the pipeline above stopped at the stale stage
@@ -109,6 +111,9 @@ export class GoalSettlement {
         const accounted = await this.stage1Account(input);
         if ('stage' in accounted)
             return accounted;
+        if (accounted.accounting.boundTurn.kind === 'completion-summary') {
+            return { stage: 1, action: 'settled', reason: 'completion_summary_accounted' };
+        }
         const classified = this.stage2ClassifyStale(input, accounted.accounting);
         if ('stage' in classified)
             return classified;
@@ -242,8 +247,16 @@ export class GoalSettlement {
     }
     async stage5CheckDependencies(context) {
         const dependency = await firstGoalSettlementDependency(context.goal, this.deps.gates);
-        if (!dependency)
-            return undefined;
+        if (!dependency) {
+            // A rejected ask_user never creates a pending questionnaire. Without this
+            // guard, paraphrased requests for the same answer bypass the reply breaker
+            // and keep spending tokens. Let the current Turn repair the call first;
+            // only an unresolved committed failure requires explicit user recovery.
+            if (!context.input.questionnaireFailed)
+                return undefined;
+            const next = { status: 'paused', statusReason: 'paused(questionnaire_failed)' };
+            return settlementTransitionDecision(5, next.statusReason, await this.settleBoundStatus(context.accounting, next));
+        }
         // This Turn leaves the pipeline before the breaker stage, but its real tool
         // calls still have to interrupt the no-tool streak. Persist that first so
         // the deferred continuation is enqueued against the resulting epoch.

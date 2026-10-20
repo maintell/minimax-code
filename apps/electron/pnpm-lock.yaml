@@ -230,6 +230,9 @@ importers:
       '@mavis/thrift-gen-client':
         specifier: file:./vendor/@mavis/thrift-gen-client
         version: file:vendor/@mavis/thrift-gen-client
+      '@minimax/mcode-app-server-protocol':
+        specifier: file:./vendor/@minimax/mcode-app-server-protocol
+        version: file:vendor/@minimax/mcode-app-server-protocol
       '@minimax/mcode-sandbox-runtime':
         specifier: file:./vendor/@minimax/mcode-sandbox-runtime
         version: file:vendor/@minimax/mcode-sandbox-runtime
@@ -754,6 +757,10 @@ packages:
 
   '@mavis/thrift-gen@file:vendor/@mavis/thrift-gen':
     resolution: {directory: vendor/@mavis/thrift-gen, type: directory}
+
+  '@minimax/mcode-app-server-protocol@file:vendor/@minimax/mcode-app-server-protocol':
+    resolution: {directory: vendor/@minimax/mcode-app-server-protocol, type: directory}
+    engines: {node: '>=20'}
 
   '@minimax/mcode-sandbox-runtime@file:vendor/@minimax/mcode-sandbox-runtime':
     resolution: {directory: vendor/@minimax/mcode-sandbox-runtime, type: directory}
@@ -4644,6 +4651,12 @@ snapshots:
     dependencies:
       hono: 4.13.0
       lodash-es: 4.18.1
+
+  '@minimax/mcode-app-server-protocol@file:vendor/@minimax/mcode-app-server-protocol':
+    dependencies:
+      '@mavis/shared': file:vendor/@mavis/shared
+    transitivePeerDependencies:
+      - supports-color
 
   '@minimax/mcode-sandbox-runtime@file:vendor/@minimax/mcode-sandbox-runtime':
     dependencies:

@@ -21,7 +21,14 @@ if (parentPort) {
             onReady: () => parentPort.postMessage({ type: 'cua-ready', generation }),
             onPointer: (pointer) => parentPort.postMessage({ type: 'cua-pointer', generation, pointer }),
             onPreviewTarget: (target) => parentPort.postMessage({ type: 'cua-preview-target', generation, target }),
-            onOperation: ({ sessionId, turnId }) => parentPort.postMessage({ type: 'cua-operation', generation, sessionId, turnId }),
+            onOperation: ({ sessionId, turnId, requestId }) => parentPort.postMessage({ type: 'cua-operation', generation, sessionId, turnId, requestId }),
+            onOperationFinished: ({ sessionId, turnId, requestId }) => parentPort.postMessage({
+                type: 'cua-operation-finished',
+                generation,
+                sessionId,
+                turnId,
+                requestId,
+            }),
             onRelease: (sessionId, turnId) => parentPort.postMessage({ type: 'cua-released', generation, sessionId, turnId }),
             onActivityChange: (activeRequestCount) => parentPort.postMessage({
                 type: 'cua-activity',

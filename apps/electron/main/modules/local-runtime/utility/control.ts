@@ -2,6 +2,9 @@ import { isCollectionPolicy } from "@mavis/shared/collection-policy";
 import { parseWorkspaceIndexingObservation } from "../../observability/workspace-indexing";
 /** IPC channel used to deliver a transport MessagePort to a renderer. */
 export let RUNTIME_TRANSPORT_PORT_CHANNEL = 'runtime:transport-port';
+/** IPC channels used to release the renderer's runtime startup gate. */
+export let RUNTIME_READY_CHANNEL = 'runtime:ready';
+export let RUNTIME_FAILED_CHANNEL = 'runtime:failed';
 /**
  * IPC channel broadcast to renderers when the utility process is lost.
  * Mirrored as `IPC_CHANNELS.RUNTIME_TRANSPORT_LOST` in config/constants.ts

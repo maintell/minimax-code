@@ -4,7 +4,8 @@ import { DEV_SERVER_URL, IPC_CHANNELS } from "../config/constants.js";
 import { getEmbeddedBrowserManager } from "../modules/browser/embedded-browser-manager.js";
 import { MiniAppComposerBroker } from "../modules/browser/miniapp-composer.js";
 import { getUserInfo } from "./storage.ipc.js";
-function trustedHost(event) {
+/** The sender is the Host window's own main frame on the Archon page (also used by Agent IPC). */
+export function trustedHost(event) {
     if (event.sender.isDestroyed() ||
         !event.senderFrame ||
         event.senderFrame !== event.sender.mainFrame)

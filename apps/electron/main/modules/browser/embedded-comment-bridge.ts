@@ -46,7 +46,7 @@ const EMBEDDED_COMMENT_COMPOSER_ICONS = {
         ],
     },
 };
-export let EMBEDDED_COMMENT_BRIDGE_VERSION = '2026-08-07-comment-focus-ownership-v15';
+export let EMBEDDED_COMMENT_BRIDGE_VERSION = '2026-10-12-comment-sidebar-focus-v16';
 export function buildEmbeddedCommentBridgeScript(options) {
     const allowSyntheticEventsForTests = options?.allowSyntheticEventsForTests === true;
     const isolateUiInShadowRoot = options?.isolateUiInShadowRoot !== false;
@@ -147,17 +147,31 @@ export function buildEmbeddedCommentBridgeScript(options) {
     }
     event.stopPropagation();
   };
+  // A modal sidebar can reclaim focus on the outgoing page control's
+  // focusout, before focus reaches our shadow root. Isolate only transitions
+  // into annotation UI; normal page-to-page focus remains owned by the site.
+  const stopPageFocusOutIntoBridgeUi = (event) => {
+    const next = event.relatedTarget;
+    if (
+      next instanceof Element &&
+      next.closest('[data-mavis-embedded-comment-ui="true"]')
+    ) {
+      event.stopPropagation();
+    }
+  };
   const removeBridgeUiEventBoundary = () => {
     if (!bridgeUiEventBoundaryRoot) return;
     bridgeUiPropagationEvents.forEach((type) => {
       bridgeUiEventBoundaryRoot.removeEventListener(type, stopBridgeUiEventPropagation);
     });
+    document.removeEventListener('focusout', stopPageFocusOutIntoBridgeUi, true);
     bridgeUiEventBoundaryRoot = null;
   };
   const installBridgeUiEventBoundary = (root) => {
     if (!root || bridgeUiEventBoundaryRoot === root) return;
     removeBridgeUiEventBoundary();
     bridgeUiEventBoundaryRoot = root;
+    document.addEventListener('focusout', stopPageFocusOutIntoBridgeUi, true);
     bridgeUiPropagationEvents.forEach((type) => {
       root.addEventListener(type, stopBridgeUiEventPropagation);
     });

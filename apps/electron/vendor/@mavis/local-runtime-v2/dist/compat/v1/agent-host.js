@@ -69,6 +69,7 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
                         availableSkillNames: (Array.isArray(input.agentConfig.skills)
                             ? input.agentConfig.skills
                             : []).flatMap((skill) => isRecord(skill) && typeof skill.name === 'string' ? [skill.name] : []),
+                        ...(input.sessionIdInContext ? { sessionIdInContext: true } : {}),
                         ...(model ? { model } : {}),
                     });
                 },
@@ -270,6 +271,9 @@ function createV1ThreadGoalTurnLifecycle(lifecycle) {
                 const usage = summarizeCommittedPiGoalUsage(change.messages);
                 observed.tokens += usage.tokens;
                 observed.usageIncomplete ||= usage.incomplete;
+                const questionnaireFailed = readLastQuestionnaireFailure(change.messages);
+                if (questionnaireFailed !== undefined)
+                    observed.questionnaireFailed = questionnaireFailed;
                 observed.historyObserved = true;
                 observed.toolCalls += countCommittedToolCalls(change.messages);
                 const finalAssistant = readLastAssistantText(change.messages);
@@ -320,6 +324,7 @@ function createV1ThreadGoalTurnLifecycle(lifecycle) {
                     ...(observed.finalAssistantText !== undefined
                         ? { finalAssistantText: observed.finalAssistantText }
                         : {}),
+                    ...(observed.questionnaireFailed ? { questionnaireFailed: true } : {}),
                     ...(observed.workerModelKey ? { workerModelKey: observed.workerModelKey } : {}),
                     // Only report work signals backed by an actual history observation.
                     // An omitted field means "unknown" downstream; a fabricated zero
@@ -337,6 +342,22 @@ function createV1ThreadGoalTurnLifecycle(lifecycle) {
             },
         },
     };
+}
+/** Only committed tool outcomes establish a failed handoff; model prose is not evidence. */
+function readLastQuestionnaireFailure(messages) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message || typeof message !== 'object' || Array.isArray(message))
+            continue;
+        if (Reflect.get(message, 'role') !== 'toolResult')
+            continue;
+        if (Reflect.get(message, 'toolName') !== 'ask_user')
+            continue;
+        const isError = Reflect.get(message, 'isError');
+        if (typeof isError === 'boolean')
+            return isError;
+    }
+    return undefined;
 }
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -438,5 +459,91 @@ function systemReminderModel(agentConfig) {
         modelID,
         ...(typeof model.variant === 'string' && model.variant ? { variant: model.variant } : {}),
     };
+}
+/**
+ * Validates a persisted Agent mention through the same trusted v1 resolver
+ * chain that Task uses. The primary family is intentionally excluded: a main
+ * session may nominate only a delegatable SubAgent, never itself.
+ */
+export async function resolveDelegatableAgentReference(resolver, requestRef, resolveTarget) {
+    try {
+        const scope = await resolver.resolveAgentReadScope(requestRef);
+        if (scope.canonicalName === scope.primaryName)
+            return 'unauthorized';
+        await resolveTarget(resolver, requestRef);
+        return 'authorized';
+    }
+    catch {
+        // Resolver failures must neither reveal roster details nor emit Task text.
+        return 'unknown';
+    }
+}
+/** Deferred, fail-open adapter for Agent facts emitted before v1 host binding. */
+export function createDeferredAgentRuntimeTelemetry(input) {
+    const { emitSubagentTelemetry, roleClass, events: SUBAGENT_TELEMETRY_EVENT } = input;
+    let sink;
+    let closed = false;
+    const facts = {
+        onNameCompatResolve: (fact) => {
+            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.nameCompatResolve, {
+                intent: fact.intent,
+                canonical_class: fact.canonicalClass,
+                source: fact.source,
+                success: fact.success,
+                ...(fact.memberCountBucket ? { member_count_bucket: fact.memberCountBucket } : {}),
+                ...(fact.errorCode ? { error_code: fact.errorCode } : {}),
+            });
+        },
+        onAgentRoleObservation: (fact) => {
+            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.agentRoleObservation, {
+                status: fact.status,
+                source: fact.source,
+                role_class: roleClass(fact.role),
+            });
+        },
+        // Emitted on EVERY overlay branch, including the skips. "My old display
+        // name did not carry over" must be answerable from one event, not from
+        // the absence of a repository write.
+        onPrimaryProfileOverlay: (fact) => {
+            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.primaryProfileOverlay, {
+                outcome: fact.outcome,
+                // Field names only: a displayName or workspace path is user content.
+                adopted_fields: fact.adoptedFields.join(','),
+                adopted_count: fact.adoptedFields.length,
+                display_name_locked: fact.displayNameLocked,
+            });
+        },
+    };
+    return {
+        facts,
+        bind: (binding) => {
+            if (closed)
+                return;
+            sink = createAgentTelemetryHost(binding);
+        },
+        close: () => {
+            closed = true;
+            sink = undefined;
+        },
+    };
+}
+function createAgentTelemetryHost(input) {
+    const client = input.metricsClient;
+    return {
+        metrics: {
+            incr: (name, labels) => client.counter(name, 1, labels),
+            gauge: (name, value, labels) => client.gauge(name, value, labels),
+            latency: (name, durationMs, labels) => client.histogram(name, durationMs, labels),
+        },
+        ...(input.emitBusEvent ? { emitBusEvent: input.emitBusEvent } : {}),
+    };
+}
+export function legacyCollisionMigrationId(error) {
+    const migrationId = error && typeof error === 'object' && 'migrationId' in error
+        ? error.migrationId
+        : undefined;
+    return typeof migrationId === 'string' && /^agent-name-conflicts-\d+$/u.test(migrationId)
+        ? migrationId
+        : undefined;
 }
 //# sourceMappingURL=agent-host.js.map

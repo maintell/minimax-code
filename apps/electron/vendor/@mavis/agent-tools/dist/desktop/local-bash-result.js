@@ -58,6 +58,7 @@ export function readBashExecutionOutcome(details) {
             'unknown',
             'preflight_failed',
             'watchdog_timeout',
+            'output_limit',
         ].includes(value.reason) ||
         !(value.exitCode === null ||
             (typeof value.exitCode === 'number' && Number.isInteger(value.exitCode))) ||

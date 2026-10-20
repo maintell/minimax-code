@@ -6,7 +6,8 @@
 // below are inert strings that the shipped artifacts legitimately embed:
 //
 // - `*.xaminim.com` hosts: test/pre environment endpoints that the shipped
-//   binaries and bundles carry; they are dormant in the production lanes.
+//   binaries, bundles and test-install helpers carry; they are dormant in the
+//   production lanes.
 // - `/Users/minimax/`: absolute build-machine paths embedded in prebuilt
 //   artifacts (wasm assemblies, minified bundles) that cannot be rewritten
 //   without changing the shipped bytes.
@@ -28,41 +29,53 @@ export const publishedClientExceptions = {
   "apps/electron/main/modules/oss/index.ts":
     ["matrix-overseas-test.xaminim.com", "matrix-test.xaminim.com"],
   "apps/electron/main/modules/remote-control-bridge/ipc.ts": ["@mavis/thrift-gen"],
-  "apps/electron/out/_next/static/chunks/24831-6b41d8b0ca99c671.js":
-    ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "mmx-pre.xaminim.com", "mmx-test.xaminim.com", "open-platform-for-online-test.xaminim.com", "openplatform-test.xaminim.com", "platform-pre.xaminim.com", "platform-test.xaminim.com", "platform-us-pre.xaminim.com", "platform-us-test.xaminim.com"],
+  "apps/electron/main/modules/ssh-runtime/cli-install-target.ts": ["npmmirror.xaminim.com"],
+  "apps/electron/main/modules/ssh-runtime/shared-global-events.ts": ["@mavis/thrift-gen"],
+  "apps/electron/out/_next/static/chunks/41412-1218a6cf54a78020.js":
+    ["matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "platform-pay-test.xaminim.com"],
   "apps/electron/out/_next/static/chunks/51656.aa39f6bad8ce3c84.js":
     ["lark-auth-vela-bench.xaminim.com", "platform-api.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/60966-12f8280f4dd2219f.js":
-    ["matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "platform-pay-test.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/70323.ac6517e92179a16f.js": ["/Users/minimax/"],
-  "apps/electron/out/_next/static/chunks/93882.f1248d905dd23741.js": ["/Users/minimax/"],
-  "apps/electron/out/_next/static/chunks/98006.03adf8d167ee299c.js":
+  "apps/electron/out/_next/static/chunks/53243.0883e42862b425b0.js":
+    ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "mmx-pre.xaminim.com", "mmx-test.xaminim.com", "open-platform-for-online-test.xaminim.com", "openplatform-test.xaminim.com", "platform-pre.xaminim.com", "platform-test.xaminim.com", "platform-us-pre.xaminim.com", "platform-us-test.xaminim.com"],
+  "apps/electron/out/_next/static/chunks/64741-93599618c13a4408.js":
+    ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "mmx-pre.xaminim.com", "mmx-test.xaminim.com", "open-platform-for-online-test.xaminim.com", "openplatform-test.xaminim.com", "platform-pre.xaminim.com", "platform-test.xaminim.com", "platform-us-pre.xaminim.com", "platform-us-test.xaminim.com"],
+  "apps/electron/out/_next/static/chunks/68097.9eb14108b56ef21a.js":
     ["matrix-overseas-test.xaminim.com", "matrix-test.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/pptx-media-decoder.78606c2171a69153.js":
+  "apps/electron/out/_next/static/chunks/69200.38fd465b9831d0d4.js":
+    ["account-pre.xaminim.com", "account-test.xaminim.com"],
+  "apps/electron/out/_next/static/chunks/70323.ac6517e92179a16f.js": ["/Users/minimax/"],
+  "apps/electron/out/_next/static/chunks/93882.e316df98134d5ffe.js": ["/Users/minimax/"],
+  "apps/electron/out/_next/static/chunks/aad4249a.51c068675f46421b.js": ["/Users/minimax/"],
+  "apps/electron/out/_next/static/chunks/app/(pages)/login/page-9d6fe2fd7fbde9e2.js":
+    ["account-pre.xaminim.com", "account-test.xaminim.com"],
+  "apps/electron/out/_next/static/chunks/app/error-9fb08eac2be6dc9c.js":
+    ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "mmx-pre.xaminim.com", "mmx-test.xaminim.com", "open-platform-for-online-test.xaminim.com", "openplatform-test.xaminim.com", "platform-pre.xaminim.com", "platform-test.xaminim.com", "platform-us-pre.xaminim.com", "platform-us-test.xaminim.com"],
+  "apps/electron/out/_next/static/chunks/pptx-media-decoder.6797f81c64877811.js":
     ["/Users/minimax/"],
   "apps/electron/package.json": ["@mavis/thrift-gen"],
   "apps/electron/pnpm-lock.yaml": ["@mavis/thrift-gen"],
+  "apps/electron/resources/install-mcode-test.sh": ["npmmirror.xaminim.com"],
   "apps/electron/resources/mcode-tools/cli.mjs":
     ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/Mavis.Pptx.Importer.Wasm.be7u796ntu.wasm":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/Mavis.Pptx.Importer.Wasm.2f1rp4czkl.wasm":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/Mavis.Pptx.Importer.Wasm.be7u796ntu.wasm.gz":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/Mavis.Pptx.Importer.Wasm.2f1rp4czkl.wasm.gz":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/Mavis.Pptx.Importer.e8u3lmberu.wasm":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/Mavis.Pptx.Importer.ah7ai85qga.wasm":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/Mavis.Pptx.Importer.e8u3lmberu.wasm.gz":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/Mavis.Pptx.Importer.ah7ai85qga.wasm.gz":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/Mavis.Pptx.SafeOpc.zl6cna0njl.wasm":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/Mavis.Pptx.SafeOpc.o6airvchqz.wasm":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/Mavis.Pptx.SafeOpc.zl6cna0njl.wasm.gz":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/Mavis.Pptx.SafeOpc.o6airvchqz.wasm.gz":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/dotnet.native.afikkofx3k.wasm":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/dotnet.native.afikkofx3k.wasm":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/dotnet.native.afikkofx3k.wasm.gz":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/dotnet.native.afikkofx3k.wasm.gz":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/dotnet.native.q1bp8lh4u4.js":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/dotnet.native.q1bp8lh4u4.js":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/d0f0f4ea0a8e7aa30bb49efd2cdc5b8f73a5b99764037af7947ad9b61cacaf6e/_framework/dotnet.native.q1bp8lh4u4.js.gz":
+  "apps/electron/resources/pptx-core/9683f0a97cc01509a49303542d5e17c3aaf9256f3e81ab7d4bb322af9705303a/_framework/dotnet.native.q1bp8lh4u4.js.gz":
     ["/Users/minimax/"],
   "apps/electron/resources/session-transfer/win32-x64/mavis-session-transfer-client.exe":
     ["gitlab.xaminim.com"],

@@ -1,4 +1,4 @@
-export { createRuntimeServicesLifecycle, closeRuntimeServiceOwnersAfterFailure, createRuntimePluginAuthContextNotifier, createRuntimePluginSessionLifecycle, } from './session/runtime-services-lifecycle.js';
+export { createRuntimeServicesLifecycle, closeRuntimeServiceOwnersAfterFailure, createRuntimeServicesGlobalEventWriter, createRuntimePluginAuthContextNotifier, createRuntimePluginSessionLifecycle, } from './session/runtime-services-lifecycle.js';
 export { configureRuntimePluginHooks, } from './session/runtime-plugin-hook-composition.js';
 export { AgentApplication, createAgentSessionPorts, createRuntimeAgentApplication, } from './agent/agent-application.js';
 export { createV2AgentExecutionSource } from './agent/execution-source.js';

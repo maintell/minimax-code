@@ -140,7 +140,7 @@ export function createWriteToolDefinition(cwd, options) {
         async execute(_toolCallId, { path, content }, signal, _onUpdate, _ctx) {
             const absolutePath = resolveToCwd(path, cwd);
             const dir = dirname(absolutePath);
-            return withFileMutationQueue(absolutePath, async () => {
+            const mutate = async () => {
                 // Do not reject from an abort event listener here: that would release the
                 // mutation queue while an in-flight filesystem operation may still finish.
                 // Checking signal.aborted after each await observes the same aborts while
@@ -160,7 +160,8 @@ export function createWriteToolDefinition(cwd, options) {
                     content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
                     details: undefined,
                 };
-            });
+            };
+            return withFileMutationQueue(absolutePath, mutate, ops.realpath?.bind(ops));
         },
         renderCall(args, theme, context) {
             const renderArgs = args;

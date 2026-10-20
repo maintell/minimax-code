@@ -1,4 +1,4 @@
-import { buildThreadGoalContinuationMessage, readThreadGoalContinuationOrigin, threadGoalBudgetLimitClientRequestId, threadGoalRecoveryClientRequestId, } from './kickoff.js';
+import { buildThreadGoalContinuationMessage, readThreadGoalContinuationOrigin, threadGoalBudgetLimitClientRequestId, threadGoalCompletionClientRequestId, threadGoalRecoveryClientRequestId, } from './kickoff.js';
 /** Initial Thread Goal continuation staging owned exclusively by Session V2. */
 export class LocalThreadGoalKickoffQueue {
     deps;
@@ -105,6 +105,15 @@ export class LocalThreadGoalKickoffQueue {
                     this.deps.reportFailure(goal.sessionId, `thread_goal_budget_limit_recovery_failed:${formatUnknownError(error)}`);
                 }
             }));
+            const completionCandidates = await integration.store.listRecoverableCompletionSummaries();
+            await Promise.all(completionCandidates.map(async (goal) => {
+                try {
+                    await this.recoverCompletionSummary(conversation ?? this.requireConversation(), goal);
+                }
+                catch (error) {
+                    this.deps.reportFailure(goal.sessionId, `thread_goal_completion_recovery_failed:${formatUnknownError(error)}`);
+                }
+            }));
         }
         catch (error) {
             this.deps.reportRecoveryFailure(formatUnknownError(error));
@@ -167,6 +176,25 @@ export class LocalThreadGoalKickoffQueue {
             ...buildThreadGoalContinuationMessage(goal, prompt.content, 'budget-limit'),
             hideUserMessage: true,
         }, prompt.internalPromptRead);
+    }
+    async recoverCompletionSummary(conversation, goal) {
+        const proposal = goal.lastWorkerProposal;
+        if (goal.status !== 'complete' ||
+            proposal?.type !== 'complete' ||
+            proposal.resultDelivery !== 'pending')
+            return;
+        if (!(await conversation.query.getSession(goal.sessionId)))
+            return;
+        const integration = this.deps.getIntegration();
+        const clientRequestId = threadGoalCompletionClientRequestId(goal.goalId, proposal.turnId);
+        if (!(await conversation.ingress.findQueuedByClientRequestId(goal.sessionId, clientRequestId))) {
+            const prompt = await integration.preparePrompt(goal, 'completion-summary');
+            await this.submitRecoveredPrompt(conversation, goal.sessionId, clientRequestId, {
+                ...buildThreadGoalContinuationMessage(goal, prompt.content, 'completion-summary'),
+                hideUserMessage: true,
+            }, prompt.internalPromptRead);
+        }
+        await integration.store.markCompletionSummaryQueued(goal.goalId, proposal.turnId);
     }
     async submitRecoveredPrompt(conversation, sessionId, clientRequestId, message, internalPromptRead) {
         const integration = this.deps.getIntegration();

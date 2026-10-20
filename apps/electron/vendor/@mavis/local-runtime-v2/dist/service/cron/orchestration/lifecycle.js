@@ -3,7 +3,7 @@ import { isSelfReminderId } from '@mavis/shared/cron-purpose';
 import { CRON_SCHEDULER_HANDLER_KEY, } from '../contracts.js';
 import { CronRepositoryError } from '../errors.js';
 import { toCronSchedule, toSchedulerSchedule } from './schedule.js';
-import { selfRemindersToCancel, unfinishedSelfReminders } from './self-reminder-state.js';
+import { finishedSelfReminders, selfRemindersToCancel, unfinishedSelfReminders, } from './self-reminder-state.js';
 export class CronDataLifecycle {
     dependencies;
     constructor(dependencies) {
@@ -116,6 +116,19 @@ export class CronDataLifecycle {
         return cancelled
             .filter((definition) => definition.deletedAtMs === undefined)
             .map((definition) => definition.cronId);
+    }
+    /**
+     * 已结束的自提醒转为软删：任务列表不再展示，运行历史保留；
+     * 同一 tool call 重试仍读到原记录，不会复活。不传 sessionId 时清扫全部会话。
+     */
+    retireFinishedSelfReminders(nowMs, sessionId) {
+        return this.immediate(() => {
+            const finished = finishedSelfReminders(this.dependencies, sessionId);
+            for (const definition of finished) {
+                this.dependencies.definitions.tombstone(definition.cronId, definition.revision, nowMs);
+            }
+            return finished.map((definition) => definition.cronId);
+        });
     }
     createManualRun(cronId, nowMs, requestId) {
         return this.immediate(() => {

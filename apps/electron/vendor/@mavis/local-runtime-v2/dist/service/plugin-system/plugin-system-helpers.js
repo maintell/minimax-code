@@ -118,13 +118,24 @@ export function findLocalPlugin(snapshot, pluginName) {
     const key = normalizedPluginName(pluginName);
     return snapshot.localPlugins.find((plugin) => normalizedPluginName(plugin.name) === key);
 }
+export function assertPluginNameAvailable(pluginName, officialInstallations, snapshot) {
+    const key = normalizedPluginName(pluginName);
+    if (officialInstallations.some((item) => item.installed && normalizedPluginName(item.name) === key) ||
+        snapshot.localPlugins.some((item) => normalizedPluginName(item.name) === key)) {
+        throw new PluginSystemError('PLUGIN_ALREADY_EXISTS', 'Plugin name is already installed');
+    }
+}
 function freeze(value) {
     return Object.freeze(value);
 }
 /** Explicit disable/uninstall revokes persisted selections before publishing the new snapshot. */
 export async function revokeOfficialPluginSelection(onRevoked, mutation, scope) {
     if (!mutation.installExists || !mutation.enabled) {
-        await onRevoked?.({ pluginName: mutation.pluginName, scope });
+        await onRevoked?.({
+            pluginName: mutation.pluginName,
+            scope,
+            reason: mutation.installExists ? 'disabled' : 'uninstalled',
+        });
     }
 }
 /** Fence explicit mutations against both the active publication and current identity. */

@@ -6,13 +6,13 @@
  * 类似于 electron-serve 库的实现
  *
  * 热更新支持：
- * - 优先从热更新缓存目录加载资源
- * - 如果热更新资源不存在，回退到打包时的资源
+ * - 静态资源只从启动时决定的渲染根目录读取（安装包 out/ 或某个完整的热更新版本目录），
+ *   进程生命周期内不变，不做逐文件回退。
  */
 import * as path from "path";
 import * as fs from "fs";
 import { protocol, app, session, net } from "electron";
-import { getHotUpdateResourceDir, isHotUpdateEnabled } from "../hotUpdate";
+import { getHotUpdateBootRenderer } from "../hotUpdate";
 import { handleLocalRuntimeRequest } from "../local-runtime";
 import { createDocumentPreviewArtifactRequestGuard, createDocumentPreviewProtocolHandler } from "../document-preview/artifact-protocol";
 import { sharedDocumentPreviewArtifactStore } from "../document-preview/artifact-store";
@@ -21,6 +21,7 @@ import * as logger_1 from "../../utils/logger";
 import { PREVIEW_ARTIFACT_PROTOCOL_NAME_V1 } from "@mavis/shared/document-preview";
 import { createPptxCoreRuntimeProtocolHandler } from "../document-preview/pptx-core/runtime-protocol";
 import { DOMAIN_URL } from "../../config/constants";
+import { routeProjectRuntimeMediaRequest } from "./project-runtime-media";
 import { isDeveloperBuildEligible } from "../../config/developer-build-policy";
 import { isDev, isTest, isStaging, isInternalBuild, isInsideBuild } from "../../config/env";
 /**
@@ -107,13 +108,14 @@ export function createDocumentPreviewGuardHitReporter(enqueue = enqueueElectronO
 }
 function defaultDocumentPreviewProtocolOptions() {
     const appPath = app.getAppPath();
-    const hotUpdatePath = getHotUpdateResourceDir();
+    const rendererRoot = getHotUpdateBootRenderer().root;
+    const bundledOutPath = path.join(appPath, 'out');
     return {
         store: sharedDocumentPreviewArtifactStore,
         pdfRoots: [
-            path.join(appPath, 'out', 'pdf'),
+            path.join(rendererRoot, 'pdf'),
+            ...(rendererRoot === bundledOutPath ? [] : [path.join(bundledOutPath, 'pdf')]),
             path.join(appPath, 'public', 'pdf'),
-            path.join(hotUpdatePath, 'pdf'),
         ],
         logger: (0, logger_1.getCategoryLogger)('document-preview'),
     };
@@ -298,13 +300,11 @@ function shouldMaterializeResponse(method, urlPath, response) {
 }
 /**
  * 设置自定义协议处理器
- * 支持热更新：优先从热更新缓存目录加载，回退到打包资源
+ * 静态资源根目录在启动时确定（内置 out/ 或热更新版本目录），进程内固定
  */
 export function setupProtocolHandler(options = {}) {
-    // 打包时的资源目录
-    const bundledOutPath = path.join(app.getAppPath(), 'out');
-    // 热更新资源目录
-    const hotUpdatePath = getHotUpdateResourceDir();
+    const bootRenderer = getHotUpdateBootRenderer();
+    const rendererRoot = bootRenderer.root;
     const pptxCoreRuntimeRoot = app.isPackaged
         ? path.join(process.resourcesPath, 'resources', 'pptx-core')
         : (process.env.MAVIS_PPTX_CORE_RUNTIME_ROOT ??
@@ -314,8 +314,8 @@ export function setupProtocolHandler(options = {}) {
             ? pptxCoreRuntimeRoot
             : null,
     });
-    logger_1.default.info(`[Protocol] Bundled resources path: ${bundledOutPath}`);
-    logger_1.default.info(`[Protocol] Hot update resources path: ${hotUpdatePath}`);
+    logger_1.default.info(`[Protocol] Renderer root: ${rendererRoot} (source=${bootRenderer.source}, ` +
+        `version=${bootRenderer.version ?? 'bundled'})`);
     protocol.handle('app', async (request) => {
         const url = new URL(request.url);
         let urlPath = decodeURIComponent(url.pathname);
@@ -387,7 +387,8 @@ export function setupProtocolHandler(options = {}) {
                     signal: combinedSignal,
                     duplex: 'half',
                 });
-                const response = await handleLocalRuntimeRequest(localRequest);
+                const response = (await routeProjectRuntimeMediaRequest(localRequest)) ??
+                    (await handleLocalRuntimeRequest(localRequest));
                 if (isStreaming && response.body) {
                     combinedSignal.addEventListener('abort', () => {
                         response.body?.cancel().catch(() => { });
@@ -431,29 +432,12 @@ export function setupProtocolHandler(options = {}) {
                 });
             }
         }
-        // ── Static files: serve from hot-update or bundled out/ ──
+        // ── Static files: serve from the boot renderer root ──
         // 处理根路径
         if (urlPath === '/' || urlPath === '') {
             urlPath = '/index.html';
         }
-        // 构建资源路径优先级列表
-        // 如果热更新启用且热更新目录存在，优先使用热更新资源
-        const basePaths = [];
-        if (isHotUpdateEnabled() && fs.existsSync(hotUpdatePath)) {
-            basePaths.push(hotUpdatePath);
-            // 打包资源作为回退
-            basePaths.push(bundledOutPath);
-        }
-        else {
-            // 只使用打包资源
-            basePaths.push(bundledOutPath);
-        }
-        const filePath = resolveFilePath(basePaths, urlPath);
-        // 记录资源加载来源（仅在开发调试时有用）
-        const isFromHotUpdate = filePath.startsWith(hotUpdatePath);
-        if (isFromHotUpdate) {
-            logger_1.default.debug(`[Protocol] Loading from hot update: ${urlPath}`);
-        }
+        const filePath = resolveFilePath([rendererRoot], urlPath);
         const response = await net.fetch('file://' + filePath);
         // Only packaged public fonts are readable from the opaque Word iframe.
         // Do not extend CORS access to app pages, local runtime or cloud API routes.
@@ -469,20 +453,4 @@ export function setupProtocolHandler(options = {}) {
         }
         return response;
     });
-}
-/**
- * 获取当前资源加载路径信息
- * 用于调试和状态显示
- */
-export function getResourcePaths() {
-    const bundledPath = path.join(app.getAppPath(), 'out');
-    const hotUpdatePath = getHotUpdateResourceDir();
-    const isHotUpdateActive = isHotUpdateEnabled() &&
-        fs.existsSync(hotUpdatePath) &&
-        fs.existsSync(path.join(hotUpdatePath, 'index.html'));
-    return {
-        bundledPath,
-        hotUpdatePath,
-        activeSource: isHotUpdateActive ? 'hot-update' : 'bundled',
-    };
 }

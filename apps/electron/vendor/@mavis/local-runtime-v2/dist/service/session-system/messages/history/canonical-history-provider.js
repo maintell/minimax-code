@@ -10,6 +10,7 @@ import { ensureCanonicalHistoryMaterialized, } from './canonical-history-materia
 import { CanonicalHistoryIndexWriteError, createCanonicalHistoryIndexAdapter, } from './mutation/canonical-history-index.js';
 import { HistoryScannerError, scanCanonicalHistoryArtifacts, } from './mutation/canonical-history-scanner.js';
 import { isUserMessageId } from '../../shared/user-message-id.js';
+import { isSideChatModeMessage } from '../../shared/sidechat-mode.js';
 import { createSessionHistoryIoLane, } from './mutation/session-history-coordination.js';
 const MAX_CANONICAL_WRITE_ATTEMPTS = 3;
 const CANONICAL_RETRY_DELAYS_MS = [25, 50];
@@ -399,9 +400,7 @@ function compactionReplacementEnvelopes(change, active) {
     const baseMessages = currentUserTail?.baseMessages ?? change.messages;
     if (change.method === 'llm_checkpoint') {
         const replacement = baseMessages.map((message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }));
-        if (replacement.length !== 1 || replacement[0]?.message.role !== 'compactionSummary') {
-            throw new TypeError('Canonical checkpoint compaction must contain one native summary.');
-        }
+        assertCheckpointReplacement(replacement);
         return currentUserTail ? [...replacement, ...currentUserTail.envelopes] : replacement;
     }
     const sourceIndexes = validateToolReplacementSourceIndexes(change, active, baseMessages.length);
@@ -425,6 +424,13 @@ function compactionReplacementEnvelopes(change, active) {
     }
     return currentUserTail ? [...replacement, ...currentUserTail.envelopes] : replacement;
 }
+function assertCheckpointReplacement(replacement) {
+    if (replacement[0]?.message.role !== 'compactionSummary' ||
+        (replacement.length !== 1 &&
+            !(replacement.length === 2 && isSideChatModeMessage(replacement[1]?.message)))) {
+        throw new TypeError('Canonical checkpoint compaction must contain one native summary.');
+    }
+}
 function readCurrentUserTail(change, active) {
     const sourceIndex = change.currentUserSourceIndex;
     if (sourceIndex === undefined)
@@ -432,24 +438,30 @@ function readCurrentUserTail(change, active) {
     if (!Number.isSafeInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= active.length) {
         throw new TypeError('Canonical current-user tail source lineage is invalid.');
     }
-    if (change.messages.length < 2) {
+    const markerCount = change.placedMarkerCount ?? 1;
+    if (!Number.isSafeInteger(markerCount) || markerCount < 1) {
+        throw new TypeError('Canonical current-user tail marker count is invalid.');
+    }
+    const tailLength = markerCount + 1;
+    if (change.messages.length < tailLength) {
         throw new TypeError('Canonical current-user tail is incomplete.');
     }
-    const marker = change.messages.at(-2);
+    const baseLength = change.messages.length - tailLength;
+    const markers = change.messages.slice(baseLength, -1);
     const userMessage = change.messages.at(-1);
     const source = requireExternalCurrentUserSource(active[sourceIndex]);
-    const normalizedMarker = requireHiddenTypedCustom(marker);
+    const normalizedMarkers = markers.map(requireHiddenTypedCustom);
     const normalizedUser = requireExactCurrentUserMessage(userMessage, source);
     return {
-        baseMessages: change.messages.slice(0, -2),
+        baseMessages: change.messages.slice(0, baseLength),
         user: source,
         envelopes: [
-            envelope({
+            ...normalizedMarkers.map((message, offset) => envelope({
                 change,
-                message: normalizedMarker,
+                message,
                 turnId: `${change.turnId}:compaction`,
-                index: change.messages.length - 2,
-            }),
+                index: baseLength + offset,
+            })),
             { ...withoutHistoryArtifact(source), message: normalizedUser },
         ],
     };

@@ -9,6 +9,7 @@ import { MemoryLegacyMigrationService } from './orchestration/legacy-migration-s
 import { MemoryRecallService } from './orchestration/recall-service.js';
 import { MemoryReconciler } from './orchestration/reconciler.js';
 import { MemoryScopeMutationCoordinator } from './scope-mutation.js';
+import { MemoryOnboardingStore } from './onboarding.js';
 import { MemoryAgentContributionAdapter } from './adapters/agent-contribution.js';
 import { MemoryFileStoreImpl } from './adapters/file-store.js';
 import { MemoryStateRepositoryImpl } from './adapters/state-repository.js';
@@ -28,7 +29,7 @@ export function initializeMemorySystem(options) {
     const fileStore = traceMemoryPort(diagnostics, 'files', new MemoryFileStoreImpl(options.dataDir));
     const source = traceMemoryPort(diagnostics, 'source', options.source);
     const model = traceMemoryPort(diagnostics, 'model', {
-        quotaRemainingPercent: () => options.model.quotaRemainingPercent(),
+        readQuota: options.model.readQuota.bind(options.model),
         resolveContract: options.model.resolveContract.bind(options.model),
         capture: (input) => options.model.capture(input),
         consolidateInPlace: (input) => options.model.consolidateInPlace(input),
@@ -127,6 +128,7 @@ export function initializeMemorySystem(options) {
         recall,
         governance,
         legacyMigration,
+        onboarding: new MemoryOnboardingStore(options.db, repository, nowMs),
         reconciler,
         scopeMutation,
         agent,

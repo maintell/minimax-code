@@ -1,13 +1,20 @@
 import { createHash } from 'node:crypto';
+import { encodeRequestImageDetails } from '@mavis/context-manager';
+import { parseImageDimensionsFromBytes } from '@mavis/shared/image-dimensions';
 const MAX_POST_ACTION_VISUAL_DEDUP_SESSIONS = 128;
-const EXPLICIT_SCREENSHOT_BUDGET = {
-    maxBytes: 5 * 1024 * 1024,
-    maxEdgePx: 1_920,
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+/** Post-action images are supplemental evidence, so they stay below `requestMedia.image`. */
+const POST_ACTION_SCREENSHOT_CEILING = {
+    maxWidth: 1_280,
+    maxHeight: 1_280,
+    maxBase64Bytes: 1024 * 1024,
 };
-const POST_ACTION_SCREENSHOT_BUDGET = {
-    maxBytes: 1024 * 1024,
-    maxEdgePx: 1_280,
-};
+/**
+ * Explicit screenshots keep the captured image: the host encodes every tool
+ * result image to `requestMedia.image` once, adding the only size note.
+ * Post-action screenshots are encoded here to the stricter of that config and
+ * `POST_ACTION_SCREENSHOT_CEILING`, which the host encoder then leaves as is.
+ */
 export function createBrowserScreenshotPreprocessor(options) {
     const lastPostActionFingerprintBySession = new Map();
     const preprocess = async (result, ctx, signal, preprocessOptions) => {
@@ -15,14 +22,13 @@ export function createBrowserScreenshotPreprocessor(options) {
         const screenshot = readScreenshot(result);
         if (!screenshot)
             return result;
-        const budget = preprocessOptions?.purpose === 'post-action'
-            ? POST_ACTION_SCREENSHOT_BUDGET
-            : EXPLICIT_SCREENSHOT_BUDGET;
-        const prepared = prepareScreenshot(options.compressScreenshot, screenshot, budget);
-        throwIfAborted(signal);
         if (preprocessOptions?.purpose === 'post-action') {
+            const prepared = await prepareScreenshot(screenshot, postActionEncoding(options.getImageEncoding()));
+            throwIfAborted(signal);
             return preprocessPostActionScreenshot(prepared, ctx.sessionId, lastPostActionFingerprintBySession);
         }
+        const prepared = await prepareScreenshot(screenshot);
+        throwIfAborted(signal);
         return registerExplicitScreenshot(prepared, ctx, options.registerGeneratedAsset, signal);
     };
     return Object.assign(preprocess, {
@@ -36,38 +42,54 @@ function readScreenshot(result) {
     const screenshot = result;
     return typeof screenshot.data === 'string' && screenshot.data.length > 0 ? screenshot : undefined;
 }
-function prepareScreenshot(compressScreenshot, screenshot, budget) {
-    let compressed;
-    try {
-        compressed = compressScreenshot({
-            bytes: Buffer.from(screenshot.data, 'base64'),
-            fileName: 'browser-screenshot.png',
-            budget,
-        });
-    }
-    catch {
-        compressed = undefined;
-    }
-    const decoded = compressed ? decodeDataUrl(compressed.dataUrl) : undefined;
-    if (!compressed || !decoded) {
-        throw new Error('BROWSER_SCREENSHOT_PREPROCESS_FAILED: Browser screenshot could not be compressed');
-    }
+function postActionEncoding(configured) {
     return {
-        compressed,
-        decoded,
+        maxWidth: Math.min(configured.maxWidth, POST_ACTION_SCREENSHOT_CEILING.maxWidth),
+        maxHeight: Math.min(configured.maxHeight, POST_ACTION_SCREENSHOT_CEILING.maxHeight),
+        maxBase64Bytes: Math.min(configured.maxBase64Bytes, POST_ACTION_SCREENSHOT_CEILING.maxBase64Bytes),
+    };
+}
+async function prepareScreenshot(screenshot, encoding) {
+    const captured = Buffer.from(screenshot.data, 'base64');
+    const capturedMime = screenshotMimeType(captured);
+    if (!capturedMime) {
+        throw new Error('BROWSER_SCREENSHOT_PREPROCESS_FAILED: Browser screenshot is not a PNG, JPEG, or WebP image');
+    }
+    const result = encoding
+        ? await encodeRequestImageDetails(captured, capturedMime, encoding)
+        : undefined;
+    // An undecodable capture stays as is; the host encoder replaces it in the tool result.
+    const encoded = result === 'undecodable' ? undefined : result;
+    const bytes = encoded ? Buffer.from(encoded.image.data, 'base64') : captured;
+    const mimeType = encoded?.image.mimeType ?? capturedMime;
+    const size = encoded ?? parseImageDimensionsFromBytes(captured);
+    return {
+        bytes,
+        mimeType,
         result: {
             ...screenshot,
-            format: 'jpeg',
-            width: compressed.width,
-            height: compressed.height,
-            bytes: decoded.byteLength,
-            data: decoded.toString('base64'),
-            visualBudget: budget,
+            format: mimeType.slice('image/'.length),
+            ...(size ? { width: size.width, height: size.height } : {}),
+            bytes: bytes.byteLength,
+            data: bytes.toString('base64'),
+            ...(encoded?.dimensionNote ? { dimensionNote: encoded.dimensionNote } : {}),
+            ...(encoding ? { visualBudget: encoding } : {}),
         },
     };
 }
+function screenshotMimeType(bytes) {
+    if (bytes.subarray(0, 8).equals(PNG_SIGNATURE))
+        return 'image/png';
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
+        return 'image/jpeg';
+    if (bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
+        bytes.subarray(8, 12).toString('ascii') === 'WEBP') {
+        return 'image/webp';
+    }
+    return undefined;
+}
 function preprocessPostActionScreenshot(prepared, sessionId, fingerprints) {
-    const fingerprint = createHash('sha256').update(prepared.decoded).digest('hex');
+    const fingerprint = createHash('sha256').update(prepared.bytes).digest('hex');
     if (fingerprints.get(sessionId) === fingerprint) {
         const metadata = { ...prepared.result };
         delete metadata.data;
@@ -80,11 +102,11 @@ function preprocessPostActionScreenshot(prepared, sessionId, fingerprints) {
 async function registerExplicitScreenshot(prepared, ctx, registerGeneratedAsset, signal) {
     try {
         const asset = await registerGeneratedAsset({
-            fileName: 'browser-screenshot.jpg',
-            mimeType: 'image/jpeg',
+            fileName: `browser-screenshot.${screenshotExtension(prepared.mimeType)}`,
+            mimeType: prepared.mimeType,
             kind: 'image',
             sourceKind: 'generated',
-            dataUrl: prepared.compressed.dataUrl,
+            dataUrl: `data:${prepared.mimeType};base64,${prepared.bytes.toString('base64')}`,
             sessionId: ctx.sessionId,
             turnId: ctx.turnId,
             generatedBy: 'browser_screenshot',
@@ -117,11 +139,8 @@ async function registerExplicitScreenshot(prepared, ctx, registerGeneratedAsset,
         };
     }
 }
-function decodeDataUrl(dataUrl) {
-    const match = /^data:[^;,]*(?:;charset=[^;,]+)?;base64,(.+)$/s.exec(dataUrl);
-    if (!match?.[1])
-        return undefined;
-    return Buffer.from(match[1], 'base64');
+function screenshotExtension(mimeType) {
+    return mimeType === 'image/jpeg' ? 'jpg' : mimeType.slice('image/'.length);
 }
 function trimOldestEntries(values) {
     while (values.size > MAX_POST_ACTION_VISUAL_DEDUP_SESSIONS) {

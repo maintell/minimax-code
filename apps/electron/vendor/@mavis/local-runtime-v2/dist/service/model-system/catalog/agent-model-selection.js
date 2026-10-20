@@ -1,4 +1,4 @@
-import { getRuntimePresetKey, resolveModelAvailability } from '@mavis/config';
+import { getRuntimePresetKey, resolveModelAvailability, resolveModelReplacement, } from '@mavis/config';
 import { ThinkingLevel } from '@mavis/protocol';
 import { MANAGED_MINIMAX_PROVIDER_ID } from '../identity.js';
 import { modelConfigForRef } from './list-models.js';
@@ -12,11 +12,14 @@ import { isMiniMaxM3ThinkingMode, isThinkingEffortDisabled, resolveMiniMaxM3Thin
  * setup is incomplete; an invalid explicit Agent selection still fails.
  */
 export function resolveEffectiveAgentModelSelection(input) {
+    const retired = input.replaceRetired
+        ? replaceRetiredSourceModel(input.config, input.sources)
+        : undefined;
     let resolved;
     try {
         resolved = resolveAgentModelSelection({
             config: input.config,
-            sources: input.sources,
+            sources: retired?.sources ?? input.sources,
         });
     }
     catch (error) {
@@ -32,9 +35,53 @@ export function resolveEffectiveAgentModelSelection(input) {
         preset: getRuntimePresetKey(),
         source: 'config_default',
     });
-    if (availability.available)
-        return resolved;
+    if (availability.available) {
+        return retired ? { ...resolved, replacedFrom: retired.replacedFrom } : resolved;
+    }
     throw new AgentModelSelectionError('MODEL_SELECTION_INVALID', availability.message);
+}
+/**
+ * The winning model source with a retired official model swapped for its
+ * replacement (Runtime default, else delivered default). The replaced group
+ * keeps no effort/limits: they belonged to the retired model.
+ *
+ * With no source naming a model (an AUTO Agent), the Runtime default is the
+ * model this read runs, so it is checked the same way. Its replacement is
+ * inserted ahead of the Runtime default that `withRuntimeDefault` appends;
+ * sources below the winning model never contribute, so the retired default's
+ * effort, context and variant stay behind.
+ */
+function replaceRetiredSourceModel(config, sources) {
+    const index = sources.findIndex(({ selection }) => selection?.model !== undefined);
+    const source = index < 0 ? undefined : sources[index];
+    const parsed = parseSourceQualifiedModelKey(source ? source.selection?.model : config.defaultModel);
+    if (!parsed)
+        return undefined;
+    const outcome = resolveModelReplacement({
+        config,
+        providerId: parsed.providerId,
+        modelId: parsed.modelId,
+        preset: getRuntimePresetKey(),
+        fallbacks: source ? [parseSourceQualifiedModelKey(config.defaultModel)] : [],
+    });
+    if (outcome.kind !== 'replaced')
+        return undefined;
+    const model = formatModelKey(outcome.model.providerId, outcome.model.modelId);
+    const next = [...sources];
+    if (source) {
+        next[index] = {
+            source: source.source,
+            selection: { model },
+            ...(source.requireCatalog ? { requireCatalog: true } : {}),
+        };
+    }
+    else {
+        next.push({ source: 'runtime-default', selection: { model } });
+    }
+    return {
+        sources: next,
+        replacedFrom: { providerId: parsed.providerId, modelId: parsed.modelId },
+    };
 }
 /** Config editing must remain available when a previously selected model was removed. */
 export function previewAgentModelSelection(input) {

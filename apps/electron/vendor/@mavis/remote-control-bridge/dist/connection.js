@@ -3,7 +3,7 @@
  *
  * Owns exactly one live WebSocket to the remote gateway:
  *   URL        wss://<endpoint>?binding_id=<id>&ticket=<t>&client_version=<v>&last_event_id=<seq>
- *              (endpoint/ticket/binding_id come fresh from GET /binding via the
+ *              (endpoint/ticket/binding_id come fresh from GET /desktop/bindings via the
  *              injected credential provider — never hardcoded; the raw
  *              desktop_device_id never appears on the URL)
  *   handshake  ctrl.hello {connection_id, server_time_ms, max_message_bytes}
@@ -55,6 +55,7 @@ export class RcConnection {
     wsFactory;
     commandRouter;
     ws = null;
+    attemptController = new AbortController();
     state = 'idle';
     stopRequested = false;
     retryAttempt = 0;
@@ -127,15 +128,20 @@ export class RcConnection {
         if (this.state === 'stopped' && !this.ws)
             return;
         this.stopRequested = true;
+        this.attemptController.abort();
         this.clearAllTimers();
         const ws = this.ws;
         this.ws = null;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            const frame = makeDisconnectReasonFrame(reason);
-            if (this.currentTraceId)
-                frame.trace_id = this.currentTraceId;
-            this.sendRaw(ws, frame);
+        if (ws) {
+            if (ws.readyState === WebSocket.OPEN) {
+                const frame = makeDisconnectReasonFrame(reason);
+                if (this.currentTraceId)
+                    frame.trace_id = this.currentTraceId;
+                this.sendRaw(ws, frame);
+            }
             try {
+                // CONNECTING also owns a socket/HTTP upgrade. Revoking callbacks
+                // without closing it would leave a late connection alive forever.
                 ws.close(1000, reason);
             }
             catch {
@@ -200,6 +206,9 @@ export class RcConnection {
     async attempt() {
         if (this.stopRequested)
             return;
+        this.attemptController.abort();
+        const attemptController = new AbortController();
+        this.attemptController = attemptController;
         this.state = 'connecting';
         this.attemptStartedAtMs = Date.now();
         this.connectedAtMs = undefined;
@@ -222,15 +231,17 @@ export class RcConnection {
             creds = await this.opts.credentials.getCredentials();
         }
         catch (err) {
+            if (attemptController.signal.aborted)
+                return;
             this.opts.logger.warn(`[rc.conn] credential refresh failed: ${connectionErrorForLog(err)}`);
             this.scheduleRetry('credential_refresh');
             return;
         }
-        if (this.stopRequested)
+        if (this.stopRequested || attemptController.signal.aborted)
             return;
         this.currentBindingId = creds.state === 'bound' ? creds.bindingId : undefined;
         if (creds.state !== 'bound') {
-            // No usable ticket in hand. The main process CANNOT sign GET /binding,
+            // No usable ticket in hand. The main process CANNOT sign GET /desktop/bindings,
             // so instead of building a doomed socket we ask the renderer to re-sign
             // (owner forwards a need-credentials event → rc:refresh-binding). A
             // backoff re-attempt is still armed so a slow/absent renderer never
@@ -250,7 +261,7 @@ export class RcConnection {
             url = u.toString();
         }
         catch (err) {
-            this.opts.logger.error(`[rc.conn] invalid endpoint from GET /binding: ${connectionErrorForLog(err)}`);
+            this.opts.logger.error(`[rc.conn] invalid endpoint from GET /desktop/bindings: ${connectionErrorForLog(err)}`);
             this.scheduleRetry('invalid_endpoint');
             return;
         }
@@ -300,7 +311,7 @@ export class RcConnection {
             this.opts.logger.warn(`[rc.conn] ws error: ${connectionErrorForLog(err)}`);
         });
         ws.on('close', (code, nativeReason) => {
-            if (this.ws === ws || this.state === 'connecting')
+            if (this.ws === ws)
                 this.handleClose(code, nativeReason);
         });
     }
@@ -346,12 +357,18 @@ export class RcConnection {
                 break;
         }
         if (isCmdFrame(frame)) {
+            const signal = this.attemptController.signal;
+            if (signal.aborted || this.state !== 'connected')
+                return;
             this.opts.logger.info(`[rc.conn] event=cmd_in trace_id=${frame.trace_id ?? ''} rc_cmd_id=${frame.id} type=${frame.type}${frame.in_reply_to ? ` in_reply_to=${frame.in_reply_to}` : ''}`);
             void this.commandRouter
                 .handleCommand(frame, (reply) => {
-                this.sendRaw(ws, reply);
-            }, this.currentConnectionId ? { streamScope: this.currentConnectionId } : undefined)
+                if (!signal.aborted && this.ws === ws)
+                    this.sendRaw(ws, reply);
+            }, { streamScope: this.currentConnectionId, signal, commandScope: this.opts.commandScope })
                 .catch((err) => {
+                if (signal.aborted || this.ws !== ws)
+                    return;
                 this.opts.logger.error(`[rc.conn] command router threw for ${frame.type}: ${connectionErrorForLog(err)}`);
                 this.sendRaw(ws, makeFrame(errTypeForCmd(frame.type), { code: 'internal_error', message: 'command handling failed', retryable: true }, { inReplyTo: frame.id, traceId: frame.trace_id }));
             });
@@ -360,6 +377,10 @@ export class RcConnection {
         this.opts.logger.debug(`[rc.conn] ignoring frame type=${frame.type}`);
     }
     handleHello(ws, frame) {
+        // One hello owns one socket lifetime. Repeated hello must not silently
+        // change the owner of commands already dispatched on that socket.
+        if (this.state !== 'connecting' || this.attemptController.signal.aborted)
+            return;
         if (this.handshakeTimer) {
             clearTimeout(this.handshakeTimer);
             this.handshakeTimer = null;
@@ -402,6 +423,7 @@ export class RcConnection {
         this.opts.onEvent({ kind: 'connected', connectionId });
     }
     handleClose(code, nativeReason) {
+        this.attemptController.abort();
         // While health-gated the recovery poll owns the next attempt — the close
         // we triggered ourselves must not clear its timer.
         if (this.state === 'health-gated')
@@ -549,6 +571,7 @@ export class RcConnection {
     }
     /** D-15: daemon down → tell the gateway why, close, poll for recovery. */
     tripHealthGate() {
+        this.attemptController.abort();
         const ws = this.ws;
         this.clearSocketTimers();
         this.state = 'health-gated';
@@ -605,6 +628,8 @@ export class RcConnection {
         }, HEALTH_RECOVERY_POLL_MS);
     }
     forceClose(ws) {
+        if (this.ws === ws)
+            this.attemptController.abort();
         try {
             ws.close(1000);
         }

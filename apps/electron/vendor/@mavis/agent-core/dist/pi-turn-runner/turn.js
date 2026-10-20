@@ -1,5 +1,5 @@
 import { EventBridge } from '../event-bridge/index.js';
-import { composeStreamFn } from './llm.js';
+import { composeStreamFn, resolveHostOutputTokenCap } from './llm.js';
 import { withLLMRetry } from './llm-retry.js';
 import { newTools } from './tools.js';
 export function newTurn(input, deps) {
@@ -122,6 +122,7 @@ export function newTurn(input, deps) {
         blockedToolCalls: [],
         syntheticResponse,
         rejectedAssistantMessages: new Set(),
+        recovery: { used: false },
         nextEventId,
         nextRuntimeSeq,
     };
@@ -135,6 +136,7 @@ function withLlmCallPreparedObservers(inner, options) {
         logicalCallCount += 1;
         for (const hook of options.hooks) {
             try {
+                const hostMaxOutputTokens = resolveHostOutputTokenCap(options.llm);
                 await hook({
                     sessionId: options.input.sessionId,
                     turnId: options.input.turnId,
@@ -143,9 +145,7 @@ function withLlmCallPreparedObservers(inner, options) {
                     messages: [...context.messages],
                     model,
                     ...(options.llm.maxTokens === undefined ? {} : { maxTokens: options.llm.maxTokens }),
-                    ...(options.llm.hostMaxOutputTokens === undefined
-                        ? {}
-                        : { hostMaxOutputTokens: options.llm.hostMaxOutputTokens }),
+                    ...(hostMaxOutputTokens === undefined ? {} : { hostMaxOutputTokens }),
                     ...(options.llm.maxSerializedInputBytes === undefined
                         ? {}
                         : { maxSerializedInputBytes: options.llm.maxSerializedInputBytes }),

@@ -1,7 +1,8 @@
 import { ipcMain } from "electron";
+import { parseMiniAppWindowPatch } from "@mavis/shared/miniapp-surface";
 import { IPC_CHANNELS } from "../config/constants";
-import { getEmbeddedBrowserManager } from "../modules/browser/embedded-browser-manager";
-import { openManagedMiniAppSurface } from "../modules/browser/miniapp-surface";
+import { getEmbeddedBrowserManager, syncManagedMiniAppLoopbackCredential } from "../modules/browser/embedded-browser-manager";
+import { readRunningMiniAppCredential, openManagedMiniAppSurface } from "../modules/browser/miniapp-surface";
 import { requestUtilityMiniApp } from "../modules/local-runtime/utility";
 import { readMiniAppBrokerFailureDiagnostic } from "../modules/local-runtime/utility/miniapp-broker.js";
 import { getCategoryLogger } from "../utils/logger.js";
@@ -24,7 +25,67 @@ export function setupMiniAppIPC() {
     ipcMain.handle(IPC_CHANNELS.MINIAPP_OPEN, (_event, params) => openMiniApp(params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_REFRESH, (_event, params) => controlMiniApp('refresh', params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_STOP, (_event, params) => controlMiniApp('stop', params));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_DETACH, (_event, params) => controlMiniApp('detach', params));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_ATTACH, (_event, params) => controlMiniApp('attach', params));
+    setupMiniAppWindowHandleIPC();
 }
+/**
+ * Page-facing `window.mcode.miniapp.window`. The calling tab is resolved from
+ * Electron's `event.sender` / `event.senderFrame` only; nothing the page sends
+ * identifies a target. Requests are re-parsed here even though the preload
+ * already validated them.
+ */
+function setupMiniAppWindowHandleIPC() {
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_WINDOW_GET_STATE, (event) => {
+        try {
+            return getEmbeddedBrowserManager().getMiniAppWindowState(event.sender, event.senderFrame);
+        }
+        catch {
+            return { success: false, code: 'result_unknown' };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_WINDOW_UPDATE, async (event, request) => {
+        if (!isRecordWithOnlyKeys(request, ['patch', 'userActivated'])) {
+            return { success: false, code: 'invalid_request' };
+        }
+        if (typeof request.userActivated !== 'boolean') {
+            return { success: false, code: 'invalid_request' };
+        }
+        const parsed = parseMiniAppWindowPatch(request.patch);
+        if (!parsed.ok)
+            return { success: false, code: parsed.code };
+        try {
+            return await getEmbeddedBrowserManager().updateMiniAppWindow(event.sender, event.senderFrame, parsed.patch, request.userActivated);
+        }
+        catch {
+            return { success: false, code: 'result_unknown' };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_WINDOW_FOCUS, (event, request) => {
+        if (!isRecordWithOnlyKeys(request, ['userActivated']) ||
+            typeof request.userActivated !== 'boolean') {
+            return { success: false, code: 'invalid_request' };
+        }
+        try {
+            return getEmbeddedBrowserManager().focusMiniAppWindow(event.sender, event.senderFrame, request.userActivated);
+        }
+        catch {
+            return { success: false, code: 'result_unknown' };
+        }
+    });
+}
+function isRecordWithOnlyKeys(value, keys) {
+    return (!!value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Object.keys(value).every((key) => keys.includes(key)));
+}
+const CONTROL_FAILURE_CODES = {
+    refresh: 'refresh_failed',
+    stop: 'stop_failed',
+    detach: 'detach_failed',
+    attach: 'attach_failed',
+};
 async function controlMiniApp(method, params) {
     const sessionId = normalizeIdentifier(params?.sessionId);
     const pluginId = normalizeIdentifier(params?.pluginId);
@@ -53,7 +114,19 @@ async function controlMiniApp(method, params) {
     try {
         const manager = getEmbeddedBrowserManager();
         if (method === 'refresh') {
-            await manager.refreshMiniAppTab({ sessionId, pluginId });
+            await manager.refreshMiniAppTab({
+                sessionId,
+                pluginId,
+                readCredential: () => readRunningMiniAppCredential(pluginId),
+            });
+            return { success: true };
+        }
+        if (method === 'detach') {
+            await manager.detachMiniAppTab({ sessionId, pluginId });
+            return { success: true };
+        }
+        if (method === 'attach') {
+            await manager.attachMiniAppTab({ sessionId, pluginId });
             return { success: true };
         }
         stage = 'utility_stop';
@@ -71,7 +144,7 @@ async function controlMiniApp(method, params) {
         return { success: true };
     }
     catch (error) {
-        const code = normalizeErrorCode(error, method === 'refresh' ? 'refresh_failed' : 'stop_failed');
+        const code = normalizeErrorCode(error, CONTROL_FAILURE_CODES[method]);
         if (method === 'stop')
             recordStopResult(code, error);
         return { success: false, code };
@@ -120,9 +193,14 @@ async function startMiniApp(pluginId) {
         // declared MCP endpoint is available. It projects only the renderer-safe
         // runtime summary and creates no tab.
         const result = await requestUtilityMiniApp('open', pluginId);
-        return 'launch' in result
-            ? { success: true, miniApp: result.miniApp }
-            : { success: false, code: 'start_failed' };
+        if (!('launch' in result))
+            return { success: false, code: 'start_failed' };
+        // Pages of this plugin already open in any session follow the run just started.
+        syncManagedMiniAppLoopbackCredential(pluginId, {
+            origin: result.launch.origin,
+            loopbackToken: result.launch.loopbackToken,
+        });
+        return { success: true, miniApp: result.miniApp };
     }
     catch (error) {
         const code = normalizeErrorCode(error);
@@ -146,10 +224,7 @@ async function openMiniApp(params) {
         return { success: false, code: 'invalid_request' };
     const startedAt = Date.now();
     try {
-        const tab = await openManagedMiniAppSurface({
-            sessionId,
-            pluginId,
-        });
+        const tab = await openManagedMiniAppSurface({ sessionId, pluginId });
         return { success: true, tab };
     }
     catch (error) {
@@ -211,7 +286,9 @@ function normalizeErrorCode(error, fallback = 'start_failed') {
         code === 'busy' ||
         code === 'refresh_failed' ||
         code === 'stop_failed' ||
-        code === 'start_failed'
+        code === 'start_failed' ||
+        code === 'detach_failed' ||
+        code === 'attach_failed'
         ? code
         : fallback;
 }

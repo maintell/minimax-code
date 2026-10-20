@@ -180,12 +180,12 @@ export class IdeLauncher {
     async listIdeApps() {
         return this.resolveCachedIdeApps();
     }
-    async openWorkspaceInIde(workspaceDir, ideId, filePath) {
+    async openWorkspaceInIde(workspaceDir, ideId, filePath, fileOnly = false) {
         const entry = IDE_CATALOG.find((item) => item.id === ideId);
         if (!entry) {
             throw new IdeLauncherError(`Unsupported IDE: ${ideId}`, 'IDE_APP_UNSUPPORTED', 400);
         }
-        const target = await this.resolveIdeOpenTarget(workspaceDir, filePath);
+        const target = await this.resolveIdeOpenTarget(workspaceDir, filePath, fileOnly);
         if (isPresentationApp(entry) && (!target.filePath || !isPresentationFile(target.filePath))) {
             throw new IdeLauncherError('A presentation file is required for this application', 'PRESENTATION_FILE_REQUIRED', 400);
         }
@@ -218,13 +218,13 @@ export class IdeLauncher {
             throw new IdeLauncherError('Workspace not found', 'NOT_FOUND', 404);
         }
     }
-    async resolveIdeOpenTarget(workspaceDir, filePath) {
+    async resolveIdeOpenTarget(workspaceDir, filePath, fileOnly = false) {
         const workspaceRoot = workspaceDir
             ? await this.resolveWorkspaceDirectory(workspaceDir)
             : undefined;
         const trimmedPath = filePath?.trim();
         if (!trimmedPath) {
-            if (workspaceRoot)
+            if (workspaceRoot && !fileOnly)
                 return { workspaceRoot };
             throw new IdeLauncherError('workspace or path is required', 'VALIDATION_ERROR', 400);
         }
@@ -235,9 +235,14 @@ export class IdeLauncher {
                 : path.resolve(workspaceRoot, trimmedPath);
             try {
                 await assertRegularFileExists(absoluteFilePath);
-                return { workspaceRoot, filePath: absoluteFilePath };
+                // File previews must not report success after opening only the workspace.
+                return fileOnly
+                    ? { filePath: absoluteFilePath }
+                    : { workspaceRoot, filePath: absoluteFilePath };
             }
-            catch {
+            catch (error) {
+                if (fileOnly)
+                    throw error;
                 return { workspaceRoot };
             }
         }

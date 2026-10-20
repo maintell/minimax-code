@@ -24,6 +24,7 @@ import { bringToFront } from "../../utils";
 import { isTest, isStaging, isZh, isDev } from "../../config/env";
 import { buildDevProtocolLaunchArgs } from "../../config/dev-protocol-launch";
 import { resolveLocalRuntimeDataDir } from "../local-runtime/data-dir";
+import { getWindowsOpenFilePaths } from "../dock/windows-file-arguments";
 import { buildSingleInstanceLockKey } from "./single-instance-lock";
 import { isSupportedDeepLinkUrl, parseDeepLink } from "./parse";
 function getProtocolEnvSuffix() {
@@ -119,7 +120,16 @@ export function acquireSingleInstanceLock() {
         isStaging: isStaging,
         devIdentity: process.env.MAVIS_ELECTRON_DEV_APP_ID,
     });
-    const gotTheLock = app.requestSingleInstanceLock(lockKey);
+    const launchData = {
+        ...lockKey,
+        ...(process.platform === 'win32'
+            ? (() => {
+                const openFilePaths = getWindowsOpenFilePaths(process.argv);
+                return openFilePaths.length ? { openFilePaths } : {};
+            })()
+            : {}),
+    };
+    const gotTheLock = app.requestSingleInstanceLock(launchData);
     if (!gotTheLock) {
         // 另一个实例已在运行，退出当前实例
         // 不要做任何其他操作，直接退出

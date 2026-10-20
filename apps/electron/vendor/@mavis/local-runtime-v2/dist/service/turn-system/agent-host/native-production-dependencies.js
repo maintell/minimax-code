@@ -25,12 +25,24 @@ export async function createNativeAgentHostProductionDependencies(options) {
         },
         async assembleTurn(context, desktopCapabilities) {
             const logContext = { sessionId: context.sessionId, turnId: context.turnId };
+            if (context.turnIntent?.kind === 'goal-completion-summary') {
+                const assembly = await observeAgentTurnSetupStage(options.runner.logger, logContext, 'agent_runtime_assembly', () => normalRuntime.assembleTurn(context, {
+                    tools: [],
+                    userPromptPrefix: '',
+                }));
+                // Include extension reminders, but expose no native, plugin, or extension tools.
+                // The host's Goal budget policy is a second execution-time fence.
+                return { ...assembly, tools: [], diagnostic: { ...assembly.diagnostic, toolCount: 0 } };
+            }
             const seed = await observeAgentTurnSetupStage(options.runner.logger, logContext, 'tool_catalog_build', () => toolCatalog.build(createLocalTurnToolCatalogInput(context, desktopCapabilities)));
             return observeAgentTurnSetupStage(options.runner.logger, logContext, 'agent_runtime_assembly', () => normalRuntime.assembleTurn(context, seed));
         },
     };
     const runtime = new LocalAgentTurnRunner(options.runner);
-    const executionPreparation = new NativeLocalTurnExecutionPreparationSource(new LocalTurnInputPreparer(options.inputPreparation), new LocalTurnPermissionGate(createPermissionGateOptions(options)));
+    const executionPreparation = new NativeLocalTurnExecutionPreparationSource(new LocalTurnInputPreparer({
+        ...options.inputPreparation,
+        persistComputerUseSelection: options.turnRuntimeFacts?.persistComputerUseSelection,
+    }), new LocalTurnPermissionGate(createPermissionGateOptions(options)));
     const dependencies = createNativeAgentHostDependencies(options, normal, runtime, executionPreparation);
     return {
         ...dependencies,

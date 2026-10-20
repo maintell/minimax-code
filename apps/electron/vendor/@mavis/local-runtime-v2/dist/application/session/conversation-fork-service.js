@@ -129,7 +129,7 @@ export class ForkService {
             ...(source.isDefaultWorkspace !== undefined
                 ? { isDefaultWorkspace: source.isDefaultWorkspace }
                 : {}),
-            title: resolveChildTitle(request, suggestedTitle),
+            ...resolveChildTitle(request, suggestedTitle),
             ...(source.appMode ? { appMode: source.appMode } : {}),
             ...(runLocation ? { runLocation } : {}),
             ...(source.effectiveModel !== undefined ? { effectiveModel: source.effectiveModel } : {}),
@@ -607,7 +607,10 @@ function displayCopyInput(context) {
     };
 }
 function resolveChildTitle(request, suggestedTitle) {
-    return request.useSuggestedTitle === true ? suggestedTitle : (request.title ?? suggestedTitle);
+    const customTitle = request.useSuggestedTitle === true ? undefined : (request.title ?? undefined);
+    return customTitle !== undefined
+        ? { title: customTitle, titleSource: 'manual' }
+        : { title: suggestedTitle, titleSource: 'auto' };
 }
 export async function suggestForkTitle(source, sessions) {
     const sourceTitle = source.title ?? source.sessionId;

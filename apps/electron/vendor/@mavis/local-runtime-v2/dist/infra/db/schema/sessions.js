@@ -129,4 +129,17 @@ export const SESSION_FTS_SQL = `
     tokenize = 'unicode61'
   );
 `;
+/** Active SideChat ownership; origin survives promotion separately in session extra data. */
+export const sessionSideChats = sqliteTable('local_runtime_session_sidechats', {
+    sideSessionId: text('side_session_id')
+        .primaryKey()
+        .references(() => sessions.sessionId, { onDelete: 'cascade' }),
+    mainSessionId: text('main_session_id')
+        .notNull()
+        .references(() => sessions.sessionId, { onDelete: 'restrict' }),
+    createdAtMs: integer('created_at_ms').notNull(),
+}, (table) => [
+    check('local_runtime_session_sidechats_not_self', sql `${table.sideSessionId} <> ${table.mainSessionId}`),
+    index('idx_local_runtime_session_sidechats_main_created').on(table.mainSessionId, desc(table.createdAtMs), asc(table.sideSessionId)),
+]);
 //# sourceMappingURL=sessions.js.map

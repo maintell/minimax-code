@@ -1,6 +1,6 @@
 import { publishBestEffort } from '../events.js';
 import { ThinkingLevel } from '@mavis/protocol';
-import { getRuntimePresetKey, resolveModelAvailability } from '@mavis/config';
+import { getRuntimePresetKey, resolveModelAvailability, resolveModelReplacement, } from '@mavis/config';
 import { LocalModelProviderError, MANAGED_MINIMAX_PROVIDER_ID, formatModelKey, freezeManagedQueueModel, savedSessionModel, isLegacyMinimaxProvider, listLocalRuntimeModels, modelConfigForRef, modelRefForModel, parseSourceQualifiedModelKey, resolveLegacyMinimaxModel, } from '../../service/model-system/index.js';
 import { AgentServiceError } from '../../service/agent/index.js';
 /** Cross-capability model catalog and selection workflow owned by Runtime V2. */
@@ -25,7 +25,7 @@ export class ModelProviderApplication {
         const channelSelection = await this.resolveChannelSelection(sessionId, session);
         if (session?.sessionKind === 'channel')
             return channelModelListState(channelSelection);
-        const selected = this.resolveLegacySelection(config, modelSelectionFromSession(session));
+        const selected = this.resolveStaleSelection(config, modelSelectionFromSession(session));
         return {
             selected,
             catalogSelection: selected,
@@ -33,40 +33,65 @@ export class ModelProviderApplication {
             bypassStoredProjection: bypassStoredParameters(sessionId, session, selected),
         };
     }
-    resolveLegacySelection(config, selected) {
+    /**
+     * Projects a stale stored selection onto the model a Turn would actually run,
+     * without writing it: a legacy alias resolves to its official model and a
+     * retired official model to its replacement (the Turn preparation rule). The
+     * Session is rewritten by its next Turn.
+     */
+    resolveStaleSelection(config, selected) {
         const current = selected ?? parseSourceQualifiedModelKey(config.defaultModel);
         if (!current?.providerId || !current.modelId)
             return selected;
-        try {
-            const replacement = resolveLegacyMinimaxModel(config, {
-                providerId: current.providerId,
-                modelId: current.modelId,
-            });
-            return replacement ? { ...replacement, variant: null } : selected;
-        }
-        catch (error) {
-            // Keep the picker available when no official model can serve this route.
-            if (error instanceof LocalModelProviderError &&
-                error.code === 'MODEL_NOT_AVAILABLE_FOR_ROUTE') {
-                return selected;
-            }
-            throw error;
-        }
+        const legacy = resolveLegacyMinimaxModel(config, {
+            providerId: current.providerId,
+            modelId: current.modelId,
+        });
+        const resolved = legacy ?? { providerId: current.providerId, modelId: current.modelId };
+        const outcome = resolveModelReplacement({
+            config,
+            ...resolved,
+            preset: getRuntimePresetKey(),
+            fallbacks: [parseSourceQualifiedModelKey(config.defaultModel)],
+        });
+        if (outcome.kind === 'replaced')
+            return { ...outcome.model, variant: null };
+        return legacy ? { ...legacy, variant: null } : selected;
     }
     async refresh() {
+        const before = this.deps.config().defaultModel;
         try {
             await this.deps.refreshOfficialModels?.();
         }
         catch {
             // Official refresh is fail-open; the catalog keeps its last-known-good config.
+            return;
         }
+        // The snapshot sync rewrites a retired saved default in the same locked
+        // write; tell the UI once. Stateless: derived from the before/after config.
+        const replacedFrom = this.retiredDefaultReplacedFrom(before);
+        if (replacedFrom)
+            this.publishDefaultModelChanged(replacedFrom);
+    }
+    retiredDefaultReplacedFrom(before) {
+        const config = this.deps.config();
+        const previous = parseSourceQualifiedModelKey(before);
+        if (!previous || before === config.defaultModel)
+            return undefined;
+        const outcome = resolveModelReplacement({
+            config,
+            providerId: previous.providerId,
+            modelId: previous.modelId,
+            preset: getRuntimePresetKey(),
+        });
+        return outcome.kind === 'replaced'
+            ? { providerId: previous.providerId, modelId: previous.modelId }
+            : undefined;
     }
     async select(input) {
         const session = input.sessionId ? await this.requireModelSession(input.sessionId) : undefined;
-        const replacement = resolveLegacyMinimaxModel(this.deps.config(), input);
-        let selection = replacement
-            ? { ...replacement, sessionId: input.sessionId, thinking: null }
-            : input;
+        const { replacement, replacedFrom, selection: replaced } = this.replaceStaleSelection(input);
+        let selection = replaced;
         const providerId = selection.providerId.trim();
         const modelId = selection.modelId.trim();
         if (!providerId || !modelId) {
@@ -88,7 +113,7 @@ export class ModelProviderApplication {
                 });
                 if (source === 'runtime-default') {
                     await this.selectDefaultModel(modelKey, selection);
-                    this.publishDefaultModelChanged();
+                    this.publishDefaultModelChanged(replacedFrom);
                 }
                 return true;
             }
@@ -98,15 +123,50 @@ export class ModelProviderApplication {
                 input: selection,
                 catalogEntry,
                 ...(replacement ? { staleModel: formatModelKey(input.providerId, input.modelId) } : {}),
+                ...(replacedFrom ? { replacedFrom } : {}),
                 ...(session ? { session } : {}),
             });
             return true;
         }
         await this.selectDefaultModel(modelKey, selection);
-        this.publishDefaultModelChanged();
+        this.publishDefaultModelChanged(replacedFrom);
         return true;
     }
-    publishDefaultModelChanged() {
+    /**
+     * A legacy alias or a retired official model (a stale picker can still offer
+     * one) is replaced instead of failing the switch; only a retirement carries
+     * `replacedFrom` so the UI can explain it.
+     */
+    replaceStaleSelection(input) {
+        const replacement = resolveLegacyMinimaxModel(this.deps.config(), input);
+        const retired = replacement ? undefined : this.retiredModelReplacement(input);
+        const model = replacement ?? retired;
+        if (!model)
+            return { selection: input };
+        return {
+            ...(replacement ? { replacement } : {}),
+            ...(retired
+                ? { replacedFrom: { providerId: input.providerId.trim(), modelId: input.modelId.trim() } }
+                : {}),
+            selection: { ...model, sessionId: input.sessionId, thinking: null },
+        };
+    }
+    retiredModelReplacement(input) {
+        const config = this.deps.config();
+        const providerId = input.providerId.trim();
+        const modelId = input.modelId.trim();
+        if (!providerId || !modelId)
+            return undefined;
+        const outcome = resolveModelReplacement({
+            config,
+            providerId,
+            modelId,
+            preset: getRuntimePresetKey(),
+            fallbacks: [parseSourceQualifiedModelKey(config.defaultModel)],
+        });
+        return outcome.kind === 'replaced' ? outcome.model : undefined;
+    }
+    publishDefaultModelChanged(replacedFrom) {
         const saved = this.deps.config();
         const savedModel = parseSourceQualifiedModelKey(saved.defaultModel);
         if (this.deps.publish && savedModel) {
@@ -118,6 +178,7 @@ export class ModelProviderApplication {
                     variant: saved.defaultModelVariant ?? null,
                     thinking: saved.defaultModelThinking ?? null,
                     contextLimit: saved.defaultModelContextWindow ?? null,
+                    ...(replacedFrom ? { replacedFrom } : {}),
                 },
             });
         }
@@ -142,7 +203,7 @@ export class ModelProviderApplication {
         }
     }
     async selectForSession(scope) {
-        const { sessionId, modelKey, input, catalogEntry, staleModel } = scope;
+        const { sessionId, modelKey, input, catalogEntry, staleModel, replacedFrom } = scope;
         const session = scope.session ?? (await this.deps.sessions.get(sessionId));
         if (!session) {
             throw new LocalModelProviderError(404, 'Session not found', 'SESSION_NOT_FOUND');
@@ -159,7 +220,7 @@ export class ModelProviderApplication {
                 catalog: catalogEntry,
             }),
             ...managedReplacementParameters(this.deps.config(), input, session),
-        });
+        }, ...(replacedFrom ? [{ replacedFrom }] : []));
     }
     async requireModelSession(sessionId) {
         const session = await this.deps.sessions.get(sessionId);

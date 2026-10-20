@@ -42,7 +42,6 @@ export function buildPermissionRouteContext(host) {
     };
 }
 export function buildQuestionnaireServiceDeps(host) {
-    const tuiProductPolicy = host.getRuntimeOwnerKind?.() === 'tui';
     const deps = {
         store: host.questionnaireStore,
         nowMs: host.nowMs,
@@ -86,26 +85,20 @@ export function buildQuestionnaireServiceDeps(host) {
         enumerable: true,
         get: () => questionnaireRequestAdmissionBindings.get(host),
     });
-    if (tuiProductPolicy) {
-        // TUI process-local facades are assembled before Plan registers its owner.
-        Object.defineProperties(deps, {
-            ownedActionHandler: {
-                enumerable: true,
-                get: () => questionnaireOwnedActionBindings.get(host)?.ownedActionHandler,
-            },
-            onOwnedActionFailure: {
-                enumerable: true,
-                get: () => questionnaireOwnedActionBindings.get(host)?.onFailure,
-            },
-        });
-    }
-    else {
-        const ownedActionBinding = questionnaireOwnedActionBindings.get(host);
-        if (ownedActionBinding)
-            deps.ownedActionHandler = ownedActionBinding.ownedActionHandler;
-        if (ownedActionBinding?.onFailure)
-            deps.onOwnedActionFailure = ownedActionBinding.onFailure;
-    }
+    // Long-lived facades (Electron/TUI/CLI/app-server peripheral questionnaires)
+    // are assembled before Plan registers its owner. Resolve both the handler and
+    // its recovery hook at use time so a live reply reaches the owning workflow
+    // instead of waiting for startup reconciliation.
+    Object.defineProperties(deps, {
+        ownedActionHandler: {
+            enumerable: true,
+            get: () => questionnaireOwnedActionBindings.get(host)?.ownedActionHandler,
+        },
+        onOwnedActionFailure: {
+            enumerable: true,
+            get: () => questionnaireOwnedActionBindings.get(host)?.onFailure,
+        },
+    });
     return deps;
 }
 //# sourceMappingURL=host-route-contexts.js.map

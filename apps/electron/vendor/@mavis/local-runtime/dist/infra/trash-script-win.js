@@ -627,4 +627,13 @@ set "ELECTRON_RUN_AS_NODE=1"
 `;
 }
 export const TRASH_CMD_LAUNCHER_CONTENT = buildTrashCmdLauncherContent();
+/** Git Bash must not pass literal filenames through CMD's percent expansion. */
+export function buildTrashBashLauncherContent(runtimeExecutable = process.execPath) {
+    const quotedExecutable = `'${runtimeExecutable.replaceAll("'", "'\\''")}'`;
+    return `#!/usr/bin/env bash
+script_path="\${BASH_SOURCE[0]//\\\\//}"
+ELECTRON_RUN_AS_NODE=1 exec ${quotedExecutable} "\${script_path%/*}/mavis-trash.js" "$@"
+`;
+}
+export const TRASH_BASH_LAUNCHER_CONTENT = buildTrashBashLauncherContent();
 //# sourceMappingURL=trash-script-win.js.map

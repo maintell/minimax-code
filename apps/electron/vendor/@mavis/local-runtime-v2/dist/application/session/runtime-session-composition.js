@@ -32,6 +32,7 @@ export function createProductionSessionComposition(input) {
         miniappAvailable: input.miniappAvailable,
         browserUse: input.browserUse,
         implicitCustomProviderThinking: tuiProductPolicy,
+        ...(input.systemPromptOverrides ? { systemPromptOverrides: input.systemPromptOverrides } : {}),
         agentReferenceProjection: input.agentReferenceProjection,
         ...(input.inspector ? { inspector: input.inspector } : {}),
         internalTurnPromptReads: input.internalTurnPromptReads,
@@ -118,7 +119,7 @@ export function createProductionSessionComposition(input) {
     const pinService = createRuntimePinService(input, sessionSystem);
     importedSessionPin.bind(pinService);
     input.compatibility.bindSessionPinReader((sessionId) => pinService.isSessionPinned(sessionId));
-    preparation.bindSessionModelRepair(createSessionModelRepair(sessionSystem.sessions.records, input.logger));
+    preparation.bindSessionModelRepair(createSessionModelRepair(sessionSystem.sessions.records, input.logger, modelUpdatedFactSink(facts)));
     preparation.bindTaskSessionBindings(sessionSystem.sessions.records);
     const modelProviderApplication = new ModelProviderApplication({
         publish: input.publishGlobalEvent,
@@ -135,7 +136,7 @@ export function createProductionSessionComposition(input) {
                 return { ...session, frozenModel };
             },
             update: (sessionId, fields) => sessionSystem.sessions.records.mutateSession(sessionId, fields),
-            onCommittedUpdate: (session) => facts.session.handle({ kind: 'model-updated', session }),
+            onCommittedUpdate: modelUpdatedFactSink(facts),
         }),
         setDefaultModel: input.modelConfig.setDefaultModel,
         refreshOfficialModels: input.refreshOfficialModels,
@@ -177,6 +178,14 @@ export function createProductionSessionComposition(input) {
         facts,
         channelTurnAdmission,
     };
+}
+/** Publishes a committed Session model write; `replacedFrom` marks a retired-model replacement. */
+function modelUpdatedFactSink(facts) {
+    return (session, replacedFrom) => facts.session.handle({
+        kind: 'model-updated',
+        session,
+        ...(replacedFrom ? { replacedFrom } : {}),
+    });
 }
 function createQueueModelResolver(input, getSessionSystem) {
     return async (session, model, queueInput, explicitModelUpdate) => {

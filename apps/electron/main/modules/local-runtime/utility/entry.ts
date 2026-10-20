@@ -1,5 +1,3 @@
-import { UtilityWordEditorClient } from "./word-editor-broker";
-import { UtilityOfficeEditorClient } from "./office-editor-broker";
 /**
  * Local-runtime utility process entry.
  *
@@ -22,6 +20,7 @@ import { UtilityOfficeEditorClient } from "./office-editor-broker";
  * Electron-only Browser and diagnostics capabilities stay in main and are
  * reached through request-id brokers on the parent control channel.
  */
+
 import dns from "dns";
 import { getHeapStatistics } from "node:v8";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
@@ -311,8 +310,6 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             warn: (message, fields) => common.logger.warn({ ...(fields ?? {}) }, `utility MCP: ${message}`),
             error: (message, fields) => common.logger.error({ ...(fields ?? {}) }, `utility MCP: ${message}`),
         },
-        ...(brokers.excelEditor ? { excelEditor: brokers.excelEditor.port } : {}),
-        ...(brokers.wordEditor ? { wordEditor: brokers.wordEditor.port } : {}),
         ...(init.hostCapabilities.browser ? { browserAdapter: brokers.browser.adapter } : {}),
         ...(init.hostCapabilities.diagnostics
             ? { hostDiagnosticsProvider: brokers.diagnostics.provider }
@@ -327,7 +324,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     // background infra all completed by the time this resolves.
     reportBootstrapProgress('sqlite-ready');
     await host.apiHost.ensureBuiltinAgents();
-    brokers.miniApp.bind(host.application?.miniApps);
+    brokers.miniApp.bind(host.application?.miniApps, host.application?.miniAppAgent);
     return {
         handleRequest: (request) => host.apiHost.handleRequest(request),
         createTransportHost: runtime.createRuntimeTransportHost,
@@ -383,8 +380,6 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         shutdown: async () => {
             brokers.auth.close();
             brokers.browser.close();
-            brokers.wordEditor?.close();
-            brokers.excelEditor?.close();
             brokers.diagnostics.close();
             brokers.miniApp.close();
             brokers.miniAppSurface.close();
@@ -437,8 +432,6 @@ if (parentPort) {
     const auth = new UtilityAuthRecoveryBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
-    const excelEditor = new UtilityOfficeEditorClient((message) => parentPort.postMessage(message), 'excel-editor');
-    const wordEditor = new UtilityWordEditorClient((message) => parentPort.postMessage(message));
     const browser = new UtilityBrowserBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
@@ -464,8 +457,6 @@ if (parentPort) {
             const surface = await prepareRuntime(init, {
                 auth,
                 browser,
-                wordEditor,
-                excelEditor,
                 diagnostics,
                 computerUse,
                 reportSkillRegistryDiagnostic: (event) => {
@@ -500,8 +491,6 @@ if (parentPort) {
             };
         },
         handleMainMessage: (message) => auth.handleMessage(message) ||
-            wordEditor.handleMessage(message) ||
-            excelEditor.handleMessage(message) ||
             browser.handleMessage(message) ||
             diagnostics.handleMessage(message) ||
             computerUse.handleMessage(message) ||

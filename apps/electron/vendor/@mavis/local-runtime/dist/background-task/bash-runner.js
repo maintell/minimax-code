@@ -1,4 +1,4 @@
-import { localBashResultFromError, readBashExecutionOutcome, resolveLocalBashTiming, validateBashCommand, resolveBashDescription, } from '@mavis/agent-tools/desktop';
+import { localBashResultFromError, readBashExecutionOutcome, resolveLocalBashTiming, validateBashCommand, resolveBashDescription, readPermissionExecutionPlan, } from '@mavis/agent-tools/desktop';
 import { createBackgroundTaskId } from './domain.js';
 import { scheduleLocalBackgroundTaskDelivery } from './delivery.js';
 import { admitBackgroundTask, shutdownBackgroundTasks } from './lifecycle.js';
@@ -29,7 +29,9 @@ export async function startBackgroundLocalBash(input) {
     if (input.signal?.aborted)
         throw new Error('Operation aborted');
     const controller = new AbortController();
+    const abortStarting = () => controller.abort(input.signal?.reason ?? 'Operation aborted');
     const admission = admitBackgroundTask(input.host, (reason) => controller.abort(reason));
+    input.signal?.addEventListener('abort', abortStarting, { once: true });
     try {
         const started = await startAdmittedBackgroundLocalBash(input, controller, admission, 'explicit_background');
         void started.settled.then((completion) => {
@@ -45,6 +47,9 @@ export async function startBackgroundLocalBash(input) {
     catch (error) {
         admission.release();
         throw error;
+    }
+    finally {
+        input.signal?.removeEventListener('abort', abortStarting);
     }
 }
 export async function runManagedForegroundLocalBash(input) {
@@ -127,31 +132,20 @@ async function startAdmittedBackgroundLocalBash(input, controller, admission, ex
     const now = input.host.nowMs();
     const description = resolveBashDescription(input.bashInput.description, input.bashInput.command);
     const maxRunMs = capBackgroundBashMaxRunMs(input.maxRunMs ?? resolveBackgroundBashMaxRunMs(timing.commandTimeoutSeconds));
-    await input.host.backgroundTaskService.create({
-        taskId,
-        kind: 'bash',
-        status: 'queued',
-        ownerSessionId: input.parentSession.sessionId,
-        description,
-        toolCallId: input.toolCtx.toolCallId,
-        createdAt: now,
-        updatedAt: now,
-        metadata: {
-            parentSessionId: input.parentSession.sessionId,
-            parentTurnId: input.toolCtx.turnId,
-            command: input.bashInput.command,
-            ...(input.bashInput.timeout ? { timeoutSeconds: input.bashInput.timeout } : {}),
-            maxRunMs,
-            timing,
-            executionMode,
-        },
+    let releaseCreation;
+    let rejectCreation;
+    const created = new Promise((resolve, reject) => {
+        releaseCreation = resolve;
+        rejectCreation = reject;
     });
     let startedDetails = { description };
-    const settled = runBackgroundLocalBashCommand({
+    const settled = created
+        .then(() => runBackgroundLocalBashCommand({
         host: input.host,
         parentSession: input.parentSession,
         taskId,
         command: input.bashInput.command,
+        permissionExecutionPlan: readPermissionExecutionPlan(input.bashInput),
         description,
         timeout: timing.commandTimeoutSeconds,
         timing,
@@ -163,9 +157,36 @@ async function startAdmittedBackgroundLocalBash(input, controller, admission, ex
         onStartedDetails: (details) => {
             startedDetails = { ...(startedDetails ?? {}), ...details };
         },
-    });
+    }))
+        .finally(() => activeBackgroundBash.delete(taskId));
     admission.bind(settled.then(() => undefined));
     activeBackgroundBash.set(taskId, { controller, settled });
+    try {
+        await input.host.backgroundTaskService.create({
+            taskId,
+            kind: 'bash',
+            status: 'queued',
+            ownerSessionId: input.parentSession.sessionId,
+            description,
+            toolCallId: input.toolCtx.toolCallId,
+            createdAt: now,
+            updatedAt: now,
+            metadata: {
+                parentSessionId: input.parentSession.sessionId,
+                parentTurnId: input.toolCtx.turnId,
+                command: input.bashInput.command,
+                ...(input.bashInput.timeout ? { timeoutSeconds: input.bashInput.timeout } : {}),
+                maxRunMs,
+                timing,
+                executionMode,
+            },
+        });
+        releaseCreation();
+    }
+    catch (error) {
+        rejectCreation(error);
+        throw error;
+    }
     return { taskId, settled, getStartedDetails: () => startedDetails };
 }
 export async function stopBackgroundLocalBashTask(task, reason) {
@@ -201,7 +222,7 @@ export async function abortBackgroundLocalBashTasksForHost(host, reason = 'runti
 async function runBackgroundLocalBashCommand(input) {
     const { controller } = input;
     const startedAt = input.host.nowMs();
-    const output = new BackgroundBashOutputWriter(input.host, input.parentSession.sessionId, input.taskId);
+    const output = new BackgroundBashOutputWriter(input.host, input.parentSession.sessionId, input.taskId, { onLimit: (error) => controller.abort(error) });
     // Watchdog: cap a runaway/forgotten background task at maxRunMs. Firing
     // aborts the same controller the stop path uses; `timedOut` disambiguates
     // the resulting abort from a user-requested stop so we land failed+TIMEOUT
@@ -217,6 +238,9 @@ async function runBackgroundLocalBashCommand(input) {
         controller.abort('TIMEOUT');
     }, maxRunMs);
     try {
+        if (controller.signal.aborted) {
+            throw managedBashAbortError(controller.signal, 'Operation aborted before command start');
+        }
         const executed = await input.executor.execute({
             identity: {
                 operationClass: input.executionMode,
@@ -229,9 +253,15 @@ async function runBackgroundLocalBashCommand(input) {
             },
             workspaceRoot: input.parentSession.workspaceDir || input.host.resolveDefaultWorkspaceDir(),
             command: input.command,
+            ...(input.permissionExecutionPlan
+                ? { permissionExecutionPlan: input.permissionExecutionPlan }
+                : {}),
             timeout: input.timeout,
             signal: controller.signal,
             onPreflightComplete: async () => {
+                if (controller.signal.aborted) {
+                    throw managedBashAbortError(controller.signal, 'Operation aborted before command start');
+                }
                 await input.host.backgroundTaskService.patch(input.taskId, {
                     status: 'running',
                     startedAt: input.host.nowMs(),
@@ -252,7 +282,7 @@ async function runBackgroundLocalBashCommand(input) {
             },
         };
         const execution = readBashExecutionOutcome(result.details);
-        if (result.isError || (execution && execution.status !== 'succeeded')) {
+        if (output.limitError || result.isError || (execution && execution.status !== 'succeeded')) {
             return await settleFailedBackgroundBash(input, output, result, startedAt, timedOut, maxRunMs);
         }
         const outputRef = await output.settleSuccess(result);
@@ -301,7 +331,6 @@ async function runBackgroundLocalBashCommand(input) {
     }
     finally {
         clearTimeout(watchdog);
-        activeBackgroundBash.delete(input.taskId);
     }
 }
 function formatError(error) {

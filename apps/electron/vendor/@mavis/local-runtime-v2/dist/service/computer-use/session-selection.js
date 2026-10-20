@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { clearComputerUseDefault } from './default-preference.js';
 import { snapshotComputerUseState } from './state.js';
 const scopeKey = (scope) => JSON.stringify([scope.principalId, scope.deployment]);
 const revocationKey = (scope) => `computer-use.revocation.v2:${scopeKey(scope)}`;
@@ -50,6 +51,8 @@ function matchesSelection(saved, revocation) {
 export function createComputerUsePluginRevocationHandler(preferences) {
     return async (input) => {
         if (input.pluginName === 'computer-use') {
+            if (input.reason === 'uninstalled')
+                await clearComputerUseDefault(preferences, input.scope);
             await revokeComputerUseSelections(preferences, input.scope);
         }
     };

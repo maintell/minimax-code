@@ -4,6 +4,18 @@ import { createSrtMacosBackend } from './backend/srt-macos.js';
 import { createDeferredLocalSandboxBashOperationsFactory, createSandboxBashOperationsFactory, } from './deferred-port.js';
 import { createSandboxEvalEventSink } from './observability/eval-adapter.js';
 import { LocalSandboxService } from './local-sandbox-service.js';
+// Normal invocation stages are local-only events, and each one is repeated in the
+// `stages` of `sandbox.invocation.finished`, so the runtime log skips them.
+// `sandbox.invocation.started` still marks commands that never finish, and the
+// abnormal stages (`process.spawn_failed`, `process.timeout`) are still logged.
+const STAGE_EVENTS_SKIPPED_IN_LOG = new Set([
+    'sandbox.policy.resolved',
+    'sandbox.invocation.wrapped',
+    'sandbox.exec.requested',
+    'sandbox.process.started',
+    'sandbox.process.command_dispatched',
+    'sandbox.process.timer_started',
+]);
 const SRT_MACOS_BACKEND_DESCRIPTOR = Object.freeze({
     id: 'srt-macos',
     platform: 'darwin',
@@ -24,7 +36,12 @@ export function composeLocalSandboxService(input) {
         operationsFactory,
         configWriter: input.configWriter,
         eventSink: input.eventSink ?? createSandboxEvalEventSink(input.evalReporter),
-        log: input.log ?? ((event) => input.logger?.info({ ...event }, event.event_type)),
+        log: input.log ??
+            ((event) => {
+                if (STAGE_EVENTS_SKIPPED_IN_LOG.has(event.event_type))
+                    return;
+                input.logger?.info({ ...event }, event.event_type);
+            }),
         ...(input.metrics
             ? {
                 metrics: {
@@ -48,7 +65,7 @@ function initializeLocalSandboxService(input) {
         ...(input.platform ? { platform: input.platform } : {}),
         descriptors: input.descriptors ?? [SRT_MACOS_BACKEND_DESCRIPTOR],
     });
-    input.operationsFactory.bind(createSandboxBashOperationsFactory(service));
+    input.operationsFactory.bind(createSandboxBashOperationsFactory(service, input.operationsFactory.resolveShell.bind(input.operationsFactory)));
     return service;
 }
 //# sourceMappingURL=initialize.js.map

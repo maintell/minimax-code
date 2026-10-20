@@ -28,6 +28,7 @@ export class NativeLocalTurnExecutionPreparationSource {
             ...(input.execution.desktopCapabilities
                 ? { desktopCapabilities: input.execution.desktopCapabilities }
                 : {}),
+            history: (input.execution.runnerHistory ?? input.execution.history)?.messages ?? [],
         });
         const browserAssets = [...(prepared.browserAssets ?? [])];
         const context = createToolContext(input.execution, input.eventWriter, browserAssets, prepared.channelContext);
@@ -55,6 +56,8 @@ export class NativeLocalTurnExecutionPreparationSource {
                     genuineUserQueryText: steering.genuineUserQueryText,
                     provenance: steering.provenance,
                     messageIndexOffset,
+                    computerUseAvailable: input.execution.assembly.tools.some((tool) => tool.def.name.startsWith('computer_')),
+                    desktopCapabilities: input.execution.desktopCapabilities,
                 });
                 browserAssets.push(...(preparedSteering.browserAssets ?? []));
                 return {
@@ -75,6 +78,10 @@ export class NativeLocalTurnExecutionPreparationSource {
                     trustedExactWritePaths: context.trustedExactWritePaths,
                     signal: signal ?? input.execution.lease.signal,
                     preToolPermission: input.execution.pluginApprovalRequests?.get(toolContext.toolCall.id),
+                    sessionLineage: {
+                        miniApp: input.execution.session.miniAppOrigin !== undefined,
+                        parentSessionId: input.execution.session.parentSessionId,
+                    },
                     ...(prepared.channelContext ? { channelContext: prepared.channelContext } : {}),
                     ...(input.execution.pluginHooks?.length
                         ? {

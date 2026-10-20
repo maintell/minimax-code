@@ -16,6 +16,7 @@ export function materializeThreadGoalWorkerProposal(input, at) {
         type: input.type,
         turnId: input.turnId,
         ...(summary ? { summary } : {}),
+        ...(input.type === 'complete' ? { resultDelivery: 'pending' } : {}),
         at,
     };
 }

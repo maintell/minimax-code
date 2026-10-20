@@ -7,6 +7,23 @@ export function createTurnController(options) {
     const abortTimeoutMs = positiveInteger(options.abortTimeoutMs, DEFAULT_ABORT_TIMEOUT_MS);
     const renewalIntervalMs = positiveInteger(options.renewalIntervalMs, DEFAULT_RENEWAL_INTERVAL_MS);
     let closed = false;
+    let draining = false;
+    let pendingAdmissionCount = 0;
+    let idleDrain;
+    const resolveIdleDrain = () => {
+        if (entries.size === 0 && pendingAdmissionCount === 0)
+            idleDrain?.resolve();
+    };
+    const beginDrain = () => {
+        draining = true;
+        idleDrain ??= deferred();
+        resolveIdleDrain();
+        return {
+            activeTurnCount: entries.size,
+            pendingAdmissionCount,
+            idle: idleDrain.promise,
+        };
+    };
     let closePromise;
     const discardSteering = (entry, messages, cause) => {
         if (messages.length === 0)
@@ -46,6 +63,7 @@ export function createTurnController(options) {
             toolResultTailClaims: new Map(),
             toolResultTailOpen: 0,
             phase: 'running',
+            releaseListeners: [],
             renewalTimer: setInterval(() => scheduleRenewal(entry), renewalIntervalMs),
         };
         entry.renewalTimer.unref?.();
@@ -82,6 +100,11 @@ export function createTurnController(options) {
     }
     function scope(lease) {
         return {
+            setComputerUseAvailable: (available) => {
+                const entry = matchingEntry(entries, lease);
+                if (entry?.phase === 'running')
+                    entry.computerUseAvailable ??= available;
+            },
             drainSteering: () => drainSteering(entries, lease),
             steeringSignal: () => matchingEntry(entries, lease)?.steeringWake.signal,
             ackSteering: (messages) => ackSteering(entries, lease, messages),
@@ -94,14 +117,39 @@ export function createTurnController(options) {
         };
     }
     return {
+        tryEnterAdmission: () => {
+            if (closed || draining)
+                return undefined;
+            pendingAdmissionCount += 1;
+            let released = false;
+            return {
+                release: () => {
+                    if (released)
+                        return;
+                    released = true;
+                    pendingAdmissionCount -= 1;
+                    resolveIdleDrain();
+                },
+            };
+        },
+        beginDrain,
+        tryBeginDrainIfIdle: () => {
+            if (entries.size > 0 || pendingAdmissionCount > 0) {
+                return { acquired: false, activeTurnCount: entries.size, pendingAdmissionCount };
+            }
+            return { acquired: true, drain: beginDrain() };
+        },
         register,
         scope,
-        abort: async ({ sessionId, turnId, reason, onAccepted }) => {
+        abort: async ({ sessionId, turnId, reason, onAccepted, onReleased }) => {
             const entry = entries.get(sessionId);
             if (!entry)
                 return { status: 'not-running' };
             if (turnId && entry.turn.turnId !== turnId)
                 return { status: 'turn-mismatch' };
+            // Attached before `onAccepted` can yield: the Turn may release while that
+            // hook is still running, and the release moment must not be missed.
+            watchRelease(entry, onReleased);
             if (entry.phase === 'closing') {
                 await onAccepted?.();
                 const released = await waitForRelease(entry.released, abortTimeoutMs);
@@ -133,7 +181,11 @@ export function createTurnController(options) {
             clearInterval(entry.renewalTimer);
             entries.delete(turn.sessionId);
             clearControl(entry);
+            // Synchronously, right after `entries.delete`: nothing can register the
+            // next Turn in between, so a listener sees the exact release moment.
+            notifyReleased(options, entry);
             entry.resolveReleased();
+            resolveIdleDrain();
         },
         activeTurnId: (sessionId) => entries.get(sessionId)?.turn.turnId,
         close: () => {
@@ -172,6 +224,38 @@ function logRuntimeShutdown(options, active, shutdownAborts) {
         // Diagnostics must never change shutdown behavior.
     }
 }
+function watchRelease(entry, listener) {
+    if (listener)
+        entry.releaseListeners.push(listener);
+}
+/**
+ * Runs each accepted abort's `onReleased` exactly once. A failing listener is
+ * logged and never reaches the caller settling the Turn: releasing ownership
+ * must not depend on a stop's follow-up, nor may one listener starve the next.
+ */
+function notifyReleased(options, entry) {
+    for (const listener of entry.releaseListeners.splice(0)) {
+        try {
+            listener();
+        }
+        catch (error) {
+            logReleaseListenerFailure(options, entry, error);
+        }
+    }
+}
+function logReleaseListenerFailure(options, entry, error) {
+    try {
+        options.logger?.info({
+            event: 'turn_release_listener_failed',
+            session_id: entry.turn.sessionId,
+            turn_id: entry.turn.turnId,
+            error: error instanceof Error ? error.message : String(error),
+        }, '[local-runtime-v2] Turn release listener failed');
+    }
+    catch {
+        // Diagnostics must never change release behavior.
+    }
+}
 async function drainActiveTurns(entries, timeoutMs) {
     const drained = await Promise.all(entries.map((entry) => waitForRelease(entryDrain(entry), timeoutMs)));
     const timedOut = entries.filter((_entry, index) => !drained[index]);
@@ -198,15 +282,27 @@ function steer(entries, input, lane) {
         return Promise.resolve({ status: 'delivery-closed' });
     }
     const identity = steeringIdentity(input.message);
-    promoteForegroundSteer(entry.turn, lane, input.foreground);
     if (entry.steeringIdentities.has(identity)) {
+        promoteForegroundSteer(entry.turn, lane, input.foreground);
         return Promise.resolve({ status: 'accepted', turnId: input.turnId });
     }
+    // A first Computer Use request cannot join a catalog frozen without the native tools.
+    // Unknown means preparation is still running; leave it queued rather than race the snapshot.
+    if (requiresComputerUseTurn(entry, input.message, lane)) {
+        return Promise.resolve({ status: 'computer-use-requires-new-turn' });
+    }
+    promoteForegroundSteer(entry.turn, lane, input.foreground);
     const target = lane === 'ordinary' ? entry.steering : entry.toolResultTail;
     target.push(input.message);
     entry.steeringIdentities.add(identity);
     wakeOrdinarySteering(entry, lane);
     return Promise.resolve({ status: 'accepted', turnId: input.turnId });
+}
+function requiresComputerUseTurn(entry, message, lane) {
+    if (lane !== 'ordinary' || entry.computerUseAvailable === true)
+        return false;
+    return (message.message.computerUse?.enable === true ||
+        message.batchMembers?.some((member) => member.message.computerUse?.enable === true) === true);
 }
 function promoteForegroundSteer(turn, lane, foreground) {
     if (lane === 'ordinary' && foreground)

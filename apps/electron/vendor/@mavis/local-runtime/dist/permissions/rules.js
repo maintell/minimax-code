@@ -83,6 +83,60 @@ export class LocalPermissionRuleStore {
             return this.writeRules(targetPath, sourceRules.map((rule) => ({ ...rule, destination: targetSessionId })), this.readStorageWriteVersion());
         });
     }
+    /**
+     * Startup snapshot for a trusted child execution, not a grant or a fork.
+     * Merge only parent Session restrictions; never replace the child's rules.
+     * Read/lock/write failures propagate so the caller can stop before its first Turn.
+     */
+    async inheritSessionRestrictions(sourceSessionId, targetSessionId) {
+        validateSessionId(sourceSessionId);
+        validateSessionId(targetSessionId);
+        const source = await this.readConfigFile(this.filePath('session', sourceSessionId), 'session', sourceSessionId, true);
+        const targetPath = this.filePath('session', targetSessionId);
+        await this.withFileQueue(targetPath, async () => {
+            const current = await this.readConfigFile(targetPath, 'session', targetSessionId, true);
+            let next = current.rules;
+            for (const behavior of ['deny', 'ask']) {
+                next = mutateRules(next, {
+                    type: 'addRules',
+                    source: 'session',
+                    destination: targetSessionId,
+                    behavior,
+                    rules: source.rules
+                        .filter((rule) => rule.ruleBehavior === behavior)
+                        .map((rule) => rule.ruleValue),
+                });
+            }
+            if (next.length === current.rules.length)
+                return;
+            const writeVersion = this.readStorageWriteVersion();
+            if (writeVersion === 1) {
+                // The rollback writer may erase action/matcher semantics. This trusted
+                // preparation must fail closed instead of widening existing child rules.
+                const projected = configV1ToRules(rulesToConfigV1(next), 'session', targetSessionId);
+                const comparisons = [
+                    [next, projected],
+                    [projected, next],
+                ];
+                for (const behavior of ['allow', 'deny', 'ask']) {
+                    for (const [original, comparison] of comparisons) {
+                        if (mutateRules(original, {
+                            type: 'addRules',
+                            source: 'session',
+                            destination: targetSessionId,
+                            behavior,
+                            rules: comparison
+                                .filter((rule) => rule.ruleBehavior === behavior)
+                                .map((rule) => rule.ruleValue),
+                        }).length !== original.length) {
+                            throw new LocalPermissionRuleError('Cannot preserve Session permission restrictions with the v1 permission writer.', 503);
+                        }
+                    }
+                }
+            }
+            await this.writeRules(targetPath, next, writeVersion);
+        });
+    }
     async check(input) {
         if (input.mode === 'off') {
             return {
@@ -124,7 +178,7 @@ export class LocalPermissionRuleStore {
         const state = await this.readConfigFile(this.filePath(source, destination), source, destination);
         return state.rules;
     }
-    async readConfigFile(filePath, source, destination) {
+    async readConfigFile(filePath, source, destination, strictLegacyShape = false) {
         let text;
         try {
             text = await readFile(filePath, 'utf-8');
@@ -170,6 +224,17 @@ export class LocalPermissionRuleStore {
         if (record.version !== undefined) {
             logger.warn({ lifecycle: 'unsupported_store_version', source, version: record.version }, 'permission.store');
             throw new LocalPermissionStoreUnhealthyError('unsupported-version', source);
+        }
+        if (strictLegacyShape &&
+            ['allow', 'deny', 'ask'].some((behavior) => {
+                const values = record[behavior];
+                return (values !== undefined &&
+                    (!Array.isArray(values) ||
+                        values.some((value) => typeof value !== 'string' || !value.trim())));
+            })) {
+            // Legacy management reads remain compatible; child initialization must
+            // not interpret malformed restrictions as an empty snapshot.
+            throw new LocalPermissionStoreUnhealthyError('invalid-store-shape', source);
         }
         const config = {
             allow: readRuleStringArray(record.allow),

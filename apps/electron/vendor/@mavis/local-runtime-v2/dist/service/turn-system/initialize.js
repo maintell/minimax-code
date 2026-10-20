@@ -152,6 +152,7 @@ export async function initializeTurnSystem(options) {
     let closePromise;
     return {
         turns,
+        ...subagentOccupancyCapability(options.subagentConcurrency),
         sessionLifecycle: {
             runExclusive: async (sessionId, operation) => {
                 const lease = operations.tryAcquireExclusive(sessionId);
@@ -182,8 +183,9 @@ export async function initializeTurnSystem(options) {
             },
             latestTurnActivity: (sessionId) => repository.findLatestTurnActivity(sessionId),
         },
+        processLifecycle: createProcessLifecycle(controller),
         maintenance,
-        receipts: { findReceipt: (turnId) => repository.findReceipt(turnId) },
+        receipts: receiptReader(repository),
         trustedEditSubmission: createTrustedEditSubmission(trustedSubmission),
         ready: () => {
             readyPromise ??= closed ? Promise.resolve() : recovery.recoverPending();
@@ -230,6 +232,11 @@ function createRuntimeQueueSteer(queue, completions) {
         },
         release: (claim) => queue.release({ sessionId: claim.sessionId, claimId: claim.claimId }),
     };
+}
+function subagentOccupancyCapability(subagentConcurrency) {
+    return subagentConcurrency
+        ? { subagentOccupancy: (parentSessionId) => subagentConcurrency.occupancy(parentSessionId) }
+        : {};
 }
 function createSubagentSiblingWake(subagentConcurrency) {
     let wakeQueuedSiblings;
@@ -522,6 +529,7 @@ function createQueuedTurnControl(options, repository, steeringRequeue) {
 }
 function createTurnFacade(input) {
     return {
+        prepareSideChat: (request) => input.historyMutation.prepareSideChat(request),
         fork: (request) => input.historyMutation.fork(request),
         rewind: (request) => input.historyMutation.rewind(request),
         submit: (request) => input.submission.submit(request),
@@ -622,5 +630,17 @@ async function settleShutdown(operations) {
     const failure = results.find((result) => result.status === 'rejected');
     if (failure)
         throw failure.reason;
+}
+function createProcessLifecycle(controller) {
+    return {
+        beginDrain: () => controller.beginDrain(),
+        tryBeginDrainIfIdle: () => controller.tryBeginDrainIfIdle(),
+    };
+}
+function receiptReader(repository) {
+    return {
+        findReceipt: (turnId) => repository.findReceipt(turnId),
+        findClientRequestBindings: (input) => repository.findClientRequestBindings(input),
+    };
 }
 //# sourceMappingURL=initialize.js.map

@@ -17,6 +17,14 @@ import { clearThreadGoalExecutionWait, listThreadGoalsWaitingOnVerification, set
 import { patchThreadGoal } from './store-patch.js';
 import { recordThreadGoalVerification } from './store-verification.js';
 import { newThreadGoalId, positiveOrNull, rowToThreadGoalState, } from './store-row.js';
+export class ThreadGoalDismissConflictError extends Error {
+    statusCode = 409;
+    code = 'GOAL_DISMISS_CONFLICT';
+    constructor(sessionId, goalId) {
+        super(`Goal ${goalId} is not the current completed Goal for session ${sessionId}`);
+        this.name = 'ThreadGoalDismissConflictError';
+    }
+}
 export class SqliteThreadGoalStore {
     dataDir;
     nowMs;
@@ -159,6 +167,26 @@ export class SqliteThreadGoalStore {
     async patchByUser(goalId, input) {
         return this.patch(goalId, input);
     }
+    /** 仅隐藏指定已完成 Goal 的提示；幂等写入，不推进执行 epoch。 */
+    async dismissCompleted(sessionId, goalId) {
+        return this.withDb((db) => runInImmediateTransaction(db, () => {
+            const result = db
+                .prepare(`UPDATE local_runtime_thread_goals
+             SET dismissed_at_ms = COALESCE(dismissed_at_ms, ?)
+             WHERE session_id = ? AND goal_id = ? AND status = 'complete'`)
+                .run(this.nowMs(), sessionId, goalId);
+            if ((result.changes ?? 0) === 0) {
+                throw new ThreadGoalDismissConflictError(sessionId, goalId);
+            }
+            const row = db
+                .prepare(`SELECT * FROM local_runtime_thread_goals WHERE session_id = ? AND goal_id = ?`)
+                .get(sessionId, goalId);
+            const goal = rowToThreadGoalState(row);
+            if (!goal)
+                throw new ThreadGoalDismissConflictError(sessionId, goalId);
+            return goal;
+        }));
+    }
     async bumpBoundUsage(binding, delta, limits) {
         return this.withDb((db) => bumpThreadGoalBoundUsage(db, this.nowMs, binding, delta, limits));
     }
@@ -211,6 +239,32 @@ export class SqliteThreadGoalStore {
             const state = rowToThreadGoalState(row);
             return state ? [state] : [];
         }));
+    }
+    /** Only new, undelivered proposals are eligible; never wake historical completed Goals. */
+    async listRecoverableCompletionSummaries() {
+        return this.withDb((db) => db
+            .prepare(`SELECT * FROM local_runtime_thread_goals WHERE status = 'complete'
+        ORDER BY updated_at_ms, goal_id`)
+            .all()
+            .flatMap((row) => {
+            const state = rowToThreadGoalState(row);
+            return state?.lastWorkerProposal?.type === 'complete' &&
+                state.lastWorkerProposal.resultDelivery === 'pending'
+                ? [state]
+                : [];
+        }));
+    }
+    /** Delivery receipt is not a new Goal decision and must not advance its admission epoch. */
+    async markCompletionSummaryQueued(goalId, proposalTurnId) {
+        this.withDb((db) => {
+            db.prepare(`UPDATE local_runtime_thread_goals
+        SET last_worker_proposal = json_set(last_worker_proposal, '$.resultDelivery', 'queued')
+        WHERE goal_id = ? AND status = 'complete'
+          AND json_valid(last_worker_proposal)
+          AND json_extract(last_worker_proposal, '$.type') = 'complete'
+          AND json_extract(last_worker_proposal, '$.turnId') = ?
+          AND json_extract(last_worker_proposal, '$.resultDelivery') = 'pending'`).run(goalId, proposalTurnId);
+        });
     }
     async transitionKickoffState(goalId, expected, next) {
         return this.withDb((db) => {

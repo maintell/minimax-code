@@ -23,6 +23,7 @@ export function buildLocalTurnPayloadTransform(agentConfig, options = {}) {
         : (options.thinkingLevel ?? 'off') !== 'off';
     const thinking = thinkingOn ? thinkingVariants?.thinking : thinkingVariants?.noneThinking;
     const managedThinking = readManagedThinking(modelConfig ?? {}, capabilities ?? {}, options.managedProvider, thinkingOn);
+    const selectedEffort = readSelectedThinkingEffort(modelConfig ?? {}, capabilities ?? {}, options.managedProvider, thinkingOn);
     return (payload, model) => transformLocalTurnPayload({
         payload,
         model,
@@ -30,6 +31,7 @@ export function buildLocalTurnPayloadTransform(agentConfig, options = {}) {
         fileApiPatcher,
         thinking,
         managedThinking,
+        ...(selectedEffort ? { selectedEffort } : {}),
         thinkingRequestPatch: options.thinkingRequestPatch,
         outputContract: options.outputContract,
         jsonObjectOutputEnabled: options.supportsJsonObjectOutput === true,
@@ -39,7 +41,7 @@ export function buildLocalTurnPayloadTransform(agentConfig, options = {}) {
 function readManagedThinking(model, capabilities, managed, enabled) {
     if (!managed)
         return undefined;
-    const effort = model.thinking_effort ?? capabilities.selected_thinking_effort;
+    const effort = readRawThinkingEffort(model, capabilities);
     if (model.thinking_level === undefined &&
         capabilities.thinking_mode === undefined &&
         effort === undefined)
@@ -51,6 +53,22 @@ function readManagedThinking(model, capabilities, managed, enabled) {
             ? { effort }
             : {}),
     };
+}
+function readRawThinkingEffort(model, capabilities) {
+    return model.thinking_effort ?? capabilities.selected_thinking_effort;
+}
+/**
+ * The explicitly selected effort level for an API-key request. Plain on/off
+ * models have no level, and `default` means "let the provider decide", so
+ * neither is forwarded.
+ */
+function readSelectedThinkingEffort(model, capabilities, managed, enabled) {
+    if (managed || !enabled)
+        return undefined;
+    const effort = readRawThinkingEffort(model, capabilities);
+    return typeof effort === 'string' && !['', 'on', 'off', 'default'].includes(effort)
+        ? effort
+        : undefined;
 }
 export function buildLocalRequestPayloadTransform(input, runtime) {
     const fileApiFetch = resolveFileApiFetch(input.llm, runtime.fileApi?.fetchImpl);
@@ -103,7 +121,7 @@ async function transformLocalTurnPayload(input) {
         const fileApiChanged = await patchFileApiPayload(input.payload, input.model, input.fileApiPatcher);
         const thinkingChanged = input.managedThinking
             ? patchManagedThinkingPayload(input.payload, input.thinking, input.managedThinking)
-            : patchThinkingPayload(input.payload, input.thinking, input.model);
+            : patchThinkingPayload(input.payload, input.thinking, input.model, input.selectedEffort);
         changed = videoChanged || fileApiChanged || thinkingChanged;
     }
     const requestPatchChanged = patchRequestPayload(input.payload, input.thinkingRequestPatch);
@@ -118,7 +136,9 @@ function assertRequestBodyFits(payload, limit) {
     const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
     if (bytes <= limit)
         return;
-    throw Object.assign(new Error(`Request body too large: ${bytes} bytes exceeds client limit ${limit} bytes.`), {
+    // `request_too_large` lets Pi's isContextOverflow recognise the local gate
+    // like the provider rejection it pre-empts.
+    throw Object.assign(new Error(`Request body too large (request_too_large): ${bytes} bytes exceeds client limit ${limit} bytes.`), {
         code: 'REQUEST_BODY_TOO_LARGE',
         retryable: false,
     });
@@ -246,7 +266,7 @@ function mergeRequestPatch(target, patch) {
         target[key] = isRecord(value) ? structuredClone(value) : value;
     }
 }
-function patchThinkingPayload(payload, thinking, model) {
+function patchThinkingPayload(payload, thinking, model, selectedEffort) {
     if (!thinking || !Array.isArray(payload.messages))
         return false;
     if (model.api === 'anthropic-messages' && isDefaultThinkingModelId(model.id)) {
@@ -255,8 +275,15 @@ function patchThinkingPayload(payload, thinking, model) {
         return hadThinking;
     }
     payload.thinking = { ...thinking };
-    if (!shouldPreserveCustomProviderTopEffort(payload, model))
-        delete payload.output_config;
+    if (shouldPreserveCustomProviderTopEffort(payload, model))
+        return true;
+    if (selectedEffort && parseProviderId(model.provider)?.source === 'minimax_api') {
+        // The MiniMax API-key path speaks the same Messages dialect as the managed
+        // gateway; keep the selected `--effort` exactly like patchManagedThinkingPayload.
+        payload.output_config = { ...readRecord(payload.output_config), effort: selectedEffort };
+        return true;
+    }
+    delete payload.output_config;
     return true;
 }
 function patchManagedThinkingPayload(payload, thinking, selection) {

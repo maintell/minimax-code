@@ -34,14 +34,27 @@
  * one fresh. Listeners are attached/detached symmetrically so a hot
  * unbind+rebind never leaks a stale subscription.
  */
+import { EventEmitter } from 'node:events';
 import { detach } from '../../../settle.js';
 import { MessageType } from '../sdk/ilink-types.js';
 import { LocalWeChatChannelStore } from '../wechat-store.js';
 import { parseLocalWeChatEvent } from './wechat-events.js';
 import { resolveWeChatAttachments, } from './wechat-attachment-support.js';
+import { ChannelTransportStatusTracker, isNetworkTimeoutError, } from '../../../ingress/channel-transport-status.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 /** Dropping messages older than this is safe — agent context has rotated. */
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
+/**
+ * Whether this monitor can deliver `poll` verdicts. The shared handle type
+ * cannot require the event (see {@link WeChatMonitorPollEventSource}), so it
+ * is checked at runtime: an EventEmitter accepts any event name, and every
+ * monitor the runtime builds is one — the package `ILinkMonitor`, which the
+ * Electron SDK wiring hands over unwrapped, and the test doubles. A handle
+ * that only wraps an emitter (the inert offline stub) is not.
+ */
+function hasPollEvents(monitor) {
+    return monitor instanceof EventEmitter;
+}
 export class LocalWeChatMonitorWire {
     options;
     nowMs;
@@ -50,13 +63,26 @@ export class LocalWeChatMonitorWire {
     startedToken = null;
     /** Last status emitted by the monitor — detects a dead (expired/stopped) loop. */
     lastStatus = null;
+    /**
+     * Live receive-channel state (see `channel-transport-status.ts`). Unlike
+     * {@link lastStatus} it survives `clearCurrentMonitor`: a session that
+     * expired stays `error` / `session_expired` after the loop is released,
+     * until the next start.
+     */
+    transport;
     messageListener = null;
     errorListener = null;
     statusListener = null;
     disconnectedListener = null;
+    pollListener = null;
     constructor(options) {
         this.options = options;
         this.nowMs = options.nowMs ?? (() => Date.now());
+        this.transport = new ChannelTransportStatusTracker({
+            platform: 'wechat',
+            agentName: options.agentName,
+            clientName: options.clientName,
+        });
     }
     /**
      * Start the iLink long-poll for the bound agent. Returns as soon as the
@@ -86,6 +112,9 @@ export class LocalWeChatMonitorWire {
         });
         this.startedToken = record.botToken;
         this.lastStatus = null;
+        // A new attempt forgets the previous verdict, a held `session_expired`
+        // included: only this loop's own getUpdates rounds may move it again.
+        this.transport.toConnecting('start_requested');
         const createParams = { client };
         if (record.ilinkBotId)
             createParams.botId = record.ilinkBotId;
@@ -106,6 +135,7 @@ export class LocalWeChatMonitorWire {
                 await loop;
                 if (!monitor.isRunning()) {
                     logger.warn({ agentName, clientName: this.options.clientName }, 'WeChat monitor did not enter running state');
+                    this.markLoopDead('start_failed');
                     this.clearCurrentMonitor(monitor);
                 }
                 return;
@@ -115,6 +145,7 @@ export class LocalWeChatMonitorWire {
         }
         catch (err) {
             logger.error({ err, agentName, clientName: this.options.clientName }, 'WeChat monitor start failed');
+            this.markLoopDead('start_failed');
             this.clearCurrentMonitor(monitor);
             throw err;
         }
@@ -125,6 +156,9 @@ export class LocalWeChatMonitorWire {
      * so a re-`start()` builds a clean subscription set.
      */
     stop() {
+        // Our own stop turns the channel off; whatever the loop held (even a
+        // session_expired) is not a failure of the stopped channel.
+        this.transport.toIdle('stop_requested');
         if (!this.monitor)
             return;
         const { agentName, clientName } = this.options;
@@ -165,6 +199,10 @@ export class LocalWeChatMonitorWire {
     /** Last status the monitor emitted (`null` before the first start). */
     liveStatus() {
         return this.lastStatus;
+    }
+    /** Live receive-channel state; held after the loop ends (see {@link transport}). */
+    transportStatus() {
+        return this.transport.snapshot();
     }
     // -------------------------------------------------------------------------
     // Internals
@@ -211,6 +249,15 @@ export class LocalWeChatMonitorWire {
         monitor.on('error', this.errorListener);
         monitor.on('status', this.statusListener);
         monitor.on('disconnected', this.disconnectedListener);
+        if (hasPollEvents(monitor)) {
+            this.pollListener = (result) => this.onPollResult(result);
+            monitor.on('poll', this.pollListener);
+            return;
+        }
+        // Skip branch: without poll verdicts nothing can confirm the channel, so
+        // this binding reports `connecting` until the loop ends or is stopped.
+        // Inbound messages still flow through the listeners above.
+        logger.warn({ agentName, clientName, reason: 'poll_events_unsupported' }, 'WeChat monitor poll verdicts unavailable; transport status stays connecting');
     }
     detachListeners() {
         if (!this.monitor) {
@@ -218,6 +265,7 @@ export class LocalWeChatMonitorWire {
             this.errorListener = null;
             this.statusListener = null;
             this.disconnectedListener = null;
+            this.pollListener = null;
             return;
         }
         if (this.messageListener)
@@ -228,10 +276,43 @@ export class LocalWeChatMonitorWire {
             this.monitor.off('status', this.statusListener);
         if (this.disconnectedListener)
             this.monitor.off('disconnected', this.disconnectedListener);
+        if (this.pollListener && hasPollEvents(this.monitor)) {
+            this.monitor.off('poll', this.pollListener);
+        }
         this.messageListener = null;
         this.errorListener = null;
         this.statusListener = null;
         this.disconnectedListener = null;
+        this.pollListener = null;
+    }
+    /**
+     * One getUpdates verdict → receive-channel state. Only a server answer
+     * with ret / errcode 0 counts as `connected`; the monitor's
+     * `status: 'polling'` / `connected` events fire before any request.
+     */
+    onPollResult(result) {
+        if (result.outcome === 'ok') {
+            this.transport.toConnected('poll_succeeded');
+        }
+        else if (result.outcome === 'session_expired') {
+            this.transport.toError('session_expired', 'session_expired');
+        }
+        else if (result.outcome === 'api_error') {
+            this.transport.toError('poll_rejected', 'endpoint_rejected');
+        }
+        else {
+            this.transport.toError('poll_request_failed', isNetworkTimeoutError(result.error) ? 'network_timeout' : 'network_error');
+        }
+    }
+    /**
+     * The loop is gone without our stop (failed start, crash, own exit). A
+     * held `session_expired` stays: it is why the loop ended, and it tells
+     * the user what to do. Anything else becomes `error` / `unknown`.
+     */
+    markLoopDead(reason) {
+        if (this.transport.snapshot().errorCategory === 'session_expired')
+            return;
+        this.transport.toError(reason, 'unknown');
     }
     /**
      * Detached supervision of the monitor loop: a clean exit clears the stale
@@ -241,6 +322,9 @@ export class LocalWeChatMonitorWire {
         try {
             await loop;
             if (this.monitor === monitor && !monitor.isRunning()) {
+                // Our own stop() releases the monitor first, so reaching here means
+                // the loop ended by itself (session expiry being the normal cause).
+                this.markLoopDead('loop_exited');
                 this.clearCurrentMonitor(monitor);
             }
         }
@@ -248,6 +332,7 @@ export class LocalWeChatMonitorWire {
             if (this.monitor !== monitor)
                 return;
             logger.error({ err, agentName: this.options.agentName, clientName: this.options.clientName }, 'WeChat monitor loop failed');
+            this.markLoopDead('loop_crashed');
             this.clearCurrentMonitor(monitor);
         }
     }

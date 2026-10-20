@@ -1,6 +1,7 @@
 import { isMemoryV2Enabled, getRuntimePresetKey, resolveModelAvailability } from '@mavis/config';
 import { hasConversationTaskModelSelection, } from '@mavis/conversation-contract';
 import { COMPUTER_USE_TOOL_NAMES } from '../../service/computer-use/index.js';
+import { bindPluginAgentMcpSelectors, pluginAgentSource, renderPluginAgentProfile, } from './plugin-agent-capture.js';
 import { resolveEffectiveAgentModelSelection, modelConfigForRef, modelRefForModel, savedSessionModel, parseSourceQualifiedModelKey, } from '../../service/model-system/index.js';
 import { toLegacyTaskSessionBinding } from '../../service/session-system/index.js';
 import { filterLocalTurnCapabilityInventory, resolveAgentPromptSurface, } from '../../service/turn-system/index.js';
@@ -39,18 +40,11 @@ async function captureDefinition(options, input, historical) {
     if (!session)
         throw new Error('Session Agent definition capture requires a Session.');
     const config = options.config();
-    const profile = await renderSessionProfile({
-        options,
-        config,
-        agentName: input.agentName,
-        session,
-        appMode: input.appMode,
-        legacyTaskSurface: input.session === undefined,
-    });
+    const profile = await renderCaptureProfile({ options, config, session, input, historical });
     const frozenSurface = input.legacyDefinition ?? {
         systemPrompt: profile.agentSystemPrompt ?? '',
         ...(profile.promptSnapshot ? { promptSnapshot: profile.promptSnapshot } : {}),
-        capabilities: freezeSelectorCapabilities(profile, await options.inventory.capture({ session, profile })),
+        capabilities: await freezeCapturedCapabilities(options, session, profile, input.pluginAgent),
     };
     const selection = resolveCapturedModel({
         config,
@@ -64,7 +58,6 @@ async function captureDefinition(options, input, historical) {
     const effectiveModel = `${selection.providerId}/${selection.modelId}`;
     const variant = resolvedModelVariant({ selection, session, parent: input.parent });
     const thinking = resolvedThinkingSelection({ selection, session, parent: input.parent });
-    const ownerInstanceId = await captureOwnerInstanceId(options.agentService, profile);
     return buildCapturedDefinition({
         profile,
         frozenSurface,
@@ -73,8 +66,48 @@ async function captureDefinition(options, input, historical) {
         effectiveModel,
         variant,
         thinking,
-        ownerInstanceId,
+        ...(await captureOwnerFields(options, profile, input.pluginAgent)),
     });
+}
+async function freezeCapturedCapabilities(options, session, profile, pluginAgent) {
+    const ready = await options.inventory.capture({ session, profile });
+    const bindings = ready.desktopCapabilities?.runtimeToolBindings ?? [];
+    const inventoryToolNames = [
+        ...ready.sources.nativeTools,
+        ...ready.sources.mcpEntries.map(({ tool }) => tool),
+        ...ready.sources.threadGoalTools,
+        ...(ready.desktopCapabilities?.runtimeTools ?? []),
+    ].map((tool) => tool.def.name);
+    return freezeSelectorCapabilities(bindPluginAgentMcpSelectors(profile, pluginAgent, bindings, inventoryToolNames), ready);
+}
+async function renderCaptureProfile(input) {
+    const { options, config, session } = input;
+    const pluginAgent = input.input.pluginAgent;
+    if (!pluginAgent) {
+        return renderSessionProfile({
+            options,
+            config,
+            agentName: input.input.agentName,
+            session,
+            appMode: input.input.appMode,
+            legacyTaskSurface: input.input.session === undefined,
+        });
+    }
+    if (input.historical || input.input.session?.sessionKind !== 'task' || !input.input.parent) {
+        throw new Error('Plugin Agent definitions are captured only for new Task Sessions.');
+    }
+    return renderPluginAgentProfile({
+        agentService: options.agentService,
+        agent: pluginAgent,
+        request: profileRequest(options, config, session, input.input.appMode),
+    });
+}
+/** Plugin Agents have no Agent row, so they carry their source instead of an instance id. */
+async function captureOwnerFields(options, profile, pluginAgent) {
+    if (pluginAgent)
+        return { pluginSource: pluginAgentSource(pluginAgent) };
+    const ownerInstanceId = await captureOwnerInstanceId(options.agentService, profile);
+    return ownerInstanceId ? { ownerInstanceId } : {};
 }
 function resolveCapturedModel(input) {
     const historical = input.historical ? historicalModelSelection(input.session) : undefined;
@@ -94,6 +127,7 @@ function resolveCapturedModel(input) {
     const resolved = historical ??
         resolveEffectiveAgentModelSelection({
             config: input.config,
+            replaceRetired: !input.historical,
             sources: modelSources({
                 profile: input.profile,
                 session: input.session,
@@ -122,31 +156,43 @@ function resolveCapturedModel(input) {
     // It stays exempt because describing a historical Session must succeed even
     // when the model it recorded has since been retired: the alternative is that
     // one removed model makes an old Session permanently unopenable, and the
-    // startup sweep unable to finish. Availability is an *execution* concern and
-    // belongs after a frozen definition is read for a turn, not here.
+    // startup sweep unable to finish. A frozen definition is never replaced.
     //
-    // The branch below is the live path (`capture`), where the Session's saved
-    // model flows through `modelSources` and an unusable model is rejected during
-    // preparation, before any provider request is made.
-    if (!historical) {
-        const availability = resolveModelAvailability({
-            config: input.config,
-            providerId: resolved.providerId,
-            modelId: resolved.modelId,
-            preset: getRuntimePresetKey(),
-            source: 'config_default',
-        });
-        if (!availability.available) {
-            input.diagnostics?.info?.({
-                event: 'task_agent_captured_model_unavailable',
-                agent_name: input.profile.exactOwnerName,
-                provider_id: resolved.providerId,
-                model_id: resolved.modelId,
-            }, 'Agent execution preparation rejected: captured model is not available');
-            throw new Error(availability.message);
-        }
-    }
+    // The branch below is the live path (`capture`): a retired official model
+    // was replaced by `replaceRetired`; it only records what was captured.
+    if (!historical)
+        recordCapturedModel(input, resolved);
     return resolved;
+}
+/**
+ * A retired official model was already replaced during capture. Anything still
+ * not listed (e.g. a removed custom model) is frozen as captured and left for
+ * the upstream to reject; capture only records it.
+ */
+function recordCapturedModel(input, resolved) {
+    const available = resolveModelAvailability({
+        config: input.config,
+        providerId: resolved.providerId,
+        modelId: resolved.modelId,
+        preset: getRuntimePresetKey(),
+        source: 'config_default',
+    }).available;
+    const replacedFrom = resolved.replacedFrom;
+    if (available && !replacedFrom)
+        return;
+    input.diagnostics?.info?.({
+        event: available
+            ? 'task_agent_captured_model_replaced'
+            : 'task_agent_captured_model_unavailable',
+        agent_name: input.profile.exactOwnerName,
+        provider_id: resolved.providerId,
+        model_id: resolved.modelId,
+        ...(replacedFrom
+            ? { replaced_from: `${replacedFrom.providerId}/${replacedFrom.modelId}` }
+            : {}),
+    }, available
+        ? 'Agent execution captured a replacement for a retired model'
+        : 'Agent execution captured a model the catalog does not list; the upstream decides');
 }
 function buildCapturedDefinition(input) {
     const agentDefinition = buildAgentDefinition(input);
@@ -170,6 +216,7 @@ function buildAgentDefinition(input) {
             definitionVersion: 2,
             exactOwnerName: input.profile.exactOwnerName,
             ...(input.ownerInstanceId ? { ownerInstanceId: input.ownerInstanceId } : {}),
+            ...(input.pluginSource ? { pluginSource: input.pluginSource } : {}),
             systemPrompt: input.frozenSurface.systemPrompt,
             ...(input.frozenSurface.promptSnapshot
                 ? { promptSnapshot: input.frozenSurface.promptSnapshot }
@@ -198,27 +245,32 @@ function buildAgentDefinition(input) {
     };
 }
 async function renderSessionProfile(input) {
-    const configuredCapabilities = input.config.agents?.default;
-    const capabilities = input.options.capabilityProfile === 'cli'
-        ? {
-            ...configuredCapabilities,
-            features: { ...configuredCapabilities?.features, mavis: false },
-        }
-        : configuredCapabilities;
     return input.options.agentService.renderProfile({
         exactOwnerName: input.agentName,
         surface: input.legacyTaskSurface
             ? 'task-child'
             : resolveAgentPromptSurface(input.session, input.options.runtimeOwnerKind),
-        promptProfile: input.options.runtimeOwnerKind === 'tui' ? 'tui' : 'desktop',
-        appMode: input.appMode ?? input.session.appMode ?? 'coding',
-        capabilities,
-        memoryEnabled: !isCommandLineRuntimeOwner(input.options.runtimeOwnerKind) &&
-            !isMemoryV2Enabled(input.config.memory) &&
-            input.config.memory?.enabled,
-        cronEnabled: !isCommandLineRuntimeOwner(input.options.runtimeOwnerKind),
-        dataDirToken: input.config.dataDir,
+        ...profileRequest(input.options, input.config, input.session, input.appMode),
     });
+}
+function profileRequest(options, config, session, appMode) {
+    const configuredCapabilities = config.agents?.default;
+    const capabilities = options.capabilityProfile === 'cli'
+        ? {
+            ...configuredCapabilities,
+            features: { ...configuredCapabilities?.features, mavis: false },
+        }
+        : configuredCapabilities;
+    return {
+        promptProfile: options.runtimeOwnerKind === 'tui' ? 'tui' : 'desktop',
+        appMode: appMode ?? session.appMode ?? 'coding',
+        capabilities,
+        memoryEnabled: !isCommandLineRuntimeOwner(options.runtimeOwnerKind) &&
+            !isMemoryV2Enabled(config.memory) &&
+            config.memory?.enabled,
+        cronEnabled: !isCommandLineRuntimeOwner(options.runtimeOwnerKind),
+        dataDirToken: config.dataDir,
+    };
 }
 /** V1 compatibility: historical Task prompt/capability recovery never reselects a model. */
 async function captureLegacyTaskBinding(options, input) {
@@ -467,18 +519,27 @@ function freezeSelectorCapabilities(profile, ready) {
         ...filtered.mcpEntries.flatMap((entry) => (entry.serverName ? [entry.serverName] : [])),
         ...(filtered.desktopCapabilities?.runtimeToolBindings.flatMap((binding) => binding.kind === 'mcp' ? [binding.source] : []) ?? []),
     ]);
-    const skills = uniqueNames(ready.skills
-        .filter((skill) => filtered.selector.allowsSkill(skill.name))
-        .map((skill) => skill.name));
+    // The Skill reader checks both allowlists for Desktop Plugin Skills, so a
+    // frozen Plugin Skill must be named in `skills` as well as `extensionSkills`.
+    const desktopSkills = (filtered.desktopCapabilities?.skills ?? [])
+        .filter((skill) => filtered.selector.allowsExtensionSkill(skill.pluginName, skill.name))
+        .map((skill) => ({ ...skill, runtimeName: `${skill.pluginName}:${skill.name}` }));
+    const skills = uniqueNames([
+        ...ready.skills
+            .filter((skill) => filtered.selector.allowsSkill(skill.name))
+            .map((skill) => skill.name),
+        ...desktopSkills
+            .filter((skill) => filtered.selector.allowsSkill(skill.name) ||
+            filtered.selector.allowsSkill(skill.runtimeName))
+            .map((skill) => skill.runtimeName),
+    ]);
     const extensionSkills = uniqueNames([
         ...ready.skills
             .filter((skill) => !isBuiltinRuntimeSkill(skill))
             .filter((skill) => filtered.selector.allowsSkill(skill.name))
             .filter((skill) => filtered.selector.allowsExtensionSkill('', skill.name))
             .map((skill) => skill.name),
-        ...(filtered.desktopCapabilities?.skills ?? [])
-            .filter((skill) => filtered.selector.allowsExtensionSkill(skill.pluginName, skill.name))
-            .map((skill) => `${skill.pluginName}:${skill.name}`),
+        ...desktopSkills.map((skill) => skill.runtimeName),
     ]);
     const disallowedTools = profile.configSelection?.disallowedTools ?? [];
     return {

@@ -1,3 +1,4 @@
+import { MINIAPP_AGENT_DEFAULT_CONCURRENCY } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
 export function sameMiniAppCandidate(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
@@ -44,12 +45,20 @@ export function miniAppCandidateFromPackage(packageEntry) {
         packageDigest: miniapp.contentDigest,
         clientDigest: miniapp.clientDigest,
         surfacePath: miniapp.surface.path,
+        ...(miniapp.surface.window ? { surfaceWindow: miniapp.surface.window } : {}),
         lifecycle: miniapp.runtime.lifecycle,
         nodeDigest: miniapp.nodeDigest,
         nodeEntry: miniapp.runtime.entry,
         mcpEndpoints: miniapp.mcpEndpoints.map(({ server, path }) => ({ id: server, path })),
         hostConnectorPolicy: miniapp.hostConnectorAccess?.providers.length
             ? { kind: 'allowlist', providers: [...miniapp.hostConnectorAccess.providers] }
+            : { kind: 'deny-all' },
+        agentPolicy: miniapp.agentAccess?.length
+            ? {
+                kind: 'allowlist',
+                capabilities: [...miniapp.agentAccess],
+                maxConcurrent: miniapp.agentConcurrency ?? MINIAPP_AGENT_DEFAULT_CONCURRENCY,
+            }
             : { kind: 'deny-all' },
     };
 }

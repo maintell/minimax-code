@@ -34,6 +34,7 @@ export function composeV1Conversation(input) {
         turns: input.turns,
         rootAgents: input.rootAgents,
         resolveAgentWriteTarget: input.resolveAgentWriteTarget,
+        ...(input.taskOccupancy ? { taskOccupancy: input.taskOccupancy } : {}),
         ...(input.onQueueWakeFailure ? { onQueueWakeFailure: input.onQueueWakeFailure } : {}),
     });
 }

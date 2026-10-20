@@ -35,6 +35,9 @@ export function publishThreadGoalEvent(publish, event) {
                 status: event.goal.status,
                 createdAt: event.goal.createdAt,
                 updatedAt: event.goal.updatedAt,
+                ...(event.goal.dismissedAt !== undefined
+                    ? { dismissedAt: event.goal.dismissedAt }
+                    : {}),
                 tokensUsed: event.goal.tokensUsed,
                 turnsUsed: event.goal.turnsUsed,
                 timeUsedSeconds: event.goal.timeUsedSeconds,

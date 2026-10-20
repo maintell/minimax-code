@@ -196,6 +196,7 @@ export let IPC_CHANNELS = {
     DESKTOP_SET_GLOBAL_ACCESS_SHORTCUT: 'desktop:set-global-access-shortcut',
     DESKTOP_GET_GLOBAL_ACCESS_SHORTCUT: 'desktop:get-global-access-shortcut',
     DESKTOP_SET_SHORTCUT_OVERRIDES: 'desktop:set-shortcut-overrides',
+    DESKTOP_SHORTCUTS_CHANGED: 'desktop:shortcuts-changed',
     DESKTOP_OPEN_NOTIFICATION_SETTINGS: 'desktop:open-notification-settings',
     DESKTOP_SET_LANGUAGE: 'desktop:set-language',
     DESKTOP_GET_LOCAL_RUNTIME_DATA_DIR_INFO: 'desktop:get-local-runtime-data-dir-info',
@@ -236,9 +237,30 @@ export let IPC_CHANNELS = {
     MINIAPP_OPEN: 'miniapp:open',
     MINIAPP_REFRESH: 'miniapp:refresh',
     MINIAPP_STOP: 'miniapp:stop',
+    MINIAPP_DETACH: 'miniapp:detach',
+    MINIAPP_ATTACH: 'miniapp:attach',
     MINIAPP_COMPOSER_APPEND: 'miniapp:composer-append',
     MINIAPP_COMPOSER_REQUEST: 'miniapp:composer-request',
     MINIAPP_COMPOSER_REPLY: 'miniapp:composer-reply',
+    MINIAPP_AGENT_RUN: 'miniapp:agent-run',
+    MINIAPP_AGENT_CANCEL: 'miniapp:agent-cancel',
+    MINIAPP_AGENT_EVENT: 'miniapp:agent-event',
+    MINIAPP_AGENT_REPLY: 'miniapp:agent-reply',
+    MINIAPP_AGENT_ANSWER: 'miniapp:agent-answer',
+    MINIAPP_AGENT_OPEN: 'miniapp:agent-open',
+    MINIAPP_AGENT_MODELS: 'miniapp:agent-models',
+    MINIAPP_AGENT_AGENTS: 'miniapp:agent-agents',
+    MINIAPP_AGENT_CREATE: 'miniapp:agent-create',
+    // Main -> Host renderer: show a Mini App session in the host chat's side panel.
+    MINIAPP_AGENT_OPEN_SESSION: 'miniapp:agent-open-session',
+    // Host renderer -> Main: the preload's answer to MINIAPP_AGENT_OPEN_SESSION (same requestId).
+    MINIAPP_AGENT_OPEN_SESSION_REPLY: 'miniapp:agent-open-session-reply',
+    // Host renderer -> Main: the user closed a Mini App session tab.
+    MINIAPP_AGENT_PANEL_CLOSED: 'miniapp:agent-panel-closed',
+    // Page-facing window handle; invoked only by the Mini App preload.
+    MINIAPP_WINDOW_GET_STATE: 'miniapp:window-get-state',
+    MINIAPP_WINDOW_UPDATE: 'miniapp:window-update',
+    MINIAPP_WINDOW_FOCUS: 'miniapp:window-focus',
     // Browser profile import (trusted host renderer only)
     BROWSER_PROFILE_IMPORT_LIST: 'browser-profile-import:list',
     BROWSER_PROFILE_IMPORT_START: 'browser-profile-import:start',
@@ -338,6 +360,34 @@ export let IPC_CHANNELS = {
     RUNTIME_TRANSPORT_GET_CURRENT: 'runtime:transport-get-current',
     RUNTIME_TRANSPORT_REQUEST_SWITCH: 'runtime:transport-request-switch',
     RUNTIME_TRANSPORT_LOST: 'runtime:transport-lost',
+    SSH_CONNECTIONS_LIST: 'ssh-connections:list',
+    SSH_CONNECTIONS_OPERATION_STATES: 'ssh-connections:operation-states',
+    SSH_CONNECTIONS_OPERATION_STATE: 'ssh-connections:operation-state',
+    SSH_CONNECTIONS_ADD: 'ssh-connections:add',
+    SSH_CONNECTIONS_CANCEL_ADD: 'ssh-connections:cancel-add',
+    SSH_CONNECTIONS_ADD_PROGRESS: 'ssh-connections:add-progress',
+    SSH_CONNECTIONS_UPDATE: 'ssh-connections:update',
+    SSH_CONNECTIONS_SET_ENABLED: 'ssh-connections:set-enabled',
+    SSH_CONNECTIONS_REMOTE_ACCOUNT: 'ssh-connections:remote-account',
+    SSH_CONNECTIONS_REMOVE: 'ssh-connections:remove',
+    SSH_CONNECTIONS_DISCOVER: 'ssh-connections:discover',
+    SSH_CONNECTIONS_PROBE: 'ssh-connections:probe',
+    SSH_CONNECTIONS_CONNECT: 'ssh-connections:connect',
+    SSH_CONNECTIONS_SETUP_CLI: 'ssh-connections:setup-cli',
+    SSH_CONNECTIONS_LIST_DIRECTORIES: 'ssh-connections:list-directories',
+    SSH_PROJECTS_LIST: 'ssh-projects:list',
+    SSH_PROJECTS_CREATE: 'ssh-projects:create',
+    SSH_PROJECTS_UPDATE: 'ssh-projects:update',
+    SSH_PROJECTS_REMOVE: 'ssh-projects:remove',
+    SSH_PROJECTS_UPLOAD_ATTACHMENT: 'ssh-projects:upload-attachment',
+    PROJECT_RUNTIME_TRANSPORT_REQUEST_PORT: 'project-runtime:transport-request-port',
+    PROJECT_RUNTIME_TRANSPORT_DISCONNECT: 'project-runtime:transport-disconnect',
+    PROJECT_RUNTIME_GET_STATUS: 'project-runtime:get-status',
+    PROJECT_RUNTIME_TRANSPORT_LOST: 'project-runtime:transport-lost',
+    PROJECT_RUNTIME_FAILED: 'project-runtime:failed',
+    PROJECT_RUNTIME_STATUS: 'project-runtime:status',
+    PROJECT_RUNTIME_NETWORK_ONLINE: 'project-runtime:network-online',
+    PROJECT_RUNTIME_ACTIVE_PROJECT: 'project-runtime:active-project',
     LOCAL_ASR_SESSION_OPEN: 'local-asr:session-open',
     LOCAL_ASR_SESSION_FRAME: 'local-asr:session-frame',
     LOCAL_ASR_SESSION_AUDIO: 'local-asr:session-audio',
@@ -408,6 +458,15 @@ export let IPC_CHANNELS = {
     // process owns the unbind HTTP call (kept for the account-switch path,
     // which has no renderer axios available).
     RC_MARK_UNBOUND: 'rc:mark-unbound',
+    // Renderer → main: "用户点了解绑，请给我这次 producer 全删的 request_id"。
+    // request_id 由 main 生成并持久化（ADR-011 D12：renderer 刷新会丢），
+    // 已存在未确认记录时复用同一个 id —— 幂等重放靠的就是它（方案 §4.5.4）。
+    RC_BEGIN_UNBIND: 'rc:begin-unbind',
+    // Renderer → main: 冷启动时读取未确认解绑记录，用于恢复重放。
+    RC_GET_PENDING_UNBIND: 'rc:get-pending-unbind',
+    // Renderer → main: 解绑得到**确定结果**（confirmed / rejected）。
+    // 超时与网络错误不走这里 —— 那些保持待确认，不能凭 HTTP 超时判定未解绑。
+    RC_RESOLVE_UNBIND: 'rc:resolve-unbind',
     RC_PUBLISH_SESSION_COMPOSER_MODE: 'rc:publish-session-composer-mode',
     RC_SESSION_COMPOSER_MODE_CHANGED: 'rc:session-composer-mode-changed',
     // 应用生命周期
@@ -419,13 +478,10 @@ export let IPC_CHANNELS = {
     APP_BRING_TO_FRONT: 'app:bring-to-front',
     // Dock file drop (macOS)
     DOCK_FILE_OPENED: 'dock:file-opened',
+    DOCK_FILE_RECEIVER_READY: 'dock:file-receiver-ready',
 };
 /** 全局快捷键键值 */
 export let SHORTCUT_KEYS = {
     MINI_CHAT_CREATE: 'miniChatCreate',
     MINI_CHAT_TOGGLE: 'miniChat.toggle',
-};
-/** 全局快捷键默认值 */
-export let DEFAULT_SHORTCUT = {
-    MINI_CHAT_CREATE: 'Alt+A',
 };

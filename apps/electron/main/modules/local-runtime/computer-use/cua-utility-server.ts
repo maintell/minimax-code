@@ -210,6 +210,7 @@ export async function startCuaUtilityServer(input) {
                 activeTurnId === operation.turnId &&
                 activeLeaseId === requestLeaseId) {
                 input.onOperation?.(operation);
+                return () => input.onOperationFinished?.(operation);
             }
         }, pointerTargets, (event) => {
             if (!controller.signal.aborted)
@@ -315,14 +316,6 @@ async function handleRequest(runtime, request, parentPort, logger, signal, readD
             ? { name: 'host_display_list', payload: {} }
             : await mapRequestToCuaTool(runtime, request, signal);
         signal.throwIfAborted();
-        if ((process.platform === 'win32' ||
-            (process.platform === 'darwin' &&
-                (['app_activate', 'app_launch', 'secondary_action'].includes(request.kind) ||
-                    payload.delivery_mode === 'foreground' ||
-                    (isRecord(payload.target) && payload.target.kind === 'desktop')))) &&
-            isMutatingRequest(request.kind)) {
-            onOperation?.(request);
-        }
         await publishPreview?.(request, payload);
         logger.info('action_mapped', {
             requestId: request.requestId,
@@ -361,10 +354,26 @@ async function handleRequest(runtime, request, parentPort, logger, signal, readD
             /* Optional presentation must never prevent input. */
         }
         signal.throwIfAborted();
-        driverDispatched = request.kind !== 'display_list';
-        const rawResult = request.kind === 'display_list'
-            ? await readDisplays(signal)
-            : await callCuaToolWithDeliveryMode(runtime, name, payload, signal);
+        const finishOperation = ['win32', 'darwin'].includes(process.platform) &&
+            isMutatingRequest(request.kind) &&
+            (['app_activate', 'app_launch', 'secondary_action'].includes(request.kind) ||
+                payload.delivery_mode === 'foreground' ||
+                (isRecord(payload.target) && payload.target.kind === 'desktop'))
+            ? onOperation?.(request)
+            : undefined;
+        let rawResult;
+        try {
+            driverDispatched = request.kind !== 'display_list';
+            rawResult =
+                request.kind === 'display_list'
+                    ? await readDisplays(signal)
+                    : await callCuaToolWithDeliveryMode(runtime, name, payload, signal);
+        }
+        finally {
+            // Supervision tracks foreground input, independently of the turn's control lease
+            // and any read-only observation/diagnostics performed after the native action.
+            finishOperation?.();
+        }
         if (!signal.aborted && !(isRecord(rawResult) && rawResult.isError === true)) {
             onPointer?.({
                 sessionId: request.sessionId,

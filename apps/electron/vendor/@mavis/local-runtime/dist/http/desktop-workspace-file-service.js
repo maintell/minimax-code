@@ -4,14 +4,34 @@ import { DesktopModelProviderServiceBase } from './desktop-model-provider-servic
 const LOCAL_RUNTIME_ORIGIN = 'http://local-runtime.test';
 /** Thin DesktopService adapter over the existing /mavis/api/file and /fs facades. */
 export class DesktopWorkspaceFileServiceBase extends DesktopModelProviderServiceBase {
+    async getWorkspaceFileMetadata(_ctx, _req) {
+        throw new HTTPException(501, { message: 'Workspace file metadata requires Runtime V2.' });
+    }
     async listWorkspaceFileTree(_ctx, req) {
+        if (req.cursor !== undefined ||
+            req.limit !== undefined ||
+            req.includeHidden !== undefined ||
+            req.includeMetadata !== undefined) {
+            throw new HTTPException(501, { message: 'Workspace file pagination requires Runtime V2.' });
+        }
         const entries = await this.localApiJson(query('/mavis/api/file/tree', { workspace: req.workspace, path: req.path }));
         return { entries };
     }
     readWorkspaceFile(_ctx, req) {
+        if (req.offset !== undefined || req.length !== undefined || req.maxBytes !== undefined) {
+            throw new HTTPException(501, { message: 'Workspace file byte ranges require Runtime V2.' });
+        }
         return this.localApiJson(query('/mavis/api/file/content', { workspace: req.workspace, path: req.path }));
     }
     saveWorkspaceFile(_ctx, req) {
+        if (req.content === undefined ||
+            req.contentBase64 !== undefined ||
+            req.encoding !== undefined ||
+            req.expectedRevision !== undefined) {
+            throw new HTTPException(501, {
+                message: 'Workspace file binary and revision writes require Runtime V2.',
+            });
+        }
         return this.localApiJson('/mavis/api/file/save', {
             method: 'POST',
             body: { workspace: req.workspace, path: req.path, content: req.content },

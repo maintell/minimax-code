@@ -62,17 +62,56 @@ export function mergeAgentHostTurnCapabilities(input) {
         finalTools: merged.tools,
         deferredToolNames: new Set(attributed.plan.deferred ? attributed.plan.deferredRegistry.keys() : []),
     });
+    const delegable = delegablePluginIds(capabilities.agents, merged.tools);
     const unavailable = [
         ...new Set(parsePluginMentions(input.userText).map((mention) => mention.pluginId)),
-    ].filter((id) => !inventory.some((plugin) => plugin.pluginId === id &&
-        (plugin.skills.length > 0 ||
-            plugin.appCliProviders?.length ||
-            plugin.appTools.length > 0 ||
-            plugin.mcpTools.length > 0 ||
-            plugin.hostTools?.some((group) => group.tools.length > 0))));
-    const reminder = buildPluginReferenceReminder(detectPluginReferencesForMessages([{ content: input.userText }], input.userText, inventory), unavailable);
+    ].filter((id) => !delegable.has(id) &&
+        !inventory.some((plugin) => plugin.pluginId === id &&
+            (plugin.skills.length > 0 ||
+                plugin.appCliProviders?.length ||
+                plugin.appTools.length > 0 ||
+                plugin.mcpTools.length > 0 ||
+                plugin.hostTools?.some((group) => group.tools.length > 0))));
+    const reminder = [
+        buildPluginReferenceReminder(detectPluginReferencesForMessages([{ content: input.userText }], input.userText, inventory), unavailable),
+        renderPluginAgentRoster(capabilities.agents, merged.tools),
+    ]
+        .filter(Boolean)
+        .join('\n\n');
     return { ...attributed, ...(reminder ? { reminder } : {}) };
 }
+/** Plugin Agents come only from LOCAL packages and are callable only through `task`. */
+function delegablePluginIds(agents, tools) {
+    if (!agents?.length || !tools.some((tool) => tool.def.name === 'task'))
+        return new Set();
+    return new Set(agents.map((agent) => buildPluginId(agent.pluginName, 'local')));
+}
+const PLUGIN_AGENT_DESCRIPTION_LIMIT = 200;
+/**
+ * @internal Exported only for focused roster tests.
+ * Stable Plugin Agent roster; emitted only when this Turn can call `task`.
+ */
+export function renderPluginAgentRoster(agents, tools) {
+    if (!agents?.length || !tools.some((tool) => tool.def.name === 'task'))
+        return undefined;
+    const lines = [...agents]
+        .sort((left, right) => (left.scopedName < right.scopedName ? -1 : 1))
+        .map((agent) => `- \`${agent.scopedName}\`: ${rosterDescription(agent.description)}`);
+    return [
+        '<plugin-agents>',
+        'Enabled Plugin subagents. To delegate, call `task` with `agent_name` set to the scoped name.',
+        ...lines,
+        '</plugin-agents>',
+    ].join('\n');
+}
+function rosterDescription(description) {
+    const flat = description.replace(/\s+/gu, ' ').trim();
+    const clipped = flat.length > PLUGIN_AGENT_DESCRIPTION_LIMIT
+        ? `${flat.slice(0, PLUGIN_AGENT_DESCRIPTION_LIMIT - 1)}…`
+        : flat;
+    return clipped.replace(/[<>&]/gu, (char) => ROSTER_ESCAPES[char] ?? char);
+}
+const ROSTER_ESCAPES = { '<': '&lt;', '>': '&gt;', '&': '&amp;' };
 function buildAttributionIndex(input) {
     const plugins = new Map(input.capabilities.plugins.map((plugin) => [normalizedName(plugin.name), plugin]));
     const finalTools = new Set(input.finalTools);

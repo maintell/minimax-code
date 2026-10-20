@@ -1,19 +1,32 @@
-import { isTerminalTaskStatus, normalizeTaskError, } from './domain.js';
+import { BackgroundTaskError, isTerminalTaskStatus, normalizeTaskError, } from './domain.js';
+const STOP_CONFIRMATION_TIMEOUT_MS = 15_000;
 export async function performTaskStop(context, task, reason) {
     const taskId = task.taskId;
     const stoppingResult = await context.patchStatusIfNotTerminal(task, 'stopping', {
         updatedAt: context.nowMs(),
-        ...(reason ? { lastError: { message: reason, code: 'TASK_STOP_REQUESTED' } } : {}),
+        lastError: reason ? { message: reason, code: 'TASK_STOP_REQUESTED' } : undefined,
+        metadata: { stopError: undefined },
     });
     if (!stoppingResult.patched)
         return stoppingResult.task;
     const stopping = stoppingResult.task;
-    await context.emit(stopping, 'stop_requested', { reason });
+    context.onStatusChanged(stopping);
+    let timeout;
     try {
-        await context.stopRuntime?.(stopping, reason);
+        await Promise.race([
+            context.stopRuntime?.(stopping, reason),
+            new Promise((_resolve, reject) => {
+                timeout = setTimeout(() => reject(new BackgroundTaskError('Timed out waiting for task shutdown confirmation', 'TASK_STOP_TIMEOUT')), STOP_CONFIRMATION_TIMEOUT_MS);
+                timeout.unref?.();
+            }),
+        ]);
         const settled = await context.store.get(taskId);
         if (settled && isTerminalTaskStatus(settled.status))
             return settled;
+        // Bash runners publish the observed exit and final output before settling.
+        if (task.kind === 'bash') {
+            throw new BackgroundTaskError('Bash process exit could not be confirmed by its owning runtime', 'TASK_STOP_UNCONFIRMED');
+        }
         const canceledResult = await context.patchStatusIfNotTerminal(stopping, 'canceled', {
             endedAt: context.nowMs(),
             ...(reason ? { lastError: { message: reason, code: 'TASK_CANCELED' } } : {}),
@@ -21,7 +34,7 @@ export async function performTaskStop(context, task, reason) {
         if (!canceledResult.patched)
             return canceledResult.task;
         const canceled = canceledResult.task;
-        await context.emit(canceled, 'completed', { status: 'canceled' });
+        context.onStatusChanged(canceled);
         return canceled;
     }
     catch (error) {
@@ -31,15 +44,15 @@ export async function performTaskStop(context, task, reason) {
         });
         if (isTerminalTaskStatus(settled.status))
             return settled;
-        const canceledResult = await context.patchStatusIfNotTerminal(stopping, 'canceled', {
-            endedAt: context.nowMs(),
+        const failedResult = await context.patchStatusIfNotTerminal(stopping, 'stopping', {
             lastError: stopError,
         });
-        if (!canceledResult.patched)
-            return canceledResult.task;
-        const canceled = canceledResult.task;
-        await context.emit(canceled, 'completed', { status: 'canceled', stopFailed: true });
-        return canceled;
+        if (failedResult.patched)
+            context.onStatusChanged(failedResult.task);
+        return failedResult.task;
+    }
+    finally {
+        clearTimeout(timeout);
     }
 }
 //# sourceMappingURL=task-stop.js.map

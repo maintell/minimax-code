@@ -163,14 +163,21 @@ export class SessionContentApplication {
         }
     }
     async readMessages(input) {
-        const repaired = await this.options.maintenance.tryRunExclusive(input.sessionId, async () => {
-            const page = await this.options.messages.list(input);
-            return {
-                ...page,
-                messages: await this.options.staleCompactionRepair.repair(input.sessionId, page.messages),
-            };
-        });
-        const page = repaired.acquired ? repaired.value : await this.options.messages.list(input);
+        let page = await this.options.messages.list(input);
+        // Normal history reads must not take the admission lock: concurrent sends
+        // otherwise fail as "active Turn" even though no Turn exists. Mutating stale
+        // compaction repair still re-reads and writes under the exclusive fence.
+        if (this.options.staleCompactionRepair.needsRepair(page.messages)) {
+            const repaired = await this.options.maintenance.tryRunExclusive(input.sessionId, async () => {
+                const current = await this.options.messages.list(input);
+                return {
+                    ...current,
+                    messages: await this.options.staleCompactionRepair.repair(input.sessionId, current.messages),
+                };
+            });
+            if (repaired.acquired)
+                page = repaired.value;
+        }
         return {
             ...page,
             messages: await this.options.conversationActions.project({

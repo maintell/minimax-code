@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { dataDirFs } from "./data-dir-fs.js";
 export class DataDirStorageError extends Error {
     constructor(code, detail) {
         super(detail ? `${code}: ${detail}` : code);
@@ -146,19 +146,19 @@ export async function assertInternalDataDirStorage(realDirectory) {
     }
 }
 export async function probeDataDirWrites(parentDir) {
-    const probe = await fs.mkdtemp(path.join(parentDir, '.minimax-storage-probe-'));
+    const probe = await dataDirFs.mkdtemp(path.join(parentDir, '.minimax-storage-probe-'));
     try {
         const source = path.join(probe, 'source');
         const target = path.join(probe, 'target');
-        await fs.writeFile(source, 'minimax-storage-probe', { flag: 'wx' });
-        await fs.writeFile(target, 'replace-me', { flag: 'wx' });
-        await fs.rename(source, target);
-        if ((await fs.readFile(target, 'utf8')) !== 'minimax-storage-probe') {
+        await dataDirFs.writeFile(source, 'minimax-storage-probe', { flag: 'wx' });
+        await dataDirFs.writeFile(target, 'replace-me', { flag: 'wx' });
+        await dataDirFs.rename(source, target);
+        if ((await dataDirFs.readFile(target, 'utf8')) !== 'minimax-storage-probe') {
             throw new Error('Data directory readback failed');
         }
-        await fs.unlink(target);
+        await dataDirFs.unlink(target);
     }
     finally {
-        await fs.rm(probe, { recursive: true, force: true });
+        await dataDirFs.rm(probe, { recursive: true, force: true });
     }
 }

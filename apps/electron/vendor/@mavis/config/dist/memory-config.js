@@ -19,8 +19,9 @@ export const MEMORY_V2_DEFAULTS = {
     maxCaptureAttemptsPerRevision: 3,
     captureFailureBackoffMs: 60 * 60 * 1000,
     publicationCooldownMs: 6 * 60 * 60 * 1000,
+    consolidationCron: undefined,
     maxConsolidationAgentTurns: 64,
-    minModelQuotaRemainingPercent: 25,
+    minModelQuotaRemainingPercent: 20,
     captureModel: undefined,
     captureReasoningEffort: 'low',
     consolidationModel: undefined,
@@ -76,6 +77,9 @@ export function parseMemoryConfig(raw, memoryDefaults) {
             maxCaptureAttemptsPerRevision: positiveIntegerOr(v2Obj.maxCaptureAttemptsPerRevision, defaults.maxCaptureAttemptsPerRevision),
             captureFailureBackoffMs: positiveIntegerOr(v2Obj.captureFailureBackoffMs, defaults.captureFailureBackoffMs),
             publicationCooldownMs: positiveIntegerOr(v2Obj.publicationCooldownMs, defaults.publicationCooldownMs),
+            consolidationCron: typeof v2Obj.consolidationCron === 'string'
+                ? v2Obj.consolidationCron.trim() || undefined
+                : defaults.consolidationCron,
             maxConsolidationAgentTurns: positiveIntegerOr(v2Obj.maxConsolidationAgentTurns, defaults.maxConsolidationAgentTurns),
             minModelQuotaRemainingPercent: percentOr(v2Obj.minModelQuotaRemainingPercent, defaults.minModelQuotaRemainingPercent),
             captureModel: modelNameOr(v2Obj.captureModel, defaults.captureModel),

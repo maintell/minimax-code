@@ -34,6 +34,8 @@ export async function composeMiniAppRuntimeCapability(input) {
                 ...input.options,
                 db: input.db,
                 connectorGateway: input.plugin.hostConnectorGateway,
+                ...(input.agentGateway ? { agentGateway: input.agentGateway } : {}),
+                ...(input.logger ? { logger: input.logger } : {}),
                 verifyCandidate: (candidate) => input.plugin.verifyMiniAppCandidate(candidate),
                 materializePackage: (materialization) => input.plugin.materializeMiniAppRuntimePackage(materialization),
                 // Plugin-authored context.dataDir is persistent state. Keep the shipped physical root.

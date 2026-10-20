@@ -104,12 +104,17 @@ export function createLocalSkillRegistryProvider(configGetter, rootsGetter, diag
         }
         return handle.refreshPromise;
     }
+    async function refreshCachedHandles() {
+        // Shared roots must publish mutations to every warm workspace/Agent view,
+        // including remote hosts where recursive watching is unavailable.
+        await Promise.all([...handles.values()].map(refreshHandle));
+    }
     return {
         ...createRegistryOperations({
             getHandleForAgent,
             withAgentResourceScope,
             resolveSkillHandle,
-            refreshHandle,
+            refreshCachedHandles,
             enabledState,
             readMcpServerNames,
         }),
@@ -121,7 +126,7 @@ export function createLocalSkillRegistryProvider(configGetter, rootsGetter, diag
     };
 }
 function createRegistryOperations(context) {
-    const { getHandleForAgent, withAgentResourceScope, resolveSkillHandle, refreshHandle, enabledState, readMcpServerNames, } = context;
+    const { getHandleForAgent, withAgentResourceScope, resolveSkillHandle, refreshCachedHandles, enabledState, readMcpServerNames, } = context;
     return {
         async listSkills(input, installedHubMetadataByLocationUri) {
             return withAgentResourceScope(input, async (scopedInput) => {
@@ -251,7 +256,7 @@ function createRegistryOperations(context) {
             if (deleted && deleted !== 'protected') {
                 if (identity)
                     await enabledState.forget(identity.locationUri);
-                await refreshHandle(handle);
+                await refreshCachedHandles();
             }
             return deleted;
         },
@@ -267,8 +272,8 @@ function createRegistryOperations(context) {
             return { ok: true, name: identity.name, enabled };
         },
         async refresh(input = {}) {
-            const handle = await getHandleForAgent(input);
-            await refreshHandle(handle);
+            await getHandleForAgent(input);
+            await refreshCachedHandles();
         },
     };
 }

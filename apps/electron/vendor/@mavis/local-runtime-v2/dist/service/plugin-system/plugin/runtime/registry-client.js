@@ -106,6 +106,7 @@ function readMarketplaceResponse(value) {
     const record = requireRecord(value, 'Marketplace response');
     return {
         plugins: readArray(record, 'plugins', 'plugins').map(readMarketplaceSummary),
+        ...optionalArrayProjection(record, ['tag_definitions', 'tagDefinitions'], 'tagDefinitions', readPluginTag),
         ...optionalStringProjection(record, 'next_cursor', 'nextCursor', 'nextCursor'),
         ...optionalBooleanProjection(record, 'has_more', 'hasMore', 'hasMore'),
         ...optionalNumberProjection(record, 'plugin_total', 'pluginTotal', 'pluginTotal'),
@@ -154,6 +155,7 @@ function readMarketplaceSummary(value) {
     const record = requireRecord(value, 'Plugin Marketplace summary');
     return {
         name: requireString(record, 'name', 'name'),
+        ...optionalArrayProjection(record, ['tags', 'tags'], 'tags', readPluginTag),
         ...optionalStringProjection(record, 'version', 'version', 'version'),
         ...optionalStringProjection(record, 'display_name', 'displayName', 'displayName'),
         ...optionalStringProjection(record, 'description', 'description', 'description'),
@@ -415,5 +417,12 @@ function invalidResponse(detail) {
 }
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function readPluginTag(value) {
+    const record = requireRecord(value, 'Plugin tag');
+    return {
+        key: requireString(record, 'key', 'key'),
+        displayName: requireString(record, 'display_name', 'displayName'),
+    };
 }
 //# sourceMappingURL=registry-client.js.map

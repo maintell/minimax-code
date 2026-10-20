@@ -8,6 +8,7 @@ import { app } from "electron";
 import turndown from "turndown";
 import { ElementMapManager, abortableDelay, withTimeout, BROWSER_TIMEOUTS, isBrowserOperationInterruption, throwIfAborted, CDPTextInputError } from "@mavis/browser-core";
 import { getCategoryLogger } from "../../utils/logger";
+import { isBackgroundRenderForegroundClaim } from "./background-browser-render-host";
 import { CDPHelper } from "./cdp-helper";
 // 页面加载超时时间 (ms)
 const PAGE_LOAD_TIMEOUT = 30000;
@@ -680,11 +681,16 @@ export class BrowserActions {
                 if (!options.signal)
                     return;
                 const onAbort = () => {
-                    try {
-                        wc.stop();
-                    }
-                    catch {
-                        // WebContents can disappear while an abort is propagating.
+                    // A foreground reveal only reclaims the hidden render slot; the page
+                    // it reveals is this navigation, so let the load continue visibly.
+                    // Every other abort (caller cancel, deadline, teardown) stops it.
+                    if (!isBackgroundRenderForegroundClaim(options.signal)) {
+                        try {
+                            wc.stop();
+                        }
+                        catch {
+                            // WebContents can disappear while an abort is propagating.
+                        }
                     }
                     reject(new Error('ABORTED: Browser action was cancelled'));
                 };

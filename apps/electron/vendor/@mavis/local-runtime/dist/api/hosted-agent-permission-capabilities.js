@@ -19,6 +19,9 @@ export function createHostedAgentPermissionCapabilities(host) {
                     sessionId: input.sessionId,
                     permissionModeOverride: input.permissionMode ?? readLocalPermissionMode(ctx.configGetter().permissionMode),
                     trustedExactWritePaths: [...(input.trustedExactWritePaths ?? [])],
+                    ...(input.nativeDeleteSnapshot !== undefined
+                        ? { nativeDeleteSnapshot: input.nativeDeleteSnapshot }
+                        : {}),
                 });
                 if (decision.behavior === 'deny') {
                     return { behavior: 'deny', reason: decision.reason };
