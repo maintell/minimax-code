@@ -59,7 +59,9 @@ jobs:
       # a different revision of the same first-party packages.
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10
+          # The client pins its own pnpm in its standalone manifest; the root
+          # workspace pins a different one.
+          package_json_file: apps/electron/package.json
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'

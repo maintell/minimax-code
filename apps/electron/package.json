@@ -221,5 +221,6 @@
       "urllib": "2.44.0",
       "xml-naming": "0.1.0"
     }
-  }
+  },
+  "packageManager": "pnpm@10.34.5"
 }
