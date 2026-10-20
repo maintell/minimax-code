@@ -45,6 +45,10 @@ extraResources:
 
 win:
   icon: resources/icon.ico
+  # No spaces: release hosts (GitHub releases among them) rewrite spaces in
+  # asset names, which would no longer match the `path` recorded in latest.yml
+  # and break the updater.
+  artifactName: MiniMax-Code-Setup-${version}.${ext}
   target:
     - target: nsis
       arch:
