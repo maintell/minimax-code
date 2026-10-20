@@ -64,18 +64,23 @@ and one file is a prebuilt bundle copied verbatim.
 The shipped client retries a failed model request with exponential backoff and a
 five-attempt / two-minute budget, and treats a dropped response body (`5xx`,
 `net::ERR_INCOMPLETE_CHUNKED_ENCODING`, empty response) as terminal. This product
-wants the opposite: provider errors retry without a practical limit, on a fixed
-three-second cadence.
+wants provider errors retried without a practical limit, on a fixed three-second
+cadence, while a wrong credential or an exhausted quota stays terminal instead of
+hiding behind days of retries.
 
 That is a behavioural change, not a recovery artefact, so it is applied by
 [`apply-local-patches.mjs`](./apply-local-patches.mjs) after vendoring:
 
 ```sh
-node tools/restore/apply-local-patches.mjs      # patches vendor/** in place
+node tools/restore/apply-local-patches.mjs      # patches vendor/** and out/ in place
 ```
 
-The script asserts every anchor it edits, so a shipped build that refactors the
-retry loop or the classifier fails loudly here instead of silently reverting to
+It patches three things: the retry policy and delay in `@mavis/agent-core`, the
+classifier in `@mavis/shared`, and the renderer's retry copy (`({{attempt}}/{{total}})`
+→ `({{attempt}}/∞)`, English and Chinese), since the renderer is a prebuilt
+artifact and would otherwise print the raw cap. The script is idempotent and
+asserts every anchor, so a shipped build that refactors the retry loop, the
+classifier or the retry copy fails loudly here instead of silently reverting to
 the shipped defaults. `RESTORATION.md` records the patched files.
 
 ## Re-running on a new shipped build

@@ -118,14 +118,17 @@ exception documented below.
 
 | File | Change | Reason |
 | --- | --- | --- |
-| `vendor/@mavis/agent-core/dist/pi-turn-runner/llm-retry.js` | Provider errors retry without a practical limit (one million attempts) on the fixed `baseDelayMs` cadence (3 s), with no backoff, no jitter and no wall-clock budget. A server-directed `Retry-After` header still wins. BYOK retry-all additionally treats deterministic request rejections (413 / oversized body, context overflow, image limit, HTTP 400 `invalid_request_error`) as terminal. | Unstable upstreams must recover without user intervention; mirrors the same change in `packages/agent-core/src/pi-turn-runner/llm-retry.ts` so the desktop runtime and the CLI behave identically. The terminal carve-out matters more under the unbounded budget: without it a deterministic rejection would be re-sent roughly forever. |
+| `vendor/@mavis/agent-core/dist/pi-turn-runner/llm-retry.js` | Provider errors retry without a practical limit (`2_147_483_647` attempts — the largest serialisable integer, since the retry-event contract requires a non-negative integer) on the fixed `baseDelayMs` cadence (3 s), with no backoff, no jitter and no wall-clock budget. A server-directed `Retry-After` header still wins. BYOK retry-all additionally keeps these terminal: a wrong credential (`auth`), an exhausted usage plan (`usage_limit`), exhausted credits (`credits_exhausted`), deterministic request rejections (413 / oversized body, context overflow, image limit, HTTP 400 `invalid_request_error`) and provider safety refusals. | Unstable upstreams must recover without user intervention; mirrors the same change in `packages/agent-core/src/pi-turn-runner/llm-retry.ts` so the desktop runtime and the CLI behave identically. The terminal carve-outs matter more under the unbounded budget: retrying a bad key or an empty account can never succeed, it only hides the actionable error. |
 | `vendor/@mavis/shared/dist/llm-error-classifier.js` | `ERR_INCOMPLETE_CHUNKED_ENCODING` and `ERR_EMPTY_RESPONSE` join the transient-network marker set, and 5xx responses plus empty provider responses classify as retryable (`server_error` / `empty_response`). Deterministic-rejection signals (`image_limit`, `invalid_request`, `request_too_large`, `context_overflow`) and the exported `isLLMDeterministicRequestRejection` are backported. | A dropped or truncated response body is the classic flaky-upstream shape; mirrors `packages/shared/src/llm-error-classifier.ts`. |
+| `out/_next/static/chunks/*.js` (renderer string table) | The retry banner copy drops the attempt cap: `({{attempt}}/{{total}})` becomes `({{attempt}}/∞)`, in both the English and the Chinese tables. | The renderer is a prebuilt artifact, so the budget is presented by rewriting its plain strings; otherwise an unbounded budget would read `(3/2147483647)`. The TUI uses `formatRetryBudget()` from `@mavis/shared/llm-retry-event` for the same result. |
 
-Both snapshots are otherwise byte-identical to the shipped build; each patch is
-a few lines and is marked with a `Local patch:` comment in the file. They are not
-hand-edited: `tools/restore/apply-local-patches.mjs` re-applies them after every
-re-vendoring and asserts each anchor, so a shipped refactor of the retry loop or
-the classifier fails loudly instead of silently restoring the shipped defaults.
+The two vendored snapshots are otherwise byte-identical to the shipped build,
+and the renderer differs only in those four retry strings. Each code patch is a
+few lines marked with a `Local patch:` comment. None of this is hand-edited:
+`tools/restore/apply-local-patches.mjs` re-applies everything after every
+re-vendoring, works on an already-patched tree, and asserts each anchor — a
+shipped refactor of the retry loop, the classifier or the retry copy fails
+loudly instead of silently restoring the shipped behaviour.
 
 ## Dependency closure
 

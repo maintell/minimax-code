@@ -9,10 +9,12 @@ export const LLM_RETRY_CALL_IDENTITY = Symbol('mavis.llmRetryCallIdentity');
 export const LLM_RETRY_REQUEST_SETTLED_OBSERVER = Symbol('mavis.llmRetryRequestSettledObserver');
 export const DEFAULT_LLM_RETRY_POLICY = {
     // Local patch: provider errors retry without a practical limit on a fixed
-    // three-second cadence (no backoff, no wall-clock budget). The budget stays
-    // a serialisable integer for retry events; only user cancellation, model
-    // refusals and deterministic request rejections stay terminal.
-    maxRetries: 1_000_000,
+    // three-second cadence (no backoff, no wall-clock budget). The budget is the
+    // largest serialisable integer because the retry-event contract requires a
+    // non-negative integer; only user cancellation, model refusals, wrong
+    // credentials, exhausted quota and deterministic request rejections stay
+    // terminal.
+    maxRetries: 2_147_483_647,
     baseDelayMs: 3_000,
     maxDelayMs: 30_000,
     maxRetryElapsedMs: Number.POSITIVE_INFINITY,
@@ -368,6 +370,9 @@ function failureResult(input) {
     const decision = input.retryAllErrors &&
         !normalized.facts.explicitAbort &&
         !normalized.facts.signals.has('refusal') &&
+        // Local patch: a wrong credential or an exhausted usage plan cannot be
+        // fixed by waiting; those stay terminal under the unbounded budget.
+        !['auth', 'usage_limit', 'credits_exhausted'].includes(toLLMMetricErrorKind(normalized.facts)) &&
         !isLLMDeterministicRequestRejection(normalized) &&
         !(input.final && isContextOverflow(input.final))
         ? { retryable: true, reason: 'network' }
