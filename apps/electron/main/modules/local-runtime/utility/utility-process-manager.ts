@@ -1,5 +1,3 @@
-import { handleExcelEditorBrokerMessage } from "../../../ipc/excel-editor.ipc";
-import { handleWordEditorBrokerMessage } from "../../../ipc/word-editor.ipc";
 /**
  * Local-runtime utility process lifecycle manager (Electron main side).
  *
@@ -30,6 +28,7 @@ import { handleWordEditorBrokerMessage } from "../../../ipc/word-editor.ipc";
  * quarantined `actualExit`) that make every fork wait for the previous
  * process's real exit (§2.8 single-writer ordering).
  */
+
 import path from "path";
 import { randomUUID } from "crypto";
 import { boundFailureDetail } from "../../observability/failure-detail";
@@ -533,6 +532,45 @@ export class LocalRuntimeUtilityProcessManager {
     }
     /** Main-owned UI request over the utility control plane. */
     async requestMiniApp(method, pluginId, signal) {
+        return this.miniAppBroker.request(await this.readyMiniAppTarget(), method, pluginId, signal);
+    }
+    /** Page-path Agent run; `input.caller` was resolved by Main from the sending tab. */
+    async runMiniAppAgent(input, options) {
+        return this.miniAppBroker.runAgent(await this.readyMiniAppTarget(), input, options);
+    }
+    /** Page-path permission decision; `input.caller` was resolved by Main from the sending tab. */
+    async replyMiniAppAgent(input) {
+        return this.miniAppBroker.replyAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path side-panel check; `input.caller` was resolved by Main from the sending tab. */
+    async openMiniAppAgent(input) {
+        return this.miniAppBroker.openAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path model catalog; `input.caller` was resolved by Main from the sending tab. */
+    async modelsMiniAppAgent(input) {
+        return this.miniAppBroker.modelsAgent(await this.readyMiniAppTarget(), input);
+    }
+    async agentsMiniAppAgent(input) {
+        return this.miniAppBroker.agentsAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path session creation without a turn. */
+    async createMiniAppAgent(input) {
+        return this.miniAppBroker.createAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Host-reported side panel change for a Mini App session; no tab caller. */
+    async reportMiniAppAgentPanel(method, input) {
+        // A panel report describes in-memory runtime state. `panelOpened` follows a successful
+        // `open`, so the runtime is up; `panelClosed` must not start a runtime that is not
+        // running, since a stopped runtime has nothing left to forget.
+        if (method === 'agent.panelClosed' && this.state.phase !== 'ready')
+            return;
+        return this.miniAppBroker.reportAgentPanel(await this.readyMiniAppTarget(), method, input);
+    }
+    /** Page-path questionnaire answer; the continuation turn is followed like `runMiniAppAgent`. */
+    async answerMiniAppAgent(input, options) {
+        return this.miniAppBroker.answerAgent(await this.readyMiniAppTarget(), input, options);
+    }
+    async readyMiniAppTarget() {
         const ready = await this.ensureStarted();
         const state = this.state;
         if (!ready || state.phase !== 'ready') {
@@ -540,7 +578,7 @@ export class LocalRuntimeUtilityProcessManager {
                 code: 'runtime_unavailable',
             });
         }
-        return this.miniAppBroker.request(state.child, method, pluginId, signal);
+        return state.child;
     }
     disconnectRenderer(rendererId) {
         this.rendererGenerations.set(rendererId, (this.rendererGenerations.get(rendererId) ?? 0) + 1);
@@ -911,8 +949,23 @@ export class LocalRuntimeUtilityProcessManager {
         return this.stopPromise;
     }
     async doStop() {
+        const startedAtMs = Date.now();
+        const runtimePid = this.getProcessId();
         try {
-            return await this.performStop();
+            const result = await this.performStop();
+            try {
+                (this.options.logger ?? noopLogger).info(`[UtilityRuntime] stop completed ${JSON.stringify({
+                    ts_ms: Date.now(),
+                    runtime_pid: runtimePid,
+                    remaining_runtime_pid: this.getProcessId(),
+                    duration_ms: Date.now() - startedAtMs,
+                    ...result,
+                })}`);
+            }
+            catch {
+                // Diagnostics must not change the stop result or lifecycle cleanup.
+            }
+            return result;
         }
         finally {
             // A deliberate stop ends the supervision session: exits separated by
@@ -1408,8 +1461,6 @@ export class LocalRuntimeUtilityProcessManager {
             if ((state.phase !== 'starting' && state.phase !== 'ready') || state.child !== child) {
                 return;
             }
-            if (handleWordEditorBrokerMessage(child, raw) || handleExcelEditorBrokerMessage(child, raw))
-                return;
             if (this.browserBroker.handleMessage(child, raw))
                 return;
             if (this.diagnosticsBroker.handleMessage(child, raw))

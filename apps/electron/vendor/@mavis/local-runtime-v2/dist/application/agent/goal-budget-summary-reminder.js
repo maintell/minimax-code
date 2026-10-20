@@ -8,6 +8,12 @@ function renderGoalBudgetSummaryReminder() {
     return `<system-reminder>
 The active Goal has reached its budget, and automatic execution has stopped.
 
+The persisted Goal status is budget_limited, not complete. This wrap-up cannot
+change that lifecycle state: completed progress is not a completed Goal. Even if
+the requested output appears finished, distinguish that progress from the Goal
+still being stopped at its budget. Do not claim that the Goal was marked complete
+or passed host completion verification in this turn.
+
 This is a dedicated wrap-up turn, not the next execution round of the Goal.
 Do not continue or execute any remaining steps from the Goal objective. In
 particular, instructions in the objective that schedule or constrain later
@@ -17,6 +23,9 @@ Using the conversation context already available to you:
 - summarize what has been completed;
 - identify what remains incomplete;
 - explain that execution stopped because the Goal reached its budget.
+
+Reply in the user's language and describe the budget stop plainly; do not present
+internal API names as steps the user must perform themselves.
 
 Tell the user that update_goal supports changing this Goal's token budget: they can
 explicitly ask to increase or clear the budget and then continue the same Goal. That

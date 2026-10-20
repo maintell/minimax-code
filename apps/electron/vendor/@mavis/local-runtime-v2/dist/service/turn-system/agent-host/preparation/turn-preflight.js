@@ -68,16 +68,17 @@ export class TurnPreflight {
             request: input,
             referenced: referencedComputerUsePlugins.length > 0,
             runtimeFacts: this.dependencies.turnRuntimeFacts,
+            session,
         });
         const agent = freezeTurnExecutionSnapshot(freezeExecutionOwner(snapshot), {
             runtimeFacts: turnRuntimeFacts,
-            selected,
+            selected: selected.active,
         });
         const history = await observeAgentTurnSetupStage(this.dependencies.logger, logContext, 'history_read', () => this.dependencies.history.read(input.lease.sessionId));
         const runnerHistory = input.request.executionMode === 'continuation' ? continuationRunnerHistory(history) : history;
         const canonicalUserInput = createCanonicalAgentHostUserInput(input.request);
         const internalPromptRead = this.dependencies.internalTurnPromptReads?.take(input.lease.turnId);
-        const preparation = await observeAgentTurnSetupStage(this.dependencies.logger, logContext, 'agent_preparation', () => this.dependencies.preparation.prepare({
+        const prepared = await observeAgentTurnSetupStage(this.dependencies.logger, logContext, 'agent_preparation', () => this.dependencies.preparation.prepare({
             turnId: input.lease.turnId,
             request: input.request,
             session,
@@ -86,6 +87,12 @@ export class TurnPreflight {
             ...(desktopCapabilities ? { desktopCapabilities } : {}),
             ...(internalPromptRead ? { promptRead: internalPromptRead } : {}),
         }));
+        const preparation = selected.unavailable
+            ? {
+                ...prepared,
+                agentConfig: { ...prepared.agentConfig, computerUseDefaultUnavailable: true },
+            }
+            : prepared;
         const effectiveUserInput = replaceRetryContinuationPrompt(canonicalUserInput, preparation);
         const assemblyContext = createSecretFreeTurnAssemblyContext({
             input,
@@ -177,16 +184,40 @@ async function resolveTaskComputerUseSelection(input) {
         plugin.source === 'official' &&
         plugin.hostCapabilities?.includes('computer-use') === true) === true;
     if (!trustedEnabled)
-        return false;
+        return { active: false };
     const requestSelection = input.request.request.input.computerUse?.enable;
     const explicitSelection = requestSelection === true && input.referenced;
     if (!input.runtimeFacts?.resolveComputerUseSelection)
-        return explicitSelection;
+        return { active: explicitSelection };
     const selection = requestSelection === false || explicitSelection ? { selection: explicitSelection } : {};
-    return input.runtimeFacts.resolveComputerUseSelection({
+    const selected = await input.runtimeFacts.resolveComputerUseSelection({
         sessionId: input.request.lease.sessionId,
         ...selection,
     });
+    if (selected || requestSelection === false)
+        return { active: selected };
+    if (!isComputerUseDefaultEligible(input.session, input.request.request) ||
+        !input.runtimeFacts.snapshot().computerUseGloballyEnabled) {
+        return { active: false };
+    }
+    const defaultSelection = await input.runtimeFacts.resolveComputerUseDefault?.();
+    return {
+        active: defaultSelection === 'enabled',
+        unavailable: defaultSelection === 'unavailable',
+    };
+}
+// Positive admission only: background producers can target ordinary sessions too.
+function isComputerUseDefaultEligible(session, request) {
+    return (session.sessionKind === 'conversation' &&
+        !session.originCronId &&
+        session.visibility !== 'hidden' &&
+        !session.archived &&
+        (request.executionMode === 'continuation'
+            ? request.provenance.source === 'turn-continuation'
+            : request.provenance.source === 'api') &&
+        !request.input.channelContext &&
+        !request.input.origin &&
+        !request.input.queuedMessages?.some((message) => message.channelContext || message.origin));
 }
 /** Materializes the behaviour owner so every later stage reads one frozen value. */
 function freezeExecutionOwner(agent) {

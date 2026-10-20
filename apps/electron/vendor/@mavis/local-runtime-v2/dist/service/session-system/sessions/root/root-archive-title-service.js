@@ -88,7 +88,7 @@ export class RootArchiveTitleService {
             const fresh = await this.options.sessions.get(sessionId);
             if (!isEligibleArchiveSession(fresh, fallbackName, locale))
                 return false;
-            await this.options.sessions.update(sessionId, { title });
+            await this.options.sessions.update(sessionId, { title, titleSource: 'auto' });
             return true;
         }
         catch (error) {

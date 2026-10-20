@@ -1,5 +1,4 @@
-import { isComputerUseLog, createComputerUseLogWriter } from "./computer-use-log-writer";
-import promises from "fs/promises";
+import { createBoundedLogStorage } from "./bounded-log-storage.js";
 import path from "path";
 import electronLog from "electron-log";
 import { isDev } from "../config";
@@ -61,6 +60,11 @@ function getFullDateString() {
     const day = String(now.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
 }
+function isComputerUseLog(category, prefix) {
+    return (category === 'main' &&
+        prefix !== undefined &&
+        ['computer-use', 'computer-use-preview', 'computer-use-permission-guide'].includes(prefix));
+}
 // 默认日志文件名（main 类别）
 electronLog.transports.file.fileName = `main-${getDateString()}.log`;
 // 错误捕获 - 记录未捕获的异常
@@ -88,18 +92,43 @@ function getLogFileName(category, filenamePrefix) {
     }
     return `${category}-${dateStr}.log`;
 }
-// Track whether the log directory has been ensured to avoid repeated checks.
-let logDirEnsured = false;
-// Per-file serial write chains — ensures writes to the same log file are ordered.
-const writeComputerUseLog = createComputerUseLogWriter();
-const writeChains = new Map();
-// Pending write count for flush support.
+// A shared chain serializes writes, rotation and cleanup across categories.
+// Otherwise one category could prune a file while another appends to it.
+const storage = createBoundedLogStorage({ isManagedFile: isManagedLogFile });
+const MAX_RECORD_BYTES = 64 * 1024;
+const MAX_PENDING_BYTES = 8 * 1024 * 1024;
+const MAX_PENDING_RECORDS = 2048;
+let writeChain = Promise.resolve();
 let pendingCount = 0;
+let pendingBytes = 0;
+let droppedCount = 0;
+let cleanupPromise;
 let flushResolvers = [];
+function finishPendingWrite() {
+    pendingCount--;
+    if (pendingCount === 0) {
+        for (const resolve of flushResolvers)
+            resolve();
+        flushResolvers = [];
+    }
+}
+function boundedRecord(content) {
+    // Slice before encoding so exceptional strings do not allocate huge Buffers.
+    const bytes = Buffer.from(content.slice(0, MAX_RECORD_BYTES) + '\n');
+    if (bytes.length <= MAX_RECORD_BYTES)
+        return bytes;
+    const suffix = Buffer.from(' [truncated]\n');
+    let end = MAX_RECORD_BYTES - suffix.length;
+    while ((bytes[end] & 0xc0) === 0x80)
+        end--;
+    return Buffer.concat([bytes.subarray(0, end), suffix]);
+}
 function shouldWriteFileInDev(category, filenamePrefix) {
     // chat/session-trace is the historical dev allow-list entry. remoteControl
     // is added because the RC bridge is exercised mostly during dev 联调; without
     // files the WS lifecycle is hard to inspect in diagnostic bundles.
+    // main/ssh-perf carries the SSH Runtime latency records, which are only
+    // useful when they can be aggregated across a whole dev session.
     return ((category === 'chat' && filenamePrefix === 'session-trace') ||
         category === 'remoteControl' ||
         (category === 'archon' &&
@@ -109,66 +138,54 @@ function shouldWriteFileInDev(category, filenamePrefix) {
         (category === 'main' &&
             (filenamePrefix === 'browser-profile-import' ||
                 filenamePrefix === 'git-review-trace' ||
+                filenamePrefix === 'ssh-perf' ||
+                filenamePrefix === 'ssh-diagnostics' ||
                 filenamePrefix === 'computer-use')));
 }
-/**
- * 写入日志到指定类别的文件（异步，fire-and-forget）
- * 非开发环境下，将日志异步追加写入对应类别的文件，不阻塞主进程。
- * 同一文件的写入通过 Promise chain 串行化，保证日志顺序。
- */
+/** Queue bounded, best-effort writes without blocking the main process. */
 function writeToFile(category, content, filenamePrefix) {
     if (isDev && !shouldWriteFileInDev(category, filenamePrefix))
         return;
-    const logDir = getLogDir();
-    const fileName = getLogFileName(category, filenamePrefix);
-    const filePath = path.join(logDir, fileName);
-    const doWrite = async () => {
-        if (isComputerUseLog(category, filenamePrefix)) {
-            await writeComputerUseLog(filePath, content);
+    try {
+        const logDir = getLogDir();
+        const filePath = path.join(logDir, getLogFileName(category, filenamePrefix));
+        // Prefixes identify files, not paths. Never write outside the managed directory.
+        if (path.dirname(filePath) !== logDir)
+            return;
+        const bytes = boundedRecord(content);
+        if (pendingCount >= MAX_PENDING_RECORDS || pendingBytes + bytes.length > MAX_PENDING_BYTES) {
+            droppedCount = Math.min(Number.MAX_SAFE_INTEGER, droppedCount + 1);
             return;
         }
-        if (category === 'remoteControl') {
-            try {
-                const stat = await promises.stat(filePath);
-                const maxRemoteControlLogSize = 50 * 1024 * 1024;
-                if (stat.size >= maxRemoteControlLogSize) {
-                    await promises.rename(filePath, `${filePath}.${Date.now()}.old`);
-                }
+        const policy = isComputerUseLog(category, filenamePrefix)
+            ? { maxBytes: 5 * 1024 * 1024, backups: 3 }
+            : category === 'main' && filenamePrefix === 'ssh-diagnostics'
+                ? { maxBytes: 8 * 1024 * 1024, backups: 3, mode: 0o600 }
+                : undefined;
+        pendingCount++;
+        pendingBytes += bytes.length;
+        writeChain = writeChain
+            .then(async () => {
+            await storage.append(filePath, bytes, policy);
+            // Summarize dropped records on the next successful queued write, even
+            // if no new log arrives. flushLogs also waits for this summary.
+            if (droppedCount > 0) {
+                const dropped = droppedCount;
+                droppedCount = 0;
+                await storage.append(filePath, boundedRecord(formatLogLine('warn', `[file-logger] dropped ${dropped} records due to backpressure`)), policy);
             }
-            catch {
-                // file does not exist yet, or rotation failed; append best-effort below
-            }
-        }
-        await promises.appendFile(filePath, content + '\n').catch(() => { });
-    };
-    // Chain this write after the previous write to the same file.
-    const prev = writeChains.get(filePath) ?? Promise.resolve();
-    pendingCount++;
-    const next = prev
-        .then(() => {
-        if (!logDirEnsured) {
-            return promises
-                .mkdir(logDir, { recursive: true })
-                .then(() => {
-                logDirEnsured = true;
-            })
-                .catch(() => { });
-        }
-    })
-        .then(doWrite)
-        .finally(() => {
-        // Clean up chain entry when it becomes the tail — avoids map growth.
-        if (writeChains.get(filePath) === next) {
-            writeChains.delete(filePath);
-        }
-        pendingCount--;
-        if (pendingCount === 0 && flushResolvers.length > 0) {
-            for (const resolve of flushResolvers)
-                resolve();
-            flushResolvers = [];
-        }
-    });
-    writeChains.set(filePath, next);
+        })
+            .catch(() => {
+            // I/O errors must neither reject the chain nor recursively log to it.
+        })
+            .finally(() => {
+            pendingBytes -= bytes.length;
+            finishPendingWrite();
+        });
+    }
+    catch {
+        // Resolving the file transport can fail during startup/shutdown too.
+    }
 }
 /**
  * Wait for all pending async log writes to complete.
@@ -226,6 +243,8 @@ function formatLogLine(level, data) {
  */
 function createCategoryLogger(category, filenamePrefix) {
     const write = (level, data, extra) => {
+        // Preserve debug file evidence in production; only the console transport
+        // filters by level. Disk and queue budgets bound storage independently.
         const combined = extra === undefined ? formatLogData(data) : `${formatLogData(data)} ${formatLogData(extra)}`;
         electronLog[level](combined);
         writeToFile(category, formatLogLine(level, combined), filenamePrefix);
@@ -305,41 +324,38 @@ export function isLogFile(fileName) {
  */
 export { resolveRuntimeLogsDir, getExtraLogSources } from "./extra-log-source";
 
+// Legacy remoteControl archives are cleaned but not newly included in uploads.
+function isManagedLogFile(fileName) {
+    if (!isLogFile(fileName) && !/^remoteControl-.+\.log\.\d+\.old$/u.test(fileName))
+        return false;
+    if (!isDev)
+        return true;
+    const category = LOG_FILE_PREFIXES.find((prefix) => fileName.startsWith(prefix))?.slice(0, -1);
+    if (!category)
+        return false;
+    const prefix = fileName
+        .slice(category.length + 1)
+        .replace(/(?:-\d{2}-\d{2})?(?:\.\d+)?\.log(?:\.\d+\.old)?$/u, '');
+    return shouldWriteFileInDev(category, prefix);
+}
 /**
- * 清理过期日志文件（保留最近 7 天）
- * 应在应用启动时调用，异步执行不阻塞启动流程
+ * 启动时清理；写入器也在持续写入期间检查七天保留和目录容量。
+ * 与追加/轮转共用串行队列，flushLogs 会等待清理完成。
  */
-export async function cleanupOldLogs() {
-    if (isDev)
-        return;
-    try {
-        const logDir = getLogDir();
-        let files;
-        try {
-            files = await promises.readdir(logDir);
-        }
-        catch {
-            return;
-        }
-        const now = Date.now();
-        const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 天
-        for (const file of files) {
-            if (isLogFile(file)) {
-                const filePath = path.join(logDir, file);
-                try {
-                    const stat = await promises.stat(filePath);
-                    if (now - stat.mtimeMs > maxAge) {
-                        await promises.unlink(filePath);
-                    }
-                }
-                catch {
-                    // Skip individual file failures
-                }
-            }
-        }
-    }
-    catch {
-        // 静默失败，不影响日志功能
-    }
+export function cleanupOldLogs() {
+    if (cleanupPromise)
+        return cleanupPromise;
+    pendingCount++;
+    cleanupPromise = writeChain
+        .then(() => storage.cleanup(getLogDir()))
+        .catch(() => {
+        // Best-effort maintenance must not prevent application startup.
+    })
+        .finally(() => {
+        cleanupPromise = undefined;
+        finishPendingWrite();
+    });
+    writeChain = cleanupPromise;
+    return cleanupPromise;
 }
 export default logger;

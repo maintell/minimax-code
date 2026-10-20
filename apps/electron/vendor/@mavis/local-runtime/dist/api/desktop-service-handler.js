@@ -15,10 +15,11 @@ import { fetchOfficialModelConfig, OfficialModelConfigFetchError, OfficialModelC
 export function buildHostDesktopHandler(host, threadGoal, legacyMigrator) {
     return buildDesktopServiceHandler(host, {
         store: threadGoal.store,
-        createGoal: (input) => threadGoal.createGoal(input),
+        createGoal: (input, options) => threadGoal.createGoal(input, options),
         patchGoal: (sessionId, patch) => threadGoal.patchGoal(sessionId, patch),
         pauseGoalByUser: (sessionId) => threadGoal.pauseGoalByUser(sessionId),
         deleteGoal: (sessionId) => threadGoal.deleteGoal(sessionId),
+        dismissGoal: (sessionId, goalId) => threadGoal.dismissGoal(sessionId, goalId),
         isReadOnlyLegacySession: async (sessionId) => {
             const session = await host.getSessionById(sessionId);
             return isReadOnlyLegacySession(legacyMigrator, session ?? sessionId);
@@ -100,36 +101,49 @@ export function buildDesktopServiceHandler(host, goalDeps) {
         selectModel: (modelKey) => setDefaultModel(modelKey),
     });
     return createDesktopServiceRequestHandler(new DesktopService({
-        runtime: host.cronRuntime,
-        reviewContent: host.contentSafetyChecker,
-        routeLocalApiRequest: (request) => host.routeLocalApiRequest(request),
-        resolveCronKey: (cronId) => host.cronStore.resolveKeyByCronId?.(cronId) ?? Promise.resolve(undefined),
-        getSessionById: (sessionId) => host.getSessionById(sessionId),
-        listAllSessions: (agentName, options) => host.listAllSessions(agentName, options),
-        agentExists: (agentName) => host.agentRuntimePort.agentExists(agentName),
-        nowMs: host.nowMs,
-    }, gatedGoalDeps, {
-        resolveSessionScope: async (sessionId) => {
-            const session = await host.getSessionById(sessionId);
-            if (!session)
-                return undefined;
-            return { agentName: session.agentName, workspaceDir: session.workspaceDir };
+        cron: {
+            runtime: host.cronRuntime,
+            reviewContent: host.contentSafetyChecker,
+            routeLocalApiRequest: (request) => host.routeLocalApiRequest(request),
+            resolveCronKey: (cronId) => host.cronStore.resolveKeyByCronId?.(cronId) ?? Promise.resolve(undefined),
+            getSessionById: (sessionId) => host.getSessionById(sessionId),
+            listAllSessions: (agentName, options) => host.listAllSessions(agentName, options),
+            agentExists: (agentName) => host.agentRuntimePort.agentExists(agentName),
+            nowMs: host.nowMs,
         },
-    }, host.memoryFacade, { service: host.agentRuntimePort }, { routeContext: () => host.permissionRouteContext() }, undefined, undefined, { serviceDeps: () => host.questionnaireServiceDeps() }, {
-        service: modelProviderService,
-        refreshOfficialModels: () => host.refreshOfficialModels(),
-        configGetter: host.configGetter,
-        getSessionById: (sessionId) => host.getSessionById(sessionId),
-        updateSession,
-        setDefaultModel,
-    }, host.metricsClient, createSessionMutationEventPublisher((event) => host.publishGlobalEvent(event), {
-        publishLifecycleEvents: false,
-    }), {
-        dataDir: host.configGetter().dataDir,
-        getSessionById: (sessionId) => host.getSessionById(sessionId),
-    }, undefined, {
-        subscribe: (subscriber) => host.subscribeGlobalEvents(subscriber),
-        nowMs: host.nowMs,
-    }, undefined, undefined));
+        goal: gatedGoalDeps,
+        skills: {
+            resolveSessionScope: async (sessionId) => {
+                const session = await host.getSessionById(sessionId);
+                if (!session)
+                    return undefined;
+                return { agentName: session.agentName, workspaceDir: session.workspaceDir };
+            },
+        },
+        memory: host.memoryFacade,
+        agents: { service: host.agentRuntimePort },
+        permission: { routeContext: () => host.permissionRouteContext() },
+        questionnaire: { serviceDeps: () => host.questionnaireServiceDeps() },
+        modelProvider: {
+            service: modelProviderService,
+            refreshOfficialModels: () => host.refreshOfficialModels(),
+            configGetter: host.configGetter,
+            getSessionById: (sessionId) => host.getSessionById(sessionId),
+            updateSession,
+            setDefaultModel,
+        },
+        metricsClient: host.metricsClient,
+        sessionMutationEvents: createSessionMutationEventPublisher((event) => host.publishGlobalEvent(event), {
+            publishLifecycleEvents: false,
+        }),
+        review: {
+            dataDir: host.configGetter().dataDir,
+            getSessionById: (sessionId) => host.getSessionById(sessionId),
+        },
+        globalEvents: {
+            subscribe: (subscriber) => host.subscribeGlobalEvents(subscriber),
+            nowMs: host.nowMs,
+        },
+    }));
 }
 //# sourceMappingURL=desktop-service-handler.js.map

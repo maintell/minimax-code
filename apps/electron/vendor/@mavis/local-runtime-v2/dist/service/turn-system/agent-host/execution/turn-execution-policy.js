@@ -1,8 +1,15 @@
 export function hostOutputTokenCap(resolver, input) {
-    const cap = resolver?.resolveOutputTokenCap({
+    const context = {
         ...(input.assemblyContext.turnIntent ? { turnIntent: input.assemblyContext.turnIntent } : {}),
-    });
-    return cap === undefined ? {} : { hostMaxOutputTokens: cap };
+    };
+    const cap = resolver?.resolveOutputTokenCap(context);
+    return cap === undefined
+        ? {}
+        : {
+            hostMaxOutputTokens: cap,
+            // A budgeted owner disappearing mid-turn must not remove its constraint.
+            resolveHostMaxOutputTokens: () => resolver?.resolveOutputTokenCap(context) ?? 0,
+        };
 }
 export function contentReviewOptions(input, options) {
     if (options.tuiProductPolicy === true) {

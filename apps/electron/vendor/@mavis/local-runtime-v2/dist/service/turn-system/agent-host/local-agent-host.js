@@ -154,6 +154,7 @@ export class LocalAgentHost {
             });
         }
         finally {
+            this.dependencies.compaction?.barrier?.endTurn(context.sessionId, context.turnId);
             capabilityLease?.release();
         }
     }

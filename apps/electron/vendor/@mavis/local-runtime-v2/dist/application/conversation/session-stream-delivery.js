@@ -341,6 +341,11 @@ const DIRECT_SEND_ADMISSION_ERRORS = {
         key: 'local_session_deleting',
         message: 'Session is being deleted',
     },
+    'computer-use-requires-new-turn': {
+        status: 409,
+        key: 'local_computer_use_requires_new_turn',
+        message: 'Computer Use requires a new Turn. Keep the message queued until the current Turn ends.',
+    },
     'compaction-active': {
         status: 409,
         key: 'local_session_compacting',
@@ -354,7 +359,7 @@ function directSendAdmissionError(reason) {
     if (isTurnContinuationAdmissionReason(reason)) {
         return turnContinuationAdmissionError(reason);
     }
-    const policyError = planAdmissionError(reason);
+    const policyError = runtimeAdmissionError(reason) ?? planAdmissionError(reason);
     if (policyError)
         return policyError;
     return (DIRECT_SEND_ADMISSION_ERRORS[reason] ?? {
@@ -379,6 +384,23 @@ function turnContinuationAdmissionError(reason) {
         key: 'local_turn_waiting_for_user',
         message: 'The current Turn is waiting for user input',
     };
+}
+function runtimeAdmissionError(reason) {
+    if (reason === 'policy:runtime:draining') {
+        return {
+            status: 503,
+            key: 'local_runtime_draining',
+            message: 'MCode is preparing to restart. Retry after reconnecting.',
+        };
+    }
+    if (reason === 'policy:runtime:auth-pending') {
+        return {
+            status: 503,
+            key: 'local_runtime_auth_pending',
+            message: 'MCode is waiting for Desktop authentication. Reconnect the development machine from Desktop.',
+        };
+    }
+    return undefined;
 }
 function planAdmissionError(reason) {
     if (reason === 'policy:plan:lifecycle-active') {

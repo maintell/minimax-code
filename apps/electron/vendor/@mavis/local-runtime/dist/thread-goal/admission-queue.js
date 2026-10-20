@@ -36,6 +36,13 @@ async function classifyContinuationQueueItem(item, hasPendingPlan, deps) {
     if (!goal || goal.goalId !== origin.goalId || goal.updatedAt !== origin.goalUpdatedAt) {
         return 'cancel';
     }
+    if (origin.kind === 'completion-summary') {
+        if (goal.status !== 'complete' ||
+            goal.lastWorkerProposal?.type !== 'complete' ||
+            !goal.lastWorkerProposal.resultDelivery)
+            return 'cancel';
+        return classifyAgainstBlockers(goal, hasPendingPlan, deps);
+    }
     if (origin.kind === 'budget-limit') {
         if (await deps.gates.hasAutomationOwnerConflict(goal.sessionId)) {
             deps.emitDecision(goal.sessionId, goal.goalId, 'deferred', 'deferred(automation_owner_conflict)');
@@ -56,7 +63,11 @@ async function classifyAgainstBlockers(goal, hasPendingPlan, deps) {
     let blocker;
     try {
         blocker = await firstGoalBlocker({
-            hasPendingQuestionnaire: (sessionId, goalId) => deps.gates.hasPendingQuestionnaire(sessionId, goalId),
+            hasPendingQuestionnaire: (sessionId, goalId) => 
+            // The Goal-owned continuation guard also requires an active Goal.
+            // Result delivery is terminal work: check real unresolved input without
+            // re-entering that active-only guard or auto-answering a Goal questionnaire.
+            deps.gates.hasPendingQuestionnaire(sessionId, goal.status === 'complete' ? undefined : goalId),
             hasPendingPermission: (sessionId) => deps.gates.hasPendingPermission(sessionId),
             ...(hasPendingPlan ? { hasPendingPlan } : {}),
             hasRequiredBackgroundWork: (sessionId) => deps.gates.hasRequiredBackgroundWork(sessionId),

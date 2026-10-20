@@ -1,7 +1,9 @@
 import { getRuntimeRegion, isLocalSourceProvenanceEnabled, } from '@mavis/config';
+import { createRuntimeAuthSubmissionPreparation } from './runtime-execution-auth.js';
 import { isCommandLineRuntimeOwner } from '../agent/profile-source.js';
 import { combineLocalTurnToolPolicyGuards, createGoalBudgetToolPolicyGuard, } from '../agent/goal-budget-tool-policy.js';
 import { createGoalBudgetSummaryExtension } from '../agent/goal-budget-summary-reminder.js';
+import { createGoalCompletionSummaryExtension } from '../agent/goal-completion-summary-reminder.js';
 import { createGoalFinalReply } from '../agent/goal-final-reply.js';
 import { createRuntimeSourceReferenceExtension } from '../agent/source-reference-extension.js';
 import { createPlanEntrySubmissionPreparation, } from '../../service/plan/index.js';
@@ -18,7 +20,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         ownerId: input.runtimeOwnerIdentity.createOwnerId('background-task'),
         isOwnerAlive: input.runtimeOwnerIdentity.isOwnerAlive,
     });
-    return initializeTurnSystem({
+    const owner = await initializeTurnSystem({
         db: input.options.db,
         // Explicit user stops cascade into this Session's background work. Owned by
         // the V1 compat layer, which holds the task runners and their admissions.
@@ -73,12 +75,14 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                     plan.extension,
                     goalVerifierExtension,
                     createGoalBudgetSummaryExtension(),
+                    createGoalCompletionSummaryExtension(),
                     goalFinalReply.extension,
                     ...normalExtensions,
                     ...(input.memory ? [input.memory.agentExtension] : []),
                 ],
                 eventObserver: combineAgentEventObservers(...(input.channelSystem ? [input.channelSystem.terminalReplies] : []), input.turnLifecycleEvents),
                 nowMs: input.nowMs,
+                miniAppApprovals: dependencies.miniAppApprovals,
                 ...(isCommandLineRuntimeOwner(input.options.runtimeOwnerKind)
                     ? { cliProductPolicy: true }
                     : {}),
@@ -106,7 +110,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
             }
         },
         ...createRuntimeTurnAdmissionOptions(input, plan.admission),
-        submissionPreparation: composeTurnSubmissionPreparations(createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
+        submissionPreparation: composeTurnSubmissionPreparations(createRuntimeAuthSubmissionPreparation(input.options.executionAuthMode, input.product.preparation.modelResolver.authContextGetter), createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
             prepare: input.options.compatibility.sessionV2.goals.prepareTurnAdmission,
             hasPendingPlan: (sessionId) => plan.lifecycleFence.blocks({ sessionId }),
             hasPriorityMailboxWork: async (sessionId) => hasPriorityUserQueueItem(await input.sessionSystem.queue.committed.list(sessionId)),
@@ -158,5 +162,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         onRuntimeRecoveryFailure: createQueueWakeFailureReporter(input.product.executor.reportFailure, 'runtime_recovery_failed'),
         nowMs: input.nowMs,
     });
+    input.options.compatibility.backgroundTasks.bindNotificationReceipts(owner.receipts);
+    return owner;
 }
 //# sourceMappingURL=turn-system-composition.js.map

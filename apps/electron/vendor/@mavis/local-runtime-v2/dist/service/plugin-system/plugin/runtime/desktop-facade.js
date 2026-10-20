@@ -237,7 +237,7 @@ export class PluginDesktopFacade {
         try {
             // Persist explicit withdrawal before dispatch: a committed response can be lost.
             if (action === 'disable' || action === 'uninstall') {
-                await this.options.system.revokeOfficialSelection(requestedName, scope);
+                await this.options.system.revokeOfficialSelection(requestedName, scope, action === 'uninstall' ? 'uninstalled' : 'disabled');
             }
             const response = await this.options.registryClient.mutate(requestedName, action);
             assertOfficialMutationResponse(response, requestedName);
@@ -418,6 +418,7 @@ function officialInstalledCapabilities(plugin) {
         mcpServerCount: plugin?.mcpServers.length ?? 0,
         skillCount: plugin?.skills.length ?? 0,
         hookCount: plugin?.hooks?.length ?? 0,
+        agentCount: plugin?.agents?.length ?? 0,
     };
 }
 function overlayOfficialSummary(summary, installations) {
@@ -471,6 +472,7 @@ function localMarketplaceSummary(plugin) {
             mcpServerCount: plugin.plugin.mcpServers.length,
             skillCount: plugin.plugin.skills.length,
             hookCount: plugin.plugin.hooks?.length ?? 0,
+            agentCount: plugin.plugin.agents?.length ?? 0,
         },
         installExists: true,
         enabled: plugin.enabled,
@@ -501,6 +503,15 @@ function pluginPackageDetail(plugin, installExists, enabled) {
             content: skill.content,
         })),
         exampleQueries: [...plugin.exampleQueries],
+        ...(plugin.agents?.length
+            ? {
+                agents: plugin.agents.map((agent) => ({
+                    name: agent.scopedName,
+                    description: agent.description,
+                    content: agent.content,
+                })),
+            }
+            : {}),
     };
 }
 function pluginPackageSummary(plugin, installExists, enabled) {
@@ -516,6 +527,7 @@ function pluginPackageSummary(plugin, installExists, enabled) {
             mcpServerCount: plugin.mcpServers.length,
             skillCount: plugin.skills.length,
             hookCount: plugin.hooks?.length ?? 0,
+            agentCount: plugin.agents?.length ?? 0,
         },
         installExists,
         enabled,

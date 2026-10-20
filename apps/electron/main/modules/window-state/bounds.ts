@@ -21,17 +21,13 @@ function intersectionArea(a, b) {
     return width * height;
 }
 /**
- * 校验并规整落盘数据。任何字段缺失、非数字或尺寸非正都视为无效存档，
- * 返回 null 让调用方回落到默认值。
+ * 校验并规整一个矩形（供落盘数据使用）。任何字段缺失、非数字或尺寸非正
+ * 都视为无效，返回 null 让调用方回落到默认值。
  */
-export function normalizePersistedWindowState(raw) {
+export function normalizeWindowRectangle(raw) {
     if (!raw || typeof raw !== 'object')
         return null;
-    const candidate = raw;
-    const bounds = candidate.bounds;
-    if (!bounds || typeof bounds !== 'object')
-        return null;
-    const { x, y, width, height } = bounds;
+    const { x, y, width, height } = raw;
     if (!isFiniteNumber(x) || !isFiniteNumber(y))
         return null;
     if (!isFiniteNumber(width) || !isFiniteNumber(height))
@@ -39,12 +35,25 @@ export function normalizePersistedWindowState(raw) {
     if (width <= 0 || height <= 0)
         return null;
     return {
-        bounds: {
-            x: Math.round(x),
-            y: Math.round(y),
-            width: Math.round(width),
-            height: Math.round(height),
-        },
+        x: Math.round(x),
+        y: Math.round(y),
+        width: Math.round(width),
+        height: Math.round(height),
+    };
+}
+/**
+ * 校验并规整落盘数据。任何字段缺失、非数字或尺寸非正都视为无效存档，
+ * 返回 null 让调用方回落到默认值。
+ */
+export function normalizePersistedWindowState(raw) {
+    if (!raw || typeof raw !== 'object')
+        return null;
+    const candidate = raw;
+    const bounds = normalizeWindowRectangle(candidate.bounds);
+    if (!bounds)
+        return null;
+    return {
+        bounds,
         maximized: candidate.maximized === true,
     };
 }
@@ -98,4 +107,57 @@ export function resolveStartupWindowState(options) {
         return { bounds: null, maximized: normalized.maximized };
     }
     return { bounds, maximized: normalized.maximized };
+}
+/**
+ * True when at least part of `bounds` overlaps a current display's work
+ * area. Distinct from `clampBoundsToWorkAreas`, which always clamps into
+ * the nearest display instead of signalling "not visible anywhere" — this
+ * is used where the caller wants to drop a stale *position* outright
+ * (e.g. an external display that is no longer connected) rather than
+ * relocate it onto whatever screen remains.
+ */
+export function isBoundsVisibleOnAnyDisplay(bounds, workAreas) {
+    return workAreas.some((area) => isFiniteNumber(area?.x) &&
+        isFiniteNumber(area?.y) &&
+        isFiniteNumber(area?.width) &&
+        isFiniteNumber(area?.height) &&
+        area.width > 0 &&
+        area.height > 0 &&
+        intersectionArea(bounds, area) > 0);
+}
+/**
+ * True when at least `minVisiblePx` × `minVisiblePx` of `bounds` overlaps a
+ * current display's work area on both axes. Stricter than
+ * {@link isBoundsVisibleOnAnyDisplay}, which accepts any nonzero overlap
+ * (a 1×1 px sliver) — this is the on-screen rule for a MiniApp's own window,
+ * where a barely-visible window is effectively unreachable to the user.
+ */
+export function hasMinimumVisibleArea(bounds, workAreas, minVisiblePx) {
+    return workAreas.some((area) => {
+        if (!isFiniteNumber(area?.x) ||
+            !isFiniteNumber(area?.y) ||
+            !isFiniteNumber(area?.width) ||
+            !isFiniteNumber(area?.height) ||
+            area.width <= 0 ||
+            area.height <= 0) {
+            return false;
+        }
+        const overlapWidth = Math.min(bounds.x + bounds.width, area.x + area.width) - Math.max(bounds.x, area.x);
+        const overlapHeight = Math.min(bounds.y + bounds.height, area.y + area.height) - Math.max(bounds.y, area.y);
+        return overlapWidth >= minVisiblePx && overlapHeight >= minVisiblePx;
+    });
+}
+/**
+ * Validates and applies the "off-screen position is dropped, size is kept"
+ * rule to a persisted per-pluginId popup bounds record. Returns null for a
+ * missing or malformed record — the caller falls back to its own defaults.
+ */
+export function resolveMiniAppWindowMemory(options) {
+    const rect = normalizeWindowRectangle(options.stored);
+    if (!rect)
+        return null;
+    if (isBoundsVisibleOnAnyDisplay(rect, options.workAreas)) {
+        return rect;
+    }
+    return { width: rect.width, height: rect.height };
 }

@@ -1,6 +1,6 @@
 import { ThreadGoalBudgetLimitedError, ThreadGoalEpochConflictError, ThreadGoalTokenBudgetExhaustedError, } from '@mavis/goal';
 import { sumPiTurnUsageTokens } from '../usage/api.js';
-import { ThreadGoalAutomationOwnerConflictError, ThreadGoalVerifierSessionError } from './gate.js';
+import { ThreadGoalAutomationOwnerConflictError, ThreadGoalSessionNotFoundError, ThreadGoalVerifierSessionError, } from './gate.js';
 import { buildThreadGoalRuntimeTools, publishThreadGoalEvent } from './wiring.js';
 import { withPreparedGoalResources } from './objective-resources.js';
 /** Owns CRUD, pause/resume, tool exposure, and live response projection. */
@@ -10,6 +10,9 @@ export class GoalLifecycle {
         this.deps = deps;
     }
     async createGoal(input, options = {}) {
+        if (!(await this.deps.sessionExists(input.sessionId))) {
+            throw new ThreadGoalSessionNotFoundError(input.sessionId);
+        }
         if (await this.deps.gates.isGoalVerifierChildSession(input.sessionId)) {
             throw new ThreadGoalVerifierSessionError(input.sessionId);
         }
@@ -116,7 +119,7 @@ export class GoalLifecycle {
             type: 'updated',
             goal: projected,
             userPatch: true,
-            ...(patch.status === 'active' && existing.status === 'paused' && existing.statusReason
+            ...(projected.status === 'active' && existing.status !== 'active' && existing.statusReason
                 ? { resumedFromReason: existing.statusReason }
                 : {}),
             ...((patch.objective !== undefined && patch.objective !== existing.objective) ||
@@ -199,7 +202,12 @@ export class GoalLifecycle {
             throw error;
         }
         this.deps.runtime.emitStateTransition(existing.status, updated);
-        this.deps.runtime.handleChanged({ type: 'updated', goal: updated, userPatch: true });
+        this.deps.runtime.handleChanged({
+            type: 'updated',
+            goal: updated,
+            userPatch: true,
+            ...(resumed && existing.statusReason ? { resumedFromReason: existing.statusReason } : {}),
+        });
         this.deps.runtime.emitRuntimeEvent({
             type: 'goal.budget_updated',
             at: this.deps.runtime.nowMs(),
@@ -220,6 +228,15 @@ export class GoalLifecycle {
             previousTokenBudget: existing.tokenBudget,
             resumed,
         };
+    }
+    /** 只发布展示状态；不进入用户 PATCH 的执行和 continuation 链路。 */
+    async dismissGoal(sessionId, goalId) {
+        const dismissed = await this.deps.store().dismissCompleted(sessionId, goalId);
+        publishThreadGoalEvent(this.deps.runtime.publishGlobalEvent, {
+            type: 'updated',
+            goal: dismissed,
+        });
+        return dismissed;
     }
     async deleteGoal(sessionId) {
         const existing = await this.deps.store().getBySession(sessionId);

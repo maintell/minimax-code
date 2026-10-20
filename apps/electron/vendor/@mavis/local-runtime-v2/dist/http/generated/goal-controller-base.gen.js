@@ -15,6 +15,11 @@ export class GoalControllerBase {
         void req;
         throw new NotImplementedError('patchGoal');
     }
+    async dismissGoal(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('dismissGoal');
+    }
     async deleteGoal(ctx, req) {
         void ctx;
         void req;

@@ -154,10 +154,8 @@ export class LocalOutputSafetyEventWriter {
         }
     }
     async handleChunk(event, chunk) {
-        if (typeof chunk.msg_id === 'string' && chunk.msg_id) {
-            this.approvedMsgId = chunk.msg_id;
-            this.attemptMessageIds.add(chunk.msg_id);
-        }
+        if (!(await this.beginMessage(chunk.msg_id)))
+            return;
         if (chunk.thinking_content) {
             const pending = this.enqueuePending(event);
             this.thinkingWindow.push(pending);
@@ -185,10 +183,8 @@ export class LocalOutputSafetyEventWriter {
         this.enqueueReady(event);
     }
     async handleFinalMessage(event, message) {
-        if (typeof message.msg_id === 'string' && message.msg_id) {
-            this.approvedMsgId = message.msg_id;
-            this.attemptMessageIds.add(message.msg_id);
-        }
+        if (!(await this.beginMessage(message.msg_id)))
+            return;
         if (!(await this.reviewFinalWindow(message.thinking_content, this.thinkingText, SAFETY_SCENE.ThinkingContent))) {
             return;
         }
@@ -209,6 +205,20 @@ export class LocalOutputSafetyEventWriter {
         this.releaseWindow(this.contentWindow);
         this.contentText = '';
         this.enqueueReady(this.safetyReviewUnknown ? markSafetyReviewUnknown(event, message) : event);
+    }
+    /** Approved partials belong to one assistant message, not the entire tool loop. */
+    async beginMessage(messageId) {
+        if (typeof messageId !== 'string' || !messageId || messageId === this.approvedMsgId)
+            return true;
+        // Settle the old identity's pending window before switching. If review
+        // stops here, its approved prefix must still be attributed to that message.
+        if (!(await this.flushStreamingWindows()))
+            return false;
+        this.approvedMsgId = messageId;
+        this.approvedThinking = '';
+        this.approvedContent = '';
+        this.attemptMessageIds.add(messageId);
+        return true;
     }
     /** Settle all short streaming windows before a finish/tool-call frame can enter ready state. */
     async flushStreamingWindows() {

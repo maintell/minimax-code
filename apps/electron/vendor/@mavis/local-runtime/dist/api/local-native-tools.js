@@ -1,6 +1,6 @@
 import { buildLocalToolRegistry, LocalTodoWriteToolDef, } from '@mavis/agent-tools/desktop';
 import { MatrixWebSearchToolDef } from '@mavis/agent-tools';
-import { resolveAgentCapabilities, } from '@mavis/config';
+import { getConfig, resolveAgentCapabilities, } from '@mavis/config';
 import { executeLocalMemoryTool } from '../memory/local-memory-tool.js';
 import { buildLocalHostTrashRuntime } from '../permissions/host-trash-runtime.js';
 import { resolveAgentBashEnvPolicy } from '../infra/ensure-rm-shim.js';
@@ -56,7 +56,8 @@ export function buildLocalNativeRuntimeTools(input) {
             bashAdapter: input.bashAdapter,
             sandboxOperationsFactory: input.sandboxOperationsFactory,
             hostTrashRuntime: buildLocalHostTrashRuntime(input),
-            bashEnvPolicy: resolveAgentBashEnvPolicy(input.dataDir),
+            bashEnvPolicy: (plan) => resolveAgentBashEnvPolicy(input.dataDir, process.platform, plan?.nativeDelete ??
+                (input.configGetter ?? getConfig)().permission?.nativeDelete === true),
             webFetchAdapter,
             webSearchAdapter,
             taskAdapter: input.taskAdapter,
@@ -116,6 +117,7 @@ export async function buildLocalTurnToolSources(input) {
     const nativeTools = buildLocalNativeRuntimeTools({
         skillRuntime: input.skillRuntime,
         dataDir: input.dataDir,
+        configGetter: input.configGetter,
         workspaceRoot: input.workspaceRoot,
         agentName: input.agentName,
         ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),

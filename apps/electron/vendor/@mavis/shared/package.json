@@ -12,6 +12,9 @@
     "./office-preview-limits": {
       "import": "./dist/office-preview-limits.js"
     },
+    "./text-preview-limits": {
+      "import": "./dist/text-preview-limits.js"
+    },
     "./desktop-login-diagnostics": {
       "import": "./dist/desktop-login-diagnostics.js",
       "default": "./dist/desktop-login-diagnostics.js"
@@ -72,6 +75,9 @@
     "./cron-purpose": {
       "import": "./dist/cron-purpose.js"
     },
+    "./mcode-context-mode": {
+      "import": "./dist/mcode-context-mode.js"
+    },
     "./desktop-service": {
       "import": "./dist/desktop-service.js"
     },
@@ -108,6 +114,18 @@
     "./runtime-transport": {
       "import": "./dist/runtime-transport/index.js",
       "default": "./dist/runtime-transport/index.js"
+    },
+    "./desktop-authorization-url": {
+      "import": "./dist/desktop-authorization-url.js",
+      "default": "./dist/desktop-authorization-url.js"
+    },
+    "./desktop-runtime": {
+      "import": "./dist/desktop-runtime.js",
+      "default": "./dist/desktop-runtime.js"
+    },
+    "./app-server-transport": {
+      "import": "./dist/app-server-transport/index.js",
+      "default": "./dist/app-server-transport/index.js"
     },
     "./document-preview": {
       "import": "./dist/document-preview.js",
@@ -195,6 +213,9 @@
     "./local-runtime-paths": {
       "import": "./dist/local-runtime-paths.js"
     },
+    "./local-runtime-migration-lock": {
+      "import": "./dist/local-runtime-migration-lock.js"
+    },
     "./local-runtime-diagnostics": {
       "import": "./dist/local-runtime-diagnostics/index.js"
     },
@@ -281,6 +302,9 @@
       "cron-purpose": [
         "src/cron-purpose.ts"
       ],
+      "mcode-context-mode": [
+        "src/mcode-context-mode.ts"
+      ],
       "desktop-service": [
         "src/desktop-service.ts"
       ],
@@ -310,6 +334,15 @@
       ],
       "runtime-transport": [
         "src/runtime-transport/index.ts"
+      ],
+      "desktop-authorization-url": [
+        "src/desktop-authorization-url.ts"
+      ],
+      "desktop-runtime": [
+        "src/desktop-runtime.ts"
+      ],
+      "app-server-transport": [
+        "src/app-server-transport/index.ts"
       ],
       "document-preview": [
         "src/document-preview.ts"

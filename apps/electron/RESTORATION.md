@@ -9,16 +9,23 @@ a locally installed client.
 
 | | |
 | --- | --- |
-| Installed client | `MiniMax Code` 3.1.1 (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
-| Application | `@mmx-agent/electron` 3.1.1, Electron 42.8.0, `buildEnv=prod`, locale `zh` |
+| Installed client | `MiniMax Code` 3.1.4 (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
+| Application | `@mmx-agent/electron` 3.1.4, Electron 42.8.0, `buildEnv=prod`, locale `zh` |
 | Identity | appId `com.minimax.agent.cn`, runtime app name `MiniMax`, user data `%APPDATA%\MiniMax` |
-| Package | `resources/app.asar` (377 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+| Package | `resources/app.asar` (396 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+
+Version history of this recovery:
+
+| App | Date | Notes |
+| --- | --- | --- |
+| 3.1.4 | 2026-10-20 | Current. New `@minimax/mcode-app-server-protocol` dependency, an SSH runtime (`main/modules/ssh-runtime/**`), mini-app agent IPC and detached windows; the Word/Excel editor IPC modules are gone. Renderer grew ~14 MB. |
+| 3.1.1 | 2026-10-17 | Initial recovery. |
 
 ## What was recovered
 
 | Part | Method | Fidelity |
 | --- | --- | --- |
-| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **285 of 290 files byte-identically**; the remaining 4 files differ only in the *order* of adjacent export-assignment statements (5 lines total, semantically inert). See "Verification" below. |
+| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **342 of 346 files byte-identically**; the remaining 4 files differ only in the *order* of adjacent export-assignment statements (5 lines total, semantically inert). See "Verification" below. |
 | Renderer (`out/**`) | Committed as the prebuilt static Next.js export. | Byte-identical to the shipped `out/`. The upstream UI sources are not part of this distribution and the build carries no source maps, so a source recovery is not possible. |
 | `public/**` | Committed as-is from the shipped app root. | Byte-identical. The main process reads the prompt-config key carriers from `public/assets/img/*.png` at runtime (`main/config/prompt-config-key.ts`), so this directory is part of the application, not only of the renderer build. |
 | Model menu (`model-menu/**`) | Committed as the prebuilt Vite build output. | Byte-identical. |
@@ -32,7 +39,7 @@ a locally installed client.
 
 1. **Emit equivalence.** `tools/restore/verify-main.mjs` compiles `main/**` with
    the app `tsconfig.json` and diffs every emitted file against the shipped
-   `dist/main`. Result: 285/290 identical, 4 files with export-order-only
+   `dist/main`. Result: 342/346 identical, 4 files with export-order-only
    differences (`config/env.js`, `ipc/documentPreview.ipc.js`,
    `modules/desktop-appearance.js`, `modules/document-preview/artifact-protocol.js`),
    1 prebuilt bundle copied verbatim. The differences are caused by information
@@ -111,11 +118,17 @@ exception documented below.
 
 | File | Change | Reason |
 | --- | --- | --- |
-| `vendor/@mavis/agent-core/dist/pi-turn-runner/llm-retry.js` | Provider errors retry without a practical limit (one million attempts) on the fixed `baseDelayMs` cadence (3 s), with no backoff, no jitter and no wall-clock budget. A server-directed `Retry-After` header still wins. BYOK retry-all additionally treats deterministic request rejections (413 / oversized body, context overflow, image limit, HTTP 400 `invalid_request_error`) as terminal. | Unstable upstreams must recover without user intervention; mirrors the same change in `packages/agent-core/src/pi-turn-runner/llm-retry.ts` so the desktop runtime and the CLI behave identically. The terminal carve-out matters more under the unbounded budget: without it a deterministic rejection would be re-sent roughly forever. |
+| `vendor/@mavis/agent-core/dist/pi-turn-runner/llm-retry.js` | Provider errors retry without a practical limit (`2_147_483_647` attempts — the largest serialisable integer, since the retry-event contract requires a non-negative integer) on the fixed `baseDelayMs` cadence (3 s), with no backoff, no jitter and no wall-clock budget. A server-directed `Retry-After` header still wins. BYOK retry-all additionally keeps these terminal: a wrong credential (`auth`), an exhausted usage plan (`usage_limit`), exhausted credits (`credits_exhausted`), deterministic request rejections (413 / oversized body, context overflow, image limit, HTTP 400 `invalid_request_error`) and provider safety refusals. | Unstable upstreams must recover without user intervention; mirrors the same change in `packages/agent-core/src/pi-turn-runner/llm-retry.ts` so the desktop runtime and the CLI behave identically. The terminal carve-outs matter more under the unbounded budget: retrying a bad key or an empty account can never succeed, it only hides the actionable error. |
 | `vendor/@mavis/shared/dist/llm-error-classifier.js` | `ERR_INCOMPLETE_CHUNKED_ENCODING` and `ERR_EMPTY_RESPONSE` join the transient-network marker set, and 5xx responses plus empty provider responses classify as retryable (`server_error` / `empty_response`). Deterministic-rejection signals (`image_limit`, `invalid_request`, `request_too_large`, `context_overflow`) and the exported `isLLMDeterministicRequestRejection` are backported. | A dropped or truncated response body is the classic flaky-upstream shape; mirrors `packages/shared/src/llm-error-classifier.ts`. |
+| `out/_next/static/chunks/*.js` (renderer string table) | The retry banner copy drops the attempt cap: `({{attempt}}/{{total}})` becomes `({{attempt}}/∞)`, in both the English and the Chinese tables. | The renderer is a prebuilt artifact, so the budget is presented by rewriting its plain strings; otherwise an unbounded budget would read `(3/2147483647)`. The TUI uses `formatRetryBudget()` from `@mavis/shared/llm-retry-event` for the same result. |
 
-Both snapshots are otherwise byte-identical to the shipped build; each patch is
-a few lines and is marked with a `Local patch:` comment in the file.
+The two vendored snapshots are otherwise byte-identical to the shipped build,
+and the renderer differs only in those four retry strings. Each code patch is a
+few lines marked with a `Local patch:` comment. None of this is hand-edited:
+`tools/restore/apply-local-patches.mjs` re-applies everything after every
+re-vendoring, works on an already-patched tree, and asserts each anchor — a
+shipped refactor of the retry loop, the classifier or the retry copy fails
+loudly instead of silently restoring the shipped behaviour.
 
 ## Dependency closure
 

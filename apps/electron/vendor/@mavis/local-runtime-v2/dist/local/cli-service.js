@@ -106,11 +106,21 @@ export class CliService {
     }
     async getLatestPlanReview(req, ctx = {}) {
         void ctx;
-        const request = await this.requireQuestionnaires().getLatestPlanReview({
+        const record = await this.requireQuestionnaires().getLatestPlanReview({
             agentName: req.name,
             sessionId: req.sessionId,
         });
-        return request ? { request: toQuestionnaireRequestView(request) } : {};
+        if (!record)
+            return {};
+        return {
+            request: toQuestionnaireRequestView(record.request),
+            status: toQuestionnaireStatus(record.status),
+            sessionId: record.sessionId,
+            ...(record.agentName ? { agentName: record.agentName } : {}),
+            createdAt: record.createdAt,
+            ...(record.answeredAt !== undefined ? { answeredAt: record.answeredAt } : {}),
+            ...(record.dismissedAt !== undefined ? { dismissedAt: record.dismissedAt } : {}),
+        };
     }
     getPlanModeCapabilities() {
         return { entryEnabled: this.requireCapability('plan', 'Plan').isEntryEnabled() };
@@ -186,6 +196,21 @@ export class CliService {
     }
     getActiveTurn(sessionId) {
         return this.options.conversation.getActiveTurn(sessionId);
+    }
+    beginProcessDrain() {
+        const drain = this.options.processLifecycle.beginDrain();
+        return { accepted: true, ...drain };
+    }
+    tryBeginProcessDrainIfIdle() {
+        const result = this.options.processLifecycle.tryBeginDrainIfIdle();
+        if (!result.acquired) {
+            return {
+                accepted: false,
+                activeTurnCount: result.activeTurnCount,
+                pendingAdmissionCount: result.pendingAdmissionCount,
+            };
+        }
+        return { accepted: true, ...result.drain };
     }
     watchEvents(signal) {
         return this.options.application.events.watch(signal);
@@ -287,7 +312,7 @@ export class CliService {
     }
     /** Resolves false when the host has no model-favorite store. */
     async setModelFavorite(input) {
-        const models = this.requireCapability("models", "Model");
+        const models = this.requireCapability('models', 'Model');
         if (!models.setFavorite)
             return false;
         return models.setFavorite(input);

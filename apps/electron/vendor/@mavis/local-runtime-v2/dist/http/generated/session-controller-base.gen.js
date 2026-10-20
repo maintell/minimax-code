@@ -75,6 +75,21 @@ export class SessionControllerBase {
         void req;
         throw new NotImplementedError('compressSession');
     }
+    async createSideChat(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('createSideChat');
+    }
+    async createSideChatFromQueue(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('createSideChatFromQueue');
+    }
+    async promoteSideChat(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('promoteSideChat');
+    }
     async getMessages(ctx, req) {
         void ctx;
         void req;

@@ -1,6 +1,7 @@
 import { digestThreadGoalObjective, isContinuationStatus, } from '@mavis/goal';
 import { checkThreadGoalTurnBudget } from './admission-budget.js';
 import { classifyThreadGoalQueueItem } from './admission-queue.js';
+import { firstGoalBlocker } from './blockers.js';
 import { finalRecheck, } from './gate.js';
 import { readThreadGoalContinuationOrigin, readThreadGoalKickoffOrigin, } from './kickoff.js';
 import { publishThreadGoalEvent } from './wiring.js';
@@ -45,13 +46,35 @@ export class GoalAdmission {
             return rejectedAdmission('cancel', 'stale(turn_binding)');
         let result;
         try {
-            if (continuation?.kind === 'budget-limit') {
-                const binding = await this.captureBudgetSummaryBinding(input, continuation);
+            if (continuation?.kind === 'budget-limit' || continuation?.kind === 'completion-summary') {
+                const binding = await this.captureSummaryBinding(input, continuation);
                 if (!binding) {
                     this.emitAdmissionDecision(input.sessionId, continuation.goalId, 'cancelled', 'final_recheck', 'stale(turn_binding)');
                     return rejectedAdmission('cancel', 'stale(turn_binding)');
                 }
-                return this.readyTurnBindingPreparation(input, binding, 'budget-summary');
+                if (continuation.kind === 'completion-summary') {
+                    const blocker = await firstGoalBlocker({
+                        // Completion summaries wait for real unresolved input, not the
+                        // active-only Goal questionnaire continuation lifecycle.
+                        hasPendingQuestionnaire: (sessionId) => this.deps.gates.hasPendingQuestionnaire(sessionId),
+                        hasPendingPermission: (sessionId) => this.deps.gates.hasPendingPermission(sessionId),
+                        hasPendingPlan: input.hasPendingPlan,
+                        hasRequiredBackgroundWork: (sessionId) => this.deps.gates.hasRequiredBackgroundWork(sessionId),
+                        hasAutomationOwnerConflict: (sessionId) => this.deps.gates.hasAutomationOwnerConflict(sessionId),
+                    }, { sessionId: input.sessionId, goalId: continuation.goalId });
+                    // Result delivery already owns its FIFO Queue claim. Waiting for a
+                    // later user item would release this same head forever, preventing
+                    // either item from running. Queue's admission fence still protects
+                    // older user work; unresolved input remains a real blocker here.
+                    if (blocker) {
+                        return {
+                            status: 'rejected',
+                            queueDisposition: 'defer',
+                            reason: `policy:goal-completion-summary:${blocker}`,
+                        };
+                    }
+                }
+                return this.readyTurnBindingPreparation(input, binding, continuation.kind === 'budget-limit' ? 'budget-summary' : 'completion-summary');
             }
             result = await finalRecheck({
                 getGoalBySession: (sessionId) => this.deps.store().getBySession(sessionId),
@@ -119,11 +142,15 @@ export class GoalAdmission {
     async checkTurnBudget(input) {
         return checkThreadGoalTurnBudget(input, this.deps);
     }
-    async captureBudgetSummaryBinding(input, origin) {
+    async captureSummaryBinding(input, origin) {
         const goal = await this.deps.store().getBySession(input.sessionId);
         if (!goal ||
             goal.goalId !== origin.goalId ||
-            goal.status !== 'budget_limited' ||
+            (origin.kind === 'budget-limit'
+                ? goal.status !== 'budget_limited'
+                : goal.status !== 'complete' ||
+                    goal.lastWorkerProposal?.type !== 'complete' ||
+                    !goal.lastWorkerProposal.resultDelivery) ||
             goal.updatedAt !== origin.goalUpdatedAt ||
             digestThreadGoalObjective(goal.objective) !== origin.objectiveDigest) {
             return undefined;

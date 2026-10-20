@@ -6,7 +6,7 @@ import lockfile from 'proper-lockfile';
 import { getConfig, getConfigPath, resetConfig } from './config.js';
 import { minimaxApiModels } from './byok-config.js';
 import { serializeConfigPreservingComments } from './comment-preserving-config-write.js';
-import { MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID } from './model-availability.js';
+import { MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID, deliveredDefaultModelId, } from './model-availability.js';
 const LOCAL_CONFIG_FILE_MODE = 0o600;
 const DANGEROUS_CONFIG_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 const LOCAL_BYOK_CONFIG_ROOTS = ['minimax_api', 'custom_provider'];
@@ -22,7 +22,14 @@ export async function removeLocalProviderConfig(providerId) {
         return { write: true, value: undefined };
     }).then(({ config }) => ({ config }));
 }
-/** Replace the official MiniMax snapshot without taking ownership of BYOK roots. */
+/**
+ * Replace the official MiniMax snapshot without taking ownership of BYOK roots.
+ *
+ * A saved Runtime default that the new snapshot no longer lists is rewritten
+ * in the same locked write to the delivered default, so the user stays pinned
+ * to a concrete callable model. Its variant/effort/context belonged to the
+ * retired model and are dropped.
+ */
 export async function replaceLocalManagedMinimaxProvider(provider) {
     if (!isPlainRecord(provider) || !isPlainRecord(provider.models)) {
         throw new LocalModelProviderConfigValidationError('Invalid managed MiniMax provider snapshot');
@@ -33,8 +40,40 @@ export async function replaceLocalManagedMinimaxProvider(provider) {
             ...(isPlainRecord(raw.provider) ? raw.provider : {}),
             [MANAGED_MINIMAX_PROVIDER_ID]: structuredClone(provider),
         };
-        return { write: true, value: undefined };
-    }).then(({ config }) => ({ config }));
+        const replacedDefaults = replaceRetiredDefaultModels(raw, provider);
+        return { write: true, value: replacedDefaults };
+    }).then(({ config, value }) => ({ config, replacedDefaults: value }));
+}
+function replaceRetiredDefaultModels(raw, provider) {
+    const providerView = provider;
+    const deliveredDefault = deliveredDefaultModelId(providerView);
+    if (!deliveredDefault)
+        return [];
+    const listed = new Set(Object.entries(provider.models)
+        .filter(([, model]) => !(isPlainRecord(model) && model.enabled === false))
+        .map(([modelId]) => modelId));
+    const replaced = [];
+    for (const field of ['defaultModel', 'defaultLightModel']) {
+        const value = raw[field];
+        if (typeof value !== 'string')
+            continue;
+        const slash = value.indexOf('/');
+        const providerId = slash > 0 ? value.slice(0, slash) : '';
+        const modelId = value.slice(slash + 1).trim();
+        if (providerId !== MANAGED_MINIMAX_PROVIDER_ID && providerId !== MINIMAX_API_PROVIDER_ID)
+            continue;
+        if (!modelId || listed.has(modelId))
+            continue;
+        const to = `${providerId}/${deliveredDefault}`;
+        raw[field] = to;
+        if (field === 'defaultModel') {
+            delete raw.defaultModelVariant;
+            delete raw.defaultModelThinking;
+            delete raw.defaultModelContextWindow;
+        }
+        replaced.push({ field, from: value, to });
+    }
+    return replaced;
 }
 class LocalModelProviderConfigValidationError extends Error {
     name = 'LocalModelProviderConfigValidationError';

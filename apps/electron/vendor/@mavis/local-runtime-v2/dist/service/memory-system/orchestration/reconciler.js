@@ -1,3 +1,4 @@
+import { checkConsolidationWindow } from './consolidation-window.js';
 import { GLOBAL_SCOPE_KEY } from '../contracts.js';
 import { computeOutputDigest, renderRulesMirror, renderSessionMirror } from './session-doc.js';
 export class MemoryReconciler {
@@ -10,7 +11,7 @@ export class MemoryReconciler {
     drainPromise;
     running = false;
     runPromise;
-    /** 整理与非会话级失败的进程内退避；抽取失败走持久记账（§6.1）。 */
+    /** 整理、非会话级失败与抽取环境故障的进程内退避；其余抽取失败走持久记账（§6.1）。 */
     retryAfter = new Map();
     /** 模型限流后的下一次可运行时刻；到期本身不产生唤醒（§10）。 */
     modelBlockedUntilMs = 0;
@@ -122,15 +123,13 @@ export class MemoryReconciler {
         // Step 2: 清理临时文件、孤儿目录，并把镜像补物化到与 DB 一致(§6.4)。
         await this.cleanupOrphanScopeDirs();
         await this.maintainFiles(work, config);
-        // Step 3: 配额保护线；读数不可用时放行(§2.3)。
-        const modelAllowed = await this.modelTasksAllowed(config);
-        // Step 4: 本轮含 task-start 时按领取上限抽取旧会话。
+        // Step 3/4: 按阶段实际通道检查额度；后续每项新任务再次准入，在途任务继续完成。
         const capturedScopeKeys = new Set();
-        if (modelAllowed && boundary) {
+        if (boundary && (await this.modelTasksAllowed('capture', config))) {
             await this.captureCandidates(config, boundary, capturedScopeKeys);
         }
-        // Step 5: 对持久工作集与本轮变化的 scope 串行整理。
-        if (modelAllowed && this.deps.nowMs() >= this.modelBlockedUntilMs) {
+        // Step 5: 整理独立准入，允许 capture 与 consolidation 使用不同通道。
+        if (await this.modelTasksAllowed('consolidation', config)) {
             await this.consolidateScopes(work, capturedScopeKeys);
         }
         // Step 6: Apply retention
@@ -143,26 +142,46 @@ export class MemoryReconciler {
         await this.cleanupResetFiles(work);
         // Step 8 由 runLoop 检查执行期间收到的新 wake。
     }
-    async modelTasksAllowed(config) {
-        if (this.deps.nowMs() < this.modelBlockedUntilMs) {
-            this.event('model.skipped', { reason: 'model-backoff', retryAtMs: this.modelBlockedUntilMs });
+    async modelTasksAllowed(kind, config) {
+        if (!this.modelSchedulingAllowed(kind, config))
             return false;
-        }
-        let remaining;
         try {
-            remaining = await this.deps.model.quotaRemainingPercent();
+            const quota = await this.deps.model.readQuota(kind);
+            const allowed = quota.status !== 'available' ||
+                ![quota.fiveHour, quota.weekly].some((remaining) => typeof remaining === 'number' && remaining < config.minModelQuotaRemainingPercent);
+            this.event('model.quota', {
+                kind,
+                quota,
+                minimumPercent: config.minModelQuotaRemainingPercent,
+                allowed,
+            });
+            if (!allowed) {
+                this.event('model.skipped', { kind, reason: 'subscription-quota-low' });
+                return false;
+            }
         }
         catch {
-            this.event('model.quota', { reason: 'quota-unavailable', allowed: true });
-            return true;
+            this.event('model.quota', { kind, reason: 'quota-unavailable', allowed: true });
         }
-        const allowed = remaining === undefined || remaining >= config.minModelQuotaRemainingPercent;
-        this.event('model.quota', {
-            remainingPercent: remaining,
-            minimumPercent: config.minModelQuotaRemainingPercent,
-            allowed,
-        });
-        return allowed;
+        return true;
+    }
+    modelSchedulingAllowed(kind, config) {
+        if (kind === 'consolidation') {
+            const window = checkConsolidationWindow(config.consolidationCron, this.deps.nowMs());
+            if (window !== 'allowed') {
+                this.event('model.skipped', { kind, reason: `consolidation-${window}` });
+                return false;
+            }
+        }
+        if (this.deps.nowMs() < this.modelBlockedUntilMs) {
+            this.event('model.skipped', {
+                kind,
+                reason: 'model-backoff',
+                retryAtMs: this.modelBlockedUntilMs,
+            });
+            return false;
+        }
+        return true;
     }
     /** `scopes/` 层级下非 global 的目录都是孤儿，直接删除(§6.4)。 */
     async cleanupOrphanScopeDirs() {
@@ -330,7 +349,7 @@ export class MemoryReconciler {
                     continue;
                 }
                 const next = await candidates.next();
-                if (next.done || this.deps.nowMs() < this.modelBlockedUntilMs)
+                if (next.done)
                     break;
                 const candidate = next.value;
                 if (seen.has(candidate.sessionId))
@@ -343,6 +362,11 @@ export class MemoryReconciler {
                         attempt: attempts.get(candidate.sessionId),
                     });
                     continue;
+                }
+                // Recheck synchronously at dispatch after quota I/O and queued continuations.
+                if (!(await this.modelTasksAllowed('capture', this.deps.config())) ||
+                    !this.modelSchedulingAllowed('capture', this.deps.config())) {
+                    break;
                 }
                 inFlight.set(candidate.sessionId, runCandidate(candidate));
             }
@@ -365,13 +389,18 @@ export class MemoryReconciler {
     }
     /** 失败记账过滤：退避期内跳过；同 revision 耗尽转 retry-exhausted 终态(§2.3)。 */
     isBackedOff(attempts, candidate, config) {
+        if ((this.retryAfter.get(captureHoldKey(candidate)) ?? 0) > this.deps.nowMs())
+            return true;
         const attempt = attempts.get(candidate.sessionId);
         if (!attempt)
             return false;
         if (attempt.sourceRevision !== candidate.sourceRevision)
             return false;
-        if (attempt.attempts >= config.maxCaptureAttemptsPerRevision)
+        // 旧版本把环境故障也记入次数；最后一次失败是环境故障的历史行不判耗尽，让会话恢复抽取。
+        if (attempt.attempts >= config.maxCaptureAttemptsPerRevision &&
+            countsTowardCaptureAttempts(attempt.lastReason)) {
             return true;
+        }
         return attempt.retryAtMs > this.deps.nowMs();
     }
     /** 返回本次是否消耗了模型抽取额度。 */
@@ -384,10 +413,16 @@ export class MemoryReconciler {
             case 'stale-input':
                 return true;
             case 'deferred': {
-                if (result.reason === 'model-unavailable') {
-                    this.modelBlockedUntilMs = this.deps.nowMs() + 60_000;
+                if (countsTowardCaptureAttempts(result.reason)) {
+                    await this.recordFailure(candidate, result.reason, config);
+                    return true;
                 }
-                await this.recordFailure(candidate, result.reason, config);
+                // 环境故障与会话内容无关：停止本批模型任务，不消耗该会话的重试次数；
+                // 进程内会话退避避免同一会话在后续唤醒中反复占住队首(§10)。
+                this.modelBlockedUntilMs = this.deps.nowMs() + 60_000;
+                const retryAtMs = this.deps.nowMs() + config.captureFailureBackoffMs;
+                this.holdUntil(captureHoldKey(candidate), retryAtMs);
+                this.event('capture.held', { candidate, reason: result.reason, retryAtMs });
                 return true;
             }
             case 'updated':
@@ -424,6 +459,11 @@ export class MemoryReconciler {
                 });
                 continue;
             }
+            // Recheck synchronously at dispatch after quota I/O and queued continuations.
+            if (!(await this.modelTasksAllowed('consolidation', this.deps.config())) ||
+                !this.modelSchedulingAllowed('consolidation', this.deps.config())) {
+                break;
+            }
             try {
                 const result = await this.deps.consolidation.rebuild(scopeKey, {
                     reason: governanceScopes.has(scopeKey) ? 'governance' : 'routine',
@@ -458,14 +498,18 @@ export class MemoryReconciler {
         }
     }
     defer(key, error) {
+        this.holdUntil(key, this.deps.nowMs() + 60_000);
+        this.reportFailure(error);
+    }
+    /** 登记进程内退避；按插入顺序淘汰最旧条目，长时间运行也不会无界增长。 */
+    holdUntil(key, retryAtMs) {
         this.retryAfter.delete(key);
-        this.retryAfter.set(key, this.deps.nowMs() + 60_000);
+        this.retryAfter.set(key, retryAtMs);
         if (this.retryAfter.size > 4096) {
             const oldest = this.retryAfter.keys().next().value;
             if (oldest !== undefined)
                 this.retryAfter.delete(oldest);
         }
-        this.reportFailure(error);
     }
     event(event, payload) {
         this.deps.diagnostics?.event(event, payload);
@@ -479,5 +523,13 @@ export class MemoryReconciler {
             /* 上报失败不影响后台恢复。 */
         }
     }
+}
+/** 只有可归因于会话本身的失败计入重试次数；环境故障换个时间重发就可能成功(§10)。 */
+function countsTowardCaptureAttempts(reason) {
+    return reason !== 'model-unavailable';
+}
+/** 环境故障的会话退避键；绑定 revision，会话更新后立即重新入场。 */
+function captureHoldKey(candidate) {
+    return `capture:${candidate.sessionId}:${candidate.sourceRevision}`;
 }
 //# sourceMappingURL=reconciler.js.map

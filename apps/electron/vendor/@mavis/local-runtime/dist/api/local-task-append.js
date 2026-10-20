@@ -4,7 +4,7 @@ import { createBackgroundTaskId, isTerminalTaskStatus, } from '../background-tas
 import { taskIdFromTurnId, taskTurnId } from '../background-task/turn-id.js';
 import { isLocalDirectTaskPurpose } from '../sessions/session-policy.js';
 import { admitAppendActivation, createAppendTaskRow, persistActivatedAppendAdmissionFailure, registerAppendCompletion, } from './local-task-append-lifecycle.js';
-import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, SUBAGENT_CONCURRENCY_LIMIT_ERROR_CODE, } from './injected-conversation-task-turn.js';
+import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, readTaskOccupancy, SUBAGENT_CONCURRENCY_LIMIT_ERROR_CODE, } from './injected-conversation-task-turn.js';
 /**
  * Failure contract of `task_append`. The code/status pair is what the desktop
  * tool renders back to the model, so it stays stable and enumerated.
@@ -269,7 +269,10 @@ async function steerChild(args) {
         });
     }
     catch (error) {
-        throw toAppendFailure(error, args.sourceTaskId);
+        const occupancy = isSubagentConcurrencyLimitRejection(error)
+            ? await readTaskOccupancy(args.conversation, args.toolCtx.sessionId)
+            : undefined;
+        throw toAppendFailure(error, args.sourceTaskId, occupancy);
     }
 }
 /**
@@ -299,11 +302,11 @@ async function resolveActiveTaskId(host, turnId, context) {
     }
     return activeTaskId;
 }
-function toAppendFailure(error, sourceTaskId) {
+function toAppendFailure(error, sourceTaskId, occupancy) {
     if (error instanceof LocalTaskAppendError)
         return error;
     if (error instanceof ConversationTurnRejectedError) {
-        return mapTurnRejection(error, sourceTaskId);
+        return mapTurnRejection(error, sourceTaskId, occupancy);
     }
     if (isRuntimeConversationUnavailableError(error) || isRuntimeConversationShutdownError(error)) {
         return appendError('Runtime Conversation is unavailable for task_append.', {
@@ -314,9 +317,9 @@ function toAppendFailure(error, sourceTaskId) {
     }
     return error;
 }
-function mapTurnRejection(error, sourceTaskId) {
+function mapTurnRejection(error, sourceTaskId, occupancy) {
     if (isSubagentConcurrencyLimitRejection(error)) {
-        return appendError(localTaskAdmissionFailure(error).errorMessage, {
+        return appendError(localTaskAdmissionFailure(error, occupancy).errorMessage, {
             status: 409,
             code: SUBAGENT_CONCURRENCY_LIMIT_ERROR_CODE,
             taskId: sourceTaskId,

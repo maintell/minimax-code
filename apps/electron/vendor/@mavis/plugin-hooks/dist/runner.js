@@ -161,8 +161,7 @@ export class PluginHookRunner {
             return { diagnostic: runDiagnostic(handler, 'HOOK_INVALID_INPUT'), processKilled: false };
         }
         let child;
-        const pluginDataDir = handler.pluginDataDir ??
-            resolvePath(handler.pluginRoot, '..', '.plugin-data', safePluginDataName(handler.pluginName));
+        const pluginDataDir = handler.pluginDataDir ?? resolvePluginDataDirectory(handler.pluginRoot, handler.pluginName);
         try {
             await mkdir(pluginDataDir, { recursive: true, mode: 0o700 });
             const env = {
@@ -279,6 +278,10 @@ export class PluginHookRunner {
             this.activeChildren.delete(child);
         }
     }
+}
+/** Per-Plugin writable directory shared by Hooks and Plugin Agent prompts. */
+export function resolvePluginDataDirectory(pluginRoot, pluginName) {
+    return resolvePath(pluginRoot, '..', '.plugin-data', safePluginDataName(pluginName));
 }
 function safePluginDataName(pluginName) {
     const safe = pluginName.replace(/[^A-Za-z0-9._-]/gu, '_').slice(0, 80);

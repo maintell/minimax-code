@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { DEFAULT_COMPACTION_SETTINGS } from '@earendil-works/pi-coding-agent/compaction';
 import { resolveCompactionTokenBudget } from '@mavis/context-manager';
 import { compactContext, } from './algorithm/compact-context.js';
-import { createCheckpointSession } from './execution/checkpoint-provider.js';
+import { createCheckpointSession, } from './execution/checkpoint-provider.js';
 import { checkpointMaxOutputTokens } from './execution/checkpoint-prompt.js';
 import { createLocalContextFootprintMeasurer } from './execution/local-context-footprint.js';
 /** Manual caller: bypasses the automatic trigger and transient filters. */
@@ -10,10 +10,19 @@ export class LocalContextCompactor {
     checkpointState;
     logger;
     promptSnapshots;
-    constructor(checkpointState, logger, promptSnapshots) {
+    checkpointContext;
+    imageFileWriter;
+    resolveEarlierFiles;
+    constructor(checkpointState, logger, promptSnapshots, context = {}) {
         this.checkpointState = checkpointState;
         this.logger = logger;
         this.promptSnapshots = promptSnapshots;
+        this.checkpointContext = {
+            reminder: context.reminder,
+            projectRequestMessages: context.projectRequestMessages,
+        };
+        this.imageFileWriter = context.imageFileWriter;
+        this.resolveEarlierFiles = context.resolveEarlierFiles;
     }
     async compactManual(input, hooks) {
         input.signal?.throwIfAborted();
@@ -27,6 +36,10 @@ export class LocalContextCompactor {
             checkpointState: this.checkpointState,
             logger: this.logger,
             promptSnapshots: this.promptSnapshots,
+            checkpointReminder: this.checkpointContext.reminder,
+            checkpointRequestMessages: this.checkpointContext.projectRequestMessages,
+            imageFileWriter: this.imageFileWriter,
+            resolveEarlierFiles: this.resolveEarlierFiles,
         });
         logManualReplacementGrowthBestEffort(this.logger, input.sessionId, decision, {
             providerInputLimit: preparation.providerInputLimit,
@@ -53,9 +66,20 @@ function prepareManualCompaction(input) {
     };
 }
 async function runManualPolicy(options) {
-    const { input, hooks, preparation } = options;
+    const { input, hooks, preparation, checkpointReminder, imageFileWriter, resolveEarlierFiles } = options;
     return compactContext({
+        ...(checkpointReminder
+            ? { checkpointReminder: (timestamp) => checkpointReminder(input.sessionId, timestamp) }
+            : {}),
         history: preparation.history,
+        ...(resolveEarlierFiles
+            ? { resolveEarlierFiles: () => resolveEarlierFiles(input.sessionId) }
+            : {}),
+        ...(imageFileWriter
+            ? {
+                writeImageFile: (messages, image) => imageFileWriter.writeImageFile({ sessionId: input.sessionId, messages }, image),
+            }
+            : {}),
         ...(input.customInstructions === undefined ? {} : { instructions: input.customInstructions }),
         limits: manualLimits(input, preparation.providerInputLimit),
         measurePair: async (pair) => preparation.measurer.measurePair(pair),
@@ -70,6 +94,7 @@ async function runManualPolicy(options) {
             tokensBefore: preparation.before.inputTokens,
             providerInputLimit: preparation.providerInputLimit,
             promptSnapshots: options.promptSnapshots,
+            projectRequestMessages: options.checkpointRequestMessages,
         }),
         ...manualSubagentCapture(input.sessionId, options.checkpointState, options.logger),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -83,7 +108,7 @@ function manualLimits(input, providerInputLimit) {
             : { maxSerializedInputBytes: input.maxSerializedInputBytes }),
     };
 }
-function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, }) {
+function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, projectRequestMessages, }) {
     return {
         tokensBefore,
         timestamp: Date.now(),
@@ -96,6 +121,7 @@ function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, prom
                 throw new TypeError('Manual context compaction requires streamFn for checkpoint.');
             }
             return createCheckpointSession({
+                projectRequestMessages,
                 model: input.model,
                 streamFn: input.streamFn,
                 thinkingLevel: input.thinkingLevel,

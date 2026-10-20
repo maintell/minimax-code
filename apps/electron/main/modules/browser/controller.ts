@@ -4,13 +4,22 @@
  * 作为方法入口，调用 BrowserActions 子模块
  */
 import path from "node:path";
-import { forwardEmbeddedBrowserHostShortcut } from "./embedded-browser-host-shortcut";
+import { MINIAPP_SURFACE_ID_ARGUMENT_PREFIX } from "@mavis/shared/miniapp-surface";
+import { matchesEmbeddedBrowserShortcutAction, forwardEmbeddedBrowserHostShortcut } from "./embedded-browser-host-shortcut";
 import { WebContentsView } from "electron";
 import { BrowserActions } from "./browser-actions";
 import { DevicePreviewController } from "./device-preview-controller";
 import { AgentCursorController } from "./agent-cursor-controller";
 import { AGENT_CURSOR_WORLD_ID, AGENT_CURSOR_BRIDGE_SCRIPT } from "./agent-cursor-bridge";
 export let EMBEDDED_BROWSER_PARTITION = 'persist:mavis-browser';
+/**
+ * Electron's own default for a `WebContentsView` created with no explicit
+ * background — opaque white. Exported so every call site that restores the
+ * view after a transparent pop-out shares this literal instead of duplicating it.
+ */
+export let DEFAULT_VIEW_BACKGROUND = '#ffffffff';
+/** Mini App pages get their own storage and the only webRequest hook that adds loopback auth. */
+export let MINIAPP_BROWSER_PARTITION = 'persist:mavis-miniapp';
 function boundsEqual(left, right) {
     return (left.x === right.x &&
         left.y === right.y &&
@@ -29,6 +38,18 @@ export class BrowserController {
         this.options = options;
         this.webContentsView = null;
         this.parentWindow = null;
+        /**
+         * File Panel host that owns shortcut routing. Unlike parentWindow it does not
+         * follow temporary reparenting into a background render or detached window.
+         */
+        this.shortcutHostWindow = null;
+        /**
+         * Wired by the manager while this Mini App page owns a detached window.
+         * Cmd/Ctrl+W in that state returns the page to the panel instead of
+         * forwarding to the File Panel host or falling through to the app menu's
+         * `role: 'close'`, which would otherwise close the main window.
+         */
+        this.onRequestCloseDetached = null;
         this.bounds = {
             x: 0,
             y: 0,
@@ -123,10 +144,12 @@ export class BrowserController {
             }
             this.devicePreviewController.reset();
             this.parentWindow = parentWindow;
+            this.shortcutHostWindow = parentWindow;
             this.bounds = bounds;
+            const partition = options.surfaceKind === 'miniapp' ? MINIAPP_BROWSER_PARTITION : EMBEDDED_BROWSER_PARTITION;
             this.webContentsView = new WebContentsView({
                 webPreferences: {
-                    partition: EMBEDDED_BROWSER_PARTITION,
+                    partition,
                     nodeIntegration: false,
                     nodeIntegrationInSubFrames: false,
                     contextIsolation: true,
@@ -139,6 +162,16 @@ export class BrowserController {
                     // 允许隐藏/后台页面被 Chromium 节流；自动化操作期间由 manager 临时关闭。
                     backgroundThrottling: true,
                     preload: path.join(__dirname, options.surfaceKind === 'miniapp' ? 'miniapp-preload.bundle.js' : 'preload.js'),
+                    // Fixed at WebContents creation; the page reads it synchronously as
+                    // `window.mcode.miniapp.window.id`. The WebContents is never rebuilt, so the
+                    // id survives pop-out and return.
+                    ...(options.surfaceKind === 'miniapp' && options.miniAppSurfaceId
+                        ? {
+                            additionalArguments: [
+                                `${MINIAPP_SURFACE_ID_ARGUMENT_PREFIX}${options.miniAppSurfaceId}`,
+                            ],
+                        }
+                        : {}),
                 },
             });
             // Normal creation loads a blank page for Windows initialization.
@@ -162,7 +195,7 @@ export class BrowserController {
             // 设置边界
             this.webContentsView.setBounds(bounds);
             // 设置事件监听
-            this.setupEventListeners(options.onOpenTab);
+            this.setupEventListeners(options.onOpenTab, partition);
             if (options.skipInitialLoad === true) {
                 this.deferredInitialization = options.devicePreviewMode ?? 'responsive';
             }
@@ -326,7 +359,11 @@ export class BrowserController {
         // iframe 内的第一次点击只会重新聚焦 WebContents，无法携带打开 OAuth
         // popup 所需的瞬时用户激活，表现为 Google 登录按钮无响应。
         try {
-            this.webContents?.focus();
+            // Selecting a tab from a native child menu must update the live page
+            // without stealing focus and dismissing that menu.
+            const childHasFocus = this.parentWindow?.getChildWindows().some((child) => child.isFocused());
+            if (!childHasFocus)
+                this.webContents?.focus();
         }
         catch {
             // Ignore races while the WebContents is being closed or reparented.
@@ -378,6 +415,7 @@ export class BrowserController {
             this.safeRemoveFromContentView(this.webContentsView, previousParentWindow);
         }
         this.parentWindow = parentWindow;
+        this.shortcutHostWindow = parentWindow;
         this.safeRemoveFromContentView(this.webContentsView, parentWindow);
         if (this.bounds.x >= 0 && this.bounds.y >= 0) {
             this.safeAddToContentView(this.webContentsView, parentWindow);
@@ -445,6 +483,30 @@ export class BrowserController {
         catch {
             // Ignore races while the WebContents is closing.
         }
+    }
+    /**
+     * Sets the native `WebContentsView`'s own background — separate from the
+     * page DOM background and from the owning `BaseWindow`'s. A `frame:false,
+     * transparent:true` Mini App window needs this cleared to an alpha-channel
+     * color, or the view paints an opaque rectangle regardless of the window's
+     * own transparency.
+     */
+    setBackgroundColor(color) {
+        if (!this.webContents || !this.webContentsView)
+            return;
+        try {
+            this.webContentsView.setBackgroundColor(color);
+        }
+        catch {
+            // Ignore races while the native view is being torn down.
+        }
+    }
+    /**
+     * Wired by the manager around a detach/attach round trip; see the field
+     * comment on `onRequestCloseDetached` above.
+     */
+    setOnRequestCloseDetached(callback) {
+        this.onRequestCloseDetached = callback;
     }
     /**
      * 获取当前状态
@@ -655,6 +717,17 @@ export class BrowserController {
     getWebContents() {
         return this.webContents;
     }
+    /**
+     * Gives the page real keyboard focus. A newly opened pop-out window does
+     * not otherwise pull it: without this, shortcuts like Cmd/Ctrl+W only
+     * work once the user clicks inside the page (Bug 2).
+     */
+    focusPage() {
+        const wc = this.webContents;
+        if (!wc || wc.isDestroyed())
+            return;
+        wc.focus();
+    }
     async updateElementMapAfterAction(options) {
         return this.browserActions.updateElementMapAfterAction(options);
     }
@@ -673,7 +746,7 @@ export class BrowserController {
     /**
      * 设置事件监听
      */
-    setupEventListeners(onOpenTab) {
+    setupEventListeners(onOpenTab, partition = EMBEDDED_BROWSER_PARTITION) {
         const wc = this.webContents;
         if (!wc || wc?.isDestroyed?.()) {
             return;
@@ -681,7 +754,22 @@ export class BrowserController {
         wc.on('before-input-event', (event, input) => {
             if (input.type !== 'keyDown' || !(input.meta || input.control || input.alt || input.shift))
                 return;
-            forwardEmbeddedBrowserHostShortcut(event, input, this.parentWindow, this.options.getShortcutOverrides?.() ?? {});
+            const overrides = this.options.getShortcutOverrides?.() ?? {};
+            const isDetached = this.parentWindow !== this.shortcutHostWindow;
+            if (isDetached &&
+                matchesEmbeddedBrowserShortcutAction(input, 'workspacePanel.closeCurrentTab', overrides)) {
+                // Detached: handle the close shortcut ourselves instead of forwarding
+                // it (nowhere useful to land) or leaving it to fall through to the
+                // app menu's `role: 'close'`, which resolves to the main window, not
+                // this Mini App's own pop-out.
+                event.preventDefault();
+                this.onRequestCloseDetached?.();
+                return;
+            }
+            forwardEmbeddedBrowserHostShortcut(event, input, this.shortcutHostWindow,
+            // Outside the File Panel host the close shortcut belongs to the page's
+            // own window, whose close handler returns the page to the panel.
+            isDetached ? { ...overrides, 'workspacePanel.closeCurrentTab': null } : overrides);
         });
         // 拦截新窗口打开请求
         wc.setWindowOpenHandler(({ url, features }) => {
@@ -704,7 +792,7 @@ export class BrowserController {
                         minimizable: false,
                         maximizable: false,
                         webPreferences: {
-                            partition: EMBEDDED_BROWSER_PARTITION,
+                            partition,
                             nodeIntegration: false,
                             nodeIntegrationInSubFrames: false,
                             contextIsolation: true,

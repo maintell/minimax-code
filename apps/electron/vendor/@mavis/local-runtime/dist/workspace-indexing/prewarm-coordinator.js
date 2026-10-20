@@ -41,9 +41,9 @@ export class WorkspacePrewarmCoordinator {
         this.metrics = options.metrics ?? new WorkspaceIndexingMetrics();
     }
     async prewarmWorkspace(workspaceDir) {
+        const cancellationSignal = this.abortController.signal;
         if (!(await this.isEnabled()))
             return { status: 'disabled' };
-        const cancellationSignal = this.abortController.signal;
         cancellationSignal.throwIfAborted();
         const workspaceRealPath = await realpath(workspaceDir);
         cancellationSignal.throwIfAborted();
@@ -59,7 +59,9 @@ export class WorkspacePrewarmCoordinator {
         return toWorkspacePrewarmResult(outcome.value);
     }
     async withCleanWorkspace(workspaceDir, signal, usePrepared) {
+        signal = AbortSignal.any([signal, this.abortController.signal]);
         const workspaceRealPath = await realpath(workspaceDir);
+        signal.throwIfAborted();
         const state = this.getOrCreateState(workspaceRealPath);
         try {
             return await this.operations.run(workspaceRealPath, async () => {

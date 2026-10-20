@@ -32,15 +32,17 @@ async function showNotification(options) {
             return;
         }
     }
-    // 构建图标路径
-    let iconPath = icon;
-    if (!iconPath) {
-        // 使用彩色图标作为通知图标，视觉效果更好
-        if (isDev) {
-            iconPath = path.join(__dirname, '../../resources/tray.png');
-        }
-        else {
-            iconPath = path.join(process.resourcesPath, 'resources', 'tray.png');
+    // macOS 自带左侧应用图标，显式 icon 会变成右侧附件，导致 logo 重复。
+    let iconPath;
+    if (process.platform !== 'darwin') {
+        iconPath = icon;
+        if (!iconPath) {
+            if (isDev) {
+                iconPath = path.join(__dirname, '../../resources/tray.png');
+            }
+            else {
+                iconPath = path.join(process.resourcesPath, 'resources', 'tray.png');
+            }
         }
     }
     const id = `mavis-notification-${randomUUID()}`;
@@ -49,7 +51,7 @@ async function showNotification(options) {
         title,
         body,
         silent,
-        icon: iconPath,
+        ...(iconPath ? { icon: iconPath } : {}),
     });
     if (data)
         payloadStore?.put(id, data);

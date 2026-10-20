@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_COMPACTION_SETTINGS } from '@earendil-works/pi-coding-agent/compaction';
-import { resolveCompactionTokenBudget } from '@mavis/context-manager';
+import { boundRequestMedia, createDefaultTokenEstimator, fitRequestMedia, halfRequestMediaBudget, isArchivableRequestImage, recoveryRequestMediaBudget, resolveCompactionTokenBudget, resolveRequestMediaBudget, selectImagesToArchive, selectRequestImages, tokenRequestMediaBudget, } from '@mavis/context-manager';
 import { compactContext, } from './algorithm/compact-context.js';
 import { ToolResultArchiver, } from './algorithm/tool-result-archiver.js';
-import { createCheckpointSession } from './execution/checkpoint-provider.js';
+import { createCheckpointSession, } from './execution/checkpoint-provider.js';
 import { checkpointMaxOutputTokens } from './execution/checkpoint-prompt.js';
 import { createLocalContextFootprintMeasurer } from './execution/local-context-footprint.js';
 import { ContextUsageAnchorState } from './execution/usage-anchor.js';
@@ -11,35 +11,40 @@ export class AutomaticContextCompactor {
     usageAnchor;
     checkpointState;
     logger;
+    checkpointReminder;
     toolResultArchiver;
     promptSnapshots;
+    getRecoveryDivisor;
+    resolveEarlierFiles;
+    checkpointRequestMessages;
     constructor(usageAnchor, checkpointState, logger, dependencies) {
         this.usageAnchor = usageAnchor;
         this.checkpointState = checkpointState;
         this.logger = logger;
+        this.checkpointReminder = dependencies.checkpointReminder;
         this.toolResultArchiver = dependencies.toolResultArchiver;
         this.promptSnapshots = dependencies.promptSnapshots;
+        this.getRecoveryDivisor = dependencies.getRecoveryDivisor;
+        this.resolveEarlierFiles = dependencies.resolveEarlierFiles;
+        this.checkpointRequestMessages = dependencies.checkpointRequestMessages;
     }
     probeBeforeLlm(input) {
         input.signal?.throwIfAborted();
         return {
-            shouldStart: prepareAutomaticCompaction(input, this.usageAnchor, this.toolResultArchiver)
-                .shouldStart,
+            shouldStart: prepareAutomaticCompaction(input, this.usageAnchor, this.toolResultArchiver, this.getRecoveryDivisor?.()).shouldStart,
         };
     }
     async compactBeforeLlm(input, hooks) {
         input.signal?.throwIfAborted();
-        const preparation = prepareAutomaticCompaction(input, this.usageAnchor, this.toolResultArchiver);
+        const preparation = prepareAutomaticCompaction(input, this.usageAnchor, this.toolResultArchiver, this.getRecoveryDivisor?.());
         if (!preparation.shouldStart) {
             return { status: 'unchanged', reason: 'nothing-to-compact' };
         }
         await hooks?.onStarted();
         input.signal?.throwIfAborted();
-        const toolResultCompactionCandidate = await materializeToolResultCompactionBestEffort(this.toolResultArchiver, input.sessionId, preparation.toolResultCompactionPlan, preparation.canReadArchivedToolResults);
+        const toolResultCompactionCandidate = await materializeToolResultCompactionBestEffort(this.toolResultArchiver, input, preparation);
         input.signal?.throwIfAborted();
-        if (preparation.toolResultCompactionPlan &&
-            !toolResultCompactionCandidate &&
-            !preparation.normalTriggerMatched) {
+        if (!toolResultCompactionCandidate && !preparation.normalTriggerMatched) {
             return { status: 'unchanged', reason: 'nothing-to-compact' };
         }
         const decision = await runAutomaticPolicy({
@@ -49,14 +54,17 @@ export class AutomaticContextCompactor {
             toolResultCompactionCandidate,
             checkpointState: this.checkpointState,
             logger: this.logger,
-            legacyToolTrim: this.toolResultArchiver === undefined,
+            archiver: this.toolResultArchiver,
             promptSnapshots: this.promptSnapshots,
+            resolveEarlierFiles: this.resolveEarlierFiles,
+            checkpointReminder: this.checkpointReminder,
+            checkpointRequestMessages: this.checkpointRequestMessages,
         });
         this.usageAnchor?.invalidate(input.sessionId);
         return completedAutomaticCompaction(input.messages, decision);
     }
 }
-function prepareAutomaticCompaction(input, usageAnchor, archiver) {
+function prepareAutomaticCompaction(input, usageAnchor, archiver, recoveryDivisor) {
     const measurer = createAutomaticFootprintMeasurer(input, usageAnchor);
     const footprint = measurer.measure(input.messages);
     const { providerInputLimit, automaticTriggerAt } = resolveCompactionTokenBudget({
@@ -67,35 +75,90 @@ function prepareAutomaticCompaction(input, usageAnchor, archiver) {
         sessionId: input.sessionId,
         messages: input.messages,
     });
-    const normalTriggerMatched = footprint.inputTokens > automaticTriggerAt ||
-        (input.maxSerializedInputBytes !== undefined &&
-            footprint.serializedBytes > input.maxSerializedInputBytes);
+    const serializedBytesExceeded = input.maxSerializedInputBytes !== undefined &&
+        footprint.serializedBytes > input.maxSerializedInputBytes;
+    const normalTriggerMatched = footprint.inputTokens > automaticTriggerAt || serializedBytesExceeded;
+    const imageArchiveTarget = archiver
+        ? resolveImageArchiveTarget(input, recoveryDivisor, {
+            inputTokens: footprint.inputTokens,
+            triggerAt: automaticTriggerAt,
+            perImage: createDefaultTokenEstimator().estimateVisualTokens(),
+        })
+        : undefined;
     return {
         measurer,
         footprint,
         toolResultCompactionPlan,
+        imageArchiveTarget,
         canReadArchivedToolResults: hasReadTool(input.tools),
         normalTriggerMatched,
-        shouldStart: toolResultCompactionPlan !== undefined || normalTriggerMatched,
+        shouldStart: toolResultCompactionPlan !== undefined ||
+            imageArchiveTarget !== undefined ||
+            normalTriggerMatched,
         providerInputLimit,
     };
 }
+/**
+ * Image budget the history is archived down to: 1/`recoveryDivisor` of what a
+ * rejected request carried when repeating it, or the request guard's low
+ * watermark once the guard would drop a tool result image, so tool images
+ * leave the history instead of being dropped again on every request. When the
+ * images alone push the context over the automatic trigger, the stricter
+ * `tokenRequestMediaBudget` applies, so archiving them replaces a checkpoint.
+ * `undefined` when no tool result image falls outside it.
+ */
+function resolveImageArchiveTarget(input, recoveryDivisor, tokens) {
+    const budget = resolveRequestMediaBudget(input);
+    let target;
+    if (input.recovery) {
+        target = recoveryRequestMediaBudget(input.recovery.requestMessages, budget, recoveryDivisor);
+    }
+    else if (selectRequestImages(input.messages, budget).dropped.some(isArchivableRequestImage)) {
+        target = halfRequestMediaBudget(budget);
+    }
+    const tokenTarget = tokenRequestMediaBudget(input.messages, tokens, budget);
+    if (tokenTarget) {
+        target = target
+            ? {
+                maxImages: Math.min(target.maxImages, tokenTarget.maxImages),
+                maxImageBytes: Math.min(target.maxImageBytes, tokenTarget.maxImageBytes),
+            }
+            : tokenTarget;
+    }
+    if (!target)
+        return undefined;
+    return selectImagesToArchive(input.messages, target, isArchivableRequestImage).length > 0
+        ? target
+        : undefined;
+}
 async function runAutomaticPolicy(options) {
-    const { input, hooks, preparation } = options;
+    const { input, hooks, preparation, archiver, checkpointReminder, resolveEarlierFiles } = options;
     return compactContext({
+        ...(checkpointReminder
+            ? { checkpointReminder: (timestamp) => checkpointReminder(input.sessionId, timestamp) }
+            : {}),
         history: input.messages,
+        ...(resolveEarlierFiles
+            ? { resolveEarlierFiles: () => resolveEarlierFiles(input.sessionId) }
+            : {}),
         limits: automaticLimits(input, preparation.providerInputLimit),
         measurePair: async (pair) => preparation.measurer.measurePair(pair),
         ...(options.toolResultCompactionCandidate
             ? { toolResultCompactionCandidate: options.toolResultCompactionCandidate }
             : {}),
-        allowLegacyToolTrim: options.legacyToolTrim,
+        allowLegacyToolTrim: archiver === undefined,
+        ...(archiver
+            ? {
+                writeImageFile: (messages, image) => archiver.writeImageFile({ sessionId: input.sessionId, messages }, image),
+            }
+            : {}),
         checkpoint: automaticCheckpoint({
             input,
             hooks,
             tokensBefore: preparation.footprint.inputTokens,
             providerInputLimit: preparation.providerInputLimit,
             promptSnapshots: options.promptSnapshots,
+            projectRequestMessages: options.checkpointRequestMessages,
         }),
         ...automaticSubagentCapture(input.sessionId, options.checkpointState, options.logger),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -109,7 +172,7 @@ function automaticLimits(input, providerInputLimit) {
             : { maxSerializedInputBytes: input.maxSerializedInputBytes }),
     };
 }
-function automaticCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, }) {
+function automaticCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, projectRequestMessages, }) {
     return {
         tokensBefore,
         timestamp: Date.now(),
@@ -117,14 +180,18 @@ function automaticCheckpoint({ input, hooks, tokensBefore, providerInputLimit, p
             ? { onAttemptSettled: hooks.onCheckpointAttemptSettled }
             : {}),
         ...(hooks?.getProviderTokenUsage ? { getTokenUsage: hooks.getProviderTokenUsage } : {}),
-        open: () => openAutomaticCheckpoint(input, hooks, providerInputLimit, promptSnapshots),
+        open: () => openAutomaticCheckpoint(input, hooks, providerInputLimit, {
+            promptSnapshots,
+            projectRequestMessages,
+        }),
     };
 }
-async function openAutomaticCheckpoint(input, hooks, providerInputLimit, promptSnapshots) {
+async function openAutomaticCheckpoint(input, hooks, providerInputLimit, context) {
     if (!input.streamFn) {
         throw new TypeError('Automatic context compaction requires streamFn.');
     }
     const session = await createCheckpointSession({
+        projectRequestMessages: context.projectRequestMessages,
         model: input.model,
         streamFn: input.streamFn,
         thinkingLevel: input.thinkingLevel,
@@ -144,28 +211,9 @@ async function openAutomaticCheckpoint(input, hooks, providerInputLimit, promptS
             stopReason: generation.stopReason,
             outputTokens: generation.outputTokens,
         }),
-        ...(promptSnapshots ? { promptSnapshots } : {}),
+        ...(context.promptSnapshots ? { promptSnapshots: context.promptSnapshots } : {}),
     });
-    const measure = session.measure;
-    return {
-        ...session,
-        fits: (request) => session.fits({
-            ...request,
-            messages: projectAutomaticContextRequestMessages(request.messages),
-        }),
-        ...(measure === undefined
-            ? {}
-            : {
-                measure: (request) => measure({
-                    ...request,
-                    messages: projectAutomaticContextRequestMessages(request.messages),
-                }),
-            }),
-        generate: async (request) => await session.generate({
-            ...request,
-            messages: projectAutomaticContextRequestMessages(request.messages),
-        }),
-    };
+    return session;
 }
 function automaticSubagentCapture(sessionId, checkpointState, logger) {
     if (!checkpointState)
@@ -212,22 +260,72 @@ function hmidRecoveryMetadata(decision) {
 function hasReadTool(tools) {
     return tools?.some((tool) => tool.name === 'read') === true;
 }
-async function materializeToolResultCompactionBestEffort(archiver, sessionId, plan, canReadArchivedToolResults) {
-    if (!archiver || !plan)
+async function materializeToolResultCompactionBestEffort(archiver, input, preparation) {
+    if (!archiver)
         return undefined;
+    const { sessionId } = input;
+    const plan = preparation.toolResultCompactionPlan;
     try {
-        return canReadArchivedToolResults
-            ? await archiver.materialize({ sessionId, plan })
-            : await archiver.materializeTrim({ sessionId, plan });
+        let text;
+        if (plan) {
+            text = preparation.canReadArchivedToolResults
+                ? await archiver.materialize({ sessionId, plan })
+                : await archiver.materializeTrim({ sessionId, plan });
+        }
+        const images = preparation.imageArchiveTarget
+            ? await archiver.archiveImages({
+                sessionId,
+                messages: text?.messages ?? input.messages,
+                target: preparation.imageArchiveTarget,
+            })
+            : undefined;
+        return images ? withArchivedImages(text, images) : text;
     }
     catch {
         return undefined;
     }
 }
-export function createAutomaticContextRequestFilterHook() {
+function withArchivedImages(text, images) {
+    const actualSavingsBytes = (text?.actualSavingsBytes ?? 0) + images.savedBytes;
+    if (text && 'trimmedResultCount' in text) {
+        return {
+            messages: images.messages,
+            trimmedResultCount: text.trimmedResultCount + images.archivedImageCount,
+            actualSavingsBytes,
+        };
+    }
+    return {
+        messages: images.messages,
+        archivedResultCount: (text?.archivedResultCount ?? 0) + images.archivedImageCount,
+        actualSavingsBytes,
+    };
+}
+/**
+ * Request-only image limit for every image, user or tool. Runs after
+ * compaction, so its placeholders never reach durable history. Compaction has
+ * already archived the tool result images outside the same target, so what
+ * this drops is what history cannot lose: user attachments, and images kept
+ * for a model with a higher limit. A repeated request is fitted to the
+ * recovery target of the rejected one, cut by `getRecoveryDivisor()`.
+ */
+export function createRequestMediaGuardHook(getRecoveryDivisor) {
     return (input) => {
-        const messages = projectAutomaticContextRequestMessages(input.messages);
-        return messages === input.messages
+        const budget = resolveRequestMediaBudget(input);
+        const target = input.recovery
+            ? recoveryRequestMediaBudget(input.recovery.requestMessages, budget, getRecoveryDivisor?.())
+            : undefined;
+        const { messages, omittedCount } = target
+            ? fitRequestMedia(input.messages, target)
+            : boundRequestMedia(input.messages, budget);
+        return omittedCount === 0
+            ? { type: 'continue' }
+            : { type: 'replaceRequestMessages', messages, reason: 'request-media-guard' };
+    };
+}
+export function createAutomaticContextRequestFilterHook(projectRequestMessages) {
+    return (input) => {
+        const messages = projectRequestMessages?.(input.sessionId, input.messages) ?? input.messages;
+        return messages.length === input.messages.length
             ? { type: 'continue' }
             : {
                 type: 'replaceRequestMessages',
@@ -235,9 +333,6 @@ export function createAutomaticContextRequestFilterHook() {
                 reason: 'internal-context-filter',
             };
     };
-}
-function projectAutomaticContextRequestMessages(messages) {
-    return messages;
 }
 export function createAutomaticFootprintMeasurer(input, usageAnchor) {
     return createLocalContextFootprintMeasurer({

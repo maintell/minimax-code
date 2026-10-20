@@ -31,13 +31,13 @@
  *   a bash escape hatch, the model can self-correct, and the context window
  *   is not wasted on replacement characters.
  *
- * Local-FS assumption: this module calls `node:fs` directly, following the
- * precedent set by `read-video.ts` — desktop runs on the local machine and
- * cloud runs inside the sandbox executor, so the workspace filesystem is
- * always local. Remote-FS scenarios go through pi's pluggable
+ * Local-FS assumption: this module uses physical-fs — desktop runs on the
+ * local machine and cloud runs inside the sandbox executor. Electron's ASAR
+ * virtual directories must not change user-file semantics. Remote-FS
+ * scenarios go through pi's pluggable
  * `ReadOperations` and never reach these wrapper-level guards.
  */
-import { open, stat } from 'node:fs/promises';
+import { open, stat } from './physical-fs.js';
 import { basename, extname } from 'node:path';
 import { inferReadVideoMimeType } from './read-video.js';
 // ---------------------------------------------------------------------------
@@ -284,6 +284,21 @@ export function checkBinaryReadExtension(absolutePath) {
  * detection would see.
  */
 const BINARY_SNIFF_BYTES = 4100;
+async function readFileSample(absolutePath) {
+    const handle = await open(absolutePath, 'r');
+    try {
+        const buffer = Buffer.alloc(BINARY_SNIFF_BYTES);
+        const { bytesRead } = await handle.read(buffer, 0, BINARY_SNIFF_BYTES, 0);
+        return buffer.subarray(0, bytesRead);
+    }
+    finally {
+        await handle.close();
+    }
+}
+/** Keep pi's image sniffing on the same physical filesystem as the read guards. */
+export async function detectPiSupportedImageMimeTypeFromFile(absolutePath) {
+    return detectPiSupportedImageMimeType(await readFileSample(absolutePath));
+}
 /**
  * Full binary detection: extension blacklist + 4KB sample (image magic
  * exemption → UTF-16 BOM exemption → NUL short-circuit → control-character
@@ -307,15 +322,7 @@ export async function detectBinaryRead(absolutePath) {
     const byExtension = checkBinaryReadExtension(absolutePath);
     let sample;
     try {
-        const handle = await open(absolutePath, 'r');
-        try {
-            const buffer = Buffer.alloc(BINARY_SNIFF_BYTES);
-            const { bytesRead } = await handle.read(buffer, 0, BINARY_SNIFF_BYTES, 0);
-            sample = buffer.subarray(0, bytesRead);
-        }
-        finally {
-            await handle.close();
-        }
+        sample = await readFileSample(absolutePath);
     }
     catch {
         // ENOENT / EACCES / EISDIR … — not our call; let pi produce the error

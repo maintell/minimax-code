@@ -1,3 +1,4 @@
+import { migration as m0044 } from './migrations/session/migration-0044-converge-rc-sidechat-version-collision.js';
 import { migration as m0014 } from './migrations/agent/migration-0014-create-agents.js';
 import { migration as m0024 } from './migrations/canvas/migration-0024-create-canvas.js';
 import { migration as m0031 } from './migrations/canvas/migration-0031-repair-canvas-version-collision.js';
@@ -38,6 +39,8 @@ import { migration as m0035 } from './migrations/session/migration-0035-converge
 import { migration as m0041 } from './migrations/session/migration-0041-create-session-clio.js';
 import { migration as m0039 } from './migrations/memory/migration-0039-memory-governance-revision.js';
 import { migration as m0040 } from './migrations/memory/migration-0040-memory-executions.js';
+import { migration as m0042 } from './migrations/session/migration-0042-repair-session-sidechats-version-collision.js';
+import { migration as m0043 } from './migrations/cron/migration-0043-cron-deferred-delivery.js';
 export const ALL_MIGRATIONS = [
     m0001,
     m0002,
@@ -79,5 +82,8 @@ export const ALL_MIGRATIONS = [
     m0039,
     m0040,
     m0041,
+    m0042,
+    m0043,
+    m0044,
 ];
 //# sourceMappingURL=migrations.js.map

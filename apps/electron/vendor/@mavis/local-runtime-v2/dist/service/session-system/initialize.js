@@ -68,6 +68,7 @@ export function initializeSessionApplicationSystem(options) {
     };
     return {
         repositories: owner.repositories,
+        sideChats: owner.sideChats,
         session: {
             query: owner.sessions.query,
             lifecycle,
@@ -79,6 +80,7 @@ export function initializeSessionApplicationSystem(options) {
                     records: owner.sessions.records,
                     cleanup,
                     facts: options.facts.session,
+                    sideChats: owner.sideChats,
                 }),
             },
         },
@@ -100,6 +102,7 @@ export function initializeSessionApplicationSystem(options) {
         },
         diff: initializeSessionDiffCapability(owner.repositories.sessions),
         queue: {
+            facts: owner.queue.facts,
             committed: owner.queue.committed,
         },
         stream: owner.stream,

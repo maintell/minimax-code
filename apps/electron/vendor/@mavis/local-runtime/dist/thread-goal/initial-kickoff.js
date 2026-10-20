@@ -2,7 +2,7 @@ import { buildThreadGoalKickoffMessage, threadGoalKickoffClientRequestId } from 
 /** Owns initial Goal kickoff materialization, replacement, recovery, and cancellation. */
 export class GoalInitialKickoffCoordinator {
     deps;
-    /** Serialize rewrites so rapid PATCHes cannot restore an older Goal epoch. */
+    /** Serialize retirement and rewrites so rapid PATCHes cannot restore an older Goal epoch. */
     refreshTails = new Map();
     /*
      * Goals whose queued kickoff was cancelled for a rewrite but not yet
@@ -20,6 +20,10 @@ export class GoalInitialKickoffCoordinator {
         this.deps = deps;
     }
     async reconcile(goal, dispatch, refreshQueued = false) {
+        if (goal.status === 'paused') {
+            const current = await this.retireAfterPause(goal, dispatch);
+            return current?.kickoffState ?? goal.kickoffState;
+        }
         const clientRequestId = threadGoalKickoffClientRequestId(goal.goalId);
         let queued = await this.deps.external.hasPendingInitialContinuation(goal.sessionId, clientRequestId);
         if (goal.status === 'complete' || goal.kickoffState === 'consumed') {
@@ -27,6 +31,12 @@ export class GoalInitialKickoffCoordinator {
                 await this.deps.external.cancelInitialContinuation(goal.sessionId, clientRequestId);
             if (goal.kickoffState !== 'consumed')
                 await this.consume(goal);
+            return 'consumed';
+        }
+        if (!queued &&
+            goal.kickoffState === 'pending' &&
+            (goal.turnsUsed > 0 || this.deps.hasActiveTurn(goal))) {
+            await this.consume(goal);
             return 'consumed';
         }
         if (goal.kickoffState === 'enqueued' && !queued && !this.awaitingRedelivery.has(goal.goalId)) {
@@ -42,11 +52,34 @@ export class GoalInitialKickoffCoordinator {
         }
         if (!queued) {
             const prompt = await this.deps.preparePrompt(goal);
-            await this.deps.external.enqueueInitialContinuationTurn(goal, buildThreadGoalKickoffMessage(goal, prompt.content, goal.kickoffAttachments.map((attachment) => ({ ...attachment }))), clientRequestId, prompt.internalPromptRead);
+            try {
+                await this.deps.external.enqueueInitialContinuationTurn(goal, buildThreadGoalKickoffMessage(goal, prompt.content, goal.kickoffAttachments.map((attachment) => ({ ...attachment }))), clientRequestId, prompt.internalPromptRead);
+            }
+            catch (error) {
+                // A persisted receipt owns the work even if submission lost its ACK.
+                if (!(await this.deps.external.hasPendingInitialContinuation(goal.sessionId, clientRequestId))) {
+                    const current = await this.deps.store().getById(goal.goalId);
+                    if (this.deps.hasActiveTurn(goal) ||
+                        (current?.turnsUsed ?? 0) > 0 ||
+                        current?.kickoffState === 'consumed') {
+                        await this.consume(current ?? goal);
+                        this.awaitingRedelivery.delete(goal.goalId);
+                        return 'consumed';
+                    }
+                    throw error;
+                }
+                this.deps.external.reportFailure(goal.sessionId, `thread_goal_kickoff_ack_failed:${this.deps.external.formatError(error)}`);
+            }
         }
         this.awaitingRedelivery.delete(goal.goalId);
         if (goal.kickoffState === 'pending') {
-            await this.deps.store().transitionKickoffState(goal.goalId, 'pending', 'enqueued');
+            try {
+                await this.deps.store().transitionKickoffState(goal.goalId, 'pending', 'enqueued');
+            }
+            catch (error) {
+                // Queue admission has committed. Recovery can repair this bookkeeping.
+                this.deps.external.reportFailure(goal.sessionId, `thread_goal_kickoff_state_failed:${this.deps.external.formatError(error)}`);
+            }
         }
         if (dispatch)
             this.deps.external.requestQueueDispatch(goal.sessionId);
@@ -54,47 +87,75 @@ export class GoalInitialKickoffCoordinator {
     }
     /** Rebuild a queued kickoff from the newest durable Goal after a decision-epoch advance. */
     async refreshQueuedKickoff(observed) {
-        const previous = this.refreshTails.get(observed.sessionId) ?? Promise.resolve();
-        const refresh = previous.then(async () => {
-            const current = await this.deps.store().getBySession(observed.sessionId);
-            if (!current ||
-                current.goalId !== observed.goalId ||
-                current.status !== 'active' ||
-                current.kickoffState === 'consumed') {
-                return undefined;
-            }
-            await this.reconcile(current, true, true);
-            const refreshed = await this.deps.store().getBySession(observed.sessionId);
-            return refreshed?.goalId === observed.goalId ? refreshed : undefined;
-        });
-        const tail = refresh.then(() => undefined, () => undefined);
-        this.refreshTails.set(observed.sessionId, tail);
         try {
-            return await refresh;
+            return await this.serialize(observed.sessionId, async () => {
+                const current = await this.deps.store().getBySession(observed.sessionId);
+                if (!current || current.goalId !== observed.goalId || current.status !== 'active') {
+                    return undefined;
+                }
+                // A concurrent pause may have retired the kickoff while this PATCH
+                // waited its turn. Resume that Goal through the ordinary continuation.
+                if (current.kickoffState === 'consumed')
+                    return current;
+                await this.reconcile(current, true, true);
+                const refreshed = await this.deps.store().getBySession(observed.sessionId);
+                return refreshed?.goalId === observed.goalId ? refreshed : undefined;
+            });
         }
         catch (error) {
             this.deps.external.reportFailure(observed.sessionId, `thread_goal_kickoff_refresh_failed:${this.deps.external.formatError(error)}`);
-            /*
-             * A stale or not-applicable refresh already returned `undefined` above.
-             * Reaching here means the rewrite itself failed, so the caller still owes
-             * this Goal a runner: swallowing it here is what let the re-arm drain
-             * drop the marker and stop the Goal for good.
-             */
+            // Failed queue rewrites must retain redelivery responsibility.
             throw error;
         }
+    }
+    /**
+     * A paused Goal owns no runnable kickoff. Retire the marker before removing
+     * its Queue item: even an already-claimed item then fails admission and cannot
+     * pin the FIFO head. The Goal/objective/attachment snapshot remains durable;
+     * explicit resume uses a new continuation, carrying first-turn attachments.
+     */
+    async retireAfterPause(observed, dispatch = true) {
+        try {
+            return await this.serialize(observed.sessionId, async () => {
+                const current = await this.deps.store().getBySession(observed.sessionId);
+                if (!current || current.goalId !== observed.goalId || current.status !== 'paused')
+                    return current;
+                await this.consume(current);
+                try {
+                    await this.cancel(current);
+                }
+                finally {
+                    if (dispatch)
+                        this.deps.external.requestQueueDispatch(current.sessionId);
+                }
+                return this.deps.store().getBySession(current.sessionId);
+            });
+        }
+        catch (error) {
+            this.deps.external.reportFailure(observed.sessionId, `thread_goal_kickoff_retire_failed:${this.deps.external.formatError(error)}`);
+            return undefined;
+        }
+    }
+    async serialize(sessionId, operation) {
+        const result = (this.refreshTails.get(sessionId) ?? Promise.resolve()).then(operation);
+        const tail = result.then(() => undefined, () => undefined);
+        this.refreshTails.set(sessionId, tail);
+        try {
+            return await result;
+        }
         finally {
-            if (this.refreshTails.get(observed.sessionId) === tail) {
-                this.refreshTails.delete(observed.sessionId);
-            }
+            if (this.refreshTails.get(sessionId) === tail)
+                this.refreshTails.delete(sessionId);
         }
     }
     async rollbackFailedCreation(goal) {
-        try {
-            await this.cancel(goal);
-        }
-        catch (error) {
-            this.deps.external.reportFailure(goal.sessionId, `thread_goal_kickoff_rollback_cancel_failed:${this.deps.external.formatError(error)}`);
-        }
+        if (this.deps.hasActiveTurn(goal))
+            return;
+        const current = await this.deps.store().getById(goal.goalId);
+        if (current && (current.updatedAt !== goal.updatedAt || current.kickoffState !== 'pending'))
+            return;
+        if (await this.deps.external.hasPendingInitialContinuation(goal.sessionId, threadGoalKickoffClientRequestId(goal.goalId)))
+            return;
         await this.deps.store().delete(goal.goalId);
     }
     cancel(goal) {

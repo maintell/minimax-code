@@ -1,4 +1,4 @@
-import { MINIMAX_MODELS } from './minimax-model-catalog.js';
+import { MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID, MINIMAX_MODELS } from './minimax-model-catalog.js';
 import fs from 'node:fs';
 import { restrictConfigFileSync, writePrivateConfigFileSync } from './private-config-file.js';
 import { parseConfigText, serializeConfigPreservingComments, } from './comment-preserving-config-write.js';
@@ -23,6 +23,7 @@ import { ASK_USER_CONFIG_DEFAULTS, parseAskUserConfig, } from './ask-user-config
 import { DATA_CONTRIBUTION_CONFIG_DEFAULTS, parseDataContributionConfig, } from './data-contribution-config.js';
 import { GOAL_CONFIG_DEFAULTS, parseGoalConfig } from './goal-config.js';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from './tool-result-compaction-config.js';
+import { REQUEST_MEDIA_DEFAULTS, parseRequestMediaConfig, } from './request-media-config.js';
 import { BROWSER_CONFIG_DEFAULTS, parseBrowserConfig, } from './browser-config.js';
 import { parseSandboxConfig, SANDBOX_CONFIG_DEFAULTS, } from './sandbox-config.js';
 import { parseSubagentConfig, SUBAGENT_CONFIG_DEFAULTS, } from './subagent-config.js';
@@ -615,7 +616,7 @@ function buildPresetEntry(key) {
     };
     return {
         provider: { minimax: provider },
-        defaultModel: 'minimax/MiniMax-M3.1-Flash-Preview',
+        defaultModel: `minimax/${MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID}`,
     };
 }
 export const DEFAULT_MODEL_PRESETS = {
@@ -632,6 +633,7 @@ const DEFAULTS = {
     logLevel: 'info',
     devPort: DEFAULT_UI_PORT,
     permissionMode: 'auto',
+    skipWindowsHardSafetyChecks: false,
     sseErrorPush: {
         history: true,
         stream: true,
@@ -716,6 +718,7 @@ const DEFAULTS = {
     },
     runawayGuard: { enabled: true },
     toolResultCompaction: { ...TOOL_RESULT_COMPACTION_DEFAULTS },
+    requestMedia: { ...REQUEST_MEDIA_DEFAULTS },
     agentRuntime: {
         // Single source of truth lives in `./agent-runtime-config.ts` so the
         // default and the union type cannot drift.
@@ -772,6 +775,8 @@ function ensureConfigFile() {
         dataContribution: { enabled: DATA_CONTRIBUTION_CONFIG_DEFAULTS.enabled },
         // 仅新安装写入，避免改变已有用户缺省开启的选择。
         memory: { enabled: false },
+        // 首装写出可编辑的安全默认值；已有文件不补写、不覆盖用户选择。
+        skipWindowsHardSafetyChecks: DEFAULTS.skipWindowsHardSafetyChecks,
     });
     writePrivateConfigFileSync(configPath, content, true);
 }
@@ -904,6 +909,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
             })()
             : undefined,
         defaultLightModel: typeof raw.defaultLightModel === 'string' ? raw.defaultLightModel : undefined,
+        skipWindowsHardSafetyChecks: raw.skipWindowsHardSafetyChecks === true,
         permissionMode: typeof raw.permissionMode === 'string' &&
             ['default', 'bypassPermissions', 'auto', 'off'].includes(raw.permissionMode)
             ? raw.permissionMode
@@ -948,6 +954,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         contextManagement: parseContextManagementConfig(raw),
         runawayGuard: resolveRunawayGuardConfig(raw.runawayGuard),
         toolResultCompaction: parseToolResultCompactionConfig(raw.toolResultCompaction),
+        requestMedia: parseRequestMediaConfig(raw.requestMedia),
         agentRuntime: parseAgentRuntimeConfig(raw.agentRuntime),
         logRetentionDays: parseLogRetentionDays(raw),
         contentReview: parseContentReviewConfig(raw),

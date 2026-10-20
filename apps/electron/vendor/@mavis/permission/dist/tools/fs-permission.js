@@ -474,8 +474,10 @@ export function isDangerousRemovalPath(inputPath, homeDir) {
  * Check if a path is within the working directory.
  */
 export function pathInWorkingPath(filePath, workingDirectory) {
-    const resolved = path.resolve(filePath);
-    const normalizedWork = path.resolve(workingDirectory);
+    const resolved = process.platform === 'win32' ? path.resolve(filePath).toLowerCase() : path.resolve(filePath);
+    const normalizedWork = process.platform === 'win32'
+        ? path.resolve(workingDirectory).toLowerCase()
+        : path.resolve(workingDirectory);
     return resolved === normalizedWork || resolved.startsWith(normalizedWork + path.sep);
 }
 /**
@@ -594,7 +596,10 @@ function resolveExistingPath(filePath) {
             : path.join(resolveExistingPath(parent), path.basename(filePath));
     }
 }
-/** Runtime state is private; only designated agent assets get implicit read access. */
+/**
+ * Runtime state is private; only designated agent assets get implicit read access.
+ * Mini App agent workspaces live in the active agent's `agents/<agentName>/miniapps`.
+ */
 function isProtectedRuntimeRead(filePath, context, recursive) {
     const within = (target, root) => {
         const relative = path.relative(root, target);
@@ -618,7 +623,8 @@ function isProtectedRuntimeRead(filePath, context, recursive) {
             within(canonicalPath, path.join(canonicalRoot, '.builtin-skills')) ||
             (context.agentName != null &&
                 (within(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'workspace')) ||
-                    within(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'skills')))) ||
+                    within(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'skills')) ||
+                    within(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'miniapps')))) ||
             isInternalWhitelistedPath(canonicalPath, {
                 ...context,
                 dataDir: canonicalRoot,
@@ -988,7 +994,7 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
         },
     };
 }
-function ruleSupportsPathAction(rule, action) {
+export function ruleSupportsPathAction(rule, action) {
     const matcher = rule.ruleValue.matcher;
     if (!matcher || matcher.kind === 'tool')
         return true;

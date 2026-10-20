@@ -1,16 +1,22 @@
 import { isSelfReminderId } from '@mavis/shared/cron-purpose';
 /** 只用持久化事实判定名额，调用方在写事务内完成检查与变更。 */
 export function unfinishedSelfReminders(sessionId, deps) {
-    return [...sessionSelfReminders(sessionId, deps.definitions)].filter((definition) => occupiesReminderSlot(definition, deps));
+    return [...selfReminders(deps.definitions, { sessionId })].filter((definition) => occupiesReminderSlot(definition, deps));
 }
-/** 软删记录仍参与 timer 清理，允许取消提交后的清理失败重试。 */
+/** 已结束的自提醒：调度终止且本代次 Run 已落终态。不传 sessionId 时覆盖全部会话。 */
+export function finishedSelfReminders(deps, sessionId) {
+    return [...selfReminders(deps.definitions, { sessionId })].filter((definition) => !occupiesReminderSlot(definition, deps));
+}
+/** 软删记录仍参与 timer 清理，允许取消提交后的清理失败重试；已终止的调度不再改写。 */
 export function selfRemindersToCancel(sessionId, deps) {
-    return [...sessionSelfReminders(sessionId, deps.definitions, true)].filter((definition) => definition.deletedAtMs !== undefined || occupiesReminderSlot(definition, deps));
+    return [...selfReminders(deps.definitions, { sessionId, includeDeleted: true })].filter((definition) => definition.deletedAtMs === undefined
+        ? occupiesReminderSlot(definition, deps)
+        : deps.scheduler.inspect(definition.schedulerId)?.state === 'active');
 }
-function* sessionSelfReminders(sessionId, definitions, includeDeleted = false) {
+function* selfReminders(definitions, scope) {
     let before;
     do {
-        const page = definitions.listPage({ sessionId, includeDeleted, before, take: 100 });
+        const page = definitions.listPage({ ...scope, before, take: 100 });
         for (const definition of page) {
             if (isSelfReminderId(definition.cronId))
                 yield definition;

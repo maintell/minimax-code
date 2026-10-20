@@ -1,3 +1,13 @@
+export function createPluginAgentRoster(agents) {
+    const byName = new Map(agents.map((agent) => [pluginAgentKey(agent.scopedName), agent]));
+    return Object.freeze({
+        list: () => agents,
+        resolve: (scopedName) => byName.get(pluginAgentKey(scopedName)),
+    });
+}
+function pluginAgentKey(name) {
+    return name.trim().normalize('NFKC').toLowerCase();
+}
 /**
  * Owns the v2 execution/publication boundary. TurnSystem remains the authority
  * for session admission; this lifecycle leases the capability generation

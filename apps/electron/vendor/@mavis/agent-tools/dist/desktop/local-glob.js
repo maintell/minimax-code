@@ -47,7 +47,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     return useValue ? value : void 0;
 };
 import { bindTool } from '@mavis/agent-core/tools';
-import { realpath, stat } from 'node:fs/promises';
+import { realpath, stat } from '../shared/physical-fs.js';
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { defaultScanNoiseDirectoriesInSearchRoot, defaultScanExcludeArgs, filterGlobPaths, findGlobMagicIndex, globToPathRegex, isBroadFileScan, isNarrowSearchRoot, resolveGlobStaticSearchRoot, } from '../shared/rg-scan-policy.js';
 import { withCompatibleGlobToolResponse } from '../plugin-hooks/vendor-tool-response.js';
@@ -178,11 +178,15 @@ let LocalGlobTool = (() => {
             }
             // Clear error for a missing path — spawn's cwd ENOENT would otherwise
             // surface as a misleading "ripgrep binary not found".
+            let rootStats;
             try {
-                await stat(searchRoot);
+                rootStats = await stat(searchRoot);
             }
             catch {
                 throw new Error(`glob path does not exist: ${input.path ?? searchRoot}`);
+            }
+            if (!rootStats.isDirectory()) {
+                throw new Error(`glob path must be a directory: ${input.path ?? searchRoot}`);
             }
             if (await isSensitiveSearchRoot(searchRoot)) {
                 return withCompatibleGlobToolResponse(textResult(LocalGlobToolDef.name, 'No files matched'), {

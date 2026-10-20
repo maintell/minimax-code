@@ -3,8 +3,15 @@ import { isInlineDisplayDataUrl, toConversationCommittedMessage, } from '../sess
 /** v2 service implementation injected into hosted v1 compatibility consumers. */
 export class V1ConversationCompatibilityService {
     options;
+    taskConcurrency;
     constructor(options) {
         this.options = options;
+        const { taskOccupancy } = options;
+        if (taskOccupancy) {
+            this.taskConcurrency = {
+                occupancy: async (parentSessionId) => taskOccupancy(parentSessionId),
+            };
+        }
     }
     query = {
         getSession: async (sessionId) => toConversationSession(await this.options.sessions.query.find(sessionId)),
@@ -287,6 +294,7 @@ function sessionExecutionPreferences(input) {
             ? { isDefaultWorkspace: input.isDefaultWorkspace }
             : {}),
         ...(input.origin ? { origin: input.origin } : {}),
+        ...(input.pluginAgentDefinition ? { pluginAgentDefinition: input.pluginAgentDefinition } : {}),
     };
 }
 function toQueueMessage(message) {

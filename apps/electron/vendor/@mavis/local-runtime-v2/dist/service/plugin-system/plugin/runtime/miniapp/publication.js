@@ -1,4 +1,4 @@
-import { miniAppBusyReason, miniAppFailureReasonCode, } from '../../../../miniapp/index.js';
+import { MINIAPP_LOOPBACK_TOKEN_HEADER, miniAppBusyReason, miniAppFailureReasonCode, } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
 import { runAllFinally } from '../../../plugin-system-helpers.js';
 import { withPluginMcpRuntime, } from '../snapshot-builder.js';
@@ -307,6 +307,7 @@ export class SupervisedMiniAppPublicationParticipant {
                     ...item,
                     candidate: transition.candidate,
                     target: transition.target,
+                    ...(transition.loopbackToken ? { loopbackToken: transition.loopbackToken } : {}),
                     transition,
                 });
             }
@@ -582,9 +583,12 @@ function rewriteManagedMcpServers(snapshot, accepted) {
             return [];
         }
         used.add(key);
+        const url = new URL(replacement.path, replacement.origin).toString();
         const transport = {
             type: 'http',
-            url: new URL(replacement.path, replacement.origin).toString(),
+            url,
+            headers: { [MINIAPP_LOOPBACK_TOKEN_HEADER]: replacement.loopbackToken },
+            protectHeadersOnRedirect: true,
         };
         const rewritten = {
             ...entry,
@@ -596,8 +600,12 @@ function rewriteManagedMcpServers(snapshot, accepted) {
             },
             server: {
                 ...entry.server,
+                // `transport.headers` carries the loopback token; `resolvedServer` (this whole object) is
+                // JSON.stringify'd into `lifecycleKey` (mcp/runtime.ts) and `mcpDiscoveryKey`
+                // (plugin-system/publication.ts) as an in-memory Map key — never log or project either key.
                 resolvedServer: { ...entry.server.resolvedServer, transport },
-                configJson: JSON.stringify(transport),
+                // The per-generation credential lives only on the live transport, never in declared config.
+                configJson: JSON.stringify({ type: 'http', url }),
             },
         };
         return [rewritten];
@@ -613,7 +621,8 @@ function managedReplacements(accepted) {
             continue;
         const origin = item.target.origin;
         const processGeneration = item.target.processGeneration;
-        if (!origin || !processGeneration) {
+        const loopbackToken = item.loopbackToken;
+        if (!origin || !processGeneration || !loopbackToken) {
             if (item.runtimeStopped)
                 continue;
             throw publicationError('MINIAPP_MCP_RUNTIME_NOT_READY');
@@ -623,6 +632,7 @@ function managedReplacements(accepted) {
                 endpointId: declaration.id,
                 path: declaration.path,
                 origin,
+                loopbackToken,
                 miniAppGeneration: item.target.miniAppGeneration,
                 processGeneration,
             });

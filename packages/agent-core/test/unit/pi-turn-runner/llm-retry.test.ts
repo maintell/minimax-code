@@ -14,6 +14,7 @@ import {
   isLLMImageLimitMessage,
   normalizeLLMError,
 } from "@mavis/shared/llm-error-classifier";
+import { UNBOUNDED_RETRY_ATTEMPTS } from "@mavis/shared/llm-retry-event";
 import {
   DEFAULT_LLM_RETRY_POLICY,
   LLM_RETRY_REQUEST_SETTLED_OBSERVER,
@@ -589,26 +590,32 @@ describe("withLLMRetry", () => {
       3_000, 3_000, 3_000, 3_000, 3_000, 3_000, 3_000,
     ]);
     expect(DEFAULT_LLM_RETRY_POLICY.baseDelayMs).toBe(3_000);
+    expect(DEFAULT_LLM_RETRY_POLICY.maxRetries).toBe(UNBOUNDED_RETRY_ATTEMPTS);
     expect(DEFAULT_LLM_RETRY_POLICY.maxRetryElapsedMs).toBe(
       Number.POSITIVE_INFINITY,
     );
   });
 
-  it("limits BYOK errors to the retry budget regardless of error classification", async () => {
+  it.each([
+    ["401 invalid api key", "a wrong credential"],
+    ["403 forbidden", "a forbidden credential"],
+    ['500 {"status_code":2056,"status_msg":"plan exhausted"}', "an exhausted usage plan"],
+    ["402 insufficient balance", "exhausted credits"],
+  ])("does not retry BYOK %s failures: %s", async (message) => {
     let attempts = 0;
+    const sleep = vi.fn(async () => {});
     const inner = (async () => {
       attempts += 1;
-      return errorStream("[Error] 401 invalid api key");
+      return errorStream(`[Error] ${message}`);
     }) as StreamFn;
-    const wrapped = withLLMRetry(
-      inner,
-      retryOptions({ policy: { maxRetries: 5 }, sleep: vi.fn(async () => {}) }),
-    );
+    // The default budget is unbounded, so a terminal classification is the only
+    // thing that can stop the loop here.
+    const wrapped = withLLMRetry(inner, retryOptions({ sleep }));
 
-    const result = await wrapped(fakeModel("minimax_api"), CONTEXT, {});
-    await collectEvents(result);
+    await collectEvents(await wrapped(fakeModel("custom_provider:zen"), CONTEXT, {}));
 
-    expect(attempts).toBe(6);
+    expect(attempts).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   // #425: a request the provider deterministically rejects (too many images,

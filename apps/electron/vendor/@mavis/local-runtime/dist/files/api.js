@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createReadStream } from 'node:fs';
+import { addParentDirectories, scoreFileSearchCandidate } from './search-candidates.js';
 import { mkdir, readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, win32, } from 'node:path';
@@ -7,7 +8,9 @@ import { promisify, TextDecoder } from 'node:util';
 import { Readable } from 'node:stream';
 import { getWorkspaceImagePreviewMimeType } from '@mavis/shared/media-asset-meta';
 import { OFFICE_PREVIEW_TOO_LARGE, officePreviewByteLimit, } from '@mavis/shared/office-preview-limits';
+import { TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_TOO_LARGE } from '@mavis/shared/text-preview-limits';
 import { OfficePreviewSizeError, readOfficePreviewFile } from './office-preview-read.js';
+import { MAX_OPEN_FORMAT_PREVIEW_BYTES, readOpenFormatFile } from './open-format-read.js';
 import { getDataDir } from '@mavis/config';
 import { LocalReviewLinkStore } from '../review-link/store.js';
 import { generateDefaultWorktreeBranch } from '../worktrees/branch.js';
@@ -35,6 +38,11 @@ const RC_REQUEST_SOURCE_HEADER = 'X-MCode-Request-Source';
 const RC_REQUEST_SOURCE_VALUE = 'remote-control';
 const RC_FILE_CONTENT_MAX_BYTES_HEADER = 'X-MCode-Remote-Control-File-Content-Max-Bytes';
 const DEFAULT_RC_FILE_CONTENT_MAX_BYTES = 10 * 1024 * 1024;
+// Keep aligned with UI open-format-policy.ts. Text diagrams and RFC 822 mail
+// retain the existing text path; these formats require their original bytes.
+const OPEN_FORMAT_BINARY_EXTENSIONS = new Set('zip rar 7z tar gz tgz bz2 xz ttf otf woff woff2 eot psd psb ai eps ps webarchive sqlite sqlite3 db wasm parquet avro xmind epub ofd xps oxps msg'
+    .split(' ')
+    .map((extension) => `.${extension}`));
 const TEXT_EXTENSIONS = new Set([
     '.css',
     '.csv',
@@ -137,7 +145,6 @@ const HIDDEN_SEARCH_DIRS = new Set([
     'node_modules',
     'out',
 ]);
-const FILE_SEARCH_PATH_TIEBREAKER_WEIGHT = 0.001;
 /** Read-only process-local Git metadata facade; mutation remains outside this seam. */
 export function createLocalWorkspaceGitFacade(reviewLinkStore = new LocalReviewLinkStore(getDataDir)) {
     return {
@@ -232,8 +239,10 @@ async function routeFileApi(method, request, tail, url, gitChangesCoordinator, m
         const fileTooLarge = await remoteControlFileContentLimitResponse(request.headers, workspace, filePath, metrics, 'content');
         if (fileTooLarge)
             return fileTooLarge;
-        const content = await readWorkspaceFile(workspace, filePath);
-        return json(content, content.code === OFFICE_PREVIEW_TOO_LARGE ? { status: 413 } : undefined);
+        const { value: content } = await readWorkspaceFileOutcome(workspace, filePath, TEXT_PREVIEW_MAX_BYTES);
+        return json(content, content.code === OFFICE_PREVIEW_TOO_LARGE || content.code === TEXT_PREVIEW_TOO_LARGE
+            ? { status: 413 }
+            : undefined);
     }
     if (method === 'GET' && tail === 'thumbnail') {
         const workspace = requiredQuery(url, 'workspace');
@@ -390,7 +399,7 @@ async function routeFileApi(method, request, tail, url, gitChangesCoordinator, m
         if (query instanceof Response)
             return query;
         const limit = Number.parseInt(url.searchParams.get('limit') ?? '50', 10);
-        return json(await searchFiles(workspace, query, Number.isFinite(limit) ? limit : 50));
+        return json(await searchFiles(workspace, query, Number.isFinite(limit) ? limit : 50, url.searchParams.get('includeDirectories') === 'true'));
     }
     if (method === 'GET' && tail === 'open-app') {
         return json(null);
@@ -422,8 +431,15 @@ async function routeFileApi(method, request, tail, url, gitChangesCoordinator, m
         if (!workspace && !filePath) {
             return json({ error: 'workspace or path is required' }, { status: 400 });
         }
+        if (body['fileOnly'] !== undefined && typeof body['fileOnly'] !== 'boolean') {
+            return json({ error: 'fileOnly must be a boolean' }, { status: 400 });
+        }
+        const fileOnly = body['fileOnly'] === true;
+        if (fileOnly && !filePath) {
+            return json({ error: 'path is required for fileOnly' }, { status: 400 });
+        }
         try {
-            await ideLauncher.openWorkspaceInIde(workspace, ideId, filePath);
+            await ideLauncher.openWorkspaceInIde(workspace, ideId, filePath, fileOnly);
             return json({ ok: true });
         }
         catch (error) {
@@ -838,7 +854,9 @@ export async function listFileTree(workspace, subPath) {
 async function readWorkspaceFile(workspace, filePath) {
     return (await readWorkspaceFileOutcome(workspace, filePath)).value;
 }
-async function readWorkspaceFileOutcome(workspace, filePath) {
+async function readWorkspaceFileOutcome(workspace, filePath, 
+// Only inline content previews opt in; Git diff and line statistics keep their read contract.
+textPreviewMaxBytes) {
     const absolute = await resolveWorkspacePath(workspace, filePath);
     if (!absolute) {
         return {
@@ -847,24 +865,63 @@ async function readWorkspaceFileOutcome(workspace, filePath) {
         };
     }
     const ext = extname(filePath).toLowerCase();
-    const previewBinaryMime = PREVIEW_BINARY_MIME_TYPES.get(ext);
+    const isOpenFormatBinary = OPEN_FORMAT_BINARY_EXTENSIONS.has(ext);
+    const previewBinaryMime = isOpenFormatBinary
+        ? 'application/octet-stream'
+        : PREVIEW_BINARY_MIME_TYPES.get(ext);
     const previewLimit = officePreviewByteLimit(filePath);
     const readBytes = () => previewLimit === undefined ? readFile(absolute) : readOfficePreviewFile(absolute, previewLimit);
     if (previewBinaryMime) {
         try {
+            const bytes = isOpenFormatBinary
+                ? await readOpenFormatFile(absolute, ext, textPreviewMaxBytes !== undefined)
+                : await readBytes();
+            // PostScript may be editable source, including legacy Illustrator files.
+            // Raw-byte preview support must not change text diff/edit classification.
+            if (ext === '.ps' ||
+                ext === '.eps' ||
+                (ext === '.ai' && bytes.subarray(0, 4).toString() === '%!PS')) {
+                const text = decodeUtf16TextBytes(bytes) ??
+                    (isProbablyBinary(bytes) ? undefined : bytes.toString('utf-8'));
+                if (text !== undefined) {
+                    if (textPreviewMaxBytes !== undefined && bytes.byteLength > textPreviewMaxBytes) {
+                        return oversizedPreviewOutcome(new OfficePreviewSizeError(bytes.byteLength, textPreviewMaxBytes), 'text');
+                    }
+                    return {
+                        value: {
+                            type: 'text',
+                            content: text,
+                            ...(textPreviewMaxBytes !== undefined ? { sizeBytes: bytes.byteLength } : {}),
+                        },
+                        readSucceeded: true,
+                    };
+                }
+            }
+            const oversized = isOpenFormatBinary && bytes.byteLength > MAX_OPEN_FORMAT_PREVIEW_BYTES;
             return {
                 value: {
                     type: 'binary',
-                    content: (await readBytes()).toString('base64'),
-                    encoding: 'base64',
+                    content: oversized ? '' : bytes.toString('base64'),
+                    ...(oversized ? { error: 'preview_too_large' } : { encoding: 'base64' }),
                     mimeType: previewBinaryMime,
                 },
                 readSucceeded: true,
             };
         }
         catch (error) {
-            if (error instanceof OfficePreviewSizeError)
-                return oversizedOfficeOutcome(error);
+            if (error instanceof OfficePreviewSizeError) {
+                if (previewLimit !== undefined)
+                    return oversizedPreviewOutcome(error);
+                return {
+                    value: {
+                        type: 'binary',
+                        content: '',
+                        mimeType: previewBinaryMime,
+                        error: 'preview_too_large',
+                    },
+                    readSucceeded: true,
+                };
+            }
             return {
                 value: { type: 'binary', content: '', mimeType: previewBinaryMime },
                 readSucceeded: false,
@@ -875,32 +932,46 @@ async function readWorkspaceFileOutcome(workspace, filePath) {
         return { value: { type: 'binary', content: '' }, readSucceeded: true };
     }
     try {
-        const bytes = await readBytes();
+        const bytes = textPreviewMaxBytes === undefined
+            ? await readBytes()
+            : await readOfficePreviewFile(absolute, textPreviewMaxBytes);
         const utf16Text = decodeUtf16TextBytes(bytes);
         if (utf16Text !== undefined) {
-            return { value: { type: 'text', content: utf16Text }, readSucceeded: true };
+            return {
+                value: {
+                    type: 'text',
+                    content: utf16Text,
+                    ...(textPreviewMaxBytes !== undefined ? { sizeBytes: bytes.byteLength } : {}),
+                },
+                readSucceeded: true,
+            };
         }
         if (!TEXT_EXTENSIONS.has(ext) && isProbablyBinary(bytes)) {
             return { value: { type: 'binary', content: '' }, readSucceeded: true };
         }
         return {
-            value: { type: 'text', content: bytes.toString('utf-8') },
+            value: {
+                type: 'text',
+                content: bytes.toString('utf-8'),
+                ...(textPreviewMaxBytes !== undefined ? { sizeBytes: bytes.byteLength } : {}),
+            },
             readSucceeded: true,
         };
     }
     catch (error) {
-        if (error instanceof OfficePreviewSizeError)
-            return oversizedOfficeOutcome(error);
+        if (error instanceof OfficePreviewSizeError) {
+            return oversizedPreviewOutcome(error, textPreviewMaxBytes === undefined ? 'office' : 'text');
+        }
         return { value: { type: 'text', content: '' }, readSucceeded: false };
     }
 }
-function oversizedOfficeOutcome(error) {
+function oversizedPreviewOutcome(error, kind = 'office') {
     return {
         value: {
-            type: 'binary',
+            type: kind === 'text' ? 'text' : 'binary',
             content: '',
-            error: error.message,
-            code: error.code,
+            error: kind === 'text' ? 'Text file exceeds the inline preview size limit' : error.message,
+            code: kind === 'text' ? TEXT_PREVIEW_TOO_LARGE : error.code,
             sizeBytes: error.sizeBytes,
             maxBytes: error.maxBytes,
         },
@@ -977,13 +1048,28 @@ async function readWorkspaceTextFileFromGitIndex(workspace, filePath) {
     }
     return { type: 'text', content: result.stdout };
 }
-export async function searchFiles(workspace, query, limit) {
+export async function searchFiles(workspace, query, limit, includeDirectories = false) {
     const root = resolveWorkspace(workspace);
     const needle = query.trim().toLowerCase();
     if (!needle || limit <= 0)
         return [];
-    const candidates = (await listGitSearchCandidates(workspace)) ?? (await listFsSearchCandidates(root));
-    return candidates
+    const gitFiles = await listGitSearchCandidates(workspace);
+    const files = gitFiles ?? (await listFsSearchCandidates(root, includeDirectories));
+    // A trailing slash identifies directories without changing file-only callers.
+    const candidates = new Set(files);
+    if (includeDirectories) {
+        if (gitFiles) {
+            const directories = await git(['ls-files', '--others', '--directory', '--exclude-standard', '-z'], workspace);
+            if (directories.code === 0) {
+                for (const path of directories.stdout.split('\0')) {
+                    if (path.endsWith('/'))
+                        candidates.add(path);
+                }
+            }
+        }
+        addParentDirectories(candidates);
+    }
+    return [...candidates]
         .filter(isSearchableRelativePath)
         .map((filePath) => ({ filePath, score: scoreFileSearchCandidate(filePath, needle) }))
         .filter((item) => item.score !== undefined)
@@ -1013,41 +1099,20 @@ async function listGitSearchCandidates(workspace) {
     }
     return candidates;
 }
-async function listFsSearchCandidates(root) {
+async function listFsSearchCandidates(root, includeDirectories = false) {
     const results = [];
     await walk(root, async (absolute, entry) => {
-        if (entry.isDirectory())
+        if (entry.isDirectory()) {
+            if (includeDirectories)
+                results.push(`${toPortableRelativePath(relative(root, absolute))}/`);
             return true;
+        }
         const rel = relative(root, absolute);
         if (isSearchableRelativePath(rel))
             results.push(rel);
         return true;
     });
     return results;
-}
-function scoreFileSearchCandidate(filePath, needle) {
-    const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase();
-    const normalizedName = basename(normalizedPath);
-    const stem = normalizedName.slice(0, normalizedName.length - extname(normalizedName).length);
-    const pathIndex = normalizedPath.indexOf(needle);
-    if (pathIndex < 0)
-        return undefined;
-    const nameIndex = normalizedName.indexOf(needle);
-    const segments = normalizedPath.split('/').filter(Boolean);
-    const matchingSegmentIndex = segments.findIndex((segment) => segment.startsWith(needle));
-    const tieBreaker = normalizedPath.length * FILE_SEARCH_PATH_TIEBREAKER_WEIGHT;
-    const depthPenalty = Math.max(0, segments.length - 1);
-    if (normalizedName === needle)
-        return tieBreaker;
-    if (stem === needle)
-        return 5 + tieBreaker;
-    if (normalizedName.startsWith(needle))
-        return 10 + normalizedName.length + tieBreaker;
-    if (nameIndex >= 0)
-        return 20 + nameIndex + normalizedName.length + tieBreaker;
-    if (matchingSegmentIndex >= 0)
-        return 40 + matchingSegmentIndex + depthPenalty + tieBreaker;
-    return 80 + pathIndex + depthPenalty + tieBreaker;
 }
 function isSearchableRelativePath(filePath) {
     return filePath

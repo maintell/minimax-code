@@ -1,5 +1,5 @@
 import { isContinuationStatus } from '@mavis/goal';
-import { buildThreadGoalContinuationMessage, threadGoalBudgetLimitClientRequestId, threadGoalRearmClientRequestId, } from './kickoff.js';
+import { buildThreadGoalContinuationMessage, threadGoalBudgetLimitClientRequestId, threadGoalCompletionClientRequestId, threadGoalRearmClientRequestId, } from './kickoff.js';
 import { GoalInitialKickoffCoordinator } from './initial-kickoff.js';
 import { createThreadGoalContinuationOrchestrator, } from './orchestrator.js';
 import { ObjectiveSteeringTargetChangedError, objectiveUpdateSteeringKey, } from './objective-steering.js';
@@ -23,6 +23,11 @@ export class GoalContinuation {
         });
         this.initialKickoff = new GoalInitialKickoffCoordinator({
             store: deps.store,
+            hasActiveTurn: (goal) => {
+                const timing = deps.turnTimingReader.getBySession(goal.sessionId);
+                return (timing !== undefined &&
+                    deps.turnContext.getBinding(timing.turnId)?.binding.goalId === goal.goalId);
+            },
             preparePrompt: (goal) => this.preparePrompt(goal, 'kickoff'),
             external: deps.external,
         });
@@ -57,12 +62,15 @@ export class GoalContinuation {
         }
         if (projectedEvent.type === 'updated' &&
             projectedEvent.userPatch === true &&
-            projectedEvent.resumedFromReason === 'paused(retracted)' &&
+            projectedEvent.resumedFromReason !== undefined &&
             projectedEvent.goal.status === 'active') {
             this.promptCoordinator.armRecovery(projectedEvent.goal.goalId);
         }
         if (projectedEvent.type === 'updated' && projectedEvent.userPatch === true) {
             this.rearm.armUserPatch(projectedEvent.goal);
+        }
+        if (projectedEvent.type !== 'deleted' && projectedEvent.goal.status === 'paused') {
+            void this.initialKickoff.retireAfterPause(projectedEvent.goal);
         }
         if (projectedEvent.type === 'updated' && projectedEvent.objectiveChanged === true) {
             void this.injectObjectiveUpdatedSteering(projectedEvent.goal, projectedEvent.userPatch === true);
@@ -185,6 +193,35 @@ export class GoalContinuation {
         }
         catch (error) {
             this.deps.external.reportFailure(input.sessionId, `thread_goal_budget_limit_enqueue_failed:${this.deps.external.formatError(error)}`);
+            throw error;
+        }
+    }
+    async enqueueCompletionSummary(input) {
+        const enqueue = this.deps.external.enqueuePostTurnContinuation;
+        if (!enqueue)
+            return;
+        const store = this.deps.store();
+        const goal = await store.getBySession(input.sessionId);
+        const proposal = goal?.lastWorkerProposal;
+        if (!goal ||
+            goal.status !== 'complete' ||
+            proposal?.type !== 'complete' ||
+            proposal.turnId !== input.turnId ||
+            proposal.resultDelivery !== 'pending')
+            return;
+        try {
+            const prompt = await this.preparePrompt(goal, 'completion-summary');
+            await enqueue({
+                ...input,
+                message: buildThreadGoalContinuationMessage(goal, prompt.content, 'completion-summary'),
+                clientRequestId: threadGoalCompletionClientRequestId(goal.goalId, proposal.turnId),
+                ...(prompt.internalPromptRead ? { internalPromptRead: prompt.internalPromptRead } : {}),
+            });
+            // Queue owns recovery after this point. Retrying this handoff uses the same durable key.
+            await store.markCompletionSummaryQueued(goal.goalId, proposal.turnId);
+        }
+        catch (error) {
+            this.deps.external.reportFailure(input.sessionId, `thread_goal_completion_enqueue_failed:${this.deps.external.formatError(error)}`);
             throw error;
         }
     }

@@ -8,6 +8,7 @@ import { filterBindings, migratedMethodsForHost, } from './routing/allowlist.js'
 import { makeBindings } from './routing/bindings.gen.js';
 import { withMcpRequestParseErrorPolicy } from './routing/mcp-request-policy.js';
 import { withModelProviderResponsePolicy } from './routing/model-provider-response-policy.js';
+import { withPreferenceRequestParseErrorPolicy } from './routing/preference-request-policy.js';
 import { mountProviderAuthRoutes } from './routing/provider-auth.js';
 import { abortAllComputerUse, snapshotComputerUseState, } from '../service/computer-use/index.js';
 import { mountWorkspaceHtmlPreviewRoutes } from './routing/workspace-html-preview.js';
@@ -52,7 +53,7 @@ export function createLocalRuntimeV2FrontDoor(deps) {
 }
 function createFrontDoorAppDeps(deps, controllers, ownerCapabilities) {
     return {
-        bindings: filterBindings(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(makeBindings(controllers))), migratedMethodsForHost(ownerCapabilities)),
+        bindings: filterBindings(withPreferenceRequestParseErrorPolicy(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(makeBindings(controllers)))), migratedMethodsForHost(ownerCapabilities)),
         logger: deps.logger,
         metrics: deps.metrics,
         forceLegacy: () => false,
@@ -85,6 +86,9 @@ export function ownerCapabilitiesForServices(services) {
         plugin: Boolean(services),
         session: Boolean(services?.applications || services?.conversation || services?.cronDelivery),
         workspaceGit: Boolean(services?.workspace?.git),
+        workspaceFile: Boolean(services?.workspace?.file),
+        workspaceLocalActions: Boolean(services?.workspace?.localActions),
+        interaction: Boolean(services?.application?.questionnaires && services.application.permissions),
         workspaceIndexing: Boolean(services?.workspace?.indexing),
         modelProvider: Boolean(services?.modelSystem && services.modelProviderApplication),
         sessionApplications: Boolean(services?.applications),
@@ -92,6 +96,7 @@ export function ownerCapabilitiesForServices(services) {
         // falling through to the v1 fail-closed stubs.
         llmContextInspector: Boolean(services?.llmContextInspector),
         preference: Boolean(services?.composerSendBehavior),
+        agentShell: Boolean(services?.agentShell),
         sandbox: Boolean(services?.sandbox),
         globalInstructions: Boolean(services?.globalInstructions),
         // Channel routes mount only where the channel owner is really assembled

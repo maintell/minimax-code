@@ -59,10 +59,40 @@ and one file is a prebuilt bundle copied verbatim.
 
 `--details=<file>` writes a per-line diff report for the remaining files.
 
+## Local behavioural patches
+
+The shipped client retries a failed model request with exponential backoff and a
+five-attempt / two-minute budget, and treats a dropped response body (`5xx`,
+`net::ERR_INCOMPLETE_CHUNKED_ENCODING`, empty response) as terminal. This product
+wants provider errors retried without a practical limit, on a fixed three-second
+cadence, while a wrong credential or an exhausted quota stays terminal instead of
+hiding behind days of retries.
+
+That is a behavioural change, not a recovery artefact, so it is applied by
+[`apply-local-patches.mjs`](./apply-local-patches.mjs) after vendoring:
+
+```sh
+node tools/restore/apply-local-patches.mjs      # patches vendor/** and out/ in place
+```
+
+It patches three things: the retry policy and delay in `@mavis/agent-core`, the
+classifier in `@mavis/shared`, and the renderer's retry copy (`({{attempt}}/{{total}})`
+→ `({{attempt}}/∞)`, English and Chinese), since the renderer is a prebuilt
+artifact and would otherwise print the raw cap. The script is idempotent and
+asserts every anchor, so a shipped build that refactors the retry loop, the
+classifier or the retry copy fails loudly here instead of silently reverting to
+the shipped defaults. `RESTORATION.md` records the patched files.
+
 ## Re-running on a new shipped build
 
 1. Run the pipeline against the new installation.
-2. Run `pnpm build` and `verify-main.mjs`; review every reported difference.
-3. Re-run `pnpm check:source` in the repository root and review the
+2. Re-apply the local patches (`apply-local-patches.mjs`).
+3. Update `package.json`: the app version, any new vendored dependency, and the
+   third-party versions the new build resolved.
+4. `pnpm install --ignore-workspace`, then `pnpm build`; run `verify-main.mjs`
+   and review every reported difference.
+5. `pnpm package`, then boot the packaged client with an isolated profile and
+   check the main log for errors.
+6. Re-run `pnpm check:source` in the repository root and review the
    `scripts/lib/published-client-exceptions.mjs` list against the restored
    files (see `docs/desktop-client.md`).

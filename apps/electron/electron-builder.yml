@@ -45,6 +45,10 @@ extraResources:
 
 win:
   icon: resources/icon.ico
+  # No spaces: release hosts (GitHub releases among them) rewrite spaces in
+  # asset names, which would no longer match the `path` recorded in latest.yml
+  # and break the updater.
+  artifactName: MiniMax-Code-Setup-${version}.${ext}
   target:
     - target: nsis
       arch:
@@ -56,6 +60,13 @@ nsis:
   allowElevation: true
   allowToChangeInstallationDirectory: true
   include: installer-zh-prod.nsh
+  # The shipped 3.1.4 resources add `installer-diagnostics.nsh`, whose
+  # `un.MavisInstallerLog` is called from a patched app-builder-lib template
+  # that this distribution does not carry. The stock template therefore leaves
+  # the uninstaller function unreferenced, which NSIS reports as warning 6010
+  # ("zeroing code") and electron-builder escalates to an error. The function is
+  # inert either way, so warnings stay warnings here.
+  warningsAsErrors: false
 
 publish:
   provider: generic

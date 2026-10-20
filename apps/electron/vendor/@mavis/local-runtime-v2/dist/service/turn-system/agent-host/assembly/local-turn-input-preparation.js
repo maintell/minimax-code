@@ -1,6 +1,8 @@
+import { detectReferencedOfficialHostCapabilityPlugins } from './local-turn-plugin-capabilities.js';
 import { createCanonicalAgentHostSteeringInput, createCanonicalAgentHostUserInput, } from '../canonical-user-input.js';
 import { createBackgroundTaskHostMetadata } from '../history/background/host-metadata.js';
 import { assertAgentHostCapabilityAvailable } from '../empty-dependencies.js';
+import { messagesCarrySessionId } from '../compaction/session-identity.js';
 import { prepareLocalInlineMedia, } from '../preparation/inline-media.js';
 import { projectLocalAgentReferencesForModel, } from '../preparation/agent-prompt-surface.js';
 /**
@@ -22,12 +24,11 @@ export class LocalTurnInputPreparer {
         const { batchInputs, canonicalUserInput, promptText, promptTexts, genuineUserQueryText, genuineUserQueryTexts, } = await this.prepareInitialPromptBatch(input, projectAgentReferences);
         const attachments = await this.prepareAttachments({
             lease: input.lease,
-            preparation: input.preparation,
             messages: canonicalUserInput.messages,
             messageIndexOffset: 0,
         });
         const capabilities = modelCapabilities(input.preparation.agentConfig);
-        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities);
+        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities, this.options.getImageEncoding?.());
         const systemValue = await this.options.reminders.buildSystem({
             session: input.session,
             agent: input.agent,
@@ -35,6 +36,9 @@ export class LocalTurnInputPreparer {
             promptText,
             turnId: input.lease.turnId,
             ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
+            ...(input.history && messagesCarrySessionId(input.history, input.session.sessionId)
+                ? { sessionIdInContext: true }
+                : {}),
         });
         const system = validateSystemReminder(systemValue);
         const systemBlock = optionalReminderBlock('system', system.content);
@@ -42,7 +46,7 @@ export class LocalTurnInputPreparer {
             content: systemBlock,
             ...(system.diagnostic !== undefined ? { diagnostic: system.diagnostic } : {}),
         });
-        const attachmentBlock = buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities);
+        const attachmentBlock = buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities, selectedMedia.dimensionNotes);
         const skillBlock = buildSlashSkillReminder(canonicalUserInput, input.preparation.agentConfig);
         const channelContext = canonicalUserInput.messages.find((message) => message.channelContext)?.channelContext;
         return {
@@ -136,14 +140,13 @@ export class LocalTurnInputPreparer {
         });
         const attachments = await this.prepareAttachments({
             lease: input.lease,
-            preparation: input.preparation,
             messages: canonical.messages,
             messageIndexOffset: input.messageIndexOffset,
         });
         const capabilities = modelCapabilities(input.preparation.agentConfig);
-        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities);
+        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities, this.options.getImageEncoding?.());
         const reminderBlocks = [
-            buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities),
+            buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities, selectedMedia.dimensionNotes),
             buildSlashSkillReminder(canonical, input.preparation.agentConfig),
         ].filter((block) => Boolean(block));
         const projected = await this.projectCanonicalUserInput({
@@ -152,6 +155,23 @@ export class LocalTurnInputPreparer {
             provenance: input.provenance,
             projectAgentReferences,
         });
+        // Persist only after accepted input preparation succeeds; the frozen tool set stays unchanged.
+        if (input.computerUseAvailable === true &&
+            input.message.computerUse?.enable === true &&
+            input.provenance.source === 'api' &&
+            !canonical.messages.some((message) => message.origin || message.channelContext) &&
+            input.desktopCapabilities?.plugins.some((plugin) => plugin.name === 'computer-use' &&
+                plugin.source === 'official' &&
+                plugin.hostCapabilities?.includes('computer-use')) &&
+            detectReferencedOfficialHostCapabilityPlugins({
+                capabilities: input.desktopCapabilities,
+                capability: 'computer-use',
+                userInput: input.message,
+            }).includes('computer-use')) {
+            await this.options.persistComputerUseSelection?.({
+                sessionId: input.lease.sessionId,
+            });
+        }
         return {
             userMessage: {
                 text: [...reminderBlocks, projected.content].filter(Boolean).join('\n\n'),
@@ -230,9 +250,7 @@ export class LocalTurnInputPreparer {
         })));
         if (raw.length === 0)
             return [];
-        const imageAttachmentCount = raw.filter(({ attachment }) => isImageAttachment(attachment)).length;
         const assets = this.options.assets;
-        const capabilities = modelCapabilities(input.preparation.agentConfig);
         assertAgentHostCapabilityAvailable('attachment-materializer', typeof assets?.materialize === 'function');
         if (!assets) {
             throw new TypeError('Attachment materializer is unavailable.');
@@ -244,9 +262,7 @@ export class LocalTurnInputPreparer {
                 turnId: input.lease.turnId,
                 messageIndex: entry.messageIndex,
                 attachmentIndex: entry.attachmentIndex,
-                imageAttachmentCount,
                 attachment: entry.attachment,
-                ...(capabilities ? { modelCapabilities: capabilities } : {}),
             })),
         })));
     }
@@ -349,14 +365,17 @@ function hasValidInlineMedia(media) {
         media.sizeBytes >= 0 &&
         (media.data === undefined || typeof media.data === 'string'));
 }
-function buildAttachmentReminder(entries, inlinedKeys, capabilities) {
+function buildAttachmentReminder(entries, inlinedKeys, capabilities, dimensionNotes = new Map()) {
     if (entries.length === 0)
         return '';
     const lines = entries.map(({ messageIndex, prepared }) => {
-        const inline = inlinedKeys.has(attachmentKey(messageIndex, prepared)) ? 'true' : 'false';
+        const key = attachmentKey(messageIndex, prepared);
+        const inline = inlinedKeys.has(key) ? 'true' : 'false';
+        const dimensionNote = dimensionNotes.get(key);
         return [
             `<attachment name="${escapeAttribute(prepared.fileName)}" mime="${escapeAttribute(prepared.mimeType)}" path="${escapeAttribute(prepared.filePath)}" message_index="${messageIndex + 1}" kind="${prepared.kind}" inline="${inline}">`,
             attachmentWorkflowInstruction(prepared.kind, inline === 'true', capabilities),
+            ...(dimensionNote ? [dimensionNote] : []),
             '</attachment>',
         ].join('\n');
     });

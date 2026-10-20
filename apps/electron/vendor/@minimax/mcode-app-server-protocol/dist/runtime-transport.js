@@ -1,0 +1,2 @@
+export { decodeRuntimeTransportWirePayload, encodeRuntimeTransportWirePayload, RUNTIME_TRANSPORT_DEFAULT_STREAM_WINDOW, RUNTIME_TRANSPORT_MAX_STREAM_WINDOW, RUNTIME_TRANSPORT_PROTOCOL_VERSION, } from '@mavis/shared/runtime-transport';
+//# sourceMappingURL=runtime-transport.js.map

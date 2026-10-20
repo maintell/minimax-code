@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { isSelfReminderId } from '@mavis/shared/cron-purpose';
 const SESSION_CREATE_FAILED = 'SESSION_CREATE_FAILED';
 const SESSION_DELIVERY_FAILED = 'SESSION_DELIVERY_FAILED';
@@ -13,6 +14,7 @@ const TARGET_SESSION_FAILURE_MESSAGES = {
     CRON_SESSION_TARGET_NOT_FOUND: 'Cron target session was not found',
     CRON_SESSION_TARGET_ARCHIVED: 'Cron target session is archived',
     CRON_SESSION_TARGET_AGENT_MISMATCH: 'Cron target session belongs to a different agent',
+    CRON_SESSION_TARGET_PROJECT_MISMATCH: 'Cron target session belongs to a different project',
 };
 class CronExecutionError extends Error {
     code;
@@ -36,35 +38,34 @@ export class CronExecutor {
     pumpTail = Promise.resolve();
     pumpScheduled = false;
     closed = false;
-    /**
-     * 脱离请求链路的手动执行队列尾部。把串联后的 Promise 保存到字段，既满足
-     * `no-floating-promises`，也无需行内关闭规则；最终结果始终记录在持久化的
-     * CronRun 终态中。
-     */
-    manualPumpTail = Promise.resolve();
+    retryTimers = new Map();
     constructor(deps) {
         this.deps = deps;
     }
     /**
-     * 领域门面调用的脱离请求链路手动触发入口。该入口持久化并异步执行手动运行，
-     * 且不会向调用方抛错：控制器按任务 §5.3 立即返回 pending 运行，持久化终态
-     * 承担权威事实。错误在此收敛，不向请求链路暴露。
+     * 兼容调用方的脱离请求链路手动触发入口。同步检查 requestId 所有权，冲突会
+     * 向调用方抛错；接纳后的后台执行结果记录在持久化 CronRun 终态中。
+     * 当前 HTTP 控制器使用 prepareManual，先取得持久化的 pending 运行再返回。
      */
     kickManual(request) {
+        this.assertOpen();
         const existing = this.existingManualRun(request);
         if (existing) {
             this.enqueue(existing.runId, request.triggerMetric);
             return;
         }
-        this.manualPumpTail = this.chainManual(request);
-    }
-    async chainManual(request) {
-        await this.manualPumpTail;
         try {
-            await this.runManual(request);
+            // All triggers commit admission synchronously and use the same pump.
+            // A second detached manual tail could admit new work after close drained.
+            const pending = this.resolveManualRun(request);
+            this.enqueue(pending.runId, request.triggerMetric);
         }
-        catch {
-            // 此处有意收敛错误，执行结果由 CronRun 终态记录。
+        catch (error) {
+            if (error instanceof CronExecutionError && error.code === 'CRON_RUN_ID_CONFLICT') {
+                throw error;
+            }
+            // Preserve the compatibility entry's best-effort creation contract.
+            // Product callers use prepareManual and observe creation failures.
         }
     }
     /**
@@ -72,6 +73,8 @@ export class CronExecutor {
      * 同一记录，随后加入队列；该入口不等待会话工作。
      */
     acceptScheduledTrigger(envelope) {
+        if (this.closed)
+            return { accepted: false, errorCode: 'CRON_EXECUTOR_CLOSED' };
         try {
             const run = this.deps.db.transaction(() => {
                 const definition = this.deps.definitions.getBySchedulerId(envelope.schedulerId);
@@ -93,13 +96,15 @@ export class CronExecutor {
      * 调用方拿到的运行已具备可导航的 sessionId，运行终态仍由同一执行循环持久化。
      */
     async prepareManual(request) {
+        this.assertOpen();
         const pending = this.resolveManualRun(request);
         return pending.status === 'pending'
             ? this.prepareSingleflight(pending, request.triggerMetric)
             : pending;
     }
-    /** 手动触发的完整执行入口：等待运行进入终态。 */
+    /** 执行一次手动投递；暂时拒绝时返回 pending，后续由持久化重试推进。 */
     async runManual(request) {
+        this.assertOpen();
         const pending = this.resolveManualRun(request);
         return this.executeSingleflight(pending, request.triggerMetric);
     }
@@ -132,25 +137,40 @@ export class CronExecutor {
     }
     /** 等待脱离请求链路的队列和所有已领取执行完成。 */
     async waitForIdle() {
-        await this.pumpTail;
-        await Promise.all([...this.inFlight.values()].map((execution) => execution.completion));
+        const outcomes = await Promise.allSettled([
+            this.pumpTail,
+            ...[...this.inFlight.values()].map((execution) => execution.completion),
+        ]);
+        const failed = outcomes.find((outcome) => outcome.status === 'rejected');
+        if (failed?.status === 'rejected')
+            throw failed.reason;
+    }
+    assertOpen() {
+        if (this.closed) {
+            throw new CronExecutionError('CRON_EXECUTOR_CLOSED', 'Cron executor is closed');
+        }
     }
     /** 停止接收队列工作，并等待当前已领取运行写入数据库终态。 */
     async close() {
         this.closed = true;
         this.queue.splice(0);
+        for (const timer of this.retryTimers.values())
+            clearTimeout(timer);
+        this.retryTimers.clear();
         await this.waitForIdle();
     }
     /**
      * 启动时恢复上一进程遗留的运行：
      * - 尚未领取的 pending 运行重新进入执行队列；
-     * - 已领取的 pending 运行收敛为 failed(PROCESS_RESTARTED)，不再重复投递。
+     * - 已持久化投递快照的运行复用 session/run 身份恢复，由 Turn 回执去重；
+     * - 旧版本没有快照的已领取运行仍收敛为 failed(PROCESS_RESTARTED)。
      */
     async recoverPendingRuns() {
+        this.assertOpen();
         const pending = this.listPendingRuns();
         const outcomes = [];
         for (const run of pending) {
-            if (run.executionClaimedAtMs === undefined) {
+            if (run.executionClaimedAtMs === undefined || (run.deliveryInput && run.sessionId)) {
                 this.enqueue(run.runId);
                 continue;
             }
@@ -169,6 +189,8 @@ export class CronExecutor {
                 outcomes.push(resolved);
         }
         const drained = await this.drainAll();
+        // 覆盖离线期间过期的单次提醒和旧版本遗留的已结束提醒。
+        retireBestEffort(() => this.deps.lifecycle.retireFinishedSelfReminders(this.deps.nowMs()));
         return [...outcomes, ...drained];
     }
     enqueue(runId, triggerMetric) {
@@ -263,8 +285,10 @@ export class CronExecutor {
         return raced;
     }
     findManualRun(request) {
-        if (request.requestId)
-            return this.deps.runs.getByManualRequestId(request.requestId);
+        if (request.requestId) {
+            return (this.deps.runs.getByManualRequestId(request.requestId) ??
+                this.deps.runs.get(`manual-request:${createHash('sha256').update(request.requestId).digest('hex')}`));
+        }
         if (!request.runId)
             return undefined;
         return this.deps.runs.get(request.runId) ?? this.deps.runs.getByManualRequestId(request.runId);
@@ -300,7 +324,9 @@ export class CronExecutor {
     async executeDeferred(pending, settleReady, triggerMetric) {
         await Promise.resolve();
         try {
-            return await this.executePending(pending, settleReady, triggerMetric);
+            const outcome = await this.executePending(pending, settleReady, triggerMetric);
+            this.retireAfterSelfReminderRun(outcome);
+            return outcome;
         }
         catch (error) {
             settleReady({ kind: 'error', error });
@@ -313,18 +339,27 @@ export class CronExecutor {
     async executePending(pending, settleReady, triggerMetric) {
         if (pending.status !== 'pending')
             return settlePrepared(settleReady, pending);
-        const claimed = this.deps.runs.claimExecution(pending.runId, this.deps.nowMs());
+        if (pending.retryAtMs !== undefined && pending.retryAtMs > this.deps.nowMs()) {
+            this.scheduleRetry(pending);
+            return settlePrepared(settleReady, pending);
+        }
+        const claimed = pending.deliveryInput && pending.sessionId
+            ? pending
+            : this.deps.runs.claimExecution(pending.runId, this.deps.nowMs());
         if (!claimed) {
             if (triggerMetric) {
                 this.deps.metrics.taskTriggered(triggerMetric.task, triggerMetric.source, 'skipped');
             }
             return settlePrepared(settleReady, this.requireRun(pending.runId));
         }
+        return this.executeClaimed(claimed, settleReady, triggerMetric);
+    }
+    async executeClaimed(claimed, settleReady, triggerMetric) {
         const startedAtMs = Date.now();
         let agentName = 'unknown';
         let outcome;
         try {
-            const executionInput = currentExecutionInput(this.deps.definitions.get(pending.cronId));
+            const executionInput = claimed.deliveryInput ?? currentExecutionInput(this.deps.definitions.get(claimed.cronId));
             if (!executionInput) {
                 outcome = settlePrepared(settleReady, this.finishFailed(claimed, CRON_DEFINITION_DELETED, CRON_DEFINITION_DELETED_ERROR, ''));
                 return outcome;
@@ -332,33 +367,46 @@ export class CronExecutor {
             agentName = executionInput.agentName;
             let sessionId;
             try {
-                sessionId = await this.createExecutionSession(claimed, executionInput);
+                sessionId =
+                    claimed.sessionId ?? (await this.createExecutionSession(claimed, executionInput));
             }
             catch (error) {
                 const failure = targetSessionFailure(error);
                 outcome = settlePrepared(settleReady, this.finishFailed(claimed, failure.code, failure.message, ''));
                 return outcome;
             }
-            if (!this.deps.runs.attachSession(claimed.runId, sessionId)) {
+            if (!this.deps.runs.attachSession(claimed.runId, sessionId, executionInput)) {
                 outcome = settlePrepared(settleReady, this.resolveConflict(claimed, 'session-attach-conflict', 'pending'));
                 return outcome;
             }
             settleReady({ kind: 'ready', run: this.requireRun(claimed.runId) });
-            const delivery = await this.deliver(executionInput, claimed, sessionId);
-            if (!delivery.delivered) {
-                outcome = this.finishFailed(claimed, delivery.errorCode, delivery.error, executionInput.prompt);
-                return outcome;
-            }
-            if (!this.deps.runs.markDelivered(claimed.runId, this.deps.nowMs())) {
-                outcome = this.resolveConflict(claimed, 'terminal-conflict', 'delivered');
-                return outcome;
-            }
-            outcome = this.requireRun(claimed.runId);
+            outcome = await this.deliverClaimed(executionInput, claimed, sessionId);
             return outcome;
         }
         finally {
             this.reportExecutionMetrics(agentName, outcome, startedAtMs, triggerMetric);
         }
+    }
+    async deliverClaimed(input, run, sessionId) {
+        const delivery = await this.deliver(input, run, sessionId);
+        if (!delivery.delivered) {
+            if (delivery.retryable)
+                return this.deferDelivery(run);
+            return this.finishFailed(run, delivery.errorCode, delivery.error, input.prompt);
+        }
+        if (!this.deps.runs.markDelivered(run.runId, this.deps.nowMs())) {
+            return this.resolveConflict(run, 'terminal-conflict', 'delivered');
+        }
+        return this.requireRun(run.runId);
+    }
+    deferDelivery(run) {
+        const delay = Math.min(30_000, 1_000 * 2 ** Math.min(run.retryAttempt ?? 0, 5));
+        if (!this.deps.runs.deferDelivery(run.runId, this.deps.nowMs() + delay)) {
+            return this.resolveConflict(run, 'terminal-conflict', 'pending');
+        }
+        const deferred = this.requireRun(run.runId);
+        this.scheduleRetry(deferred);
+        return deferred;
     }
     async createExecutionSession(claimed, executionInput) {
         const created = await this.deps.sessionCreation.create({
@@ -405,16 +453,30 @@ export class CronExecutor {
             return;
         this.deps.metrics.taskTriggered(triggerMetric.task, triggerMetric.source, triggerMetricOutcome(outcome));
     }
-    selfReminderCancellationError(cronId) {
-        return isSelfReminderId(cronId) && !this.deps.definitions.get(cronId)
-            ? CRON_DEFINITION_DELETED
-            : undefined;
+    scheduleRetry(run) {
+        if (this.closed || this.retryTimers.has(run.runId))
+            return;
+        const delay = Math.max(1, (run.retryAtMs ?? this.deps.nowMs()) - this.deps.nowMs());
+        const timer = setTimeout(() => {
+            this.retryTimers.delete(run.runId);
+            this.enqueue(run.runId);
+        }, Math.min(delay, 30_000));
+        timer.unref();
+        this.retryTimers.set(run.runId, timer);
+    }
+    /** 自提醒运行落终态后，软删同会话已结束的提醒。 */
+    retireAfterSelfReminderRun(run) {
+        if (!isSelfReminderId(run.cronId) || run.status === 'pending')
+            return;
+        retireBestEffort(() => {
+            const target = this.deps.definitions.get(run.cronId)?.sessionTarget;
+            if (target?.mode !== 'sessionId' || !target.sessionId)
+                return;
+            this.deps.lifecycle.retireFinishedSelfReminders(this.deps.nowMs(), target.sessionId);
+        });
     }
     async deliver(executionInput, pending, sessionId) {
         try {
-            const errorCode = this.selfReminderCancellationError(pending.cronId);
-            if (errorCode)
-                return { delivered: false, errorCode };
             return await this.deps.delivery.deliver({
                 cronId: pending.cronId,
                 runId: pending.runId,
@@ -422,18 +484,18 @@ export class CronExecutor {
                 agentName: executionInput.agentName,
                 cronName: executionInput.cronName,
                 text: executionInput.prompt,
-                ...(isSelfReminderId(pending.cronId)
-                    ? {
-                        beforeDelivery: async () => {
-                            const error = this.selfReminderCancellationError(pending.cronId);
-                            if (error)
-                                throw new Error(error);
-                        },
+                ...(executionInput.model === undefined ? {} : { model: executionInput.model }),
+                beforeDelivery: async () => {
+                    if (!this.deps.definitions.get(pending.cronId)) {
+                        throw new CronExecutionError(CRON_DEFINITION_DELETED, CRON_DEFINITION_DELETED_ERROR);
                     }
-                    : {}),
+                },
             });
         }
-        catch {
+        catch (error) {
+            if (error instanceof CronExecutionError) {
+                return { delivered: false, errorCode: error.code, error: error.message };
+            }
             return {
                 delivered: false,
                 errorCode: SESSION_DELIVERY_FAILED,
@@ -496,6 +558,14 @@ async function discardSessionBestEffort(sessionCreation, sessionId) {
     }
     catch {
         // The durable fixed-session winner remains authoritative even if orphan cleanup fails.
+    }
+}
+function retireBestEffort(retire) {
+    try {
+        retire();
+    }
+    catch {
+        // 软删只影响列表展示；失败不改变 Run 终态，下一次运行或启动清扫会重试。
     }
 }
 function normalizeCreateManualError(error) {

@@ -199,7 +199,7 @@ async function admitQueuedSessionClioQuery(options, input, item) {
         occurredAtMs: item.createdAt,
     });
 }
-function toQueueInput(input, values) {
+export function toQueueInput(input, values) {
     return {
         session: { sessionId: input.sessionId, agentName: values.agentName },
         requestedTurnId: values.requestedTurnId,
@@ -217,6 +217,7 @@ function toQueueMessage(input) {
     const channelContext = toQueueChannelContext(input);
     return {
         content: input.input.text,
+        ...(input.input.computerUse ? { computerUse: input.input.computerUse } : {}),
         attachments: (input.input.attachments ?? []).flatMap(toQueueAttachment),
         ...(input.input.computerUse ? { computerUse: { enable: input.input.computerUse.enable } } : {}),
         ...(input.inputSafetyDecision ? { inputSafetyDecision: input.inputSafetyDecision } : {}),

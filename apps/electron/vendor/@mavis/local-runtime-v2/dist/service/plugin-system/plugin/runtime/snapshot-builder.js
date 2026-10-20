@@ -61,6 +61,7 @@ export class PluginSnapshotBuilder {
             runtimeToolBindings: freeze([]),
             hostBindings: freeze(state.hostBindings),
             hooks: freeze([...state.hooks]),
+            agents: freeze([...state.agents].sort((left, right) => left.scopedName.localeCompare(right.scopedName))),
         });
         return freeze({
             revision: input.revision,
@@ -110,6 +111,7 @@ function createSnapshotBuildState(reservations) {
         mcpServers: [],
         hooks: [],
         hostBindings: [],
+        agents: [],
         pluginNames: new Set(),
         skillNames: new Set(reservations.skillNames.map(normalizedSkillKey)),
     };
@@ -164,10 +166,7 @@ function appendLocalPlugin(entry, isLocalEnabled, state) {
     });
     if (!accepted)
         return;
-    if (plugin.skills.length === 0 &&
-        plugin.mcpServers.length === 0 &&
-        (plugin.hooks?.length ?? 0) === 0 &&
-        !plugin.miniapp) {
+    if (!hasSupportedLocalCapability(plugin)) {
         state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NO_SUPPORTED_CAPABILITY', pluginName: plugin.name }));
         return;
     }
@@ -181,6 +180,14 @@ function appendLocalPlugin(entry, isLocalEnabled, state) {
     state.mcpServers.push(...accepted.mcpServers);
     state.hooks.push(...accepted.hooks);
     state.hostBindings.push(...accepted.hostBindings);
+    state.agents.push(...accepted.agents);
+}
+function hasSupportedLocalCapability(plugin) {
+    return (plugin.skills.length > 0 ||
+        plugin.mcpServers.length > 0 ||
+        (plugin.hooks?.length ?? 0) > 0 ||
+        (plugin.agents?.length ?? 0) > 0 ||
+        Boolean(plugin.miniapp));
 }
 function localProjection(plugin, contentDigest, enabled) {
     return freeze({
@@ -219,7 +226,7 @@ function acceptPackageCapabilities(input) {
     const pluginKey = collisionKey(plugin.name);
     input.pluginNames.add(pluginKey);
     if (!input.includeRuntimeCapabilities) {
-        return { skills: [], mcpServers: [], hooks: [], hostBindings: [] };
+        return { skills: [], mcpServers: [], hooks: [], hostBindings: [], agents: [] };
     }
     const skills = acceptPackageSkills(input);
     return {
@@ -227,6 +234,38 @@ function acceptPackageCapabilities(input) {
         mcpServers: acceptPackageServers(input),
         hooks: [...(plugin.hooks ?? [])],
         hostBindings: acceptHostBindings(input, skills),
+        agents: input.sourceKind === 'local' ? acceptPackageAgents(input) : [],
+    };
+}
+function acceptPackageAgents(input) {
+    return (input.plugin.agents ?? []).map((agent) => turnPluginAgent(input.plugin, input.packageContentDigest, agent));
+}
+function turnPluginAgent(plugin, packageDigest, agent) {
+    return freeze({
+        scopedName: agent.scopedName,
+        pluginName: plugin.name,
+        agentName: agent.name,
+        sourceFormat: agent.sourceFormat === 'MINIMAX' ? 'minimax' : '\u0063\u006c\u0061\u0075\u0064\u0065',
+        packageDigest,
+        pluginRoot: plugin.rootPath,
+        description: agent.description,
+        ...(agent.displayName ? { displayName: agent.displayName } : {}),
+        systemPrompt: agent.systemPrompt,
+        ...(agent.model ? { model: agent.model } : {}),
+        ...(agent.effort ? { effort: agent.effort } : {}),
+        ...(agent.contextWindow === undefined ? {} : { contextWindow: agent.contextWindow }),
+        ...(agent.maxOutputTokens === undefined ? {} : { maxOutputTokens: agent.maxOutputTokens }),
+        ...turnPluginAgentSelectors(agent),
+        declaredMcpServers: freeze(plugin.mcpServers.map((server) => server.name)),
+    });
+}
+function turnPluginAgentSelectors(agent) {
+    return {
+        ...(agent.tools === undefined ? {} : { tools: agent.tools }),
+        ...(agent.disallowedTools === undefined ? {} : { disallowedTools: agent.disallowedTools }),
+        ...(agent.mcpServers === undefined ? {} : { mcpServers: agent.mcpServers }),
+        ...(agent.skills === undefined ? {} : { skills: agent.skills }),
+        ...(agent.extensionSkills === undefined ? {} : { extensionSkills: agent.extensionSkills }),
     };
 }
 function acceptHostBindings(input, acceptedSkills) {

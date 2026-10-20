@@ -53,6 +53,7 @@ export const THREAD_GOAL_STATUS_REASONS = [
     'paused(retracted)',
     'paused(infra_retryable)',
     'paused(accounting_unavailable)',
+    'paused(questionnaire_failed)',
     'paused(verifier_unavailable)',
     'paused(route_unavailable)',
     // Verifier pauses are split by owner layer, not by adapter error: see

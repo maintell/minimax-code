@@ -1,13 +1,15 @@
+import { initializeAgentShellService, bindAgentShellService, } from './service/agent-shell/index.js';
 import { initializeSkillSystem } from './service/skill/index.js';
-import { createComputerUsePreferenceStore, createComputerUsePluginCallbacks, deactivateComputerUsePlugin, restoreRuntimeComputerUsePreferences, } from './service/computer-use/index.js';
+import { createComputerUseDefaultPreference, createComputerUsePreferenceStore, createComputerUsePluginCallbacks, deactivateComputerUsePlugin, restoreRuntimeComputerUsePreferences, } from './service/computer-use/index.js';
 import { CloudSessionReader } from '@mavis/agent-tools/desktop';
+import { getRuntimeRegion, getRuntimeBuildEnv } from '@mavis/config';
 import { createQueryCollapseKeyResolver, } from './application/conversation/index.js';
 import { createRuntimeMessageDelivery } from './application/conversation/runtime-message-delivery.js';
-import { createRuntimeNormalExtensions, createServiceGlobalEventWriter, bindRuntimeHostedCloudHandoff, requirePreparedSkillState, prepareRuntimeServices, createServiceWorkspace, initializeRuntimeSandbox, initializeRuntimeCron, resolveServicesCompatibility, } from './application/session/runtime-services-composition.js';
+import { createRuntimeAuthRecoveryNotifier } from './application/session/runtime-execution-auth.js';
+import { createRuntimeWorkspace, createRuntimeNormalExtensions, createServiceGlobalEventWriter, bindRuntimeHostedCloudHandoff, requirePreparedSkillState, prepareRuntimeServices, initializeRuntimeSandbox, initializeRuntimeCron, resolveServicesCompatibility, } from './application/session/runtime-services-composition.js';
 import { AgentApplication, AppError, createRuntimeAgentApplication, configureRuntimePluginHooks, createRuntimePluginSessionLifecycle, createRuntimeServicesLifecycle, closeRuntimeServiceOwnersAfterFailure, createRuntimeSkillApplication, createRuntimeBrowserUseComposition, createGoalEvaluatorVerifier, createGoalSubagentVerifierRuntime, initializeApplications, ownsElectronRuntimeCapabilities, ModelProviderApplication, } from './application/index.js';
-import { createRuntimeUserApplications } from './application/session/runtime-user-applications.js';
+import { createRuntimeProcessLocalApplication, createRuntimeUserApplications, } from './application/session/runtime-user-applications.js';
 import { createGoalVerificationTranscriptReader } from './application/agent/goal-verification-transcript.js';
-import { composeProcessLocalApplication } from './application/session/process-local-composition.js';
 import { createProductionConversationMutationWorkflow, unavailableForkWorktree, } from './application/session/conversation-mutation-workflow.js';
 import { bindTaskAgentBindingCapture } from './application/session/task-agent-ready-inventory.js';
 import { createForkState } from './application/session/conversation-fork-state.js';
@@ -19,10 +21,9 @@ import { initializeRuntimeTurnSystem } from './application/session/turn-system-c
 import { composeSessionClio, } from './service/session-clio/index.js';
 import { buildCompatChannelSystemOwner, } from './service/channel-system/index.js';
 import { initializeManagedContentSafetyService, } from './service/content-safety/index.js';
-import {} from './service/workspace/index.js';
 import { createOptionalRuntimeCronTurnDelivery, hasActiveCronSessionOwner, listCronTargetSessionIds, } from './service/cron/index.js';
 import { AgentFavorites } from './service/agent/index.js';
-import { bindRuntimeServicePromptLifecycle, createRuntimePromptAuthNotifier, withRuntimePromptSupportRollback, } from './service/prompt-config/index.js';
+import { bindRuntimeServicePromptLifecycle, withRuntimePromptSupportRollback, } from './service/prompt-config/index.js';
 import { createRuntimePromptSessionSupport } from './application/session/runtime-prompt-support.js';
 import { createRuntimeInspector, } from './service/llm-context-inspector/index.js';
 import { initializeRuntimeMemoryV2System, } from './service/memory-system/index.js';
@@ -31,10 +32,9 @@ import { initializeSessionApplicationSystem, createComposerPreferences, } from '
 import { initializePluginHookPermissions, initializePluginService, createPluginNameReservations, } from './service/plugin-system/index.js';
 import { resolvePluginServiceLogger } from './application/session/plugin-service-logger.js';
 import { initializeMcpService, } from './service/mcp/index.js';
-import { composeMiniAppRuntimeCapability, createDeferredRuntimeOwnersLifecycle, resolveRuntimeMiniAppOptions, } from './service/miniapp/index.js';
+import { composeMiniAppRuntimeCapability, createDeferredRuntimeOwnersLifecycle, createMiniAppAgentGateway, createMiniAppAgentSessionPorts, resolveRuntimeMiniAppOptions, } from './service/miniapp/index.js';
 import { bindConversationMutationPlanState, initializePlanService, createPlanEntryReaders, } from './service/plan/index.js';
-import { ModelFavoritesPreference } from './service/model-system/index.js';
-import { AgentHostTurnCapabilityLifecycle, deactivateLocalPluginHooks, disposeLocalPluginHookSessions, readLocalInstructionSources, requireTurnSystem, } from './service/turn-system/index.js';
+import { AgentHostTurnCapabilityLifecycle, deactivateLocalPluginHooks, disposeLocalPluginHookSessions, requireTurnSystem, } from './service/turn-system/index.js';
 import { composeV1Conversation } from './service/v1-conversation-compat/index.js';
 export { createRuntimeAgentComposition, } from './service/agent/index.js';
 export { createDeferredLocalSandboxBashOperationsFactory, } from './service/sandbox/index.js';
@@ -61,17 +61,20 @@ export async function createRuntimeServices(creation) {
     }
 }
 async function composeRuntimeServices(creation, safety, hookPermissions) {
-    const { options, browserUseComposition, nowMs, processStartedAtMs, ownerLifecycle, state, computerUse, sandbox, bindSessionSystem, inspector, writeGlobalEvent, workspace, turnCapabilities, globalInstructions, promptSupport, productionSessionComposition, agentSessionPorts, promptConfig, internalTurnPromptReads, } = await prepareRuntimeServiceComposition(creation, safety);
+    const { options, browserUseComposition, nowMs, processStartedAtMs, ownerLifecycle, state, computerUse, sandbox, bindSessionSystem, inspector, writeGlobalEvent, turnCapabilities, globalInstructions, promptSupport, productionSessionComposition, agentSessionPorts, promptConfig, internalTurnPromptReads, } = await prepareRuntimeServiceComposition(creation, safety);
     bindSessionSystem(productionSessionComposition.sessionSystem);
     const { product, preparation, modelSystem, modelProviderApplication, sessionSystem, pinService, archiveTitleModel, facts, channelTurnAdmission, } = productionSessionComposition;
+    const agentShell = composeAgentShell(options, nowMs, productionSessionComposition);
     const { planEntryEnabled, agentPlanEntryEnabled } = createPlanEntryReaders(product.preparation.configBuilder.config);
     const canvas = initializeRuntimeCanvas(options, sessionSystem);
+    const workspace = createRuntimeWorkspace(options, sessionSystem, writeGlobalEvent);
     const promptBoundOwners = await initializePromptBoundRuntimeServiceOwners({
         options,
         processStartedAtMs,
         product,
         preparation,
         sessionSystem,
+        modelProviderApplication,
         pinService,
         canvas,
         archiveTitleModel,
@@ -84,7 +87,7 @@ async function composeRuntimeServices(creation, safety, hookPermissions) {
         internalTurnPromptReads,
         writeGlobalEvent,
         nowMs,
-        enableCron: ownsElectronRuntimeCapabilities(options.runtimeOwnerKind),
+        enableCron: ownsScheduledRuntimeCapabilities(options.runtimeOwnerKind),
         runtimeOwnerIdentity: options.runtimeOwnerIdentity,
         planEntryEnabled,
         agentPlanEntryEnabled,
@@ -107,28 +110,14 @@ async function composeRuntimeServices(creation, safety, hookPermissions) {
         nowMs,
         createSkillApplication: createRuntimeSkillApplication,
     });
-    const application = composeProcessLocalApplication({
-        eventBus: options.eventBus,
-        usageCommits: sessionSystem.usage.commits,
-        compatibility: options.compatibility,
-        listRuntimeSkills: (request) => skill.listRuntimeSkills(request),
-        listSkills: owners.skillSystem.management.listSkills,
-        plugins: owners.plugin.plugin,
-        pluginControl: owners.plugin,
-        miniApp: owners.miniAppComposition.services.miniApp,
+    const application = createRuntimeProcessLocalApplication({
+        options,
+        owners,
+        sessionSystem,
+        skill,
         planEntryEnabled,
-        sessionReports: sessionSystem.reporting,
-        instructions: {
-            listSources: (input) => readLocalInstructionSources({ ...input, dataDir: options.dataDir }),
-        },
-        mcp: owners.mcp.public,
-        modelProvider: {
-            application: modelProviderApplication,
-            providers: modelSystem.providers,
-            listProviderPresets: modelSystem.listProviderPresets,
-            oauth: modelSystem.oauth,
-            favorites: new ModelFavoritesPreference(options.db),
-        },
+        modelSystem,
+        modelProviderApplication,
     });
     if (owners.cron)
         options.compatibility.cron.bindAgentCleanup(owners.cron.service);
@@ -145,6 +134,8 @@ async function composeRuntimeServices(creation, safety, hookPermissions) {
         sessionSystem,
         workspaceGit: workspace.git,
         workspaceHtmlPreview: workspace.htmlPreview,
+        workspaceFile: workspace.file,
+        workspaceIndexing: workspace.indexing,
         sandbox,
         closeBrowserUse: browserUseComposition.close,
         ...owners,
@@ -161,21 +152,10 @@ async function composeRuntimeServices(creation, safety, hookPermissions) {
     });
     ownerLifecycle.bind({
         ready: promptLifecycle.ready,
-        close: async () => {
-            try {
-                await promptLifecycle.close();
-            }
-            finally {
-                try {
-                    await hookPermissions.close();
-                }
-                finally {
-                    await safety.close();
-                }
-            }
-        },
+        close: () => closeRuntimeServiceResources(promptLifecycle, hookPermissions, safety),
     });
     return {
+        agentShell,
         agent: owners.agentApplication,
         safety,
         canvas,
@@ -192,6 +172,7 @@ async function composeRuntimeServices(creation, safety, hookPermissions) {
         ...(channelSystem ? { channelSystem } : {}),
         turnSystem: owners.turnSystem,
         browserUse: browserUseComposition.service,
+        processLifecycle: owners.turnSystem.processLifecycle,
         conversation,
         applications: owners.applications,
         application,
@@ -203,22 +184,70 @@ async function composeRuntimeServices(creation, safety, hookPermissions) {
         skill,
         skillEvolve: owners.skillSystem.evolve,
         ...computerUse,
+        computerUseDefaultPreference: composeComputerUseDefaultPreference(options),
         sandbox,
         ...(inspector ? { llmContextInspector: inspector.service } : {}),
         ...memoryDesktopApplicationFor(owners.memory),
         ...owners.miniAppComposition.services,
-        notifyAuthContextChanged: createRuntimePromptAuthNotifier(notifyAuthContextChanged, promptConfig),
+        notifyAuthContextChanged: createRuntimeAuthRecoveryNotifier({
+            mode: options.executionAuthMode,
+            isClosed: () => state.closed,
+            notifyPluginContextChanged: notifyAuthContextChanged,
+            promptConfig,
+            recoverQuestionnaires: async () => {
+                await options.compatibility.questionnaires.createService().recoverOnStartup();
+            },
+            reconcilePlan: () => owners.plan.lifecycleReconciler.schedule('auth-context-ready'),
+            listPendingSessionIds: () => sessionSystem.queue.committed.listPendingSessionIds(),
+            dispatchQueue: (sessionId) => owners.turnSystem.turns.dispatchQueue(sessionId),
+            reportFailure: (scope, message) => product.executor.reportFailure?.(scope, message),
+        }),
         builtinAgentDefinitionsReady: lifecycle.builtinAgentDefinitionsReady,
         ready: owners.miniAppComposition.ready,
         close: () => closeRuntimeOwners(sessionClio, owners.miniAppComposition),
     };
 }
+async function closeRuntimeServiceResources(promptLifecycle, hookPermissions, safety) {
+    try {
+        await promptLifecycle.close();
+    }
+    finally {
+        try {
+            await hookPermissions.close();
+        }
+        finally {
+            await safety.close();
+        }
+    }
+}
+function ownsScheduledRuntimeCapabilities(runtimeOwnerKind) {
+    return ownsElectronRuntimeCapabilities(runtimeOwnerKind) || runtimeOwnerKind === 'app-server';
+}
+function composeComputerUseDefaultPreference(options) {
+    return createComputerUseDefaultPreference({
+        preferences: options.computerUsePreferences,
+        clientAvailable: Boolean(options.computerUseClient),
+        scope: () => {
+            const principalId = options.compatibility.plugin.authContextGetter()?.realUserID?.trim();
+            return principalId
+                ? { principalId, deployment: `${getRuntimeRegion()}-${getRuntimeBuildEnv()}` }
+                : undefined;
+        },
+    });
+}
 function closeRuntimeOwners(sessionClio, miniApp) {
     sessionClio?.close();
     return miniApp.close();
 }
+function planFailureReporter(product, stage) {
+    return (error) => {
+        product.executor.reportFailure?.('plan-lifecycle', `owner=plan;stage=${stage};error=${describeError(error)}`);
+    };
+}
 async function initializeRuntimeServiceOwners(input) {
     const pluginLogger = resolvePluginServiceLogger(input.options.logger);
+    const miniAppOptions = resolveRuntimeMiniAppOptions(input.options);
+    const miniAppAgent = miniAppOptions ? createRuntimeMiniAppAgent(input, pluginLogger) : undefined;
     let plugin;
     let mcp;
     let skillSystem;
@@ -259,11 +288,13 @@ async function initializeRuntimeServiceOwners(input) {
         });
         bindTaskAgentBindingCapture(input, { plugin, mcp }, pluginLogger);
         miniAppComposition = await composeMiniAppRuntimeCapability({
-            options: resolveRuntimeMiniAppOptions(input.options),
+            options: miniAppOptions,
             db: input.options.db,
             dataDir: input.options.dataDir,
             nowMs: input.nowMs,
             plugin,
+            agentGateway: miniAppAgent,
+            logger: pluginLogger,
             readyOwners: input.readyOwners,
             closeOwners: input.closeOwners,
         });
@@ -275,8 +306,6 @@ async function initializeRuntimeServiceOwners(input) {
                 surface: input.options.compatibility.miniAppSurface,
                 logger: pluginLogger,
             },
-            wordEditor: input.options.wordEditor,
-            excelEditor: input.options.excelEditor,
         });
         const plan = initializePlanService({
             db: input.options.db,
@@ -290,9 +319,8 @@ async function initializeRuntimeServiceOwners(input) {
             dispatchQueue: (sessionId) => requireTurnSystem(turnSystem).turns.dispatchQueue(sessionId),
             entryEnabled: input.planEntryEnabled,
             agentEntryEnabled: input.agentPlanEntryEnabled,
-            reportFailure: (error) => {
-                input.product.executor.reportFailure?.('plan-lifecycle', `owner=plan;stage=lifecycle-reconcile;error=${describeError(error)}`);
-            },
+            reportFailure: planFailureReporter(input.product, 'lifecycle-reconcile'),
+            reportReviewFallbackFailure: planFailureReporter(input.product, 'review-fallback'),
             nowMs: input.nowMs,
         });
         bindConversationMutationPlanState({
@@ -319,8 +347,11 @@ async function initializeRuntimeServiceOwners(input) {
             disposeMcpSession: (sessionId) => mcpRuntime.disposeSession(sessionId),
             goalVerifierExtension: subagentVerification.extension,
             goalVerifierOutputTokenCap: subagentVerification.outputTokenCap,
+            miniAppApprovals: miniAppAgent,
         });
         const sessionApplications = await initializeSessionApplications(input, turnSystem, plugin, (sessionId) => cron?.isSessionOwnedByDefinition(sessionId) ?? false);
+        if (miniAppAgent)
+            bindMiniAppAgentSessions(miniAppAgent, input, turnSystem, sessionApplications);
         cron = input.enableCron
             ? initializeRuntimeCron({
                 reviewContent: input.safety.review,
@@ -359,6 +390,7 @@ async function initializeRuntimeServiceOwners(input) {
             cron,
             plugin,
             miniAppComposition,
+            miniAppAgent,
             mcp,
             skillSystem,
             agentApplication: sessionApplications.agentApplication,
@@ -383,6 +415,28 @@ async function initializeRuntimeServiceOwners(input) {
         throw error;
     }
 }
+/** Created before the turn system: its permission gate consults the gateway's listeners. */
+function createRuntimeMiniAppAgent(input, logger) {
+    return createMiniAppAgentGateway({ dataDir: input.options.dataDir, logger, nowMs: input.nowMs });
+}
+function bindMiniAppAgentSessions(gateway, input, turnSystem, sessionApplications) {
+    gateway.bind(createMiniAppAgentSessionPorts({
+        records: input.sessionSystem.sessions.records,
+        lifecycle: sessionApplications.sessionApplications.session.lifecycle,
+        repository: input.sessionSystem.sessions.repository,
+        turns: turnSystem.turns,
+        stream: input.sessionSystem.stream,
+        messages: input.sessionSystem.messages.repository,
+        questionnaires: input.options.compatibility.peripherals.questionnaires,
+        permissions: input.options.compatibility.peripherals.permissions,
+        eventBus: input.options.eventBus,
+        logger: resolvePluginServiceLogger(input.options.logger),
+        modelConfig: input.product.preparation.configBuilder.config,
+        models: { list: () => input.modelProviderApplication.list() },
+        agents: sessionApplications.agentApplication,
+        nowMs: input.nowMs,
+    }));
+}
 async function initializePromptBoundRuntimeServiceOwners(input) {
     return withRuntimePromptSupportRollback(input.promptSupport, async () => {
         // Compat channel owner assembly (single-production-owner rule + wire
@@ -401,7 +455,10 @@ async function initializePromptBoundRuntimeServiceOwners(input) {
         const sessionClio = composeRuntimeSessionClio(input);
         const messageDelivery = createRuntimeMessageDelivery(input.sessionSystem, channelSystem, queryCollapseKeys, { nowMs: input.nowMs, ...(sessionClio ? { sessionClio: sessionClio.capture } : {}) });
         const turnLifecycleEvents = createSessionTurnLifecycleEvents(input.sessionSystem.sessions.repository, input.writeGlobalEvent, input.product.terminalMemory, (sessionId) => input.workspaceIndexing.captureRevisionAfterTurn(sessionId));
-        const memory = initializeRuntimeMemoryV2System(input);
+        const memory = initializeRuntimeMemoryV2System({
+            ...input,
+            quota: input.options.compatibility.sessionHandoff.cloud,
+        });
         const owners = await initializeRuntimeServiceOwners({
             ...input,
             channelSystem,
@@ -525,6 +582,7 @@ async function initializeSessionApplications(input, turnSystem, plugin, isSessio
         lifecycle: sessionApplications.session.lifecycle,
         deletion: applications.session.lifecycle,
         root: applications.session.root,
+        taskOccupancy: turnSystem.subagentOccupancy,
         onQueueWakeFailure: createQueueWakeFailureReporter(input.product.executor.reportFailure, 'conversation_queue_wake_failed'),
     });
     return { sessionApplications, applications, agentApplication, runtimeConversation };
@@ -550,7 +608,6 @@ async function prepareRuntimeServiceComposition(creation, safety) {
     const sandbox = initializeRuntimeSandbox(options);
     const { bindSessionSystem, inspector } = await createRuntimeInspector(options);
     const writeGlobalEvent = createServiceGlobalEventWriter(options, state, browserUseComposition.service, sandbox);
-    const workspace = createServiceWorkspace(prepared, options.compatibility, writeGlobalEvent);
     const turnCapabilities = new AgentHostTurnCapabilityLifecycle();
     options.overrides?.inspectTurnCapabilities?.(turnCapabilities);
     const { globalInstructions, promptSupport, productionSessionComposition, agentSessionPorts } = await createRuntimePromptSessionSupport({
@@ -574,7 +631,6 @@ async function prepareRuntimeServiceComposition(creation, safety) {
         bindSessionSystem,
         inspector,
         writeGlobalEvent,
-        workspace,
         turnCapabilities,
         globalInstructions,
         promptSupport,
@@ -583,5 +639,17 @@ async function prepareRuntimeServiceComposition(creation, safety) {
         promptConfig,
         internalTurnPromptReads,
     };
+}
+function composeAgentShell(options, nowMs, composition) {
+    const { sessionSystem, preparation } = composition;
+    const agentShell = initializeAgentShellService({ db: options.db, nowMs });
+    bindAgentShellService(agentShell, {
+        sessions: (id) => sessionSystem.sessions.repository.get(id),
+        records: sessionSystem.sessions.records,
+        preparation,
+        bindPermissions: options.compatibility.bindPermissionShellResolver,
+    });
+    options.sandboxOperationsFactory?.bindShellResolver((id) => agentShell.resolveForExecution(id));
+    return agentShell;
 }
 //# sourceMappingURL=services.js.map

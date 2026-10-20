@@ -33,10 +33,10 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     return useValue ? value : void 0;
 };
 import { bindTool, } from '@mavis/agent-core/tools';
-import { sanitizeBashSubprocessEnv, } from '@mavis/agent-core/bash-subprocess-env';
+import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
 import { createBashTool, createEditTool, createReadTool, createWriteTool, } from '@earendil-works/pi-coding-agent/tools';
 import { getShellConfig } from '@earendil-works/pi-coding-agent/shell';
-import { access } from 'node:fs/promises';
+import { access, readFile } from '../shared/physical-fs.js';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { homedir, release } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -46,9 +46,10 @@ import { DEFAULT_FOREGROUND_BASH_SOFT_YIELD_MS, resolveLocalBashTiming, validate
 import { localBashResultFromError, localBashResultFromPi, readBashExecutionOutcome, } from './local-bash-result.js';
 import { LocalBashToolDef, LocalEditToolDef, LocalReadToolDef, LocalWriteToolDef, } from './builtin-defs.js';
 import { executeLocalHostTrashIfRequested, } from './host-trash-executor.js';
+import { copyWithPermissionExecutionPlan, readPermissionExecutionPlan, resolvePermissionBashEnvPolicy, } from './permission-execution.js';
 import { inferReadVideoMimeType, readVideoAsToolResult } from '../shared/read-video.js';
 import { buildReplaceAllEdit, ReplaceAllError } from '../shared/replace-all-edit.js';
-import { checkBlockedDeviceRead, checkNonRegularFileRead, detectBinaryRead, } from '../shared/read-guards.js';
+import { checkBlockedDeviceRead, checkNonRegularFileRead, detectBinaryRead, detectPiSupportedImageMimeTypeFromFile, } from '../shared/read-guards.js';
 import { isPdfReadPath, readPdfAsToolResult } from '../shared/read-pdf.js';
 import { isNotebookReadPath, readNotebookAsToolResult } from '../shared/read-notebook.js';
 import { piReadResultToToolResult, readErrorResult } from '../shared/read-result.js';
@@ -56,7 +57,7 @@ import { executeEditWithLineNumberRetry, normalizeEditsForLineNumberRetry, } fro
 import { createCapturingEditOperations } from '../shared/edit-capture.js';
 import { withCompatibleBashToolResponseFromPiDetails, withCompatibleEditToolResponse, } from '../plugin-hooks/vendor-tool-response.js';
 import { buildWriteToolResult, createCapturingWriteOperations } from '../shared/write-capture.js';
-import { applyDesktopTextLimit, DESKTOP_BASH_MAX_BYTES, DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_READ_TEXT_MAX_BYTES, limitDesktopHeadTailLines, limitDesktopPrefixLines, withDesktopOutputContinuation, } from './output-limit.js';
+import { applyDesktopTextLimit, DESKTOP_BASH_MAX_BYTES, DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, DESKTOP_READ_TEXT_MAX_BYTES, limitDesktopHeadTailLines, limitDesktopPrefixLines, withDesktopOutputContinuation, } from './output-limit.js';
 export function getLocalBashEnvironment() {
     let shell = 'unavailable';
     try {
@@ -91,7 +92,16 @@ let LocalReadTool = (() => {
         tool;
         constructor(workspaceRoot) {
             this.workspaceRoot = workspaceRoot;
-            this.tool = createReadTool(workspaceRoot);
+            // The host's request media extension encodes every tool result image to
+            // `requestMedia.image`; a second resize here would cap it and add a note.
+            this.tool = createReadTool(workspaceRoot, {
+                autoResizeImages: false,
+                operations: {
+                    access,
+                    readFile,
+                    detectImageMimeType: detectPiSupportedImageMimeTypeFromFile,
+                },
+            });
         }
         async execute(ctx, input, signal) {
             if (signal?.aborted)
@@ -350,7 +360,6 @@ let LocalBashTool = (() => {
         backgroundAdapter;
         hostTrashRuntime;
         sandboxOperationsFactory;
-        tool;
         envPolicy;
         /** Names stripped by the sanitizer at the most recent spawn (never values). */
         lastEnvRemoved = [];
@@ -362,22 +371,6 @@ let LocalBashTool = (() => {
             this.hostTrashRuntime = hostTrashRuntime;
             this.sandboxOperationsFactory = sandboxOperationsFactory;
             this.envPolicy = envPolicy;
-            // Env sanitizer (design: bash-tool-optimization.md §2.2). Layer A boundary
-            // strip is always on; Layer B secret scrub follows the resolved policy.
-            // The background executor and the pi-turn-runner fallback apply the same
-            // hook — keep the three spawn sites in sync.
-            this.tool = createBashTool(workspaceRoot, {
-                output: {
-                    strategy: 'head_tail',
-                    maxBytes: DESKTOP_BASH_PREVIEW_BYTES,
-                    maxLines: Number.MAX_SAFE_INTEGER,
-                },
-                spawnHook: (ctx) => {
-                    const { env, removed } = sanitizeBashSubprocessEnv(ctx.env, this.envPolicy);
-                    this.lastEnvRemoved = removed;
-                    return { ...ctx, env };
-                },
-            });
         }
         async execute(ctx, input, signal) {
             if (signal?.aborted)
@@ -406,7 +399,9 @@ let LocalBashTool = (() => {
                 };
             }
             try {
-                const result = await this.executeValidated(ctx, { ...input, description }, timing, signal);
+                const result = await this.executeValidated(ctx, readPermissionExecutionPlan(input)
+                    ? copyWithPermissionExecutionPlan({ ...input, description }, readPermissionExecutionPlan(input))
+                    : { ...input, description }, timing, signal);
                 return { ...result, details: { ...result.details, description } };
             }
             catch (error) {
@@ -421,11 +416,13 @@ let LocalBashTool = (() => {
             if (input.run_in_background === true && ctx.canConsumeBackgroundBashOutput !== true) {
                 return unavailableBackgroundBashOutputResult();
             }
+            const permissionExecutionPlan = readPermissionExecutionPlan(input);
+            const envPolicy = () => resolvePermissionBashEnvPolicy(this.envPolicy, permissionExecutionPlan);
             const hostTrashResult = await executeLocalHostTrashIfRequested({
                 toolInput: input,
                 workspaceRoot: this.workspaceRoot,
                 runtime: this.hostTrashRuntime,
-                envPolicy: this.envPolicy,
+                envPolicy,
                 timeoutSeconds: resolveForegroundTimeout({ timeout: timing.commandTimeoutSeconds }),
                 ...(signal ? { signal } : {}),
             });
@@ -462,7 +459,9 @@ let LocalBashTool = (() => {
                 }));
             }
             const { run_in_background: _runInBackground, ...rest } = input;
-            const foregroundInput = { ...rest, timeout: timing.commandTimeoutSeconds };
+            const foregroundInput = permissionExecutionPlan
+                ? copyWithPermissionExecutionPlan({ ...rest, timeout: timing.commandTimeoutSeconds }, permissionExecutionPlan)
+                : { ...rest, timeout: timing.commandTimeoutSeconds };
             if (ctx.canConsumeBackgroundBashOutput === true &&
                 ctx.allowBashAutoPromotion !== false &&
                 this.backgroundAdapter?.runManagedForeground) {
@@ -503,24 +502,30 @@ let LocalBashTool = (() => {
             }
             let result;
             try {
-                const tool = this.sandboxOperationsFactory
-                    ? createBashTool(this.workspaceRoot, {
-                        output: {
-                            strategy: 'head_tail',
-                            maxBytes: DESKTOP_BASH_PREVIEW_BYTES,
-                            maxLines: Number.MAX_SAFE_INTEGER,
-                        },
-                        operations: this.sandboxOperationsFactory.create({
-                            identity: directForegroundIdentity(ctx),
-                            workspaceRoot: this.workspaceRoot,
-                        }),
-                        spawnHook: (spawnContext) => {
-                            const { env, removed } = sanitizeBashSubprocessEnv(spawnContext.env, this.envPolicy);
-                            this.lastEnvRemoved = removed;
-                            return { ...spawnContext, env };
-                        },
-                    })
-                    : this.tool;
+                const tool = createBashTool(this.workspaceRoot, {
+                    output: {
+                        strategy: 'head_tail',
+                        maxBytes: DESKTOP_BASH_PREVIEW_BYTES,
+                        maxTotalBytes: DESKTOP_BASH_MAX_OUTPUT_BYTES,
+                        maxPendingBytes: DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES,
+                        maxLines: Number.MAX_SAFE_INTEGER,
+                    },
+                    ...(this.sandboxOperationsFactory
+                        ? {
+                            operations: this.sandboxOperationsFactory.create({
+                                identity: directForegroundIdentity(ctx),
+                                workspaceRoot: this.workspaceRoot,
+                                ...(permissionExecutionPlan ? { permissionExecutionPlan } : {}),
+                            }),
+                        }
+                        : {}),
+                    // Bind the approved policy to this invocation, including its spawn hook.
+                    spawnHook: (spawnContext) => {
+                        const { env, removed } = sanitizeBashSubprocessEnv(spawnContext.env, envPolicy);
+                        this.lastEnvRemoved = removed;
+                        return { ...spawnContext, env };
+                    },
+                });
                 const res = await tool.execute('', foregroundInput, signal);
                 const completed = localBashResultFromPi(res);
                 result = withCompatibleBashToolResponseFromPiDetails({
@@ -581,10 +586,12 @@ function directForegroundIdentity(ctx) {
 }
 function limitDesktopBashOutput(text, fullOutputPath, details, taskId) {
     const output = details?.output;
+    const readableOutputPath = fullOutputPath ?? output?.partialOutputPath;
+    const outputLabel = fullOutputPath ? 'Full output' : 'Saved partial output';
     let previewText = text;
     if (!taskId) {
         if (details?.truncation?.truncated) {
-            previewText += `\n\n[desktop bash output truncated: original_bytes=${output?.rawBytes}; original head+tail shown.${fullOutputPath ? ` Full output: ${fullOutputPath}` : ''}]`;
+            previewText += `\n\n[desktop bash output truncated: original_bytes=${output?.rawBytes}; ${output?.partialOutputPath ? 'saved output' : 'original'} head+tail shown.${readableOutputPath ? ` ${outputLabel}: ${readableOutputPath}` : ''}]`;
         }
         if (output?.persistenceError) {
             previewText += `\n\n[Output persistence failed; complete output is unavailable: ${output.persistenceError}]`;
@@ -592,8 +599,8 @@ function limitDesktopBashOutput(text, fullOutputPath, details, taskId) {
     }
     const limited = limitDesktopHeadTailLines(previewText, {
         maxBytes: DESKTOP_BASH_MAX_BYTES,
-        notice: ({ originalBytes }) => fullOutputPath
-            ? `[desktop bash output truncated: original_bytes=${originalBytes}; head+tail shown; boundary lines may be UTF-8 byte-truncated; Full output: ${fullOutputPath}]`
+        notice: ({ originalBytes }) => readableOutputPath
+            ? `[desktop bash output truncated: original_bytes=${originalBytes}; head+tail shown; boundary lines may be UTF-8 byte-truncated; ${outputLabel}: ${readableOutputPath}]`
             : `[desktop bash output truncated: original_bytes=${originalBytes}; head+tail shown; boundary lines may be UTF-8 byte-truncated.]`,
     });
     if (limited.truncation ||
@@ -614,11 +621,11 @@ function limitDesktopBashOutput(text, fullOutputPath, details, taskId) {
                 preserve_args: ['task_id'],
                 instruction: `Read task ${taskId} with task_output; continue with its next_offset (UTF-8 log file bytes). Check output persistence status before treating the log as complete.`,
             }
-            : fullOutputPath
+            : readableOutputPath
                 ? {
                     tool: 'read',
                     preserve_args: ['path'],
-                    instruction: `Read the full output at ${fullOutputPath}; continue long reads with the returned next_offset.`,
+                    instruction: `Read the ${fullOutputPath ? 'full' : 'saved partial'} output at ${readableOutputPath}; continue long reads with the returned next_offset.`,
                 }
                 : {
                     tool: 'bash',

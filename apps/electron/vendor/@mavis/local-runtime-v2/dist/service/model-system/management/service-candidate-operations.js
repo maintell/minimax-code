@@ -86,7 +86,7 @@ async function persistCandidate(context, transaction) {
         tree[transaction.resolved.providerKey] = transaction.resolved.provider;
         draft.custom_provider = tree;
         activateSavedCandidate(draft, transaction);
-        resetUnavailableCustomDefaultModel(draft);
+        resetUnavailableCustomDefaultModel(draft, currentConfig);
     });
 }
 function candidateRevisionChanged(resolved, tree, currentConfig) {

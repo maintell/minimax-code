@@ -75,6 +75,7 @@ export function goalStateToGoalState(state) {
         status: state.status,
         createdAt: state.createdAt,
         updatedAt: state.updatedAt,
+        ...(state.dismissedAt !== undefined ? { dismissedAt: state.dismissedAt } : {}),
         tokensUsed: state.tokensUsed,
         turnsUsed: state.turnsUsed,
         timeUsedSeconds: state.timeUsedSeconds,

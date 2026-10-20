@@ -240,8 +240,15 @@ export function setupSystemIPC(options = {}) {
         const { level, message, data, category, filenamePrefix } = params;
         const prefix = '[Renderer]';
         const logContent = data !== undefined ? { msg: `${prefix} ${message}`, data } : `${prefix} ${message}`;
-        // 根据传入的 category 选择对应的 logger，默认 Main
-        const targetLogger = category && category !== 'main' ? getCategoryLogger(category, filenamePrefix) : logger;
+        // 根据传入的 category 选择对应的 logger，默认 Main。
+        // category 为 'main' 时同样要尊重 filenamePrefix：否则渲染进程无法写入
+        // main-<prefix>-<date>.log，日志会被并入 main 主文件并在 dev 下被文件白
+        // 名单直接丢弃。
+        const targetLogger = category && category !== 'main'
+            ? getCategoryLogger(category, filenamePrefix)
+            : filenamePrefix
+                ? getCategoryLogger('main', filenamePrefix)
+                : logger;
         switch (level) {
             case 'debug':
                 targetLogger.debug(logContent);

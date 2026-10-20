@@ -64,7 +64,9 @@ export class QueueSteerWorkflow {
         }
         if (!result.delivered) {
             await this.options.control.release(claim);
-            throw new ApplicationError(409, 'local_queue_dispatch_rejected', `Queue item could not start (${result.reason}): ${claim.sessionId}/${claim.item.itemId}`);
+            throw new ApplicationError(409, result.reason === 'computer-use-requires-new-turn'
+                ? 'local_computer_use_requires_new_turn'
+                : 'local_queue_dispatch_rejected', `Queue item could not start (${result.reason}): ${claim.sessionId}/${claim.item.itemId}`);
         }
         return result;
     }

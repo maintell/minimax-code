@@ -25,6 +25,7 @@ export { ThreadGoalAlreadyExistsError, ThreadGoalBudgetLimitedError, ThreadGoalE
 export { DEFAULT_GOAL_CONTINUATION_TEMPLATE, DEFAULT_GOAL_RECOVERY_TEMPLATE, DEFAULT_GOAL_RECOVERY_TERMINAL_AUDIT_TEMPLATE, DEFAULT_GOAL_TERMINAL_AUDIT_TEMPLATE, renderKickoffPrompt, renderContinuationPrompt, renderNudgePrompt, renderRecoveryPrompt, renderRecoveryTerminalAuditPrompt, renderTerminalAuditPrompt, } from './continuation.js';
 export { DEFAULT_OBJECTIVE_UPDATED_TEMPLATE, renderObjectiveUpdatedPrompt, } from './objective-updated.js';
 export { DEFAULT_BUDGET_LIMIT_TEMPLATE, renderBudgetLimitPrompt } from './budget-limit.js';
+export { DEFAULT_GOAL_COMPLETION_SUMMARY_TEMPLATE, renderCompletionSummaryPrompt, } from './completion-summary.js';
 export { fingerprintThreadGoalReply } from './reply-fingerprint.js';
 export { digestThreadGoalObjective } from './objective-digest.js';
 export { boundVerificationTranscript, } from './verification/transcript-window.js';

@@ -1,4 +1,4 @@
-import { access, readFile, writeFile } from 'node:fs/promises';
+import { access, readFile, realpath, writeFile } from './physical-fs.js';
 /**
  * Captures the exact pre-edit file inside Pi's mutation-queue critical section.
  * The helper is created per execute, so concurrent agents cannot exchange
@@ -8,6 +8,7 @@ export function createCapturingEditOperations() {
     const pendingReads = new Map();
     const captures = new Map();
     const operations = {
+        realpath,
         access,
         async readFile(path) {
             const buffer = await readFile(path);

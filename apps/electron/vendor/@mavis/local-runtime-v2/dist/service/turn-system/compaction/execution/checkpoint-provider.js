@@ -1,8 +1,8 @@
 import { Buffer } from 'node:buffer';
 import { isContextOverflow } from '@earendil-works/pi-ai';
-import { LLM_RETRY_REQUEST_SETTLED_OBSERVER, projectAgentMessagesForModel, } from '@mavis/agent-core/pi-turn-runner';
+import { isLLMImageLimitMessage, LLM_RETRY_REQUEST_SETTLED_OBSERVER, projectAgentMessagesForModel, } from '@mavis/agent-core/pi-turn-runner';
 import { createDefaultTokenEstimator } from '@mavis/context-manager';
-import { CheckpointCandidateTooLargeError, } from '../contracts.js';
+import { CheckpointCandidateMediaRejectedError, CheckpointCandidateTooLargeError, } from '../contracts.js';
 import { buildCheckpointControl, CHECKPOINT_SYSTEM_PROMPT, CHECKPOINT_SYSTEM_PROMPT_KEY, } from './checkpoint-prompt.js';
 const EXPLICIT_INPUT_TOO_LARGE_CODES = new Set([
     'context_length_exceeded',
@@ -30,6 +30,9 @@ export async function createCheckpointSession(options) {
             }, systemPrompt);
             if (isContextOverflow(final, options.model.contextWindow)) {
                 throw new CheckpointCandidateTooLargeError(final);
+            }
+            if (final.stopReason === 'error' && isLLMImageLimitMessage(final.errorMessage)) {
+                throw new CheckpointCandidateMediaRejectedError(final);
             }
             const generation = toGeneration(final);
             options.onGenerated?.(generation);
@@ -67,6 +70,9 @@ async function requestCheckpoint(options, input, systemPrompt) {
         });
         if (isExplicitInputTooLargeError(error))
             throw new CheckpointCandidateTooLargeError(error);
+        if (isLLMImageLimitMessage(error instanceof Error ? error.message : undefined)) {
+            throw new CheckpointCandidateMediaRejectedError(error);
+        }
         throw error;
     }
 }
@@ -95,7 +101,8 @@ function reportUnobservedCheckpointSettlement(onRequestSettled, requestSettled, 
     onRequestSettled(event);
 }
 function buildCheckpointRequest(options, input, systemPrompt = CHECKPOINT_SYSTEM_PROMPT) {
-    const projected = projectAgentMessagesForModel(input.messages, options.model).messages;
+    const messages = options.projectRequestMessages?.(input.messages) ?? input.messages;
+    const projected = projectAgentMessagesForModel(messages, options.model).messages;
     const control = {
         role: 'user',
         content: [{ type: 'text', text: buildCheckpointControl(input.instructions) }],

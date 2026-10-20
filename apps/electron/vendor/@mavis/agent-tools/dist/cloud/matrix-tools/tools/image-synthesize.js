@@ -194,7 +194,15 @@ let MatrixImageSynthesizeTool = (() => {
             }
             const downloaded = perRequest.filter((s) => s.status === 'downloaded').length;
             const failed = perRequest.filter((s) => s.status !== 'downloaded').length;
-            const text = `${downloaded}/${perRequest.length} images saved (${failed} failed/missing).`;
+            // `details` is UI metadata, not guaranteed to reach the model. Expose the
+            // actual saved paths in content so it need not reconstruct cwd-relative
+            // destinations when producing Markdown or <media> links.
+            const text = [
+                `${downloaded}/${perRequest.length} images saved (${failed} failed/missing).`,
+                ...perRequest.map((slot) => slot.status === 'downloaded'
+                    ? `Saved image: ${JSON.stringify(slot.output_file_path)}`
+                    : `Image ${slot.index + 1} ${slot.status}: ${slot.error ?? 'No image file was saved.'}`),
+            ].join('\n');
             return {
                 tool_name: toolName,
                 text,

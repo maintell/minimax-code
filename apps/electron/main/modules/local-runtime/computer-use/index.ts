@@ -267,16 +267,21 @@ async function ensureCuaUtilityStarted() {
                 const controlMessage = message;
                 if (!controlMessage || controlMessage.generation !== generation || cuaChild !== child)
                     return;
-                if (controlMessage.type === 'cua-operation' &&
-                    typeof controlMessage.sessionId === 'string') {
-                    desktopOverlay.show({
+                if ((controlMessage.type === 'cua-operation' ||
+                    controlMessage.type === 'cua-operation-finished') &&
+                    typeof controlMessage.sessionId === 'string' &&
+                    typeof controlMessage.requestId === 'string') {
+                    const turn = {
                         sessionId: controlMessage.sessionId,
                         turnId: controlMessage.turnId,
-                    });
-                    void windowHandoff.begin({
-                        sessionId: controlMessage.sessionId,
-                        turnId: controlMessage.turnId,
-                    });
+                    };
+                    if (controlMessage.type === 'cua-operation-finished') {
+                        desktopOverlay.finish(turn, controlMessage.requestId);
+                    }
+                    else {
+                        desktopOverlay.show(turn, controlMessage.requestId);
+                        void windowHandoff.begin(turn);
+                    }
                     return;
                 }
                 if (controlMessage.type === 'cua-pointer' && controlMessage.pointer) {

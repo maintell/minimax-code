@@ -90,6 +90,7 @@ export function composeGoalHostModules(input) {
     };
     lifecycle = new GoalLifecycle({
         dataDir: deps.dataDir,
+        sessionExists: deps.sessionExists,
         store: input.getStore,
         gates,
         timeAccounting,

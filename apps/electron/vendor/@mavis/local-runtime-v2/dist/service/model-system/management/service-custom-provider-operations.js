@@ -66,9 +66,9 @@ export async function updateUserProvider(context, input) {
         removeHeaders,
         implicitCustomProviderThinking: context.deps.implicitCustomProviderThinking === true,
     };
-    await context.deps.updateByokConfig((draft) => {
+    await context.deps.updateByokConfig((draft, currentConfig) => {
         applyUserProviderUpdate(draft, providerKey, input, prepared);
-        resetUnavailableCustomDefaultModel(draft);
+        resetUnavailableCustomDefaultModel(draft, currentConfig);
     });
     await activateUpdatedProvider(context, providerKey, input.saveAndUse === true);
     return context.requireCustomProviderView(providerKey);
@@ -161,7 +161,7 @@ export async function duplicateUserProvider(context, input) {
 }
 export async function deleteUserProvider(context, input) {
     const providerKey = context.requireExistingProviderKey(input.providerId);
-    await context.deps.updateByokConfig(async (draft) => {
+    await context.deps.updateByokConfig(async (draft, currentConfig) => {
         const tree = (draft.custom_provider ?? {});
         const provider = tree[providerKey];
         if (provider?.kind === 'oauth') {
@@ -179,7 +179,7 @@ export async function deleteUserProvider(context, input) {
         delete tree[providerKey];
         draft.custom_provider =
             Object.keys(tree).length > 0 ? tree : undefined;
-        resetUnavailableCustomDefaultModel(draft);
+        resetUnavailableCustomDefaultModel(draft, currentConfig);
     });
     await context.deps.cache.removeProvider(`${CUSTOM_PROVIDER_ID_PREFIX}${providerKey}`);
 }

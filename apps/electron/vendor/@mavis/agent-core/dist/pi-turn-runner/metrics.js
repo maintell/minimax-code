@@ -382,6 +382,10 @@ export class TurnMetricsRecorder {
     getLLMFailureObservation() {
         return this.llmFailure;
     }
+    /** A recovered provider error must not become the turn's failure provenance. */
+    forgetLLMFailureObservation() {
+        this.llmFailure = undefined;
+    }
     tryRecordTerminalFailure(provenance) {
         if (provenance.errorSource !== 'llm') {
             this.firstNonLlmTerminalFailure ??= provenance;

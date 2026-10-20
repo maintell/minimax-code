@@ -1,7 +1,7 @@
 /**
  * 应用菜单模块
  */
-import { shell, dialog, Menu } from "electron";
+import { BaseWindow, shell, dialog, Menu } from "electron";
 import { hideWindowsMenuBar } from "../../windows/windows-titlebar";
 import { isDev, isTest, isStaging, isInternalBuild } from "../../config";
 import { IPC_CHANNELS, DOMAIN_URL, DISPLAY_NAME } from "../../config/constants";
@@ -39,9 +39,16 @@ function notifyArchonRendererToOpenFeedback() {
         win.webContents.send(IPC_CHANNELS.MENU_OPEN_FEEDBACK);
     }
 }
-/** Keep the menu action while the renderer dispatches contextual Cmd+W handling and fallback. */
+/**
+ * Keep the menu action while the renderer dispatches contextual Cmd+W
+ * handling and fallback: this closes whichever window currently has OS
+ * focus, falling back to the main window when nothing is focused. For a
+ * Mini App pop-out, closing it runs its own close handler, which returns
+ * the page to the File Panel instead of hiding the main window out from
+ * under the user.
+ */
 function closeArchonWindow() {
-    const win = getMainWindow();
+    const win = BaseWindow.getFocusedWindow() ?? getMainWindow();
     if (win && !win.isDestroyed())
         win.close();
 }
@@ -153,6 +160,23 @@ function buildHelpSubmenu(isEn, onCheckForUpdates, onOpenFeedback) {
         ],
     ];
 }
+function buildZoomSubmenu(isEn) {
+    return [
+        { role: 'zoomIn', label: isEn ? 'Zoom In' : '放大' },
+        // Electron's Plus accelerator requires Shift on the Windows main keyboard
+        // and does not match numpad Add. Keep it and register both native aliases.
+        ...(process.platform === 'win32'
+            ? ['Ctrl+=', 'Ctrl+numadd'].map((accelerator) => ({
+                role: 'zoomIn',
+                accelerator,
+                visible: false,
+                acceleratorWorksWhenHidden: true,
+            }))
+            : []),
+        { role: 'zoomOut', label: isEn ? 'Zoom Out' : '缩小' },
+        { role: 'resetZoom', label: isEn ? 'Actual Size' : '实际大小' },
+    ];
+}
 /**
  * 设置登录窗口的简化菜单
  */
@@ -198,11 +222,7 @@ export function setupLoginMenu() {
         // 视图菜单
         {
             label: isEn ? 'View' : '视图',
-            submenu: [
-                { role: 'zoomIn', label: isEn ? 'Zoom In' : '放大' },
-                { role: 'zoomOut', label: isEn ? 'Zoom Out' : '缩小' },
-                { role: 'resetZoom', label: isEn ? 'Actual Size' : '实际大小' },
-            ],
+            submenu: buildZoomSubmenu(isEn),
         },
         // 窗口菜单
         {
@@ -301,11 +321,7 @@ export function setupArchonMenu() {
         // 视图菜单
         {
             label: isEn ? 'View' : '视图',
-            submenu: [
-                { role: 'zoomIn', label: isEn ? 'Zoom In' : '放大' },
-                { role: 'zoomOut', label: isEn ? 'Zoom Out' : '缩小' },
-                { role: 'resetZoom', label: isEn ? 'Actual Size' : '实际大小' },
-            ],
+            submenu: buildZoomSubmenu(isEn),
         },
         // 窗口菜单
         {

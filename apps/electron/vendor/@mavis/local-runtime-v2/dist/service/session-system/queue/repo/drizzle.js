@@ -3,7 +3,7 @@ import { and, asc, eq, inArray, isNotNull, lte, sql } from 'drizzle-orm';
 import { legacyQueues, queueItems, queuePauses, queueRowMigrations, } from '../../../../infra/db/schema/queue.js';
 import { QueueClaimNotAcceptedError, QueueClaimNotFoundError, QueueEnqueueAdmissionError, } from './contract.js';
 import { decodeQueueRow, encodeQueueItem, isQueueItem } from './codec.js';
-import { completePermutation, makeQueued, routingFingerprint, validEnqueue, validUpdate, } from './policy.js';
+import { completePermutation, groupRecoverable, transferExpired, makeQueued, routingFingerprint, validEnqueue, validUpdate, replaceItemMessage, } from './policy.js';
 import { ensureQueueRowsReadyInTransaction } from './readiness.js';
 import { queueExecutionSource, queueRoutingProvenance } from '../routing.js';
 const DEFAULT_CLAIM_LEASE_MS = 30_000;
@@ -221,6 +221,34 @@ class DrizzleQueueRepository {
             });
             return committed(dispatchItem(claimed, claimSelection(input)), facts);
         });
+    }
+    renewClaim(sessionId, claimId) {
+        return this.options.db.transaction((db) => {
+            const nowMs = this.nowMs();
+            const claimed = this.claimRows(db, sessionId, claimId);
+            if (claimed.length === 0 ||
+                claimed.some((item) => item.claimOwnerId !== this.claimOwnerId || (item.claimLeaseExpiresAt ?? 0) <= nowMs))
+                return false;
+            claimed.forEach((item) => this.write(db, { ...item, claimLeaseExpiresAt: nowMs + this.claimLeaseMs }));
+            return true;
+        }, { behavior: 'immediate' });
+    }
+    consumeTransferClaimInTransaction(db, claim) {
+        const item = this.find(db, claim.sessionId, claim.item.itemId);
+        const nowMs = this.nowMs();
+        if (!item ||
+            item.status !== 'claimed' ||
+            item.claimId !== claim.claimId ||
+            item.claimOwnerId !== this.claimOwnerId ||
+            item.claimOwnerId !== claim.claimOwnerId ||
+            (item.claimLeaseExpiresAt ?? 0) <= nowMs ||
+            transferExpired(item, nowMs)) {
+            throw new QueueClaimNotFoundError(claim.sessionId, claim.claimId);
+        }
+        this.deleteItem(db, item.sessionId, item.itemId);
+        const wasPaused = Boolean(this.pause(db, item.sessionId));
+        this.reconcilePause(db, item.sessionId);
+        return withPauseRemovalFact(committed(item, [removalFact(item, 'accepted', nowMs)]), item.sessionId, wasPaused && !this.pause(db, item.sessionId));
     }
     async prepareDelivery(input) {
         if (!input.turnId)
@@ -444,6 +472,10 @@ class DrizzleQueueRepository {
             throw new QueueEnqueueAdmissionError(sessionId, rejection);
     }
     enqueueInTransaction(db, input) {
+        if (!validEnqueue(input))
+            return committed(undefined);
+        this.assertMutationAdmitted(db, input.session.sessionId);
+        ensureQueueRowsReadyInTransaction(db, input.session.sessionId, this.nowMs());
         const nowMs = this.nowMs();
         const expiredItems = this.deleteExpired(db, input.session.sessionId, nowMs);
         const expiredFacts = expiredItems.map((item) => removalFact(item, 'expired', nowMs));
@@ -849,43 +881,10 @@ function withoutClaim(item) {
     void claimLeaseExpiresAt;
     return { ...rest, status: 'queued' };
 }
-function groupRecoverable(items, liveness) {
-    const grouped = new Map();
-    items.forEach((item) => {
-        if (item.status !== 'claimed' || !item.claimId)
-            return;
-        grouped.set(item.claimId, [...(grouped.get(item.claimId) ?? []), item]);
-    });
-    return new Map([...grouped].filter(([, claimed]) => !claimed.some((item) => activeClaim(item, liveness))));
-}
 function expired(item, nowMs) {
     return item.expiresAt !== undefined && item.expiresAt <= nowMs;
 }
 function positiveInteger(value, fallback) {
     return value !== undefined && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
-function replaceItemMessage(item, message) {
-    const { channelContext, ...withoutContext } = item;
-    void channelContext;
-    const replacement = {
-        ...message,
-        ...(item.message.clientIntent !== undefined ? { clientIntent: item.message.clientIntent } : {}),
-    };
-    return {
-        ...withoutContext,
-        message: replacement,
-        ...(replacement.channelContext ? { channelContext: replacement.channelContext } : {}),
-    };
-}
-function activeClaim(item, liveness) {
-    if (liveness.scope?.claimedAtOrBeforeMs !== undefined &&
-        item.claimedAt !== undefined &&
-        item.claimedAt <= liveness.scope.claimedAtOrBeforeMs) {
-        return false;
-    }
-    return (Boolean(item.claimOwnerId) &&
-        item.claimedAt !== undefined &&
-        (item.claimLeaseExpiresAt ?? item.claimedAt + liveness.claimLeaseMs) > liveness.nowMs &&
-        liveness.isOwnerAlive(item.claimOwnerId));
 }
 //# sourceMappingURL=drizzle.js.map

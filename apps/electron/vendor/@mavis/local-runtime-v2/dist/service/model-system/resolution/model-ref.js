@@ -1,4 +1,5 @@
 import { isDefaultThinkingModelId } from '@earendil-works/pi-ai';
+import { normalizeMaxImagesPerRequest } from '@mavis/agent-core/pi-turn-runner';
 import { ThinkingLevel, ThinkingMode, } from '@mavis/protocol';
 import { LocalModelProviderError, } from '../contracts.js';
 import { CUSTOM_PROVIDER_ID_PREFIX } from '../identity.js';
@@ -347,6 +348,7 @@ export function capabilitiesFromModelConfig(modelConfig) {
         support_video: modalities.includes('video') || modelConfig?.capabilities?.support_video === true,
         ...normalizeLocalFileApiCapabilities(modelConfig?.capabilities),
         ...normalizeLocalMultimodalLimitCapabilities(modelConfig?.capabilities),
+        ...maxImagesPerRequestCapability(modelConfig?.capabilities?.max_images_per_request),
         ...(modelConfig?.capabilities?.support_json_object_output === true
             ? { [SUPPORT_JSON_OBJECT_OUTPUT_CAPABILITY]: true }
             : {}),
@@ -361,6 +363,11 @@ export function capabilitiesFromModelConfig(modelConfig) {
         Reflect.set(capabilities, OPENPLATFORM_THINKING_VARIANTS_CAPABILITY, variants);
     }
     return capabilities;
+}
+/** Per-request image ceiling (#425); absent unless the model config declares a positive integer. */
+function maxImagesPerRequestCapability(value) {
+    const maxImages = normalizeMaxImagesPerRequest(value);
+    return maxImages === undefined ? {} : { max_images_per_request: maxImages };
 }
 export function supportsJsonObjectOutput(modelRef) {
     const capabilities = modelRef.capabilities;

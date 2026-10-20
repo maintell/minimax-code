@@ -6,6 +6,7 @@ import { openLocalRuntimeDb } from '../db.js';
 import { getLocalRuntimeSqliteTableRoleLegend } from '../sqlite-table-roles.js';
 import { formatV2TimestampParts, isPathInside, resolveV2DirectoryContract, resolveV2MigrationManifestDir, } from '../layout/v2-paths.js';
 import { dedupeRootSessionsSync } from './v2-root-session-dedup.js';
+import { isLayoutMigrationReceiptCurrent, writeLayoutMigrationReceipt, LAYOUT_RECEIPT_CURRENT_SKIP, LAYOUT_RECEIPT_WRITE_FAILED_NOTE, } from './layout-receipt.js';
 const MANIFEST_PREFIX = 'current-local-runtime';
 const ASSET_REF_MIGRATION_VERSION = 1;
 const ASSET_REF_MIGRATION_CURRENT_SKIP = 'sqlite:asset-refs:migration-current';
@@ -36,7 +37,20 @@ export function ensureCurrentLocalRuntimeDataMigratedToV2(options) {
         errors: [],
     };
     try {
-        copyCurrentLocalRuntimeStores(dataDir, manifest);
+        // 三方 identity(legacy 两个源 + v2 目标)与上次成功回执完全一致时,跳过
+        // sqlite copy/reconcile 块:常驻 INSERT OR IGNORE 不允许把用户已删除的数据
+        // 从 legacy 库复活。任何不一致都回到完整迁移路径。receipt 指纹只覆盖 sqlite
+        // 文件,所以 ledgers/snapshots 不受 receipt 门控,每次启动都执行(仍是
+        // copy-if-missing 语义,不覆盖已存在的目标文件)。
+        const layoutReceiptCurrent = isLayoutMigrationReceiptCurrent(dataDir);
+        if (layoutReceiptCurrent) {
+            manifest.skipped.push(LAYOUT_RECEIPT_CURRENT_SKIP);
+        }
+        else {
+            copyCurrentLocalRuntimeSqliteStores(dataDir, manifest);
+        }
+        copyCurrentLocalRuntimeLedgersAndSnapshots(dataDir, manifest);
+        const copyPhaseErrorCount = manifest.errors.length;
         manifest.assetRefMigrationDbIdentity = readCurrentRuntimeDbIdentity(dataDir);
         const skipAssetRefMigration = isAssetRefMigrationCurrent(dataDir, manifest);
         const result = migrateCurrentLocalRuntimeAssetRefs({
@@ -46,6 +60,18 @@ export function ensureCurrentLocalRuntimeDataMigratedToV2(options) {
             skipAssetRefMigration,
             // eslint-disable-next-line no-console
             logLine: options.logLine ?? ((line) => console.log(line)),
+            onCompleted: (completedManifest) => {
+                // 只有 copy/reconcile 相关步骤真正跑过且零 error 的完成态才落 receipt;
+                // 写失败不致命 —— 迁移结果不变,下次启动重跑完整路径即可。
+                if (layoutReceiptCurrent || copyPhaseErrorCount > 0)
+                    return;
+                try {
+                    writeLayoutMigrationReceipt(dataDir, nowMs());
+                }
+                catch {
+                    completedManifest.skipped.push(LAYOUT_RECEIPT_WRITE_FAILED_NOTE);
+                }
+            },
             onDone: (finishedManifest) => writeMigrationManifest(dataDir, nowMs(), finishedManifest),
             onError: options.onError,
         });
@@ -135,12 +161,26 @@ function markCompletedV2LayoutMigrationReceipt(manifest, dataDir) {
         writable: false,
     });
 }
-function copyCurrentLocalRuntimeStores(dataDir, manifest) {
+/**
+ * Sqlite copy/reconcile block. This is the only part gated by the layout
+ * receipt: the receipt fingerprints exactly these source/target files.
+ */
+function copyCurrentLocalRuntimeSqliteStores(dataDir, manifest) {
     const v2 = resolveV2DirectoryContract(dataDir);
     runMigrationStep('sqlite:dev-draft-v2:copy', () => copyOrReconcileSqliteSnapshot(v2.legacyDraftDb, v2.db, 'sqlite:dev-draft-v2', manifest, v2.root));
     runMigrationStep('sqlite:dev-draft-v2:schema-check', () => ensureCurrentRuntimeSqliteSchemaIfPresent(dataDir));
     runMigrationStep('sqlite:legacy-current:copy', () => copyOrReconcileSqliteSnapshot(path.join(dataDir, 'local-runtime', 'local-runtime.sqlite'), v2.db, 'sqlite', manifest, v2.root));
     runMigrationStep('sqlite:runtime-state:schema-check', () => ensureCurrentRuntimeSqliteSchemaIfPresent(dataDir));
+}
+/**
+ * Ledgers/snapshots directory copies. The layout receipt does not fingerprint
+ * these directories, so they must run on every start regardless of the
+ * receipt — otherwise entries added to the legacy directories after a receipt
+ * hit would never reach the v2 target. Copy semantics stay copy-if-missing:
+ * existing target files are never overwritten.
+ */
+function copyCurrentLocalRuntimeLedgersAndSnapshots(dataDir, manifest) {
+    const v2 = resolveV2DirectoryContract(dataDir);
     runMigrationStep('ledgers:copy', () => copyDirIfMissing(path.join(dataDir, 'local-runtime', 'ledgers'), v2.legacyDraftLedgers, 'ledgers', manifest, v2.root));
     runMigrationStep('snapshots:copy', () => copyDirIfMissing(path.join(dataDir, 'local-runtime', 'snapshots'), v2.legacyDraftSnapshots, 'snapshots', manifest, v2.root));
 }
@@ -178,6 +218,7 @@ function migrateCurrentLocalRuntimeAssetRefs(input) {
         }
         runMigrationStep('sqlite:root-sessions:dedupe', () => dedupeRootSessionsBestEffort(db, input));
         input.manifest.status = 'completed';
+        input.onCompleted?.(input.manifest);
     }
     catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));

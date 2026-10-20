@@ -16,6 +16,7 @@ export async function buildLocalTurnToolSourcesForHost(input) {
         skillRuntime: input.host.skillRuntime,
         toolsDisabled: input.toolsDisabled,
         dataDir: runtimeConfig.dataDir,
+        configGetter: input.host.configGetter,
         workspaceRoot: input.session.workspaceDir,
         agentName: input.resourceAgentName,
         ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),

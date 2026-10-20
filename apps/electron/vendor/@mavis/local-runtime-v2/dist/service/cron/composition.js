@@ -90,7 +90,12 @@ export function composeCronService(options) {
             await executor.recoverPendingRuns();
         },
         close: async () => {
-            await executor.close();
+            // Stop definition mutations and queue scheduling before waiting. Session-side
+            // reconciliation must drain while its downstream Session owner is alive.
+            const results = await Promise.allSettled([service.close(), executor.close()]);
+            const failure = results.find((result) => result.status === 'rejected');
+            if (failure?.status === 'rejected')
+                throw failure.reason;
         },
     };
 }

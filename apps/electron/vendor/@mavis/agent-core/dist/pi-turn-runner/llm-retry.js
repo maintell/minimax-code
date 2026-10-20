@@ -1,4 +1,5 @@
-import { normalizeLLMError, toLLMMetricErrorKind, toLLMProtocolClassification, toLLMRetryDecision, isLLMDeterministicRequestRejection, } from '@mavis/shared/llm-error-classifier';
+import { isContextOverflow, } from '@earendil-works/pi-ai';
+import { isLLMDeterministicRequestRejection, normalizeLLMError, toLLMMetricErrorKind, toLLMProtocolClassification, toLLMRetryDecision, } from '@mavis/shared/llm-error-classifier';
 function isByokProvider(provider) {
     return provider === 'minimax_api' || provider.startsWith('custom_provider:');
 }
@@ -8,10 +9,12 @@ export const LLM_RETRY_CALL_IDENTITY = Symbol('mavis.llmRetryCallIdentity');
 export const LLM_RETRY_REQUEST_SETTLED_OBSERVER = Symbol('mavis.llmRetryRequestSettledObserver');
 export const DEFAULT_LLM_RETRY_POLICY = {
     // Local patch: provider errors retry without a practical limit on a fixed
-    // three-second cadence (no backoff, no wall-clock budget). The budget stays
-    // a serialisable integer for retry events; only user cancellation, model
-    // refusals and deterministic request rejections stay terminal.
-    maxRetries: 1_000_000,
+    // three-second cadence (no backoff, no wall-clock budget). The budget is the
+    // largest serialisable integer because the retry-event contract requires a
+    // non-negative integer; only user cancellation, model refusals, wrong
+    // credentials, exhausted quota and deterministic request rejections stay
+    // terminal.
+    maxRetries: 2_147_483_647,
     baseDelayMs: 3_000,
     maxDelayMs: 30_000,
     maxRetryElapsedMs: Number.POSITIVE_INFINITY,
@@ -357,15 +360,21 @@ function failureResult(input) {
         explicitAbort: input.final?.stopReason === 'aborted',
     });
     // BYOK retries every pre-output failure because custom gateways report errors
-    // inconsistently, but a model safety refusal and a deterministic request
-    // rejection (413 / oversized body, context overflow, image limit, HTTP 400
-    // invalid_request) are terminal: retrying the same request only repeats
-    // (and may re-bill) the decline. Local patch — mirrors the same condition in
-    // packages/agent-core/src/pi-turn-runner/llm-retry.ts.
+    // inconsistently, but some failures are deterministic: a model safety refusal,
+    // or a request the provider rejects as invalid (too many images, or an HTTP
+    // 400 `invalid_request_error`). Retrying those only re-sends the same request,
+    // repeats (and may re-bill) the rejection and delays the actionable error by
+    // the whole backoff window. The deterministic check excludes anything that
+    // also looks transient (timeout, network, 408/429/5xx). A context overflow,
+    // by tokens or by request bytes, is left to context management as in Pi.
     const decision = input.retryAllErrors &&
         !normalized.facts.explicitAbort &&
         !normalized.facts.signals.has('refusal') &&
-        !isLLMDeterministicRequestRejection(normalized)
+        // Local patch: a wrong credential or an exhausted usage plan cannot be
+        // fixed by waiting; those stay terminal under the unbounded budget.
+        !['auth', 'usage_limit', 'credits_exhausted'].includes(toLLMMetricErrorKind(normalized.facts)) &&
+        !isLLMDeterministicRequestRejection(normalized) &&
+        !(input.final && isContextOverflow(input.final))
         ? { retryable: true, reason: 'network' }
         : toLLMRetryDecision(normalized);
     if (!decision.retryable) {

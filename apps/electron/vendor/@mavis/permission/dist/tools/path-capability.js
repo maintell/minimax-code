@@ -3,7 +3,8 @@ import path from 'node:path';
 import { getContentRulesForTool, hasWholeToolRule } from '../context.js';
 import { matchHardBlockedFsRead } from '../classifier/dangerous-patterns.js';
 import { matchesMcpServerRuntimeName } from '../mcp-runtime-name.js';
-import { shellTokenize } from './shell-tokenize.js';
+import { shellTokenize, shellTokenizeWithMetadata } from './shell-tokenize.js';
+import { readBashCommand, gitBashCommandName } from './bash-command.js';
 import { splitCommand, findHeredocBodyRanges } from './bash-split.js';
 import { extractSourceTarget } from './bash-permission.js';
 import { isDiscardSinkTarget } from './bash-write-target.js';
@@ -691,7 +692,10 @@ function extractApplyPatchText(input) {
 export const READ_PATH_COMMANDS = new Set(['cat', 'head', 'tail', 'less', 'more', 'nl', 'wc']);
 export const SEARCH_PATH_COMMANDS = new Set(['grep', 'rg']);
 const EXECUTE_SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
-export function extractBashPathIntents(command) {
+export function extractBashPathIntents(command, windowsPosix = false, options = {}) {
+    // Hard safety needs unresolved operands; the default classifier delegates
+    // those operands to its separate ASK policy.
+    const retainDynamic = options.retainDynamicTargets === true;
     const intents = [];
     for (const rawSubcommand of splitCommand(command)) {
         // Heredoc/here-string bodies are DATA, not command arguments. splitCommand
@@ -700,7 +704,7 @@ export function extractBashPathIntents(command) {
         // mistaken for real path intents. The heredoc operator token itself
         // (`<<EOF`, `<<<…`) is dropped later by isStaticPathToken.
         const subcommand = maskHeredocBodies(rawSubcommand);
-        intents.push(...extractRedirectIntents(subcommand));
+        intents.push(...extractRedirectIntents(subcommand, retainDynamic));
         const sourceTarget = extractSourceTarget(subcommand);
         if (sourceTarget) {
             if (sourceTarget !== '/dev/stdin') {
@@ -712,10 +716,33 @@ export function extractBashPathIntents(command) {
         if (tokens.length === 0)
             continue;
         const commandIndex = skipEnvPrefixes(tokens);
-        const head = normalizeCommandToken(tokens[commandIndex]);
+        const parsed = windowsPosix ? readBashCommand(subcommand, retainDynamic) : undefined;
+        const head = parsed
+            ? gitBashCommandName(parsed.executable)
+            : normalizeCommandToken(tokens[commandIndex]);
         if (!head)
             continue;
-        const args = tokens.slice(commandIndex + 1);
+        const args = parsed?.args ?? tokens.slice(commandIndex + 1);
+        const operands = parsed?.argTokens ?? args;
+        const pushOperand = (operand, action) => {
+            intents.push(typeof operand === 'string'
+                ? { path: operand, action }
+                : { path: operand.value, action, pathSyntax: operand.pathSyntax });
+        };
+        if (windowsPosix && ['robocopy', 'xcopy'].includes(head)) {
+            // These native tools receive Bash-decoded words too. Their destination
+            // is the second operand, not a trailing filter or /switch.
+            const nativeOperands = operands.filter((arg) => !/^\/[a-z]+(?::.*)?$/i.test(operandValue(arg)));
+            if (nativeOperands[0]) {
+                pushOperand(nativeOperands[0], 'read');
+                if (head === 'robocopy' && args.some((arg) => /^\/(?:mov|move)$/i.test(arg))) {
+                    pushOperand(nativeOperands[0], 'delete');
+                }
+            }
+            if (nativeOperands[1])
+                pushOperand(nativeOperands[1], 'write');
+            continue;
+        }
         if (READ_PATH_COMMANDS.has(head)) {
             for (const target of collectPathArgs(args)) {
                 intents.push({ path: target, action: 'read' });
@@ -726,15 +753,15 @@ export function extractBashPathIntents(command) {
             intents.push(...extractSearchPathIntents(args));
             continue;
         }
-        if (head === 'rm') {
-            for (const target of collectPathArgs(args)) {
-                intents.push({ path: target, action: 'delete' });
+        if (head === 'rm' || (windowsPosix && head === 'mavis-trash')) {
+            for (const target of collectPathArgs(operands, retainDynamic)) {
+                pushOperand(target, 'delete');
             }
             continue;
         }
-        if (head === 'tee') {
-            for (const target of collectPathArgs(args)) {
-                intents.push({ path: target, action: 'write' });
+        if (head === 'tee' || (windowsPosix && ['touch', 'mkdir'].includes(head))) {
+            for (const target of collectPathArgs(operands, retainDynamic)) {
+                pushOperand(target, 'write');
             }
             continue;
         }
@@ -744,8 +771,8 @@ export function extractBashPathIntents(command) {
             // DIR — not the last positional. Without this, `cp -t /external/dir src`
             // would treat the in-workspace `src` as the destination and wave the
             // external write through.
-            const targetDir = extractTargetDirectoryFlag(args);
-            const positional = collectPathArgs(args);
+            const targetDir = extractTargetDirectoryFlag(operands, retainDynamic);
+            const positional = collectPathArgs(operands, retainDynamic);
             // Source operands must be read-checked (and, for `mv`, delete-checked):
             // copying / moving a sensitive file (`cp ~/.ssh/id_rsa /tmp/key`) must
             // not slip through just because the destination is writable. With a
@@ -758,16 +785,16 @@ export function extractBashPathIntents(command) {
                 ? positional.filter((entry) => entry !== targetDir)
                 : positional.slice(0, -1);
             for (const source of sources) {
-                intents.push({ path: source, action: 'read' });
+                pushOperand(source, 'read');
                 if (head === 'mv') {
-                    intents.push({ path: source, action: 'delete' });
+                    pushOperand(source, 'delete');
                 }
             }
             if (targetDir) {
-                intents.push({ path: targetDir, action: 'write' });
+                pushOperand(targetDir, 'write');
             }
             else if (positional.length >= 2) {
-                intents.push({ path: positional[positional.length - 1], action: 'write' });
+                pushOperand(positional[positional.length - 1], 'write');
             }
             continue;
         }
@@ -855,13 +882,13 @@ export function extractBashPathIntents(command) {
                     }
                     continue;
                 }
-                if (isStaticPathToken(token))
-                    positional.push(token);
+                if (isStaticPathToken(token, retainDynamic))
+                    positional.push(operands[index] ?? token);
             }
             if (inPlace) {
                 const targets = scriptFromFlag ? positional : positional.slice(1);
                 for (const target of targets) {
-                    intents.push({ path: target, action: 'write' });
+                    pushOperand(target, 'write');
                 }
             }
             continue;
@@ -964,11 +991,22 @@ function normalizeCommandToken(token) {
         return token.split('/').pop() ?? token;
     return token;
 }
-function collectPathArgs(tokens) {
+function operandValue(operand) {
+    return typeof operand === 'string' ? operand : operand.value;
+}
+function sliceOperand(operand, start) {
+    return typeof operand === 'string'
+        ? operand.slice(start)
+        : {
+            ...operand,
+            value: operand.value.slice(start),
+        };
+}
+function collectPathArgs(tokens, retainDynamic = false) {
     const positional = [];
     let afterDoubleDash = false;
     for (let index = 0; index < tokens.length; index++) {
-        const token = tokens[index] ?? '';
+        const token = operandValue(tokens[index] ?? '');
         if (!afterDoubleDash && token === '--') {
             afterDoubleDash = true;
             continue;
@@ -986,10 +1024,10 @@ function collectPathArgs(tokens) {
         if (!afterDoubleDash && token.startsWith('-')) {
             continue;
         }
-        if (!isStaticPathToken(token)) {
+        if (!isStaticPathToken(token, retainDynamic)) {
             continue;
         }
-        positional.push(token);
+        positional.push(tokens[index]);
     }
     return positional;
 }
@@ -1145,18 +1183,19 @@ function isRedirectOperatorToken(token) {
  *
  * Long `--` and `-T` / `--no-target-directory` (dest-is-a-file) never match.
  */
-function extractTargetDirectoryFlag(args) {
+function extractTargetDirectoryFlag(args, retainDynamic = false) {
     for (let index = 0; index < args.length; index++) {
-        const arg = args[index] ?? '';
+        const entry = args[index] ?? '';
+        const arg = operandValue(entry);
         if (arg === '--')
             break;
         if (arg === '-t' || arg === '--target-directory') {
             const value = args[index + 1];
-            return value && isStaticPathToken(value) ? value : undefined;
+            return value && isStaticPathToken(operandValue(value), retainDynamic) ? value : undefined;
         }
         if (arg.startsWith('--target-directory=')) {
-            const value = arg.slice('--target-directory='.length);
-            return value && isStaticPathToken(value) ? value : undefined;
+            const value = sliceOperand(entry, '--target-directory='.length);
+            return value && isStaticPathToken(operandValue(value), retainDynamic) ? value : undefined;
         }
         // Short-option cluster (single leading dash, not `--`). GNU getopt: when
         // `t` is the last char its argument is the next token; otherwise it is the
@@ -1167,10 +1206,10 @@ function extractTargetDirectoryFlag(args) {
             if (tIndex !== -1) {
                 if (tIndex === arg.length - 1) {
                     const value = args[index + 1];
-                    return value && isStaticPathToken(value) ? value : undefined;
+                    return value && isStaticPathToken(operandValue(value), retainDynamic) ? value : undefined;
                 }
-                const value = arg.slice(tIndex + 1);
-                return isStaticPathToken(value) ? value : undefined;
+                const value = sliceOperand(entry, tIndex + 1);
+                return isStaticPathToken(operandValue(value), retainDynamic) ? value : undefined;
             }
         }
     }
@@ -1182,12 +1221,12 @@ function extractTargetDirectoryFlag(args) {
  * `$(…)`, backticks) cannot be resolved here — let the bash classifier handle
  * them instead of fabricating a bogus path check.
  */
-function isStaticPathToken(token) {
+function isStaticPathToken(token, retainDynamic = false) {
     if (!token)
         return false;
     if (token.startsWith('<') || token.startsWith('>'))
         return false;
-    if (token.includes('$') || token.includes('`'))
+    if (!retainDynamic && (token.includes('$') || token.includes('`')))
         return false;
     return true;
 }
@@ -1234,7 +1273,7 @@ function extractShellScriptPath(tokens) {
     }
     return undefined;
 }
-function extractRedirectIntents(command) {
+function extractRedirectIntents(command, retainDynamic = false) {
     const intents = [];
     let inSingle = false;
     let inDouble = false;
@@ -1293,9 +1332,16 @@ function extractRedirectIntents(command) {
             let start = index + 1;
             if (ch === '>' && next === '>')
                 start = index + 2;
+            if (ch === '>' && next === '|')
+                start = index + 2;
             if (ch === '&' && next === '>')
                 start = command[index + 2] === '>' ? index + 3 : index + 2;
-            const target = readRedirectTarget(command, skipWhitespace(command, start));
+            let word;
+            const target = readRedirectTarget(command, skipWhitespace(command, start), retainDynamic
+                ? (raw) => {
+                    word = shellTokenizeWithMetadata(raw, true)[0];
+                }
+                : undefined);
             // Same static-resolvability guard as the input redirect above: a write to a
             // shell-expanded target (`echo x > $HOME/out`) must reach the bash classifier
             // (ASK), not be hard-DENIED by validatePath on the unresolvable path.
@@ -1306,8 +1352,14 @@ function extractRedirectIntents(command) {
             // popped a permission dialog (the regression the fix commit repairs)
             // and its `bash(/dev/**)` suggestion would silently allow /dev/tcp
             // reverse-shell and block-device writes on the next command.
-            if (isLikelyLocalPath(target) && isStaticPathToken(target) && !isDiscardSinkTarget(target)) {
-                intents.push({ path: target, action: 'write' });
+            if ((retainDynamic || isLikelyLocalPath(target)) &&
+                isStaticPathToken(target, retainDynamic) &&
+                !isDiscardSinkTarget(target)) {
+                intents.push({
+                    path: word?.value ?? target,
+                    action: 'write',
+                    ...(word?.pathSyntax ? { pathSyntax: word.pathSyntax } : {}),
+                });
             }
             continue;
         }
@@ -1320,7 +1372,7 @@ function skipWhitespace(command, index) {
         cursor++;
     return cursor;
 }
-function readRedirectTarget(command, start) {
+function readRedirectTarget(command, start, capture) {
     let index = start;
     let out = '';
     let inSingle = false;
@@ -1359,6 +1411,7 @@ function readRedirectTarget(command, start) {
         out += ch;
         index++;
     }
+    capture?.(command.slice(start, index));
     return out;
 }
 //# sourceMappingURL=path-capability.js.map

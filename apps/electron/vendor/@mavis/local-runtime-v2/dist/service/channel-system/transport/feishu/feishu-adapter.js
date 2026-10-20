@@ -8,7 +8,14 @@ import { enrichFeishuSenderName } from './outbound/feishu-sender-name.js';
 import { makeFeishuWsAttachmentDownloader, removeAckReaction, startFeishuEventDispatcher, } from './feishu-ws.js';
 import { errorMessage, isUsableFeishuBinding, normalizeMode, pickString, } from './feishu-adapter-utils.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
-import { buildFeishuSdkLoggerBridge, } from './feishu-sdk-logger.js';
+import { buildFeishuSdkLoggerBridge, clearFeishuWsError, describeFeishuWsStatus, transitionFeishuWsStatus, } from './feishu-sdk-logger.js';
+import { summarizeFeishuSdkMessage } from './feishu-sdk-message-summary.js';
+/**
+ * Numeric value of the SDK's `LoggerLevel.debug` (SDK 1.60.0 enum:
+ * fatal=0 … info=3, debug=4, trace=5). Fallback for an SDK build that does
+ * not export the enum.
+ */
+const FEISHU_SDK_LOGGER_LEVEL_DEBUG = 4;
 /**
  * Concrete adapter instance bound to a single agentName. Re-bind through
  * the store rotates credentials in-place; the cached sender + WS client are
@@ -35,9 +42,19 @@ export class FeishuPlatformAdapter {
     wsClient;
     /** Last detached WS close; observable for tests/drain, never awaited inline. */
     wsClosePromise;
-    /** Live WS transport state — see {@link FeishuWsStatusInfo}. */
-    wsStatus = 'idle';
-    wsLastError;
+    /**
+     * Live WS transport state — see {@link FeishuWsStatusInfo}. One mutable
+     * object shared with the SDK logger bridge so SDK-signalled transitions
+     * (handshake success / failure, drops) land where `getWsStatus` reads.
+     * Status writes go through {@link transitionWs} only.
+     */
+    ws = { status: 'idle' };
+    /**
+     * `retire()` of each SDK logger bridge, keyed by the client it logs for,
+     * so teardown detaches exactly the client it closes. Only the default
+     * factory registers here; injected factories bring no bridge.
+     */
+    wsBridgeRetirers = new WeakMap();
     constructor(input, options = {}) {
         this.store = input.store;
         this.agentName = input.agentName.trim() || 'mavis';
@@ -69,21 +86,31 @@ export class FeishuPlatformAdapter {
     async createDefaultWsClient(factoryInput) {
         const sdkSpecifier = '@larksuiteoapi/node-sdk';
         const sdk = (await import(sdkSpecifier));
-        const sdkLogger = buildFeishuSdkLoggerBridge({
+        // Debug, not the SDK default `info`: the SDK filters by level BEFORE
+        // calling our logger, and the handshake verdicts (`ws connect success`,
+        // `reconnect success`, `client closed`) are debug lines — at `info` the
+        // bridge never sees a connection come up. Trace (ping/pong) stays off.
+        const sdkDebugLevel = sdk.LoggerLevel?.debug;
+        const loggerLevel = sdkDebugLevel ?? FEISHU_SDK_LOGGER_LEVEL_DEBUG;
+        logger.info({
             agentName: this.agentName,
-            getStatus: () => this.wsStatus,
-            setStatus: (next, err) => {
-                this.wsStatus = next;
-                if (err !== undefined)
-                    this.wsLastError = err;
-            },
-        });
-        return new sdk.WSClient({
+            platform: 'feishu',
+            sdkLoggerLevel: loggerLevel,
+            // `fallback` means the SDK build did not export `LoggerLevel`; the
+            // numeric value then comes from FEISHU_SDK_LOGGER_LEVEL_DEBUG.
+            sdkLoggerLevelSource: sdkDebugLevel === undefined ? 'fallback' : 'sdk',
+        }, 'Feishu WS SDK client constructing');
+        const sdkBridge = buildFeishuSdkLoggerBridge({ agentName: this.agentName, state: this.ws });
+        const client = new sdk.WSClient({
             appId: factoryInput.appId,
             appSecret: factoryInput.appSecret,
             ...(factoryInput.domain ? { domain: factoryInput.domain } : {}),
-            logger: sdkLogger,
+            logger: sdkBridge.logger,
+            loggerLevel,
         });
+        // One bridge per client: `invalidateTransport` retires it before close().
+        this.wsBridgeRetirers.set(client, sdkBridge.retire);
+        return client;
     }
     /** Credential + mode gates for bind(); mock mode is rejected outright. */
     validateBindCredentials(credentials) {
@@ -632,13 +659,26 @@ export class FeishuPlatformAdapter {
             return null;
         return { behavior: value.behavior };
     }
+    /**
+     * Start (or restart) the Feishu long connection for this agent.
+     *
+     * Resolves `true` once the SDK client was DISPATCHED — not when the
+     * handshake succeeded: SDK 1.60.0 `WSClient.start()` fires its connect
+     * without awaiting it. Callers (`composition/channel-apis.ts`,
+     * `restore-platforms.ts` `wsSucceeded`) count dispatches with it; the
+     * handshake outcome is tracked in {@link getWsStatus}. `false` means the
+     * start was skipped (binding unusable / factory disabled); a throw means
+     * dispatch itself failed.
+     */
     async startWebSocket(input) {
         // Track the live transport state so status APIs stop echoing only the
         // persisted `connected: true` (which is bind-time, not transport-time).
-        const prevStatus = this.wsStatus;
-        this.wsStatus = 'connecting';
-        this.wsLastError = undefined;
+        const prevStatus = this.ws.status;
         logger.info({ agentName: this.agentName, platform: 'feishu', prevStatus }, 'Feishu WS start attempt');
+        // A new attempt starts clean so an error from a previous attempt is
+        // never reported as the cause of this one.
+        clearFeishuWsError(this.ws);
+        this.transitionWs('connecting', 'start_requested');
         const record = await this.readStartableWsRecord();
         if (!record)
             return false;
@@ -666,13 +706,19 @@ export class FeishuPlatformAdapter {
             this.recordWsStartFailure(err);
             throw err;
         }
-        this.wsStatus = 'connected';
-        logger.info({ agentName: this.agentName, platform: 'feishu' }, 'Feishu WS connected');
+        // No status write here on purpose: the SDK logger bridge owns the verdict
+        // (`ws connect success` → connected, `connect failed` → error). If it
+        // already arrived we keep it; otherwise the status stays `connecting`
+        // (or whatever a concurrent teardown set) until the SDK reports.
+        logger.info({ agentName: this.agentName, platform: 'feishu', status: this.ws.status }, 'Feishu WS start dispatched');
         return true;
     }
     recordWsStartFailure(err) {
-        this.wsStatus = 'error';
-        this.wsLastError = errorMessage(err);
+        // Raw text for the status API, safe summary for logs / UI — written
+        // together, like every other error write.
+        this.ws.lastError = errorMessage(err);
+        this.ws.lastErrorSummary = summarizeFeishuSdkMessage([err]);
+        this.transitionWs('error', 'start_threw');
         const code = err && typeof err === 'object' ? err.code : undefined;
         logger.error({
             agentName: this.agentName,
@@ -686,10 +732,11 @@ export class FeishuPlatformAdapter {
      * {@link FeishuWsStatusInfo} for the state semantics.
      */
     getWsStatus() {
-        return {
-            status: this.wsStatus,
-            ...(this.wsLastError ? { lastError: this.wsLastError } : {}),
-        };
+        return describeFeishuWsStatus(this.ws);
+    }
+    /** Single write path for the WS status: every change is logged with a fixed reason. */
+    transitionWs(next, reason) {
+        transitionFeishuWsStatus({ state: this.ws, agentName: this.agentName, next, reason });
     }
     /**
      * Tear down cached sender + WS client. Safe to call when nothing is
@@ -705,19 +752,27 @@ export class FeishuPlatformAdapter {
         this.senderForCredentials = undefined;
         const ws = this.wsClient;
         this.wsClient = undefined;
-        // Mark this teardown as intentional. When the SDK's `client closed`
-        // log fires shortly after, an operator grepping the log can tell it
-        // was caused by our side (this line) rather than a server-initiated
-        // drop (SDK closed with no adapter teardown log preceding it).
+        const retireSdkBridge = ws ? this.wsBridgeRetirers.get(ws) : undefined;
+        // Mark this teardown as intentional. The SDK's own line for it follows
+        // as `client_closed_manually` tagged `stale: true`, which tells it apart
+        // from a server-side drop (`client_closed`, untagged). `hasSdkBridge` is
+        // false for injected factories (no bridge) or when no client existed.
         logger.info({
             clientName: this.clientName,
             agentName: this.agentName,
             hadWsClient: Boolean(ws),
-            prevStatus: this.wsStatus,
+            hasSdkBridge: Boolean(retireSdkBridge),
+            prevStatus: this.ws.status,
             reason: 'adapter-invalidate',
         }, 'Feishu WS transport teardown (intentional)');
-        this.wsStatus = 'idle';
-        this.wsLastError = undefined;
+        // Retire the client's SDK logger bridge BEFORE close(): whatever the SDK
+        // still reports for this client afterwards — its own close line, or a
+        // first connect close() cannot cancel (see the bridge handle's `retire`)
+        // — is logged tagged `stale: true` and can no longer write `this.ws`.
+        retireSdkBridge?.();
+        // Teardown forgets the previous connection's error along with it.
+        clearFeishuWsError(this.ws);
+        this.transitionWs('idle', 'adapter_teardown');
         if (ws && typeof ws.close === 'function') {
             // Detached on purpose: teardown must not block the caller on socket IO.
             // The promise is kept on the instance so tests (and a future drain
@@ -749,12 +804,12 @@ export class FeishuPlatformAdapter {
                 hasAppId: Boolean(record?.appId),
                 hasAppSecret: Boolean(record?.appSecret),
             }, 'Feishu WS start skipped: binding is not usable');
-            this.wsStatus = 'idle';
+            this.transitionWs('idle', 'start_skipped');
             return undefined;
         }
         if (this.wsClientFactory === false) {
             logger.info({ agentName: this.agentName, platform: 'feishu' }, 'Feishu WS start skipped: factory disabled');
-            this.wsStatus = 'idle';
+            this.transitionWs('idle', 'start_skipped');
             return undefined;
         }
         return record;

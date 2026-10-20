@@ -1,5 +1,6 @@
 import { digestThreadGoalObjective, } from '@mavis/goal';
 import { firstExhaustedThreadGoalBudget, resolveThreadGoalBudgetLimits, threadGoalBudgetGraceSteps, } from './gate.js';
+import { sanitizeUsageCounter } from './usage-counter.js';
 /** Enforce the live Goal budget immediately before a v2 tool call. */
 export async function checkThreadGoalTurnBudget(input, deps) {
     const boundTurn = deps.turnContext.getBinding(input.turnId);
@@ -46,8 +47,5 @@ export async function checkThreadGoalTurnBudget(input, deps) {
         decision: 'stop',
         message: `GOAL_BUDGET_EXHAUSTED(${dimension}): Tool execution remains disabled for this Goal turn.`,
     };
-}
-function sanitizeUsageCounter(value) {
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 //# sourceMappingURL=admission-budget.js.map

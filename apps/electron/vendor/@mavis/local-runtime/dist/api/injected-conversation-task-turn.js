@@ -85,10 +85,25 @@ export function isSubagentConcurrencyLimitRejection(error) {
     return (error instanceof ConversationTurnRejectedError &&
         error.reason === 'policy:subagent:concurrency-limit');
 }
-export function localTaskAdmissionFailure(error) {
+/**
+ * Advisory snapshot for the model. Admission already decided the outcome, so
+ * a failed read degrades to "unknown" instead of failing the task.
+ */
+export async function readTaskOccupancy(conversation, parentSessionId) {
+    try {
+        return await conversation?.taskConcurrency?.occupancy(parentSessionId);
+    }
+    catch {
+        return undefined;
+    }
+}
+export function localTaskAdmissionFailure(error, occupancy) {
     if (isSubagentConcurrencyLimitRejection(error)) {
+        const limit = occupancy
+            ? ` (${String(occupancy.active)} running, limit ${String(occupancy.limit)})`
+            : '';
         return {
-            errorMessage: 'This parent Session has reached its configured child-Agent concurrency limit. Wait for one to finish, then retry.',
+            errorMessage: `This parent Session has reached its configured child-Agent concurrency limit${limit}. Wait for one to finish, then retry.`,
             errorCode: SUBAGENT_CONCURRENCY_LIMIT_ERROR_CODE,
         };
     }

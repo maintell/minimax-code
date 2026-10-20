@@ -1,3 +1,4 @@
+import { logger } from '../common/logger.js';
 const hostStates = new WeakMap();
 export function admitBackgroundTask(host, abort) {
     const state = getHostState(host);
@@ -47,6 +48,24 @@ export function isBackgroundTaskAdmittedHere(host, taskId) {
             return true;
     }
     return false;
+}
+/** Abort this task's runner, including setup before its child Turn is admitted. */
+export function abortAdmittedBackgroundTask(host, taskId, reason) {
+    for (const task of hostStates.get(host)?.active ?? []) {
+        if (task.taskId !== taskId || !task.abort)
+            continue;
+        try {
+            task.abort(reason);
+        }
+        catch {
+            try {
+                logger.warn({ event: 'background_task_admission_abort_failed', taskId, reason }, 'Background task admission abort failed');
+            }
+            catch {
+                // Diagnostics must not skip the host's existing process/Turn stop.
+            }
+        }
+    }
 }
 export function beginBackgroundTaskShutdown(host, reason = 'runtime-shutdown') {
     const state = getHostState(host);

@@ -65,7 +65,7 @@ export class StartupTaskRecovery {
                 continue;
             const next = patched.task;
             logStartupLostTask(task, options.createdBeforeMs, now);
-            await this.settlement.emitCompleted(next, reason);
+            this.settlement.onStatusChanged(next);
             lost.push(next);
         }
         return lost;

@@ -31,9 +31,6 @@ export class InvalidTaskStatusTransitionError extends BackgroundTaskError {
 export function createBackgroundTaskId() {
     return `bg_${randomUUID()}`;
 }
-export function createTaskLifecycleEventId() {
-    return `bge_${randomUUID()}`;
-}
 export function isTerminalTaskStatus(status) {
     return ['succeeded', 'failed', 'canceled', 'lost'].includes(status);
 }

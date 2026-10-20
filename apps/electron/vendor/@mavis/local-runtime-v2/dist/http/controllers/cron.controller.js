@@ -16,6 +16,7 @@ const DOMAIN_ERROR_STATUS = {
     CRON_NOT_FOUND: 404,
     CRON_DEFINITION_NOT_FOUND: 404,
     CRON_CONFLICT: 409,
+    CRON_RUN_ID_CONFLICT: 409,
     SELF_REMINDER_EXISTS: 409,
     CRON_INVALID_STATE: 409,
     SCHEDULER_INVALID: 400,
@@ -298,7 +299,7 @@ class CronController extends CronControllerBase {
     // 旧版 v1 形态的 Cron 接口。
     // v1 CronTask/ActiveHours/keepSessions 结构包含 v2 领域按 §9 移除的能力。
     // 这些路由继续保留在生成契约中，并返回稳定的不支持错误，避免有损映射到新领域。
-    // Local Mavis Tool 按 §8 调用 v2 方法。
+    // Agent 通过 v2 cron 工具调用新领域；Local Mavis Tool 的旧 cron 分支返回 CRON_TOOL_MOVED。
     async listCrons(_ctx, _req) {
         throw legacyUnsupported('listCrons');
     }

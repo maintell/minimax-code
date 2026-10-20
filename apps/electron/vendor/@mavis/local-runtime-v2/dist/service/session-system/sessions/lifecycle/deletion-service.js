@@ -12,6 +12,7 @@ export class SessionDeletionService {
         if (current.runtime !== 'pi-agent') {
             throw new SessionServiceError('runtime-unsupported', 'Legacy opencode Session mutation is unavailable');
         }
+        const previousMainSessionId = this.options.sideChats?.relation(sessionId)?.mainSessionId;
         await this.options.cleanup.markLegacyMigrationDeleted(sessionId);
         await this.options.cleanup.deleteCanvas(sessionId);
         // Peek Sessions are ephemeral, but their token/cost ledger is not. Drop
@@ -34,7 +35,11 @@ export class SessionDeletionService {
         await this.options.sessions.reparentChildren(sessionId, current.parentSessionId ?? null);
         await this.options.clearSessionReference(current);
         await this.options.records.deleteSessionRecord(sessionId);
-        this.options.facts.handle({ kind: 'deleted', sessionId });
+        this.options.facts.handle({
+            kind: 'deleted',
+            sessionId,
+            ...(previousMainSessionId ? { previousMainSessionId } : {}),
+        });
         return current;
     }
 }

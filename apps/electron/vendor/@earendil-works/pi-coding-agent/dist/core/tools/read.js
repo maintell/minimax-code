@@ -130,6 +130,19 @@ function formatReadResult(args, result, options, theme, showImages, _cwd, isErro
 export function createReadToolDefinition(cwd, options) {
     const autoResizeImages = options?.autoResizeImages ?? true;
     const ops = options?.operations ?? defaultReadOperations;
+    // Custom reads must not probe another filesystem before reaching ops.access.
+    // Keep the default F_OK probe unchanged for hosts without custom operations.
+    const pathExistenceProbe = options?.operations
+        ? async (filePath) => {
+            try {
+                await ops.access(filePath);
+                return true;
+            }
+            catch {
+                return false;
+            }
+        }
+        : undefined;
     return {
         name: "read",
         label: "read",
@@ -151,7 +164,7 @@ export function createReadToolDefinition(cwd, options) {
                 signal?.addEventListener("abort", onAbort, { once: true });
                 (async () => {
                     try {
-                        const absolutePath = await resolveReadPathAsync(path, cwd);
+                        const absolutePath = await resolveReadPathAsync(path, cwd, pathExistenceProbe);
                         if (aborted)
                             return;
                         // Check if file exists and is readable.

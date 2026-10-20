@@ -2,6 +2,13 @@ import { GOAL_CONFIG_DEFAULTS, GOAL_CONFIG_LIMITS, resolveBetaFeature, } from '@
 import { digestThreadGoalObjective, } from '@mavis/goal';
 import { firstGoalBlocker } from './blockers.js';
 export const GOAL_AUTOMATION_OWNER_CONFLICT = 'GOAL_AUTOMATION_OWNER_CONFLICT';
+export class ThreadGoalSessionNotFoundError extends Error {
+    statusCode = 404;
+    code = 'SESSION_NOT_FOUND';
+    constructor(sessionId) {
+        super(`Session not found: ${sessionId}`);
+    }
+}
 export class ThreadGoalAutomationOwnerConflictError extends Error {
     sessionId;
     name = 'ThreadGoalAutomationOwnerConflictError';

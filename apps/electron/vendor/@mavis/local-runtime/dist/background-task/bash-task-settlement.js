@@ -9,7 +9,18 @@ export async function settleFailedBackgroundBash(input, output, result, startedA
             message: result.text,
         }),
     };
-    if (watchdogTimedOut) {
+    if (output.limitError &&
+        input.controller.signal.reason === output.limitError &&
+        observed?.reason !== 'command_timeout') {
+        Object.assign(execution, {
+            status: 'failed',
+            reason: 'output_limit',
+            errorCode: 'BASH_OUTPUT_LIMIT',
+            message: output.limitError.message,
+            cancellationReason: undefined,
+        });
+    }
+    else if (watchdogTimedOut) {
         Object.assign(execution, {
             status: 'failed',
             reason: 'watchdog_timeout',
@@ -22,7 +33,9 @@ export async function settleFailedBackgroundBash(input, output, result, startedA
         execution.reason = 'canceled';
     }
     const errorText = formatBashExecutionOutcome(execution);
-    const text = watchdogTimedOut ? `${result.text}\n\n${errorText}` : result.text;
+    const text = watchdogTimedOut || execution.reason === 'output_limit'
+        ? `${result.text}\n\n${errorText}`
+        : result.text;
     const status = execution.status === 'canceled' ? 'canceled' : 'failed';
     const statusText = watchdogTimedOut ? errorText : `Background bash ${status}: ${errorText}`;
     const terminalText = output.streamedOutput
@@ -97,6 +110,7 @@ export async function settleBackgroundBashTask(input) {
         lastError: input.lastError,
         metadata: {
             ...input.metadata,
+            stopError: undefined,
             durationMs,
             cacheTtlExceeded: durationMs >= 300_000,
         },
@@ -117,7 +131,7 @@ async function patchTerminalBashResult(host, taskId, outputRef, metadata) {
         return;
     await host.backgroundTaskService.patch(taskId, {
         ...(outputRef ? { outputRef } : {}),
-        metadata,
+        metadata: { ...metadata, stopError: undefined },
         endedAt: existing.endedAt ?? host.nowMs(),
     });
 }

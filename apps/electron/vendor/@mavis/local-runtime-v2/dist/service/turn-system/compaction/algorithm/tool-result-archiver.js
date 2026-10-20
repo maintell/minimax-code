@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { replaceRequestImages, } from '@mavis/agent-core/pi-turn-runner';
+import { archivedImageText, isArchivableRequestImage, selectImagesToArchive, } from '@mavis/context-manager';
 import { parseToolRounds } from './history-reduction.js';
 // Defensive defaults for standalone algorithm callers. Production always injects
 // the config.yaml/Apollo-resolved settings from production-composition.
@@ -103,6 +105,63 @@ export class ToolResultArchiver {
             trimmedResultCount: replacements.length,
             actualSavingsBytes: materialized.actualSavingsBytes,
         };
+    }
+    /**
+     * Replaces tool result images older than the newest ones within `target`
+     * with a receipt naming their file, so later requests carry text instead.
+     * An image whose history names no source file is written to the Session
+     * artifacts first; user attachments are never archived.
+     */
+    async archiveImages(input) {
+        const images = selectImagesToArchive(input.messages, input.target, isArchivableRequestImage);
+        if (images.length === 0)
+            return undefined;
+        const receipts = new Map();
+        let savedBytes = 0;
+        for (const image of images) {
+            const receipt = archivedImageText(image.path ?? (await this.writeImageFile(input, image)));
+            receipts.set(image.key, receipt);
+            savedBytes += Math.max(0, image.base64Bytes - Buffer.byteLength(receipt));
+        }
+        logBestEffort(this.options.logger, 'info', {
+            event: 'tool_result_image_archive',
+            session_id: input.sessionId,
+            archived_image_count: images.length,
+            saved_bytes: savedBytes,
+        });
+        return {
+            messages: replaceRequestImages(input.messages, (image) => receipts.get(image.key)),
+            archivedImageCount: images.length,
+            savedBytes,
+        };
+    }
+    /** Writes a tool result image to the Session artifacts; `undefined` when it cannot. */
+    async writeImageFile(input, image) {
+        const message = input.messages[image.messageIndex];
+        if (!this.options.writeImageArtifact || message?.role !== 'toolResult')
+            return undefined;
+        const block = message.content[image.blockIndex];
+        if (block?.type !== 'image')
+            return undefined;
+        try {
+            const artifact = await this.options.writeImageArtifact({
+                sessionId: input.sessionId,
+                toolCallId: message.toolCallId,
+                toolName: message.toolName,
+                data: block.data,
+                mimeType: block.mimeType,
+            });
+            return nonEmptyString(artifact.reference);
+        }
+        catch (error) {
+            logBestEffort(this.options.logger, 'error', {
+                event: 'tool_result_image_artifact_failed',
+                session_id: input.sessionId,
+                tool_name: message.toolName,
+                reason: safeErrorReason(error),
+            });
+            return undefined;
+        }
     }
     finishMaterialization(input, replacements) {
         const actualSavingsBytes = calculateActualSavings(input.plan.candidates, replacements);

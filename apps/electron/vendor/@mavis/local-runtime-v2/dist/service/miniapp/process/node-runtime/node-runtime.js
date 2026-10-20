@@ -1,11 +1,11 @@
 import { spawn as nodeSpawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
-import { createConnection } from 'node:net';
+import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MAX_RUNNING_MINIAPP_SERVICES } from '../../contracts.js';
+import { MAX_RUNNING_MINIAPP_SERVICES, MINIAPP_LOOPBACK_HEALTH_PATH, MINIAPP_LOOPBACK_TOKEN_HEADER, } from '../../contracts.js';
 import { selectFailureAfterCleanup } from '../../supervisor/cleanup-settlement.js';
 import { MiniAppCleanupUnprovenError, markMiniAppRootTerminationProven } from '../../errors.js';
 import { sanitizeMiniAppRuntimeLogEvent } from '../../runtime-log.js';
@@ -78,6 +78,8 @@ function artifactRootError() {
     return new MiniAppNodeRuntimeError('CANDIDATE_CHANGED', 'Mini App process artifact root is not an owned physical directory');
 }
 async function prepareRuntime(input) {
+    // One credential per process generation; port retries reuse it with a fresh startupToken.
+    const loopbackToken = input.options.makeLoopbackToken();
     let lastError;
     for (let index = 0; index < input.options.maxPortAttempts; index += 1) {
         const port = candidatePort(input, index);
@@ -91,12 +93,17 @@ async function prepareRuntime(input) {
         const deadline = input.options.nowMs() + input.options.runnerStartTimeoutMs;
         let attempt;
         try {
-            attempt = await spawnAttempt(input, port);
+            attempt = await spawnAttempt(input, port, loopbackToken);
             const readinessSignal = AbortSignal.any([input.signal, attempt.fatal.signal]);
-            await waitForStarted(attempt, readinessSignal, Math.min(input.options.runnerStartTimeoutMs, remaining(deadline, input.options.nowMs)));
-            await waitForTcp({
+            await waitForStarted(attempt, readinessSignal, {
+                deadline,
+                timeoutMs: input.options.runnerStartTimeoutMs,
+                nowMs: input.options.nowMs,
+            });
+            await waitForLoopbackReadiness({
                 options: input.options,
                 port,
+                loopbackToken,
                 signal: readinessSignal,
                 deadline,
             });
@@ -138,7 +145,7 @@ async function cleanupFailedPreparation(attempt, reservation, cause) {
     }
     throwPostStopErrors(postStopErrors);
 }
-async function spawnAttempt(input, port) {
+async function spawnAttempt(input, port, loopbackToken) {
     const init = {
         type: 'miniapp:init',
         protocolVersion: 1,
@@ -152,7 +159,9 @@ async function spawnAttempt(input, port) {
             startupToken: input.options.makeStartupToken(),
             nodeDigest: input.candidate.nodeDigest,
         },
+        loopbackToken,
         hostConnectorPolicy: input.candidate.hostConnectorPolicy,
+        agentPolicy: input.candidate.agentPolicy ?? { kind: 'deny-all' },
     };
     const physicalRoot = input.physicalRoots.acquire(input.candidate.pluginId);
     let child;
@@ -300,7 +309,8 @@ async function ignoreClosedRejection(closed) {
     }
 }
 function createConnectorSession(input, child, fatal) {
-    if (input.candidate.hostConnectorPolicy.kind !== 'allowlist')
+    const { hostConnectorPolicy, agentPolicy } = input.candidate;
+    if (!needsConnectorChannel(input.candidate))
         return undefined;
     if (!child.send || child.connected === false || !input.options.hostConnectorSessionFactory) {
         throw new MiniAppNodeRuntimeError('HOST_CONNECTOR_UNAVAILABLE', 'Host Connector IPC or session factory is unavailable');
@@ -308,7 +318,8 @@ function createConnectorSession(input, child, fatal) {
     return input.options.hostConnectorSessionFactory.create({
         pluginId: input.candidate.pluginId,
         processGeneration: input.processGeneration,
-        providers: input.candidate.hostConnectorPolicy.providers,
+        providers: hostConnectorPolicy.kind === 'allowlist' ? hostConnectorPolicy.providers : [],
+        ...(agentPolicy ? { agentPolicy } : {}),
         transport: child,
         onFatal: (error) => fatal.abort(error),
     });
@@ -353,8 +364,12 @@ function captureChildLogs(child, options) {
     child.stderr?.on('data', (chunk) => captureStreamLog('error', chunk));
     child.stdout?.on('data', (chunk) => captureStreamLog('info', chunk));
 }
-function waitForStarted(attempt, signal, timeoutMs) {
+function waitForStarted(attempt, signal, budget) {
     throwIfAborted(signal);
+    const remainingMs = deadlineBudget(budget.deadline, budget.nowMs);
+    if (remainingMs <= 0)
+        return Promise.reject(readinessTimeout('started'));
+    const timeoutMs = Math.min(budget.timeoutMs, remainingMs);
     return new Promise((resolve, reject) => {
         let settled = false;
         const finish = (error) => {
@@ -388,7 +403,7 @@ function waitForStarted(attempt, signal, timeoutMs) {
                     : new MiniAppNodeRuntimeError('RUNNER_IDENTITY_MISMATCH', 'Runner identity did not match the candidate'));
             }
         };
-        const timer = setTimeout(() => finish(new MiniAppNodeRuntimeError('READINESS_TIMEOUT', 'Runner start timed out')), Math.max(1, timeoutMs));
+        const timer = setTimeout(() => finish(readinessTimeout('started')), Math.max(1, timeoutMs));
         timer.unref();
         signal.addEventListener('abort', onAbort, { once: true });
         attempt.child.on('message', onMessage);
@@ -403,30 +418,50 @@ function waitForStarted(attempt, signal, timeoutMs) {
         }
     });
 }
-async function waitForTcp(input) {
+async function waitForLoopbackReadiness(input) {
     let lastError;
+    let lastRejection;
     for (;;) {
         throwIfAborted(input.signal);
+        const budget = deadlineBudget(input.deadline, input.options.nowMs);
+        if (budget <= 0)
+            throw readinessTimeout('loopback-auth', lastRejection ?? lastError);
         try {
-            await input.options.connectPort({
+            await input.options.probeReadiness({
                 host: LOOPBACK_HOST,
                 port: input.port,
-                timeoutMs: Math.min(input.options.tcpConnectTimeoutMs, remaining(input.deadline, input.options.nowMs)),
+                loopbackToken: input.loopbackToken,
+                timeoutMs: Math.min(input.options.readinessProbeTimeoutMs, budget),
                 signal: input.signal,
             });
             return;
         }
         catch (error) {
+            throwIfAborted(input.signal);
             lastError = error;
+            if (isProbeRejection(error))
+                lastRejection = error;
         }
-        const delay = Math.min(input.options.tcpRetryMs, remaining(input.deadline, input.options.nowMs));
-        await input.options.wait(delay, input.signal);
-        if (input.options.nowMs() >= input.deadline) {
-            throw new MiniAppNodeRuntimeError('READINESS_TIMEOUT', 'TCP readiness timed out', {
-                cause: lastError,
-            });
-        }
+        const left = deadlineBudget(input.deadline, input.options.nowMs);
+        // A capped final probe may time out at the deadline; keep the last status mismatch as the reason.
+        if (left <= 0)
+            throw readinessTimeout('loopback-auth', lastRejection ?? lastError);
+        await input.options.wait(Math.min(input.options.readinessRetryMs, left), input.signal);
     }
+}
+/** Non-throwing time remaining before `deadline`, as observed through `nowMs`. */
+function deadlineBudget(deadline, nowMs) {
+    return deadline - nowMs();
+}
+function readinessTimeout(stage, reason) {
+    if (stage === 'started') {
+        return new MiniAppNodeRuntimeError('READINESS_TIMEOUT', 'Runner start readiness timed out');
+    }
+    const message = 'Loopback auth probe readiness timed out';
+    return new MiniAppNodeRuntimeError('READINESS_TIMEOUT', isProbeRejection(reason) ? `${message}: ${reason.message}` : message, reason === undefined ? undefined : { cause: reason });
+}
+function isProbeRejection(error) {
+    return error instanceof MiniAppNodeRuntimeError && error.code === 'READINESS_PROBE_REJECTED';
 }
 function preparedRuntime(input) {
     let stopPromise;
@@ -476,6 +511,7 @@ function preparedRuntime(input) {
         nodeDigest: input.candidate.nodeDigest,
         port: input.port,
         origin: `http://${LOOPBACK_HOST}:${input.port}`,
+        loopbackToken: input.attempt.init.loopbackToken,
         ...(input.attempt.connector ? { hostConnectorSession: input.attempt.connector } : {}),
         closed: input.attempt.closed,
         stop() {
@@ -543,7 +579,7 @@ function resolveOptions(options) {
         platform: process.platform,
         env: process.env,
         spawn: nodeSpawn,
-        connectPort: connectMiniAppPort,
+        probeReadiness: probeMiniAppLoopbackAuth,
         createTerminator: createDirectNodeRootTerminator,
         createRuntimeDir: () => mkdtemp(path.join(os.tmpdir(), 'mavis-miniapp-')),
         lstatPath: lstat,
@@ -555,11 +591,12 @@ function resolveOptions(options) {
         },
         resolveRealPath: realpath,
         makeStartupToken: randomUUID,
+        makeLoopbackToken: () => randomBytes(32).toString('base64url'),
         nowMs: Date.now,
         wait: defaultWait,
         runnerStartTimeoutMs: 10_000,
-        tcpConnectTimeoutMs: 500,
-        tcpRetryMs: 50,
+        readinessProbeTimeoutMs: 500,
+        readinessRetryMs: 50,
         maxPortAttempts: 3,
     };
     const defined = Object.fromEntries(Object.entries(options).filter((entry) => entry[1] !== undefined));
@@ -576,6 +613,15 @@ function assertCapabilities(options, candidate) {
     if (candidate.hostConnectorPolicy.kind === 'allowlist' && !options.hostConnectorSessionFactory) {
         throw new MiniAppNodeRuntimeError('HOST_CONNECTOR_UNAVAILABLE', 'Host Connector session is unavailable');
     }
+    // Agent calls share the connector IPC session, so its absence surfaces with the same code.
+    if (candidate.agentPolicy?.kind === 'allowlist' && !options.hostConnectorSessionFactory) {
+        throw new MiniAppNodeRuntimeError('HOST_CONNECTOR_UNAVAILABLE', 'Mini App Agent IPC session is unavailable');
+    }
+}
+/** Connector and Agent access share one `miniapp:connector` IPC session. */
+function needsConnectorChannel(candidate) {
+    return (candidate.hostConnectorPolicy.kind === 'allowlist' ||
+        candidate.agentPolicy?.kind === 'allowlist');
 }
 async function resolveDataDir(options, pluginId) {
     const requested = await options.resolvePluginDataDir(pluginId);
@@ -621,41 +667,66 @@ function runnerEnvironment(env) {
     }
     return result;
 }
-function connectMiniAppPort(input) {
-    if (input.signal.aborted)
-        return Promise.reject(input.signal.reason);
+/**
+ * Proves the Host guard owns the port: an anonymous health check must be rejected
+ * before the authenticated one is answered by the guard itself.
+ */
+async function probeMiniAppLoopbackAuth(input) {
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new MiniAppNodeRuntimeError('READINESS_PROBE_TIMEOUT', 'Loopback auth probe request timed out')), Math.max(1, input.timeoutMs));
+    timer.unref();
+    const signal = AbortSignal.any([input.signal, timeout.signal]);
+    try {
+        const anonymous = await requestLoopbackHealth(input, signal, undefined);
+        if (anonymous !== 401) {
+            throw probeRejected(`unauthenticated health probe expected 401, received ${anonymous}`);
+        }
+        const authenticated = await requestLoopbackHealth(input, signal, input.loopbackToken);
+        if (authenticated !== 204) {
+            throw probeRejected(`authenticated health probe expected 204, received ${authenticated}`);
+        }
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+function probeRejected(message) {
+    return new MiniAppNodeRuntimeError('READINESS_PROBE_REJECTED', message);
+}
+function requestLoopbackHealth(input, signal, token) {
+    if (signal.aborted)
+        return Promise.reject(signal.reason);
     return new Promise((resolve, reject) => {
-        const socket = createConnection({ host: input.host, port: input.port });
         let settled = false;
-        const finish = (error) => {
+        const finish = (outcome) => {
             if (settled)
                 return;
             settled = true;
-            clearTimeout(timer);
-            input.signal.removeEventListener('abort', onAbort);
-            socket.removeListener('connect', onConnect);
-            socket.removeListener('error', onError);
-            socket.destroy();
-            if (error)
-                reject(error);
-            else
-                resolve();
+            signal.removeEventListener('abort', onAbort);
+            if ('status' in outcome) {
+                resolve(outcome.status);
+                return;
+            }
+            request.destroy();
+            reject(outcome.error);
         };
-        const onConnect = () => finish();
-        const onError = (error) => finish(error);
-        const onAbort = () => finish(input.signal.reason);
-        const timer = setTimeout(() => finish(new MiniAppNodeRuntimeError('TCP_CONNECT_TIMEOUT', 'TCP connect timed out')), Math.max(1, input.timeoutMs));
-        timer.unref();
-        socket.once('connect', onConnect);
-        socket.once('error', onError);
-        input.signal.addEventListener('abort', onAbort, { once: true });
+        const request = httpRequest({
+            host: input.host,
+            port: input.port,
+            method: 'GET',
+            path: MINIAPP_LOOPBACK_HEALTH_PATH,
+            agent: false,
+            headers: token ? { [MINIAPP_LOOPBACK_TOKEN_HEADER]: token } : {},
+        }, (response) => {
+            response.on('error', () => undefined);
+            response.resume();
+            finish({ status: response.statusCode ?? 0 });
+        });
+        const onAbort = () => finish({ error: signal.reason });
+        request.on('error', (error) => finish({ error }));
+        signal.addEventListener('abort', onAbort, { once: true });
+        request.end();
     });
-}
-function remaining(deadline, now) {
-    const value = deadline - now();
-    if (value <= 0)
-        throw new MiniAppNodeRuntimeError('READINESS_TIMEOUT', 'Readiness deadline expired');
-    return value;
 }
 function defaultWait(ms, signal) {
     if (signal.aborted)

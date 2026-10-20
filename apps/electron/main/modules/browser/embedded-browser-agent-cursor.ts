@@ -132,7 +132,7 @@ export async function captureTabScreenshotWithoutAgentCursor(tab, params, getWeb
 export async function captureFrameWithoutAgentCursor(options) {
     let tab;
     try {
-        tab = options.resolveTab(options.target);
+        tab = await options.resolveTab(options.target);
     }
     catch (error) {
         return { success: false, error: options.safeError(error) };

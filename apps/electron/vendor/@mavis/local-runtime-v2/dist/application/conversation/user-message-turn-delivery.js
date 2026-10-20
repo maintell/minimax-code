@@ -274,12 +274,12 @@ function commitMessage(options, input) {
         ...(context ? { sourceContext: context } : {}),
     }));
 }
-function shouldProjectMessage(input) {
+export function shouldProjectMessage(input) {
     if (!input)
         return true;
     return input.hideUserMessage !== true || hasDisplayContent(input);
 }
-function projectedMessageContent(input, fallback) {
+export function projectedMessageContent(input, fallback) {
     return hasDisplayContent(input) ? input.displayContent : fallback;
 }
 function hasDisplayContent(input) {

@@ -10,6 +10,7 @@ import { resolveMemorySystemConfig, resolveMemoryV2Config } from './config.js';
 import { initializeMemorySystem } from './initialize.js';
 import { MemoryV2ModelGateway } from './adapters/model-gateway.js';
 import { SessionMemorySourceAdapter } from './adapters/session-source.js';
+import { MemorySubscriptionQuota, } from './adapters/quota/subscription-quota.js';
 import { createProductionSessionSystemPort, } from './adapters/session-source.production.js';
 /** kind 与 `assets/agents/memory-v2-*.md` 的固定对应。 */
 const PROMPT_ASSETS = {
@@ -33,7 +34,9 @@ export function initializeProductionMemoryV2System(input) {
         nowMs,
     }));
     const readPrompt = (kind) => input.readPrompt(PROMPT_ASSETS[kind]);
+    const quota = input.quota ? new MemorySubscriptionQuota({ ...input.quota, nowMs }) : undefined;
     const model = new MemoryV2ModelGateway({
+        readSubscriptionQuota: quota ? (modelName) => quota.read(modelName) : undefined,
         config,
         readPrompt,
         completion: traceMemoryPort(diagnostics, 'completion', createGlobalMemoryModelCompletion({
@@ -77,6 +80,7 @@ export function initializeRuntimeMemoryV2System(input) {
         return undefined;
     const appConfig = () => resolveMemorySystemConfig(memory());
     const system = initializeProductionMemoryV2System({
+        quota: input.quota,
         disableLegacyRecall: input.options.compatibility.memoryMigration.disableLegacyRecall,
         db: input.options.db,
         dataDir: input.options.dataDir,

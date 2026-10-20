@@ -1,3 +1,4 @@
+import { parseResolvedAgentShell } from '../../../../agent-shell/index.js';
 import { canonicalProjectWorkspaceDir } from '../../../shared/workspace.js';
 import { SESSION_KINDS, SESSION_RUN_LOCATION_MODES, SESSION_RUNTIMES, SESSION_STATUSES, SESSION_VISIBILITIES, } from '../contract.js';
 import { normalizePersistedSessionKind, normalizeSessionType } from './normalization.js';
@@ -65,6 +66,7 @@ export function decodeSessionRow(row) {
         ...(row.purpose !== null ? { purpose: row.purpose } : {}),
         ...(row.originCronId !== null ? { originCronId: row.originCronId } : {}),
         ...extra,
+        sessionDataVersion: nativeSessionDataVersion(row, extra),
         status: requireEnum(row.status, SESSION_STATUSES, `Session ${row.sessionId}.status`),
         ...(row.errorMessage !== null ? { errorMessage: row.errorMessage } : {}),
         ...(row.errorCode !== null
@@ -79,8 +81,22 @@ export function decodeSessionRow(row) {
         updatedAtMs,
     });
 }
+function nativeSessionDataVersion(row, extra) {
+    if (extra.sessionDataVersion !== undefined)
+        return extra.sessionDataVersion;
+    // Early native SideChat records omitted this field but wrote format 4 history.
+    // Keep the historical format fixed when CURRENT_SESSION_DATA_VERSION advances.
+    if (row.runtime === 'pi-agent' &&
+        extra.sessionOrigin === 'local-runtime' &&
+        extra.sideChatOrigin &&
+        row.historyRelativeDir)
+        return 4;
+    return undefined;
+}
 export function sessionExtraDataFromRecord(record) {
     return compactExtraData({
+        agentShell: record.agentShell,
+        titleSource: record.titleSource,
         runLocation: record.runLocation,
         appMode: record.sessionType === 'branch' ? record.appMode : undefined,
         interactionMode: record.interactionMode,
@@ -95,8 +111,10 @@ export function sessionExtraDataFromRecord(record) {
         effectiveModelMaxOutputTokens: record.effectiveModelMaxOutputTokens,
         scratchpadPath: record.scratchpadPath,
         origin: record.origin,
+        sideChatOrigin: record.sideChatOrigin,
         sessionDataVersion: record.sessionDataVersion,
         sessionOrigin: record.sessionOrigin,
+        miniAppOrigin: record.miniAppOrigin,
     });
 }
 export function withoutRootAppMode(record) {
@@ -115,8 +133,11 @@ export function parseSessionExtraData(raw) {
     const runLocation = readRunLocation(record);
     return compactExtraData({
         runLocation,
+        sideChatOrigin: readSideChatOrigin(record),
+        titleSource: readOptionalEnum(record, 'titleSource', ['default', 'auto', 'manual'], 'extra_data_json'),
         appMode: readOptionalEnum(record, 'appMode', ['coding', 'work'], 'extra_data_json'),
         interactionMode: readOptionalEnum(record, 'interactionMode', ['plan', 'goal'], 'extra_data_json'),
+        agentShell: record.agentShell === undefined ? undefined : parseResolvedAgentShell(record.agentShell),
         memoryPolicy: readOptionalSessionMemoryPolicy(record, 'memoryPolicy', 'extra_data_json'),
         errorSource: readOptionalString(record, 'errorSource', 'extra_data_json'),
         errorDetail: readOptionalString(record, 'errorDetail', 'extra_data_json'),
@@ -130,7 +151,23 @@ export function parseSessionExtraData(raw) {
         origin: readOptionalEnum(record, 'origin', ['user', 'root-repair'], 'extra_data_json'),
         sessionDataVersion: readOptionalSafeInteger(record, 'sessionDataVersion', 'extra_data_json'),
         sessionOrigin: readOptionalEnum(record, 'sessionOrigin', ['local-runtime', 'legacy-opencode', 'unknown'], 'extra_data_json'),
+        miniAppOrigin: readMiniAppOrigin(record.miniAppOrigin),
     });
+}
+/** Lenient: an unrecognized origin shape means "not a Mini App session", never a decode failure. */
+function readMiniAppOrigin(value) {
+    if (!isPlainObject(value))
+        return undefined;
+    const { pluginId, createdAtMs, hostSessionId } = value;
+    if (typeof pluginId !== 'string' || pluginId.length === 0)
+        return undefined;
+    if (typeof createdAtMs !== 'number' || !Number.isSafeInteger(createdAtMs))
+        return undefined;
+    return {
+        pluginId,
+        createdAtMs,
+        ...(typeof hostSessionId === 'string' && hostSessionId.length > 0 ? { hostSessionId } : {}),
+    };
 }
 function validateExtraData(data) {
     if (data.runLocation) {
@@ -204,6 +241,26 @@ function optionalThinkingBudgets(record, field) {
         budgets[key] = budget;
     }
     return Object.keys(budgets).length > 0 ? { budgets } : {};
+}
+function readSideChatOrigin(record) {
+    const value = readOptionalObject(record, 'sideChatOrigin', 'extra_data_json');
+    if (!value)
+        return undefined;
+    return {
+        mainSessionId: readRequiredString(value, 'mainSessionId', 'sideChatOrigin'),
+        capturedAtMs: requireSafeInteger(value.capturedAtMs, 'sideChatOrigin.capturedAtMs'),
+        historyRevision: readRequiredString(value, 'historyRevision', 'sideChatOrigin'),
+        ...(value.sourceMessageId === undefined
+            ? {}
+            : {
+                sourceMessageId: readRequiredString(value, 'sourceMessageId', 'sideChatOrigin'),
+            }),
+        ...(value.inheritedThroughMessageId === undefined
+            ? {}
+            : {
+                inheritedThroughMessageId: readRequiredString(value, 'inheritedThroughMessageId', 'sideChatOrigin'),
+            }),
+    };
 }
 function readRunLocation(record) {
     const value = readOptionalObject(record, 'runLocation', 'extra_data_json');

@@ -2,6 +2,16 @@ import { BaseWindow } from "electron";
 import { getCategoryLogger } from "../../utils/logger";
 import { OFFSCREEN_BOUNDS } from "./embedded-browser-manager-helpers";
 const browserInputDiagnosticLogger = getCategoryLogger('archon', 'browser-input');
+/**
+ * Abort reason used when a foreground reveal takes over a target from a hidden
+ * background action. The reveal only needs the shared render slot back; page
+ * work the user is about to see (for example an in-flight navigation) must
+ * keep running in the foreground instead of being stopped.
+ */
+export let BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON = 'background-render-target-claimed-by-foreground';
+export function isBackgroundRenderForegroundClaim(signal) {
+    return signal?.reason === BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON;
+}
 export let BACKGROUND_BROWSER_RENDER_BOUNDS = {
     x: 0,
     y: 0,
@@ -216,7 +226,7 @@ export class BackgroundBrowserRenderHost {
         // ownership at dequeue time so a foreground reveal that happened while it
         // waited cannot be undone by a stale background attachment.
         if (this.isForegroundOwned(request.target)) {
-            request.controller.abort('background-render-target-claimed-by-foreground');
+            request.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
             this.settleRequest(request, 'reject', this.foregroundClaimError());
             this.startAvailableRequests();
             return;
@@ -317,7 +327,7 @@ export class BackgroundBrowserRenderHost {
             if (this.isForegroundOwned(request.target)) {
                 this.queue.splice(index, 1);
                 index -= 1;
-                request.controller.abort('background-render-target-claimed-by-foreground');
+                request.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
                 this.settleRequest(request, 'reject', this.foregroundClaimError());
                 continue;
             }
@@ -391,13 +401,13 @@ export class BackgroundBrowserRenderHost {
         for (const slot of this.slots) {
             const active = slot.activeRequest;
             if (active?.target === target) {
-                active.controller.abort('background-render-target-claimed-by-foreground');
+                active.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
             }
         }
         for (const request of [...this.queue]) {
             if (request.target !== target || !this.removeQueuedRequest(request))
                 continue;
-            request.controller.abort('background-render-target-claimed-by-foreground');
+            request.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
             this.settleRequest(request, 'reject', this.foregroundClaimError());
         }
     }

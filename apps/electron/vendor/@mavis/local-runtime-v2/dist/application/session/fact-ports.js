@@ -5,9 +5,9 @@ import { RootArchiveTitleEventProjector } from './root-application.js';
 export function createCommittedModelProviderSessionPort(input) {
     return {
         get: input.get,
-        update: async (sessionId, fields) => {
+        update: async (sessionId, fields, notice) => {
             const updated = await input.update(sessionId, fields);
-            input.onCommittedUpdate(updated);
+            input.onCommittedUpdate(updated, notice?.replacedFrom);
             return updated;
         },
     };

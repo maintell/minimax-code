@@ -1,15 +1,15 @@
 import { createProductionRunawayGuardExtension } from './runaway-guard/extension.js';
 import { streamSimple } from '@earendil-works/pi-ai';
-import { sessionReportExtension, toolOutputBudgetExtension, } from '@mavis/agent-extension';
+import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExtension, toolOutputBudgetExtension, } from '@mavis/agent-extension';
 import { describeLocalBrowserToolInput } from '@mavis/agent-tools/desktop';
-import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from '@mavis/config';
-import { ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
+import { TOOL_RESULT_COMPACTION_DEFAULTS, parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
+import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
 import { isPeekSession } from '../session-system/sessions/repo/normalization.js';
 import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, LocalAgentHost, } from './agent-host/index.js';
 import { validateCanonicalHistoryMessages } from './agent-host/history/canonical-history-validation.js';
 import { readCompactionCommitMetadata } from './agent-host/compaction/context-compaction.js';
 import { LocalContextCompactor } from './compaction/local-context-compactor.js';
-import { AutomaticContextCompactor, createAutomaticContextRequestFilterHook, } from './compaction/automatic-context-compactor.js';
+import { AutomaticContextCompactor, createAutomaticContextRequestFilterHook, createRequestMediaGuardHook, } from './compaction/automatic-context-compactor.js';
 import { ContextUsageAnchorState } from './compaction/execution/usage-anchor.js';
 import { ToolResultArchiver } from './compaction/algorithm/tool-result-archiver.js';
 import { createFileApiUploadStoreSource } from './persistence/file-api-upload.repository.js';
@@ -17,6 +17,7 @@ import { ToolOutputArtifactRepository } from './persistence/tool-output-artifact
 import { isProductionRuntimeErrorRetryable } from './runtime-error-retry-policy.js';
 import { createTodoCadenceReminderHook } from './execution/reminder/todo-cadence-reminder.js';
 import { createBackgroundCadenceReminder } from './execution/reminder/background-cadence-reminder.js';
+import { createSessionIdentityReminderHook } from './execution/reminder/session-identity-reminder.js';
 import { fitsReminderInFinalRequest } from './execution/reminder/reminder-admission.js';
 import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/session-agent-execution-snapshot.js';
 import { McpToolResultHistoryExternalizer } from './agent-host/execution/mcp-tool-result-history-externalizer.js';
@@ -95,7 +96,10 @@ export function createProductionRootArchiveTitleModel(product, nowMs) {
         ...(nowMs ? { nowMs } : {}),
     });
 }
-/** Desktop Peek adds mutation approval; BTW shares the ordinary runtime permission policy. */
+/**
+ * Desktop Peek adds mutation approval; BTW shares the ordinary runtime permission policy.
+ * A Mini App Agent session's ask waits only while its run has a listener to answer it.
+ */
 function createHostPermissionPolicy(options) {
     return {
         ...options.product.permission,
@@ -105,21 +109,27 @@ function createHostPermissionPolicy(options) {
                 return session ? session.purpose !== 'peek_btw_session' && isPeekSession(session) : false;
             },
         },
+        ...(options.miniAppApprovals ? { miniAppApprovals: options.miniAppApprovals } : {}),
     };
 }
 /** Connects the native v2 AgentHost only to injected product, owner and observer ports. */
 export async function createLocalAgentHost(options) {
+    const isSideChat = (sessionId) => options.sessions.sideChats.relation(sessionId) !== undefined;
     const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
     const contextUsageAnchor = new ContextUsageAnchorState();
     const toolOutputArtifacts = createToolOutputArtifactRepository(options);
     const getToolResultCompactionConfig = createToolResultCompactionConfigGetter(options);
+    const getRequestMediaConfig = createRequestMediaConfigGetter(options);
+    const getRecoveryDivisor = () => getRequestMediaConfig().recoveryDivisor;
+    const getImageEncoding = () => requestImageEncoding(getRequestMediaConfig().image);
     const toolResultArchiver = new ToolResultArchiver({
         writeArtifact: (input) => toolOutputArtifacts.write(input),
+        writeImageArtifact: (input) => toolOutputArtifacts.writeImage(input),
         logger: options.product.runner.logger,
         getConfig: getToolResultCompactionConfig,
     });
     const mcpToolResultHistoryExternalizer = createMcpToolResultHistoryExternalizer(options, toolOutputArtifacts, getToolResultCompactionConfig);
-    const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig);
+    const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding);
     const dependencies = await createNativeAgentHostProductionDependencies({
         sessions: {
             get: (sessionId) => options.sessions.sessions.execution.getExecutionSnapshot(sessionId),
@@ -163,7 +173,7 @@ export async function createLocalAgentHost(options) {
             config: options.product.preparation.configBuilder.config().mcpToolSearch,
             env: process.env,
         },
-        inputPreparation: options.product.inputPreparation,
+        inputPreparation: { ...options.product.inputPreparation, getImageEncoding },
         permission: createHostPermissionPolicy(options),
         runner: {
             ...options.product.runner,
@@ -172,6 +182,7 @@ export async function createLocalAgentHost(options) {
         ...optionalToolPolicyGuard(options.toolPolicyGuard),
         executor: {
             ...options.product.executor,
+            nativeDelete: () => options.product.preparation.configBuilder.config().permission?.nativeDelete === true,
             logger: options.product.runner.logger,
             backgroundCadenceReminder: createBackgroundCadenceReminder(contextUsageAnchor),
             canAppendExecutionBudgetReminder: (input, marker) => fitsReminderInFinalRequest(input, marker, contextUsageAnchor),
@@ -201,7 +212,11 @@ export async function createLocalAgentHost(options) {
             preparePluginHookSessionOwnership: options.pluginHookSessionOwnership.prepare,
             activatePluginHookSessionOwnership: options.pluginHookSessionOwnership.activate,
             afterCompactionBeforeLlmCallHooks: [
-                createAutomaticContextRequestFilterHook(),
+                createAutomaticContextRequestFilterHook((sessionId, messages) => isSideChat(sessionId)
+                    ? messages
+                    : messages.filter((message) => !isSideChatModeMessage(message))),
+                createRequestMediaGuardHook(getRecoveryDivisor),
+                createSessionIdentityReminderHook(contextUsageAnchor),
                 createTodoCadenceReminderHook(contextUsageAnchor),
             ],
             onSteeringConsumed: options.onSteeringConsumed,
@@ -216,14 +231,25 @@ export async function createLocalAgentHost(options) {
         canonicalHistory: adaptCanonicalHistory(options.sessions.canonicalHistory, options.sessions.sessions.historyMutation),
         compaction: {
             ...createContextCompactors({
+                checkpointRequestMessages: (messages) => messages.filter((message) => !isSideChatModeMessage(message)),
+                checkpointReminder: (sessionId, timestamp) => isSideChat(sessionId) ? createSideChatModeMessage(timestamp) : undefined,
                 contextUsageAnchor,
                 checkpointState: options.product.checkpointState,
                 logger: options.product.runner.logger,
                 toolResultArchiver,
                 promptSnapshots: options.product.promptSnapshots,
+                getRecoveryDivisor,
+                resolveEarlierFiles: async (sessionId) => {
+                    const [snapshots, toolOutputs] = await Promise.all([
+                        options.sessions.artifacts.resolveSnapshotsDirectory(sessionId),
+                        toolOutputArtifacts.directory(sessionId),
+                    ]);
+                    return { snapshots, toolOutputs };
+                },
             }),
             control: options.turnControl,
             lifecycle: options.sessions.agentProjection.compactionLifecycle,
+            barrier: options.sessions.sessions.historyMutation.compactionBarrier,
             observer: options.sessions.agentProjection.compactionObserver,
             ...(options.product.runner.metricsClient
                 ? { metricsClient: options.product.runner.metricsClient }
@@ -253,13 +279,15 @@ export async function createLocalAgentHost(options) {
     });
     return { host: new LocalAgentHost(dependencies), lifecycle: dependencies.lifecycle };
 }
-function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig) {
+function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding) {
     return mergeNormalExtensions([
         sessionReportExtension({
             reports: options.sessions.llmCalls,
             reportFailure: options.product.executor.reportFailure,
         }),
         createHostRunawayGuardExtension(options),
+        createHostOutputLimitRecoveryExtension(options),
+        requestMediaExtension({ getImageEncoding }),
         toolOutputBudgetExtension({
             maxInlineBytes: TOOL_RESULT_COMPACTION_DEFAULTS.maxInlineKiB * 1_024,
             getMaxInlineBytes: () => getToolResultCompactionConfig().maxInlineBytes,
@@ -295,6 +323,26 @@ function createHostRunawayGuardExtension(options) {
         reportEvent: (sessionId, event) => options.product.runner.evalReporterFactory?.reportRuntimeEvent?.(sessionId, event),
     });
 }
+function createHostOutputLimitRecoveryExtension(options) {
+    const log = (outcome) => (observation) => {
+        options.product.runner.logger?.[outcome === 'exhausted' ? 'error' : 'info']?.({
+            event: 'output_limit_recovery',
+            outcome,
+            session_id: observation.sessionId,
+            turn_id: observation.turnId,
+            attempts: observation.attempts,
+            ...(observation.truncatedToolCall === undefined
+                ? {}
+                : { truncated_tool_call: observation.truncatedToolCall }),
+            ...(observation.model === undefined ? {} : { model: observation.model }),
+        }, '[local-runtime-v2] Output limit recovery');
+    };
+    return outputLimitRecoveryExtension({
+        onRetry: log('retry'),
+        onRecovered: log('recovered'),
+        onExhausted: log('exhausted'),
+    });
+}
 function createMcpToolResultHistoryExternalizer(options, artifacts, getConfig) {
     return new McpToolResultHistoryExternalizer({
         maxInlineBytes: TOOL_RESULT_COMPACTION_DEFAULTS.mcpDetailsMaxInlineKiB * 1_024,
@@ -311,10 +359,38 @@ function createToolOutputArtifactRepository(options) {
 function createContextCompactors(input) {
     return {
         automatic: new AutomaticContextCompactor(input.contextUsageAnchor, input.checkpointState, input.logger, {
+            checkpointRequestMessages: input.checkpointRequestMessages,
+            checkpointReminder: input.checkpointReminder,
             toolResultArchiver: input.toolResultArchiver,
             promptSnapshots: input.promptSnapshots,
+            getRecoveryDivisor: input.getRecoveryDivisor,
+            resolveEarlierFiles: input.resolveEarlierFiles,
         }),
-        manual: new LocalContextCompactor(input.checkpointState, input.logger, input.promptSnapshots),
+        manual: new LocalContextCompactor(input.checkpointState, input.logger, input.promptSnapshots, {
+            imageFileWriter: input.toolResultArchiver,
+            resolveEarlierFiles: input.resolveEarlierFiles,
+            reminder: input.checkpointReminder,
+            projectRequestMessages: input.checkpointRequestMessages,
+        }),
+    };
+}
+function createRequestMediaConfigGetter(options) {
+    return () => {
+        let raw;
+        try {
+            raw = options.product.preparation.configBuilder.config().requestMedia;
+        }
+        catch {
+            raw = undefined;
+        }
+        return parseRequestMediaConfig(raw);
+    };
+}
+function requestImageEncoding(image) {
+    return {
+        maxWidth: image.max_width,
+        maxHeight: image.max_height,
+        maxBase64Bytes: image.max_base64_bytes,
     };
 }
 function createToolResultCompactionConfigGetter(options) {
@@ -524,7 +600,12 @@ function adaptCanonicalHistory(provider, mutation) {
                 summary: metadata.summary,
                 ...(metadata.currentUserSourceIndex === undefined
                     ? {}
-                    : { currentUserSourceIndex: metadata.currentUserSourceIndex }),
+                    : {
+                        currentUserSourceIndex: metadata.currentUserSourceIndex,
+                        ...(metadata.placedMarkerCount === undefined
+                            ? {}
+                            : { placedMarkerCount: metadata.placedMarkerCount }),
+                    }),
             };
             if (metadata.method !== 'llm_checkpoint') {
                 const committed = await provider.compact({

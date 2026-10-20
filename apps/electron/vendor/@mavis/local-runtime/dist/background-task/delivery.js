@@ -4,7 +4,7 @@ import { isLocalChildWorkerSession } from '../sessions/session-policy.js';
 import { isTerminalTaskStatus } from './domain.js';
 import { startConversationBackgroundTaskDeliveryTurn } from './conversation-delivery.js';
 import { createDeliveryTaskPreview, selectDeliveryBatch } from './delivery-batch.js';
-import { isTaskDeliverySuppressed, isUserStopWindowOpen } from './user-stop-suppression.js';
+import { isTaskDeliverySuppressed, isUserStopWindowOpen, userStopAdmissionHold, } from './user-stop-suppression.js';
 const DELIVERY_RETRY_DELAYS_MS = [1_000, 2_000, 5_000];
 const DELIVERY_BURST_WINDOW_MS = 60_000;
 const DELIVERY_RECOVERY_INITIAL_MS = 60_000;
@@ -88,12 +88,10 @@ async function deliverBatch(host, ownerSessionId, previews, taskIds) {
         // retry would say the same thing, so `skipped` (no reschedule) is correct.
         if (closedHosts.has(host) || tasks.length === 0)
             return 'skipped';
-        // Gate 1 again, after every await above. A stop that begins while this batch
-        // was reading the snapshot or re-reading its tasks opened the window after the
-        // first check, and its targets may not be registered yet — e.g. the Turn had
-        // ended and only background work remained, which is exactly what a user stop
-        // is for. Known bound: the few synchronous steps between this check and the
-        // ingress accepting the steer are not covered; that gap is sub-millisecond.
+        // Gate 1 again, after every await above. This catches a stop early and avoids
+        // an unnecessary ingress call. The pre-delivery hook below is the final
+        // guarantee: a window there stays `busy`; known targets become `skipped` only
+        // when every task named to the model is suppressed.
         if (isUserStopWindowOpen(host, ownerSessionId)) {
             recordDeliverySuppressed(host, 'user_stop_window_recheck');
             logDeliverySuppressed(host, ownerSessionId, taskIds, 'user_stop_window_recheck');
@@ -109,6 +107,15 @@ async function deliverBatch(host, ownerSessionId, previews, taskIds) {
             // named to the model even though they still key this batch.
             batchTaskIds: taskIds,
             observedTerminalCount: snapshot.terminalTotal,
+            holdAtAdmission: (admission) => {
+                const hold = userStopAdmissionHold(host, ownerSessionId, tasks.map((task) => task.taskId));
+                if (!hold)
+                    return undefined;
+                const count = 'suppressedIds' in hold ? hold.suppressedIds.length : 1;
+                recordDeliverySuppressed(host, hold.reason, count);
+                logDeliverySuppressed(host, ownerSessionId, 'suppressedIds' in hold ? hold.suppressedIds : taskIds, hold.reason, { ...admission, result: hold.result });
+                return hold.result;
+            },
         });
         delivered = result === 'delivered';
         return result;
@@ -127,13 +134,14 @@ function recordDeliverySuppressed(host, reason, count = 1) {
         // Telemetry must not turn a deliberate suppression into a retry storm.
     }
 }
-function logDeliverySuppressed(host, ownerSessionId, taskIds, reason) {
+function logDeliverySuppressed(host, ownerSessionId, taskIds, reason, admission) {
     try {
         logger.info({
             event: 'background_task_delivery_suppressed',
             sessionId: ownerSessionId,
             taskIds: [...taskIds],
             reason,
+            ...(admission ?? {}),
         }, 'Suppressed local background task delivery after a user stop');
     }
     catch {

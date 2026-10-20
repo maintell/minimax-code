@@ -27,10 +27,41 @@ const updateSession = Type.Object({
 const prompt = nonblank('Task instructions. State the intended result and when follow-up is complete.');
 const timezone = Type.Optional(nonblank('IANA timezone for the schedule.'));
 const schedule = Type.Optional(nonblank('Five-field cron expression for a recurring task.'));
-const enabled = Type.Optional(Type.Boolean({ description: 'false pauses the task; true resumes it.' }));
+/**
+ * 把数字形态的任务 ID 还原成 schema 要求的 string。
+ *
+ * 模型看到的 ID 来自工具输出,而输出侧 `coerceI64IdFields` 已把 i64 ID 统一
+ * 转成 string;模型读到 15 位数字串后常按直觉续写成 JSON number,于是
+ * `Type.String` 校验失败,白转一圈。公开 schema 保持 string —— ID 在 wire 上
+ * 本来就是 string(mavis 工具 description 已写明这条约定),放宽成 union 只会
+ * 让模型失去唯一预期。
+ *
+ * 只转 `Number.isSafeInteger` 的值:更大的 snowflake 在模型侧 JSON.parse 那一刻
+ * 精度就已丢失,字符串化等于把错误的 ID 送到后端查无此行,比现在这个响亮的
+ * schema 报错更糟。这类值原样交回校验层。
+ */
+function normalizeNumericId(args, idField) {
+    if (!args || typeof args !== 'object' || Array.isArray(args))
+        return args;
+    const record = args;
+    const id = record[idField];
+    if (typeof id !== 'number' || !Number.isSafeInteger(id))
+        return args;
+    return { ...record, [idField]: String(id) };
+}
+function cronPrepareArguments(idField) {
+    return (args) => normalizeNumericId(args, idField);
+}
 export function cronToolDefinitions(idField) {
+    // Local models can serialize booleans as JSON strings. Accept only the two
+    // unambiguous spellings; the local tool normalizes them before domain validation.
+    const enabled = Type.Optional(idField === 'cron_id'
+        ? Type.Union([Type.Boolean(), Type.Literal('true'), Type.Literal('false')], {
+            description: 'false pauses the task; true resumes it. Prefer JSON booleans.',
+        })
+        : Type.Boolean({ description: 'false pauses the task; true resumes it.' }));
     const identity = {
-        [idField]: nonblank('Exact scheduled-task ID returned by cron_read or cron_create.'),
+        [idField]: nonblank('Exact scheduled-task ID returned by cron_read or cron_create. Pass it as a string — snowflake IDs exceed safe integer range once quoted values are lost.'),
     };
     return [
         {
@@ -56,13 +87,16 @@ export function cronToolDefinitions(idField) {
                 model: Type.Optional(nonblank(idField === 'cron_id'
                     ? 'User-selected model name; omit to inherit the current model. Ambiguity returns candidates without creating a task.'
                     : 'Exact provider/model_id. Omit to inherit the current model.')),
-                project: Type.Optional(nonblank('Project name, ID or local workspace path; omit to inherit the current task’s project.')),
+                project: Type.Optional(nonblank(idField === 'cron_id'
+                    ? 'Absolute workspace path on the execution host. An existing target session must already use this directory. Omit to retain defaults.'
+                    : 'Project name, ID or local workspace path; omit to inherit the current task’s project.')),
             }, { additionalProperties: false }),
         },
         {
             name: 'cron_read',
             loading: 'on_demand',
             description: 'List scheduled tasks, inspect a task, or read its run history.',
+            prepareArguments: cronPrepareArguments(idField),
             schema: Type.Object({
                 view: Type.String({
                     enum: ['list', 'detail', 'runs'],
@@ -78,8 +112,20 @@ export function cronToolDefinitions(idField) {
             name: 'cron_update',
             loading: 'on_demand',
             description: `Update or pause/resume a scheduled task. ${idField === 'cron_id' ? 'Self-reminder sessions, models and workspaces stay fixed. ' : ''}Run immediately from the scheduling UI.`,
+            prepareArguments: cronPrepareArguments(idField),
             schema: Type.Object({
                 ...identity,
+                ...(idField === 'cron_id'
+                    ? {
+                        cron_name: Type.Optional(nonblank('Natural-language task title.')),
+                        project: Type.Optional(Type.String({
+                            description: 'Absolute workspace path on the execution host; must match an existing target session. Omit to keep the override; empty string clears it.',
+                        })),
+                        model: Type.Optional(Type.String({
+                            description: 'Exact provider/model or model ID. Omit to keep the override; empty string clears it. Does not change shared settings.',
+                        })),
+                    }
+                    : {}),
                 schedule,
                 timezone,
                 enabled,
@@ -91,6 +137,7 @@ export function cronToolDefinitions(idField) {
             name: 'cron_delete',
             loading: 'on_demand',
             description: 'Delete a scheduled task and stop future runs. Keep run history and conversations.',
+            prepareArguments: cronPrepareArguments(idField),
             schema: Type.Object(identity, { additionalProperties: false }),
         },
     ];

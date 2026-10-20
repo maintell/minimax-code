@@ -79,13 +79,16 @@ export function assembleChannelSystemOwner(options) {
         }
         return wired.startChannelSubsystem();
     };
-    const guardedShutdown = async () => {
-        if (closed) {
-            logger.info({ agentName: options.wire.agentName, stage: 'channel_shutdown' }, 'Channel shutdown repeated: already closed (idempotent no-op)');
-            return;
-        }
+    let shutdown;
+    const guardedShutdown = () => {
+        if (shutdown)
+            return shutdown;
         closed = true;
-        await hostFacadePort.shutdownChannelSubsystem();
+        shutdown = (async () => {
+            await wired.stopChannelStartup();
+            await hostFacadePort.shutdownChannelSubsystem();
+        })();
+        return shutdown;
     };
     const guardedFacadePort = {
         ...hostFacadePort,

@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, gt, inArray, sql } from 'drizzle-orm';
-import { sessionLocks, turnIngress, turnIngressClientRequests, turnIngressSequences, } from '../../../infra/db/schema/turn.js';
+import { sessionLocks, isDeletionOwnerKind, turnIngress, turnIngressClientRequests, turnIngressSequences, } from '../../../infra/db/schema/turn.js';
 import { COMPACTION_DELETING_OWNER_KIND, createRecoveredTerminalFact, DELETION_FENCE_EXPIRES_AT_MS, MAINTENANCE_DELETING_OWNER_KIND, MAINTENANCE_OWNER_KIND, recoverDeadLegacyOwnerInTransaction, recoverExpiredInTransaction, recoverProcessRestartInTransaction, shouldRecoverStalledLegacyTurnLease, SESSION_DELETION_OWNER_KIND, TURN_DELETING_OWNER_KIND, } from './turn-lease-recovery.js';
 import { createPluginHookSessionPersistence } from './plugin-hook-session.repository.js';
-import { persistedTurnConsumesQueuePause, publishQueueFacts, } from './turn-queue-pause-persistence.js';
+import { findClientRequestBindings, insertReceiptAliases, persistedTurnConsumesQueuePause, publishQueueFacts, } from './turn-ingress-persistence.js';
 const DEFAULT_LEASE_MS = 30 * 60 * 1_000;
 export function createTurnRepository(options) {
     const nowMs = options.nowMs ?? Date.now;
@@ -139,6 +139,7 @@ export function createTurnRepository(options) {
         findSteeringReceipt: (input) => findSteeringReceipt(options, input),
         reserveSteeringReceipt: (input) => reserveSteeringReceipt(options, input),
         releaseSteeringReceipt: (input) => releaseSteeringReceipt(options, input),
+        findClientRequestBindings: async (input) => findClientRequestBindings(options.db, input),
         revokeAdmission: (input) => revokeAdmission(options, input, nowMs()),
         isAcceptedInTransaction: (db, query) => Boolean(findAcceptedQueueTurn(db, query)),
         markAcknowledgedInTransaction: (db, query) => {
@@ -401,13 +402,17 @@ async function reserveSteeringReceipt(options, input) {
             ordinal: 0,
         })
             .run();
+        insertReceiptAliases(tx, input);
         return { status: 'reserved' };
     }, { behavior: 'immediate' });
 }
 async function releaseSteeringReceipt(options, input) {
     options.db.transaction((tx) => {
         tx.delete(turnIngressClientRequests)
-            .where(and(eq(turnIngressClientRequests.sessionId, input.sessionId), eq(turnIngressClientRequests.clientRequestId, input.clientRequestId), eq(turnIngressClientRequests.turnId, input.turnId)))
+            .where(and(eq(turnIngressClientRequests.sessionId, input.sessionId), inArray(turnIngressClientRequests.clientRequestId, [
+            input.clientRequestId,
+            ...(input.receiptAliases ?? []),
+        ]), eq(turnIngressClientRequests.turnId, input.turnId)))
             .run();
     }, { behavior: 'immediate' });
 }
@@ -624,12 +629,6 @@ function deletionPendingOwnerKind(ownerKind) {
     }
     return undefined;
 }
-function isDeletionOwnerKind(ownerKind) {
-    return (ownerKind === SESSION_DELETION_OWNER_KIND ||
-        ownerKind === TURN_DELETING_OWNER_KIND ||
-        ownerKind === COMPACTION_DELETING_OWNER_KIND ||
-        ownerKind === MAINTENANCE_DELETING_OWNER_KIND);
-}
 function findAcceptedQueueTurn(db, query) {
     const receipt = db
         .select()
@@ -818,6 +817,7 @@ function insertAdmission(tx, input, lease) {
             ordinal: 0,
         })
             .run();
+        insertReceiptAliases(tx, input);
     }
     return { status: 'accepted', leaseId, acceptedSequence: sequence, acceptedAtMs: nowMs };
 }

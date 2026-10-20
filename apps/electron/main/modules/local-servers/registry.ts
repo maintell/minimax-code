@@ -1,4 +1,5 @@
 import { extractLocalServerOrigins } from "./url-extractor";
+import { LOCAL_DESKTOP_RUNTIME_ID } from "@mavis/shared/desktop-runtime";
 const MAX_SERVERS_PER_SESSION = 20;
 const PARTIAL_LINE_CAP = 2048;
 const PROBE_CACHE_TTL_MS = 3000;
@@ -29,6 +30,9 @@ export class LocalServerRegistry {
         this.now = options?.now ?? Date.now;
     }
     ingest(event) {
+        // Remote loopback is not this machine's loopback. Missing provenance also fails closed.
+        if (event.runtimeId !== LOCAL_DESKTOP_RUNTIME_ID)
+            return;
         const sessionId = event.sessionId;
         if (!sessionId)
             return;

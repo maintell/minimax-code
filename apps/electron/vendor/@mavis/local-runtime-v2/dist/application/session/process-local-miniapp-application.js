@@ -9,22 +9,31 @@ export function createProcessLocalMiniAppApplication(plugins, supervisor) {
             throw applicationError('NOT_FOUND');
         return miniApp;
     };
-    const launch = (miniApp, status) => {
+    /** Coordinates of the accepting run serving `pluginId`, or undefined when none is. */
+    const currentRun = (pluginId, status) => {
         const active = status?.active;
+        const credential = supervisor.launchCredential(pluginId);
         if (status?.phase !== 'active' ||
             !active?.origin ||
             !active.processGeneration ||
-            active.pluginId !== miniApp.pluginId) {
-            throw applicationError(status?.failureCode ?? 'RUNTIME_FAILED');
+            active.pluginId !== pluginId ||
+            credential?.origin !== active.origin ||
+            credential.processGeneration !== active.processGeneration) {
+            return undefined;
         }
         return {
-            miniApp: summary(miniApp, status),
-            launch: {
-                origin: active.origin,
-                surfacePath: active.surfacePath,
-                runId: active.processGeneration,
-            },
+            origin: active.origin,
+            surfacePath: active.surfacePath,
+            runId: active.processGeneration,
+            loopbackToken: credential.loopbackToken,
+            ...(active.surfaceWindow ? { window: active.surfaceWindow } : {}),
         };
+    };
+    const launch = (miniApp, status) => {
+        const run = currentRun(miniApp.pluginId, status);
+        if (!run)
+            throw applicationError(status?.failureCode ?? 'RUNTIME_FAILED');
+        return { miniApp: summary(miniApp, status), launch: run };
     };
     const open = async (pluginId, signal) => {
         signal?.throwIfAborted();
@@ -53,6 +62,20 @@ export function createProcessLocalMiniAppApplication(plugins, supervisor) {
         stop: async ({ pluginId, signal }) => {
             await requireDefinition(pluginId);
             await plugins.stopMiniApp({ pluginId, ...(signal ? { signal } : {}) });
+        },
+        // Read-only: unlike open, this never calls ensureMiniAppStarted.
+        credential: async ({ pluginId, signal }) => {
+            signal?.throwIfAborted();
+            const run = currentRun(pluginId, supervisor.inspect(pluginId)[0]);
+            return run
+                ? {
+                    credential: {
+                        origin: run.origin,
+                        runId: run.runId,
+                        loopbackToken: run.loopbackToken,
+                    },
+                }
+                : { running: false };
         },
     };
 }

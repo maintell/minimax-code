@@ -16,16 +16,14 @@
  *      normal ASK so auto mode can route them through the classifier gate
  *      (handled by PermissionService, not here).
  */
-import { logger, backgroundCtx } from '../host-utils.js';
 import { recordWrite } from '../written-files-registry.js';
 import { validateGlobPattern } from './fs-permission.js';
 import { evaluatePathCapability, generateSuggestionRules } from './path-capability.js';
-const WRITE_TOOLS = new Set(['edit', 'write', 'append']);
+import { extractFilePath, toolActionForFsTool, WRITE_TOOLS } from './fs-input.js';
 export class FsToolPermissionChecker {
     checkPermissions(toolName, 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     input, context) {
-        logger.info(backgroundCtx(), `FsToolPermissionChecker checkPermissions called, toolName=${toolName}, input=${JSON.stringify(input)}, context=${JSON.stringify(context)}`);
         // Glob tool: validate pattern first
         if (toolName === 'glob') {
             const pattern = typeof input.pattern === 'string' ? input.pattern : undefined;
@@ -40,7 +38,7 @@ export class FsToolPermissionChecker {
             }
         }
         // Extract file path from input
-        const filePath = extractFilePath(input) ??
+        const filePath = extractFilePath(toolName, input) ??
             (toolName === 'grep' || toolName === 'glob' || toolName === 'list'
                 ? context.workingDirectory
                 : undefined);
@@ -86,19 +84,5 @@ export class FsToolPermissionChecker {
             return;
         recordWrite(sessionId, filePath);
     }
-}
-function toolActionForFsTool(toolName) {
-    return WRITE_TOOLS.has(toolName) ? 'write' : 'read';
-}
-/** Extract the primary file path from a tool's input object. */
-function extractFilePath(input) {
-    if (typeof input.file_path === 'string' && input.file_path)
-        return input.file_path;
-    if (typeof input.filePath === 'string' && input.filePath)
-        return input.filePath;
-    if (typeof input.path === 'string' && input.path)
-        return input.path;
-    // A search pattern is not a filesystem path. Directory tools default to cwd.
-    return undefined;
 }
 //# sourceMappingURL=fs-checker.js.map

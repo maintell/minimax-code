@@ -39,6 +39,10 @@ export const SessionKind = {
 export const SessionCollaborationKind = {
     LocalCloudHandoff: 1,
 };
+export const SideChatMutationState = {
+    Pending: 0,
+    Committed: 1,
+};
 export const AppId = {
     Glow: 1,
     MakeAI: 2,
@@ -95,6 +99,10 @@ export const PluginInstallationPolicy = {
 export const PluginShowcaseMediaType = {
     IMAGE: 1,
     VIDEO: 2,
+    PPT: 3,
+    WORD: 4,
+    EXCEL: 5,
+    PDF: 6,
 };
 export const InstalledPluginSource = {
     OFFICIAL: 1,
@@ -212,6 +220,15 @@ export const LocalMcpTransport = {
     StreamableHttp: 3,
     Sse: 4,
 };
+export const LocalHookScope = {
+    USER: 1,
+    PROJECT: 2,
+};
+export const LocalHookSource = {
+    USER: 1,
+    PROJECT: 2,
+    PLUGIN: 3,
+};
 export const FeedbackStatus = {
     FEEDBACK_STATUS_UNSPECIFIED: 0,
     PROCESSING: 1,
@@ -221,6 +238,12 @@ export const FeedbackClientType = {
     FEEDBACK_CLIENT_UNSPECIFIED: 0,
     DESKTOP: 1,
     WEB: 2,
+};
+export const FeedbackCategory = {
+    FEEDBACK_CATEGORY_UNSPECIFIED: 0,
+    MODEL_QUALITY: 1,
+    APP_BUG: 2,
+    OTHER: 3,
 };
 export const WebsiteManagementCode = {
     OK: 0,

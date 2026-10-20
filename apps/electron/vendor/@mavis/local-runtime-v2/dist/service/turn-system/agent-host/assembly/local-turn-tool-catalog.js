@@ -1,11 +1,16 @@
 import { CRON_TOOL_NAMES, createLocalBashToolDefinition, resolveLocalBashShell, applyToolLoading, filterCanonicalBuiltinMcpEntries, filterCanonicalNativeToolCeiling, createMcpInvokeTool, createToolSearchTool, getSuppressedToolNamesForModelCapabilities, isCanonicalBuiltinTurn, modelInWhitelist, planMcpDisclosure, renderMcpToolSearchHintBlock, } from '@mavis/agent-tools';
 import { AGENT_BUILTIN_MCP_TOOL_IDS, AGENT_BUILTIN_TOOL_IDS } from '@mavis/config';
 import { mergeAgentHostTurnCapabilities } from './local-turn-plugin-capabilities.js';
-export function prepareBashTurnTools(admittedTools, background) {
+export function prepareBashTurnTools(admittedTools, background, nativeDelete = false, agentShell) {
     const hasNativeBash = admittedTools.some((tool) => tool.def.name === 'bash' && (tool.source === undefined || tool.source === 'builtin'));
+    const unboundShell = process.platform === 'win32' ? 'unavailable' : undefined;
+    const sessionShell = agentShell
+        ? { 'git-bash': 'bash', 'windows-powershell': 'powershell', pwsh: 'pwsh' }[agentShell.family]
+        : unboundShell;
     const bashCapabilities = {
         background,
-        shell: hasNativeBash ? resolveLocalBashShell() : 'unavailable',
+        shell: hasNativeBash ? (sessionShell ?? resolveLocalBashShell()) : 'unavailable',
+        nativeDelete,
     };
     return admittedTools.map((tool) => {
         if (tool.def.name !== 'bash' || (tool.source !== undefined && tool.source !== 'builtin'))

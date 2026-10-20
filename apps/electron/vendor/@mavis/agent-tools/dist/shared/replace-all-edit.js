@@ -10,7 +10,7 @@
  * here; pi does the read-verify-write on the (now unique) full content
  * edit.
  */
-import { readFile as fsReadFile } from 'fs/promises';
+import { readFile as fsReadFile } from './physical-fs.js';
 export class ReplaceAllError extends Error {
     code;
     constructor(message, code) {

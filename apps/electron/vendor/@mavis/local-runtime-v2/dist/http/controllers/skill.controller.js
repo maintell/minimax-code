@@ -1,6 +1,7 @@
 import { HTTPException } from 'hono/http-exception';
 import { SkillControllerBase } from '../generated/skill-controller-base.gen.js';
 import { AppError, NotImplementedError } from '../errors.js';
+import { AgentServiceError } from '../../service/agent/index.js';
 export class SkillController extends SkillControllerBase {
     service;
     constructor(service = unimplementedSkillService) {
@@ -79,10 +80,12 @@ async function preserveSkillError(action) {
         return await action();
     }
     catch (error) {
-        if (error instanceof AppError)
+        if (error instanceof AppError || error instanceof AgentServiceError) {
+            const code = error instanceof AppError ? error.key : error.code;
             throw new HTTPException(error.status, {
-                res: Response.json({ error: error.message, code: error.key }, { status: error.status }),
+                res: Response.json({ error: error.message, code }, { status: error.status }),
             });
+        }
         throw error;
     }
 }

@@ -30,6 +30,10 @@ export function threadGoalRearmClientRequestId(goal) {
 export function threadGoalBudgetLimitClientRequestId(goal) {
     return threadGoalContinuationClientRequestId(`budget-limit:${goal.goalId}:${goal.updatedAt}`);
 }
+/** The worker proposal is stable even when verifier/summary usage advances the Goal epoch. */
+export function threadGoalCompletionClientRequestId(goalId, proposalTurnId) {
+    return threadGoalContinuationClientRequestId(`completion:${goalId}:${proposalTurnId}`);
+}
 export function buildThreadGoalKickoffMessage(goal, content, attachments = []) {
     return {
         content,
@@ -55,7 +59,11 @@ export function buildThreadGoalKickoffMessage(goal, content, attachments = []) {
 export function buildThreadGoalContinuationMessage(goal, content, kind) {
     return {
         content,
-        attachments: [],
+        // A pause may retire the initial Queue item before it ever starts. Keep its
+        // inputs on the first resumed Goal turn, not on later turns or summaries.
+        attachments: kind === 'active' && goal.turnsUsed === 0
+            ? (goal.kickoffAttachments ?? []).map((attachment) => ({ ...attachment }))
+            : [],
         origin: {
             type: THREAD_GOAL_CONTINUATION_ORIGIN_TYPE,
             goalId: goal.goalId,
@@ -106,7 +114,9 @@ export function readThreadGoalContinuationOrigin(value) {
     if (!isUnixMs(record.goalUpdatedAt) || typeof record.objectiveDigest !== 'string') {
         return undefined;
     }
-    if (record.kind !== 'active' && record.kind !== 'budget-limit')
+    if (record.kind !== 'active' &&
+        record.kind !== 'budget-limit' &&
+        record.kind !== 'completion-summary')
         return undefined;
     return {
         type: THREAD_GOAL_CONTINUATION_ORIGIN_TYPE,

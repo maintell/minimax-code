@@ -99,9 +99,9 @@ export function createSecretFreeModelContextAssemblyContext(scope) {
 }
 function projectTurnIntent(provenance) {
     const origin = readRecord(provenance.sourceContext?.origin);
-    if (isGoalBudgetSummaryOrigin(origin)) {
-        return { kind: 'goal-budget-summary' };
-    }
+    const goalSummaryIntent = projectGoalSummaryIntent(provenance, origin);
+    if (goalSummaryIntent)
+        return goalSummaryIntent;
     const cloudHandoff = readRecord(provenance.sourceContext?.cloudHandoff);
     if (cloudHandoff.trigger === 'slash') {
         return { kind: 'cloud-handoff', attributes: { trigger: 'slash' } };
@@ -144,6 +144,13 @@ function projectCodeReviewIntent(review) {
 }
 function isGoalBudgetSummaryOrigin(origin) {
     return origin.type === 'thread-goal-continuation' && origin.kind === 'budget-limit';
+}
+function projectGoalSummaryIntent(provenance, origin) {
+    if (provenance.source === 'thread-goal' &&
+        origin.type === 'thread-goal-continuation' &&
+        origin.kind === 'completion-summary')
+        return { kind: 'goal-completion-summary' };
+    return isGoalBudgetSummaryOrigin(origin) ? { kind: 'goal-budget-summary' } : undefined;
 }
 function projectResolvedModel(preparation) {
     const configured = readRecord(preparation.agentConfig.model);

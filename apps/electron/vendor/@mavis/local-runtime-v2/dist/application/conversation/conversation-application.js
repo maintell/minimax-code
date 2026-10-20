@@ -98,28 +98,35 @@ export class ConversationApplication {
         return error ? streamOpenError(error.status, error.key, error.message) : undefined;
     }
     async reviewAdmissionError(req) {
-        if (!req.reviewRequest)
-            return undefined;
-        if (req.reviewRequest.scope !== 'local_changes') {
-            return new ApplicationError(400, 'local_review_scope_unsupported', 'Only reviewRequest.scope="local_changes" is supported.');
-        }
-        const session = await this.options.sessionReader.find(req.id);
-        if (session && (session.appMode ?? 'coding') !== 'coding') {
-            return new ApplicationError(400, 'local_review_coding_mode_required', 'Built-in code review is only available in coding mode.');
-        }
-        return undefined;
+        return reviewAdmissionError(req, (id) => this.options.sessionReader.find(id));
     }
     async resumeSession(_ctx, req) {
         return this.withSessionLifecycle('resume', async () => {
+            const activeSide = this.options.sideChats.relation(req.id) !== undefined;
             const session = await this.options.sessionReader.find(req.id);
             if (!session) {
                 return streamOpenError(404, 'local_session_not_found', `Session not found: ${req.id}`);
             }
             const frames = this.options.stream.resume({
                 sessionId: req.id,
-                ...(req.afterMsgId ? { afterMsgId: req.afterMsgId } : {}),
-                ...(req.afterCursor ? { afterCursor: req.afterCursor } : {}),
-                waitForTerminal: shouldWaitForTerminal(req.drainQueued === true || req.continuePausedQueue === true, session.status),
+                ...resumeAnchors(req, activeSide),
+                waitForTerminal: activeSide
+                    ? async (lastTerminalTurnId) => {
+                        const pending = await this.options.queue.snapshot(req.id);
+                        const current = await this.options.sessionReader.find(req.id);
+                        if (!current)
+                            return false;
+                        if (shouldWaitForTerminal(req.drainQueued === true ||
+                            req.continuePausedQueue === true ||
+                            (pending.pendingCount > 0 && !pending.pause), current.status))
+                            return true;
+                        // Admission precedes Session started, but terminal projection also
+                        // precedes lease release. Only wait for a Turn whose terminal was
+                        // not already captured at the subscription's replay boundary.
+                        const activeTurn = await this.getActiveTurn(req.id);
+                        return activeTurn !== undefined && activeTurn.turnId !== lastTerminalTurnId;
+                    }
+                    : shouldWaitForTerminal(req.drainQueued === true || req.continuePausedQueue === true, session.status),
             });
             try {
                 if (req.continuePausedQueue) {
@@ -185,9 +192,9 @@ export class ConversationApplication {
         }
     }
     async enqueueMessage(_ctx, req) {
-        const reviewAdmissionError = await this.reviewAdmissionError(req);
-        if (reviewAdmissionError)
-            throw reviewAdmissionError;
+        const reviewError = await this.reviewAdmissionError(req);
+        if (reviewError)
+            throw reviewError;
         let result;
         let discardCreated = async () => undefined;
         try {
@@ -273,6 +280,13 @@ function queueContinueApplicationError(result, sessionId) {
     }
     return new ApplicationError(409, 'local_queue_continue_not_ready', 'The paused Queue head could not be started');
 }
+function resumeAnchors(req, activeSide) {
+    return {
+        ...(req.afterMsgId ? { afterMsgId: req.afterMsgId } : {}),
+        ...(req.afterCursor ? { afterCursor: req.afterCursor } : {}),
+        ...(activeSide && !req.afterMsgId && !req.afterCursor ? { replayFromStart: true } : {}),
+    };
+}
 function shouldWaitForTerminal(drainQueued, status) {
     return drainQueued === true || status === 'started';
 }
@@ -296,7 +310,7 @@ function requireNonEmpty(value) {
         return undefined;
     return value.trim().length === 0 ? undefined : value;
 }
-async function toDirectSendInput(req, registration) {
+export async function toDirectSendInput(req, registration) {
     const executionOptions = directExecutionOptions(req);
     const materialized = await materializeLocalAttachmentInputs(registration, {
         sessionId: req.id,
@@ -524,6 +538,7 @@ function normalizedRetryClientIntent(clientIntent, content, hasAttachments) {
 function toAgentHostUserInput(req, text, attachments) {
     return {
         text,
+        ...(req.computerUse ? { computerUse: structuredClone(req.computerUse) } : {}),
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(req.model ? { model: toUserModelSelection(req.model) } : {}),
         ...(req.computerUse ? { computerUse: { enable: req.computerUse.enable } } : {}),
@@ -668,9 +683,9 @@ function genericRejectionError(reason, sessionId) {
     if (reason === 'ingress-conflict') {
         return new ApplicationError(409, 'local_turn_ingress_conflict', 'Turn ingress conflicts');
     }
-    const planError = planRejectionError(reason);
-    if (planError)
-        return planError;
+    const policyError = policyRejectionError(reason);
+    if (policyError)
+        return policyError;
     if (reason === 'duplicate') {
         return new ApplicationError(409, 'local_turn_duplicate', 'Turn was already accepted');
     }
@@ -685,7 +700,10 @@ function genericRejectionError(reason, sessionId) {
     }
     return new ApplicationError(409, 'local_session_busy', 'Session already has an active Turn. Retry with queueing enabled to deliver it later.');
 }
-function planRejectionError(reason) {
+function policyRejectionError(reason) {
+    if (reason === 'policy:runtime:draining') {
+        return new ApplicationError(503, 'local_runtime_draining', 'MCode is preparing to restart. Retry after reconnecting.');
+    }
     if (reason === 'policy:plan:lifecycle-active') {
         return new ApplicationError(409, 'local_plan_lifecycle_active', 'Plan review processing must finish before this request can run');
     }
@@ -697,6 +715,18 @@ function planRejectionError(reason) {
     }
     if (reason === 'policy:plan:mode-conflict') {
         return new ApplicationError(409, 'local_plan_mode_conflict', 'Session mode changed before Plan Mode entry');
+    }
+    return undefined;
+}
+export async function reviewAdmissionError(req, findSession) {
+    if (!req.reviewRequest)
+        return undefined;
+    if (req.reviewRequest.scope !== 'local_changes') {
+        return new ApplicationError(400, 'local_review_scope_unsupported', 'Only reviewRequest.scope="local_changes" is supported.');
+    }
+    const session = await findSession(req.id);
+    if (session && (session.appMode ?? 'coding') !== 'coding') {
+        return new ApplicationError(400, 'local_review_coding_mode_required', 'Built-in code review is only available in coding mode.');
     }
     return undefined;
 }

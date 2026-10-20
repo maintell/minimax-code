@@ -9,7 +9,7 @@
  *   rc:status-changed  main→renderer   RCStatus push on every change
  *   rc:get-device-name renderer→main   optional stable host name for pairing metadata
  *   rc:binding-ready   renderer→main   fresh credentials → spin up / retry WS
- *   rc:refresh-binding main→renderer   ask renderer to re-sign GET /binding
+ *   rc:refresh-binding main→renderer   ask renderer to re-sign GET /desktop/bindings
  *   rc:binding-lost    renderer→main   state=none → disconnect (only exit)
  *
  * Main-process lifecycle wiring:
@@ -25,6 +25,7 @@ import { IPC_CHANNELS, DOMAIN_URL } from "../../config/constants";
 import { isDev, isTest, isStaging } from "../../config/env";
 import { getDesktopConfig, getUserInfo, onSwimLaneNameChanged, onUserInfoChanged } from "../../ipc/storage.ipc";
 import { handleLocalRuntimeRequest, isLocalRuntimeReady } from "../local-runtime";
+import { setRemoteAccessEnabled } from "../power";
 import { createRcAuditLogger } from "./audit-log";
 import { getHostDeviceName } from "./device-name";
 import { createRemoteControlGlobalEventSource } from "./global-events";
@@ -64,6 +65,9 @@ const RC_CHANNELS = [
     IPC_CHANNELS.RC_BINDING_READY,
     IPC_CHANNELS.RC_BINDING_LOST,
     IPC_CHANNELS.RC_MARK_UNBOUND,
+    IPC_CHANNELS.RC_BEGIN_UNBIND,
+    IPC_CHANNELS.RC_GET_PENDING_UNBIND,
+    IPC_CHANNELS.RC_RESOLVE_UNBIND,
     IPC_CHANNELS.RC_PUBLISH_SESSION_COMPOSER_MODE,
 ];
 export function resolveCurrentUserId(user) {
@@ -153,7 +157,7 @@ function buildDefaultProxy(logger, bridge) {
         isRuntimeHealthy: () => isLocalRuntimeReady(),
         getCurrentUserId: () => resolveCurrentUserId(getUserInfo()),
         getWebSocketHeaders,
-        // Reverse loop: main can't sign GET /binding, so ask the renderer to
+        // Reverse loop: main can't sign GET /desktop/bindings, so ask the renderer to
         // re-sign and push credentials back (self-heal design §4.2).
         requestRendererRefresh: () => broadcastRefreshBinding(logger),
         onSessionComposerModeChange: broadcastSessionComposerMode,
@@ -185,6 +189,13 @@ function broadcastStatus(status) {
         }
     }
 }
+function remoteAccessEnabled(status) {
+    return status.binding_id !== undefined && status.phase !== 'unbound';
+}
+function handleRemoteControlStatus(status) {
+    setRemoteAccessEnabled(remoteAccessEnabled(status));
+    broadcastStatus(status);
+}
 function broadcastSessionComposerMode(change) {
     for (const win of BrowserWindow.getAllWindows()) {
         if (!win.isDestroyed()) {
@@ -194,7 +205,7 @@ function broadcastSessionComposerMode(change) {
 }
 /**
  * Ask every renderer to re-sign the binding via its axios pipeline (the main
- * process cannot sign GET /binding). The resident RC daemon in the renderer
+ * process cannot sign GET /desktop/bindings). The resident RC daemon in the renderer
  * handles `rc:refresh-binding` and pushes the result back through
  * rc:binding-ready (bound) or rc:binding-lost (state=none). Broadcasting to
  * all windows is safe: checkBinding is idempotent and multi-window pushes are
@@ -260,17 +271,46 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     // server-side check to expose here. Re-enable if the WS control plane ever
     // needs to consult /binding directly.
     ipcMain.handle(IPC_CHANNELS.RC_BINDING_READY, async (_event, payload) => {
-        log.info(`[rc.ipc] rc:binding-ready invoked binding_id=${payload.binding_id}`);
+        log.info(`[rc.ipc] rc:binding-ready invoked binding_id=${payload?.binding_id} producer_generation=${payload?.producer_generation ?? 'absent'} request_epoch=${payload?.request_epoch ?? 'absent'}`);
+        // 只有三个必填字段能否决整条凭据；producer_generation / request_epoch 这类
+        // 可选字段即便畸形也不整条拒绝 —— 见下方「按未提供处理 + 留痕」。
+        // 否则一个装饰性字段写错就能让桌面端永远连不上（§4.5.1 / §4.5.2）。
         if (typeof payload?.binding_id !== 'number' ||
             typeof payload?.ticket !== 'string' ||
             typeof payload?.endpoint !== 'string') {
+            log.warn(`[rc.ipc] rc:binding-ready rejected reason=invalid_payload binding_id=${String(payload?.binding_id)}`);
             return { success: false, error: 'invalid payload' };
+        }
+        // 可选字段做类型校验后再透传：非法值一律按「未提供」处理，不能把
+        // NaN/字符串塞进代次比较里造成误判（§4.5.1）。
+        const producerGeneration = typeof payload.producer_generation === 'number' &&
+            Number.isSafeInteger(payload.producer_generation)
+            ? payload.producer_generation
+            : undefined;
+        if (payload.producer_generation !== undefined && producerGeneration === undefined) {
+            log.warn(`[rc.ipc] rc:binding-ready producer_generation ignored reason=not_a_safe_integer raw=${String(payload.producer_generation)}`);
+        }
+        const requestEpoch = typeof payload.request_epoch === 'number' && Number.isSafeInteger(payload.request_epoch)
+            ? payload.request_epoch
+            : undefined;
+        if (payload.request_epoch !== undefined && requestEpoch === undefined) {
+            log.warn(`[rc.ipc] rc:binding-ready request_epoch ignored reason=not_a_safe_integer raw=${String(payload.request_epoch)}`);
         }
         try {
             // Cache the fresh credentials so the WS layer can resolve them via
             // the credential provider without re-querying /binding (which the
             // main process no longer does).
-            rc.applyRendererCredentials(payload);
+            const accepted = rc.applyRendererCredentials({
+                binding_id: payload.binding_id,
+                ticket: payload.ticket,
+                endpoint: payload.endpoint,
+                ...(producerGeneration !== undefined ? { producer_generation: producerGeneration } : {}),
+                ...(requestEpoch !== undefined ? { request_epoch: requestEpoch } : {}),
+            });
+            if (!accepted) {
+                log.warn(`[rc.ipc] rc:binding-ready rejected reason=stale_request_epoch binding_id=${payload.binding_id}`);
+                return { success: false, error: 'stale request epoch' };
+            }
             const result = await rc.connect();
             if (result.phase === 'error') {
                 return { success: false, error: result.last_error?.message ?? 'connect failed' };
@@ -304,6 +344,53 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
             return { success: false, error: String(err) };
         }
     });
+    // ── producer 全删解绑的 request_id 幂等链路（方案 §4.5.4 / ADR-011 D12） ──
+    // 持久化在 main（renderer 刷新会丢），HTTP 仍由 renderer 发（matrix gateway
+    // 签名材料只在 renderer 的 axios 管线里，是硬约束）。
+    ipcMain.handle(IPC_CHANNELS.RC_BEGIN_UNBIND, async () => {
+        try {
+            const pending = rc.beginProducerUnbind();
+            log.info(`[rc.ipc] rc:begin-unbind → request_id=${pending.request_id} attempts=${pending.attempts}`);
+            return { success: true, pending };
+        }
+        catch (err) {
+            log.error(`[rc.ipc] rc:begin-unbind threw: ${err instanceof Error ? err.message : String(err)}`);
+            return { success: false, error: String(err) };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.RC_GET_PENDING_UNBIND, async () => {
+        try {
+            const pending = rc.getPendingProducerUnbind();
+            if (pending) {
+                log.info(`[rc.ipc] rc:get-pending-unbind → pending request_id=${pending.request_id} attempts=${pending.attempts} created_at_ms=${pending.created_at_ms}`);
+            }
+            else {
+                log.debug('[rc.ipc] rc:get-pending-unbind → none');
+            }
+            return { success: true, ...(pending ? { pending } : {}) };
+        }
+        catch (err) {
+            log.error(`[rc.ipc] rc:get-pending-unbind threw: ${err instanceof Error ? err.message : String(err)}`);
+            return { success: false, error: String(err) };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.RC_RESOLVE_UNBIND, async (_event, payload) => {
+        const outcome = payload?.outcome;
+        if (outcome !== 'confirmed' && outcome !== 'rejected') {
+            // 只接受两种**确定**结果。超时/网络错误必须保持待确认，不能从这里溜进来。
+            log.warn(`[rc.ipc] rc:resolve-unbind rejected reason=invalid_outcome raw=${String(outcome)} (timeouts must stay pending — §4.5.4)`);
+            return { success: false, error: 'invalid outcome' };
+        }
+        const reason = typeof payload?.reason === 'string' ? payload.reason : 'unspecified';
+        try {
+            rc.resolveProducerUnbind(outcome, reason);
+            return { success: true };
+        }
+        catch (err) {
+            log.error(`[rc.ipc] rc:resolve-unbind threw: ${err instanceof Error ? err.message : String(err)}`);
+            return { success: false, error: String(err) };
+        }
+    });
     ipcMain.handle(IPC_CHANNELS.RC_REQUEST_CODE, async () => {
         log.info('[rc.ipc] rc:request-code invoked');
         try {
@@ -314,7 +401,11 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
             return rc.getStatus();
         }
     });
-    teardownHooks.push(rc.onStatusChange(broadcastStatus));
+    // Keep-awake is effective only while this computer owns a producer binding.
+    // Seed the power state before listening so hot reload/setup cannot inherit a
+    // stale value from a previous proxy instance.
+    setRemoteAccessEnabled(remoteAccessEnabled(rc.getStatus()));
+    teardownHooks.push(rc.onStatusChange(handleRemoteControlStatus));
     // A lane change changes the WS routing destination only in non-production
     // environments. Production does not inject lane headers, so avoid a
     // pointless WS restart if a hidden/stale config value changes there.
@@ -327,8 +418,10 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     // Account switch / logout: a binding belongs to the user who paired it.
     const unsubscribeUserChange = onUserInfoChanged(() => {
         const state = rc.getBoundUserState();
-        if (state.binding_id === undefined)
+        if (state.binding_id === undefined) {
+            log.debug('[rc.ipc] user identity changed but no local binding; nothing to do action=none');
             return;
+        }
         const userInfo = getUserInfo();
         if (Object.keys(userInfo).length === 0) {
             log.info(`[rc.ipc] user identity cleared; disconnecting binding_id=${state.binding_id}`);
@@ -338,12 +431,27 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
             return;
         }
         const currentUserId = resolveCurrentUserId(userInfo);
-        if (!currentUserId || !state.bound_user_id || currentUserId === state.bound_user_id)
+        if (!currentUserId || !state.bound_user_id || currentUserId === state.bound_user_id) {
+            log.debug(`[rc.ipc] user identity change is not an owner switch binding_id=${state.binding_id} bound_user=${state.bound_user_id ?? 'unknown'} current_user=${currentUserId ?? 'unknown'} action=none`);
             return;
-        log.info(`[rc.ipc] user identity changed (owner mismatch); unbinding stale binding_id=${state.binding_id}`);
-        void rc.disconnect({ unbind: true }).catch((err) => {
-            log.warn(`[rc.ipc] stale-binding unbind failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        // ★ 安全（方案 §4.5.4）：账号已经切走，这里**不能**再发服务端解绑 ——
+        // pairingClient 的 token 与 user_id 公参都取自「当前」账号，用它去删旧账号的
+        // 绑定就是拿新账号冒认旧账号。改为只做本地断开 + 清本地绑定；服务端那条关系
+        // 留给旧账号自己在授权状态下清理（proxy.disconnect 内有 fail-closed 归属校验，
+        // 这里的 unbind:false 是第二道闸）。
+        log.warn(`[rc.ipc] user identity changed (owner mismatch) binding_id=${state.binding_id} bound_user=${state.bound_user_id} current_user=${currentUserId} server_unbind=skipped action=local_disconnect_only reason=refuse_to_impersonate_previous_account`);
+        void rc.disconnect().catch((err) => {
+            log.warn(`[rc.ipc] stale-binding local disconnect failed: ${err instanceof Error ? err.message : String(err)}`);
         });
+        try {
+            // 本地绑定必须清掉：新账号下这台机器不应继续按旧绑定重连。
+            // 服务端关系仍在（旧账号可见），这是有意为之，见上面的安全说明。
+            rc.clearLocalBindingForAccountSwitch();
+        }
+        catch (err) {
+            log.warn(`[rc.ipc] stale-binding local clear failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
     });
     teardownHooks.push(unsubscribeUserChange);
 }
@@ -379,6 +487,7 @@ export function teardownRemoteControlBridgeIPC() {
     teardownHooks = [];
     activeProxy = null;
     activeLogger = null;
+    setRemoteAccessEnabled(false);
     if (!rc)
         return;
     log?.info('[rc.ipc] teardown → disconnect (keep binding)');

@@ -26,6 +26,8 @@ export class WorkspaceIndexingRemoteWorker {
     revisionSemaphore;
     inFlight = new Map();
     sessionOperations = new KeyedOperationQueue();
+    closed = false;
+    closePromise;
     timer;
     constructor(options) {
         this.store = options.store;
@@ -55,22 +57,44 @@ export class WorkspaceIndexingRemoteWorker {
         });
     }
     start(intervalMs = 5_000) {
-        if (this.timer)
+        if (this.closed || this.timer)
             return;
         void this.processDue();
         this.timer = setInterval(() => void this.processDue(), Math.max(250, intervalMs));
         this.timer.unref?.();
     }
     close() {
+        this.closed = true;
         clearInterval(this.timer);
         this.timer = undefined;
         for (const active of this.inFlight.values())
             active.controller.abort();
+        this.closePromise ??= this.drainActive();
+        return this.closePromise;
+    }
+    async drainActive() {
+        if (this.inFlight.size === 0)
+            return;
+        let timer;
+        try {
+            await Promise.race([
+                Promise.allSettled([...this.inFlight.values()].map((active) => active.done)),
+                new Promise((_resolve, reject) => {
+                    timer = setTimeout(() => reject(new Error('Workspace indexing drain timed out')), 5_000);
+                }),
+            ]);
+        }
+        finally {
+            if (timer)
+                clearTimeout(timer);
+        }
     }
     enqueue(revisionId) {
+        if (this.closed)
+            return;
         void this.isEnabled()
             .then((enabled) => {
-            if (!enabled)
+            if (!enabled || this.closed)
                 return;
             return this.store
                 .patchRevision(revisionId, {
@@ -105,25 +129,29 @@ export class WorkspaceIndexingRemoteWorker {
             active.controller.abort();
     }
     async processDue(limit = 10) {
-        if (!(await this.isEnabled().catch(() => false)))
+        if (this.closed || !(await this.isEnabled().catch(() => false)) || this.closed)
             return;
         const nowMs = this.nowMs();
         const records = await this.store.listRemoteWork(nowMs, limit).catch(() => []);
+        if (this.closed)
+            return;
         // Reported from a dedicated count rather than the fetched page, so the
         // gauge does not silently saturate at the batch limit.
         const backlog = await this.store
             .countRemoteWork(nowMs)
             .catch(() => ({ pending: records.length, oldestCreatedAtMs: undefined }));
+        if (this.closed)
+            return;
         this.metrics.backlog(backlog.pending, backlog.oldestCreatedAtMs === undefined ? 0 : Math.max(0, nowMs - backlog.oldestCreatedAtMs));
         await Promise.all(records
             .filter((record) => !this.cancellations.isSessionCancelled(record.sessionId))
             .map((record) => this.processRevision(record)));
     }
     async processRevisionById(revisionId) {
-        if (!(await this.isEnabled().catch(() => false)))
+        if (this.closed || !(await this.isEnabled().catch(() => false)) || this.closed)
             return;
         const record = await this.store.getRevision(revisionId);
-        if (record && !this.cancellations.isSessionCancelled(record.sessionId)) {
+        if (!this.closed && record && !this.cancellations.isSessionCancelled(record.sessionId)) {
             await this.processRevision(record);
         }
     }
@@ -133,8 +161,9 @@ export class WorkspaceIndexingRemoteWorker {
      * arrival order so two dispatches never race on the same capture chain.
      */
     processRevision(record) {
-        if (this.cancellations.isSessionCancelled(record.sessionId))
+        if (this.closed || this.cancellations.isSessionCancelled(record.sessionId)) {
             return Promise.resolve();
+        }
         const existing = this.inFlight.get(record.revisionId);
         if (existing)
             return existing.done;

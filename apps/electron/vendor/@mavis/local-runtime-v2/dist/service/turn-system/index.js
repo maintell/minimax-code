@@ -22,5 +22,6 @@ export { createLocalAgentCapabilitySelector, filterLocalTurnCapabilityInventory,
 export { resolveAgentPromptSurface } from './agent-host/preparation/agent-prompt-surface.js';
 export { configureLocalPluginHookEnabledResolver, configureLocalPluginHookObservability, configureLocalPluginHookSessionEndFence, deactivateLocalPluginHooks, abortLocalPluginHookSessionTurn, disposeLocalPluginHookSessions, endAllLocalPluginHookSessionsForLogout, endLocalPluginHookSession, markNextLocalPluginHookSessionStart, } from './agent-host/assembly/local-turn-plugin-hooks.js';
 export { buildLocalTurnPayloadTransform } from './agent-host/index.js';
+export { toQueueInput } from './turn-submission.service.js';
 export { normalizeModelSelection } from './agent-host/index.js';
 //# sourceMappingURL=index.js.map

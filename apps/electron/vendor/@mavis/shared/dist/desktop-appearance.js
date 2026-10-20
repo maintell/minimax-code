@@ -14,6 +14,11 @@
  * chain owns pre-paint application and build-time px mapping. Both slices are
  * broadcast together as one appearance snapshot.
  */
+export function getChatContentWidthPercent(value) {
+    if (value === 'full')
+        return 100;
+    return clampNumber(value, 0, 0, 100);
+}
 export const DEFAULT_THEME_PACK_ID = 'mcode-default';
 const EMPTY_COLORS = {
     accent: null,
@@ -108,7 +113,9 @@ export function normalizeAppearancePreferences(value) {
             : DEFAULT_APPEARANCE_PREFERENCES.density,
         chatContentWidth: CHAT_CONTENT_WIDTHS.has(value.chatContentWidth)
             ? value.chatContentWidth
-            : DEFAULT_APPEARANCE_PREFERENCES.chatContentWidth,
+            : typeof value.chatContentWidth === 'number' && Number.isFinite(value.chatContentWidth)
+                ? getChatContentWidthPercent(value.chatContentWidth)
+                : DEFAULT_APPEARANCE_PREFERENCES.chatContentWidth,
         contrast: clampNumber(value.contrast, DEFAULT_APPEARANCE_PREFERENCES.contrast, 0, 100),
         colors: {
             light: parseColorOverrides(colors.light),

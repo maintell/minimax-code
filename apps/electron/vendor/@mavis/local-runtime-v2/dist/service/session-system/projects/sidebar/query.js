@@ -36,7 +36,8 @@ export class SidebarQueryService {
             const hasEligibleSession = sqlExists(tx
                 .select({ id: s.sessionId })
                 .from(s)
-                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds))));
+                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds)))
+                .limit(1));
             const rows = tx
                 .select({
                 project: { ...getTableColumns(p), latestActivityAtMs: projectActivityExpression },
@@ -53,7 +54,34 @@ export class SidebarQueryService {
                 .limit(limit + 1)
                 .all();
             const page = rows.slice(0, limit);
-            const ids = page.map((r) => r.project.projectId);
+            // Resolve selection by session ID, not by the current project page. Only the
+            // first page may carry an extra group; later pages retain ordinary boundaries.
+            const activeRow = input.activeSessionId
+                ? tx
+                    .select({ record: s, project: p, done: isDone })
+                    .from(s)
+                    .innerJoin(p, eq(s.projectId, p.projectId))
+                    .where(and(eq(s.sessionId, input.activeSessionId), sidebarPredicate(q)))
+                    .get()
+                : undefined;
+            const selectedProject = (() => {
+                if (last ||
+                    !activeRow ||
+                    page.some((row) => row.project.projectId === activeRow.project.projectId))
+                    return undefined;
+                return tx
+                    .select({
+                    project: { ...getTableColumns(p), latestActivityAtMs: projectActivityExpression },
+                    matchedCount: count,
+                })
+                    .from(p)
+                    .where(eq(p.projectId, activeRow.project.projectId))
+                    .get();
+            })();
+            const ids = [
+                ...page.map((r) => r.project.projectId),
+                ...(selectedProject ? [selectedProject.project.projectId] : []),
+            ];
             const previews = new Map();
             if (ids.length) {
                 const ranked = tx.$with('sidebar_ranked').as(tx
@@ -79,17 +107,10 @@ export class SidebarQueryService {
                     previews.set(row.project.projectId, list);
                 }
             }
-            // Selection is a separate projection: preserve normal page boundaries and
-            // apply exactly the same eligibility, filter and pin predicates as the list.
-            const activeRow = input.activeSessionId && ids.length
-                ? tx
-                    .select({ record: s, project: p, done: isDone })
-                    .from(s)
-                    .innerJoin(p, eq(s.projectId, p.projectId))
-                    .where(and(eq(s.sessionId, input.activeSessionId), inArray(s.projectId, ids), sidebarPredicate(q)))
-                    .get()
-                : undefined;
-            const groups = page.map((row) => {
+            const groups = [
+                ...page,
+                ...(selectedProject ? [selectedProject] : []),
+            ].map((row) => {
                 const entries = previews.get(row.project.projectId) ?? [];
                 const shown = entries.slice(0, sessionLimit);
                 return {
@@ -101,7 +122,7 @@ export class SidebarQueryService {
                     },
                     entries: shown,
                     ...(activeRow?.project.projectId === row.project.projectId &&
-                        !shown.some((value) => value.session.sessionId === activeRow.record.sessionId)
+                        (selectedProject || !shown.some((value) => value.session.sessionId === activeRow.record.sessionId))
                         ? { activeEntry: entry(activeRow, q) }
                         : {}),
                     matchedCount: Number(row.matchedCount),

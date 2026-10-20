@@ -98,9 +98,14 @@ const cronListSchema = z.object({
     limit: optionalNumber,
 });
 const cronGetSchema = z.object({ cron_id: idString });
+const cronExecutionFields = {
+    project: z.string().optional(),
+    model: z.string().optional(),
+};
 const cronResolveModelSchema = z.object({ model: z.string().trim().min(1) }).strict();
 const cronCreateSchema = z
     .object({
+    ...cronExecutionFields,
     agent_name: optionalString,
     cron_name: z.string().min(1),
     schedule: z.string().min(1),
@@ -109,23 +114,21 @@ const cronCreateSchema = z
     active_hours: activeHoursSchema.optional(),
     session: cronCreationSessionSchema,
     enabled: optionalBoolean,
-    project: optionalString,
-    model: optionalString,
 })
     .strict()
     .superRefine(validateCronCreationOwnerInput);
 const cronSelfSchema = z.object({
+    ...cronExecutionFields,
     cron_name: optionalString,
     every: z.string().min(1),
     prompt: z.string().min(1),
     timezone: optionalString,
     quiet_on_skip: optionalBoolean,
     session_id: optionalString,
-    project: optionalString,
-    model: optionalString,
 });
 const cronOnceSchema = z
     .object({
+    ...cronExecutionFields,
     agent_name: optionalString,
     cron_name: optionalString,
     after: optionalString,
@@ -133,13 +136,13 @@ const cronOnceSchema = z
     prompt: z.string().min(1),
     timezone: optionalString,
     session: cronCreationSessionSchema,
-    project: optionalString,
-    model: optionalString,
 })
     .strict()
     .superRefine(validateCronCreationOwnerInput);
 const cronUpdateSchema = z
     .object({
+    ...cronExecutionFields,
+    cron_name: z.string().trim().min(1).optional(),
     cron_id: idString,
     schedule: optionalString,
     prompt: optionalString,
@@ -743,6 +746,7 @@ async function handleCronCreate(ctx, args, signal) {
         agentName,
         cronName: args.cron_name,
         schedule: args.schedule,
+        ...cronExecutionConfig(args),
         prompt: args.prompt,
         ...(args.timezone ? { timezone: args.timezone } : {}),
         ...(args.active_hours ? { activeHours: args.active_hours } : {}),
@@ -776,6 +780,7 @@ async function handleCronSelf(ctx, args, signal) {
         agentName,
         sessionId,
         every: args.every,
+        ...cronExecutionConfig(args),
         prompt: args.prompt,
         ...(args.cron_name ? { cronName: args.cron_name } : {}),
         ...(args.timezone ? { timezone: args.timezone } : {}),
@@ -787,16 +792,18 @@ async function handleCronSelf(ctx, args, signal) {
 async function handleCronOnce(ctx, args, signal) {
     const session = toAdapterCronCreationSession(ctx, args.session);
     const agentName = await resolveCronCreationAgentName(ctx, args.agent_name, session, signal);
+    const project = await resolveCronCreationProject(ctx, args.project, signal);
     const model = args.model ?? ctx.currentModel;
     return success(ctx.command, await requireCronAdapter(ctx).createOnceCron({
         agentName,
         ...(args.cron_name ? { cronName: args.cron_name } : {}),
         ...(args.after ? { after: args.after } : {}),
+        ...cronExecutionConfig(args),
         ...(args.at !== undefined ? { at: args.at } : {}),
         prompt: args.prompt,
         ...(args.timezone ? { timezone: args.timezone } : {}),
         session,
-        ...(args.project === undefined ? {} : { project: args.project }),
+        ...(project === undefined ? {} : { project }),
         ...(model === undefined ? {} : { model }),
     }, signal));
 }
@@ -816,12 +823,20 @@ async function handleCronUpdate(ctx, args, signal) {
     return success(ctx.command, await adapter.updateCron({
         cronId: args.cron_id,
         ...(args.schedule !== undefined ? { schedule: args.schedule } : {}),
+        ...(args.cron_name === undefined ? {} : { cronName: args.cron_name }),
+        ...cronExecutionConfig(args),
         ...(args.prompt !== undefined ? { prompt: args.prompt } : {}),
         ...(args.timezone !== undefined ? { timezone: args.timezone } : {}),
         ...(args.active_hours ? { activeHours: args.active_hours } : {}),
         ...(session ? { session } : {}),
         ...(args.enabled !== undefined ? { enabled: args.enabled } : {}),
     }, signal));
+}
+function cronExecutionConfig(args) {
+    return {
+        ...(args.project === undefined ? {} : { project: args.project }),
+        ...(args.model === undefined ? {} : { model: args.model }),
+    };
 }
 async function handleCronDelete(ctx, args, signal) {
     return success(ctx.command, await requireCronAdapter(ctx).deleteCron({ cronId: args.cron_id }, signal));

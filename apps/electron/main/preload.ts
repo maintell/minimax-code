@@ -6,6 +6,7 @@ import { ipcRenderer, contextBridge, webFrame, webUtils } from "electron";
 const modelMenuPopupAPI = {
     setModalScope: (scope) => ipcRenderer.invoke('model-menu-popup:modal-scope', scope),
     open: (request) => ipcRenderer.invoke('model-menu-popup:open', request),
+    containsPointer: () => ipcRenderer.invoke('model-menu-popup:contains-pointer'),
     update: (id, presentation) => ipcRenderer.send('model-menu-popup:owner', 'update', id, presentation),
     close: (id) => ipcRenderer.send('model-menu-popup:owner', 'close', id),
     onEvent: (listener) => {
@@ -106,6 +107,12 @@ const IPC_CHANNELS = {
     RC_REFRESH_BINDING: 'rc:refresh-binding',
     RC_BINDING_LOST: 'rc:binding-lost',
     RC_MARK_UNBOUND: 'rc:mark-unbound',
+    // producer 全删解绑的 request_id 幂等链路（方案 §4.5.4 / ADR-011 D12）。
+    // 注意：preload 维护着一份独立的通道表，新增通道必须同时改
+    // `main/config/constants.ts` 和这里，否则 preload 侧取到 undefined。
+    RC_BEGIN_UNBIND: 'rc:begin-unbind',
+    RC_GET_PENDING_UNBIND: 'rc:get-pending-unbind',
+    RC_RESOLVE_UNBIND: 'rc:resolve-unbind',
     RC_PUBLISH_SESSION_COMPOSER_MODE: 'rc:publish-session-composer-mode',
     RC_SESSION_COMPOSER_MODE_CHANGED: 'rc:session-composer-mode-changed',
     // 外部链接
@@ -130,6 +137,7 @@ const IPC_CHANNELS = {
     DESKTOP_SET_GLOBAL_ACCESS_SHORTCUT: 'desktop:set-global-access-shortcut',
     DESKTOP_GET_GLOBAL_ACCESS_SHORTCUT: 'desktop:get-global-access-shortcut',
     DESKTOP_SET_SHORTCUT_OVERRIDES: 'desktop:set-shortcut-overrides',
+    DESKTOP_SHORTCUTS_CHANGED: 'desktop:shortcuts-changed',
     DESKTOP_OPEN_NOTIFICATION_SETTINGS: 'desktop:open-notification-settings',
     DESKTOP_SET_LANGUAGE: 'desktop:set-language',
     DESKTOP_GET_LOCAL_RUNTIME_DATA_DIR_INFO: 'desktop:get-local-runtime-data-dir-info',
@@ -165,8 +173,13 @@ const IPC_CHANNELS = {
     MINIAPP_OPEN: 'miniapp:open',
     MINIAPP_REFRESH: 'miniapp:refresh',
     MINIAPP_STOP: 'miniapp:stop',
+    MINIAPP_DETACH: 'miniapp:detach',
+    MINIAPP_ATTACH: 'miniapp:attach',
     MINIAPP_COMPOSER_REQUEST: 'miniapp:composer-request',
     MINIAPP_COMPOSER_REPLY: 'miniapp:composer-reply',
+    MINIAPP_AGENT_OPEN_SESSION: 'miniapp:agent-open-session',
+    MINIAPP_AGENT_OPEN_SESSION_REPLY: 'miniapp:agent-open-session-reply',
+    MINIAPP_AGENT_PANEL_CLOSED: 'miniapp:agent-panel-closed',
     BROWSER_PROFILE_IMPORT_LIST: 'browser-profile-import:list',
     BROWSER_PROFILE_IMPORT_START: 'browser-profile-import:start',
     BROWSER_PROFILE_IMPORT_CANCEL: 'browser-profile-import:cancel',
@@ -266,6 +279,34 @@ const IPC_CHANNELS = {
     RUNTIME_TRANSPORT_GET_CURRENT: 'runtime:transport-get-current',
     RUNTIME_TRANSPORT_REQUEST_SWITCH: 'runtime:transport-request-switch',
     RUNTIME_TRANSPORT_LOST: 'runtime:transport-lost',
+    SSH_CONNECTIONS_LIST: 'ssh-connections:list',
+    SSH_CONNECTIONS_OPERATION_STATES: 'ssh-connections:operation-states',
+    SSH_CONNECTIONS_OPERATION_STATE: 'ssh-connections:operation-state',
+    SSH_CONNECTIONS_ADD: 'ssh-connections:add',
+    SSH_CONNECTIONS_CANCEL_ADD: 'ssh-connections:cancel-add',
+    SSH_CONNECTIONS_ADD_PROGRESS: 'ssh-connections:add-progress',
+    SSH_CONNECTIONS_UPDATE: 'ssh-connections:update',
+    SSH_CONNECTIONS_SET_ENABLED: 'ssh-connections:set-enabled',
+    SSH_CONNECTIONS_REMOTE_ACCOUNT: 'ssh-connections:remote-account',
+    SSH_CONNECTIONS_REMOVE: 'ssh-connections:remove',
+    SSH_CONNECTIONS_DISCOVER: 'ssh-connections:discover',
+    SSH_CONNECTIONS_PROBE: 'ssh-connections:probe',
+    SSH_CONNECTIONS_CONNECT: 'ssh-connections:connect',
+    SSH_CONNECTIONS_SETUP_CLI: 'ssh-connections:setup-cli',
+    SSH_CONNECTIONS_LIST_DIRECTORIES: 'ssh-connections:list-directories',
+    SSH_PROJECTS_LIST: 'ssh-projects:list',
+    SSH_PROJECTS_CREATE: 'ssh-projects:create',
+    SSH_PROJECTS_UPDATE: 'ssh-projects:update',
+    SSH_PROJECTS_REMOVE: 'ssh-projects:remove',
+    SSH_PROJECTS_UPLOAD_ATTACHMENT: 'ssh-projects:upload-attachment',
+    PROJECT_RUNTIME_TRANSPORT_REQUEST_PORT: 'project-runtime:transport-request-port',
+    PROJECT_RUNTIME_TRANSPORT_DISCONNECT: 'project-runtime:transport-disconnect',
+    PROJECT_RUNTIME_GET_STATUS: 'project-runtime:get-status',
+    PROJECT_RUNTIME_TRANSPORT_LOST: 'project-runtime:transport-lost',
+    PROJECT_RUNTIME_FAILED: 'project-runtime:failed',
+    PROJECT_RUNTIME_STATUS: 'project-runtime:status',
+    PROJECT_RUNTIME_NETWORK_ONLINE: 'project-runtime:network-online',
+    PROJECT_RUNTIME_ACTIVE_PROJECT: 'project-runtime:active-project',
     LOCAL_ASR_SESSION_OPEN: 'local-asr:session-open',
     LOCAL_ASR_SESSION_FRAME: 'local-asr:session-frame',
     LOCAL_ASR_SESSION_AUDIO: 'local-asr:session-audio',
@@ -319,6 +360,7 @@ const IPC_CHANNELS = {
     APP_BRING_TO_FRONT: 'app:bring-to-front',
     // Dock file drop (macOS)
     DOCK_FILE_OPENED: 'dock:file-opened',
+    DOCK_FILE_RECEIVER_READY: 'dock:file-receiver-ready',
 };
 const pendingNotificationClicks = [];
 const notificationClickListeners = new Set();
@@ -781,7 +823,12 @@ const electronAPI = {
     // 快捷键
     setGlobalAccessShortcut: (globalAccessShortcut) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_GLOBAL_ACCESS_SHORTCUT, globalAccessShortcut),
     getGlobalAccessShortcut: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_GLOBAL_ACCESS_SHORTCUT),
-    setShortcutOverrides: (overrides) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_SHORTCUT_OVERRIDES, overrides),
+    setShortcutOverrides: (overrides, enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_SHORTCUT_OVERRIDES, overrides, enabled),
+    onShortcutsChanged: (callback) => {
+        const handler = (_event, settings) => callback(settings);
+        ipcRenderer.on(IPC_CHANNELS.DESKTOP_SHORTCUTS_CHANGED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.DESKTOP_SHORTCUTS_CHANGED, handler);
+    },
     // 通知设置
     openNotificationSettings: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_OPEN_NOTIFICATION_SETTINGS),
     // 语言设置（需要重启）
@@ -986,10 +1033,18 @@ const electronAPI = {
                 : data.filePath
                     ? [data.filePath]
                     : [];
-            callback({ filePaths });
+            callback({
+                filePaths,
+                ...(data.selectedFileTokens ? { selectedFileTokens: data.selectedFileTokens } : {}),
+            });
         };
         ipcRenderer.on(IPC_CHANNELS.DOCK_FILE_OPENED, handler);
-        return () => ipcRenderer.removeListener(IPC_CHANNELS.DOCK_FILE_OPENED, handler);
+        // The React consumer now exists; DOM load alone does not guarantee this.
+        ipcRenderer.send(IPC_CHANNELS.DOCK_FILE_RECEIVER_READY, true);
+        return () => {
+            ipcRenderer.removeListener(IPC_CHANNELS.DOCK_FILE_OPENED, handler);
+            ipcRenderer.send(IPC_CHANNELS.DOCK_FILE_RECEIVER_READY, false);
+        };
     },
     // Sidebar terminal panel (interactive PTY)
     terminal: terminalAPI,
@@ -1124,6 +1179,307 @@ const runtimeTransportAPI = {
     },
 };
 contextBridge.exposeInMainWorld('runtimeTransportAPI', runtimeTransportAPI);
+const sshConnectionsAPI = {
+    getOperationStates: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_OPERATION_STATES),
+    onOperationState: (listener) => {
+        const handler = (_event, state) => listener(state);
+        ipcRenderer.on(IPC_CHANNELS.SSH_CONNECTIONS_OPERATION_STATE, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.SSH_CONNECTIONS_OPERATION_STATE, handler);
+    },
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_LIST),
+    add: (input, request) => request === undefined
+        ? ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_ADD, input)
+        : ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_ADD, input, request),
+    cancelAdd: (requestId) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_CANCEL_ADD, requestId),
+    onAddProgress: (listener) => {
+        const handler = (_event, progress) => listener(progress);
+        ipcRenderer.on(IPC_CHANNELS.SSH_CONNECTIONS_ADD_PROGRESS, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.SSH_CONNECTIONS_ADD_PROGRESS, handler);
+    },
+    update: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_UPDATE, input),
+    setEnabled: (alias, enabled) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_SET_ENABLED, alias, enabled),
+    remoteAccount: (alias, input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_REMOTE_ACCOUNT, alias, input),
+    remove: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_REMOVE, alias),
+    discover: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_DISCOVER),
+    probe: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_PROBE, alias),
+    connect: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_CONNECT, alias),
+    setupCli: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_SETUP_CLI, alias),
+    listDirectories: (alias, path) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_LIST_DIRECTORIES, alias, path),
+};
+contextBridge.exposeInMainWorld('sshConnectionsAPI', sshConnectionsAPI);
+const sshProjectsAPI = {
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_LIST),
+    create: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_CREATE, input),
+    update: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_UPDATE, input),
+    remove: (projectId) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_REMOVE, projectId),
+    uploadAttachment: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_UPLOAD_ATTACHMENT, input),
+};
+contextBridge.exposeInMainWorld('sshProjectsAPI', sshProjectsAPI);
+// Project-scoped SSH runtimes are independent from the process-owned local
+// Runtime above. One preload may therefore hold several isolated ports.
+const PROJECT_RUNTIME_TRANSPORT_PORT_CHANNEL = 'project-runtime:transport-port';
+const projectRuntimePorts = new Map();
+const projectRuntimeConnectionIds = new Map();
+const projectRuntimeIntents = new Map();
+// A fresh preload context must not accept a previous context's queued port.
+const projectRuntimeIntentPrefix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+let projectRuntimeIntentSequence = 0;
+const projectRuntimeReadyListeners = new Map();
+const projectRuntimeStatusListeners = new Map();
+const projectRuntimeFrameListeners = new Map();
+const projectRuntimeLostListeners = new Map();
+const projectRuntimeFailedListeners = new Map();
+const projectRuntimePortWaiters = new Map();
+function readProjectRuntimeEvent(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return null;
+    const record = value;
+    if (typeof record.runtimeId !== 'string')
+        return null;
+    return {
+        runtimeId: record.runtimeId,
+        ...(typeof record.message === 'string' ? { message: record.message } : {}),
+        ...(typeof record.reasonCode === 'string' ? { reasonCode: record.reasonCode } : {}),
+        ...(typeof record.connectionId === 'string' ? { connectionId: record.connectionId } : {}),
+        ...(typeof record.transportIntentId === 'string'
+            ? { transportIntentId: record.transportIntentId }
+            : {}),
+    };
+}
+function dropProjectRuntimePort(runtimeId, info) {
+    const port = projectRuntimePorts.get(runtimeId);
+    projectRuntimePorts.delete(runtimeId);
+    projectRuntimeConnectionIds.delete(runtimeId);
+    if (port) {
+        try {
+            port.close();
+        }
+        catch {
+            // Already closed with its renderer context.
+        }
+    }
+    if (!info)
+        return;
+    for (const listener of [...(projectRuntimeLostListeners.get(runtimeId) ?? [])]) {
+        try {
+            listener(info);
+        }
+        catch {
+            // Listener errors must not break other project runtimes.
+        }
+    }
+}
+ipcRenderer.on(PROJECT_RUNTIME_TRANSPORT_PORT_CHANNEL, (event, payload) => {
+    const metadata = readProjectRuntimeEvent(payload);
+    const port = event.ports[0];
+    if (!port)
+        return;
+    if (!metadata?.transportIntentId ||
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId ||
+        (metadata.connectionId &&
+            projectRuntimeConnectionIds.get(metadata.runtimeId) === metadata.connectionId)) {
+        port.close();
+        return;
+    }
+    // A genuine replacement also terminates pending requests on the old pipe.
+    // This produces one false/true edge so EventBus replaces its stream once.
+    dropProjectRuntimePort(metadata.runtimeId, projectRuntimePorts.has(metadata.runtimeId)
+        ? { reasonCode: 'runtime_connection_replaced' }
+        : undefined);
+    projectRuntimePorts.set(metadata.runtimeId, port);
+    if (metadata.connectionId) {
+        projectRuntimeConnectionIds.set(metadata.runtimeId, metadata.connectionId);
+    }
+    port.onmessage = (messageEvent) => {
+        if (projectRuntimePorts.get(metadata.runtimeId) !== port)
+            return;
+        for (const listener of [...(projectRuntimeFrameListeners.get(metadata.runtimeId) ?? [])]) {
+            try {
+                listener(messageEvent.data);
+            }
+            catch {
+                // Listener errors must not break the pipe for other listeners.
+            }
+        }
+    };
+    for (const listener of [...(projectRuntimeReadyListeners.get(metadata.runtimeId) ?? [])]) {
+        try {
+            listener(metadata.connectionId ? { connectionId: metadata.connectionId } : {});
+        }
+        catch {
+            // One observer must not interrupt the port handoff.
+        }
+    }
+    for (const notify of [...(projectRuntimePortWaiters.get(metadata.runtimeId) ?? [])])
+        notify(true);
+    projectRuntimePortWaiters.delete(metadata.runtimeId);
+});
+function handleProjectRuntimeLost(_event, payload) {
+    const metadata = readProjectRuntimeEvent(payload);
+    if (!metadata)
+        return;
+    if (metadata.transportIntentId &&
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId)
+        return;
+    if (metadata.connectionId &&
+        projectRuntimePorts.has(metadata.runtimeId) &&
+        metadata.connectionId !== projectRuntimeConnectionIds.get(metadata.runtimeId))
+        return;
+    dropProjectRuntimePort(metadata.runtimeId, {
+        ...(metadata.message ? { message: metadata.message } : {}),
+        ...(metadata.reasonCode ? { reasonCode: metadata.reasonCode } : {}),
+    });
+}
+function handleProjectRuntimeFailed(_event, payload) {
+    const metadata = readProjectRuntimeEvent(payload);
+    if (!metadata)
+        return;
+    if (metadata.transportIntentId &&
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId)
+        return;
+    // Older Main builds call this field `type`. Keep it on the failure path only.
+    const legacyType = payload.type;
+    const reasonCode = metadata.reasonCode ?? (typeof legacyType === 'string' ? legacyType : undefined);
+    const info = {
+        ...(metadata.message ? { message: metadata.message } : {}),
+        ...(reasonCode ? { reasonCode } : {}),
+    };
+    for (const listener of [...(projectRuntimeFailedListeners.get(metadata.runtimeId) ?? [])]) {
+        try {
+            listener(info);
+        }
+        catch {
+            // One recovery observer must not interrupt other observers.
+        }
+    }
+}
+ipcRenderer.on(IPC_CHANNELS.PROJECT_RUNTIME_STATUS, (_event, payload) => {
+    const metadata = readProjectRuntimeEvent(payload);
+    if (!metadata?.transportIntentId ||
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId)
+        return;
+    const status = { ...payload };
+    delete status.transportIntentId;
+    for (const listener of [...(projectRuntimeStatusListeners.get(metadata.runtimeId) ?? [])]) {
+        try {
+            listener(status);
+        }
+        catch {
+            // Status observers are isolated from each other and from transport readiness.
+        }
+    }
+});
+ipcRenderer.on(IPC_CHANNELS.PROJECT_RUNTIME_TRANSPORT_LOST, handleProjectRuntimeLost);
+ipcRenderer.on(IPC_CHANNELS.PROJECT_RUNTIME_FAILED, handleProjectRuntimeFailed);
+const projectRuntimeTransportAPI = {
+    requestPort: async (runtimeId) => {
+        let intent = projectRuntimeIntents.get(runtimeId);
+        if (!intent) {
+            intent = `${projectRuntimeIntentPrefix}:${++projectRuntimeIntentSequence}`;
+            projectRuntimeIntents.set(runtimeId, intent);
+        }
+        const isCurrent = () => projectRuntimeIntents.get(runtimeId) === intent;
+        const hasPort = () => isCurrent() && projectRuntimePorts.has(runtimeId);
+        const result = await requestRuntimeTransport({
+            invoke: async () => {
+                const ack = await ipcRenderer.invoke(IPC_CHANNELS.PROJECT_RUNTIME_TRANSPORT_REQUEST_PORT, runtimeId, { transportIntentId: intent });
+                if (!isCurrent())
+                    return { mode: 'direct', enabled: true, connected: false };
+                // Main can deliver a recovery port before an older request ACK settles.
+                return hasPort() ? { mode: 'direct', enabled: true, connected: true } : ack;
+            },
+            hasPort,
+            waitForPort: () => new Promise((resolve) => {
+                let portReadyTimeout = null;
+                const onPortReady = (ready) => {
+                    if (portReadyTimeout)
+                        clearTimeout(portReadyTimeout);
+                    projectRuntimePortWaiters.get(runtimeId)?.delete(onPortReady);
+                    resolve(ready && hasPort());
+                };
+                const waiters = projectRuntimePortWaiters.get(runtimeId) ?? new Set();
+                waiters.add(onPortReady);
+                projectRuntimePortWaiters.set(runtimeId, waiters);
+                portReadyTimeout = setTimeout(() => onPortReady(hasPort()), 10000);
+            }),
+        });
+        return isCurrent() ? result : { mode: 'direct', enabled: true, connected: false };
+    },
+    disconnect: async (runtimeId) => {
+        const transportIntentId = projectRuntimeIntents.get(runtimeId);
+        projectRuntimeIntents.delete(runtimeId);
+        for (const notify of [...(projectRuntimePortWaiters.get(runtimeId) ?? [])])
+            notify(false);
+        projectRuntimePortWaiters.delete(runtimeId);
+        dropProjectRuntimePort(runtimeId, { reasonCode: 'runtime_connection_stopped' });
+        await ipcRenderer.invoke(IPC_CHANNELS.PROJECT_RUNTIME_TRANSPORT_DISCONNECT, runtimeId, {
+            transportIntentId,
+        });
+    },
+    networkOnline: () => ipcRenderer.send(IPC_CHANNELS.PROJECT_RUNTIME_NETWORK_ONLINE),
+    setActiveRuntime: (runtimeId) => ipcRenderer.send(IPC_CHANNELS.PROJECT_RUNTIME_ACTIVE_PROJECT, runtimeId),
+    subscribeReady: (runtimeId, listener) => {
+        const listeners = projectRuntimeReadyListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeReadyListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeReadyListeners.delete(runtimeId);
+        };
+    },
+    subscribeStatus: (runtimeId, listener) => {
+        const listeners = projectRuntimeStatusListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeStatusListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeStatusListeners.delete(runtimeId);
+        };
+    },
+    getStatus: (runtimeId) => ipcRenderer.invoke(IPC_CHANNELS.PROJECT_RUNTIME_GET_STATUS, runtimeId),
+    post: (runtimeId, frame) => {
+        const port = projectRuntimePorts.get(runtimeId);
+        if (!port)
+            throw new Error('project runtime transport port unavailable');
+        port.postMessage(frame);
+    },
+    subscribe: (runtimeId, listener) => {
+        const listeners = projectRuntimeFrameListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeFrameListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeFrameListeners.delete(runtimeId);
+        };
+    },
+    subscribeLost: (runtimeId, listener) => {
+        const listeners = projectRuntimeLostListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeLostListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeLostListeners.delete(runtimeId);
+        };
+    },
+    subscribeFailed: (runtimeId, listener) => {
+        const listeners = projectRuntimeFailedListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeFailedListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeFailedListeners.delete(runtimeId);
+        };
+    },
+};
+contextBridge.exposeInMainWorld('projectRuntimeTransportAPI', projectRuntimeTransportAPI);
+// The sandbox's browser global is intentionally structural: preload is compiled without DOM lib.
+const networkEventTarget = globalThis;
+networkEventTarget.addEventListener?.('online', projectRuntimeTransportAPI.networkOnline);
 // ============================================
 // 同步暴露平台信息（无需 IPC，立即可用）
 // 渲染进程可以通过 window.electronPlatform 同步访问
@@ -1200,12 +1556,58 @@ const miniAppComposer = {
         };
     },
 };
+let miniAppOpenSessionHandler = null;
+const isNonEmptyString = (value) => typeof value === 'string' && value.length > 0;
+// Install before React mounts so Main learns "no Host UI yet" instead of waiting out its bound.
+// The sandboxed preload cannot load `@mavis/shared` at runtime, so the field checks mirror
+// `MiniAppAgentOpenSessionMessage` by hand.
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_AGENT_OPEN_SESSION, async (_event, message) => {
+    const { requestId, hostSessionId, sessionId } = (message ?? {});
+    if (!isNonEmptyString(requestId))
+        return;
+    if (!isNonEmptyString(hostSessionId) || !isNonEmptyString(sessionId))
+        return;
+    let result;
+    try {
+        const handler = miniAppOpenSessionHandler;
+        const shown = handler ? await handler({ hostSessionId, sessionId }) : false;
+        result = shown === true ? { ok: true } : { ok: false, code: 'target_unavailable' };
+    }
+    catch {
+        // A Host UI failure must not surface in the preload; the tab may or may not be shown.
+        result = { ok: false, code: 'result_unknown' };
+    }
+    try {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_AGENT_OPEN_SESSION_REPLY, {
+            requestId,
+            result,
+        });
+    }
+    catch {
+        // The Host document may be exiting. Main settles its outstanding request on document teardown.
+    }
+});
+const miniAppAgentSessions = {
+    onOpenRequest: (handler) => {
+        miniAppOpenSessionHandler = handler;
+        return () => {
+            if (miniAppOpenSessionHandler === handler)
+                miniAppOpenSessionHandler = null;
+        };
+    },
+    notifyClosed: ({ hostSessionId, sessionId }) => {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_AGENT_PANEL_CLOSED, { hostSessionId, sessionId });
+    },
+};
 const miniAppAPI = {
+    agentSessions: miniAppAgentSessions,
     composer: miniAppComposer,
     list: () => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_LIST),
     open: openMiniApp,
     refresh: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_REFRESH, params),
     stop: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_STOP, params),
+    detach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_DETACH, params),
+    attach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_ATTACH, params),
 };
 contextBridge.exposeInMainWorld('miniAppAPI', miniAppAPI);
 const browserProfileImportAPI = {
@@ -1537,6 +1939,13 @@ function toUIStatus(s) {
         pairingCode: s.pairing_code,
         pairingExpiresAt: s.expires_in !== undefined ? Date.now() + s.expires_in * 1000 : undefined,
         ...(typeof s.binding_id === 'number' ? { bindingId: s.binding_id } : {}),
+        ...(typeof s.request_epoch === 'number' ? { requestEpoch: s.request_epoch } : {}),
+        ...(typeof s.producer_generation === 'number'
+            ? { producerGeneration: s.producer_generation }
+            : {}),
+        ...(typeof s.pending_unbind_request_id === 'string'
+            ? { pendingUnbindRequestId: s.pending_unbind_request_id }
+            : {}),
     };
 }
 function isErrorResult(v) {
@@ -1545,6 +1954,10 @@ function isErrorResult(v) {
 const remoteControlAPI = {
     getDeviceId: () => ipcRenderer.invoke(IPC_CHANNELS.RC_GET_DEVICE_ID),
     getDeviceName: () => ipcRenderer.invoke(IPC_CHANNELS.RC_GET_DEVICE_NAME),
+    getStatus: async () => {
+        const status = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_STATUS);
+        return toUIStatus(status);
+    },
     onStatusChanged: (callback) => {
         const handler = (_event, status) => {
             callback(toUIStatus(status));
@@ -1593,6 +2006,27 @@ const remoteControlAPI = {
         const status = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_STATUS);
         return toUIStatus(status);
     },
+    beginUnbind: async () => {
+        const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_BEGIN_UNBIND);
+        if (!raw || raw.success === false || !raw.pending) {
+            return { code: 'begin_unbind_failed', message: raw?.error ?? 'Begin unbind failed' };
+        }
+        return raw.pending;
+    },
+    getPendingUnbind: async () => {
+        const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_PENDING_UNBIND);
+        if (!raw || raw.success === false)
+            return undefined;
+        return raw.pending;
+    },
+    resolveUnbind: async (input) => {
+        const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_RESOLVE_UNBIND, input);
+        if (raw && raw.success === false) {
+            return { code: 'resolve_unbind_failed', message: raw.error ?? 'Resolve unbind failed' };
+        }
+        const status = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_STATUS);
+        return toUIStatus(status);
+    },
     cancelBind: async () => {
         const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_DISCONNECT);
         if (raw && !raw.success) {
@@ -1623,34 +2057,4 @@ catch {
 }
 contextBridge.exposeInMainWorld('cuPreviewAPI', {
     inspect: (sessionId, capture) => ipcRenderer.invoke('cu:preview:inspect', sessionId, capture),
-});
-contextBridge.exposeInMainWorld('wordEditorAPI', {
-    register: (input) => ipcRenderer.invoke('word-editor:register', input),
-    unregister: (documentId) => ipcRenderer.send('word-editor:unregister', documentId),
-    onRequest: (callback) => {
-        const handler = (_event, request) => callback(request);
-        ipcRenderer.on('word-editor:request', handler);
-        return () => ipcRenderer.removeListener('word-editor:request', handler);
-    },
-    onCancel: (callback) => {
-        const handler = (_event, requestId) => callback(requestId);
-        ipcRenderer.on('word-editor:cancel', handler);
-        return () => ipcRenderer.removeListener('word-editor:cancel', handler);
-    },
-    reply: (result) => ipcRenderer.send('word-editor:result', result),
-});
-contextBridge.exposeInMainWorld('excelEditorAPI', {
-    register: (input) => ipcRenderer.invoke('excel-editor:register', input),
-    unregister: (documentId) => ipcRenderer.send('excel-editor:unregister', documentId),
-    onRequest: (callback) => {
-        const handler = (_event, request) => callback(request);
-        ipcRenderer.on('excel-editor:request', handler);
-        return () => ipcRenderer.removeListener('excel-editor:request', handler);
-    },
-    onCancel: (callback) => {
-        const handler = (_event, requestId) => callback(requestId);
-        ipcRenderer.on('excel-editor:cancel', handler);
-        return () => ipcRenderer.removeListener('excel-editor:cancel', handler);
-    },
-    reply: (result) => ipcRenderer.send('excel-editor:result', result),
 });

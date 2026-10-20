@@ -69,6 +69,10 @@ const { acquireSingleInstanceLock, setupDeepLinkEventHandlers } = require('./mod
 const hasSingleInstanceLock = acquireSingleInstanceLock();
 if (hasSingleInstanceLock)
     setupDeepLinkEventHandlers();
+if (hasSingleInstanceLock) {
+    const { setupFileOpenEventHandlers } = require('./modules/dock');
+    setupFileOpenEventHandlers();
+}
 const { applyGpuGuard, isGpuDisabledByGuard } = require('./modules/gpu-guard');
 const gpuGuardReason = hasSingleInstanceLock ? applyGpuGuard() : null;
 if (gpuGuardReason) {

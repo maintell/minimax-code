@@ -106,6 +106,7 @@ export function patchThreadGoal(db, nowMs, goalId, input) {
         status: nextStatus,
         createdAt: state.createdAt,
         updatedAt: now,
+        ...(state.dismissedAt !== undefined ? { dismissedAt: state.dismissedAt } : {}),
         // patch never touches accounting — it's status / objective / budget only.
         tokensUsed: state.tokensUsed,
         turnsUsed: state.turnsUsed,

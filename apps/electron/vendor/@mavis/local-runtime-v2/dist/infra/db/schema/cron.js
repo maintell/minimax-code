@@ -45,6 +45,9 @@ export const cronRuns = sqliteTable('local_runtime_v2_cron_runs', {
     failedAtMs: integer('failed_at_ms'),
     errorCode: text('error_code'),
     error: text('error'),
+    deliveryInputJson: text('delivery_input_json'),
+    retryAtMs: integer('retry_at_ms'),
+    retryAttempt: integer('retry_attempt').notNull().default(0),
 }, (table) => [
     uniqueIndex('idx_v2_cron_runs_scheduler_trigger')
         .on(table.schedulerTriggerId)

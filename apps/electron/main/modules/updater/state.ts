@@ -51,7 +51,10 @@ export function getUpdateStatus() {
     return updateStatus;
 }
 export function setUpdateStatus(status) {
-    logger.info(`[Updater] 状态变更: ${updateStatus} -> ${status}`);
+    // 下载进度每次回调都会重复设置 downloading，只记录真正发生的状态变化
+    if (status !== updateStatus) {
+        logger.info(`[Updater] 状态变更: ${updateStatus} -> ${status}`);
+    }
     updateStatus = status;
 }
 // 便捷方法：检查当前状态

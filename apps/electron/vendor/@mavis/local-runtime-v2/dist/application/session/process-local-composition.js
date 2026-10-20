@@ -1,11 +1,12 @@
 import { createProcessLocalApplication } from '../index.js';
+import { createProcessLocalMiniAppAgentApplication } from './process-local-miniapp-agent-application.js';
 import { createProcessLocalMiniAppApplication } from './process-local-miniapp-application.js';
 /**
  * Wires the process-local Application facade over owners the runtime has already
  * initialized, keeping that wiring out of the services composition root.
  */
 export function composeProcessLocalApplication(input) {
-    return createProcessLocalApplication({
+    const application = createProcessLocalApplication({
         eventBus: input.eventBus,
         usageCommits: input.usageCommits,
         skills: {
@@ -21,5 +22,11 @@ export function composeProcessLocalApplication(input) {
         peripherals: { ...input.compatibility.peripherals, mcp: input.mcp },
         modelProvider: input.modelProvider,
     });
+    return input.miniAppAgent
+        ? {
+            ...application,
+            miniAppAgent: createProcessLocalMiniAppAgentApplication(input.miniAppAgent),
+        }
+        : application;
 }
 //# sourceMappingURL=process-local-composition.js.map

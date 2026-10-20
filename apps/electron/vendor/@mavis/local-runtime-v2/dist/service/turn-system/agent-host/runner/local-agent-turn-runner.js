@@ -560,6 +560,9 @@ function toPiControlInput(input) {
             : {}),
         ...(input.shouldStopAfterTurn ? { shouldStopAfterTurn: input.shouldStopAfterTurn } : {}),
         ...(input.tryBeginClose ? { tryBeginClose: input.tryBeginClose } : {}),
+        ...(input.unexpectedToolCallFallback
+            ? { unexpectedToolCallFallback: input.unexpectedToolCallFallback }
+            : {}),
     };
 }
 function combineAbortSignals(...signals) {

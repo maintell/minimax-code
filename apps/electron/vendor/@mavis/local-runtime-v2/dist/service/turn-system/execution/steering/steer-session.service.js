@@ -57,7 +57,7 @@ async function deliverToActive(options, input, clientRequestId, observedTurnId) 
     return deliverToKnownActive(options, activeSteeringInput(input), clientRequestId, activeTurnId);
 }
 async function deliverToKnownActive(options, input, clientRequestId, activeTurnId) {
-    const reservation = await reserveActiveDeliveryReceipt(options, input.sessionId, clientRequestId, activeTurnId);
+    const reservation = await reserveActiveDeliveryReceipt(options, input, clientRequestId, activeTurnId);
     if (reservation.kind === 'duplicate') {
         return { delivered: true, mode: 'duplicate', turnId: reservation.turnId };
     }
@@ -70,13 +70,14 @@ async function deliverToKnownActive(options, input, clientRequestId, activeTurnI
         reservation,
     });
 }
-async function reserveActiveDeliveryReceipt(options, sessionId, clientRequestId, turnId) {
+async function reserveActiveDeliveryReceipt(options, input, clientRequestId, turnId) {
     if (!clientRequestId)
         return { kind: 'deliver', receiptReserved: false };
     const receipt = await options.receipts.reserveSteeringReceipt({
-        sessionId,
+        sessionId: input.sessionId,
         clientRequestId,
         turnId,
+        ...(input.receiptAliases?.length ? { receiptAliases: input.receiptAliases } : {}),
     });
     if (receipt.status === 'duplicate')
         return { kind: 'duplicate', turnId: receipt.turnId };
@@ -99,12 +100,23 @@ async function deliverToReservedActive(options, delivery) {
         // the active Turn and this receipt is safe to compensate.
         await releaseReservedReceipt(options, delivery);
     }
-    return result.delivered || result.reason === 'delivery-closed' ? result : undefined;
+    return result.delivered ||
+        result.reason === 'delivery-closed' ||
+        result.reason === 'computer-use-requires-new-turn'
+        ? result
+        : undefined;
 }
 async function releaseReservedReceipt(options, delivery) {
     if (!delivery.reservation.receiptReserved || !delivery.clientRequestId)
         return;
-    await releaseKnownUndeliveredReceipt(options, delivery.input.sessionId, delivery.clientRequestId, delivery.activeTurnId);
+    await releaseKnownUndeliveredReceipt(options, {
+        sessionId: delivery.input.sessionId,
+        clientRequestId: delivery.clientRequestId,
+        turnId: delivery.activeTurnId,
+        ...(delivery.input.receiptAliases?.length
+            ? { receiptAliases: delivery.input.receiptAliases }
+            : {}),
+    });
 }
 async function activateOrSteerRace(options, input, clientRequestId) {
     const activated = await options.activation.execute(steerActivationInput(options, input, clientRequestId));
@@ -119,7 +131,7 @@ function steerActivationInput(options, input, clientRequestId) {
     return {
         sessionId: input.sessionId,
         input: input.input,
-        clientRequestId: clientRequestId ?? input.idempotencyKey,
+        ...activationReceipt(input, clientRequestId),
         provenance: input.provenance,
         ...(options.sessionClio ? { admittedQueryId: sessionClioSteeringQueryId(input) } : {}),
         ...(input.clientIntent ? { clientIntent: input.clientIntent } : {}),
@@ -133,6 +145,15 @@ function steerActivationInput(options, input, clientRequestId) {
         ...(input.requestedTurnId ? { requestedTurnId: input.requestedTurnId } : {}),
         delivery: activationDelivery(input),
         immediateSendBatch: input.immediateSendBatch,
+    };
+}
+/** Per-item aliases are only admitted alongside the durable producer receipt. */
+function activationReceipt(input, clientRequestId) {
+    return {
+        clientRequestId: clientRequestId ?? input.idempotencyKey,
+        ...(clientRequestId && input.receiptAliases?.length
+            ? { receiptAliases: input.receiptAliases }
+            : {}),
     };
 }
 function activationDelivery(input) {
@@ -193,9 +214,9 @@ function activeSteeringInput(input) {
     // explicit choice.
     return { ...input, input: activeInput, requeueModel: activationPreference };
 }
-async function releaseKnownUndeliveredReceipt(options, sessionId, clientRequestId, turnId) {
+async function releaseKnownUndeliveredReceipt(options, receipt) {
     try {
-        await options.receipts.releaseSteeringReceipt({ sessionId, clientRequestId, turnId });
+        await options.receipts.releaseSteeringReceipt(receipt);
     }
     catch {
         // The receipt stays durable on a compensation write failure. Replaying it
@@ -213,6 +234,9 @@ async function steer(turns, input, turnId) {
     });
     if (result.status === 'accepted') {
         return { delivered: true, mode: 'steered', turnId: result.turnId };
+    }
+    if (result.status === 'computer-use-requires-new-turn') {
+        return { delivered: false, reason: result.status };
     }
     if (result.status === 'unsupported-delivery' ||
         result.status === 'delivery-closed' ||
@@ -260,6 +284,7 @@ function bufferedSteeringMessage(input) {
                     message: {
                         text: member.message.content,
                         attachments: member.message.attachments,
+                        computerUse: member.message.computerUse,
                         ...(member.message.quotedMessage
                             ? { quotedMessage: member.message.quotedMessage }
                             : {}),
@@ -306,7 +331,7 @@ function isForegroundSteerSend(clientIntent) {
     return isPausedQueueSend(clientIntent) || clientIntent === 'composer-steer';
 }
 function durableSteeringReceiptId(input) {
-    return input.preDelivery ? steeringReceiptId(input) : undefined;
+    return input.preDelivery || input.receiptAliases?.length ? steeringReceiptId(input) : undefined;
 }
 function identifyVisibleSteering(input) {
     if (input.userMessageId || !projectsVisibleUserMessage(input.delivery))

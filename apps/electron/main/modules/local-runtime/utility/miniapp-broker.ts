@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { MINIAPP_AGENT_FAILURE_CODES, readMiniAppAgentRunEvent, readMiniAppAgentRunResult, toMiniAppAgentFailureCode, isMiniAppAgentBusyReason, readMiniAppAgentModelSelection, MINIAPP_AGENT_MAX_TEXT_LENGTH, isMiniAppAgentPermissionDecision, readMiniAppAgentAnswers, readMiniAppAgentModels, readMiniAppAgentAgents, readMiniAppAgentCreateResponse, validateMiniAppSurfaceWindow } from "@mavis/shared/miniapp-surface";
+import { parseMiniAppLoopbackOrigin } from "../../browser/miniapp-loopback-origin";
 import { isSafeBrokerRequestId } from "./control";
+const UTILITY_CONSOLE_LOGGER = {
+    warn: (message, fields) => console.warn(`[LocalRuntimeUtility] ${message}`, fields),
+};
 const MINIAPP_ERROR_MESSAGES = {
     invalid_request: 'Invalid Mini App request',
     runtime_unavailable: 'Mini App runtime is unavailable',
@@ -8,9 +13,49 @@ const MINIAPP_ERROR_MESSAGES = {
     refresh_failed: 'Mini App page refresh failed',
     stop_failed: 'Mini App failed to stop',
     start_failed: 'Mini App failed to start',
+    detach_failed: 'Mini App page could not open in its own window',
+    attach_failed: 'Mini App page could not return to the panel',
+    not_permitted: 'Mini App Agent access is not permitted',
+    session_not_found: 'Mini App Agent session was not found',
+    cancelled: 'Mini App Agent run was cancelled',
+    result_unknown: 'Mini App Agent run result is unknown',
+    request_not_found: 'Mini App Agent request was not found or already settled',
 };
+const MINIAPP_AGENT_FAILURE_CODE_SET = new Set(MINIAPP_AGENT_FAILURE_CODES);
+const MINIAPP_SURFACE_ERROR_CODE_SET = new Set([
+    'invalid_request',
+    'runtime_unavailable',
+    'not_found',
+    'busy',
+    'refresh_failed',
+    'stop_failed',
+    'start_failed',
+]);
 const REQUEST_TIMEOUT_MS = 60000;
 const REQUEST_SETTLEMENT_TIMEOUT_MS = 15000;
+function isAgentTurnMethod(method) {
+    return method === 'agent.run' || method === 'agent.answer';
+}
+function isAgentPanelMethod(method) {
+    return method === 'agent.panelOpened' || method === 'agent.panelClosed';
+}
+function isAgentCatalogMethod(method) {
+    return method === 'agent.models' || method === 'agent.agents' || method === 'agent.create';
+}
+function isAgentMethod(method) {
+    return (method === 'agent.run' ||
+        method === 'agent.answer' ||
+        method === 'agent.reply' ||
+        method === 'agent.open' ||
+        isAgentCatalogMethod(method) ||
+        isAgentPanelMethod(method));
+}
+function isAgentCatalogRequest(message) {
+    return isAgentCatalogMethod(message.method);
+}
+function isAgentRequestMessage(message) {
+    return isAgentMethod(message.method);
+}
 // Broker diagnostics cross a process boundary. Keep this closed to the
 // Host-owned codes that distinguish manual activation/publication failures;
 // unknown values stay private instead of being mirrored automatically.
@@ -93,17 +138,135 @@ export class MainMiniAppBrokerClient {
         if (!isMiniAppBrokerRequestMessage(message)) {
             return Promise.reject(miniAppError('invalid_request'));
         }
+        return this.dispatch(target, message, signal);
+    }
+    /** Agent turns can run for minutes: no request deadline, only caller cancellation or target loss. */
+    runAgent(target, input, options = {}) {
+        return this.dispatchAgentTurn(target, {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'agent.run',
+            payload: {
+                caller: copyAgentCaller(input.caller),
+                text: input.text,
+                ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+                ...copyAgentModel(input.model),
+                ...(input.agent !== undefined ? { agent: input.agent } : {}),
+                observe: options.onEvent !== undefined,
+            },
+        }, options);
+    }
+    /** The continuation turn is followed exactly like `runAgent`. */
+    answerAgent(target, input, options = {}) {
+        return this.dispatchAgentTurn(target, {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'agent.answer',
+            payload: {
+                caller: copyAgentCaller(input.caller),
+                sessionId: input.sessionId,
+                questionId: input.questionId,
+                answers: input.answers,
+                ...copyAgentModel(input.model),
+                observe: options.onEvent !== undefined,
+            },
+        }, options);
+    }
+    /** Short request under the ordinary request deadline. */
+    async replyAgent(target, input) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'agent.reply',
+            payload: {
+                caller: copyAgentCaller(input.caller),
+                sessionId: input.sessionId,
+                requestId: input.requestId,
+                decision: input.decision,
+            },
+        };
+        if (!isMiniAppBrokerRequestMessage(message))
+            throw miniAppError('invalid_request');
+        await this.dispatch(target, message);
+    }
+    /** Short request under the ordinary request deadline; the Utility side only checks ownership. */
+    async openAgent(target, input) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'agent.open',
+            payload: { caller: copyAgentCaller(input.caller), sessionId: input.sessionId },
+        };
+        if (!isMiniAppBrokerRequestMessage(message))
+            throw miniAppError('invalid_request');
+        return (await this.dispatch(target, message));
+    }
+    /** Short request under the ordinary request deadline; `caller` comes from the sending tab. */
+    async modelsAgent(target, input) {
+        return (await this.requestAgentCall(target, 'agent.models', {
+            caller: copyAgentCaller(input.caller),
+        }));
+    }
+    async agentsAgent(target, input) {
+        return (await this.requestAgentCall(target, 'agent.agents', {
+            caller: copyAgentCaller(input.caller),
+        }));
+    }
+    async createAgent(target, input) {
+        return (await this.requestAgentCall(target, 'agent.create', {
+            caller: copyAgentCaller(input.caller),
+            ...(input.agent !== undefined ? { agent: input.agent } : {}),
+        }));
+    }
+    requestAgentCall(target, method, payload) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method,
+            payload,
+        };
+        if (!isMiniAppBrokerRequestMessage(message)) {
+            return Promise.reject(miniAppError('invalid_request'));
+        }
+        return this.dispatch(target, message);
+    }
+    /** Host-reported side panel change; short request under the ordinary request deadline. */
+    async reportAgentPanel(target, method, input) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method,
+            payload: { sessionId: input.sessionId, hostSessionId: input.hostSessionId },
+        };
+        if (!isMiniAppBrokerRequestMessage(message))
+            throw miniAppError('invalid_request');
+        await this.dispatch(target, message);
+    }
+    dispatchAgentTurn(target, message, options) {
+        const { signal, onEvent } = options;
+        if (signal?.aborted)
+            return Promise.reject(abortError());
+        if (!isMiniAppBrokerRequestMessage(message)) {
+            return Promise.reject(miniAppError('invalid_request'));
+        }
+        return this.dispatch(target, message, signal, onEvent);
+    }
+    dispatch(target, message, signal, onEvent) {
+        const { requestId, method } = message;
         return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                this.cancelRequest(requestId, target, 'deadline');
-            }, REQUEST_TIMEOUT_MS);
+            const timeout = isAgentTurnMethod(method)
+                ? undefined
+                : setTimeout(() => {
+                    this.cancelRequest(requestId, target, 'deadline');
+                }, REQUEST_TIMEOUT_MS);
             const pending = {
                 target,
                 method,
                 resolve,
                 reject,
-                timeout,
+                ...(timeout ? { timeout } : {}),
                 ...(signal ? { signal } : {}),
+                ...(onEvent ? { onEvent } : {}),
                 requestPosted: false,
             };
             if (signal) {
@@ -127,6 +290,10 @@ export class MainMiniAppBrokerClient {
     handleMessage(target, value) {
         if (!isRecord(value))
             return false;
+        if (value.type === 'miniapp-event') {
+            this.forwardEvent(target, value);
+            return true;
+        }
         if (value.type !== 'miniapp-result' && value.type !== 'miniapp-error')
             return false;
         const requestId = value.requestId;
@@ -136,11 +303,13 @@ export class MainMiniAppBrokerClient {
         if (!pending)
             return true;
         const diagnostic = parseBrokerErrorDiagnostic(readDataProperty(value, 'diagnostic'));
-        if (isMiniAppBrokerResultMessage(value)) {
-            pending.resolve(value.result);
+        const result = readBrokerResultMessage(value, pending.method);
+        if (result) {
+            pending.resolve(result);
         }
-        else if (isMiniAppBrokerErrorMessage(value, diagnostic)) {
-            if (pending.cancellation === 'caller') {
+        else if (isMiniAppBrokerErrorMessage(value, diagnostic, pending.method)) {
+            const unknownAfterCancel = isAgentTurnMethod(pending.method) && value.code === 'result_unknown';
+            if (pending.cancellation === 'caller' && !unknownAfterCancel) {
                 pending.reject(abortError());
             }
             else {
@@ -153,7 +322,7 @@ export class MainMiniAppBrokerClient {
             }
         }
         else {
-            pending.reject(pending.cancellation === 'caller' ? abortError() : miniAppError('invalid_request'));
+            pending.reject(unreadableSettlementError(pending));
         }
         return true;
     }
@@ -161,7 +330,26 @@ export class MainMiniAppBrokerClient {
         for (const [requestId, pending] of this.pending) {
             if (pending.target !== target)
                 continue;
-            this.reject(requestId, target, miniAppError('runtime_unavailable'));
+            // A submitted Agent request may still have applied; never let the page retry it implicitly.
+            this.reject(requestId, target, miniAppError(isAgentMethod(pending.method) ? 'result_unknown' : 'runtime_unavailable'));
+        }
+    }
+    forwardEvent(target, value) {
+        if (!hasOnlyKeys(value, ['type', 'requestId', 'event']))
+            return;
+        if (!isSafeBrokerRequestId(value.requestId))
+            return;
+        const pending = this.pending.get(value.requestId);
+        if (!pending || pending.target !== target || !isAgentTurnMethod(pending.method))
+            return;
+        const event = readMiniAppAgentRunEvent(value.event);
+        if (!event)
+            return;
+        try {
+            pending.onEvent?.(event);
+        }
+        catch {
+            // Event delivery is best-effort and never settles the run.
         }
     }
     pendingCount() {
@@ -171,7 +359,8 @@ export class MainMiniAppBrokerClient {
         const pending = this.pending.get(requestId);
         if (!pending || pending.target !== target)
             return undefined;
-        clearTimeout(pending.timeout);
+        if (pending.timeout)
+            clearTimeout(pending.timeout);
         if (pending.settlementWatchdog)
             clearTimeout(pending.settlementWatchdog);
         if (pending.signal && pending.abortListener) {
@@ -184,7 +373,7 @@ export class MainMiniAppBrokerClient {
         const current = this.pending.get(requestId);
         if (!current || current.target !== target)
             return;
-        if (current.method === 'stop' && current.requestPosted) {
+        if ((current.method === 'stop' || isAgentTurnMethod(current.method)) && current.requestPosted) {
             this.cancelRequest(requestId, target, 'caller');
             return;
         }
@@ -200,14 +389,19 @@ export class MainMiniAppBrokerClient {
         if (!pending || pending.target !== target || pending.cancellation)
             return;
         const awaitAuthoritativeSettlement = pending.requestPosted &&
-            (pending.method === 'stop' || (pending.method === 'open' && cancellation === 'deadline'));
+            (pending.method === 'stop' ||
+                isAgentTurnMethod(pending.method) ||
+                (pending.method === 'open' && cancellation === 'deadline'));
         if (!awaitAuthoritativeSettlement) {
             const taken = this.take(requestId, target);
             if (!taken)
                 return;
             if (taken.requestPosted)
                 this.postCancel(target, requestId);
-            taken.reject(cancellation === 'caller' ? abortError() : miniAppError('runtime_unavailable'));
+            taken.reject(cancellation === 'caller'
+                ? abortError()
+                : // A reply past its deadline may still have been applied.
+                    miniAppError(taken.method === 'agent.reply' ? 'result_unknown' : 'runtime_unavailable'));
             return;
         }
         pending.cancellation = cancellation;
@@ -216,7 +410,14 @@ export class MainMiniAppBrokerClient {
             return;
         pending.settlementWatchdog = setTimeout(() => {
             const unsettled = this.take(requestId, target);
-            unsettled?.reject(cancellation === 'caller' ? abortError() : miniAppError('runtime_unavailable'));
+            if (!unsettled)
+                return;
+            // An agent turn that never confirmed its abort may still have run.
+            if (isAgentTurnMethod(unsettled.method)) {
+                unsettled.reject(miniAppError('result_unknown'));
+                return;
+            }
+            unsettled.reject(cancellation === 'caller' ? abortError() : miniAppError('runtime_unavailable'));
         }, REQUEST_SETTLEMENT_TIMEOUT_MS);
         pending.settlementWatchdog.unref?.();
     }
@@ -238,12 +439,14 @@ export class MainMiniAppBrokerClient {
 }
 
 export class UtilityMiniAppBrokerServer {
-    constructor(target) {
+    constructor(target, logger = UTILITY_CONSOLE_LOGGER) {
         this.target = target;
+        this.logger = logger;
         this.pending = new Map();
     }
-    bind(application) {
+    bind(application, agent) {
         this.application = application;
+        this.agent = agent;
     }
     handleMessage(value) {
         if (!isRecord(value))
@@ -267,6 +470,10 @@ export class UtilityMiniAppBrokerServer {
             this.postError(requestId, 'busy');
             return true;
         }
+        if (isAgentRequestMessage(value)) {
+            this.handleAgentRequest(value);
+            return true;
+        }
         const application = this.application;
         if (!application) {
             this.postError(requestId, 'runtime_unavailable');
@@ -282,7 +489,7 @@ export class UtilityMiniAppBrokerServer {
                 this.postError(requestId, 'start_failed');
                 return;
             }
-            this.target.postMessage({ type: 'miniapp-result', requestId, result });
+            this.postResult(requestId, value.method, result);
         }, (error) => {
             if (!this.takePending(requestId, pending))
                 return;
@@ -297,6 +504,7 @@ export class UtilityMiniAppBrokerServer {
     }
     close() {
         this.application = undefined;
+        this.agent = undefined;
         for (const pending of this.pending.values()) {
             if (pending.settlementWatchdog)
                 clearTimeout(pending.settlementWatchdog);
@@ -307,11 +515,170 @@ export class UtilityMiniAppBrokerServer {
     pendingCount() {
         return this.pending.size;
     }
+    handleAgentRequest(request) {
+        const { requestId } = request;
+        const agent = this.agent;
+        if (!agent) {
+            this.postError(requestId, 'runtime_unavailable');
+            return;
+        }
+        const controller = new AbortController();
+        const pending = { controller, method: request.method };
+        this.pending.set(requestId, pending);
+        if (request.method === 'agent.reply') {
+            void Promise.resolve()
+                .then(() => agent.reply(request.payload))
+                .then(() => {
+                if (!this.takePending(requestId, pending))
+                    return;
+                this.postResult(requestId, request.method, { replied: true });
+            }, (error) => {
+                if (!this.takePending(requestId, pending))
+                    return;
+                this.postAgentError(requestId, error);
+            });
+            return;
+        }
+        if (isAgentCatalogRequest(request)) {
+            this.handleAgentCatalogRequest(request, agent, pending);
+            return;
+        }
+        if (request.method === 'agent.panelOpened' || request.method === 'agent.panelClosed') {
+            const { method, payload } = request;
+            void Promise.resolve()
+                .then(() => method === 'agent.panelOpened' ? agent.panelOpened(payload) : agent.panelClosed(payload))
+                .then(() => {
+                if (!this.takePending(requestId, pending))
+                    return;
+                this.postResult(requestId, method, { acknowledged: true });
+            }, (error) => {
+                if (!this.takePending(requestId, pending))
+                    return;
+                this.postAgentError(requestId, error);
+            });
+            return;
+        }
+        if (request.method === 'agent.open') {
+            void Promise.resolve()
+                .then(() => agent.open(request.payload))
+                .then((value) => {
+                if (!this.takePending(requestId, pending))
+                    return;
+                // Only the contract fields cross the port; anything else stays in the Utility.
+                const result = isRecord(value)
+                    ? readAgentOpenResult({
+                        sessionId: value.sessionId,
+                        hostSessionId: value.hostSessionId,
+                    })
+                    : undefined;
+                if (!result) {
+                    this.postError(requestId, 'result_unknown');
+                    return;
+                }
+                this.postResult(requestId, request.method, result);
+            }, (error) => {
+                if (!this.takePending(requestId, pending))
+                    return;
+                this.postAgentError(requestId, error);
+            });
+            return;
+        }
+        const onEvent = (value) => {
+            if (this.pending.get(requestId) !== pending)
+                return;
+            const event = readMiniAppAgentRunEvent(value);
+            if (!event)
+                return;
+            try {
+                this.target.postMessage({
+                    type: 'miniapp-event',
+                    requestId,
+                    event,
+                });
+            }
+            catch {
+                // Uncloneable frame data or a closing port drops this event only.
+            }
+        };
+        // Only a page that registered `onEvent` is a listener the runtime may wait on.
+        const options = {
+            signal: controller.signal,
+            ...(request.payload.observe === true ? { onEvent } : {}),
+        };
+        void Promise.resolve()
+            .then(() => {
+            if (request.method === 'agent.run') {
+                const { payload } = request;
+                return agent.run({
+                    caller: payload.caller,
+                    text: payload.text,
+                    ...(payload.sessionId !== undefined ? { sessionId: payload.sessionId } : {}),
+                    ...(payload.model ? { model: payload.model } : {}),
+                    ...(payload.agent !== undefined ? { agent: payload.agent } : {}),
+                    ...options,
+                });
+            }
+            const { payload } = request;
+            return agent.answer({
+                caller: payload.caller,
+                sessionId: payload.sessionId,
+                requestId: payload.questionId,
+                answers: payload.answers,
+                ...(payload.model ? { model: payload.model } : {}),
+                ...options,
+            });
+        })
+            .then((value) => {
+            if (!this.takePending(requestId, pending))
+                return;
+            const result = readMiniAppAgentRunResult(value);
+            if (!result) {
+                this.postError(requestId, 'result_unknown');
+                return;
+            }
+            this.postResult(requestId, request.method, result);
+        }, (error) => {
+            if (!this.takePending(requestId, pending))
+                return;
+            this.postAgentError(requestId, error);
+        });
+    }
+    /**
+     * `models` / `agents` / `create`: only the contract fields cross the port, validated with the
+     * shared readers; anything else stays in the Utility.
+     */
+    handleAgentCatalogRequest(request, agent, pending) {
+        const { requestId, method } = request;
+        void Promise.resolve()
+            .then(() => {
+            if (request.method === 'agent.models')
+                return agent.models(request.payload);
+            if (request.method === 'agent.agents')
+                return agent.agents(request.payload);
+            return agent.create(request.payload);
+        })
+            .then((value) => {
+            if (!this.takePending(requestId, pending))
+                return;
+            const result = readAgentCatalogResult(method, value);
+            if (!result) {
+                this.postError(requestId, 'result_unknown');
+                return;
+            }
+            this.postResult(requestId, method, result);
+        }, (error) => {
+            if (!this.takePending(requestId, pending))
+                return;
+            this.postAgentError(requestId, error);
+        });
+    }
     cancelRequest(requestId) {
         const pending = this.pending.get(requestId);
         if (!pending || pending.controller.signal.aborted)
             return;
-        if (pending.method !== 'open' && pending.method !== 'stop') {
+        if (pending.method !== 'open' &&
+            pending.method !== 'stop' &&
+            !isAgentTurnMethod(pending.method)) {
             this.pending.delete(requestId);
             pending.controller.abort();
             return;
@@ -319,7 +686,9 @@ export class UtilityMiniAppBrokerServer {
         pending.settlementWatchdog = setTimeout(() => {
             if (!this.takePending(requestId, pending))
                 return;
-            this.postError(requestId, 'runtime_unavailable');
+            // An agent turn that never confirmed its abort may still have run; never
+            // report it as cleanly cancelled.
+            this.postError(requestId, isAgentTurnMethod(pending.method) ? 'result_unknown' : 'runtime_unavailable');
         }, REQUEST_SETTLEMENT_TIMEOUT_MS);
         pending.settlementWatchdog.unref?.();
         // Keep open/stop registered until the operation reports whether a native
@@ -336,15 +705,47 @@ export class UtilityMiniAppBrokerServer {
             clearTimeout(pending.settlementWatchdog);
         return true;
     }
+    /**
+     * A result that cannot cross the port is reported as unknown: the operation already ran. Main's
+     * `releaseTarget` / deadline still settles the request if the fallback error is lost too.
+     */
+    postResult(requestId, method, result) {
+        try {
+            this.target.postMessage({ type: 'miniapp-result', requestId, result });
+        }
+        catch (error) {
+            this.logger.warn('miniapp broker result delivery failed', {
+                requestId,
+                method,
+                errorName: readErrorName(error),
+            });
+            // Surface requests have no `result_unknown`; their callers treat target loss the same way.
+            this.postError(requestId, isAgentMethod(method) ? 'result_unknown' : 'runtime_unavailable');
+        }
+    }
+    postAgentError(requestId, error) {
+        const code = normalizeAgentErrorCode(error);
+        this.postError(requestId, code, code === 'busy' ? normalizeAgentBusyReason(error) : undefined);
+    }
     postError(requestId, code, busyReason, diagnostic) {
-        this.target.postMessage({
-            type: 'miniapp-error',
-            requestId,
-            code,
-            message: MINIAPP_ERROR_MESSAGES[code],
-            ...(code === 'busy' && busyReason ? { busyReason } : {}),
-            ...(diagnostic ? { diagnostic } : {}),
-        });
+        try {
+            this.target.postMessage({
+                type: 'miniapp-error',
+                requestId,
+                code,
+                message: MINIAPP_ERROR_MESSAGES[code],
+                ...(code === 'busy' && busyReason ? { busyReason } : {}),
+                ...(diagnostic ? { diagnostic } : {}),
+            });
+        }
+        catch (error) {
+            // Main settles the request through `releaseTarget` or its deadline.
+            this.logger.warn('miniapp broker error delivery failed', {
+                requestId,
+                code,
+                errorName: readErrorName(error),
+            });
+        }
     }
 }
 
@@ -360,8 +761,26 @@ async function execute(application, request, signal) {
         throw miniAppError('invalid_request');
     if (request.method === 'open')
         return application.open({ pluginId, signal });
+    if (request.method === 'credential')
+        return application.credential({ pluginId, signal });
     await application.stop({ pluginId, signal });
     return { stopped: true };
+}
+function normalizeAgentErrorCode(error) {
+    if (error instanceof Error && error.name === 'AbortError')
+        return 'cancelled';
+    const code = error && typeof error === 'object' && 'code' in error
+        ? error.code
+        : undefined;
+    // An unrecognised failure may follow a submitted turn, so it is not retryable.
+    return toMiniAppAgentFailureCode(code) ?? 'result_unknown';
+}
+/** The runtime's `MiniAppAgentError.reason` of a `BUSY`. */
+function normalizeAgentBusyReason(error) {
+    const reason = error && typeof error === 'object' && 'reason' in error
+        ? error.reason
+        : undefined;
+    return isMiniAppAgentBusyReason(reason) ? reason : undefined;
 }
 function normalizeErrorCode(error, method) {
     if (error instanceof Error && error.name === 'AbortError') {
@@ -395,6 +814,18 @@ function miniAppError(code, busyReason) {
 }
 function abortError() {
     return Object.assign(new Error('Mini App request was cancelled'), { name: 'AbortError' });
+}
+/**
+ * A settlement frame Main cannot read. A submitted Agent request may already have applied, so
+ * the caller must not conclude its parameters were wrong and resend.
+ */
+function unreadableSettlementError(pending) {
+    if (isAgentMethod(pending.method))
+        return miniAppError('result_unknown');
+    return pending.cancellation === 'caller' ? abortError() : miniAppError('invalid_request');
+}
+function readErrorName(error) {
+    return error instanceof Error ? error.name : typeof error;
 }
 function readBrokerErrorDiagnostic(error, dataOnly = false) {
     const fields = dataOnly
@@ -475,17 +906,133 @@ function isSafePluginId(value) {
         value.trim() === value &&
         !/[\u0000-\u001f\u007f]/u.test(value));
 }
+const AGENT_PAYLOAD_VALIDATORS = {
+    'agent.run': isAgentRunPayload,
+    'agent.models': isAgentCatalogPayload,
+    'agent.agents': isAgentCatalogPayload,
+    'agent.create': isAgentCreatePayload,
+    'agent.reply': isAgentReplyPayload,
+    'agent.answer': isAgentAnswerPayload,
+    'agent.open': isAgentOpenPayload,
+    'agent.panelOpened': isAgentPanelPayload,
+    'agent.panelClosed': isAgentPanelPayload,
+};
 function isMiniAppBrokerRequestMessage(value) {
     if (!isRecord(value) || value.type !== 'miniapp-request')
         return false;
+    if (isAgentMethod(value.method)) {
+        return (hasOnlyKeys(value, ['type', 'requestId', 'method', 'payload']) &&
+            isSafeBrokerRequestId(value.requestId) &&
+            AGENT_PAYLOAD_VALIDATORS[value.method](value.payload));
+    }
     if (!hasOnlyKeys(value, ['type', 'requestId', 'method', 'pluginId']))
         return false;
     if (!isSafeBrokerRequestId(value.requestId))
         return false;
-    if (value.method !== 'list' && value.method !== 'open' && value.method !== 'stop') {
+    if (value.method !== 'list' &&
+        value.method !== 'open' &&
+        value.method !== 'stop' &&
+        value.method !== 'credential') {
         return false;
     }
     return value.method === 'list' ? value.pluginId === undefined : isSafePluginId(value.pluginId);
+}
+function isAgentCaller(caller) {
+    return (isRecord(caller) &&
+        hasOnlyKeys(caller, ['pluginId', 'runId', 'hostSessionId']) &&
+        isSafePluginId(caller.pluginId) &&
+        isSafeLabel(caller.runId) &&
+        (caller.hostSessionId === undefined || isSafeLabel(caller.hostSessionId)));
+}
+function copyAgentCaller(caller) {
+    return {
+        pluginId: caller.pluginId,
+        runId: caller.runId,
+        ...(caller.hostSessionId !== undefined ? { hostSessionId: caller.hostSessionId } : {}),
+    };
+}
+function copyAgentModel(model) {
+    // A malformed model is passed on as is, so the request check rejects it as `invalid_request`.
+    return model === undefined ? {} : { model: readMiniAppAgentModelSelection(model) ?? model };
+}
+function isOptionalModel(value) {
+    return value === undefined || readMiniAppAgentModelSelection(value) !== null;
+}
+function isOptionalSafeLabel(value) {
+    return value === undefined || isSafeLabel(value);
+}
+function isAgentRunPayload(value) {
+    if (!isRecord(value) ||
+        !hasOnlyKeys(value, ['caller', 'text', 'sessionId', 'model', 'agent', 'observe'])) {
+        return false;
+    }
+    return (isAgentCaller(value.caller) &&
+        typeof value.text === 'string' &&
+        value.text.length <= MINIAPP_AGENT_MAX_TEXT_LENGTH &&
+        isOptionalSafeLabel(value.sessionId) &&
+        isOptionalModel(value.model) &&
+        isOptionalSafeLabel(value.agent) &&
+        isOptionalBoolean(value.observe));
+}
+function isAgentCatalogPayload(value) {
+    return isRecord(value) && hasOnlyKeys(value, ['caller']) && isAgentCaller(value.caller);
+}
+function isAgentCreatePayload(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['caller', 'agent']) &&
+        isAgentCaller(value.caller) &&
+        isOptionalSafeLabel(value.agent));
+}
+function isOptionalBoolean(value) {
+    return value === undefined || typeof value === 'boolean';
+}
+function isAgentReplyPayload(value) {
+    if (!isRecord(value) || !hasOnlyKeys(value, ['caller', 'sessionId', 'requestId', 'decision'])) {
+        return false;
+    }
+    return (isAgentCaller(value.caller) &&
+        isSafeLabel(value.sessionId) &&
+        isSafeLabel(value.requestId) &&
+        isMiniAppAgentPermissionDecision(value.decision));
+}
+function isAgentAnswerPayload(value) {
+    if (!isRecord(value) ||
+        !hasOnlyKeys(value, ['caller', 'sessionId', 'questionId', 'answers', 'model', 'observe'])) {
+        return false;
+    }
+    return (isAgentCaller(value.caller) &&
+        isSafeLabel(value.sessionId) &&
+        isSafeLabel(value.questionId) &&
+        readMiniAppAgentAnswers(value.answers) !== null &&
+        isOptionalModel(value.model) &&
+        isOptionalBoolean(value.observe));
+}
+function isAgentOpenPayload(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['caller', 'sessionId']) &&
+        isAgentCaller(value.caller) &&
+        isSafeLabel(value.sessionId));
+}
+function isAgentPanelPayload(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['sessionId', 'hostSessionId']) &&
+        isSafeLabel(value.sessionId) &&
+        isSafeLabel(value.hostSessionId));
+}
+function readAgentOpenResult(value) {
+    return isRecord(value) &&
+        hasOnlyKeys(value, ['sessionId', 'hostSessionId']) &&
+        isSafeLabel(value.sessionId) &&
+        isSafeLabel(value.hostSessionId)
+        ? { sessionId: value.sessionId, hostSessionId: value.hostSessionId }
+        : undefined;
+}
+function readAgentCatalogResult(method, value) {
+    if (method === 'agent.models')
+        return readMiniAppAgentModels(value);
+    if (method === 'agent.agents')
+        return readMiniAppAgentAgents(value);
+    return readMiniAppAgentCreateResponse(value);
 }
 function isMiniAppBrokerCancelMessage(value) {
     return (isRecord(value) &&
@@ -538,19 +1085,10 @@ function isSafeIconUrl(value) {
         value.startsWith('/mavis/api/file/preview?path=') &&
         !/[\u0000-\u001f\u007f]/u.test(value));
 }
+// Defence in depth: this broker still calls the shared parser itself rather
+// than trusting an upstream check, but no longer re-derives the parse rules.
 function isSafeLoopbackOrigin(value) {
-    if (typeof value !== 'string' || value.length > 128)
-        return false;
-    try {
-        const parsed = new URL(value);
-        return (parsed.protocol === 'http:' &&
-            (parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]') &&
-            Boolean(parsed.port) &&
-            parsed.origin === value);
-    }
-    catch {
-        return false;
-    }
+    return parseMiniAppLoopbackOrigin(value) !== null;
 }
 function isSafeSurfacePath(value) {
     return (typeof value === 'string' &&
@@ -559,11 +1097,28 @@ function isSafeSurfacePath(value) {
         value.length <= 2048 &&
         !/[\u0000-\u001f\u007f]/u.test(value));
 }
+function isSafeLoopbackToken(value) {
+    return typeof value === 'string' && /^[A-Za-z0-9_-]{16,256}$/u.test(value);
+}
+/** The broker does not trust the Utility side; re-validates the shared `surface.window` rules. */
+function isSafeMiniAppWindow(value) {
+    return validateMiniAppSurfaceWindow(value).ok;
+}
 function isMiniAppBrokerResult(value) {
     if (!isRecord(value))
         return false;
     if ('stopped' in value)
         return hasOnlyKeys(value, ['stopped']) && value.stopped === true;
+    if ('running' in value)
+        return hasOnlyKeys(value, ['running']) && value.running === false;
+    if ('credential' in value) {
+        return (hasOnlyKeys(value, ['credential']) &&
+            isRecord(value.credential) &&
+            hasOnlyKeys(value.credential, ['origin', 'runId', 'loopbackToken']) &&
+            isSafeLoopbackOrigin(value.credential.origin) &&
+            isSafeLabel(value.credential.runId) &&
+            isSafeLoopbackToken(value.credential.loopbackToken));
+    }
     if ('miniApps' in value) {
         return (hasOnlyKeys(value, ['miniApps']) &&
             Array.isArray(value.miniApps) &&
@@ -573,19 +1128,43 @@ function isMiniAppBrokerResult(value) {
     return (hasOnlyKeys(value, ['miniApp', 'launch']) &&
         isMiniAppSurfaceSummary(value.miniApp) &&
         isRecord(value.launch) &&
-        hasOnlyKeys(value.launch, ['origin', 'surfacePath', 'runId']) &&
+        hasOnlyKeys(value.launch, ['origin', 'surfacePath', 'runId', 'loopbackToken', 'window']) &&
         isSafeLoopbackOrigin(value.launch.origin) &&
         isSafeSurfacePath(value.launch.surfacePath) &&
-        isSafeLabel(value.launch.runId));
+        isSafeLabel(value.launch.runId) &&
+        isSafeLoopbackToken(value.launch.loopbackToken) &&
+        (value.launch.window === undefined || isSafeMiniAppWindow(value.launch.window)));
 }
-function isMiniAppBrokerResultMessage(value) {
-    return (isRecord(value) &&
-        value.type === 'miniapp-result' &&
-        hasOnlyKeys(value, ['type', 'requestId', 'result']) &&
-        isSafeBrokerRequestId(value.requestId) &&
-        isMiniAppBrokerResult(value.result));
+function readBrokerResultMessage(value, method) {
+    if (!isRecord(value) ||
+        value.type !== 'miniapp-result' ||
+        !hasOnlyKeys(value, ['type', 'requestId', 'result']) ||
+        !isSafeBrokerRequestId(value.requestId)) {
+        return undefined;
+    }
+    if (isAgentTurnMethod(method))
+        return readMiniAppAgentRunResult(value.result) ?? undefined;
+    if (method === 'agent.reply') {
+        return isRecord(value.result) &&
+            hasOnlyKeys(value.result, ['replied']) &&
+            value.result.replied === true
+            ? { replied: true }
+            : undefined;
+    }
+    if (method === 'agent.open')
+        return readAgentOpenResult(value.result);
+    if (isAgentCatalogMethod(method))
+        return readAgentCatalogResult(method, value.result) ?? undefined;
+    if (isAgentPanelMethod(method)) {
+        return isRecord(value.result) &&
+            hasOnlyKeys(value.result, ['acknowledged']) &&
+            value.result.acknowledged === true
+            ? { acknowledged: true }
+            : undefined;
+    }
+    return isMiniAppBrokerResult(value.result) ? value.result : undefined;
 }
-function isMiniAppBrokerErrorMessage(value, diagnostic) {
+function isMiniAppBrokerErrorMessage(value, diagnostic, method) {
     if (!isRecord(value) || value.type !== 'miniapp-error')
         return false;
     if (!hasOnlyKeys(value, ['type', 'requestId', 'code', 'message', 'busyReason', 'diagnostic'])) {
@@ -593,23 +1172,23 @@ function isMiniAppBrokerErrorMessage(value, diagnostic) {
     }
     if (!isSafeBrokerRequestId(value.requestId))
         return false;
-    if (value.code !== 'invalid_request' &&
-        value.code !== 'runtime_unavailable' &&
-        value.code !== 'not_found' &&
-        value.code !== 'busy' &&
-        value.code !== 'refresh_failed' &&
-        value.code !== 'stop_failed' &&
-        value.code !== 'start_failed') {
+    const allowedCodes = isAgentMethod(method)
+        ? MINIAPP_AGENT_FAILURE_CODE_SET
+        : MINIAPP_SURFACE_ERROR_CODE_SET;
+    if (typeof value.code !== 'string' || !allowedCodes.has(value.code))
         return false;
-    }
     if (value.message !== MINIAPP_ERROR_MESSAGES[value.code])
         return false;
     if (Object.prototype.hasOwnProperty.call(value, 'busyReason') &&
-        !(value.code === 'busy' &&
-            (value.busyReason === 'capacity_busy' || value.busyReason === 'operation_busy'))) {
+        !(value.code === 'busy' && isBusyReasonFor(method, value.busyReason))) {
         return false;
     }
     return !Object.prototype.hasOwnProperty.call(value, 'diagnostic') || diagnostic !== undefined;
+}
+function isBusyReasonFor(method, value) {
+    if (isAgentMethod(method))
+        return isMiniAppAgentBusyReason(value);
+    return value === 'capacity_busy' || value === 'operation_busy';
 }
 function parseBrokerErrorDiagnostic(value) {
     const fields = readDataRecord(value, ['hostCode', 'reasonCode', 'failureChain']);

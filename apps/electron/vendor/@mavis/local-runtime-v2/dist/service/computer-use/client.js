@@ -122,12 +122,9 @@ export function computerUseToolResult(name, value) {
     const images = trustedResultImages(record, unresolved);
     for (const image of images) {
         const resolved = computerUseResultImage(image);
-        if (!resolved)
-            continue;
-        // Never inflate an oversized binary into the text field. The SDK normally
-        // returns bounded screenshots; this fallback keeps malformed/unsupported
-        // formats fail-closed while retaining ordinary image results.
-        if (resolved.data.length <= 7_000_000)
+        // Oversized screenshots are re-encoded after the call like every tool image;
+        // a request leaves out any image still above the per-image provider limit.
+        if (resolved)
             content.push({ type: 'image', ...resolved });
     }
     text = describeScreenshotAvailability(name, text, content);

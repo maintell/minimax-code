@@ -180,5 +180,15 @@ export class MemoryControllerBase {
         void req;
         throw new NotImplementedError('discardLegacyMemoryMigration');
     }
+    async getMemoryV2Onboarding(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getMemoryV2Onboarding');
+    }
+    async completeMemoryV2Onboarding(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('completeMemoryV2Onboarding');
+    }
 }
 //# sourceMappingURL=memory-controller-base.gen.js.map

@@ -380,6 +380,9 @@ function batchQueueMessage(members) {
     return {
         content: members.map((member) => member.message.content).join('\n\n'),
         attachments: members.flatMap((member) => member.message.attachments),
+        ...(members.some((member) => member.message.computerUse?.enable === true)
+            ? { computerUse: { enable: true } }
+            : {}),
         hideUserMessage: members.every((member) => member.message.hideUserMessage === true),
         ...(members.some((member) => member.message.displayContent !== undefined)
             ? {
@@ -423,6 +426,7 @@ function toRequeueInput(sessionId, agentName, message) {
         message: {
             content: input.text,
             attachments: (input.attachments ?? []).flatMap(toRequeueAttachment),
+            ...(input.computerUse ? { computerUse: { ...input.computerUse } } : {}),
             ...(delivery?.hideUserMessage !== undefined
                 ? { hideUserMessage: delivery.hideUserMessage }
                 : {}),

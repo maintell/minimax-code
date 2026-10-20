@@ -29,7 +29,6 @@ const JSON_AGENT_TABLES = new Set([
     'local_runtime_queues',
     'local_runtime_queue_items',
     'local_runtime_background_tasks',
-    'local_runtime_background_task_events',
     'local_runtime_crons',
     'questionnaire_requests',
     'local_runtime_preferences',

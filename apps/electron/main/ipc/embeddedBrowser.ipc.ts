@@ -1,6 +1,8 @@
 import { getDesktopConfig } from "./storage.ipc";
 import { ipcMain, BrowserWindow, nativeImage, clipboard } from "electron";
 import { withTimeout, BROWSER_TIMEOUTS, browserOperationFailure } from "@mavis/browser-core";
+import { LOCAL_DESKTOP_RUNTIME_ID } from "@mavis/shared/desktop-runtime";
+import { getActiveShortcutOverrides } from "@mavis/shared/keyboard-shortcuts";
 import { IPC_CHANNELS } from "../config/constants";
 import { getEmbeddedBrowserManager, openEmbeddedBrowserExternally } from "../modules/browser/embedded-browser-manager";
 import { createNewEmbeddedBrowserTab } from "../modules/browser/embedded-browser-new-tab";
@@ -128,6 +130,7 @@ function normalizeRendererViewport(value) {
 }
 let terminalObserverWired = false;
 let nextLayoutCommandId = 1;
+let nextBrowserCreateDiagnosticId = 1;
 const browserInputDiagnosticLogger = getCategoryLogger('archon', 'browser-input');
 const lastIpcDiagnosticByAction = new Map();
 function pageIdentity(url) {
@@ -170,15 +173,27 @@ function getBrowserLayoutContext(event) {
 }
 export function setupEmbeddedBrowserIPC() {
     const manager = getEmbeddedBrowserManager();
-    manager.setShortcutOverridesProvider(() => getDesktopConfig().shortcutOverrides ?? {});
+    manager.setShortcutOverridesProvider(() => {
+        const config = getDesktopConfig();
+        return getActiveShortcutOverrides(config.shortcutOverrides ?? {}, config.shortcutsEnabled !== false);
+    });
     if (!terminalObserverWired) {
         terminalObserverWired = true;
-        getTerminalManager().addDataObserver((event) => getLocalServerRegistry().ingest(event));
+        getTerminalManager().addDataObserver((event) => {
+            if (event.runtimeId === LOCAL_DESKTOP_RUNTIME_ID)
+                getLocalServerRegistry().ingest(event);
+        });
     }
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_BRIDGE_EVENT, (event, envelope) => manager.handleCommentBridgeEvent(event.sender, envelope));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_CURSOR_EVENT, (event, envelope) => manager.handleAgentCursorBridgeEvent(event.sender, envelope));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CREATE, async (event, params) => {
+        const createDiagnosticId = nextBrowserCreateDiagnosticId++;
         logIpcReceipt('create', event, {
+            createDiagnosticId,
+            newTab: params?.newTab === true,
+            restoreOnly: params?.restoreOnly === true,
+            hasInitialUrl: Boolean(params?.initialUrl),
+            ...pageIdentity(params?.initialUrl ?? ''),
             sessionId: typeof params?.sessionId === 'string' ? params.sessionId : null,
             visible: params?.visible !== false,
             bounds: normalizeBounds(params?.bounds),
@@ -191,13 +206,38 @@ export function setupEmbeddedBrowserIPC() {
         const sessionId = typeof params?.sessionId === 'string' ? params.sessionId : null;
         const options = {
             visible: params?.visible !== false,
+            ...(params?.restoreOnly === true ? { restoreOnly: true } : {}),
             ...(typeof params?.initialUrl === 'string' ? { initialUrl: params.initialUrl } : {}),
             layoutContext: getBrowserLayoutContext(event),
             ...(viewport ? { viewport } : {}),
         };
-        return params?.newTab === true
-            ? createNewEmbeddedBrowserTab(manager, bounds, sessionId, options)
-            : manager.createOrShow(bounds, sessionId, options);
+        try {
+            const result = await (params?.newTab === true
+                ? createNewEmbeddedBrowserTab(manager, bounds, sessionId, options)
+                : manager.createOrShow(bounds, sessionId, options));
+            browserInputDiagnosticLogger.info({
+                msg: '[EmbeddedBrowserInput] create-completed',
+                createDiagnosticId,
+                sessionId,
+                tabId: result.tabId ?? null,
+                selectedTabId: result.selectedTabId ?? null,
+                tabIds: Array.isArray(result.tabs)
+                    ? result.tabs.map((tab) => tab.tabId)
+                    : undefined,
+                success: result.success !== false,
+                ...pageIdentity(typeof result.url === 'string' ? result.url : ''),
+            });
+            return result;
+        }
+        catch (error) {
+            browserInputDiagnosticLogger.info({
+                msg: '[EmbeddedBrowserInput] create-failed',
+                createDiagnosticId,
+                sessionId,
+                errorName: error instanceof Error ? error.name : 'unknown',
+            });
+            throw error;
+        }
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SHOW, async (event, bounds, params) => {
         const layoutCommandId = issueLayoutCommandId();

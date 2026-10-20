@@ -1,6 +1,6 @@
 export { LocalEventSink, } from './events/sink.js';
 export { abortAllBackgroundLocalBashTasks } from './background-task/index.js';
-export { createUserStopCascade } from './background-task/index.js';
+export { backgroundTaskNotificationReceiptId, createUserStopCascade, isTaskDeliverySuppressed, } from './background-task/index.js';
 export { ensureRmShim, resolveAgentBashEnvPolicy, resolveRmShimDir, } from './infra/ensure-rm-shim.js';
 export { ManagedWorktreeService, } from './files/managed-worktrees.js';
 export { projectLocalRuntimeEvent, projectLocalRuntimeEvents, } from './runtime/projection.js';
@@ -55,6 +55,7 @@ export { buildCompressedModelImageFromBuffer } from './utils/model-image-preproc
 export { formatV2TimestampParts, isPathInside, resolveV2AssetDir, resolveV2DatedDir, resolveV2DiagnosticDir, resolveV2DirectoryContract, resolveV2EventDir, resolveV2MigrationBackupDir, resolveV2MigrationManifestDir, resolveV2Root, sanitizeV2PathSegment, } from './persistence/layout/v2-paths.js';
 export { V2_DISPLAY_TRANSCRIPT_SCHEMA_VERSION, V2_SESSION_ARTIFACT_MANIFEST_SCHEMA_VERSION, appendV2SessionDisplayTranscriptSync, collectV2SessionArtifactDiagnostics, deleteV2SessionArtifactsSync, deleteV2SessionSnapshotSync, ensureV2SessionArtifactManifestSync, inspectV2SessionArtifacts, resolveV2SessionArtifactPathsSync, } from './persistence/layout/v2-session-artifacts.js';
 export { ensureCurrentLocalRuntimeDataMigratedToV2, ensureCurrentLocalRuntimeDataMigratedToV2OrThrow, } from './persistence/migration/v2-migration.js';
+export { acquireLocalRuntimeMigrationLock, LocalRuntimeMigrationLockTimeoutError, } from './persistence/migration/migration-lock.js';
 export { dedupeRootSessionsSync, } from './persistence/migration/v2-root-session-dedup.js';
 export { hostDiagnosticsUnavailable, } from './observability/diagnostics-provider.js';
 export { createDefaultObservabilityRedactionPolicy, createObservabilityEventSink, createLocalRuntimeTelemetrySink, createThreadGoalObservabilityEventSink, DEFAULT_OBSERVABILITY_REDACTION_POLICY, isSensitiveObservabilityKey, JsonlFileObservabilitySink, maskObservabilitySecret, maskUrlCredentials, NOOP_OBSERVABILITY_LOGGER, serializeObservabilityError, collectDiagnosticBundle, FileDiagnosticArtifactSource, StaticDiagnosticArtifactSource, } from './observability/index.js';
@@ -80,5 +81,4 @@ export { LocalEvalReporterFactory } from './eval/reporter-factory.js';
 export { buildLocalTrajectoryId, LOCAL_PI_CAPTURE_ORIGIN } from './eval/payload.js';
 export { collectEvalMetaInfo, EVAL_META_INFO_SCHEMA } from '@mavis/shared/eval-meta-info';
 export { getConfig as getDefaultLocalRuntimeConfig, resetConfig as resetDefaultLocalRuntimeConfig, } from '@mavis/config';
-export { createRuntimeTransportHost, createRuntimeTransportStreamCoordinator, } from './transport/runtime-transport-host.js';
 //# sourceMappingURL=index.js.map

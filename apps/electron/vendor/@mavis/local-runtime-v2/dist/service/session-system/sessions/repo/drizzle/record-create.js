@@ -2,6 +2,7 @@ import { normalizeSessionType } from './normalization.js';
 export function recordFromCreate(input, nowMs) {
     const sessionType = normalizeSessionType(input.sessionType ?? 'branch');
     return {
+        ...(input.agentShell ? { agentShell: input.agentShell } : {}),
         ...recordIdentityFields(input, sessionType),
         ...recordStateFields(input),
         ...recordErrorFields(input),
@@ -18,9 +19,11 @@ function recordIdentityFields(input, sessionType) {
         sessionType,
         sessionKind: input.sessionKind ?? 'conversation',
         title: input.title ?? null,
+        titleSource: input.titleSource ?? (input.title?.trim() ? 'manual' : 'default'),
         parentSessionId: input.parentSessionId ?? null,
         purpose: input.purpose,
         originCronId: input.originCronId,
+        miniAppOrigin: input.miniAppOrigin,
         isDefaultWorkspace: input.isDefaultWorkspace,
         runLocation: input.runLocation,
         ...appModeFields(sessionType, input.appMode),
@@ -55,6 +58,7 @@ function recordModelFields(input) {
 function recordProvenanceFields(input, nowMs) {
     return {
         origin: input.origin,
+        sideChatOrigin: input.sideChatOrigin,
         sessionOrigin: input.sessionOrigin,
         sessionDataVersion: input.sessionDataVersion,
         scratchpadPath: input.scratchpadPath,

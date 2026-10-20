@@ -304,12 +304,53 @@ export async function ensureComputerUseUtilityStarted() {
     });
 }
 export async function requestUtilityMiniApp(method, pluginId, signal) {
+    assertMiniAppRuntimeStartable();
+    return getManager().requestMiniApp(method, pluginId, signal);
+}
+export async function runUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().runMiniAppAgent(input, options);
+}
+export async function replyUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().replyMiniAppAgent(input);
+}
+export async function openUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().openMiniAppAgent(input);
+}
+export async function modelsUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().modelsMiniAppAgent(input);
+}
+export async function agentsUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().agentsMiniAppAgent(input);
+}
+export async function createUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().createMiniAppAgent(input);
+}
+/** Host side panel now shows `sessionId`, so its asks can wait for an answer there. */
+export async function panelOpenedUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().reportMiniAppAgentPanel('agent.panelOpened', input);
+}
+/** Host side panel no longer shows `sessionId`. */
+export async function panelClosedUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().reportMiniAppAgentPanel('agent.panelClosed', input);
+}
+export async function answerUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().answerMiniAppAgent(input, options);
+}
+function assertMiniAppRuntimeStartable() {
     if (isUtilityRuntimeStartBlocked()) {
         throw Object.assign(new Error('Mini App runtime is unavailable'), {
             code: 'runtime_unavailable',
         });
     }
-    return getManager().requestMiniApp(method, pluginId, signal);
 }
 export function isUtilityRuntimeReady() {
     return manager?.isReady() ?? false;

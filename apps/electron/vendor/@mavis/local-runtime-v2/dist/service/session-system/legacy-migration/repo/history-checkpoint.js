@@ -18,20 +18,7 @@ class DrizzleHistoryPersistenceRepository {
         return row ? decode(row) : undefined;
     }
     async upsertCheckpoint(checkpoint) {
-        validate(checkpoint);
-        this.options.db
-            .insert(fileHistoryMigrations)
-            .values(checkpoint)
-            .onConflictDoUpdate({
-            target: fileHistoryMigrations.sessionId,
-            set: {
-                migratedAtMs: checkpoint.migratedAtMs,
-                source: checkpoint.source,
-                messageCount: checkpoint.messageCount,
-                targetRevision: checkpoint.targetRevision,
-            },
-        })
-            .run();
+        writeHistoryCheckpointInTransaction(this.options.db, checkpoint);
     }
     async deleteSessionData(sessionId) {
         this.options.db.transaction((db) => {
@@ -87,5 +74,20 @@ function deleteOptional(db, table, sessionId, tableName) {
         if (!(error instanceof Error) || error.message !== `no such table: ${tableName}`)
             throw error;
     }
+}
+export function writeHistoryCheckpointInTransaction(db, checkpoint) {
+    validate(checkpoint);
+    db.insert(fileHistoryMigrations)
+        .values(checkpoint)
+        .onConflictDoUpdate({
+        target: fileHistoryMigrations.sessionId,
+        set: {
+            migratedAtMs: checkpoint.migratedAtMs,
+            source: checkpoint.source,
+            messageCount: checkpoint.messageCount,
+            targetRevision: checkpoint.targetRevision,
+        },
+    })
+        .run();
 }
 //# sourceMappingURL=history-checkpoint.js.map

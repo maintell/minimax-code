@@ -1,0 +1,134 @@
+name: Desktop release
+# Packages the desktop client (apps/electron) and publishes the Windows
+# installer. The client is a standalone install (its first-party dependencies
+# are vendored snapshots), so this job never touches the repository workspace.
+on:
+  push:
+    tags: ['desktop-v*']
+  pull_request:
+    paths:
+      - '.github/workflows/desktop-release.yml'
+      - 'apps/electron/package.json'
+      - 'apps/electron/electron-builder.yml'
+      - 'apps/electron/scripts/**'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create or update the GitHub release with the packaged installer'
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: desktop-release-${{ github.event_name == 'push' && github.ref_name || github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      # The restored client ships content-addressed assets whose absolute paths
+      # exceed MAX_PATH on the Windows runner.
+      - name: Enable long paths
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Resolve version and tag
+        id: meta
+        shell: bash
+        run: |
+          version=$(node -p "require('./apps/electron/package.json').version")
+          tag="desktop-v${version}"
+          if [ "$EVENT_NAME" = push ]; then
+            test "$REQUESTED_TAG" = "$tag" || {
+              echo "tag $REQUESTED_TAG does not match apps/electron version $version" >&2
+              exit 1
+            }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+      # apps/electron is installed standalone: the repository workspace resolves
+      # a different revision of the same first-party packages.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          # The client pins its own pnpm in its standalone manifest; the root
+          # workspace pins a different one.
+          package_json_file: apps/electron/package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          # No dependency cache here: setup-node resolves the pnpm store from the
+          # repository root, while the install runs against the client's own
+          # standalone lockfile, and its cache post-step fails the job when the
+          # paths disagree.
+      - name: Install the client
+        working-directory: apps/electron
+        run: pnpm install --ignore-workspace --frozen-lockfile
+      - name: Build the main process
+        working-directory: apps/electron
+        run: pnpm build
+      - name: Check the emitted main process
+        working-directory: apps/electron
+        run: pnpm check
+      - name: Package the Windows client
+        working-directory: apps/electron
+        run: pnpm package
+      - name: Collect release assets
+        working-directory: apps/electron
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/assets"
+          # The artifact name is pinned by electron-builder.yml; globbing keeps
+          # this step independent of it while still asserting a single installer.
+          exe_count=$(ls -1 dist/installers/*.exe 2>/dev/null | wc -l)
+          test "$exe_count" = "1" || { echo "expected one installer, found $exe_count" >&2; ls -l dist/installers >&2; exit 1; }
+          cp dist/installers/*.exe "$RUNNER_TEMP/assets/"
+          cp dist/installers/*.exe.blockmap "$RUNNER_TEMP/assets/"
+          cp dist/installers/latest.yml "$RUNNER_TEMP/assets/"
+          ls -l "$RUNNER_TEMP/assets"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-installer-${{ steps.meta.outputs.version }}
+          path: ${{ runner.temp }}/assets/
+          retention-days: 14
+          if-no-files-found: error
+  publish:
+    needs: package
+    # Pull requests only build; tagging and manual runs publish.
+    if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.publish)
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.package.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.package.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: desktop-installer-${{ needs.package.outputs.version }}
+          path: ${{ runner.temp }}/assets
+      - name: Publish the installer
+        shell: bash
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          printf 'MiniMax Code desktop %s for Windows (x64).\n\n' "$RELEASE_VERSION" > "$notes"
+          printf 'Built from `%s` by the desktop release workflow.\n' "$GITHUB_SHA" >> "$notes"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" "$RUNNER_TEMP"/assets/* \
+              --title "MiniMax Code desktop ${RELEASE_VERSION}" \
+              --notes-file "$notes" \
+              --target "$GITHUB_SHA"
+          fi

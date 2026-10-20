@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { validateMiniAppSurfaceWindow } from '@mavis/shared/miniapp-surface';
+import { MINIAPP_AGENT_MAX_CONCURRENCY } from '../../../../miniapp/index.js';
 import { isRecord, resolvePluginDirectory, resolvePluginFile, } from '../filesystem.js';
 import { validatePluginPortablePath } from '../package-contract.js';
 import { PluginReaderError, readerFail } from '../reader-errors.js';
@@ -10,10 +12,12 @@ const MINIAPP_FIELDS = new Set([
     'surface',
     'mcpEndpoints',
     'hostConnectorAccess',
+    'agentAccess',
+    'agentConcurrency',
 ]);
 const ARTIFACT_FIELDS = new Set(['client', 'node']);
 const PROCESS_RUNTIME_FIELDS = new Set(['kind', 'entry', 'lifecycle']);
-const SURFACE_FIELDS = new Set(['path']);
+const SURFACE_FIELDS = new Set(['path', 'window']);
 const MCP_ENDPOINT_FIELDS = new Set(['server', 'path']);
 const HOST_CONNECTOR_ACCESS_FIELDS = new Set(['providers']);
 const CONNECTOR_PROVIDER = /^[a-z0-9_-]{1,64}$/u;
@@ -27,12 +31,16 @@ export async function readMiniAppManifest(root, value, mcpServerNames, payloadDi
     const surface = readSurface(value.surface);
     const mcpEndpoints = readMcpEndpoints(value.mcpEndpoints, mcpServerNames);
     const hostConnectorAccess = readHostConnectorAccess(value.hostConnectorAccess);
+    const agentAccess = readAgentAccess(value.agentAccess);
+    const agentConcurrency = readAgentConcurrency(value.agentConcurrency);
     return {
         artifacts,
         runtime,
         surface,
         mcpEndpoints,
         ...(hostConnectorAccess ? { hostConnectorAccess } : {}),
+        ...(agentAccess ? { agentAccess } : {}),
+        ...(agentConcurrency === undefined ? {} : { agentConcurrency }),
     };
 }
 async function readArtifacts(root, value, payloadDirectory) {
@@ -94,9 +102,23 @@ async function readProcessRuntime(root, value, artifacts) {
 }
 function readSurface(value) {
     if (!isRecord(value) || hasUnknownField(value, SURFACE_FIELDS)) {
-        miniAppFail('SURFACE_INVALID', 'surface must contain only path');
+        miniAppFail('SURFACE_INVALID', 'surface must contain only path and window');
     }
-    return { path: normalizeRoutePath(value.path, 'surface.path') };
+    const surfacePath = normalizeRoutePath(value.path, 'surface.path');
+    const surfaceWindow = readSurfaceWindow(value.window);
+    return { path: surfacePath, ...(surfaceWindow ? { window: surfaceWindow } : {}) };
+}
+/**
+ * Defaults, position, `parent`, `title`, and close behavior are applied by the
+ * Electron side; this reader only enforces the shared `surface.window` rule set.
+ */
+function readSurfaceWindow(value) {
+    if (value === undefined)
+        return undefined;
+    const result = validateMiniAppSurfaceWindow(value);
+    if (!result.ok)
+        miniAppFail('SURFACE_INVALID', result.reason);
+    return result.value;
 }
 function readMcpEndpoints(value, mcpServerNames) {
     if (value === undefined)
@@ -140,6 +162,26 @@ function readHostConnectorAccess(value) {
         miniAppFail('HOST_CONNECTOR_ACCESS_INVALID', 'hostConnectorAccess.providers contains a duplicate');
     }
     return { providers };
+}
+function readAgentAccess(value) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value) || value.some((capability) => capability !== 'session.run')) {
+        miniAppFail('AGENT_ACCESS_INVALID', 'agentAccess may only contain session.run');
+    }
+    return [...new Set(value)];
+}
+/** Allowed without `agentAccess`, where it has no effect. */
+function readAgentConcurrency(value) {
+    if (value === undefined)
+        return undefined;
+    if (typeof value !== 'number' ||
+        !Number.isInteger(value) ||
+        value < 1 ||
+        value > MINIAPP_AGENT_MAX_CONCURRENCY) {
+        miniAppFail('AGENT_CONCURRENCY_INVALID', `agentConcurrency must be an integer from 1 to ${MINIAPP_AGENT_MAX_CONCURRENCY}`);
+    }
+    return value;
 }
 async function resolveFileOrDirectory(root, relativePath) {
     try {

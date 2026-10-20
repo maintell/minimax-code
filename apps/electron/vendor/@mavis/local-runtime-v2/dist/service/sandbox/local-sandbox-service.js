@@ -273,7 +273,7 @@ export class LocalSandboxService {
             finished = true;
             if (handle)
                 active.backendInvocationHandle = handle;
-            let cleanup = 'success';
+            let cleanup = outcome.cleanup;
             try {
                 if (active.backendInvocationHandle) {
                     await backendRecord.backend.onInvocationEnd(active.backendInvocationHandle);

@@ -8,6 +8,9 @@ export class LocalAgentPreparationService {
     constructor(options) {
         this.options = options;
     }
+    bindAgentShellResolver(resolve) {
+        this.options.configBuilder.bindAgentShellResolver(resolve);
+    }
     /** Late-bound Session model repair; see `session-model-selection.ts`. */
     bindSessionModelRepair(repair) {
         this.options.configBuilder.bindSessionModelRepair(repair);
@@ -57,6 +60,7 @@ export class LocalAgentPreparationService {
         });
         return {
             agentConfig: Object.freeze({ ...builtAgentConfig }),
+            ...(built.agentShell ? { agentShell: built.agentShell } : {}),
             llm,
             outputRevisionInstruction: built.outputRevisionInstruction,
             ...(built.retryContinuationPrompt

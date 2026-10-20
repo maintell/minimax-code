@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { Cron } from 'croner';
+import { Cron, CronPattern } from 'croner';
 import { eq, sql } from 'drizzle-orm';
 import { schedulerJobs, } from '../db/schema/scheduler.js';
-class ScheduleHasNoFutureRunError extends Error {
+class InvalidScheduleError extends Error {
     code = 'SCHEDULER_INVALID';
+}
+class ScheduleHasNoFutureRunError extends InvalidScheduleError {
 }
 export class Scheduler {
     options;
@@ -280,15 +282,32 @@ export class Scheduler {
             ? new Date(record.schedule.runAtMs)
             : record.schedule.expression;
         const timezone = record.schedule.kind === 'cron' ? record.schedule.timezone : undefined;
-        const timer = new Cron(pattern, {
-            timezone,
-            paused: true,
-            unref: true,
-            protect: () => this.reportSkipped('overlap'),
-            catch: () => this.reportSkipped('trigger_error'),
-        }, async (cron) => {
-            await this.trigger(record.schedulerId, cron);
-        });
+        let timer;
+        try {
+            // Cron also accepts ISO strings as one-shot dates. A recurring schedule must
+            // pass its expression parser before entering that overloaded constructor.
+            if (record.schedule.kind === 'cron') {
+                void new CronPattern(record.schedule.expression);
+            }
+            timer = new Cron(pattern, {
+                timezone,
+                paused: true,
+                unref: true,
+                protect: () => this.reportSkipped('overlap'),
+                catch: () => this.reportSkipped('trigger_error'),
+            }, async (cron) => {
+                await this.trigger(record.schedulerId, cron);
+            });
+        }
+        catch (error) {
+            // Only Croner's recognized pattern-validation errors are caller input failures.
+            // Unexpected timer failures and persistence errors must retain their original status.
+            if ((error instanceof TypeError || error instanceof RangeError) &&
+                error.message.startsWith('CronPattern:')) {
+                throw new InvalidScheduleError('cron schedule expression is invalid');
+            }
+            throw error;
+        }
         const nextRun = nextRunAfterMs === undefined ? timer.nextRun() : timer.nextRun(new Date(nextRunAfterMs));
         if (nextRun === null) {
             timer.stop();
@@ -403,20 +422,23 @@ function hasReachedMaxRuns(record) {
 }
 function normalizeSchedule(schedule, nowMs, allowPastOnce) {
     if (!isRecord(schedule))
-        throw new Error('scheduler schedule must be an object');
+        throw new InvalidScheduleError('scheduler schedule must be an object');
     if (schedule.kind === 'once')
         return normalizeOnce(schedule, nowMs, allowPastOnce);
     if (schedule.kind === 'cron')
         return normalizeCronSchedule(schedule);
-    throw new Error('scheduler schedule kind must be once or cron');
+    throw new InvalidScheduleError('scheduler schedule kind must be once or cron');
 }
 function normalizeOnce(schedule, nowMs, allowPast) {
     if (!Number.isSafeInteger(schedule.runAtMs)) {
-        throw new Error('once schedule runAtMs must be a Unix millisecond integer');
+        throw new InvalidScheduleError('once schedule runAtMs must be a Unix millisecond integer');
     }
     const runAtMs = schedule.runAtMs;
+    if (Number.isNaN(new Date(runAtMs).getTime())) {
+        throw new InvalidScheduleError('once schedule runAtMs must be a valid date');
+    }
     if (!allowPast && runAtMs <= nowMs) {
-        throw new Error('once schedule runAtMs must be in the future');
+        throw new InvalidScheduleError('once schedule runAtMs must be in the future');
     }
     return { kind: 'once', runAtMs };
 }
@@ -433,7 +455,7 @@ function normalizeCronSchedule(schedule) {
 }
 function readCronExpression(value) {
     if (typeof value !== 'string' || value.trim() === '') {
-        throw new Error('cron schedule expression must not be empty');
+        throw new InvalidScheduleError('cron schedule expression must not be empty');
     }
     return value;
 }
@@ -441,7 +463,16 @@ function readCronTimezone(value) {
     if (value === undefined)
         return undefined;
     if (typeof value !== 'string' || value.trim() === '') {
-        throw new Error('cron schedule timezone must not be empty');
+        throw new InvalidScheduleError('cron schedule timezone must not be empty');
+    }
+    try {
+        Intl.DateTimeFormat('en-US', { timeZone: value });
+    }
+    catch (error) {
+        if (error instanceof RangeError) {
+            throw new InvalidScheduleError('cron schedule timezone is invalid');
+        }
+        throw error;
     }
     return value;
 }
@@ -449,7 +480,7 @@ function readCronMaxRuns(value) {
     if (value === undefined)
         return undefined;
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
-        throw new Error('cron schedule maxRuns must be a positive integer');
+        throw new InvalidScheduleError('cron schedule maxRuns must be a positive integer');
     }
     return value;
 }
