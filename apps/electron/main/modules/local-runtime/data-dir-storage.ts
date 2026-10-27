@@ -10,12 +10,64 @@ export class DataDirStorageError extends Error {
 
 // Cold Storage/PnP providers can exceed 20s on otherwise valid internal disks.
 const STORAGE_TIMEOUT_MS = 60000;
+// Sync clients lock, replace or dehydrate files behind the Runtime's back, which breaks
+// SQLite and atomic renames even though the folder sits on an internal disk. Only proof
+// that a client owns the folder rejects it: a root registered with the Windows Cloud Files
+// API (checked by the helper below) or a root OneDrive publishes in the environment.
+// Folder names alone are only a hint: an ordinary folder can be called "Dropbox" or
+// "华为云盘", so callers must let the user confirm instead of rejecting on a name match.
+const CLOUD_SYNC_FOLDER_NAMES = new Set([
+    'OneDrive',
+    'Dropbox',
+    'iCloudDrive',
+    'iCloud Drive',
+    'Google Drive',
+    'Box Sync',
+    'Nutstore',
+    '坚果云',
+    '我的坚果云',
+    'BaiduSyncdisk',
+    '百度网盘同步空间',
+    '华为云盘',
+    '阿里云盘',
+    'WPS云盘',
+    'SynologyDrive',
+    'Synology Drive',
+].map((name) => name.toLowerCase()));
+// Business accounts append the tenant name, e.g. "OneDrive - Contoso" / "Dropbox (Contoso)".
+const CLOUD_SYNC_FOLDER_PREFIXES = ['onedrive - ', 'dropbox ('];
+const ONEDRIVE_ENV_KEYS = ['OneDrive', 'OneDriveConsumer', 'OneDriveCommercial'];
+function windowsPathSegments(directory) {
+    return path.win32
+        .normalize(directory)
+        .split('\\')
+        .filter(Boolean)
+        .map((segment) => segment.toLowerCase());
+}
+/** A path segment is named like a common sync client root. Not proof of syncing. */
+export function looksLikeCloudSyncedPath(directory) {
+    return windowsPathSegments(directory).some((segment) => CLOUD_SYNC_FOLDER_NAMES.has(segment) ||
+        CLOUD_SYNC_FOLDER_PREFIXES.some((prefix) => segment.startsWith(prefix)));
+}
+/** The path is inside a root that OneDrive publishes (possibly renamed) through the environment. */
+export function isInsideOneDriveRoot(directory, env = process.env) {
+    const segments = windowsPathSegments(directory);
+    return ONEDRIVE_ENV_KEYS.some((key) => {
+        const root = env[key]?.trim();
+        if (!root || !path.win32.isAbsolute(root))
+            return false;
+        const rootSegments = windowsPathSegments(root);
+        return (rootSegments.length > 0 &&
+            rootSegments.length <= segments.length &&
+            rootSegments.every((segment, index) => segment === segments[index]));
+    });
+}
 // Query the containing volume, not the drive letter: a directory can be a mounted volume.
 // PnP ancestors are checked as well because an external PCIe/NVMe enclosure can report NVMe.
 const STORAGE_SCRIPT = String.raw `
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-[Console]::Error.WriteLine('[DataDirStorage] stage=volume')
+[Console]::Error.WriteLine('[DataDirStorage] stage=sync-root')
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -26,6 +78,8 @@ public static class DataDirVolume {
   static extern bool GetVolumePathName(string path, StringBuilder volume, uint size);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
   static extern bool GetVolumeNameForVolumeMountPoint(string path, StringBuilder name, uint size);
+  [DllImport("cldapi.dll", CharSet=CharSet.Unicode)]
+  static extern int CfGetSyncRootInfoByPath(string path, int infoClass, [Out] byte[] info, uint length, out uint returned);
   public static string Resolve(string path) {
     var mount = new StringBuilder(32768);
     var name = new StringBuilder(1024);
@@ -34,9 +88,25 @@ public static class DataDirVolume {
       throw new Win32Exception(Marshal.GetLastWin32Error());
     return name.ToString();
   }
+  // S_OK or ERROR_MORE_DATA: the path is inside a registered Cloud Files sync root.
+  // ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT and an absent API (pre-1709) are not sync roots.
+  public static bool IsUnderSyncRoot(string path) {
+    var info = new byte[8];
+    uint returned;
+    try {
+      int hr = CfGetSyncRootInfoByPath(path, 0, info, (uint)info.Length, out returned);
+      return hr == 0 || hr == unchecked((int)0x800700EA);
+    } catch (DllNotFoundException) {
+      return false;
+    } catch (EntryPointNotFoundException) {
+      return false;
+    }
+  }
 }
 '@
 $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__TARGET_BASE64__'))
+$cloudSyncRoot = [DataDirVolume]::IsUnderSyncRoot($target)
+[Console]::Error.WriteLine('[DataDirStorage] stage=volume')
 $volumes = @(Get-Volume -Path ([DataDirVolume]::Resolve($target)))
 if ($volumes.Count -ne 1) { throw 'Ambiguous volume' }
 $volume = $volumes[0]
@@ -69,6 +139,7 @@ while ($deviceId -ne 'HTREE\ROOT\0') {
   $deviceId = [string]$parent[0].Data
 }
 @{
+  cloudSyncRoot = [bool]$cloudSyncRoot
   driveType = [string]$volume.DriveType
   busType = [string]$disk.BusType
   removalPolicies = @($policies)
@@ -94,7 +165,7 @@ function readStorageInfo(realDirectory) {
             // Do not log error.message or raw stderr: they can contain the encoded
             // command, the user's path, and hardware identifiers.
             const stages = [
-                ...(stderr ?? '').matchAll(/\[DataDirStorage\] stage=(volume|disk|device|pnp)\b/g),
+                ...(stderr ?? '').matchAll(/\[DataDirStorage\] stage=(sync-root|volume|disk|device|pnp)\b/g),
             ];
             const stage = stages.at(-1)?.[1] ?? 'startup';
             const reason = error.killed ? 'timeout' : `failed (code=${error.code ?? 'unknown'})`;
@@ -112,7 +183,8 @@ export function assertInternalDiskReport(output) {
     }
     const policies = report?.removalPolicies;
     const capabilities = report?.capabilities;
-    if (typeof report?.driveType !== 'string' ||
+    if (typeof report?.cloudSyncRoot !== 'boolean' ||
+        typeof report?.driveType !== 'string' ||
         typeof report?.busType !== 'string' ||
         !Array.isArray(policies) ||
         !Array.isArray(capabilities) ||
@@ -120,6 +192,9 @@ export function assertInternalDiskReport(output) {
         policies.length !== capabilities.length ||
         ![...policies, ...capabilities].every((value) => Number.isInteger(value) && value >= 0)) {
         throw new DataDirStorageError('TARGET_STORAGE_UNVERIFIED');
+    }
+    if (report.cloudSyncRoot) {
+        throw new DataDirStorageError('TARGET_CLOUD_SYNCED');
     }
     // Unknown, RAID, virtual, USB, SD, iSCSI, etc. are deliberately not an allowlist match.
     // CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL=1; CM_DEVCAP_REMOVABLE=4, DOCKDEVICE=8.
@@ -135,6 +210,9 @@ export async function assertInternalDataDirStorage(realDirectory) {
     const directory = realDirectory.replace(/^\\\\\?\\(?=[a-z]:\\)/i, '');
     if (!/^[a-z]:\\/i.test(directory)) {
         throw new DataDirStorageError('TARGET_NOT_INTERNAL_DISK');
+    }
+    if (isInsideOneDriveRoot(directory)) {
+        throw new DataDirStorageError('TARGET_CLOUD_SYNCED');
     }
     try {
         assertInternalDiskReport(await readStorageInfo(directory));

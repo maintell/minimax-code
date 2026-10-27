@@ -29,6 +29,7 @@ export function evaluatePathCapability(filePath, action, context, options = {}) 
         homeDir: context.homeDir,
         agentName: context.agentName,
         trustedExactWritePaths: [...context.trustedExactWritePaths],
+        sessionOwnedReadablePaths: [...context.sessionOwnedReadablePaths],
     };
     // Two-step match:
     //   (a) Windows-style absolute paths (`C:\...`, `\\server\share\...`, or any
@@ -187,10 +188,13 @@ export function evaluatePathCapability(filePath, action, context, options = {}) 
             const umbrellaRules = effectiveToolName !== FS_UMBRELLA_TOOL_NAME && action !== 'execute'
                 ? getContentRulesForTool(context, FS_UMBRELLA_TOOL_NAME, 'allow')
                 : [];
+            // Match the session-resolved path: matchPathRule anchors a relative operand
+            // to the daemon cwd, so a relative `.env` would miss the `<workspace>/**`
+            // rule the user just approved whenever the daemon runs elsewhere.
             for (const rule of [...allowRules, ...umbrellaRules]) {
                 if (ruleAllowsPathAction(rule, action) &&
                     rule.ruleValue.ruleContent &&
-                    matchPathRule(filePath, rule.ruleValue.ruleContent)) {
+                    matchPathRule(candidatePath, rule.ruleValue.ruleContent)) {
                     return { behavior: 'allow', reason: { type: 'rule', rule } };
                 }
             }

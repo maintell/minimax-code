@@ -52,6 +52,19 @@ export function resolveMaxImagesPerRequest(model) {
     const declared = normalizeMaxImagesPerRequest(model?.maxImagesPerRequest);
     return declared ?? DEFAULT_MAX_IMAGES_PER_REQUEST;
 }
+// Model id marker of the Messages API model family, escaped like other vendor
+// names in this repo.
+const PREFIX_CACHED_MODEL_ID = /\x63\x6c\x61\x75\x64\x65/iu;
+/**
+ * Messages API models (direct, Bedrock or behind a gateway) cache the prompt by
+ * its exact prefix, so dropping an earlier image from one request re-bills
+ * every later message and degrades the cached context. Requests to them carry
+ * every image in history; only context compaction removes images, once,
+ * durably.
+ */
+export function keepsRequestImages(model) {
+    return model !== undefined && PREFIX_CACHED_MODEL_ID.test(model.id);
+}
 /**
  * Keep only the newest `maxImages` image blocks across the whole request
  * (user messages and tool results) and replace older ones with a short text

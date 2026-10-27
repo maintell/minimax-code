@@ -60,12 +60,12 @@ nsis:
   allowElevation: true
   allowToChangeInstallationDirectory: true
   include: installer-zh-prod.nsh
-  # The shipped 3.1.4 resources add `installer-diagnostics.nsh`, whose
-  # `un.MavisInstallerLog` is called from a patched app-builder-lib template
-  # that this distribution does not carry. The stock template therefore leaves
-  # the uninstaller function unreferenced, which NSIS reports as warning 6010
-  # ("zeroing code") and electron-builder escalates to an error. The function is
-  # inert either way, so warnings stay warnings here.
+  # The shipped resources (3.1.4 and later) carry `installer-diagnostics.nsh`,
+  # whose `un.MavisInstallerLog` is called from a patched app-builder-lib
+  # template that this distribution does not carry. The stock template therefore
+  # leaves the uninstaller function unreferenced, which NSIS reports as warning
+  # 6010 ("zeroing code") and electron-builder escalates to an error. The
+  # function is inert either way, so warnings stay warnings here.
   warningsAsErrors: false
 
 publish:

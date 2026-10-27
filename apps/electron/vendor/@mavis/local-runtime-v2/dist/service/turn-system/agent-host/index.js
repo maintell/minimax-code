@@ -10,7 +10,7 @@ export { createAgentHostRuntimeLifecycle, createNativeAgentHostProductionDepende
 export * from './preparation/index.js';
 export { buildLocalTurnToolCatalog, createLocalAgentCapabilitySelector, filterLocalTurnCapabilityInventory, resolveLocalMcpDisclosureOptions, } from './assembly/local-turn-tool-catalog.js';
 export { buildLocalTurnPayloadTransform } from './assembly/local-turn-payload-transform.js';
-export { NativeLocalTurnExecutionPreparationSource } from './assembly/local-turn-execution-preparation.js';
+export { NativeLocalTurnExecutionPreparationSource, } from './assembly/local-turn-execution-preparation.js';
 export { LocalTurnInputPreparer, } from './assembly/local-turn-input-preparation.js';
 export * from './runner/index.js';
 export { AgentHostTurnCloseError } from './runner/turn-close-error.js';

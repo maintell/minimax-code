@@ -43,8 +43,10 @@ import { SessionUsageService } from './usage/service.js';
 import { createSessionUsageCommitSignal } from './usage/commit-signal.js';
 import { SessionLlmCallReportStore, SessionReportService } from '@mavis/session-report';
 import { createSessionStorageRetention } from './storage-retention.js';
+import { formatRuntimeModelIdentity } from '../model-system/index.js';
 import { repairRootProjectHistory, } from './_migration-root-project-history-repair.js';
 import { repairLegacyDefaultProjectHistory, } from './projects/legacy-default-project-history-repair.js';
+import { applyArchivedProjectSidebarBaseline, } from './projects/archived-project-sidebar-baseline.js';
 /** One production graph over the shared AppDb; repositories never own the connection. */
 export function initializeSessionSystem(options) {
     const nowMs = options.nowMs ?? Date.now;
@@ -244,6 +246,7 @@ export function initializeSessionSystem(options) {
 function createSessionSystemReadyHandler(options, queryCollapseState) {
     let rootProjectHistoryRepair;
     let legacyDefaultProjectHistoryRepair;
+    let archivedProjectSidebarBaselineChecked = false;
     return async () => {
         rootProjectHistoryRepair ??= repairRootProjectHistory({
             db: options.db,
@@ -264,6 +267,18 @@ function createSessionSystemReadyHandler(options, queryCollapseState) {
             diagnostics: options.legacyDefaultProjectHistoryRepairDiagnostics,
         });
         await legacyDefaultProjectHistoryRepair;
+        // After both repairs: they move historical sessions between projects, and
+        // the baseline must judge each project by its final session set.
+        if (!archivedProjectSidebarBaselineChecked && options.pinnedProjectIds) {
+            archivedProjectSidebarBaselineChecked = true;
+            await applyArchivedProjectSidebarBaseline({
+                db: options.db,
+                nowMs: options.nowMs ?? Date.now,
+                agentInternalWorkspaceDir: (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace'),
+                pinnedProjectIds: options.pinnedProjectIds,
+                diagnostics: options.archivedProjectSidebarBaselineDiagnostics,
+            });
+        }
         await queryCollapseState.recoverUnfinished();
     };
 }
@@ -323,9 +338,13 @@ function createSessionDirectoryOwners(historyLocations, sessions) {
         return historyLocations.ensure(session);
     };
     return {
-        reports: { ensureDirectory: async (sessionId) => (await locate(sessionId)).reports },
+        reports: {
+            ensureDirectory: async (sessionId) => (await locate(sessionId)).reports,
+            inspectDirectory: async (sessionId) => (await historyLocations.inspectSession(sessionId))?.paths.reports,
+        },
         snapshots: {
             resolveDirectory: async (sessionId) => (await locate(sessionId)).snapshots,
+            inspectDirectory: async (sessionId) => (await historyLocations.inspectSession(sessionId))?.paths.snapshots,
         },
     };
 }
@@ -496,7 +515,7 @@ function createUsageProjector(input) {
                 store: input.usage,
                 session,
                 turnId: record.turnId,
-                model: modelIdentity(record.model),
+                model: formatRuntimeModelIdentity(record.model) ?? null,
                 nowMs: input.nowMs,
                 messages: record.messages,
             });
@@ -572,14 +591,5 @@ function createTitleCommitter(records, facts) {
         const updated = await records.mutateSession(sessionId, { title, titleSource: 'auto' }, undefined, { title: expectedTitle, source: 'default' });
         facts.handle({ kind: 'title-updated', session: updated, title });
     };
-}
-function modelIdentity(model) {
-    if (!model || typeof model !== 'object')
-        return null;
-    const provider = Reflect.get(model, 'provider');
-    const id = Reflect.get(model, 'id');
-    if (typeof provider === 'string' && typeof id === 'string')
-        return `${provider}/${id}`;
-    return typeof id === 'string' ? id : null;
 }
 //# sourceMappingURL=owner.js.map

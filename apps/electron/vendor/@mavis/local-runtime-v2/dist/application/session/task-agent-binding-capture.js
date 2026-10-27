@@ -2,7 +2,7 @@ import { isMemoryV2Enabled, getRuntimePresetKey, resolveModelAvailability } from
 import { hasConversationTaskModelSelection, } from '@mavis/conversation-contract';
 import { COMPUTER_USE_TOOL_NAMES } from '../../service/computer-use/index.js';
 import { bindPluginAgentMcpSelectors, pluginAgentSource, renderPluginAgentProfile, } from './plugin-agent-capture.js';
-import { resolveEffectiveAgentModelSelection, modelConfigForRef, modelRefForModel, savedSessionModel, parseSourceQualifiedModelKey, } from '../../service/model-system/index.js';
+import { AgentModelSelectionError, canonicalSelectionModelKey, LocalModelProviderError, resolveEffectiveAgentModelSelection, modelConfigForRef, modelRefForModel, savedSessionModel, parseSourceQualifiedModelKey, } from '../../service/model-system/index.js';
 import { toLegacyTaskSessionBinding } from '../../service/session-system/index.js';
 import { filterLocalTurnCapabilityInventory, resolveAgentPromptSurface, } from '../../service/turn-system/index.js';
 /** Captures an immutable V2 Agent definition before the Session row is inserted. */
@@ -125,10 +125,12 @@ function resolveCapturedModel(input) {
         });
     }
     const resolved = historical ??
-        resolveEffectiveAgentModelSelection({
+        withTaskModelGuidance(input, () => resolveEffectiveAgentModelSelection({
             config: input.config,
             replaceRetired: !input.historical,
             sources: modelSources({
+                config: input.config,
+                historical: input.historical,
                 profile: input.profile,
                 session: input.session,
                 parent: input.input.parent,
@@ -140,7 +142,7 @@ function resolveCapturedModel(input) {
                 legacyTaskCapture: input.input.session === undefined,
                 ignoreSessionModel: input.historical,
             }),
-        });
+        }));
     if (!resolved)
         throw new Error('No runtime or Agent model is configured.');
     // `historical` marks a *describing* capture, not a running one: it completes
@@ -164,6 +166,24 @@ function resolveCapturedModel(input) {
         recordCapturedModel(input, resolved);
     return resolved;
 }
+/**
+ * 新建子对话时 task 自己给了模型或强度，却因为模型或强度不对建不起来：在报错后面
+ * 补一句，让调用方去问用户要具体的模型和强度，而不是换一个值自己重试。
+ */
+function withTaskModelGuidance(input, resolve) {
+    try {
+        return resolve();
+    }
+    catch (error) {
+        if (!input.historical &&
+            hasConversationTaskModelSelection(input.input.taskModelSelection) &&
+            (error instanceof AgentModelSelectionError || error instanceof LocalModelProviderError)) {
+            error.message = `${error.message} ${TASK_MODEL_GUIDANCE}`;
+        }
+        throw error;
+    }
+}
+const TASK_MODEL_GUIDANCE = 'Ask the user which model and thinking effort to use; do not retry the task with a guessed model or effort.';
 /**
  * A retired official model was already replaced during capture. Anything still
  * not listed (e.g. a removed custom model) is frozen as captured and left for
@@ -356,27 +376,91 @@ function modelSources(input) {
     }
     return sources;
 }
+/**
+ * 子对话按 task → 目标 Agent → 父会话的顺序选模型组。新建子对话时 task 给了模型：
+ * - 给的就是父会话的模型：沿用父会话整组设置（包括强度），task 给了强度就只替换强度。
+ *   父会话没保存模型时，它跑的 Runtime 默认模型（含替换后的模型）也算父会话的模型，
+ *   沿用 Runtime 默认的整组设置。Goal verifier 每次都只传 worker 这一轮的模型，靠这条跟父会话的强度走。
+ * - 给的是别的模型：这个模型有可选强度时必须同时给强度，没给直接报错，不再当成关闭思考。
+ * 补全已有会话的定义时保持原来的规则。
+ */
 function taskModelSources(input, targetSource, parent) {
-    const sources = [];
-    if (hasConversationTaskModelSelection(input.taskModelSelection)) {
-        sources.push({
-            source: 'task-model-override',
-            selection: input.taskModelSelection,
-            requireCatalog: true,
-            allowCustomProviderPrefixFallback: true,
-            defaultMissingEffortOff: true,
-        });
+    const task = hasConversationTaskModelSelection(input.taskModelSelection)
+        ? input.taskModelSelection
+        : undefined;
+    const parentSource = parent ? taskParentSource(input, parent) : undefined;
+    if (task && namesParentModel(input, task, parent)) {
+        return [
+            ...(task.effort === undefined
+                ? []
+                : [{ source: 'task-model-override', selection: { effort: task.effort } }]),
+            ...(parentSource ? [parentSource] : []),
+        ];
     }
+    const sources = [];
+    if (task)
+        sources.push(taskOverrideSource(input, task));
     if (targetSource)
         sources.push({ ...targetSource, source: 'task-target-agent' });
-    if (parent)
-        sources.push({
-            source: 'task-parent-session',
-            selection: parent,
-            requireCatalog: false,
-            parameterSnapshot: parentModelSnapshot(input),
-        });
+    if (parentSource)
+        sources.push(parentSource);
     return sources;
+}
+function taskParentSource(input, parent) {
+    return {
+        source: 'task-parent-session',
+        selection: parent,
+        requireCatalog: false,
+        parameterSnapshot: parentModelSnapshot(input),
+    };
+}
+function taskOverrideSource(input, task) {
+    return {
+        source: 'task-model-override',
+        selection: task,
+        requireCatalog: true,
+        allowCustomProviderPrefixFallback: true,
+        // 新建子对话要求换了的模型带上强度；补全已有会话时保持原来的"没写就当关闭"。
+        ...(input.historical ? { defaultMissingEffortOff: true } : { requireExplicitEffort: true }),
+    };
+}
+/** 新建子对话时 task 写的模型就是父会话正在用的模型。 */
+function namesParentModel(input, task, parent) {
+    if (input.historical || task.model === undefined)
+        return false;
+    return (isParentModel(input.config, task.model, parent?.model) ||
+        isParentModel(input.config, task.model, parentRunModel(input, parent)));
+}
+/**
+ * 父会话这一轮实际跑的模型：没保存模型时是 Runtime 默认模型，模型已不在目录里时是替换后的模型。
+ * 用子对话不写模型时同一套选择规则得出，算不出来就当没有。
+ */
+function parentRunModel(input, parent) {
+    if (!input.parent)
+        return undefined;
+    try {
+        const resolved = resolveEffectiveAgentModelSelection({
+            config: input.config,
+            replaceRetired: true,
+            sources: parent ? [taskParentSource(input, parent)] : [],
+        });
+        return resolved ? `${resolved.providerId}/${resolved.modelId}` : undefined;
+    }
+    catch (error) {
+        if (error instanceof AgentModelSelectionError || error instanceof LocalModelProviderError) {
+            return undefined;
+        }
+        throw error;
+    }
+}
+/** task 给的模型是不是就是父会话正在用的模型（兼容不带 `custom_provider:` 前缀的旧写法）。 */
+function isParentModel(config, taskModel, parentModel) {
+    if (!parentModel)
+        return false;
+    const parent = canonicalSelectionModelKey(config, parentModel);
+    return (parent !== undefined &&
+        canonicalSelectionModelKey(config, taskModel, { allowCustomProviderPrefixFallback: true }) ===
+            parent);
 }
 function parentModelSnapshot(input) {
     return (input.parentModel?.parameterSnapshot ?? savedSessionModel(input.parent ?? {})?.parameterSnapshot);

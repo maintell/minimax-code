@@ -21,6 +21,9 @@
  * - Exit code 0 = all succeeded, 1 = any failed
  *
  * PowerShell invocation strategy:
+ * - `MAVIS_TRASH_POWERSHELL` may explicitly select a PowerShell executable.
+ * - Without an override, prefer PowerShell 7 (`pwsh.exe`) and fall back to
+ *   Windows PowerShell 5.1 (`powershell.exe`) only when the former is missing.
  * - Files:       [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(path, UIOption, RecycleOption)
  * - Directories: [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(path, UIOption, RecycleOption)
  * - UIOption.OnlyErrorDialogs suppresses confirmation prompts
@@ -120,20 +123,46 @@ const POWERSHELL_UTF8_PREAMBLE =
   '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList $false; $OutputEncoding = [Console]::OutputEncoding; ';
 
 function runPowerShellScript(script) {
-  return execFileSync(
-    'powershell.exe',
-    [
-      '-NoProfile',
-      '-NonInteractive',
-      '-EncodedCommand',
-      toPowerShellEncodedCommand(POWERSHELL_UTF8_PREAMBLE + script),
-    ],
-    {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-      timeout: 30000,
-    },
-  );
+  const configuredExecutable =
+    typeof process.env.MAVIS_TRASH_POWERSHELL === 'string'
+      ? process.env.MAVIS_TRASH_POWERSHELL.trim()
+      : '';
+  const standardPwshExecutables = [
+    process.env.ProgramW6432,
+    process.env.ProgramFiles,
+    process.env.LOCALAPPDATA,
+  ]
+    .filter((root) => typeof root === 'string' && root.trim().length > 0)
+    .flatMap((root) => [
+      path.join(root, 'PowerShell', '7', 'pwsh.exe'),
+      path.join(root, 'Programs', 'PowerShell', '7', 'pwsh.exe'),
+    ]);
+  const executables = configuredExecutable
+    ? [configuredExecutable]
+    : [...new Set(['pwsh.exe', ...standardPwshExecutables, 'powershell.exe'])];
+  const args = [
+    '-NoProfile',
+    '-NonInteractive',
+    '-EncodedCommand',
+    toPowerShellEncodedCommand(POWERSHELL_UTF8_PREAMBLE + script),
+  ];
+  let lastError;
+  for (const executable of executables) {
+    try {
+      return execFileSync(executable, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        timeout: 30000,
+      });
+    } catch (error) {
+      // An explicit executable is authoritative. For automatic discovery,
+      // only a missing PowerShell 7 candidate should fall back to the next
+      // candidate; real script failures must be reported unchanged.
+      if (configuredExecutable || error?.code !== 'ENOENT') throw error;
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error('No PowerShell executable is available');
 }
 
 function createPowerShellPayloadPath() {
@@ -621,10 +650,25 @@ process.exit(exitCode);
  */
 export function buildTrashCmdLauncherContent(runtimeExecutable = process.execPath) {
     const escapedExecutable = runtimeExecutable.replaceAll('%', '%%').replaceAll('"', '""');
-    return `@echo off
-set "ELECTRON_RUN_AS_NODE=1"
-"${escapedExecutable}" "%~dp0mavis-trash.js" %*
-`;
+    // CMD can misparse LF-only batch files containing multibyte paths, even
+    // truncating the preceding ASCII command. Keep the on-disk bytes CRLF/UTF-8
+    // and switch code pages before CMD reads the executable path. Restore the
+    // caller's code page without replacing the trash process's exit status.
+    return [
+        '@echo off',
+        'setlocal EnableExtensions DisableDelayedExpansion',
+        'set "_MAVIS_TRASH_CODEPAGE="',
+        'for /f "tokens=2 delims=:" %%C in (\'chcp\') do set "_MAVIS_TRASH_CODEPAGE=%%C"',
+        'if not defined _MAVIS_TRASH_CODEPAGE exit /b 1',
+        'chcp 65001 >nul',
+        'if errorlevel 1 exit /b 1',
+        'set "ELECTRON_RUN_AS_NODE=1"',
+        `"${escapedExecutable}" "%~dp0mavis-trash.js" %*`,
+        'set "_MAVIS_TRASH_EXIT_CODE=%ERRORLEVEL%"',
+        'chcp %_MAVIS_TRASH_CODEPAGE% >nul',
+        'exit /b %_MAVIS_TRASH_EXIT_CODE%',
+        '',
+    ].join('\r\n');
 }
 export const TRASH_CMD_LAUNCHER_CONTENT = buildTrashCmdLauncherContent();
 /** Git Bash must not pass literal filenames through CMD's percent expansion. */

@@ -48,7 +48,7 @@ import { LocalBashToolDef, LocalEditToolDef, LocalReadToolDef, LocalWriteToolDef
 import { executeLocalHostTrashIfRequested, } from './host-trash-executor.js';
 import { copyWithPermissionExecutionPlan, readPermissionExecutionPlan, resolvePermissionBashEnvPolicy, } from './permission-execution.js';
 import { inferReadVideoMimeType, readVideoAsToolResult } from '../shared/read-video.js';
-import { buildReplaceAllEdit, ReplaceAllError } from '../shared/replace-all-edit.js';
+import { buildReplaceAllEdit, ReplaceAllError, withReplaceAllCount, } from '../shared/replace-all-edit.js';
 import { checkBlockedDeviceRead, checkNonRegularFileRead, detectBinaryRead, detectPiSupportedImageMimeTypeFromFile, } from '../shared/read-guards.js';
 import { isPdfReadPath, readPdfAsToolResult } from '../shared/read-pdf.js';
 import { isNotebookReadPath, readNotebookAsToolResult } from '../shared/read-notebook.js';
@@ -61,9 +61,12 @@ import { applyDesktopTextLimit, DESKTOP_BASH_MAX_BYTES, DESKTOP_BASH_PREVIEW_BYT
 export function getLocalBashEnvironment() {
     let shell = 'unavailable';
     try {
-        // Match local Bash execution, which does not select its shell from $SHELL.
-        const selected = getShellConfig();
-        shell = `${selected.type} (${selected.shell})`;
+        // Windows prompt preparation uses the Session binding (or pending), never
+        // Pi's synchronous auto-discovery. Unix keeps the existing executor choice.
+        if (process.platform !== 'win32') {
+            const selected = getShellConfig();
+            shell = `${selected.type} (${selected.shell})`;
+        }
     }
     catch {
         // Missing shell support must not prevent turns using other tools.
@@ -287,7 +290,10 @@ let LocalEditTool = (() => {
             const piInput = await buildPiEditInput(input, this.workspaceRoot);
             const capture = createCapturingEditOperations();
             const tool = createEditTool(this.workspaceRoot, { operations: capture.operations });
-            const res = await executeEditWithLineNumberRetry(tool, piInput, signal);
+            const piResult = await executeEditWithLineNumberRetry(tool, piInput, signal);
+            const res = piInput.replacedCount === undefined
+                ? piResult
+                : withReplaceAllCount(piResult, piInput.path, piInput.replacedCount);
             const result = toToolResult(LocalEditToolDef.name, res);
             const editCapture = capture.takeCapture(resolveLocalCandidatePath(input.file_path, this.workspaceRoot));
             if (!editCapture)
@@ -328,7 +334,11 @@ async function buildPiEditInput(input, workspaceRoot) {
         const absolutePath = resolveLocalCandidatePath(input.file_path, workspaceRoot);
         try {
             const replacement = await buildReplaceAllEdit(absolutePath, input.old_string, input.new_string);
-            return { path: replacement.path, edits: replacement.edits };
+            return {
+                path: replacement.path,
+                edits: replacement.edits,
+                replacedCount: replacement.replacedCount,
+            };
         }
         catch (err) {
             if (err instanceof ReplaceAllError) {

@@ -9,28 +9,29 @@ a locally installed client.
 
 | | |
 | --- | --- |
-| Installed client | `MiniMax Code` 3.1.4 (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
-| Application | `@mmx-agent/electron` 3.1.4, Electron 42.8.0, `buildEnv=prod`, locale `zh` |
+| Installed client | `MiniMax Code` 3.1.6 (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
+| Application | `@mmx-agent/electron` 3.1.6, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
 | Identity | appId `com.minimax.agent.cn`, runtime app name `MiniMax`, user data `%APPDATA%\MiniMax` |
-| Package | `resources/app.asar` (396 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+| Package | `resources/app.asar` (353 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
 
 Version history of this recovery:
 
 | App | Date | Notes |
 | --- | --- | --- |
-| 3.1.4 | 2026-10-20 | Current. New `@minimax/mcode-app-server-protocol` dependency, an SSH runtime (`main/modules/ssh-runtime/**`), mini-app agent IPC and detached windows; the Word/Excel editor IPC modules are gone. Renderer grew ~14 MB. |
+| 3.1.6 | 2026-10-27 | Current. Renderer assets moved out of `public/`: the shipped `public/` keeps only the six files the main process and the plugin pages load, and `out/assets/**` carries the images. New packaged Computer Use component (`resources/computer-use/0.34.1/win32-x64/**`) and the vendored `@mavis/computer-use` package it is driven by; mini-app speech/tool IPC, browser device-preview and permission-panel modules are new. `pptx-core` moved to a new content hash. Main process: 357 files (was 346). |
+| 3.1.4 | 2026-10-20 | New `@minimax/mcode-app-server-protocol` dependency, an SSH runtime (`main/modules/ssh-runtime/**`), mini-app agent IPC and detached windows; the Word/Excel editor IPC modules are gone. Renderer grew ~14 MB. |
 | 3.1.1 | 2026-10-17 | Initial recovery. |
 
 ## What was recovered
 
 | Part | Method | Fidelity |
 | --- | --- | --- |
-| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **342 of 346 files byte-identically**; the remaining 4 files differ only in the *order* of adjacent export-assignment statements (5 lines total, semantically inert). See "Verification" below. |
+| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **352 of 357 files byte-identically**; the remaining 5 files differ only in the *order* of adjacent export-assignment statements, and one of them additionally inlines an arrow function into its export assignment (9 lines total, semantically inert). See "Verification" below. |
 | Renderer (`out/**`) | Committed as the prebuilt static Next.js export. | Byte-identical to the shipped `out/`. The upstream UI sources are not part of this distribution and the build carries no source maps, so a source recovery is not possible. |
-| `public/**` | Committed as-is from the shipped app root. | Byte-identical. The main process reads the prompt-config key carriers from `public/assets/img/*.png` at runtime (`main/config/prompt-config-key.ts`), so this directory is part of the application, not only of the renderer build. |
+| `public/**` | Committed as-is from the shipped app root. | Byte-identical. 3.1.6 moved the renderer images into `out/assets/**`, so only six files remain: the prompt-config key carriers the main process reads (`public/assets/img/breakDown.png`, `computer_use.png`, see `main/config/prompt-config-key.ts`) and four plugin/permission images the renderer loads. The directory stays a runtime dependency, not only renderer input. |
 | Model menu (`model-menu/**`) | Committed as the prebuilt Vite build output. | Byte-identical. |
 | Prebuilt preload bundle (`main/modules/browser/miniapp-preload.bundle.js`) | Copied verbatim (esbuild output; banner references `main/modules/browser/preload.ts`). | Byte-identical. |
-| Runtime resources (`resources/mcode-tools`, `pptx-core`, `session-transfer`) | Copied from `<install>/resources/resources/`. | Byte-identical. |
+| Runtime resources (`resources/mcode-tools`, `pptx-core`, `session-transfer`, `computer-use`) | Copied from `<install>/resources/resources/`. | Byte-identical. `computer-use/` is the packaged Computer Use component (v0.34.1, `win32-x64`), which the main process locates at `process.resourcesPath/resources/computer-use`. |
 | Build resources (`resources/icon.ico`, `installer-*.nsh`, DMG assets, entitlements, tray icons) | Copied from `<install>/resources/resources/`; the electron-builder configuration was reconstructed around them (`directories.buildResources: resources`, `extraResources: resources -> resources`). | Files byte-identical; the packaging configuration is reconstructed (see deviations). |
 | Dependency snapshots (`vendor/**`) | Runtime files of every first-party and native package the client actually loads, extracted from the shipped `node_modules` (+ `app.asar.unpacked` overlays). Manifests are rewritten for local `file:` resolution. | Code byte-identical; manifests rewritten (see "Vendor manifest rewrites"). |
 | Environment file (`env/prod-zh.env`) | The shipped `.env.local` (prod/zh lane), mapped to `.env.local` inside the app package at build time. | Byte-identical content. |
@@ -39,13 +40,15 @@ Version history of this recovery:
 
 1. **Emit equivalence.** `tools/restore/verify-main.mjs` compiles `main/**` with
    the app `tsconfig.json` and diffs every emitted file against the shipped
-   `dist/main`. Result: 342/346 identical, 4 files with export-order-only
+   `dist/main`. Result: 352/357 identical, 5 files with export-order-only
    differences (`config/env.js`, `ipc/documentPreview.ipc.js`,
-   `modules/desktop-appearance.js`, `modules/document-preview/artifact-protocol.js`),
+   `modules/desktop-appearance.js`, `modules/document-preview/artifact-protocol.js`,
+   `modules/local-runtime/computer-use/component-release.js`),
    1 prebuilt bundle copied verbatim. The differences are caused by information
    the CommonJS build erases (the position of bare `export {}` re-export
-   statements, and the hoisting order of exported function assignments); they do
-   not change any runtime behaviour.
+   statements, the hoisting order of exported function assignments, and whether
+   an exported arrow function is inlined into its `exports.x = …` assignment);
+   they do not change any runtime behaviour.
 2. **Packaged-run verification.** `pnpm package` produces
    `dist/installers/win-unpacked/` and the NSIS installer. Launching the packaged
    executable with an isolated profile (`--user-data-dir`, and a desktop-store
@@ -69,7 +72,7 @@ Version history of this recovery:
 
 ## Known deviations
 
-1. **Export-order-only diffs** — the 4 files listed above; 5 lines total.
+1. **Export-order-only diffs** — the 5 files listed above; 9 lines total.
 2. **Erased type annotations.** The shipped build erased all TypeScript types.
    The recovered sources compile to the same JavaScript but do not satisfy a
    full type check (`pnpm typecheck:strict` reports ≈5.3k diagnostics, dominated

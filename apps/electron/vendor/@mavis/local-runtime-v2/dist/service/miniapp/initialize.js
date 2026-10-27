@@ -15,6 +15,8 @@ export function initializeMiniAppSupervisor(options) {
         hostConnectorSessionFactory: createMiniAppHostConnectorSessionFactory({
             gateway: options.connectorGateway,
             ...(options.agentGateway ? { agentGateway: options.agentGateway } : {}),
+            ...(options.permissionSwitches ? { permissionSwitches: options.permissionSwitches } : {}),
+            ...(options.toolGateway ? { toolGateway: options.toolGateway } : {}),
             ...(options.logger ? { logger: options.logger } : {}),
         }),
     });

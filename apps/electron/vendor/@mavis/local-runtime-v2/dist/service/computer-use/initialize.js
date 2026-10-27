@@ -53,7 +53,9 @@ export function initializeComputerUseProductCapabilities(input) {
                 ? {
                     resolveComputerUseDefault: async () => {
                         const scope = input.selectionScope?.();
-                        if (!scope || !isComputerUseEnabled())
+                        if (!scope ||
+                            !isComputerUseEnabled() ||
+                            input.client?.selectionPolicy === 'explicit-interactive')
                             return 'disabled';
                         try {
                             if (!(await readComputerUseDefault(preferences, scope)))
@@ -94,7 +96,10 @@ export function initializeComputerUseProductCapabilities(input) {
                     },
                 }
                 : {}),
-            snapshot: () => ({ computerUseGloballyEnabled: isComputerUseEnabled() }),
+            snapshot: () => ({
+                computerUseGloballyEnabled: isComputerUseEnabled(),
+                computerUseRequiresInteractiveTurn: input.client?.selectionPolicy === 'explicit-interactive',
+            }),
         },
         toolSources: {
             resolve: async (toolInput) => {
@@ -103,7 +108,7 @@ export function initializeComputerUseProductCapabilities(input) {
                 // Driver admission is resolved once in preflight for explicit and default selections.
                 // Re-probing here would turn a best-effort default into a fatal chat setup failure.
                 const computerTools = input.client && toolInput.computerUseActive
-                    ? buildComputerUseRuntimeTools(input.client)
+                    ? buildComputerUseRuntimeTools(input.client, input.readSessionTitle)
                     : [];
                 return {
                     ...sources,

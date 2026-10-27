@@ -25,6 +25,7 @@ const DOMAIN_ERROR_STATUS = {
     // 领域层暴露的 targetSession 校验错误。
     CRON_TARGET_SESSION_NOT_FOUND: 404,
     CRON_TARGET_SESSION_AGENT_MISMATCH: 409,
+    CRON_SESSION_TARGET_ARCHIVED: 409,
 };
 function toAppError(err) {
     if (err instanceof AppError)
@@ -96,24 +97,8 @@ function toContractSchedule(schedule) {
     }
     return { kind: CronScheduleKind.Once, runAtMs: schedule.runAtMs };
 }
-function toDomainSessionTarget(target) {
-    if (!target)
-        throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget is required');
-    if (target.mode === CronSessionTargetMode.New) {
-        if (target.sessionId !== undefined) {
-            throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget.sessionId is not allowed for New mode');
-        }
-        return { mode: 'new' };
-    }
-    if (target.mode === CronSessionTargetMode.SessionId) {
-        return {
-            mode: 'sessionId',
-            sessionId: requireText(target.sessionId, 'sessionTarget.sessionId'),
-        };
-    }
-    throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget.mode is invalid');
-}
-function toDomainCreateSessionTarget(target) {
+/** A fixed target without `sessionId` is minted on the next run, on create and on rebind alike. */
+function toDomainSessionTargetInput(target) {
     if (!target)
         throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget is required');
     if (target.mode === CronSessionTargetMode.New) {
@@ -231,7 +216,7 @@ class CronController extends CronControllerBase {
         const agentName = requireText(req.agentName, 'agentName');
         const prompt = requireText(req.prompt, 'prompt');
         const schedule = toDomainSchedule(req.schedule);
-        const sessionTarget = toDomainCreateSessionTarget(req.sessionTarget);
+        const sessionTarget = toDomainSessionTargetInput(req.sessionTarget);
         return mapDomainErrors(async () => {
             const view = await this.service.createDefinition({
                 name,
@@ -250,7 +235,7 @@ class CronController extends CronControllerBase {
     }
     async updateCronDefinition(ctx, req) {
         const cronId = requireText(req.cronId, 'cronId');
-        const sessionTarget = req.sessionTarget === undefined ? undefined : toDomainSessionTarget(req.sessionTarget);
+        const sessionTarget = req.sessionTarget === undefined ? undefined : toDomainSessionTargetInput(req.sessionTarget);
         const schedule = req.schedule === undefined ? undefined : toDomainSchedule(req.schedule);
         return mapDomainErrors(async () => {
             const view = await this.service.updateDefinition({

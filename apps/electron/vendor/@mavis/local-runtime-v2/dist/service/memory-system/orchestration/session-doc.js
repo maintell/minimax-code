@@ -13,11 +13,19 @@ export function validateDocumentEnvelope(document, maxDocBytes) {
     if (content.length === 0)
         return { status: 'empty' };
     if (Buffer.byteLength(content, 'utf8') > maxDocBytes) {
-        return { status: 'invalid', detail: 'document exceeds maxSessionDocBytes' };
+        return {
+            status: 'invalid',
+            reason: 'size-limit-exceeded',
+            detail: 'document exceeds maxSessionDocBytes',
+        };
     }
     const hasSection = SESSION_DOC_SECTIONS.some((section) => content.includes(section));
     if (!hasSection) {
-        return { status: 'invalid', detail: 'document is missing the section skeleton' };
+        return {
+            status: 'invalid',
+            reason: 'model-invalid-output',
+            detail: 'document is missing the section skeleton',
+        };
     }
     return { status: 'ok', content };
 }

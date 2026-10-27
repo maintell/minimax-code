@@ -160,6 +160,9 @@ function activationDelivery(input) {
     const preDelivery = input.preDelivery;
     return {
         ...input.delivery,
+        ...(input.activationDisplayContent !== undefined
+            ? { displayContent: input.activationDisplayContent }
+            : {}),
         messageKey: steeringMessageKey(input),
         ...(input.createdAt !== undefined ? { createdAt: input.createdAt } : {}),
         ...(input.userMessageId ? { userMessageId: input.userMessageId } : {}),

@@ -25,25 +25,29 @@ export function createDesktopSubagentConcurrency(options) {
     const currentLimit = () => parseSubagentConfig({
         maxConcurrentPerSession: options.readMaxConcurrentPerSession?.(),
     }).maxConcurrentPerSession;
-    const activeChildCount = (db, parentSessionId) => options.tasks.taskChildIdsForCandidatesInTransaction(db, {
-        parentSessionId,
-        candidateSessionIds: executionSessionIdsInTransaction(db),
-    }).length;
+    const readOccupancy = (db, parentSessionId) => {
+        const activeChildSessionIds = options.tasks.taskChildIdsForCandidatesInTransaction(db, {
+            parentSessionId,
+            candidateSessionIds: executionSessionIdsInTransaction(db),
+        });
+        return { active: activeChildSessionIds.length, limit: currentLimit(), activeChildSessionIds };
+    };
     return {
         admissionPolicy: {
             applyInTransaction(db, input) {
                 const parentSessionId = options.tasks.taskParentIdInTransaction(db, input.sessionId);
                 if (!parentSessionId)
                     return undefined;
-                return activeChildCount(db, parentSessionId) >= currentLimit()
-                    ? DESKTOP_SUBAGENT_CONCURRENCY_REJECTION
-                    : undefined;
+                const occupancy = readOccupancy(db, parentSessionId);
+                if (occupancy.active < occupancy.limit)
+                    return undefined;
+                // Every entry (task, task_append, session send, queue dispatch) is
+                // rejected here, so this records which children held the slots.
+                logAdmissionRejected(options.logger, input.sessionId, parentSessionId, occupancy);
+                return DESKTOP_SUBAGENT_CONCURRENCY_REJECTION;
             },
         },
-        occupancy: (parentSessionId) => ({
-            active: activeChildCount(options.db, parentSessionId),
-            limit: currentLimit(),
-        }),
+        occupancy: (parentSessionId) => readOccupancy(options.db, parentSessionId),
         wakeQueuedSiblings: async ({ releasedSessionId, queue, dispatch }) => {
             const pendingSessionIds = await queue.listPendingSessionIds();
             const siblingSessionIds = await options.tasks.taskSiblingIdsForCandidates(releasedSessionId, pendingSessionIds);
@@ -51,10 +55,13 @@ export function createDesktopSubagentConcurrency(options) {
                 return;
             await Promise.allSettled(siblingSessionIds.map((sessionId) => dispatch(sessionId)));
         },
-        recoverQueuedTaskChildren: async ({ queue, dispatch, recoverTaskOwners }) => {
+        recoverQueuedTaskChildren: async ({ queue, dispatch, recoverTaskOwners, signal }) => {
+            const aborted = () => signal?.aborted === true;
             const pendingSessionIds = await queue.listPendingSessionIds();
+            if (aborted())
+                return false;
             const taskChildren = await options.tasks.taskChildrenForCandidates(pendingSessionIds);
-            if (taskChildren.length === 0)
+            if (taskChildren.length === 0 || aborted())
                 return false;
             const parentSessionIds = new Set(taskChildren.map((child) => child.parentSessionId));
             const executingTaskChildren = await options.tasks.taskChildrenForCandidates(executionSessionIdsInTransaction(options.db));
@@ -62,11 +69,29 @@ export function createDesktopSubagentConcurrency(options) {
                 .filter((child) => parentSessionIds.has(child.parentSessionId))
                 .map((child) => child.sessionId);
             await recoverTaskOwners?.(staleOwnerSessionIds);
+            if (aborted())
+                return false;
             await Promise.allSettled(taskChildren.map(({ sessionId }) => dispatch(sessionId)));
+            if (aborted())
+                return false;
             const remainingSessionIds = await queue.listPendingSessionIds();
             return (await options.tasks.taskChildrenForCandidates(remainingSessionIds)).length > 0;
         },
     };
+}
+function logAdmissionRejected(logger, sessionId, parentSessionId, occupancy) {
+    try {
+        logger?.info({
+            sessionId,
+            parentSessionId,
+            active: occupancy.active,
+            limit: occupancy.limit,
+            activeChildSessionIds: occupancy.activeChildSessionIds,
+        }, 'subagent_concurrency_admission_rejected');
+    }
+    catch {
+        // Runs inside the admission transaction; a logging failure must not abort it.
+    }
 }
 function executionSessionIdsInTransaction(db) {
     return db

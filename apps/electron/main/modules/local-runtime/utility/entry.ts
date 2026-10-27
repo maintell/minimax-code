@@ -24,6 +24,7 @@
 import dns from "dns";
 import { getHeapStatistics } from "node:v8";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
+import { resolveProductBuildIdentity } from "@mavis/shared/product-build-identity";
 import { resolveLocalRuntimeV2DirectoryContract } from "../v2-paths";
 import { loadWeChatRuntimeSdk } from "../wechat-sdk-wire";
 import { startLocalRuntimeUtilityServer } from "./utility-server";
@@ -32,6 +33,7 @@ import { UtilityDiagnosticsBrokerClient } from "./diagnostics-broker";
 import { UtilityAuthRecoveryBrokerClient } from "./auth-recovery-broker";
 import { UtilityMiniAppBrokerServer } from "./miniapp-broker";
 import { UtilityMiniAppSurfaceClient } from "./miniapp-surface-broker";
+import { UtilityMiniAppToolBroker } from "./miniapp-tool-broker";
 import { createUtilityProxyFetch } from "./proxy-fetch";
 import { resolveElectronNetFetch } from "../electron-net-fetch";
 import { UtilityRuntimeMemoryMonitor } from "./runtime-memory-monitor";
@@ -151,14 +153,22 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     runtime.resetDefaultLocalRuntimeConfig?.();
     const runtimeMode = runtime.resolveLocalRuntimeMode();
     const runtimeLogsDir = resolveLocalRuntimeV2DirectoryContract(init.dataDir).logs;
+    // 打包版的 runtime 日志只写日志文件，每行当场写进去，崩溃也不丢；写文件失败的那一行才打到终端，
+    // 由 main 记下来。开发时照旧全部打到终端：和 main 一样按 NEXT_PUBLIC_BUILD_ENV 判断，
+    // 开发时 main 本来就不写日志文件，只往终端打。
+    const loggerOptions = {
+        diskOnly: !resolveProductBuildIdentity({ buildEnv: process.env.NEXT_PUBLIC_BUILD_ENV }).isDev,
+    };
     try {
         common.configureLocalRuntimeLogging({
             dir: runtimeLogsDir,
-            onError: () => warn('runtime disk logger write failed'),
+            onError: (err) => warn('runtime disk logger write failed', diskLogErrorFields(err)),
+            loggerOptions,
         });
         common.configureImLogger({
             dir: runtimeLogsDir,
-            onError: () => warn('IM disk logger write failed'),
+            onError: (err) => warn('IM disk logger write failed', diskLogErrorFields(err)),
+            loggerOptions,
         });
     }
     catch {
@@ -168,6 +178,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     let routingContext = init.routingContext;
     let contextWindowUsageEnabled = init.contextWindowUsageEnabled !== false;
     let runawayGuardConfig = init.runawayGuardConfig ?? {};
+    let promptSuggestionPolicy = init.promptSuggestionPolicy ?? {};
     let toolResultCompactionConfig = init.toolResultCompactionConfig ?? {};
     // Main only ever sends a complete, validated policy. An older main that sends
     // none leaves the built-in policy in force — never an empty one.
@@ -239,6 +250,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         skillRegistryDiagnostics: brokers.reportSkillRegistryDiagnostic,
         isContextWindowUsageEnabled: () => contextWindowUsageEnabled,
         getRunawayGuardConfig: () => runawayGuardConfig,
+        getPromptSuggestionPolicy: () => promptSuggestionPolicy,
         getToolResultCompactionConfig: () => toolResultCompactionConfig,
         getCollectionPolicy: () => collectionPolicy,
         createWorkspaceIndexingObservationSink: () => {
@@ -315,7 +327,12 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             ? { hostDiagnosticsProvider: brokers.diagnostics.provider }
             : {}),
         ...(init.hostCapabilities.miniAppSurface
-            ? { miniAppSurface: brokers.miniAppSurface.port }
+            ? {
+                miniAppSurface: {
+                    ...brokers.miniAppSurface.port,
+                    requestToolApproval: brokers.miniAppTool.requestApproval,
+                },
+            }
             : {}),
         enableLiveMcp: true,
         ...(wechatRuntimeSdk ? { wechatRuntimeSdk } : {}),
@@ -325,6 +342,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     reportBootstrapProgress('sqlite-ready');
     await host.apiHost.ensureBuiltinAgents();
     brokers.miniApp.bind(host.application?.miniApps, host.application?.miniAppAgent);
+    brokers.miniAppTool.bind(host.application?.miniAppTools);
     return {
         handleRequest: (request) => host.apiHost.handleRequest(request),
         createTransportHost: runtime.createRuntimeTransportHost,
@@ -370,6 +388,9 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         setRunawayGuardConfig: (config) => {
             runawayGuardConfig = config;
         },
+        setPromptSuggestionPolicy: (policy) => {
+            promptSuggestionPolicy = policy;
+        },
         setToolResultCompactionConfig: (config) => {
             toolResultCompactionConfig = config;
         },
@@ -383,6 +404,8 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             brokers.diagnostics.close();
             brokers.miniApp.close();
             brokers.miniAppSurface.close();
+            brokers.miniAppTool.close();
+            let shutdownFailure;
             try {
                 try {
                     await host.apiHost.shutdownChannelSubsystem?.();
@@ -395,7 +418,8 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
                     // unified apiHost.close() drains services before closing the v1 host.
                     await host.apiHost.close?.();
                 }
-                catch {
+                catch (error) {
+                    shutdownFailure = error;
                     warn('runtime API host close failed');
                 }
                 try {
@@ -415,6 +439,8 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
                 await Promise.allSettled([common.flushLocalRuntimeLogging(), common.flushImLogger()]);
                 await Promise.allSettled([common.shutdownLocalRuntimeLogging(), common.shutdownImLogger()]);
             }
+            if (shutdownFailure)
+                throw shutdownFailure;
         },
     };
 }
@@ -426,6 +452,15 @@ function warn(message, fields) {
         console.warn(`[LocalRuntimeUtility] ${message}`, fields);
     else
         console.warn(`[LocalRuntimeUtility] ${message}`);
+}
+/** 写日志文件失败时带上的字段：错误码和系统调用，取不到的就不带；不带文件路径。 */
+function diskLogErrorFields(err) {
+    const { code, syscall } = err;
+    const fields = {
+        ...(typeof code === 'string' ? { code } : {}),
+        ...(typeof syscall === 'string' ? { syscall } : {}),
+    };
+    return Object.keys(fields).length > 0 ? fields : undefined;
 }
 const parentPort = process.parentPort;
 if (parentPort) {
@@ -442,6 +477,9 @@ if (parentPort) {
         postMessage: (message) => parentPort.postMessage(message),
     });
     const miniAppSurface = new UtilityMiniAppSurfaceClient({
+        postMessage: (message) => parentPort.postMessage(message),
+    });
+    const miniAppTool = new UtilityMiniAppToolBroker({
         postMessage: (message) => parentPort.postMessage(message),
     });
     const memoryMonitor = new UtilityRuntimeMemoryMonitor({
@@ -473,6 +511,7 @@ if (parentPort) {
                 },
                 miniApp,
                 miniAppSurface,
+                miniAppTool,
                 reportWorkspaceIndexingObservation: (message) => {
                     try {
                         parentPort.postMessage(message);
@@ -496,6 +535,7 @@ if (parentPort) {
             computerUse.handleMessage(message) ||
             miniApp.handleMessage(message) ||
             miniAppSurface.handleMessage(message) ||
+            miniAppTool.handleMessage(message) ||
             memoryMonitor.handleMessage(message),
         exit: (code) => process.exit(code),
         sampleHealth: () => {

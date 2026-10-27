@@ -91,4 +91,15 @@ function toWorkspaceIdeApp(value) {
         ...(typeof available === 'boolean' ? { available } : {}),
     };
 }
+export function createV1WorkspaceIndexingWorker(api) {
+    return {
+        prepareSessionStart: (input) => api.workspaceIndexingService.prepareSessionStart(input),
+        captureRevisionAfterTurn: (input) => api.workspaceIndexingService.captureRevisionIfChanged(input),
+        prewarm: async (workspaceDir) => {
+            await api.workspaceIndexingService.prewarmWorkspace(workspaceDir);
+        },
+        closePrewarm: () => api.workspaceIndexingService.closeWorkspacePrewarm(),
+        deleteSession: (sessionId, completeDeletion) => api.workspaceIndexingService.deleteSession(sessionId, completeDeletion),
+    };
+}
 //# sourceMappingURL=workspace-local-actions.js.map

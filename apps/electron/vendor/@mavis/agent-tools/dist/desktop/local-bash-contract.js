@@ -48,6 +48,11 @@ function deletionRules(nativeDelete) {
     ];
 }
 function shellRules(shell) {
+    if (shell === 'pending')
+        return [
+            '- Shell discovery is pending in the background. Do not assume Bash or PowerShell syntax.',
+            '- The first bash call waits for discovery before permission checks and returns shell instructions without executing the command. Rewrite the command for the resolved shell in a new tool-call batch, then retry. Other tools do not wait for discovery.',
+        ];
     if (shell === 'unavailable')
         return [
             '- No local shell was resolved. Do not assume Bash or PowerShell syntax is executable.',

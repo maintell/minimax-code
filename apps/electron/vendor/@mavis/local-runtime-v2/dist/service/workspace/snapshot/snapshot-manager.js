@@ -1,3 +1,4 @@
+import { addGitObservation, measureGitRead, gitWatcherErrorCode, } from '../git-read-observation.js';
 import { randomUUID } from 'node:crypto';
 import { clearWorkspaceEntries, currentWorkspaceSnapshotId, evictOldestIdleWorkspaceEntry, isCurrentWorkspaceSnapshot, releaseWorkspaceEntry, trimIdleWorkspaceEntries, } from './snapshot-entry-cache.js';
 import { createDeferred, publishWorkspaceGitChanged, StaleWorkspaceGitSnapshotError, WorkspaceGitSnapshotManagerClosedError, WorkspaceGitSnapshotReleasedError, } from './snapshot-support.js';
@@ -26,42 +27,53 @@ export class WorkspaceGitSnapshotManager {
         this.reuseCompletedResults = options.reuseCompletedResults !== false;
         this.changeNotificationWindowMs = Math.max(0, options.changeNotificationWindowMs ?? 0);
     }
-    async getChanges(workspace, mode) {
+    async getChanges(workspace, mode, trace) {
         for (;;) {
             const entry = this.getOrCreateEntry(workspace);
             entry.activeReaders += 1;
             try {
-                const result = await this.readChangesAttempt(entry, mode);
+                addGitObservation(trace, 'attempts');
+                if (trace) {
+                    trace.workspace_key = entry.observationKey;
+                    trace.start_snapshot ??= entry.snapshotId;
+                }
+                const result = await this.readChangesAttempt(entry, mode, trace);
                 if (result)
                     return result;
             }
             finally {
+                if (trace) {
+                    trace.end_snapshot = entry.snapshotId;
+                    trace.watcher_healthy = entry.watcherHealthy;
+                    trace.watcher_error = entry.watcherErrorCode ?? 'none';
+                    trace.invalidation_reason = entry.lastInvalidationReason ?? 'none';
+                }
                 this.finishRead(entry);
             }
         }
     }
-    async readChangesAttempt(entry, mode) {
-        await this.ensureWatcher(entry);
-        await this.waitForReadBarrier(entry);
+    async readChangesAttempt(entry, mode, trace) {
+        await measureGitRead(trace, 'watcher_setup_ms', () => this.ensureWatcher(entry));
+        await this.waitForReadBarrier(entry, trace);
         this.beginReadGeneration(entry);
         const requestSnapshotId = entry.snapshotId;
-        const request = mode === 'fast' ? this.getBase(entry) : this.getFull(entry);
+        const request = mode === 'fast' ? this.getBase(entry, trace) : this.getFull(entry, trace);
         try {
-            const result = await request;
-            await this.waitForPathClassification(entry);
+            const result = await measureGitRead(trace, mode === 'fast' ? 'base_wait_ms' : 'full_wait_ms', () => request);
+            await measureGitRead(trace, 'classification_wait_ms', () => this.waitForPathClassification(entry));
             if (this.isStableResult(entry, result.snapshotId))
                 return result;
             if (entry.disposed)
                 throw new WorkspaceGitSnapshotReleasedError();
-            await this.waitForReadBarrier(entry);
+            await this.waitForReadBarrier(entry, trace);
             return undefined;
         }
         catch (error) {
-            return this.handleChangesFailure(entry, requestSnapshotId, error);
+            return this.handleChangesFailure(entry, requestSnapshotId, error, trace);
         }
     }
-    async handleChangesFailure(entry, requestSnapshotId, error) {
-        await this.waitForReadBarrier(entry);
+    async handleChangesFailure(entry, requestSnapshotId, error, trace) {
+        await this.waitForReadBarrier(entry, trace);
         if (this.closed)
             throw new WorkspaceGitSnapshotManagerClosedError();
         if (error instanceof WorkspaceGitSnapshotReleasedError || entry.disposed) {
@@ -182,7 +194,7 @@ export class WorkspaceGitSnapshotManager {
     invalidate(workspace, options = {}) {
         const entry = this.getOrCreateEntry(workspace);
         const kind = options.kind ?? 'repository';
-        this.advanceSnapshot(entry, kind);
+        this.advanceSnapshot(entry, kind, options.reason ?? 'manual');
         if (options.notify !== false) {
             this.publishChanged(entry, kind, options.reason ?? 'manual');
         }
@@ -242,7 +254,7 @@ export class WorkspaceGitSnapshotManager {
     }
     invalidateAll(reason = 'manual') {
         for (const entry of this.entries.values()) {
-            this.advanceSnapshot(entry, 'repository');
+            this.advanceSnapshot(entry, 'repository', reason);
             this.publishChanged(entry, 'repository', reason);
         }
     }
@@ -265,10 +277,14 @@ export class WorkspaceGitSnapshotManager {
             return existing;
         }
         this.evictIfNeeded();
+        const observationKey = this.nextSnapshotId();
         const entry = {
             workspace,
+            observationKey,
+            activeBaseLoads: 0,
+            activeFullLoads: 0,
             aliases: new Set(),
-            snapshotId: this.nextSnapshotId(),
+            snapshotId: observationKey,
             metadataRevision: 0,
             watcherHealthy: this.options.startWatcher === undefined,
             watcherSetup: Promise.resolve(),
@@ -343,8 +359,9 @@ export class WorkspaceGitSnapshotManager {
             }
             entry.watcher = watcher;
             if (recovering)
-                this.advanceSnapshot(entry, 'repository');
+                this.advanceSnapshot(entry, 'repository', 'recovery');
             entry.watcherHealthy = true;
+            entry.watcherErrorCode = undefined;
             entry.watcherErrorReported = false;
         }
         catch (error) {
@@ -373,11 +390,11 @@ export class WorkspaceGitSnapshotManager {
             this.resolvePendingValidation(entry);
             return;
         }
-        this.advanceSnapshot(entry, kind);
+        this.advanceSnapshot(entry, kind, 'watcher');
         this.resolvePendingValidation(entry);
         this.publishChanged(entry, kind, 'watcher');
     }
-    onWatcherError(entry, _error) {
+    onWatcherError(entry, error) {
         if (!this.isCurrentEntry(entry))
             return;
         const shouldPublish = !entry.watcherErrorReported;
@@ -387,61 +404,82 @@ export class WorkspaceGitSnapshotManager {
         entry.watcher?.close();
         entry.watcher = undefined;
         entry.watcherHealthy = false;
-        this.advanceSnapshot(entry, 'repository');
+        entry.watcherErrorCode = gitWatcherErrorCode(error);
+        this.advanceSnapshot(entry, 'repository', 'watcher-error');
         this.resolvePendingValidation(entry);
         if (shouldPublish)
             this.publishChanged(entry, 'repository', 'watcher-error');
     }
-    getBase(entry) {
+    getBase(entry, trace) {
+        if (trace)
+            trace.base_compute_id = `${entry.snapshotId}:base`;
         if (entry.base?.snapshotId === entry.snapshotId) {
+            addGitObservation(trace, 'base_cache_hits');
             return Promise.resolve(entry.base);
         }
-        if (entry.baseRequest)
+        if (entry.baseRequest) {
+            addGitObservation(trace, 'base_inflight_joins');
             return entry.baseRequest;
+        }
         const snapshotId = entry.snapshotId;
-        const request = this.loadBaseRequestAndClear(entry, snapshotId);
+        const request = this.loadBaseRequestAndClear(entry, snapshotId, trace);
         entry.baseRequest = request;
         return request;
     }
-    async loadBaseRequestAndClear(entry, snapshotId) {
+    async loadBaseRequestAndClear(entry, snapshotId, trace) {
+        addGitObservation(trace, 'base_loads');
+        entry.activeBaseLoads += 1;
+        if (trace)
+            trace.max_active_base_loads = Math.max(trace.max_active_base_loads ?? 0, entry.activeBaseLoads);
         try {
-            const value = await this.options.loadBase(entry.workspace);
+            const value = await measureGitRead(trace, 'base_compute_ms', () => this.options.loadBase(entry.workspace, trace));
             const result = { snapshotId, value };
             if (this.isStableResult(entry, snapshotId))
                 entry.base = result;
             return result;
         }
         finally {
+            entry.activeBaseLoads -= 1;
             if (entry.snapshotId === snapshotId)
                 entry.baseRequest = undefined;
             this.trimEntries();
         }
     }
-    getFull(entry) {
+    getFull(entry, trace) {
+        if (trace)
+            trace.full_compute_id = `${entry.snapshotId}:full`;
         if (entry.full?.snapshotId === entry.snapshotId) {
+            addGitObservation(trace, 'full_cache_hits');
             return Promise.resolve(entry.full);
         }
-        if (entry.fullRequest)
+        if (entry.fullRequest) {
+            addGitObservation(trace, 'full_inflight_joins');
             return entry.fullRequest;
+        }
         const snapshotId = entry.snapshotId;
-        const request = this.loadFullRequestAndClear(entry, snapshotId);
+        const request = this.loadFullRequestAndClear(entry, snapshotId, trace);
         entry.fullRequest = request;
         return request;
     }
-    async loadFullRequestAndClear(entry, snapshotId) {
+    async loadFullRequestAndClear(entry, snapshotId, trace) {
+        addGitObservation(trace, 'full_loads');
+        entry.activeFullLoads += 1;
+        if (trace)
+            trace.max_active_full_loads = Math.max(trace.max_active_full_loads ?? 0, entry.activeFullLoads);
         try {
-            const base = await this.getBase(entry);
-            await this.waitForPathClassification(entry);
+            const base = await measureGitRead(trace, 'base_wait_ms', () => this.getBase(entry, trace));
+            await measureGitRead(trace, 'classification_wait_ms', () => this.waitForPathClassification(entry));
             if (!this.isStableResult(entry, base.snapshotId)) {
                 throw new StaleWorkspaceGitSnapshotError();
             }
-            const value = await this.options.loadFull(entry.workspace, base.value);
+            const value = await measureGitRead(trace, 'full_compute_ms', () => this.options.loadFull(entry.workspace, base.value, trace));
             const result = { snapshotId, value };
             if (this.isStableResult(entry, snapshotId))
                 entry.full = result;
             return result;
         }
         finally {
+            entry.activeFullLoads -= 1;
             if (entry.snapshotId === snapshotId)
                 entry.fullRequest = undefined;
             this.trimEntries();
@@ -465,7 +503,8 @@ export class WorkspaceGitSnapshotManager {
             this.trimEntries();
         }
     }
-    advanceSnapshot(entry, kind) {
+    advanceSnapshot(entry, kind, reason = 'mutation') {
+        entry.lastInvalidationReason = reason;
         entry.snapshotId = this.nextSnapshotId();
         entry.readGenerationSnapshotId = undefined;
         entry.base = undefined;
@@ -526,7 +565,7 @@ export class WorkspaceGitSnapshotManager {
             return;
         if (entry.readGenerationSnapshotId === entry.snapshotId)
             return;
-        this.advanceSnapshot(entry, 'repository');
+        this.advanceSnapshot(entry, 'repository', 'unhealthy-watcher');
         entry.readGenerationSnapshotId = entry.snapshotId;
     }
     isStableResult(entry, snapshotId) {
@@ -542,9 +581,9 @@ export class WorkspaceGitSnapshotManager {
         while (entry.pendingValidation)
             await entry.pendingValidation.promise;
     }
-    async waitForReadBarrier(entry) {
-        await entry.mutationTail;
-        await this.waitForPathClassification(entry);
+    async waitForReadBarrier(entry, trace) {
+        await measureGitRead(trace, 'mutation_wait_ms', () => entry.mutationTail);
+        await measureGitRead(trace, 'classification_wait_ms', () => this.waitForPathClassification(entry));
     }
     resolvePendingValidation(entry) {
         const pending = entry.pendingValidation;

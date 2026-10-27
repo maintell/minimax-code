@@ -2,8 +2,8 @@ import path from 'node:path';
 import { getRuntimeBuildEnv, getRuntimeRegion } from '@mavis/config';
 import { initializeHostConnectorSystem } from '../host-connector-system/index.js';
 import { ConnectorCloudClient } from './app/cloud-client.js';
-import { DesktopConnectorRuntime } from './app/runtime.js';
 import { PluginSystemCloudTransport } from './cloud-transport.js';
+import { createMiniAppPluginMcpTools } from './mcp/miniapp-plugin-mcp-tools.js';
 import { PluginMcpRuntime } from './mcp/runtime.js';
 import { GithubPluginImporter } from './plugin/import/github-plugin-importer.js';
 import { PluginDesktopFacade } from './plugin/runtime/desktop-facade.js';
@@ -59,31 +59,21 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         },
         onAuditFailure: (error) => dependencies.logger.warn({ errorType: error instanceof Error ? error.name : typeof error }, 'Host-process Connector audit failed'),
     });
-    const connectorRuntime = new DesktopConnectorRuntime({
-        client: connectorClient,
-        logger: {
-            warn: (message, fields) => dependencies.logger.warn(fields ?? {}, message),
-        },
-        metrics: metricTags,
-        scopeKeyGetter: () => {
-            const principalId = dependencies.authContextGetter()?.realUserID?.trim();
-            const deployment = `${getRuntimeRegion()}-${getRuntimeBuildEnv()}`;
-            return principalId ? JSON.stringify([principalId, deployment]) : 'custom-only';
-        },
-    });
     const officialCacheRoot = path.join(dependencies.dataDir, 'v2', 'plugin-cache', 'official');
     const system = new PluginSystem({
         onPluginDeactivated,
         onOfficialPluginRevoked: dependencies.onOfficialPluginRevoked,
         onCapabilitiesChanged: dependencies.onCapabilitiesChanged,
         mcpNames: dependencies.mcp.getRuntimeNameRegistry(),
+        ...(dependencies.miniAppHostVersion
+            ? { miniAppHostVersion: dependencies.miniAppHostVersion }
+            : {}),
         dataDir: dependencies.dataDir,
         officialCacheRoot,
         repository,
         authContextGetter: dependencies.authContextGetter,
         deploymentGetter,
         listReservations: dependencies.listReservations,
-        connectorRuntime,
         mcpRuntime: pluginMcpRuntime,
         mcpRuntimeFactory: createPluginMcpRuntime,
         officialReconciler: new OfficialPluginReconciler({
@@ -114,23 +104,29 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         mcp: dependencies.mcp,
         skill: dependencies.skill,
         hostConnectorGateway: hostConnectorSystem.gateway,
+        miniAppPermissionSwitches: system.miniAppPublication.permissionSwitches,
+        miniAppPluginMcp: createMiniAppPluginMcpTools(system),
         attachMiniAppPublication: (input) => system.miniAppPublication.attach(input),
         listAcceptedMiniApps: () => system.miniAppPublication.listAcceptedMiniApps(),
         isAcceptedMiniAppRunning: (pluginId) => system.miniAppPublication.isAcceptedMiniAppRunning(pluginId),
         listAvailableMiniApps: () => system.miniAppPublication.listAvailableMiniApps(),
+        listAvailableMiniAppDefinitions: () => system.miniAppPublication.listAvailableDefinitions(),
+        withheldMiniAppReason: (pluginId) => system.miniAppPublication.withheldMiniAppReason(pluginId),
         activateMiniApp: (input) => system.miniAppPublication.activate(input),
         ensureMiniAppStarted: (input) => system.miniAppPublication.ensureStarted(input),
         prepareMiniAppTurn: (input) => system.prepareMiniAppTurn(input),
         initializeWorkspaceMiniApp: (input) => system.miniAppPublication.initializeWorkspace(input),
         publishWorkspaceMiniApp: (input) => system.miniAppPublication.publishWorkspace(input),
         restartMiniApp: (input) => system.miniAppPublication.restart(input),
+        applyUpdate: (input) => system.miniAppPublication.applyUpdate(input),
         stopMiniApp: (input) => system.miniAppPublication.stop(input),
+        listMiniAppPermissions: (pluginId) => system.miniAppPublication.listPermissions(pluginId),
+        setMiniAppPermission: (input) => system.miniAppPublication.setPermission(input),
         verifyMiniAppCandidate: (candidate) => system.miniAppPublication.verifyCandidate(candidate),
         materializeMiniAppRuntimePackage: (input) => system.miniAppPublication.materializeRuntimePackage(input),
         authContextChanged: () => {
             officialAuthBarrier.authContextChanged();
             hostConnectorSystem.authContextChanged();
-            connectorRuntime.authContextChanged();
             system.authContextChanged();
         },
         enabledHookPluginNames: () => new Set((system.currentSnapshot.turnCapabilities.hooks ?? []).map((handler) => handler.pluginName)),

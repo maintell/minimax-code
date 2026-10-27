@@ -1,3 +1,4 @@
+import { logger } from '@mavis/shared/local-runtime-logging';
 import { checkConsolidationWindow } from './consolidation-window.js';
 import { GLOBAL_SCOPE_KEY } from '../contracts.js';
 import { computeOutputDigest, renderRulesMirror, renderSessionMirror } from './session-doc.js';
@@ -7,12 +8,15 @@ export class MemoryReconciler {
     wakeRequested = false;
     pendingWakeIds = [];
     pendingBoundary;
+    legacyMigrationRequested = false;
     drainResolve;
     drainPromise;
     running = false;
     runPromise;
     /** 整理、非会话级失败与抽取环境故障的进程内退避；其余抽取失败走持久记账（§6.1）。 */
     retryAfter = new Map();
+    /** 各 scope 连续整理失败次数，决定下一次退避时长；成功或无需整理即清零。 */
+    consolidationFailures = new Map();
     /** 模型限流后的下一次可运行时刻；到期本身不产生唤醒（§10）。 */
     modelBlockedUntilMs = 0;
     constructor(deps) {
@@ -46,6 +50,8 @@ export class MemoryReconciler {
                 };
             }
         }
+        if (signal.kind === 'legacy-migration')
+            this.legacyMigrationRequested = true;
         this.wakeRequested = true;
         this.scheduleRun();
     }
@@ -98,13 +104,15 @@ export class MemoryReconciler {
             // 正在执行的一轮冻结自己的边界，后到信号归下一轮(§5.10)。
             const boundary = this.pendingBoundary;
             const wakeIds = this.pendingWakeIds;
+            const legacyMigration = this.legacyMigrationRequested;
             this.pendingBoundary = undefined;
             this.pendingWakeIds = [];
+            this.legacyMigrationRequested = false;
             try {
                 if (this.deps.diagnostics)
-                    await this.deps.diagnostics.run('reconciler.round', { wakeIds, boundary, config: this.deps.config() }, () => this.runOneRound(boundary), true);
+                    await this.deps.diagnostics.run('reconciler.round', { wakeIds, boundary, legacyMigration, config: this.deps.config() }, () => this.runOneRound(boundary, legacyMigration), true);
                 else
-                    await this.runOneRound(boundary);
+                    await this.runOneRound(boundary, legacyMigration);
             }
             catch (error) {
                 this.reportFailure(error);
@@ -112,7 +120,7 @@ export class MemoryReconciler {
         }
     }
     /** One round: the fixed sequence from §5.10. */
-    async runOneRound(boundary) {
+    async runOneRound(boundary, legacyMigration) {
         const config = this.deps.config();
         if (!config.writeEnabled) {
             this.event('reconciler.skipped', { reason: 'generation-disabled' });
@@ -124,8 +132,9 @@ export class MemoryReconciler {
         await this.cleanupOrphanScopeDirs();
         await this.maintainFiles(work, config);
         // Step 3/4: 按阶段实际通道检查额度；后续每项新任务再次准入，在途任务继续完成。
+        // 任务唤醒同时推进旧记忆迁移；引导刚选择迁移时的专用唤醒只迁移，不扫描历史会话。
         const capturedScopeKeys = new Set();
-        if (boundary && (await this.modelTasksAllowed('capture', config))) {
+        if ((boundary || legacyMigration) && (await this.modelTasksAllowed('capture', config))) {
             await this.captureCandidates(config, boundary, capturedScopeKeys);
         }
         // Step 5: 整理独立准入，允许 capture 与 consolidation 使用不同通道。
@@ -296,7 +305,7 @@ export class MemoryReconciler {
             const attempt = attempts.get(candidate.sessionId);
             captures.push({
                 ...candidate,
-                inspection: attempt && this.isBackedOff(attempts, candidate, config)
+                inspection: attempt && this.isBackedOff(attempts, candidate, config.maxCaptureAttemptsPerRevision)
                     ? { status: 'backoff', attempt }
                     : await inspect(candidate),
             });
@@ -318,63 +327,71 @@ export class MemoryReconciler {
             cursor = page.nextCursor;
         } while (cursor);
     }
+    /** 本轮的生成工作：先列出待迁移旧文件，再按边界分页列出历史会话候选。 */
+    async *generationWork(config, boundary, stats) {
+        let legacy = [];
+        try {
+            legacy = await this.deps.legacyMigration.listPending();
+        }
+        catch (error) {
+            this.reportFailure(error);
+        }
+        stats.pending = legacy.length;
+        for (const candidate of legacy)
+            yield { kind: 'legacy', candidate };
+        if (boundary) {
+            for await (const candidate of this.candidates(config, boundary)) {
+                yield { kind: 'session', candidate };
+            }
+        }
+    }
     async captureCandidates(config, boundary, capturedScopeKeys) {
-        const attempts = await this.loadAttempts();
-        const candidates = this.candidates(config, boundary);
+        const round = {
+            attempts: await this.loadAttempts(),
+            config,
+            capturedScopeKeys,
+            stats: { pending: 0, migrated: 0, empty: 0, failed: 0, deferred: 0, exhausted: 0 },
+        };
+        const work = this.generationWork(config, boundary, round.stats);
         const seen = new Set();
         const inFlight = new Map();
         let modelCaptures = 0;
-        const runCandidate = async (candidate) => {
-            try {
-                if (await this.captureCandidate(candidate, config, capturedScopeKeys))
-                    modelCaptures += 1;
-            }
-            catch (error) {
+        const runWork = async (item) => {
+            if (await this.runGenerationWork(item, round))
                 modelCaptures += 1;
-                this.reportFailure(error);
-                await this.recordFailure(candidate, 'store-unavailable', config);
-            }
-            finally {
-                inFlight.delete(candidate.sessionId);
-            }
+            inFlight.delete(item.candidate.sessionId);
         };
         try {
             while (modelCaptures < config.maxCaptureSessionsPerWake) {
                 if (this.deps.nowMs() < this.modelBlockedUntilMs)
                     break;
-                // 在途 Capture 先占一个模型额度；无模型的返回释放额度后再继续领取。
+                // 在途任务先占一个模型额度；无模型的返回释放额度后再继续领取。
                 if (inFlight.size >= config.maxCaptureConcurrency ||
                     modelCaptures + inFlight.size >= config.maxCaptureSessionsPerWake) {
                     await Promise.race(inFlight.values());
                     continue;
                 }
-                const next = await candidates.next();
+                const next = await work.next();
                 if (next.done)
                     break;
-                const candidate = next.value;
-                if (seen.has(candidate.sessionId))
+                const item = next.value;
+                if (seen.has(item.candidate.sessionId))
                     continue;
-                seen.add(candidate.sessionId);
-                if (this.isBackedOff(attempts, candidate, config)) {
-                    this.event('capture.skipped', {
-                        candidate,
-                        reason: 'capture-backoff-or-exhausted',
-                        attempt: attempts.get(candidate.sessionId),
-                    });
+                seen.add(item.candidate.sessionId);
+                if (await this.skipBackedOff(item, round))
                     continue;
-                }
-                // Recheck synchronously at dispatch after quota I/O and queued continuations.
-                if (!(await this.modelTasksAllowed('capture', this.deps.config())) ||
-                    !this.modelSchedulingAllowed('capture', this.deps.config())) {
+                if (!(await this.captureDispatchAllowed()))
                     break;
-                }
-                inFlight.set(candidate.sessionId, runCandidate(candidate));
+                inFlight.set(item.candidate.sessionId, runWork(item));
             }
         }
         finally {
             // 候选分页或单个任务失败时，也必须等待已启动的全部任务结束。
             await Promise.allSettled(inFlight.values());
-            await candidates.return(undefined);
+            await work.return(undefined);
+        }
+        if (round.stats.pending > 0) {
+            logger.info({ ...round.stats }, '[memory-v2] legacy migration round');
         }
         this.event('capture.batch-stopped', {
             modelCaptures,
@@ -383,12 +400,94 @@ export class MemoryReconciler {
             modelBlockedUntilMs: this.modelBlockedUntilMs,
         });
     }
+    /** 执行一项生成工作，返回是否消耗了本轮模型额度；抛错按存储故障记一次失败。 */
+    async runGenerationWork(item, round) {
+        try {
+            return item.kind === 'legacy'
+                ? await this.migrateCandidate(item.candidate, round)
+                : await this.captureCandidate(item.candidate, round.config, round.capturedScopeKeys);
+        }
+        catch (error) {
+            this.reportFailure(error);
+            await this.recordFailure(item.candidate, 'store-unavailable', round.config);
+            return true;
+        }
+    }
+    /** 退避期内或同一修订已耗尽重试次数的工作项不再领取。 */
+    async skipBackedOff(item, round) {
+        if (!this.isBackedOff(round.attempts, item.candidate, attemptLimit(item, round.config))) {
+            return false;
+        }
+        if (item.kind === 'legacy') {
+            round.stats.exhausted += 1;
+            // 放弃登记曾经失败时在这里补做，否则该文件一直算待迁，迁移无法收尾。
+            if (legacyExhausted(round.attempts.get(item.candidate.sessionId), item.candidate)) {
+                await this.deps.legacyMigration.abandon(item.candidate);
+            }
+        }
+        this.event('capture.skipped', {
+            candidate: item.kind === 'legacy' ? legacyRef(item.candidate) : item.candidate,
+            reason: 'capture-backoff-or-exhausted',
+            attempt: round.attempts.get(item.candidate.sessionId),
+        });
+        return true;
+    }
+    /** Recheck synchronously at dispatch after quota I/O and queued continuations. */
+    async captureDispatchAllowed() {
+        const config = this.deps.config();
+        // 写入开关在本轮开始后被关闭时，不再领取新的抽取或迁移任务。
+        return (config.writeEnabled &&
+            (await this.modelTasksAllowed('capture', config)) &&
+            this.modelSchedulingAllowed('capture', config));
+    }
+    /**
+     * 迁移单个旧文件，返回是否消耗了本轮模型额度。环境故障不计次，停止本批模型任务并在下次唤醒继续；
+     * 其余失败按文件内容计次，满 LEGACY_MIGRATION_MAX_ATTEMPTS 次后停止，内容变化才再试。
+     */
+    async migrateCandidate(candidate, round) {
+        const { attempts, config, capturedScopeKeys, stats } = round;
+        const ref = legacyRef(candidate);
+        const result = await this.deps.legacyMigration.migrate(candidate);
+        switch (result.status) {
+            case 'migrated':
+            case 'empty':
+                if (result.status === 'migrated')
+                    capturedScopeKeys.add(GLOBAL_SCOPE_KEY);
+                stats[result.status] += 1;
+                logger.info({ ...ref, result: result.status }, '[memory-v2] legacy migration file completed');
+                return true;
+            case 'stale-input':
+                stats.deferred += 1;
+                logger.info({ ...ref, reason: 'stale-input' }, '[memory-v2] legacy migration file deferred');
+                return true;
+            case 'deferred': {
+                if (!countsTowardCaptureAttempts(result.reason)) {
+                    stats.deferred += 1;
+                    this.blockModelAfterEnvironmentFailure(candidate, config);
+                    logger.info({ ...ref, reason: result.reason }, '[memory-v2] legacy migration file deferred');
+                    return true;
+                }
+                const previous = attempts.get(candidate.sessionId);
+                const attempt = (previous?.sourceRevision === candidate.sourceRevision ? previous.attempts : 0) + 1;
+                stats.failed += 1;
+                await this.recordFailure(candidate, result.reason, config);
+                logger.warn({ ...ref, reason: result.reason, attempt, maxAttempts: LEGACY_MIGRATION_MAX_ATTEMPTS }, attempt >= LEGACY_MIGRATION_MAX_ATTEMPTS
+                    ? '[memory-v2] legacy migration file gave up'
+                    : '[memory-v2] legacy migration file failed');
+                // 放弃是终态：登记后不再算待迁，其余文件处理完毕即可收尾。
+                if (attempt >= LEGACY_MIGRATION_MAX_ATTEMPTS) {
+                    await this.deps.legacyMigration.abandon(candidate);
+                }
+                return true;
+            }
+        }
+    }
     async loadAttempts() {
         const rows = await this.deps.repository.listCaptureAttempts(GLOBAL_SCOPE_KEY);
         return new Map(rows.map((row) => [row.sessionId, row]));
     }
     /** 失败记账过滤：退避期内跳过；同 revision 耗尽转 retry-exhausted 终态(§2.3)。 */
-    isBackedOff(attempts, candidate, config) {
+    isBackedOff(attempts, candidate, maxAttempts) {
         if ((this.retryAfter.get(captureHoldKey(candidate)) ?? 0) > this.deps.nowMs())
             return true;
         const attempt = attempts.get(candidate.sessionId);
@@ -397,8 +496,7 @@ export class MemoryReconciler {
         if (attempt.sourceRevision !== candidate.sourceRevision)
             return false;
         // 旧版本把环境故障也记入次数；最后一次失败是环境故障的历史行不判耗尽，让会话恢复抽取。
-        if (attempt.attempts >= config.maxCaptureAttemptsPerRevision &&
-            countsTowardCaptureAttempts(attempt.lastReason)) {
+        if (attempt.attempts >= maxAttempts && countsTowardCaptureAttempts(attempt.lastReason)) {
             return true;
         }
         return attempt.retryAtMs > this.deps.nowMs();
@@ -417,11 +515,7 @@ export class MemoryReconciler {
                     await this.recordFailure(candidate, result.reason, config);
                     return true;
                 }
-                // 环境故障与会话内容无关：停止本批模型任务，不消耗该会话的重试次数；
-                // 进程内会话退避避免同一会话在后续唤醒中反复占住队首(§10)。
-                this.modelBlockedUntilMs = this.deps.nowMs() + 60_000;
-                const retryAtMs = this.deps.nowMs() + config.captureFailureBackoffMs;
-                this.holdUntil(captureHoldKey(candidate), retryAtMs);
+                const retryAtMs = this.blockModelAfterEnvironmentFailure(candidate, config);
                 this.event('capture.held', { candidate, reason: result.reason, retryAtMs });
                 return true;
             }
@@ -429,6 +523,16 @@ export class MemoryReconciler {
                 capturedScopeKeys.add(GLOBAL_SCOPE_KEY);
                 return true;
         }
+    }
+    /**
+     * 环境故障与内容无关：停止本批模型任务，不消耗重试次数；进程内退避避免同一项在后续唤醒中
+     * 反复占住队首(§10)。
+     */
+    blockModelAfterEnvironmentFailure(candidate, config) {
+        this.modelBlockedUntilMs = this.deps.nowMs() + 60_000;
+        const retryAtMs = this.deps.nowMs() + config.captureFailureBackoffMs;
+        this.holdUntil(captureHoldKey(candidate), retryAtMs);
+        return retryAtMs;
     }
     async recordFailure(candidate, reason, config) {
         try {
@@ -469,10 +573,12 @@ export class MemoryReconciler {
                     reason: governanceScopes.has(scopeKey) ? 'governance' : 'routine',
                 });
                 if (result.status === 'deferred')
-                    this.defer(key, result.reason);
+                    this.deferConsolidation(scopeKey, result.reason);
+                else
+                    this.consolidationFailures.delete(scopeKey);
             }
             catch (error) {
-                this.defer(key, error);
+                this.deferConsolidation(scopeKey, error);
             }
         }
     }
@@ -497,8 +603,17 @@ export class MemoryReconciler {
             }
         }
     }
-    defer(key, error) {
-        this.holdUntil(key, this.deps.nowMs() + 60_000);
+    /**
+     * 整理失败的进程内退避：一次失败的整理常耗费上百万 token，成功冷却又只从成功时刻起算，
+     * 固定 60 秒退避会让失败在每次唤醒时重演。退避从 15 分钟起逐次翻倍，上限取成功冷却时长；
+     * 任一非 deferred 结果清零计数。
+     */
+    deferConsolidation(scopeKey, error) {
+        const failures = (this.consolidationFailures.get(scopeKey) ?? 0) + 1;
+        this.consolidationFailures.set(scopeKey, failures);
+        const ceilingMs = Math.max(this.deps.config().publicationCooldownMs, CONSOLIDATION_FAILURE_BASE_BACKOFF_MS);
+        const delayMs = Math.min(CONSOLIDATION_FAILURE_BASE_BACKOFF_MS * 2 ** (failures - 1), ceilingMs);
+        this.holdUntil(`scope:${scopeKey}`, this.deps.nowMs() + delayMs);
         this.reportFailure(error);
     }
     /** 登记进程内退避；按插入顺序淘汰最旧条目，长时间运行也不会无界增长。 */
@@ -523,6 +638,29 @@ export class MemoryReconciler {
             /* 上报失败不影响后台恢复。 */
         }
     }
+}
+const CONSOLIDATION_FAILURE_BASE_BACKOFF_MS = 15 * 60 * 1000;
+/** 旧记忆是一次性迁移，失败代价只是多等几轮唤醒，给比会话抽取更宽的重试次数。 */
+const LEGACY_MIGRATION_MAX_ATTEMPTS = 5;
+function attemptLimit(item, config) {
+    return item.kind === 'legacy'
+        ? LEGACY_MIGRATION_MAX_ATTEMPTS
+        : config.maxCaptureAttemptsPerRevision;
+}
+/** 同一内容已用尽重试次数（不含早期版本计入的环境故障）。 */
+function legacyExhausted(attempt, candidate) {
+    return (attempt !== undefined &&
+        attempt.sourceRevision === candidate.sourceRevision &&
+        attempt.attempts >= LEGACY_MIGRATION_MAX_ATTEMPTS &&
+        countsTowardCaptureAttempts(attempt.lastReason));
+}
+/** 日志与诊断只记录迁移文件的身份，不含正文。 */
+function legacyRef(candidate) {
+    return {
+        sessionId: candidate.sessionId,
+        sourceFile: candidate.sourceFile,
+        sourceRevision: candidate.sourceRevision,
+    };
 }
 /** 只有可归因于会话本身的失败计入重试次数；环境故障换个时间重发就可能成功(§10)。 */
 function countsTowardCaptureAttempts(reason) {

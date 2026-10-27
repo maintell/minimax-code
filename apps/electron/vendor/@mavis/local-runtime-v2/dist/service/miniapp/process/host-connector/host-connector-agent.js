@@ -1,7 +1,8 @@
-import { isMiniAppAgentPermissionDecision, isMiniAppAgentQuestionMode, readMiniAppAgentAnswers, } from '@mavis/shared/miniapp-surface';
-import { isMiniAppAgentBusyReason, MINIAPP_AGENT_ERROR_CODES, MiniAppAgentError, } from '../../agent/contracts.js';
+import { isMiniAppAgentPermissionDecision, isMiniAppAgentQuestionMode, readMiniAppAgentAnswers, readMiniAppAgentObserveTarget, readMiniAppAgentSessionDetail, readMiniAppAgentSessionList, } from '@mavis/shared/miniapp-surface';
+import { isMiniAppAgentBusyReason, isMiniAppAgentWhenBusy, MINIAPP_AGENT_ERROR_CODES, MiniAppAgentError, } from '../../agent/contracts.js';
 import { readMiniAppAgentModelSelection } from '../../agent/model-selection.js';
 import { detach } from '../../../channel-system/settle.js';
+import { copyAgentRunEvent, hasOptionalKeys, isBoolean, isModelSelection, isOptional, isQuestionnaireRequest, isResultError, isRunStatus, isString, } from './host-connector-agent-events.js';
 import { HostConnectorProtocolError } from './host-connector-errors.js';
 import { hasExactKeys, isBoundedIdentifier, isRecord, } from './host-connector-wire.js';
 const AGENT_ERROR_MESSAGES = {
@@ -15,21 +16,27 @@ const AGENT_ERROR_MESSAGES = {
     REQUEST_NOT_FOUND: 'Mini App Agent request was not found or already settled',
 };
 const AGENT_ERROR_CODES = new Set(MINIAPP_AGENT_ERROR_CODES);
-/** Event frames buffered per run before later ones are dropped; the terminal frame is never dropped. */
+/**
+ * Event frames buffered per request before later ones are dropped. A run's terminal result frame
+ * is never dropped; an observer has no per-turn result, so its lifecycle events are retained.
+ */
 const MAX_QUEUED_AGENT_EVENTS = 256;
 /** Events the child must act on; never dropped for the queue bound. */
 const INTERACTION_EVENT_TYPES = new Set([
     'permission.requested',
     'question.requested',
 ]);
+/** An observed turn's start, final reply and end; only progress frames fall to the bound. */
+const OBSERVED_RETAINED_EVENT_TYPES = new Set([
+    'turn.started',
+    'message.committed',
+    'turn.finished',
+]);
 export function agentClientError(code, retryable = false) {
     return new MiniAppAgentError(code, AGENT_ERROR_MESSAGES[code], retryable);
 }
 export function encodeAgentRunParams(input) {
-    if (!isRecord(input) ||
-        typeof input.text !== 'string' ||
-        (input.sessionId !== undefined && !isBoundedIdentifier(input.sessionId)) ||
-        (input.agent !== undefined && !isBoundedIdentifier(input.agent))) {
+    if (!isRecord(input) || typeof input.text !== 'string' || !hasValidRunOptions(input)) {
         throw agentClientError('INVALID_ARGUMENTS');
     }
     return {
@@ -37,7 +44,20 @@ export function encodeAgentRunParams(input) {
         ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
         ...encodeAgentModel(input.model),
         ...(input.agent === undefined ? {} : { agent: input.agent }),
+        ...(input.whenBusy === undefined ? {} : { whenBusy: input.whenBusy }),
     };
+}
+/**
+ * The optional `run` fields besides `model`, which decodes on its own. An `undefined` field is
+ * absent, as it is after JSON encoding, so the same check serves the child and the Host.
+ */
+function hasValidRunOptions(value) {
+    return (absentOr(value.sessionId, isBoundedIdentifier) &&
+        absentOr(value.agent, isBoundedIdentifier) &&
+        absentOr(value.whenBusy, isMiniAppAgentWhenBusy));
+}
+function absentOr(field, check) {
+    return field === undefined || check(field);
 }
 function encodeAgentModel(model) {
     if (model === undefined)
@@ -74,10 +94,9 @@ function decodeAgentCreateParams(params) {
 }
 function decodeAgentRunParams(params) {
     if (!params ||
-        !hasOptionalKeys(params, ['text'], ['sessionId', 'observe', 'model', 'agent']) ||
+        !hasOptionalKeys(params, ['text'], ['sessionId', 'observe', 'model', 'agent', 'whenBusy']) ||
         typeof params.text !== 'string' ||
-        !isOptional(params, 'sessionId', isBoundedIdentifier) ||
-        !isOptional(params, 'agent', isBoundedIdentifier) ||
+        !hasValidRunOptions(params) ||
         !isOptional(params, 'observe', isBoolean)) {
         throw new HostConnectorProtocolError('Host Connector request is invalid');
     }
@@ -87,6 +106,7 @@ function decodeAgentRunParams(params) {
             ...(typeof params.sessionId === 'string' ? { sessionId: params.sessionId } : {}),
             ...decodeAgentModel(params),
             ...(typeof params.agent === 'string' ? { agent: params.agent } : {}),
+            ...(isMiniAppAgentWhenBusy(params.whenBusy) ? { whenBusy: params.whenBusy } : {}),
         },
         observe: params.observe === true,
     };
@@ -145,6 +165,53 @@ function decodeAgentAnswerParams(params) {
         observe: params.observe === true,
     };
 }
+/** `onEvent` stays in the child; only the target crosses the channel. */
+export function encodeAgentObserveParams(target, options) {
+    const params = readObserveTarget(target);
+    if (!params || !isRecord(options) || typeof options.onEvent !== 'function') {
+        throw agentClientError('INVALID_ARGUMENTS');
+    }
+    return params;
+}
+function decodeAgentObserveParams(params) {
+    const target = params && hasOptionalKeys(params, [], ['sessionId', 'all']) && readObserveTarget(params);
+    if (!target)
+        throw new HostConnectorProtocolError('Host Connector request is invalid');
+    return target;
+}
+/** Exactly one of a bounded `sessionId` or `all: true`. */
+function readObserveTarget(value) {
+    const target = readMiniAppAgentObserveTarget(value);
+    if (target && 'sessionId' in target) {
+        return isBoundedIdentifier(target.sessionId) ? { sessionId: target.sessionId } : null;
+    }
+    return target;
+}
+function decodeAgentSessionGetParams(params) {
+    if (!params || !hasExactKeys(params, ['sessionId']) || !isBoundedIdentifier(params.sessionId)) {
+        throw new HostConnectorProtocolError('Host Connector request is invalid');
+    }
+    return { sessionId: params.sessionId };
+}
+/** Exact-key copy of the Gateway's `{ sessions }`; anything malformed is a protocol error. */
+function readSessionList(value) {
+    if (!isRecord(value) || !hasExactKeys(value, ['sessions']))
+        return undefined;
+    const sessions = readMiniAppAgentSessionList(value.sessions);
+    const entries = value.sessions;
+    const exact = sessions &&
+        sessions.every((summary, index) => hasExactKeys(entries[index] ?? {}, Object.keys(summary)));
+    return exact ? { sessions } : undefined;
+}
+/** Exact-key copy of the Gateway's `{ session }`. */
+function readSessionDetail(value) {
+    if (!isRecord(value) || !hasExactKeys(value, ['session']))
+        return undefined;
+    const session = readMiniAppAgentSessionDetail(value.session);
+    return session && isRecord(value.session) && hasExactKeys(value.session, Object.keys(session))
+        ? session
+        : undefined;
+}
 function isAgentRunResult(value) {
     return (isRecord(value) &&
         hasOptionalKeys(value, ['sessionId', 'status'], ['turnId', 'model', 'text', 'error', 'pendingQuestion']) &&
@@ -175,12 +242,18 @@ const AGENT_RESULT_DECODERS = {
         : undefined,
     'agent.run': decodeAgentTurnResult,
     'agent.answer': decodeAgentTurnResult,
+    'agent.observe': (value) => (value === null ? { value: undefined } : undefined),
+    'agent.sessions': (value) => {
+        const sessions = readSessionList(value);
+        return sessions ? { value: sessions } : undefined;
+    },
+    'agent.session': (value) => {
+        const session = readSessionDetail(value);
+        return session ? { value: session } : undefined;
+    },
 };
 function decodeAgentTurnResult(value) {
     return isAgentRunResult(value) ? { value: projectAgentResult(value) } : undefined;
-}
-function isModelSelection(value) {
-    return readMiniAppAgentModelSelection(value) !== null;
 }
 function isStringArray(value) {
     return Array.isArray(value) && value.every(isString);
@@ -218,105 +291,6 @@ function isAgentAgents(value) {
             isString(agent.displayName) &&
             isBoolean(agent.primary)));
 }
-/**
- * Child side: unknown `type`s (a newer Host) are ignored; a known type with a bad shape is a
- * protocol error.
- */
-export function decodeAgentRunEvent(value) {
-    const event = copyAgentRunEvent(value);
-    if (event)
-        return event;
-    if (isRecord(value) && typeof value.type === 'string' && !agentEventShape(value.type)) {
-        return undefined;
-    }
-    throw new HostConnectorProtocolError('Mini App Agent event is invalid');
-}
-const isString = (field) => typeof field === 'string';
-const isBoolean = (field) => typeof field === 'boolean';
-const TEXT_EVENT = { required: ['text'], valid: (value) => isString(value.text) };
-const AGENT_EVENT_SHAPES = {
-    'run.queued': {
-        required: ['position'],
-        turnId: 'absent',
-        sessionIdOptional: true,
-        valid: (value) => typeof value.position === 'number' &&
-            Number.isSafeInteger(value.position) &&
-            value.position >= 1,
-    },
-    'turn.started': { required: ['model'], valid: (value) => isModelSelection(value.model) },
-    'text.delta': TEXT_EVENT,
-    'message.committed': TEXT_EVENT,
-    'tool.started': { required: ['name'], valid: (value) => isString(value.name) },
-    'tool.finished': {
-        required: ['name', 'ok'],
-        valid: (value) => isString(value.name) && typeof value.ok === 'boolean',
-    },
-    'permission.requested': {
-        required: ['requestId', 'toolName', 'reason'],
-        optional: ['toolInput'],
-        turnId: 'optional',
-        valid: (value) => isBoundedIdentifier(value.requestId) &&
-            isString(value.toolName) &&
-            isString(value.reason) &&
-            isOptional(value, 'toolInput', isString),
-    },
-    'question.requested': {
-        required: ['requestId', 'mode', 'request'],
-        turnId: 'optional',
-        valid: (value) => isBoundedIdentifier(value.requestId) &&
-            isMiniAppAgentQuestionMode(value.mode) &&
-            isQuestionnaireRequest(value.request),
-    },
-    'turn.finished': {
-        required: ['status'],
-        optional: ['text', 'error'],
-        valid: (value) => isRunStatus(value.status) &&
-            isOptional(value, 'text', isString) &&
-            isOptional(value, 'error', isResultError),
-    },
-};
-function hasAgentEventEnvelope(value, shape) {
-    const sessionKey = shape.sessionIdOptional ? 'optional' : 'required';
-    const turnKey = shape.turnId ?? 'required';
-    const required = [
-        'type',
-        ...(sessionKey === 'required' ? ['sessionId'] : []),
-        ...(turnKey === 'required' ? ['turnId'] : []),
-        ...shape.required,
-    ];
-    const optional = [
-        ...(sessionKey === 'optional' ? ['sessionId'] : []),
-        ...(turnKey === 'optional' ? ['turnId'] : []),
-        ...(shape.optional ?? []),
-    ];
-    return (isOptional(value, 'sessionId', isBoundedIdentifier) &&
-        isOptional(value, 'turnId', isBoundedIdentifier) &&
-        hasOptionalKeys(value, required, optional));
-}
-function agentEventShape(type) {
-    return Object.prototype.hasOwnProperty.call(AGENT_EVENT_SHAPES, type)
-        ? AGENT_EVENT_SHAPES[type]
-        : undefined;
-}
-/**
- * Exact-key copy of a known event; anything else is `undefined` so the Host never sends it.
- * An `undefined` field counts as absent, as it would after JSON encoding.
- */
-function copyAgentRunEvent(raw) {
-    if (!isRecord(raw) || typeof raw.type !== 'string')
-        return undefined;
-    const value = Object.fromEntries(Object.entries(raw).filter(([, field]) => field !== undefined));
-    const shape = agentEventShape(raw.type);
-    if (!shape || !hasAgentEventEnvelope(value, shape) || !shape.valid(value))
-        return undefined;
-    // Every field is now a validated primitive except `error`, whose exact keys were checked,
-    // and the questionnaire `request`, whose size the response frame bound limits.
-    return {
-        ...value,
-        ...(isRecord(value.error) ? { error: { ...value.error } } : {}),
-        ...(raw.type === 'turn.started' ? { model: readMiniAppAgentModelSelection(value.model) } : {}),
-    };
-}
 export function decodeAgentWireError(value) {
     if (!isRecord(value) ||
         !hasOptionalKeys(value, ['code', 'message', 'retryable'], ['reason']) ||
@@ -328,21 +302,28 @@ export function decodeAgentWireError(value) {
     }
     return new MiniAppAgentError(value.code, value.message, value.retryable, value.reason);
 }
+/** `agent.*` calls that take no parameters. */
+function decodeNoParams(params) {
+    if (!params || !hasExactKeys(params, [])) {
+        throw new HostConnectorProtocolError('Host Connector request is invalid');
+    }
+    return {};
+}
+const AGENT_REQUEST_DECODERS = {
+    'agent.run': decodeAgentRunParams,
+    'agent.answer': decodeAgentAnswerParams,
+    'agent.reply': (params) => ({ params: decodeAgentReplyParams(params) }),
+    'agent.create': (params) => ({ params: decodeAgentCreateParams(params) }),
+    'agent.models': decodeNoParams,
+    'agent.agents': decodeNoParams,
+    'agent.observe': (params) => ({ params: decodeAgentObserveParams(params) }),
+    'agent.sessions': decodeNoParams,
+    'agent.session': (params) => ({ params: decodeAgentSessionGetParams(params) }),
+};
 /** Malformed params are a protocol error, raised before any response is written. */
 function decodeAgentRequest(method, params) {
-    if (method === 'agent.reply')
-        return { method, params: decodeAgentReplyParams(params) };
-    if (method === 'agent.create')
-        return { method, params: decodeAgentCreateParams(params) };
-    if (method === 'agent.models' || method === 'agent.agents') {
-        if (!params || !hasExactKeys(params, [])) {
-            throw new HostConnectorProtocolError('Host Connector request is invalid');
-        }
-        return { method };
-    }
-    if (method === 'agent.answer')
-        return { method, ...decodeAgentAnswerParams(params) };
-    return { method, ...decodeAgentRunParams(params) };
+    // Each decoder returns exactly the fields of its method's request shape.
+    return { method, ...AGENT_REQUEST_DECODERS[method](params) };
 }
 /** Host-side `agent.*` handling for one generation-bound connector session. */
 export function createHostAgentSession(input) {
@@ -405,6 +386,21 @@ export function createHostAgentSession(input) {
                 });
                 return;
             }
+            if (request.method === 'agent.observe') {
+                await observeHostAgent(input, { id: frame.id, gateway, params: request.params, signal });
+                return;
+            }
+            if (request.method === 'agent.sessions' || request.method === 'agent.session') {
+                await readHostAgentSessions({
+                    id: frame.id,
+                    gateway,
+                    identity,
+                    request,
+                    signal,
+                    respond: input.enqueueResponse,
+                });
+                return;
+            }
             const invocationId = input.makeInvocationId();
             await input.enqueueResponse({ v: 1, id: frame.id, receipt: 'admitted', invocationId });
             const after = admissionError();
@@ -417,7 +413,10 @@ export function createHostAgentSession(input) {
     };
 }
 function isShortAgentRequest(request) {
-    return request.method !== 'agent.run' && request.method !== 'agent.answer';
+    return (request.method === 'agent.reply' ||
+        request.method === 'agent.models' ||
+        request.method === 'agent.agents' ||
+        request.method === 'agent.create');
 }
 async function startShortAgentOperation(gateway, caller, request) {
     switch (request.method) {
@@ -449,6 +448,90 @@ async function settleShortHostAgent(short) {
         await short.respond({ v: 1, id: short.id, ok: false, error: wireError });
     }
 }
+/**
+ * Reads are not dispatched work: a quiesce does not wait for them. The request timeout
+ * applies; a lookup that outlives it is reported as retryable unavailable. Only contract fields
+ * are sent, so the child's exact-key check holds whatever the Gateway returned.
+ */
+async function readHostAgentSessions(read) {
+    const caller = processCaller(read.identity);
+    try {
+        const result = read.request.method === 'agent.sessions'
+            ? await listHostAgentSessions(read.gateway, caller, read.signal)
+            : await getHostAgentSession(read.gateway, caller, read.request.params, read.signal);
+        await read.respond({ v: 1, id: read.id, ok: true, result });
+    }
+    catch (error) {
+        const wireError = error instanceof MiniAppAgentError
+            ? agentWireError(error.code, error.retryable)
+            : agentWireError('AGENT_UNAVAILABLE', true);
+        await read.respond({ v: 1, id: read.id, ok: false, error: wireError });
+    }
+}
+async function listHostAgentSessions(gateway, caller, signal) {
+    const listed = await raceAgentSignal(gateway.sessions(caller), signal);
+    const sessions = readMiniAppAgentSessionList(listed.sessions);
+    if (!sessions)
+        throw agentClientError('AGENT_UNAVAILABLE', true);
+    return { sessions };
+}
+async function getHostAgentSession(gateway, caller, params, signal) {
+    const session = readMiniAppAgentSessionDetail(await raceAgentSignal(gateway.session(caller, params), signal));
+    if (!session)
+        throw agentClientError('AGENT_UNAVAILABLE', true);
+    return { session };
+}
+/**
+ * One `agent.observe`: progress frames only (no admission receipt, nothing the child must
+ * answer), then a `null` result once the subscription ended. Not dispatched work, so a quiesce
+ * never waits for it; a committed cutover aborts it.
+ */
+async function observeHostAgent(input, observe) {
+    const events = createAgentEventQueue({
+        maxFrameBytes: input.maxFrameBytes,
+        enqueueResponse: input.enqueueResponse,
+        onRetainedDrop: (event, reason) => reportObservedDrop(input, event, reason),
+    });
+    let open = true;
+    let notifications;
+    const onEvent = (event) => {
+        if (!open)
+            return;
+        const projected = copyAgentRunEvent(event, true);
+        if (!projected)
+            return;
+        notifications =
+            events.notify({ v: 1, id: observe.id, event: projected }, OBSERVED_RETAINED_EVENT_TYPES.has(projected.type)) ?? notifications;
+    };
+    let terminal;
+    try {
+        await observe.gateway.observe(processCaller(input.identity), observe.params, {
+            signal: observe.signal,
+            onEvent,
+        });
+        terminal = { v: 1, id: observe.id, ok: true, result: null };
+    }
+    catch (error) {
+        terminal = {
+            v: 1,
+            id: observe.id,
+            ok: false,
+            error: hostAgentWireError(error, observe.signal),
+        };
+    }
+    finally {
+        open = false;
+        await notifications;
+    }
+    if (events.dropped() > 0) {
+        input.logger?.warn({
+            pluginId: input.identity.pluginId,
+            processGeneration: input.identity.processGeneration,
+            droppedEvents: events.dropped(),
+        }, 'Mini App Agent observer dropped event frames');
+    }
+    await input.enqueueResponse(terminal);
+}
 async function followHostAgentTurn(input, turn) {
     const events = createAgentEventQueue({
         maxFrameBytes: input.maxFrameBytes,
@@ -468,6 +551,17 @@ async function followHostAgentTurn(input, turn) {
         }, 'Mini App Agent run dropped event frames');
     }
     await input.enqueueResponse(terminal);
+}
+/** The observer would miss this turn's start or end, so it is reported now. */
+function reportObservedDrop(input, event, reason) {
+    input.logger?.warn({
+        pluginId: input.identity.pluginId,
+        processGeneration: input.identity.processGeneration,
+        sessionId: event.sessionId,
+        ...('turnId' in event ? { turnId: event.turnId } : {}),
+        type: event.type,
+        reason,
+    }, 'Mini App Agent observer dropped a turn lifecycle event frame');
 }
 /**
  * A dropped interaction frame leaves the turn waiting on an ask the child never saw, so it is
@@ -510,10 +604,11 @@ function denyDroppedPermission(input, gateway, event, fields) {
     })());
 }
 /**
- * Per-run event notifier. Oversized, non-JSON or over-budget event frames are dropped and
- * counted; the terminal frame still settles the run. `retained` frames (an approval or a
- * questionnaire the child must answer) skip the budget, since dropping one stalls the turn;
- * if one cannot be sent at all, `onRetainedDrop` hears about it immediately.
+ * Per-request event notifier. Oversized, non-JSON or over-budget event frames are dropped and
+ * counted; a run's terminal frame still settles it. `retained` frames skip the budget: an
+ * approval or a questionnaire the child must answer (dropping one stalls the turn), and an
+ * observer's `turn.started` / `message.committed` / `turn.finished` (it has no per-turn result
+ * to fall back on). If one cannot be sent at all, `onRetainedDrop` hears about it immediately.
  */
 function createAgentEventQueue(input) {
     let queuedEvents = 0;
@@ -702,33 +797,11 @@ function projectAgentAgents(result) {
 function projectAgentCreate(result) {
     return { sessionId: result.sessionId };
 }
-function isRunStatus(value) {
-    return value === 'finished' || value === 'error' || value === 'aborted';
-}
 function isPendingQuestion(value) {
     return (isRecord(value) &&
         hasExactKeys(value, ['requestId', 'mode', 'request']) &&
         isBoundedIdentifier(value.requestId) &&
         isMiniAppAgentQuestionMode(value.mode) &&
         isQuestionnaireRequest(value.request));
-}
-/** Envelope check only; the step list is passed through as the Host chat renders it. */
-function isQuestionnaireRequest(value) {
-    return (isRecord(value) &&
-        value.schemaVersion === 2 &&
-        isBoundedIdentifier(value.id) &&
-        Array.isArray(value.steps));
-}
-function isOptional(value, key, check) {
-    return !(key in value) || check(value[key]);
-}
-function isResultError(value) {
-    return (isRecord(value) &&
-        hasExactKeys(value, ['code', 'message']) &&
-        typeof value.code === 'string' &&
-        typeof value.message === 'string');
-}
-function hasOptionalKeys(value, required, optional) {
-    return hasExactKeys(value, [...required, ...optional.filter((key) => key in value)]);
 }
 //# sourceMappingURL=host-connector-agent.js.map

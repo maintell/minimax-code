@@ -1,6 +1,6 @@
 {
   "name": "@mmx-agent/electron",
-  "version": "3.1.4",
+  "version": "3.1.6",
   "description": "MiniMax Agent Desktop Application",
   "author": "MiniMax",
   "private": true,
@@ -29,6 +29,7 @@
     "@mavis/agent-tools": "file:./vendor/@mavis/agent-tools",
     "@mavis/background-task": "file:./vendor/@mavis/background-task",
     "@mavis/browser-core": "file:./vendor/@mavis/browser-core",
+    "@mavis/computer-use": "file:./vendor/@mavis/computer-use",
     "@mavis/config": "file:./vendor/@mavis/config",
     "@mavis/context-manager": "file:./vendor/@mavis/context-manager",
     "@mavis/conversation-contract": "file:./vendor/@mavis/conversation-contract",

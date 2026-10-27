@@ -46,9 +46,13 @@ export class ConversationActionProjectionService {
     }
 }
 function projectActions(messages, latestAssistantSettled, planActive) {
-    if (planActive)
-        return projectPlanForkAction(messages, latestAssistantSettled);
+    return planActive
+        ? projectPlanForkAction(messages, latestAssistantSettled)
+        : projectConversationActions(messages);
+}
+function projectConversationActions(messages) {
     const result = new Map();
+    const midTurnUserMessageIds = findMidTurnUserMessageIds(messages);
     let nextBoundary;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
         const message = messages[index];
@@ -56,9 +60,13 @@ function projectActions(messages, latestAssistantSettled, planActive) {
             continue;
         const messageId = typeof message.msg_id === 'string' ? message.msg_id : undefined;
         if (isCommittedUserMessage(message, messageId)) {
-            if (shouldProjectRewind(message))
+            // A row inserted into a running Turn is not a Turn boundary: the Assistant before it is
+            // still mid-Turn, so it must not expose Fork.
+            const midTurn = midTurnUserMessageIds.has(messageId);
+            if (shouldProjectUserRewind(message, midTurn))
                 result.set(messageId, { rewind: true });
-            nextBoundary = 'user';
+            if (!midTurn)
+                nextBoundary = 'user';
             continue;
         }
         if (message.role !== 'assistant')
@@ -78,6 +86,34 @@ function projectPlanForkAction(messages, latestAssistantSettled) {
     if (latest?.role !== 'assistant' || !messageId || isUnsettled(latest))
         return new Map();
     return new Map([[messageId, { fork: true }]]);
+}
+/**
+ * Committed user rows that joined a Turn after one of its Assistant rows, e.g. a Background
+ * completion notice, an async Questionnaire answer or TUI / ACP steering consumed by the running
+ * Turn. Rows without a Turn identity keep the legacy boundary behavior.
+ */
+function findMidTurnUserMessageIds(messages) {
+    const turnsWithAssistant = new Set();
+    const result = new Set();
+    for (const message of messages) {
+        if (isSpecial(message))
+            continue;
+        const turnId = displayTurnId(message);
+        if (!turnId)
+            continue;
+        if (message.role === 'assistant') {
+            turnsWithAssistant.add(turnId);
+            continue;
+        }
+        if (isCommittedUserMessage(message, message.msg_id) && turnsWithAssistant.has(turnId)) {
+            result.add(message.msg_id);
+        }
+    }
+    return result;
+}
+function displayTurnId(message) {
+    const turnId = message.turnId ?? message.meta?.turnId;
+    return typeof turnId === 'string' && turnId.length > 0 ? turnId : undefined;
 }
 function isCommittedUserMessage(message, messageId) {
     return message.role === 'user' && messageId !== undefined && isUserMessageId(messageId);
@@ -100,6 +136,28 @@ function isUnsettled(message) {
 function shouldProjectRewind(message) {
     return (!isUnsettled(message) &&
         (!isQuestionnaireResponseInput(message) || isRewindableQuestionnaireResponseInput(message)));
+}
+/**
+ * Display sources the runtime writes on its own behalf: Background completion notices, Cron runs,
+ * Goal continuations, peer-Agent sends and internal prompts. Any other row that joins a running
+ * Turn, such as TUI / ACP / API steering stored as `source: 'api'`, is the user's own input.
+ */
+const MACHINE_INSERTION_SOURCES = new Set([
+    'background-task',
+    'cron',
+    'thread-goal',
+    'communication',
+    'system',
+    'team-engine',
+]);
+/** A machine insertion into a running Turn gets no actions; the user's own input keeps Rewind. */
+function shouldProjectUserRewind(message, midTurn) {
+    if (midTurn && isMachineInsertion(message))
+        return false;
+    return shouldProjectRewind(message);
+}
+function isMachineInsertion(message) {
+    return typeof message.source === 'string' && MACHINE_INSERTION_SOURCES.has(message.source);
 }
 function isInvalidForkAssistant(message) {
     return message.source === 'optimistic' || message.source === 'error';

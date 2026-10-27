@@ -7,38 +7,16 @@ import { LocalModelCache } from '../model-provider/model-cache.js';
 import { LocalModelProviderService } from '../model-provider/service.js';
 import { ModelConnectionTester } from '../model-provider/test-connection.js';
 import { ModelDiscoveryClient } from '../model-provider/discover-models.js';
-import { isThreadGoalEnabled } from '../thread-goal/gate.js';
 import { createSessionMutationEventPublisher } from '../http/desktop-session-mutation-events.js';
-import { isReadOnlyLegacySession } from './host-legacy-helpers.js';
 import { logger } from '../common/logger.js';
 import { fetchOfficialModelConfig, OfficialModelConfigFetchError, OfficialModelConfigSync, resolveOfficialModelConfigUrl, } from '../model-provider/official-model-config-sync.js';
-export function buildHostDesktopHandler(host, threadGoal, legacyMigrator) {
-    return buildDesktopServiceHandler(host, {
-        store: threadGoal.store,
-        createGoal: (input, options) => threadGoal.createGoal(input, options),
-        patchGoal: (sessionId, patch) => threadGoal.patchGoal(sessionId, patch),
-        pauseGoalByUser: (sessionId) => threadGoal.pauseGoalByUser(sessionId),
-        deleteGoal: (sessionId) => threadGoal.deleteGoal(sessionId),
-        dismissGoal: (sessionId, goalId) => threadGoal.dismissGoal(sessionId, goalId),
-        isReadOnlyLegacySession: async (sessionId) => {
-            const session = await host.getSessionById(sessionId);
-            return isReadOnlyLegacySession(legacyMigrator, session ?? sessionId);
-        },
-    });
-}
 /**
- * Build the DesktopService request handler with cron + goal dependencies
+ * Build the DesktopService request handler with cron dependencies
  * injected, so generated DesktopService routes resolve against real
  * local-runtime engines instead of the dependency-free echo handler.
  * Skill methods are retired here and served by the v2 generated front door.
  */
-export function buildDesktopServiceHandler(host, goalDeps) {
-    host.threadGoal.bindConfigGetter(host.configGetter);
-    const gatedGoalDeps = {
-        ...goalDeps,
-        getBySessionForResponse: (sessionId, persisted) => host.threadGoal.getGoalForResponse(sessionId, persisted),
-        isEnabled: () => goalDeps.isEnabled?.() ?? isThreadGoalEnabled(host.configGetter),
-    };
+export function buildDesktopServiceHandler(host) {
     const setDefaultModel = async (modelKey, variant) => {
         await host.updateConfig({
             defaultModel: modelKey,
@@ -111,7 +89,6 @@ export function buildDesktopServiceHandler(host, goalDeps) {
             agentExists: (agentName) => host.agentRuntimePort.agentExists(agentName),
             nowMs: host.nowMs,
         },
-        goal: gatedGoalDeps,
         skills: {
             resolveSessionScope: async (sessionId) => {
                 const session = await host.getSessionById(sessionId);

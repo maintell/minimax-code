@@ -1,4 +1,4 @@
-import { QuestionnairePurpose as DesktopQuestionnairePurpose, QuestionnaireSelectionMode, QuestionnaireStatus, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { QuestionnairePurpose as DesktopQuestionnairePurpose, QuestionnaireReopenReason, QuestionnaireSelectionMode, QuestionnaireStatus, } from '@mavis/thrift-gen/generated/desktop-service/types';
 import { AppError, NotImplementedError } from '../errors.js';
 import { QuestionnaireControllerBase } from '../generated/questionnaire-controller-base.gen.js';
 /** Generated DesktopService adapter over Runtime's process-local questionnaire application. */
@@ -47,6 +47,7 @@ export class QuestionnaireController extends QuestionnaireControllerBase {
                 sessionId: result.sessionId,
                 ...(result.agentName ? { agentName: result.agentName } : {}),
                 answeredAt: result.answeredAt,
+                ...(result.state ? { state: toDesktopStateView(result.state) } : {}),
             };
         });
     }
@@ -66,8 +67,19 @@ export class QuestionnaireController extends QuestionnaireControllerBase {
     async getPendingQuestionnaire(_ctx, req) {
         const facade = this.requireFacade('getPendingQuestionnaire');
         return this.mapErrors(async () => {
-            const request = await facade.getPending({ agentName: req.name, sessionId: req.sessionId });
-            return request ? { request: toDesktopRequestView(request) } : {};
+            const scope = { agentName: req.name, sessionId: req.sessionId };
+            let unanswered;
+            if (req.includeUnanswered) {
+                if (!facade.listUnanswered) {
+                    throw new NotImplementedError('getPendingQuestionnaire.includeUnanswered');
+                }
+                unanswered = await facade.listUnanswered(scope);
+            }
+            const request = await facade.getPending(scope);
+            return {
+                ...(request ? { request: toDesktopRequestView(request) } : {}),
+                ...(unanswered ? { unansweredRequests: unanswered.map(toDesktopRequestView) } : {}),
+            };
         });
     }
     async getQuestionnaire(_ctx, req) {
@@ -131,6 +143,7 @@ function toSharedToolInput(input) {
     return {
         ...(input.title ? { title: input.title } : {}),
         ...(input.mode ? { mode: input.mode } : {}),
+        ...(input.async !== undefined ? { async: input.async } : {}),
         ...(input.requiresExplicitResponse !== undefined
             ? { requiresExplicitResponse: input.requiresExplicitResponse }
             : {}),
@@ -171,6 +184,7 @@ function toSharedReplyAnswer(answer) {
         selectedOther: answer.selectedOther === true,
         ...(answer.otherText ? { otherText: answer.otherText } : {}),
         ...(answer.skipped === true ? { skipped: true } : {}),
+        ...(answer.contextImages?.length ? { contextImages: answer.contextImages } : {}),
     };
 }
 function toDesktopQuestionnaireResponse(record) {
@@ -192,8 +206,32 @@ function toDesktopRequestView(request) {
         steps: request.steps.map(toDesktopStep),
         mode: request.mode ?? 'questionnaire',
     };
-    Object.assign(view, toDesktopRequestMetadata(request));
+    Object.assign(view, toDesktopRequestMetadata(request), toDesktopV2Metadata(request), toDesktopReopenMetadata(request));
     return view;
+}
+function toDesktopV2Metadata(request) {
+    return {
+        ...(request.responseMode ? { responseMode: request.responseMode } : {}),
+        ...(request.countdownSeconds !== undefined
+            ? { countdownSeconds: request.countdownSeconds }
+            : {}),
+        ...(request.syncWaiting !== undefined ? { syncWaiting: request.syncWaiting } : {}),
+        ...(request.originTurnRunning !== undefined
+            ? { originTurnRunning: request.originTurnRunning }
+            : {}),
+        ...(request.answeredAt !== undefined ? { answeredAt: request.answeredAt } : {}),
+        ...(request.injectedAt !== undefined ? { injectedAt: request.injectedAt } : {}),
+    };
+}
+function toDesktopStateView(state) {
+    return {
+        requestId: state.requestId,
+        status: toDesktopStatus(state.status),
+        ...(state.responseMode ? { responseMode: state.responseMode } : {}),
+        ...(state.syncWaiting !== undefined ? { syncWaiting: state.syncWaiting } : {}),
+        ...(state.answeredAt !== undefined ? { answeredAt: state.answeredAt } : {}),
+        ...(state.injectedAt !== undefined ? { injectedAt: state.injectedAt } : {}),
+    };
 }
 function toDesktopRequestMetadata(request) {
     const metadata = {};
@@ -215,6 +253,26 @@ function toDesktopRequestMetadata(request) {
     if (request.modePayload)
         metadata.modePayload = toDesktopModePayload(request.modePayload);
     return metadata;
+}
+function toDesktopReopenMetadata(request) {
+    return {
+        ...(request.reopenReason === 'content_recall'
+            ? { reopenReason: QuestionnaireReopenReason.ContentRecall }
+            : {}),
+        ...(request.prefillAnswers
+            ? { prefillAnswers: request.prefillAnswers.map(toDesktopReplyAnswer) }
+            : {}),
+    };
+}
+function toDesktopReplyAnswer(answer) {
+    return {
+        stepId: answer.stepId,
+        selectedOptionIds: [...answer.selectedOptionIds],
+        selectedOther: answer.selectedOther,
+        ...(answer.otherText !== undefined ? { otherText: answer.otherText } : {}),
+        ...(answer.skipped === true ? { skipped: true } : {}),
+        ...(answer.contextImages?.length ? { contextImages: answer.contextImages } : {}),
+    };
 }
 function toDesktopModePayload(payload) {
     const view = {};

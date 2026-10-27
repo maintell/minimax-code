@@ -74,6 +74,7 @@ export const initializeApplications = (options) => {
         ...(options.metrics ? { metrics: options.metrics } : {}),
     });
     const query = new SessionQueryApplication({
+        backgroundTaskWait: options.backgroundTaskWait,
         cloudReader: options.cloudSessionReader,
         service: options.sessionSystem.session.query,
         sideChats: options.sessionSystem.sideChats,
@@ -128,6 +129,7 @@ export const initializeApplications = (options) => {
         publishGlobalEvent: options.publishGlobalEvent,
     });
     return {
+        backgroundTask: options.backgroundTask,
         pin,
         session: { query, content, lifecycle, root, diff, conversationMutation, handoff, sideChat },
         queue,

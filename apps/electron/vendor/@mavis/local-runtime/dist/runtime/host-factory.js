@@ -5,7 +5,7 @@ import { logger } from '../common/logger.js';
 import { LocalEvalReporterFactory } from '../eval/reporter-factory.js';
 import { createDesktopErrorReporter, createLLMFailureReportHook, } from '../error-reporting/index.js';
 import { LocalSessionController } from '../sessions/controller.js';
-import { createLocalRuntimeTelemetrySink, createMatrixToolLogger, createObservabilityEventSink, createThreadGoalObservabilityEventSink, JsonlFileObservabilitySink, } from '../observability/index.js';
+import { createLocalRuntimeTelemetrySink, createMatrixToolLogger, createObservabilityEventSink, JsonlFileObservabilitySink, } from '../observability/index.js';
 import { formatV2TimestampParts, resolveV2EventDir } from '../persistence/layout/v2-paths.js';
 import { SqliteLocalMessageStore, SqliteLocalQueueStore, SqliteLocalSessionStore, } from '../persistence/sqlite-persistence.js';
 import { FileSessionLedgerStore } from '../sessions/ledger/index.js';
@@ -128,6 +128,7 @@ export function createLocalRuntimeHost(options) {
         deferQuestionnaireRecovery: options.deferQuestionnaireRecovery,
         workspaceIndexingEnabled: options.workspaceIndexingEnabled,
         composerSendBehavior: options.composerSendBehavior,
+        createBackgroundTaskRuntime: options.createBackgroundTaskRuntime,
         runLegacyImCredentialMigration: options.runLegacyImCredentialMigration,
         runtimeOwnerKind: options.runtimeOwnerKind,
         runtimeStartupToken: options.runtimeStartupToken,
@@ -154,7 +155,6 @@ export function createLocalRuntimeHost(options) {
         legacyOpencodeEnabled,
         telemetry,
         ...(evalReporterFactory ? { evalReporterFactory } : {}),
-        threadGoalRuntimeEventSink: createThreadGoalObservabilityEventSink(observability, evalReporterFactory),
         matrixLogger: createMatrixToolLogger(observability),
         nowMs,
         metricsReporter,

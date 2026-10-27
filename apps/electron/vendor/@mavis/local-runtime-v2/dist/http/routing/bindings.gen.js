@@ -4,6 +4,11 @@ import { defineRoute, defineSseRoute } from './define-route.js';
 import * as contracts from './contracts.gen.js';
 export function makeBindings(c) {
     return [
+        defineRoute(contracts.LIST_BACKGROUND_TASKS, (ctx, req) => c.backgroundTask.listBackgroundTasks(ctx, req)),
+        defineRoute(contracts.GET_BACKGROUND_TASK, (ctx, req) => c.backgroundTask.getBackgroundTask(ctx, req)),
+        defineRoute(contracts.READ_BACKGROUND_TASK_OUTPUT, (ctx, req) => c.backgroundTask.readBackgroundTaskOutput(ctx, req)),
+        defineRoute(contracts.STOP_BACKGROUND_TASK, (ctx, req) => c.backgroundTask.stopBackgroundTask(ctx, req)),
+        defineRoute(contracts.DELETE_BACKGROUND_TASK, (ctx, req) => c.backgroundTask.deleteBackgroundTask(ctx, req)),
         defineRoute(contracts.PING, (ctx, req) => c.demo.ping(ctx, req)),
         defineRoute(contracts.GET_ECHO, (ctx, req) => c.demo.getEcho(ctx, req)),
         defineRoute(contracts.GET_HEADER_ECHO, (ctx, req) => c.demo.getHeaderEcho(ctx, req)),
@@ -210,7 +215,10 @@ export function makeBindings(c) {
         defineRoute(contracts.EDIT_SESSION_MESSAGE, (ctx, req) => c.session.editSessionMessage(ctx, req)),
         defineRoute(contracts.LIST_SESSION_INPUT_SUMMARIES, (ctx, req) => c.session.listSessionInputSummaries(ctx, req)),
         defineRoute(contracts.INSPECT_TURN_CONTINUATION, (ctx, req) => c.session.inspectTurnContinuation(ctx, req)),
+        defineRoute(contracts.GET_SESSION_ACTIVITY, (ctx, req) => c.session.getSessionActivity(ctx, req)),
         defineRoute(contracts.ABORT_SESSION, (ctx, req) => c.session.abortSession(ctx, req)),
+        defineRoute(contracts.CANCEL_PROMPT_SUGGESTION, (ctx, req) => c.session.cancelPromptSuggestion(ctx, req)),
+        defineRoute(contracts.GET_PROMPT_SUGGESTION, (ctx, req) => c.session.getPromptSuggestion(ctx, req)),
         defineRoute(contracts.STEER_SESSION, (ctx, req) => c.session.steerSession(ctx, req)),
         defineRoute(contracts.LIST_QUEUE_MESSAGES, (ctx, req) => c.session.listQueueMessages(ctx, req)),
         defineRoute(contracts.GET_QUEUE_ITEM, (ctx, req) => c.session.getQueueItem(ctx, req)),

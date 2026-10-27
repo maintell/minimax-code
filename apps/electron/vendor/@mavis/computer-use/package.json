@@ -1,0 +1,40 @@
+{
+  "name": "@mavis/computer-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./development": {
+      "import": "./dist/development-component.js",
+      "default": "./dist/development-component.js"
+    },
+    "./mapping": {
+      "import": "./dist/mapping.js",
+      "default": "./dist/mapping.js"
+    },
+    "./cua-protocol": {
+      "import": "./dist/cua-protocol.js",
+      "default": "./dist/cua-protocol.js"
+    },
+    "./cua-driver-runtime": {
+      "import": "./dist/cua-driver-runtime.js",
+      "default": "./dist/cua-driver-runtime.js"
+    },
+    "./cua-launch-observation": {
+      "import": "./dist/cua-launch-observation.js",
+      "default": "./dist/cua-launch-observation.js"
+    },
+    "./cua-logging": {
+      "import": "./dist/cua-logging.js",
+      "default": "./dist/cua-logging.js"
+    }
+  },
+  "optionalDependencies": {
+    "@trycua/cua-driver": "file:../../@trycua/cua-driver"
+  }
+}

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { getConfig, getConfigPath, minimaxApiModels, parseConfigText, resetConfig, serializeConfigPreservingComments, } from '@mavis/config';
 import lockfile from 'proper-lockfile';
 import { LocalConfigValidationError, readLocalRawConfig } from './raw-config.js';
-import { assertMutableConfigField, assertSafeConfigRecord, DANGEROUS_CONFIG_PATH_SEGMENTS, isPlainRecord, validateLocalConfigValue, validateReviewConfigRecord, validateSubagentConfigRecord, } from './update-policy.js';
+import { ASK_USER_POLICY_FIELDS, assertMutableConfigField, assertSafeConfigRecord, DANGEROUS_CONFIG_PATH_SEGMENTS, isPlainRecord, validateAskUserConfigRecord, validateLocalConfigValue, validateReviewConfigRecord, validateSubagentConfigRecord, } from './update-policy.js';
 const LOCAL_CONFIG_WRITE_ERROR_MESSAGE = 'Local runtime failed to update config file';
 const LOCAL_CONFIG_FILE_MODE = 0o600;
 class LocalConfigWriteError extends Error {
@@ -223,11 +223,14 @@ function applyLocalConfigUpdate(raw, body) {
             return;
         }
         if (Object.prototype.hasOwnProperty.call(body, 'put')) {
+            // put 会把对象深合并到目标上；对标量叶子字段做 put 会绕过取值校验，一律拒绝。
             if (field === 'review.mode' ||
                 field === 'review.turnDiffCard' ||
                 field === 'permission.nativeDelete' ||
                 field === 'worktreeRefreshBeforeCreate' ||
-                field === 'subagent.maxConcurrentPerSession') {
+                field === 'promptSuggestion.enabled' ||
+                field === 'subagent.maxConcurrentPerSession' ||
+                ASK_USER_POLICY_FIELDS.has(field)) {
                 throw new LocalConfigValidationError(`Unsupported config update operation for ${field}`);
             }
             const [target, key] = resolvePath(raw, field);
@@ -236,9 +239,11 @@ function applyLocalConfigUpdate(raw, body) {
             assertSafeConfigRecord(patch);
             const validatedPatch = field === 'review'
                 ? validateReviewConfigRecord(patch)
-                : field === 'subagent'
-                    ? validateSubagentConfigRecord(patch)
-                    : patch;
+                : field === 'askUser'
+                    ? validateAskUserConfigRecord(patch)
+                    : field === 'subagent'
+                        ? validateSubagentConfigRecord(patch)
+                        : patch;
             target[key] = deepMergeRecord(current, validatedPatch);
             return;
         }
@@ -259,7 +264,16 @@ function applyLocalConfigSet(raw, field, value) {
         delete target[key];
         return;
     }
-    target[key] = validateLocalConfigValue(field, value);
+    const validated = validateLocalConfigValue(field, value);
+    if (field === 'askUser' && isPlainRecord(validated)) {
+        // Whole-object writes may only carry the three policy fields, so replacing
+        // the object would silently drop keys the user keeps in config.yaml by
+        // hand (notably `enabled: false`, which hides the ask_user tool). Merge
+        // instead; the leaf values are already validated above.
+        target[key] = { ...(isPlainRecord(target[key]) ? target[key] : {}), ...validated };
+        return;
+    }
+    target[key] = validated;
 }
 function deepMergeRecord(base, patch) {
     const out = { ...base };

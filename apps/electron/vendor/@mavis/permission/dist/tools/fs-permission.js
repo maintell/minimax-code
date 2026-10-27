@@ -600,31 +600,23 @@ function resolveExistingPath(filePath) {
  * Runtime state is private; only designated agent assets get implicit read access.
  * Mini App agent workspaces live in the active agent's `agents/<agentName>/miniapps`.
  */
-function isProtectedRuntimeRead(filePath, context, recursive) {
-    const within = (target, root) => {
-        const relative = path.relative(root, target);
-        return (relative === '' ||
-            (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)));
-    };
-    const roots = [context.dataDir, path.join(context.homeDir ?? os.homedir(), '.minimax')];
+function isProtectedRuntimeRead(filePath, context, recursive, scope) {
     const canonicalPath = resolveExistingPath(filePath);
-    for (const root of roots) {
-        if (!root)
-            continue;
-        const resolvedRoot = path.resolve(root);
-        const canonicalRoot = resolveExistingPath(resolvedRoot);
-        if (recursive && within(canonicalRoot, canonicalPath))
+    for (const { resolvedRoot, canonicalRoot } of scope.roots()) {
+        if (recursive && isPathWithin(canonicalRoot, canonicalPath))
             return true;
-        if (!within(filePath, resolvedRoot) && !within(canonicalPath, canonicalRoot))
+        if (!isPathWithin(filePath, resolvedRoot) && !isPathWithin(canonicalPath, canonicalRoot))
             continue;
         // Do not resolve the asset subdirectory itself: a skills/ symlink pointing
         // at credentials must not turn its destination into a trusted asset root.
-        const readableAsset = within(canonicalPath, path.join(canonicalRoot, 'skills')) ||
-            within(canonicalPath, path.join(canonicalRoot, '.builtin-skills')) ||
+        const readableAsset = isPathWithin(canonicalPath, path.join(canonicalRoot, 'skills')) ||
+            isPathWithin(canonicalPath, path.join(canonicalRoot, '.builtin-skills')) ||
             (context.agentName != null &&
-                (within(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'workspace')) ||
-                    within(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'skills')) ||
-                    within(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'miniapps')))) ||
+                (isPathWithin(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'workspace')) ||
+                    isPathWithin(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'skills')) ||
+                    isPathWithin(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'miniapps')))) ||
+            matchesSessionOwnedReadableRoot(canonicalPath, scope) ||
+            matchesTrustedExactWriteTarget(canonicalPath, scope) ||
             isInternalWhitelistedPath(canonicalPath, {
                 ...context,
                 dataDir: canonicalRoot,
@@ -633,6 +625,110 @@ function isProtectedRuntimeRead(filePath, context, recursive) {
             return true;
     }
     return false;
+}
+/** The private runtime roots (`dataDir` and `~/.minimax`), lexical and canonical. */
+function protectedRuntimeRoots(context) {
+    const roots = [context.dataDir, path.join(context.homeDir ?? os.homedir(), '.minimax')];
+    return roots.flatMap((root) => {
+        if (!root)
+            return [];
+        const resolvedRoot = path.resolve(root);
+        return [{ resolvedRoot, canonicalRoot: resolveExistingPath(resolvedRoot) }];
+    });
+}
+/** Computes `compute()` on first use and returns the same value afterwards. */
+function lazy(compute) {
+    let computed = false;
+    let value;
+    return () => {
+        if (!computed) {
+            value = compute();
+            computed = true;
+        }
+        return value;
+    };
+}
+function createRuntimeReadScope(context) {
+    const roots = lazy(() => protectedRuntimeRoots(context));
+    const trusted = (paths) => (paths ?? []).flatMap((root) => {
+        const canonical = trustedSessionOwnedRoot(root, roots());
+        return canonical === undefined ? [] : [canonical];
+    });
+    return {
+        roots,
+        ownedRoots: lazy(() => trusted(context.sessionOwnedReadablePaths)),
+        exactTargets: lazy(() => trusted(context.trustedExactWritePaths)),
+    };
+}
+/** Whether a path (lexically or canonically) lies inside a private runtime root. */
+function isInsideRuntimeRoot(filePath, canonicalPath, scope) {
+    return scope
+        .roots()
+        .some(({ resolvedRoot, canonicalRoot }) => isPathWithin(filePath, resolvedRoot) || isPathWithin(canonicalPath, canonicalRoot));
+}
+/**
+ * The active Session's own files that the runtime hands the Agent (its
+ * workspace, attachments, recoverable artifacts) live inside the private
+ * runtime tree. The host injects the exact directories or files the Session
+ * owns so that reading them stays possible.
+ *
+ * An injected root only counts when it is strictly inside a private runtime
+ * root, reached without any symlink below that root. So the grant can never
+ * cover the runtime root itself, anything outside it, or — through a
+ * swapped-in symlink — another part of the tree such as `auth/`. The match
+ * runs on canonical paths, so a symlink inside the owned directory that
+ * points elsewhere does not become readable through it either.
+ */
+function matchesSessionOwnedReadableRoot(canonicalPath, scope) {
+    return scope.ownedRoots().some((root) => isPathWithin(canonicalPath, root));
+}
+/**
+ * A turn-scoped exact write target (e.g. the Plan Mode document under the
+ * Session's own artifacts) is issued by the trusted execution owner. Being
+ * allowed to write that exact file implies reading it back; otherwise the
+ * Agent is told to keep a file up to date that it cannot read.
+ *
+ * Exact file only, under the same root invariants as Session-owned roots: a
+ * target reached through a symlink below the private runtime root is ignored,
+ * so swapping the file for a link to `auth/` cannot unlock a read.
+ */
+function matchesTrustedExactWriteTarget(canonicalPath, scope) {
+    return scope.exactTargets().some((target) => isSameResolvedPath(canonicalPath, target));
+}
+/**
+ * Canonical form of an injected Session-owned root, or `undefined` when the
+ * root is not symlink-free and strictly inside a private runtime root. A root
+ * may be a directory or an exact file (e.g. one attachment asset).
+ */
+function trustedSessionOwnedRoot(root, protectedRoots) {
+    if (!root)
+        return undefined;
+    const resolved = path.resolve(root);
+    const canonical = resolveExistingPath(resolved);
+    for (const { resolvedRoot, canonicalRoot } of protectedRoots) {
+        for (const [lexicalBase, canonicalBase] of [
+            [resolvedRoot, canonicalRoot],
+            [canonicalRoot, canonicalRoot],
+        ]) {
+            const relative = path.relative(lexicalBase, resolved);
+            if (relative === '' || !isPathWithin(resolved, lexicalBase))
+                continue;
+            // Canonicalizing must not move the root: any symlink between the private
+            // runtime root and the injected root would make these differ. Compare by
+            // platform path identity: on Windows `path.relative` matches
+            // case-insensitively but keeps the injected casing, so a plain `===`
+            // silently dropped a grant whose drive or user-folder casing differed.
+            if (isSameResolvedPath(canonical, path.join(canonicalBase, relative)))
+                return canonical;
+        }
+    }
+    return undefined;
+}
+/** True when `target` is `root` itself or lives inside it. */
+function isPathWithin(target, root) {
+    const relative = path.relative(root, target);
+    return (relative === '' ||
+        (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)));
 }
 /**
  * Check if a path is in the internal whitelist (always writable by the system).
@@ -654,8 +750,9 @@ export function isInternalWhitelistedPath(filePath, context) {
     if (resolved === path.join(normalizedDataDir, 'permission.json')) {
         return true;
     }
-    // MEMORY.md at any level within data dir
-    if (resolved.endsWith('MEMORY.md') && resolved.startsWith(normalizedDataDir)) {
+    // MEMORY.md at any level within data dir. Separator-aware: a sibling
+    // profile such as `~/.minimax-dev/.../MEMORY.md` is not inside `~/.minimax`.
+    if (path.basename(resolved) === 'MEMORY.md' && isPathWithin(resolved, normalizedDataDir)) {
         return true;
     }
     // memory/ directory within data dir
@@ -715,11 +812,65 @@ export function matchPathRule(filePath, ruleContent) {
     return resolved === path.resolve(ruleContent);
 }
 /**
+ * Checks that are never skipped, whatever the boundary: system secrets,
+ * credential / private-key files, `.env` files (excluding `.env.example`
+ * etc.) and sensitive git metadata. `.git/config` can carry an HTTPS bearer
+ * token (`[remote] url = https://USER:PAT@host/...`), so even a read inside
+ * the working directory asks.
+ */
+function criticalSafetyReason(target) {
+    // Critical: never skipped — system sensitive paths.
+    if (isSystemSensitivePath(target)) {
+        return {
+            type: 'safetyCheck',
+            description: `System secret access requires LLM review and explicit approval if the LLM cannot allow it. Path: ${target}`,
+            category: 'systemSensitivePath',
+            classifierApprovable: true,
+        };
+    }
+    // Critical: never skipped — credential / private-key files.
+    if (isCredentialFile(target)) {
+        return {
+            type: 'safetyCheck',
+            description: `Credential or private-key access requires LLM review and explicit approval if the LLM cannot allow it. Path: ${target}`,
+            category: 'credentialFile',
+            classifierApprovable: true,
+        };
+    }
+    // Critical: never skipped — .env files (excluding .env.example etc.).
+    if (isEnvFile(target)) {
+        return {
+            type: 'safetyCheck',
+            description: `Environment file may contain secrets. Path: ${target}`,
+            category: 'envFile',
+            classifierApprovable: true,
+        };
+    }
+    // Critical: never skipped — sensitive git metadata (.git/config,
+    // .git/credentials, .git/modules/<x>/credentials etc.). The
+    // skipDangerousCheck would have auto-allowed reads of `.git/config`
+    // inside the workdir — but that file can contain HTTPS bearer tokens
+    // (e.g. a `[remote] url = https://USER:PAT@host/...` written by
+    // `git config credential.helper`).
+    if (isInDangerousDirectory(target) && isSensitiveGitFile(target)) {
+        return {
+            type: 'safetyCheck',
+            description: `Sensitive git metadata may contain credentials or remotes with tokens. Path: ${target}`,
+            category: path.basename(target).toLowerCase() === 'credentials'
+                ? 'credentialFile'
+                : 'gitSensitiveFile',
+            classifierApprovable: true,
+        };
+    }
+    return undefined;
+}
+/**
  * Check if a file path operation is allowed.
  *
  * Step 1: Deny rule matching
  * Step 2: Internal path whitelist
  * Step 3: Safety check (DANGEROUS_FILES + DANGEROUS_DIRECTORIES, write-only)
+ * Step 3.4: Host-injected Session-owned readable paths (read-only)
  * Step 3.5: Temp directory read auto-allow
  * Step 3.6: Well-known home subdirectory reads auto-allow
  * Step 4: Working directory boundary check
@@ -780,14 +931,21 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
     // Runtime state can contain credentials and session data. Check before ALL
     // implicit allowances, including workspace/temp and internal aliases. A grep
     // of the data root must be reviewed just like a direct config.yaml read.
+    //
+    // Paths the runtime itself hands the Agent (the Session's workspace,
+    // attachments, recoverable artifacts) are not private: the host injects them
+    // as `sessionOwnedReadablePaths`, see `isProtectedRuntimeRead`. The category
+    // names what this is — private runtime data — so logs and telemetry do not
+    // mistake a missing runtime grant for a credential-file access.
+    const runtimeReadScope = createRuntimeReadScope(context);
     if (READ_ONLY_TOOLS.has(toolName) &&
-        isProtectedRuntimeRead(resolved, context, toolName === 'grep')) {
+        isProtectedRuntimeRead(resolved, context, toolName === 'grep', runtimeReadScope)) {
         return {
             allowed: false,
             reason: {
                 type: 'safetyCheck',
                 description: `Private runtime data access requires approval. Path: ${resolved}`,
-                category: 'credentialFile',
+                category: 'privateRuntimeData',
                 classifierApprovable: false,
             },
         };
@@ -819,61 +977,11 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
         (context.allowedWorkingPaths != null &&
             pathInAllowedWorkingPath(resolved, context.allowedWorkingPaths));
     const skipDangerousCheck = isReadOnlyTool && isInWorkDir;
-    // Critical: never skipped — system sensitive paths.
-    if (isSystemSensitivePath(resolved)) {
-        return {
-            allowed: false,
-            reason: {
-                type: 'safetyCheck',
-                description: `System secret access requires LLM review and explicit approval if the LLM cannot allow it. Path: ${resolved}`,
-                category: 'systemSensitivePath',
-                classifierApprovable: true,
-            },
-        };
-    }
-    // Critical: never skipped — credential / private-key files.
-    if (isCredentialFile(resolved)) {
-        return {
-            allowed: false,
-            reason: {
-                type: 'safetyCheck',
-                description: `Credential or private-key access requires LLM review and explicit approval if the LLM cannot allow it. Path: ${resolved}`,
-                category: 'credentialFile',
-                classifierApprovable: true,
-            },
-        };
-    }
-    // Critical: never skipped — .env files (excluding .env.example etc.).
-    if (isEnvFile(resolved)) {
-        return {
-            allowed: false,
-            reason: {
-                type: 'safetyCheck',
-                description: `Environment file may contain secrets. Path: ${resolved}`,
-                category: 'envFile',
-                classifierApprovable: true,
-            },
-        };
-    }
-    // Critical: never skipped — sensitive git metadata (.git/config,
-    // .git/credentials, .git/modules/<x>/credentials etc.). The
-    // skipDangerousCheck would have auto-allowed reads of `.git/config`
-    // inside the workdir — but that file can contain HTTPS bearer tokens
-    // (e.g. a `[remote] url = https://USER:PAT@host/...` written by
-    // `git config credential.helper`).
-    if (isInDangerousDirectory(resolved) && isSensitiveGitFile(resolved)) {
-        return {
-            allowed: false,
-            reason: {
-                type: 'safetyCheck',
-                description: `Sensitive git metadata may contain credentials or remotes with tokens. Path: ${resolved}`,
-                category: path.basename(resolved).toLowerCase() === 'credentials'
-                    ? 'credentialFile'
-                    : 'gitSensitiveFile',
-                classifierApprovable: true,
-            },
-        };
-    }
+    // Critical: never skipped — system secrets, credential / private-key files,
+    // .env files and sensitive git metadata (see `criticalSafetyReason`).
+    const criticalReason = criticalSafetyReason(resolved);
+    if (criticalReason)
+        return { allowed: false, reason: criticalReason };
     if (!skipDangerousCheck && isDangerousFile(resolved)) {
         return {
             allowed: false,
@@ -904,6 +1012,39 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
             allowed: true,
             reason: { type: 'trustedExactWrite', path: resolved },
         };
+    }
+    // Step 3.4: Session-owned readable paths.
+    //
+    // The runtime externalizes oversized tool results into the active Session's
+    // own artifact directory and hands the Agent that path, so the Agent must be
+    // able to read the artifact back. Those artifacts live under the private
+    // runtime tree, which the private-runtime check refuses to read; the runtime
+    // injects the exact directory it owns, and reading inside it is allowed here.
+    //
+    // Read-only, and only for the Session's own directory: another Session's
+    // artifacts, configuration and credentials are not in the grant (see
+    // `trustedSessionOwnedRoot` for the root invariants). This step runs after
+    // the critical safety checks above, so a credential-shaped path inside the
+    // directory stays blocked.
+    // Grants only ever live inside a private runtime root (see
+    // `trustedSessionOwnedRoot`), so reads elsewhere skip this step entirely.
+    const canonicalForGrant = READ_ONLY_TOOLS.has(toolName) ? resolveExistingPath(resolved) : '';
+    if (READ_ONLY_TOOLS.has(toolName) &&
+        isInsideRuntimeRoot(resolved, canonicalForGrant, runtimeReadScope)) {
+        const canonical = canonicalForGrant;
+        if (matchesSessionOwnedReadableRoot(canonical, runtimeReadScope) ||
+            matchesTrustedExactWriteTarget(canonical, runtimeReadScope)) {
+            // The checks above saw only the lexical path. A symlink inside the
+            // granted root (`notes.txt -> .env`) must not read a secret the direct
+            // path would have to ask for, so the real target gets the same checks.
+            const canonicalReason = criticalSafetyReason(canonical);
+            if (canonicalReason)
+                return { allowed: false, reason: canonicalReason };
+            return {
+                allowed: true,
+                reason: { type: 'sessionOwnedReadablePath', path: resolved },
+            };
+        }
     }
     // Step 3.5: Temp directory read auto-allow.
     //

@@ -1,3 +1,4 @@
+import { logger } from '@mavis/shared/local-runtime-logging/logger';
 const TOP_LEVEL_STEP_KEYS = [
     'id',
     'header',
@@ -16,7 +17,7 @@ const TOP_LEVEL_STEP_KEYS = [
 export function prepareAskUserArguments(args) {
     if (!isRecord(args))
         return args;
-    let prepared = args;
+    let prepared = stripRetiredAskUserFields(args);
     if (typeof prepared.question === 'string' && prepared.options !== undefined) {
         const questionnaire = { ...prepared };
         const step = {};
@@ -49,6 +50,26 @@ export function prepareAskUserArguments(args) {
         }
     }
     return prepared;
+}
+/**
+ * `requiresExplicitResponse` was replaced by `async`. The schema forbids unknown
+ * properties, so models trained on the old contract would fail validation;
+ * drop the field instead. It carries no meaning any more: an omitted `async`
+ * already waits for the reply, which is what `requiresExplicitResponse: true`
+ * asked for. Logged so a model still sending the retired field is visible.
+ */
+function stripRetiredAskUserFields(args) {
+    if (!('requiresExplicitResponse' in args))
+        return args;
+    const rest = { ...args };
+    delete rest.requiresExplicitResponse;
+    logger.info({
+        reason: 'retired_field_stripped',
+        field: 'requiresExplicitResponse',
+        value: String(args.requiresExplicitResponse),
+        asyncProvided: 'async' in args,
+    }, 'ask_user retired argument stripped before validation');
+    return rest;
 }
 function unwrapLegacyItems(value) {
     if (!isRecord(value) || Object.keys(value).length !== 1 || !('item' in value)) {

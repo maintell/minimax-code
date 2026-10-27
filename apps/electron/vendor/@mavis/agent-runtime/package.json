@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "@mavis/agent-core": "file:../agent-core",
-    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
     "@sinclair/typebox": "^0.34.0"
   }
 }

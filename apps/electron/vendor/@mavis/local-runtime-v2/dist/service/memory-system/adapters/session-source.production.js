@@ -1,6 +1,4 @@
 import { prepareCaptureHistory, truncateToTokenBudget } from './capture-history.js';
-/** 已结束的会话状态；`started` 之外都视为终态（Mavis 语义里 idle 即 finished）。 */
-const TERMINAL_STATUSES = new Set(['idle', 'error', 'aborted', 'interrupted']);
 export function createProductionSessionSystemPort(deps) {
     async function readSnapshot(sessionId, maxInputTokens) {
         const session = await deps.sessions.get(sessionId);
@@ -79,8 +77,8 @@ export function createProductionSessionSystemPort(deps) {
                 !excluded.has(session.sessionId) &&
                 // 年龄窗：updatedAtMs 超窗的会话退出候选资格(§2.3)。
                 now - session.updatedAtMs <= maxAgeMs &&
-                // 终态会话立即具备时间资格；运行中的会话要空闲达标(§5.10)。
-                (TERMINAL_STATUSES.has(session.status) || now - session.updatedAtMs >= input.idleForMs));
+                // idle/error 等状态只表示两轮之间，用户随时可能继续；一律按距最后更新的时长判定(§5.10)。
+                now - session.updatedAtMs >= input.idleForMs);
             const candidates = [];
             for (const session of eligible) {
                 // 只对通过元数据过滤的会话付出一次 History 读取,换取 sourceRevision。

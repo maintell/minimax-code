@@ -2,14 +2,12 @@ import { HTTPException } from 'hono/http-exception';
 import { DesktopHookServiceBase } from './desktop-hook-service-base.js';
 import { getSessionFilesService } from '../session-assets/session-files-service.js';
 import { getSessionInputSummaryService, SessionInputSummaryNotFoundError, SessionInputSummaryValidationError, } from '../session-navigation/service.js';
-import { getConfig } from '@mavis/config';
 import { CronContractError, assertCronName, assertSchedulable, createCronReqToConfig, cronStateToCronTask, toCronContractError, updateCronReqToConfigUpdate, } from '../cron/contract.js'; // desktop-service-boundary-skip: anchor=server-cron-contract owner=cron reason=legacy-cron-rpc-glue-before-facade; followup=desktop-service-domain-facades
 import { createStoredCronTask, deleteStoredCronTask, getStoredCronTask, listStoredCronTasks, updateStoredCronTask, } from '../cron/index.js';
-import { ThreadGoalContractError, createGoalReqToCreateInput, goalStateToGoalState, patchGoalReqToPatchInput, toThreadGoalContractError, } from '../thread-goal/contract.js'; // desktop-service-boundary-skip: anchor=server-goal-contract owner=thread-goal reason=legacy-goal-rpc-glue-before-facade; followup=desktop-service-domain-facades
 import { LocalAgentContractError } from '../agent/contract.js';
 import { LocalProjectContractError } from '../project/index.js';
 import { cronReviewBlocks } from '../content-safety/cron-fields.js';
-import { jsonError, requireSessionId, toCronSessionStatusLabel, } from './desktop-service-support.js';
+import { jsonError, toCronSessionStatusLabel, } from './desktop-service-support.js';
 import { DesktopEchoService } from './desktop-echo-service.js';
 import { DesktopPinService } from './desktop-pin-service.js';
 import { DesktopModelProviderService, } from './desktop-model-provider-service.js';
@@ -63,6 +61,21 @@ function safeSessionMutationError(error) {
 }
 export class DesktopService extends DesktopHookServiceBase {
     dependencies;
+    async listBackgroundTasks() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async getBackgroundTask() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async readBackgroundTaskOutput() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async stopBackgroundTask() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async deleteBackgroundTask() {
+        throw new Error('Background task API requires Runtime V2');
+    }
     echoService = new DesktopEchoService();
     sessionService;
     permissionService;
@@ -666,9 +679,16 @@ export class DesktopService extends DesktopHookServiceBase {
             res: jsonError(501, 'Turn continuation requires local-runtime-v2.', 'TURN_CONTINUATION_UNSUPPORTED'),
         });
     }
+    async getSessionActivity() {
+        throw new HTTPException(501, {
+            res: jsonError(501, 'Session activity requires local-runtime-v2.', 'SESSION_ACTIVITY_UNSUPPORTED'),
+        });
+    }
     abortSession(...args) {
         return this.sessionService.abortSession(...args);
     }
+    cancelPromptSuggestion = () => this.unimplementedGeneratedMethod('CancelPromptSuggestion');
+    getPromptSuggestion = () => this.unimplementedGeneratedMethod('GetPromptSuggestion');
     listQueueMessages(...args) {
         return this.sessionService.listQueueMessages(...args);
     }
@@ -979,85 +999,12 @@ export class DesktopService extends DesktopHookServiceBase {
             error: 'Cron delivery is served by the local-runtime-v2 front door',
         };
     }
-    async createGoal(ctx, req) {
-        void ctx;
-        return this.mapGoalErrors(async () => {
-            const goal = this.requireGoal();
-            await this.assertGoalSessionMutable(req.sessionId);
-            const goalConfig = getConfig().goal;
-            const input = createGoalReqToCreateInput(req, goalConfig.objectiveMaxChars === undefined
-                ? {}
-                : { objectiveMaxChars: goalConfig.objectiveMaxChars });
-            const created = await goal.createGoal(input, { requireKickoffAdmission: true });
-            return { goal: goalStateToGoalState(created) };
-        });
-    }
-    async getGoal(ctx, req) {
-        void ctx;
-        const goal = this.requireGoal();
-        return this.mapGoalErrors(async () => {
-            const sessionId = requireSessionId(req.sessionId);
-            // Keep HTTP glue free of timing arithmetic: Thread Goal owns how a
-            // persisted row is projected while the local-runtime turn is live.
-            const state = goal.getBySessionForResponse
-                ? await goal.getBySessionForResponse(sessionId)
-                : await goal.store.getBySession(sessionId);
-            return state ? { goal: goalStateToGoalState(state) } : {};
-        });
-    }
-    async patchGoal(ctx, req) {
-        void ctx;
-        const goal = this.requireGoal();
-        return this.mapGoalErrors(async () => {
-            const sessionId = requireSessionId(req.sessionId);
-            const existing = await goal.store.getBySession(sessionId);
-            if (!existing)
-                throw this.goalNotFound(sessionId);
-            await this.assertGoalSessionMutable(sessionId);
-            const goalConfig = getConfig().goal;
-            const { patch, hasChange, isUserPause } = patchGoalReqToPatchInput(req, goalConfig.objectiveMaxChars === undefined
-                ? {}
-                : { objectiveMaxChars: goalConfig.objectiveMaxChars });
-            if (!hasChange) {
-                throw new ThreadGoalContractError(400, 'PATCH body must include status, objective, or token_budget.', 'VALIDATION_ERROR');
-            }
-            // Route on the caller's intent, not on the patch's field shape: an
-            // explicit user pause is an atomic lifecycle transition, not a field
-            // update that happens to set `status`.
-            const goalForResponse = isUserPause
-                ? await goal.pauseGoalByUser(sessionId)
-                : await goal.patchGoal(sessionId, patch);
-            if (!goalForResponse)
-                throw this.goalNotFound(sessionId);
-            return { goal: goalStateToGoalState(goalForResponse) };
-        });
-    }
-    async deleteGoal(ctx, req) {
-        void ctx;
-        const goal = this.requireGoal();
-        return this.mapGoalErrors(async () => {
-            const sessionId = requireSessionId(req.sessionId);
-            const existing = await goal.store.getBySession(sessionId);
-            if (!existing)
-                return { success: true };
-            await this.assertGoalSessionMutable(sessionId);
-            await goal.deleteGoal(sessionId);
-            return { success: true };
-        });
-    }
-    async dismissGoal(ctx, req) {
-        void ctx;
-        const goal = this.requireGoal();
-        return this.mapGoalErrors(async () => {
-            const sessionId = requireSessionId(req.sessionId);
-            const goalId = req.goalId?.trim();
-            if (!goalId) {
-                throw new ThreadGoalContractError(400, 'goal_id is required.', 'VALIDATION_ERROR');
-            }
-            await this.assertGoalSessionMutable(sessionId);
-            return { goal: goalStateToGoalState(await goal.dismissGoal(sessionId, goalId)) };
-        });
-    }
+    // Goal is owned by the local-runtime-v2 Goal service and served by its front door.
+    createGoal = () => this.unimplementedGeneratedMethod('createGoal');
+    getGoal = () => this.unimplementedGeneratedMethod('getGoal');
+    patchGoal = () => this.unimplementedGeneratedMethod('patchGoal');
+    deleteGoal = () => this.unimplementedGeneratedMethod('deleteGoal');
+    dismissGoal = () => this.unimplementedGeneratedMethod('dismissGoal');
     // ─── channel (desktop/local-runtime only) ────────────────────────────────
     // The channel handlers + their local-API dispatch helpers live in
     // DesktopChannelServiceBase (./desktop-channel-service.js). This concrete
@@ -1089,45 +1036,6 @@ export class DesktopService extends DesktopHookServiceBase {
     requestSkillEvolveScan = () => this.unimplementedGeneratedMethod('requestSkillEvolveScan');
     revertSkillEvolve = () => this.unimplementedGeneratedMethod('revertSkillEvolve');
     mutateSkillEvolveLifecycle = () => this.unimplementedGeneratedMethod('mutateSkillEvolveLifecycle');
-    requireGoal() {
-        if (!this.dependencies.goal) {
-            throw new HTTPException(503, {
-                res: jsonError(503, 'Thread goal store is not available', 'GOAL_UNAVAILABLE'),
-            });
-        }
-        if (this.dependencies.goal.isEnabled?.() === false) {
-            throw new HTTPException(403, {
-                res: jsonError(403, 'Thread Goal is disabled', 'GOAL_DISABLED'),
-            });
-        }
-        return this.dependencies.goal;
-    }
-    async assertGoalSessionMutable(sessionId) {
-        const hook = this.dependencies.goal?.isReadOnlyLegacySession;
-        if (hook && (await hook(sessionId))) {
-            throw new HTTPException(409, {
-                res: jsonError(409, 'Legacy opencode sessions are read-only in clean local-runtime mode.', 'read_only_legacy_session'),
-            });
-        }
-    }
-    goalNotFound(sessionId) {
-        return new HTTPException(404, {
-            res: jsonError(404, `Goal not found for session: ${sessionId}`, 'GOAL_NOT_FOUND'),
-        });
-    }
-    async mapGoalErrors(fn) {
-        try {
-            return await fn();
-        }
-        catch (err) {
-            if (err instanceof HTTPException)
-                throw err;
-            const mapped = toThreadGoalContractError(err);
-            throw new HTTPException(mapped.status, {
-                res: jsonError(mapped.status, mapped.message, mapped.code),
-            });
-        }
-    }
     requireCron() {
         if (!this.dependencies.cron) {
             throw new HTTPException(503, {

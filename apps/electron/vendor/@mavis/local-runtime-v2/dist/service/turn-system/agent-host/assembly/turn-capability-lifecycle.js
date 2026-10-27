@@ -35,14 +35,11 @@ export class AgentHostTurnCapabilityLifecycle {
         const allowPendingPublication = [...this.inFlight.values()].some((turn) => turn.sessionId === input.sessionId);
         if (provider)
             await provider.waitUntilReady({ allowPendingPublication });
-        const preparation = provider && input.captureCapabilities !== false
-            ? await provider.prepareTurnCapabilities?.(input.signal)
-            : undefined;
         await this.waitForPublication();
         // No await below this point: capture + registration is one JS critical section.
         input.beforeCapabilityCapture?.();
         const capabilities = provider && input.captureCapabilities !== false
-            ? provider.captureTurnCapabilities(preparation)
+            ? provider.captureTurnCapabilities()
             : undefined;
         if (capabilities)
             provider?.retainTurnCapabilities?.(capabilities);

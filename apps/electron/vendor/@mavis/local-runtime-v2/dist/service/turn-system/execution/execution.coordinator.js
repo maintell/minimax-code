@@ -1,4 +1,4 @@
-import { pausesQueueOnAbort } from './queue-pause-on-abort.js';
+import { pausesQueueOnAbort, wakesQueueOnAbort } from './queue-pause-on-abort.js';
 /**
  * Settles Turn ownership after AgentHost completes. AgentHost exclusively owns
  * runtime Session/history/stream projection. Pre-Host preparation explicitly
@@ -83,7 +83,7 @@ async function prepareTurnStart(options, turn, request) {
     });
     try {
         const guard = await Promise.race([
-            options.beforeStart({ input: request.input, signal: turn.signal }),
+            options.beforeStart({ input: request.input, sessionId: turn.sessionId, signal: turn.signal }),
             cancelled,
         ]);
         return guard ?? undefined;
@@ -119,8 +119,9 @@ async function settleAgentTurn(options, turn, request, pending) {
         turn,
         outcome: outcome.status,
         controllerTurn: turn,
-        wakeQueue: outcome.status === 'completed' &&
-            (outcome.waitingForUser !== true || request.provenance.source === 'thread-goal'),
+        wakeQueue: outcome.status === 'completed'
+            ? outcome.waitingForUser !== true || request.provenance.source === 'thread-goal'
+            : outcome.status === 'aborted' && wakesQueueOnAbort(turn.signal.reason),
     });
     return settlementError ? { status: 'failed', error: settlementError } : outcome;
 }
@@ -214,7 +215,7 @@ async function settleAndRelease(options, input) {
             status: input.outcome,
         })
         : undefined;
-    if (shouldWakeQueue(settlement.value, productSettlementError, input.wakeQueue, input.outcome)) {
+    if (shouldWakeQueue(settlement.value, productSettlementError, input)) {
         try {
             await options.released.publish(input.turn.sessionId);
         }
@@ -275,11 +276,12 @@ function terminalQueuePauseCause(input) {
 function shouldSettleProductTurn(settlement, turn) {
     return settlement?.status === 'settled' && turn.busyReason === 'turn';
 }
-function shouldWakeQueue(settlement, productSettlementError, wakeQueue, outcome) {
+function shouldWakeQueue(settlement, productSettlementError, input) {
     return (settlement?.status !== 'stale-owner' &&
         !productSettlementError &&
-        wakeQueue &&
-        outcome !== 'aborted');
+        input.wakeQueue &&
+        (input.outcome !== 'aborted' ||
+            (input.controllerTurn !== undefined && wakesQueueOnAbort(input.controllerTurn.signal.reason))));
 }
 async function settleRequiredProductTurn(settlement, input) {
     if (!settlement)

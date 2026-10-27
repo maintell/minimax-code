@@ -23,8 +23,214 @@ export function parseMiniAppComposerAppendResult(value) {
     const code = MINIAPP_COMPOSER_FAILURE_CODES.find((candidate) => candidate === result.code);
     return result.success === false && code ? { success: false, code } : null;
 }
+/** `request()` asks for at most this many tools at once. */
+export const MINIAPP_TOOL_REQUEST_MAX_NAMES = 10;
+const MINIAPP_TOOL_PERMISSION_DECISIONS = ['allowOnce', 'allowAlways', 'deny'];
+/** Both IPC boundaries keep only the contract fields; anything else is no answer. */
+export function readMiniAppToolPermissionDecision(value) {
+    if (!value || typeof value !== 'object')
+        return null;
+    const input = value;
+    const decision = MINIAPP_TOOL_PERMISSION_DECISIONS.find((item) => item === input.decision);
+    if (!decision)
+        return null;
+    if (input.names === undefined)
+        return { decision };
+    if (!Array.isArray(input.names) ||
+        input.names.length > MINIAPP_TOOL_REQUEST_MAX_NAMES ||
+        !input.names.every((name) => typeof name === 'string')) {
+        return null;
+    }
+    return { decision, names: [...input.names] };
+}
 /** Bounds one untrusted page Agent request before it crosses into Main. */
 export const MINIAPP_AGENT_MAX_TEXT_LENGTH = 100_000;
+/**
+ * The only PCM the Host transcribes: 16 kHz, mono, signed 16-bit little-endian samples. Named
+ * with the Web Audio / WebCodecs words a page already uses, and required verbatim on every call
+ * so a page that captured at another rate fails at the call instead of producing garbage text.
+ */
+export const MINIAPP_SPEECH_AUDIO_FORMAT = Object.freeze({
+    sampleRate: 16_000,
+    channelCount: 1,
+    sampleFormat: 's16',
+});
+/** 500 s of that PCM; the Host's transcription limit. */
+export const MINIAPP_SPEECH_MAX_AUDIO_BYTES = 16_000_000;
+/** Page-visible `transcribe()` failures; the page reads them as the rejection's `message`. */
+export const MINIAPP_SPEECH_FAILURE_CODES = [
+    'invalid_request',
+    'not_permitted',
+    'audio_too_large',
+    'busy',
+    'runtime_unavailable',
+    'transcription_failed',
+    'result_unknown',
+];
+export function isMiniAppSpeechFailureCode(value) {
+    return MINIAPP_SPEECH_FAILURE_CODES.includes(value);
+}
+export function isMiniAppSpeechAudioFormat(value) {
+    if (!isPlainRecord(value))
+        return false;
+    const keys = Object.keys(value);
+    const expected = Object.keys(MINIAPP_SPEECH_AUDIO_FORMAT);
+    return (keys.length === expected.length &&
+        expected.every((key) => value[key] === MINIAPP_SPEECH_AUDIO_FORMAT[key]));
+}
+/**
+ * Leading bytes of the audio containers a page might send by mistake (`MediaRecorder` output or
+ * a WAV it encoded itself). Raw PCM is not inspected beyond this; the format is a contract.
+ */
+const MINIAPP_SPEECH_CONTAINER_MAGIC = [
+    [0x52, 0x49, 0x46, 0x46], // RIFF (WAV)
+    [0x1a, 0x45, 0xdf, 0xa3], // EBML (WebM / Matroska)
+    [0x4f, 0x67, 0x67, 0x53], // OggS
+    [0x66, 0x4c, 0x61, 0x43], // fLaC
+    [0x49, 0x44, 0x33], // ID3 (MP3)
+];
+/** Shared memory cannot cross IPC; refusing it here gives the page `invalid_request` up front. */
+function isSharedArrayBuffer(buffer) {
+    return typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer;
+}
+/**
+ * Views the page's samples as bytes without copying. Both the preload and Main apply it: an
+ * ArrayBuffer or any view over one, at least one whole sample, an even byte count, under the
+ * size limit, and not the start of a known container.
+ */
+export function readMiniAppSpeechAudio(value) {
+    let audio;
+    if (value instanceof ArrayBuffer)
+        audio = new Uint8Array(value);
+    else if (ArrayBuffer.isView(value) && !isSharedArrayBuffer(value.buffer)) {
+        audio = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+    else
+        return { ok: false, code: 'invalid_request' };
+    if (audio.byteLength > MINIAPP_SPEECH_MAX_AUDIO_BYTES)
+        return { ok: false, code: 'audio_too_large' };
+    if (audio.byteLength === 0 || audio.byteLength % 2 !== 0) {
+        return { ok: false, code: 'invalid_request' };
+    }
+    const container = MINIAPP_SPEECH_CONTAINER_MAGIC.some((magic) => magic.every((byte, index) => audio[index] === byte));
+    return container ? { ok: false, code: 'invalid_request' } : { ok: true, audio };
+}
+export function parseMiniAppSpeechTranscribeResponse(value) {
+    if (!isPlainRecord(value))
+        return null;
+    if (value.ok === true) {
+        const text = isPlainRecord(value.result) ? value.result.text : undefined;
+        return typeof text === 'string' ? { ok: true, result: { text } } : null;
+    }
+    return value.ok === false && isMiniAppSpeechFailureCode(value.code)
+        ? { ok: false, code: value.code }
+        : null;
+}
+export function readMiniAppSpeechPartialMessage(value) {
+    if (!isPlainRecord(value))
+        return null;
+    const { requestId, text } = value;
+    return typeof requestId === 'string' && requestId && typeof text === 'string'
+        ? { requestId, text }
+        : null;
+}
+/**
+ * Host features a page or Node module may probe with `capabilities.has`, named by their API path.
+ * Fixed per Host version and shared by both surfaces: a name is listed once the Host offers that
+ * API on either surface. Says nothing about this Mini App's manifest or authorization.
+ */
+export const MINIAPP_HOST_CAPABILITIES = Object.freeze([
+    'agent.agents',
+    'agent.create',
+    'agent.models',
+    'agent.observe',
+    'agent.open',
+    'agent.run',
+    'agent.session',
+    'agent.sessions',
+    'hostConnector',
+    'message.append',
+    'speech.transcribe',
+    'tool',
+    'tool.request',
+    'window',
+]);
+export function hasMiniAppHostCapability(name) {
+    return MINIAPP_HOST_CAPABILITIES.includes(name);
+}
+/**
+ * Manifest `agentAccess` items. `session.run` starts and continues the Mini App's own Agent
+ * sessions; `session.read` lists, reads and observes the user's own conversations. Neither
+ * implies the other.
+ */
+export const MINIAPP_AGENT_ACCESS_ITEMS = ['session.run', 'session.read'];
+export function isMiniAppAgentAccess(value) {
+    return MINIAPP_AGENT_ACCESS_ITEMS.some((item) => item === value);
+}
+const MINIAPP_CONNECTOR_PROVIDER = /^[a-z0-9_-]{1,64}$/u;
+/**
+ * `deviceAccess` entries: each is one Chromium device permission the page may hold, named as
+ * `navigator.permissions.query` names it. The same list bounds the manifest reader.
+ */
+export const MINIAPP_DEVICE_ACCESS_ITEMS = Object.freeze(['microphone']);
+export function isMiniAppDeviceAccessItem(value) {
+    return MINIAPP_DEVICE_ACCESS_ITEMS.includes(value);
+}
+/** Builds the id of one declared item; the single place the `<domain>:<item>` shape is written. */
+export function miniAppPermissionId(domain, item) {
+    return `${domain}:${item}`;
+}
+function isMiniAppPermissionItem(domain, item) {
+    switch (domain) {
+        case 'connector':
+            return MINIAPP_CONNECTOR_PROVIDER.test(item);
+        case 'agent':
+            return isMiniAppAgentAccess(item);
+        case 'tool':
+            return item === 'call';
+        case 'device':
+            return isMiniAppDeviceAccessItem(item);
+        default:
+            return false;
+    }
+}
+export function parseMiniAppPermissionId(value) {
+    if (typeof value !== 'string')
+        return null;
+    const separator = value.indexOf(':');
+    if (separator <= 0)
+        return null;
+    const domain = value.slice(0, separator);
+    const item = value.slice(separator + 1);
+    return isMiniAppPermissionItem(domain, item)
+        ? { id: value, domain: domain, item }
+        : null;
+}
+const MINIAPP_PERMISSION_MAX_ITEMS = 256;
+/** Rebuilds a permission list from contract fields only; any invalid entry rejects the whole list. */
+export function parseMiniAppPermissionList(value) {
+    if (!isPlainRecord(value))
+        return null;
+    const { pluginId, source, items } = value;
+    if (typeof pluginId !== 'string' || !pluginId || pluginId.length > 256)
+        return null;
+    if (source !== 'local' && source !== 'official')
+        return null;
+    if (!Array.isArray(items) || items.length > MINIAPP_PERMISSION_MAX_ITEMS)
+        return null;
+    const seen = new Set();
+    const parsed = [];
+    for (const entry of items) {
+        if (!isPlainRecord(entry) || typeof entry.enabled !== 'boolean')
+            return null;
+        const permission = parseMiniAppPermissionId(entry.id);
+        if (!permission || seen.has(permission.id))
+            return null;
+        seen.add(permission.id);
+        parsed.push({ id: permission.id, enabled: entry.enabled });
+    }
+    return { pluginId, source, items: parsed };
+}
 export const MINIAPP_AGENT_FAILURE_CODES = [
     'invalid_request',
     'not_permitted',
@@ -40,6 +246,9 @@ export function isMiniAppAgentBusyReason(value) {
 }
 /** Bounds a page-chosen request id; it is only a per-page correlation key. */
 export const MINIAPP_AGENT_MAX_REQUEST_ID_LENGTH = 128;
+export function isMiniAppAgentWhenBusy(value) {
+    return value === 'queue' || value === 'steer';
+}
 /** Non-empty, bounded and free of control characters; checked on both sides of the IPC. */
 export function isMiniAppAgentRequestId(value) {
     return (typeof value === 'string' &&
@@ -152,7 +361,7 @@ export function readMiniAppAgentRunRequest(value) {
     if (!value || typeof value !== 'object')
         return null;
     const input = value;
-    const { text, sessionId, requestId, agent } = input;
+    const { text, sessionId, requestId, agent, whenBusy } = input;
     const observe = readMiniAppAgentObserveFlag(input.observe);
     const model = readOptionalModel(input.model);
     if (typeof text !== 'string' || text.length > MINIAPP_AGENT_MAX_TEXT_LENGTH)
@@ -161,12 +370,16 @@ export function readMiniAppAgentRunRequest(value) {
         return null;
     if (!isOptionalNonEmptyString(sessionId) || !isOptionalNonEmptyString(agent))
         return null;
+    if (whenBusy !== undefined && (!isMiniAppAgentWhenBusy(whenBusy) || sessionId === undefined)) {
+        return null;
+    }
     return {
         requestId,
         text,
         ...(sessionId !== undefined ? { sessionId } : {}),
         ...(model ? { model } : {}),
         ...(agent !== undefined ? { agent } : {}),
+        ...(whenBusy !== undefined ? { whenBusy } : {}),
         observe,
     };
 }
@@ -295,6 +508,17 @@ export function readMiniAppAgentOpenRequest(value) {
     const { sessionId } = value;
     return isNonEmptyString(sessionId) ? { sessionId } : null;
 }
+/**
+ * Page `session` payload: `{ sessionId }`, or `{}` for the session of the chat the tab is in.
+ * Checked in the preload and again in Main; null when malformed.
+ */
+export function readMiniAppAgentSessionRequest(value) {
+    if (!value || typeof value !== 'object')
+        return null;
+    return value.sessionId === undefined
+        ? {}
+        : readMiniAppAgentOpenRequest(value);
+}
 /** Copies a Main `open` request for the Host renderer; null when malformed. */
 export function readMiniAppAgentOpenSessionRequest(value) {
     if (!value || typeof value !== 'object')
@@ -317,6 +541,102 @@ export function readMiniAppAgentOpenSessionReply(value) {
         return { requestId, result: { ok: false, code } };
     }
     return null;
+}
+/** Bounds one list result crossing a process boundary. */
+export const MINIAPP_AGENT_MAX_SESSIONS = 100;
+function isMiniAppAgentSessionStatus(value) {
+    return value === 'idle' || value === 'running' || value === 'error' || value === 'aborted';
+}
+/** Allowlist copy of a session summary; null when a field is malformed. */
+export function readMiniAppAgentSessionSummary(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return null;
+    const record = value;
+    const { sessionId, title, agent, status, workspaceDir, isDefaultWorkspace } = record;
+    const { createdAtMs, updatedAtMs } = record;
+    if (!isNonEmptyString(sessionId) ||
+        (title !== undefined && typeof title !== 'string') ||
+        !isNonEmptyString(agent) ||
+        !isMiniAppAgentSessionStatus(status) ||
+        typeof workspaceDir !== 'string' ||
+        typeof isDefaultWorkspace !== 'boolean' ||
+        !isFiniteNumber(createdAtMs) ||
+        !isFiniteNumber(updatedAtMs)) {
+        return null;
+    }
+    return {
+        sessionId,
+        ...(title !== undefined ? { title } : {}),
+        agent,
+        status,
+        workspaceDir,
+        isDefaultWorkspace,
+        createdAtMs,
+        updatedAtMs,
+    };
+}
+function isFiniteNumber(value) {
+    return typeof value === 'number' && Number.isFinite(value);
+}
+/** Allowlist copy of a bounded summary list; null when the list or any entry is malformed. */
+export function readMiniAppAgentSessionList(value) {
+    if (!Array.isArray(value) || value.length > MINIAPP_AGENT_MAX_SESSIONS)
+        return null;
+    const sessions = [];
+    for (const entry of value) {
+        const summary = readMiniAppAgentSessionSummary(entry);
+        if (!summary)
+            return null;
+        sessions.push(summary);
+    }
+    return sessions;
+}
+/** Allowlist copy of a session detail; null when a field is malformed. */
+export function readMiniAppAgentSessionDetail(value) {
+    const summary = readMiniAppAgentSessionSummary(value);
+    if (!summary)
+        return null;
+    const record = value;
+    const { lastAssistantText } = record;
+    if (lastAssistantText !== undefined && typeof lastAssistantText !== 'string')
+        return null;
+    const model = readOptionalModel(record.model);
+    const error = readSessionError(record.error);
+    if (model === null || error === null)
+        return null;
+    return {
+        ...summary,
+        ...(model ? { model } : {}),
+        ...(error ? { error } : {}),
+        ...(lastAssistantText !== undefined ? { lastAssistantText } : {}),
+    };
+}
+/** `undefined` when absent, `null` when present but malformed. */
+function readSessionError(value) {
+    if (value === undefined)
+        return undefined;
+    return isPlainRecord(value) && isNonEmptyString(value.message)
+        ? { message: value.message }
+        : null;
+}
+/** Exactly one of `sessionId` / `all: true`; null otherwise. */
+export function readMiniAppAgentObserveTarget(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return null;
+    const { sessionId, all } = value;
+    if (sessionId !== undefined) {
+        return isNonEmptyString(sessionId) && all === undefined ? { sessionId } : null;
+    }
+    return all === true ? { all: true } : null;
+}
+/**
+ * Page `observe` payload with its (page-chosen or preload-generated) `requestId`, checked in
+ * the preload and again in Main; null when malformed.
+ */
+export function readMiniAppAgentObserveRequest(value) {
+    const target = readMiniAppAgentObserveTarget(value);
+    const { requestId } = (value ?? {});
+    return target && isMiniAppAgentRequestId(requestId) ? { ...target, requestId } : null;
 }
 const MINIAPP_AGENT_RUNTIME_ERROR_CODES = {
     NOT_PERMITTED: 'not_permitted',
@@ -391,7 +711,10 @@ function isQuestionnaireRequest(value) {
     return (request.schemaVersion === 2 && isNonEmptyString(request.id) && Array.isArray(request.steps));
 }
 function readRunOutcome(input) {
-    if (input.status !== 'finished' && input.status !== 'error' && input.status !== 'aborted') {
+    if (input.status !== 'finished' &&
+        input.status !== 'error' &&
+        input.status !== 'aborted' &&
+        input.status !== 'steered') {
         return null;
     }
     if (input.text !== undefined && typeof input.text !== 'string')
@@ -413,31 +736,54 @@ function readRunOutcome(input) {
 }
 /** Allowlist copy of one run event; unknown `type`s and malformed events return null. */
 export function readMiniAppAgentRunEvent(value) {
+    return readAgentStreamEvent(value, false);
+}
+/**
+ * Allowlist copy of one observer event: no `run.queued` or asks, `turn.started.model` may be
+ * absent, and the lifecycle events may carry `title`.
+ */
+export function readMiniAppAgentObservedEvent(value) {
+    return readAgentStreamEvent(value, true);
+}
+function readAgentStreamEvent(value, observed) {
     if (!value || typeof value !== 'object' || Array.isArray(value))
         return null;
     const input = value;
     if (input.type === 'run.queued')
-        return readRunQueuedEvent(input);
+        return observed ? null : readRunQueuedEvent(input);
     const { sessionId } = input;
     if (!isNonEmptyString(sessionId))
         return null;
-    if (input.type === 'question.requested')
-        return readQuestionRequestedEvent(sessionId, input);
-    if (input.type === 'permission.requested') {
-        return readPermissionRequestedEvent(sessionId, input);
+    if (input.type === 'question.requested') {
+        return observed ? null : readQuestionRequestedEvent(sessionId, input);
     }
-    const { turnId } = input;
+    if (input.type === 'permission.requested') {
+        return observed ? null : readPermissionRequestedEvent(sessionId, input);
+    }
+    const { turnId, title } = input;
     if (!isNonEmptyString(turnId))
         return null;
+    if (observed && title !== undefined && typeof title !== 'string')
+        return null;
+    // Only an observer's lifecycle events carry the session title.
+    const titled = observed && typeof title === 'string' ? { title } : {};
     switch (input.type) {
         case 'turn.started': {
             const model = readMiniAppAgentModelSelection(input.model);
-            return model ? { type: 'turn.started', sessionId, turnId, model } : null;
+            if (model)
+                return { type: 'turn.started', sessionId, turnId, model, ...titled };
+            // An observer's `turn.started` omits a model the Host could not read.
+            return observed && input.model === undefined
+                ? { type: 'turn.started', sessionId, turnId, ...titled }
+                : null;
         }
         case 'text.delta':
+            return typeof input.text === 'string'
+                ? { type: 'text.delta', sessionId, turnId, text: input.text }
+                : null;
         case 'message.committed':
             return typeof input.text === 'string'
-                ? { type: input.type, sessionId, turnId, text: input.text }
+                ? { type: 'message.committed', sessionId, turnId, text: input.text, ...titled }
                 : null;
         case 'tool.started':
             return typeof input.name === 'string'
@@ -449,8 +795,11 @@ export function readMiniAppAgentRunEvent(value) {
                 : null;
         case 'turn.finished': {
             const outcome = readRunOutcome(input);
-            return outcome ? { type: 'turn.finished', sessionId, turnId, ...outcome } : null;
+            return outcome ? { type: 'turn.finished', sessionId, turnId, ...outcome, ...titled } : null;
         }
+        case 'message.pending':
+        case 'message.steered':
+            return { type: input.type, sessionId, turnId };
         default:
             return null;
     }
@@ -561,6 +910,41 @@ export function parseMiniAppAgentCreateResult(value) {
 /** Same envelope as a reply acknowledgement. */
 export function parseMiniAppAgentOpenResult(value) {
     return parseMiniAppAgentReplyResult(value);
+}
+/** `ok` once the subscription ended; like a read, a malformed reply is `runtime_unavailable`. */
+export function parseMiniAppAgentObserveResult(value) {
+    if (!value || typeof value !== 'object')
+        return { ok: false, code: 'runtime_unavailable' };
+    const response = value;
+    return response.ok === true ? { ok: true } : readReadFailure(response);
+}
+/** A read changes nothing: a malformed result is retryable `runtime_unavailable`, never unknown. */
+function readReadFailure(response) {
+    return response.ok === false && isMiniAppAgentFailureCode(response.code)
+        ? { ok: false, code: response.code }
+        : { ok: false, code: 'runtime_unavailable' };
+}
+/** Any malformed entry rejects the whole list. */
+export function parseMiniAppAgentSessionsResult(value) {
+    if (!value || typeof value !== 'object')
+        return { ok: false, code: 'runtime_unavailable' };
+    const response = value;
+    if (response.ok !== true)
+        return readReadFailure(response);
+    const sessions = readMiniAppAgentSessionList(response.sessions);
+    return sessions ? { ok: true, sessions } : { ok: false, code: 'runtime_unavailable' };
+}
+/** An absent `session` is a page's `session()` outside a chat tab. */
+export function parseMiniAppAgentSessionResult(value) {
+    if (!value || typeof value !== 'object')
+        return { ok: false, code: 'runtime_unavailable' };
+    const response = value;
+    if (response.ok !== true)
+        return readReadFailure(response);
+    if (response.session === undefined)
+        return { ok: true };
+    const session = readMiniAppAgentSessionDetail(response.session);
+    return session ? { ok: true, session } : { ok: false, code: 'runtime_unavailable' };
 }
 /** Main passes the opaque handle id to the Mini App preload through Chromium argv. */
 export const MINIAPP_SURFACE_ID_ARGUMENT_PREFIX = '--mavis-miniapp-surface-id=';

@@ -1,6 +1,7 @@
 import { logger } from '@mavis/shared/local-runtime-logging';
 import { parseAgentShellPreference, selectAgentShell, } from './contracts.js';
 const PREFERENCE_KEY = 'agent-command-shell-preference';
+const DISCOVERY_TTL_MS = 30_000;
 /** Expose only bounded reason codes, never probe output or private executable paths. */
 function executionFailureReason(candidate) {
     if (candidate?.available)
@@ -19,14 +20,15 @@ function executionFailureReason(candidate) {
 /** Only detector failures are recoverable; preference and Session storage errors must propagate. */
 class AgentShellDetectionError extends Error {
 }
-/** Profile-local preference and session bindings; never changes shell on command failure. */
+/** Profile-local discovery and session bindings; never changes shell on command failure. */
 export class AgentShellService {
     options;
     sessions;
     preferenceOperation = Promise.resolve();
     sessionOperation = Promise.resolve();
     discovery;
-    pending = new Map();
+    warming;
+    discovered;
     nowMs;
     constructor(options) {
         this.options = options;
@@ -34,6 +36,27 @@ export class AgentShellService {
     }
     bindSessions(sessions) {
         this.sessions = sessions;
+    }
+    /** Only caches discovery; no background Session writes or preference mutations. */
+    warmup() {
+        if (this.options.platform !== 'win32' || this.warming)
+            return;
+        this.warming = this.warmupDiscovery();
+    }
+    async warmupDiscovery() {
+        try {
+            await this.discover();
+        }
+        catch {
+            logger.warn({}, '[agent-shell] background discovery failed; Bash can retry');
+        }
+        finally {
+            this.warming = undefined;
+        }
+    }
+    async readPreference() {
+        const raw = await this.options.preferences.get(PREFERENCE_KEY);
+        return raw === undefined || raw === null ? 'auto' : parseAgentShellPreference(raw);
     }
     async serializePreference(operation) {
         const previous = this.preferenceOperation;
@@ -53,13 +76,10 @@ export class AgentShellService {
         return this.serializePreference(() => this.readStatus(refresh));
     }
     async readStatus(refresh = false) {
-        const raw = await this.options.preferences.get(PREFERENCE_KEY);
-        let preference = raw === undefined || raw === null ? 'auto' : parseAgentShellPreference(raw);
+        let preference = await this.readPreference();
         if (this.options.platform !== 'win32')
             return { supported: false, preference, candidates: [] };
-        if (refresh)
-            this.discovery = undefined;
-        const candidates = await (this.discovery ??= this.discover());
+        const candidates = await this.discover(refresh);
         if (preference !== 'auto' && !selectAgentShell(preference, candidates)) {
             await this.options.preferences.set(PREFERENCE_KEY, 'auto');
             preference = 'auto';
@@ -77,50 +97,93 @@ export class AgentShellService {
                 ? preference
                 : 'auto';
             await this.options.preferences.set(PREFERENCE_KEY, resolvedPreference);
-            return this.readStatus();
+            return {
+                ...status,
+                preference: resolvedPreference,
+                effective: selectAgentShell(resolvedPreference, status.candidates),
+            };
         });
     }
+    /** Freeze selection intent at creation, even when discovery has not completed yet. */
     async captureNew(parentSessionId) {
         if (this.options.platform !== 'win32')
-            return undefined;
-        if (parentSessionId)
-            return this.resolveSession(parentSessionId);
-        return this.captureAvailable();
+            return {};
+        if (parentSessionId) {
+            const agentShell = await this.resolveSession(parentSessionId);
+            return {
+                agentShellPreference: await this.readSessionPreference(parentSessionId),
+                ...(agentShell ? { agentShell } : {}),
+            };
+        }
+        this.warmup();
+        // Do not queue behind status()/setPreference(), which may be waiting for a probe.
+        // The committed preference at this read is the new Session's immutable intent.
+        const agentShellPreference = await this.readPreference();
+        const agentShell = this.capture(agentShellPreference, this.cachedCandidates() ?? []);
+        return { agentShellPreference, ...(agentShell ? { agentShell } : {}) };
     }
-    /** Read the trusted binding without requiring a running Shell for chat or other tools. */
-    resolveSession(sessionId) {
+    /** Chat/preparation never joins discovery or a Bash wait, including another Session's wait. */
+    async resolveSession(sessionId) {
         if (this.options.platform !== 'win32')
-            return Promise.resolve(undefined);
-        const existing = this.pending.get(sessionId);
-        if (existing)
-            return existing;
-        // Legacy descendants can initialize the same ancestor. Serialize the entire
-        // lineage so no concurrent resolver overwrites an already captured snapshot.
-        const operation = this.resolveOnce(sessionId);
-        this.pending.set(sessionId, operation);
-        return operation;
+            return undefined;
+        const shell = await this.serializeSession(() => this.resolveStoredSession(sessionId));
+        if (!shell)
+            this.warmup();
+        return shell;
     }
-    async discover() {
+    /** Bash-only barrier, before permission parsing. Waiting happens outside the binding lock. */
+    async ensureSession(sessionId) {
+        if (this.options.platform !== 'win32')
+            return undefined;
+        const shell = await this.serializeSession(() => this.resolveStoredSession(sessionId));
+        if (shell)
+            return shell;
+        let candidates;
         try {
-            return await this.options.detector.detect();
-        }
-        catch (error) {
-            this.discovery = undefined;
-            throw new AgentShellDetectionError('AGENT_SHELL_DETECTION_FAILED', { cause: error });
-        }
-    }
-    async captureAvailable(preference) {
-        try {
-            const status = await this.status(true);
-            return this.capture(preference ?? status.preference, status.candidates);
+            candidates = await this.discover();
         }
         catch (error) {
             if (error instanceof AgentShellDetectionError)
                 return undefined;
             throw error;
         }
+        // Re-read under the short lock: a sibling may already have bound the ancestor.
+        return this.serializeSession(() => this.resolveStoredSession(sessionId, new Set(), candidates));
     }
-    async resolveOnce(sessionId) {
+    cachedCandidates() {
+        return this.discovered && this.discovered.expiresAt > this.nowMs()
+            ? this.discovered.candidates
+            : undefined;
+    }
+    discover(refresh = false) {
+        if (this.discovery)
+            return this.discovery;
+        const cached = this.cachedCandidates();
+        if (!refresh && cached)
+            return Promise.resolve(cached);
+        this.discovery = this.runDiscovery();
+        return this.discovery;
+    }
+    async runDiscovery() {
+        // Publish the in-flight promise before invoking even a synchronously throwing detector.
+        await Promise.resolve();
+        try {
+            const candidates = await this.options.detector.detect();
+            this.discovered = {
+                candidates,
+                expiresAt: this.nowMs() + (candidates.some((item) => item.available) ? DISCOVERY_TTL_MS : 0),
+            };
+            return candidates;
+        }
+        catch (error) {
+            this.discovered = undefined;
+            throw new AgentShellDetectionError('AGENT_SHELL_DETECTION_FAILED', { cause: error });
+        }
+        finally {
+            this.discovery = undefined;
+        }
+    }
+    async serializeSession(operation) {
         const previous = this.sessionOperation;
         let release;
         this.sessionOperation = new Promise((resolve) => {
@@ -128,18 +191,17 @@ export class AgentShellService {
         });
         await previous;
         try {
-            return await this.resolveStoredSession(sessionId);
+            return await operation();
         }
         finally {
-            this.pending.delete(sessionId);
             release();
         }
     }
-    /** Probe only at execution. Upgrades are supported; changing family/path is not a fallback. */
+    /** Actual execution still validates the fixed binary; failure never selects another shell. */
     async resolveForExecution(sessionId) {
         if (this.options.platform !== 'win32')
             return undefined;
-        const shell = await this.resolveSession(sessionId);
+        const shell = await this.ensureSession(sessionId);
         if (!shell)
             throw new Error('AGENT_SHELL_UNAVAILABLE: install PowerShell or Git for Windows');
         let candidate;
@@ -147,7 +209,6 @@ export class AgentShellService {
             candidate = await this.options.detector.validate(shell);
         }
         catch {
-            // Probe failures are command-local, just like an unavailable executable.
             candidate = undefined;
         }
         if (!candidate?.available ||
@@ -160,27 +221,36 @@ export class AgentShellService {
         }
         return { ...shell, version: candidate.version };
     }
-    async resolveStoredSession(sessionId, ancestors = new Set()) {
-        if (ancestors.has(sessionId) || ancestors.size >= 64)
-            throw new Error('AGENT_SHELL_INVALID_SESSION_ANCESTRY');
-        const lineage = new Set([...ancestors, sessionId]);
-        const sessions = this.sessions;
-        if (!sessions)
+    async requireSession(sessionId) {
+        if (!this.sessions)
             throw new Error('AGENT_SHELL_UNAVAILABLE: session owner is not ready');
-        const session = await sessions.get(sessionId);
+        const session = await this.sessions.get(sessionId);
         if (!session)
             throw new Error('AGENT_SHELL_SESSION_NOT_FOUND');
+        return session;
+    }
+    async readSessionPreference(sessionId, ancestors = new Set()) {
+        if (ancestors.has(sessionId) || ancestors.size >= 64)
+            throw new Error('AGENT_SHELL_INVALID_SESSION_ANCESTRY');
+        const session = await this.requireSession(sessionId);
+        if (session.agentShell)
+            return session.agentShell.requestedPreference;
+        if (session.parentSessionId)
+            return this.readSessionPreference(session.parentSessionId, new Set([...ancestors, sessionId]));
+        return session.agentShellPreference ?? 'auto';
+    }
+    async resolveStoredSession(sessionId, ancestors = new Set(), candidates = this.cachedCandidates()) {
+        if (ancestors.has(sessionId) || ancestors.size >= 64)
+            throw new Error('AGENT_SHELL_INVALID_SESSION_ANCESTRY');
+        const session = await this.requireSession(sessionId);
         if (session.agentShell)
             return session.agentShell;
-        // Sessions without metadata predate this feature. Preserve the legacy Windows
-        // preference rather than applying a newly selected preference on resume.
         const shell = session.parentSessionId
-            ? await this.resolveStoredSession(session.parentSessionId, lineage)
-            : await this.captureAvailable('auto');
-        // Absence is retryable. Never persist a failed probe as a binding or break chat.
+            ? await this.resolveStoredSession(session.parentSessionId, new Set([...ancestors, sessionId]), candidates)
+            : this.capture(session.agentShellPreference ?? 'auto', candidates ?? []);
         if (!shell)
             return undefined;
-        await sessions.save(sessionId, shell);
+        await this.sessions.save(sessionId, shell);
         return shell;
     }
     capture(preference, candidates) {

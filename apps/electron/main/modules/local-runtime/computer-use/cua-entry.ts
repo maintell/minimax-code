@@ -17,9 +17,9 @@ if (parentPort) {
         void startCuaUtilityServer({
             parentPort: port,
             generation,
+            dataDir: process.env.MINIMAX_DATA_DIR ?? '',
             exit: (code) => process.exit(code),
             onReady: () => parentPort.postMessage({ type: 'cua-ready', generation }),
-            onPointer: (pointer) => parentPort.postMessage({ type: 'cua-pointer', generation, pointer }),
             onPreviewTarget: (target) => parentPort.postMessage({ type: 'cua-preview-target', generation, target }),
             onOperation: ({ sessionId, turnId, requestId }) => parentPort.postMessage({ type: 'cua-operation', generation, sessionId, turnId, requestId }),
             onOperationFinished: ({ sessionId, turnId, requestId }) => parentPort.postMessage({
@@ -36,8 +36,13 @@ if (parentPort) {
                 generation,
                 activeRequestCount,
             }),
-        }).then((server) => {
+        })
+            .then((server) => {
             releaseLease = server.releaseLease;
+        })
+            .catch(() => {
+            // Invalid profile/host setup fails before the server can signal readiness.
+            process.exit(1);
         });
     });
 }

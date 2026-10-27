@@ -182,7 +182,7 @@ export class EmbeddedBrowserToolRuntime {
         if (tool === 'click_and_wait_for_navigation') {
             return this.clickAndWaitForNavigation(target, args, signal);
         }
-        if (tool === 'click' || tool === 'double_click') {
+        if (tool === 'click' || tool === 'double_click' || tool === 'triple_click') {
             return this.executeGuardedAgentClick(target, tool, args, signal);
         }
         if ((tool === 'fill' || tool === 'type') && asString(args.ref)) {
@@ -192,10 +192,11 @@ export class EmbeddedBrowserToolRuntime {
         let result;
         switch (tool) {
             case 'double_click':
+            case 'triple_click':
                 result = await this.executeTool('click', {
                     ...actionArgs,
                     ...target,
-                    click_count: 2,
+                    click_count: tool === 'triple_click' ? 3 : 2,
                 }, signal);
                 break;
             case 'fill':
@@ -222,7 +223,10 @@ export class EmbeddedBrowserToolRuntime {
         if (!ELECTRON_BROWSER_CORE_ACTIONS.some((action) => action === tool)) {
             return { used: false };
         }
-        const clickAction = tool === 'click' || tool === 'double_click' || tool === 'click_and_wait_for_navigation';
+        const clickAction = tool === 'click' ||
+            tool === 'double_click' ||
+            tool === 'triple_click' ||
+            tool === 'click_and_wait_for_navigation';
         if (tool === 'inspect' && input.frame) {
             throw new Error('Browser inspect does not accept a frame without an element ref');
         }
@@ -899,8 +903,13 @@ export class EmbeddedBrowserToolRuntime {
         const clickArgs = {
             ...resolvedArgs,
             ...(tool === 'double_click' ? { click_count: 2 } : {}),
+            ...(tool === 'triple_click' ? { click_count: 3 } : {}),
         };
-        const result = asRecord(await this.host.withTabOperation(tab, tool === 'double_click' ? 'double-click' : 'click', () => tab.controller.click(clickArgs), { signal }));
+        const result = asRecord(await this.host.withTabOperation(tab, tool === 'triple_click'
+            ? 'triple-click'
+            : tool === 'double_click'
+                ? 'double-click'
+                : 'click', () => tab.controller.click(clickArgs), { signal }));
         return this.projectAgentClickResult(tab, projection, result);
     }
     createAgentClickProjection(tab, args, pageContext) {
@@ -1912,6 +1921,7 @@ export function projectSharedCoreResult(tool, result) {
         'retryable',
         'recovery',
         'snapshotId',
+        'snapshotRestarted',
         'offset',
         'nextOffset',
         'truncated',
@@ -1939,10 +1949,12 @@ export function projectSharedCoreResult(tool, result) {
         'lastSequence',
         'totalEntries',
         'returnedEntries',
+        'selectorTail',
     ];
     const actionKeys = {
         click: ['target', 'effect', 'navigation', 'download'],
         double_click: ['target', 'effect', 'navigation', 'download'],
+        triple_click: ['target', 'effect', 'navigation', 'download'],
         click_and_wait_for_navigation: ['target', 'effect', 'navigation'],
         navigate: ['navigation'],
         back: ['navigation'],
@@ -1955,7 +1967,13 @@ export function projectSharedCoreResult(tool, result) {
         press_key: ['target', 'effect'],
         check: ['target', 'effect'],
         uncheck: ['target', 'effect'],
-        select_option: ['target', 'effect'],
+        select_option: [
+            'target',
+            'effect',
+            'availableOptions',
+            'availableOptionsTruncated',
+            'availableOptionCount',
+        ],
         scroll: ['target', 'effect'],
         wait: ['kind', 'waitedMs'],
         screenshot: ['format', 'width', 'height', 'data', 'file_path'],
@@ -1990,7 +2008,7 @@ export function projectSharedCoreResult(tool, result) {
         projected.download = download;
     else
         delete projected.download;
-    if ((tool === 'click' || tool === 'double_click') &&
+    if ((tool === 'click' || tool === 'double_click' || tool === 'triple_click') &&
         source.code === 'NO_CLICK_EFFECT' &&
         source.success === false) {
         projected.success = true;
@@ -2004,7 +2022,8 @@ export function projectSharedCoreResult(tool, result) {
         delete projected.error;
         delete projected.recovery;
     }
-    if ((tool === 'click' || tool === 'double_click') && source.success === true) {
+    if ((tool === 'click' || tool === 'double_click' || tool === 'triple_click') &&
+        source.success === true) {
         // Electron's established Agent contract only guarantees that the input
         // was dispatched. Keep Core's richer effect verification internal to the
         // provider so existing desktop callers still verify the business result
@@ -2079,7 +2098,7 @@ function projectSharedCoreTarget(value) {
     const projected = {};
     if (value.resolved !== undefined)
         projected.resolved = value.resolved;
-    for (const key of ['tag', 'role']) {
+    for (const key of ['tag', 'role', 'inputType', 'name']) {
         if (typeof value[key] === 'string')
             projected[key] = value[key].slice(0, 80);
     }

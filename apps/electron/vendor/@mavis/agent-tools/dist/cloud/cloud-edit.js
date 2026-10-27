@@ -46,7 +46,7 @@ import { CloudEditToolDef as EditToolDef, } from './builtin-defs.js';
 import { createEditTool } from '@earendil-works/pi-coding-agent';
 import { assertOfficeGuard, hasOfficeGuardGate } from './office-guard.js';
 import { resolveWithinWorkspace } from './path-guard.js';
-import { buildReplaceAllEdit, ReplaceAllError } from '../shared/replace-all-edit.js';
+import { buildReplaceAllEdit, ReplaceAllError, withReplaceAllCount, } from '../shared/replace-all-edit.js';
 import { executeEditWithLineNumberRetry, normalizeEditsForLineNumberRetry, } from '../shared/edit-line-number-retry.js';
 import { createCapturingEditOperations } from '../shared/edit-capture.js';
 import { withCompatibleEditToolResponse } from '../plugin-hooks/vendor-tool-response.js';
@@ -86,10 +86,12 @@ let CloudEditTool = (() => {
             // edit so we still get pi's BOM strip / line-ending restore /
             // unified-diff / withFileMutationQueue locking on the actual write.
             let piEdits;
+            let replacedCount;
             if (input.replace_all === true) {
                 try {
                     const replacement = await buildReplaceAllEdit(abs, input.old_string, input.new_string);
                     piEdits = replacement.edits;
+                    replacedCount = replacement.replacedCount;
                 }
                 catch (err) {
                     if (err instanceof ReplaceAllError) {
@@ -106,7 +108,8 @@ let CloudEditTool = (() => {
             // recovers (CR !4027 P1).
             const capture = createCapturingEditOperations();
             const tool = createEditTool(this.workspaceRoot, { operations: capture.operations });
-            const res = await executeEditWithLineNumberRetry(tool, { path: abs, edits: piEdits }, signal);
+            const piResult = await executeEditWithLineNumberRetry(tool, { path: abs, edits: piEdits }, signal);
+            const res = replacedCount === undefined ? piResult : withReplaceAllCount(piResult, abs, replacedCount);
             const textContent = res.content.filter((c) => c.type === 'text');
             const text = textContent.map((c) => c.text).join('\n');
             const result = {

@@ -884,6 +884,7 @@ export class BashToolPermissionChecker {
                 originalCommand,
                 rewrittenCommand,
                 executionKind,
+                sessionId: context.sessionId,
                 ...backgroundCtx(),
             }, '[permission] Recoverable delete rewritten to host-owned mavis-trash argv');
             // POSIX eligibility guarantees a single top-level segment. The execution
@@ -989,6 +990,7 @@ export class BashToolPermissionChecker {
             replacementCount: replacements.length,
             originalCommand,
             rewrittenCommand,
+            sessionId: context.sessionId,
             ...backgroundCtx(),
         }, `[permission] rm-rewrite applied: ${replacements.length} subcommand(s) rewritten to mavis-trash`);
         return { ...originalInput, command: rewrittenCommand };

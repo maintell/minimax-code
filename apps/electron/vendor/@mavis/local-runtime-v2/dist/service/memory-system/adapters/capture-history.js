@@ -1,5 +1,6 @@
 import { countTokens } from 'gpt-tokenizer/encoding/o200k_base';
 import { redactMemorySecrets } from '../secret-redactor.js';
+import { estimateCaptureTokens } from '../contracts/token-estimate.js';
 /** 在裁剪前判定资格，同时投影脱敏正文，供扫描与直接抽取共用。 */
 export function prepareCaptureHistory(source) {
     if (!validIdentityVector(source))
@@ -84,14 +85,16 @@ function mapMessage(eventId, sequence, value) {
             });
         case 'tool':
         case 'toolResult':
-        case 'tool-result':
-            return makeEvent({
+        case 'tool-result': {
+            const event = makeEvent({
                 eventId,
                 sequence,
                 role: 'tool',
                 kind: 'tool-result',
                 content: value.content,
             });
+            return { ...event, content: trimToolResult(event.content) };
+        }
         default:
             return undefined;
     }
@@ -107,6 +110,25 @@ function makeEvent(input) {
         content: redactMemorySecrets(text.replace(/\r\n?/gu, '\n')).content,
     };
 }
+/**
+ * 工具输出很少值得记，却最占抽取预算：只保留开头与结尾（错误常在末尾），
+ * 让同样的预算容纳更多轮用户与助手正文。截断在脱敏之后，不会切开密钥替换标记。
+ */
+const TOOL_RESULT_HEAD_CHARS = 1200;
+const TOOL_RESULT_TAIL_CHARS = 400;
+function trimToolResult(content) {
+    if (content.length <= TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS)
+        return content;
+    const head = content.slice(0, codePointBoundary(content, TOOL_RESULT_HEAD_CHARS));
+    const tail = content.slice(codePointBoundary(content, content.length - TOOL_RESULT_TAIL_CHARS));
+    const omitted = content.length - head.length - tail.length;
+    return `${head}\n…[工具输出已截断，省略 ${omitted} 个字符]…\n${tail}`;
+}
+/** 截断点落在代理对中间时后移一位，保证结果仍是合法 UTF-16。 */
+function codePointBoundary(text, index) {
+    const code = text.charCodeAt(index);
+    return code >= 0xdc00 && code <= 0xdfff ? index + 1 : index;
+}
 /** 用户消息开启一个 Turn group；裁剪保留完整问题、回答与工具结果。 */
 export function truncateToTokenBudget(events, maxInputTokens) {
     const groups = [];
@@ -118,7 +140,7 @@ export function truncateToTokenBudget(events, maxInputTokens) {
     const kept = [];
     let used = 0;
     for (const group of groups.reverse()) {
-        const cost = group.reduce((total, event) => total + estimateTokens(event.content), 0);
+        const cost = group.reduce((total, event) => total + estimateCaptureTokens(event.content), 0);
         if (used + cost > Math.max(0, maxInputTokens))
             break;
         kept.push(group);
@@ -134,10 +156,6 @@ function visibleText(content) {
     return content
         .flatMap((part) => isRecord(part) && part.type === 'text' && typeof part.text === 'string' ? [part.text] : [])
         .join('\n');
-}
-/** 与 contractId 绑定的固定估算口径,不随 tokenizer 实现漂移。 */
-function estimateTokens(value) {
-    return Math.ceil(Buffer.byteLength(value, 'utf8') / 4);
 }
 /** 新格式明确标注用户正文；旧格式仅剥离已知系统注入协议。 */
 function genuineUserText(message) {

@@ -1,4 +1,5 @@
 import { basename } from 'node:path';
+import { observeGitRead } from '../git-read-observation.js';
 import { captureGitChangesBase, classifyWorkspacePathsIgnored, enrichGitChanges, getDefaultBranch, getGitBranches, listRecentGitBranches, searchGitBranches, getGitMetadata, isGitRepo, } from '../operations/changes.js';
 import { getWorkspaceDiffContext, getWorkspaceFileDiff, listWorkspaceFileDiffs, } from '../operations/diffs.js';
 import { applyFileChangeAction, checkoutBranch, commit, commitAndPush, createBranch, push, saveWorkspaceFile, } from '../operations/mutations.js';
@@ -37,14 +38,23 @@ export class WorkspaceGitService {
             ...(options.maxWorkspaces ? { maxWorkspaces: options.maxWorkspaces } : {}),
         });
     }
-    async getChanges(workspace, mode) {
-        const identity = await this.resolveSnapshotIdentity(workspace);
-        if (mode === 'fast') {
-            const snapshot = await this.manager.getChanges(identity, 'fast');
-            return this.projectChanges(snapshot.snapshotId, snapshot.value.changes);
-        }
-        const snapshot = await this.manager.getChanges(identity, 'full');
-        return this.projectChanges(snapshot.snapshotId, snapshot.value);
+    async getChanges(workspace, mode, observer) {
+        return observeGitRead(mode, observer, async (trace) => {
+            const identity = await this.resolveSnapshotIdentity(workspace);
+            const snapshot = mode === 'fast'
+                ? await this.manager.getChanges(identity, 'fast', trace)
+                : await this.manager.getChanges(identity, 'full', trace);
+            const value = 'changes' in snapshot.value ? snapshot.value.changes : snapshot.value;
+            const result = this.projectChanges(snapshot.snapshotId, value);
+            if (trace) {
+                trace.is_git_repo = result.isGitRepo;
+                trace.result_error = Boolean(result.error);
+                trace.line_stats = result.lineStatsStatus;
+                trace.changed_files = result.changedFiles;
+                trace.result_untracked_files = result.untrackedFiles;
+            }
+            return result;
+        });
     }
     async getMetadata(workspace) {
         const identity = await this.resolveSnapshotIdentity(workspace);

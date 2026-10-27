@@ -52,10 +52,10 @@ node tools/restore/verify-main.mjs <scratch>/dist/main dist/main
 
 `verify-main.mjs` does not compile anything itself (run `pnpm build` first) and
 diffs every emitted file against the shipped `dist/main` after normalizing line
-endings and trailing whitespace. The current recovery reproduces 285 of 290
-shipped files byte-identically; the four remaining files differ only in the
+endings and trailing whitespace. The current recovery reproduces 352 of 357
+shipped files byte-identically; the five remaining files differ only in the
 order of adjacent export assignments (information the CommonJS build erases),
-and one file is a prebuilt bundle copied verbatim.
+and one prebuilt bundle is copied verbatim.
 
 `--details=<file>` writes a per-line diff report for the remaining files.
 

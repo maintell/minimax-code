@@ -6,7 +6,7 @@ export const MEMORY_V2_DEFAULTS = {
     detailedLoggingEnabled: false,
     writeEnabled: false,
     recallEnabled: false,
-    eligibleSessionIdleMs: 10 * 60 * 1000,
+    eligibleSessionIdleMs: 6 * 60 * 60 * 1000,
     maxCaptureInputTokens: 64_000,
     maxSessionDocBytes: 64 * 1024,
     maxSelectedSessions: 256,
@@ -29,6 +29,20 @@ export const MEMORY_V2_DEFAULTS = {
     retentionDays: 90,
 };
 // ── Memory config parsing ──────────────────────────────────────
+/**
+ * internal 与 inside 包默认启用 Memory V2（版本、写入与召回），作为灰度车道；其余渠道保持关闭。
+ * 只替换缺省值：配置里显式写了 `v2_enabled` 或 `v2.enabled/writeEnabled/recallEnabled` 的用户
+ * 仍按自己的选择解析，设置页关闭后不会被默认值重新打开。
+ */
+export function resolveMemoryDefaults(base, v2ByDefault) {
+    if (!v2ByDefault)
+        return base;
+    return {
+        ...base,
+        v2_enabled: true,
+        v2: { ...base.v2, writeEnabled: true, recallEnabled: true },
+    };
+}
 export function parseMemoryConfig(raw, memoryDefaults) {
     const memoryRaw = raw.memory;
     const memoryObj = memoryRaw != null && typeof memoryRaw === 'object' && !Array.isArray(memoryRaw)

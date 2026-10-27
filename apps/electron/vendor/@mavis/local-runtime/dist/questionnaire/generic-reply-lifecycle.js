@@ -150,7 +150,7 @@ export class QuestionnaireGenericReplyLifecycle {
         return record;
     }
 }
-function haveSameAnswers(left, right) {
+export function haveSameAnswers(left, right) {
     return JSON.stringify(canonicalAnswers(left)) === JSON.stringify(canonicalAnswers(right));
 }
 function canonicalAnswers(reply) {
@@ -161,6 +161,15 @@ function canonicalAnswers(reply) {
         selectedOther: answer.selectedOther === true,
         ...(answer.otherText ? { otherText: answer.otherText } : {}),
         skipped: answer.skipped === true,
+        ...(answer.contextImages?.length
+            ? {
+                contextImages: answer.contextImages.map((image) => ({
+                    contextId: image.contextId,
+                    annotationId: image.annotationId,
+                    sha256: image.sha256,
+                })),
+            }
+            : {}),
     }))
         .sort((left, right) => left.stepId.localeCompare(right.stepId));
 }

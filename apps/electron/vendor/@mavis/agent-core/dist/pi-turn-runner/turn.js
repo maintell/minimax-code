@@ -122,6 +122,7 @@ export function newTurn(input, deps) {
         blockedToolCalls: [],
         syntheticResponse,
         rejectedAssistantMessages: new Set(),
+        requestStoppedBeforeSend: false,
         recovery: { used: false },
         nextEventId,
         nextRuntimeSeq,

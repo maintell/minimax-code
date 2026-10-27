@@ -1,5 +1,6 @@
 import { ConversationTurnRejectedError } from '@mavis/conversation-contract';
 import { parseModelVerdict, } from '@mavis/agent-tools/desktop';
+import { logger } from '../common/logger.js';
 export async function runInjectedConversationTaskTurn(input) {
     const taskIdentity = {
         requestedAgentName: input.requestedAgentName ?? input.resolvedAgentName ?? 'unknown',
@@ -98,16 +99,64 @@ export async function readTaskOccupancy(conversation, parentSessionId) {
     }
 }
 export function localTaskAdmissionFailure(error, occupancy) {
-    if (isSubagentConcurrencyLimitRejection(error)) {
-        const limit = occupancy
-            ? ` (${String(occupancy.active)} running, limit ${String(occupancy.limit)})`
-            : '';
-        return {
-            errorMessage: `This parent Session has reached its configured child-Agent concurrency limit${limit}. Wait for one to finish, then retry.`,
-            errorCode: SUBAGENT_CONCURRENCY_LIMIT_ERROR_CODE,
-        };
-    }
+    if (isSubagentConcurrencyLimitRejection(error))
+        return concurrencyLimitFailure(occupancy);
     return { errorMessage: error instanceof Error ? error.message : String(error) };
+}
+function concurrencyLimitFailure(occupancy) {
+    const limit = occupancy
+        ? ` (${String(occupancy.active)} running, limit ${String(occupancy.limit)})`
+        : '';
+    return {
+        errorMessage: `This parent Session has reached its configured child-Agent concurrency limit${limit}. Wait for one to finish, then retry.`,
+        errorCode: SUBAGENT_CONCURRENCY_LIMIT_ERROR_CODE,
+    };
+}
+/**
+ * Fails a `task` call before it creates a task row or child Session when the
+ * parent is already full. Real admission resolves the parent from the child
+ * Session id, so it cannot run before that Session exists; without this check
+ * every call rejected at admission left an empty child Session behind. This is
+ * only an early exit that reserves nothing: the admission transaction still
+ * enforces the limit. Resolves undefined when the call may proceed, including
+ * when occupancy cannot be read.
+ */
+export async function precheckTaskConcurrency(input) {
+    const occupancy = await readTaskOccupancy(input.conversation, input.parentSessionId);
+    if (!occupancy || occupancy.active < occupancy.limit)
+        return undefined;
+    logBestEffort(() => logger.info({
+        parentSessionId: input.parentSessionId,
+        active: occupancy.active,
+        limit: occupancy.limit,
+        activeChildSessionIds: occupancy.activeChildSessionIds,
+        requestedAgentName: input.requestedAgentName,
+    }, 'subagent_task_precheck_rejected'));
+    return concurrencyLimitFailure(occupancy);
+}
+/**
+ * The precheck passed, but another entry (task_append, session send, a queued
+ * dispatch) took the last slot before this child's admission. The task keeps
+ * today's failure and leaves its child Session; this records how often the
+ * window is actually hit.
+ */
+export function logTaskAdmissionRejectedAfterPrecheck(input) {
+    logBestEffort(() => logger.warn({
+        parentSessionId: input.parentSessionId,
+        taskId: input.taskId,
+        childSessionId: input.childSessionId,
+        active: input.occupancy?.active,
+        limit: input.occupancy?.limit,
+        activeChildSessionIds: input.occupancy?.activeChildSessionIds,
+    }, 'subagent_task_admission_rejected_after_precheck'));
+}
+function logBestEffort(write) {
+    try {
+        write();
+    }
+    catch {
+        // Diagnostics must never change the task result.
+    }
 }
 function buildConversationVerification(input) {
     if (input.agentRole !== 'verifier')

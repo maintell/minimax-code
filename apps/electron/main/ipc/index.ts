@@ -37,6 +37,8 @@ import { setupEmbeddedBrowserIPC } from "./embeddedBrowser.ipc";
 import { setupMiniAppIPC } from "./miniApp.ipc";
 import { setupMiniAppComposerIPC } from "./miniAppComposer.ipc";
 import { setupMiniAppAgentIPC } from "./miniAppAgent.ipc";
+import { setupMiniAppToolIPC } from "./miniAppTool.ipc";
+import { setupMiniAppSpeechIPC } from "./miniAppSpeech.ipc";
 import { setupBrowserProfileImportIPC } from "./browserProfileImport.ipc";
 import { setupFileIPC } from "./file.ipc";
 import { setupDevToolsIPC } from "./devtools.ipc";
@@ -162,15 +164,21 @@ export async function setupAllIPC(options) {
     setupNotificationIPC();
     setupHotUpdateIPC();
     setupContextMenuIPC();
-    const shutdownCuPermission = setupCuPermissionIPC();
-    setupCuPreviewIPC();
+    const shutdownCuPermissionIPC = setupCuPermissionIPC();
+    const shutdownCuPreview = setupCuPreviewIPC();
+    const shutdownCuPermission = () => {
+        shutdownCuPermissionIPC();
+        shutdownCuPreview();
+    };
     setupPreviewClipboardIPC();
     const disposeOSSSharedAuth = configureOSSSharedAuthSession(options.sharedAuthSession, {
         onAccessTokenInvalidated: resyncSharedRuntimeProjection,
     });
     let documentPreview;
     let disposeMiniAppComposer;
+    let disposeMiniAppTool;
     let disposeMiniAppAgent;
+    let disposeMiniAppSpeech;
     const disposeModelMenuPopup = setupModelMenuPopupIPC();
     try {
         documentPreview = setupDocumentPreviewIPC({
@@ -192,6 +200,8 @@ export async function setupAllIPC(options) {
         setupMiniAppIPC();
         disposeMiniAppComposer = setupMiniAppComposerIPC();
         disposeMiniAppAgent = setupMiniAppAgentIPC();
+        disposeMiniAppTool = setupMiniAppToolIPC();
+        disposeMiniAppSpeech = setupMiniAppSpeechIPC();
         setupBrowserProfileImportIPC();
         await setupRemoteControlBridgeIPC();
     }
@@ -199,6 +209,8 @@ export async function setupAllIPC(options) {
         shutdownCuPermission();
         disposeMiniAppComposer?.();
         disposeMiniAppAgent?.();
+        disposeMiniAppTool?.();
+        disposeMiniAppSpeech?.();
         disposeModelMenuPopup();
         disposeOSSSharedAuth();
         try {
@@ -218,6 +230,8 @@ export async function setupAllIPC(options) {
     return createLifecycleIPCHandle(documentPreview, sshProjects, () => {
         disposeMiniAppComposer?.();
         disposeMiniAppAgent?.();
+        disposeMiniAppTool?.();
+        disposeMiniAppSpeech?.();
         disposeModelMenuPopup();
         disposeOSSSharedAuth();
     }, shutdownCuPermission);

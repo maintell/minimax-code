@@ -25,4 +25,27 @@ export async function waitForReviewCompletion(conversation, sessionId, completio
             signal.removeEventListener('abort', onAbort);
     }
 }
+/** The review subagent's outcome from its completed round: its projected annotation result. */
+export function reviewSubagentResult(result) {
+    if (result.status !== 'completed') {
+        return result.status === 'aborted'
+            ? { status: 'aborted' }
+            : { status: 'failed', errorMessage: result.error ?? 'Review subagent failed.' };
+    }
+    const finalText = [...result.messages]
+        .reverse()
+        .find((message) => message.role === 'assistant' && message.text?.trim())
+        ?.text?.trim();
+    if (!finalText) {
+        return { status: 'failed', errorMessage: 'Review subagent returned no final response.' };
+    }
+    const normalized = normalizeSubagentFinalText(finalText);
+    if (!isProjectedReviewResult(normalized)) {
+        return {
+            status: 'failed',
+            errorMessage: 'Review subagent did not return a projected annotation result.',
+        };
+    }
+    return { status: 'succeeded', finalText: normalized };
+}
 //# sourceMappingURL=subagent-result.js.map

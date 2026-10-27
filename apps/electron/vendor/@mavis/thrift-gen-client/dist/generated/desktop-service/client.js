@@ -5,6 +5,21 @@ import { invokeHttpSse, } from '../../runtime/sse.js';
 import { DESKTOP_SERVICE_ROUTES, DESKTOP_SERVICE_SSE_CONTRACTS } from './routes.js';
 export function createDesktopServiceClient(options) {
     return {
+        listBackgroundTasks(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listBackgroundTasks, req, callOptions);
+        },
+        getBackgroundTask(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getBackgroundTask, req, callOptions);
+        },
+        readBackgroundTaskOutput(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput, req, callOptions);
+        },
+        stopBackgroundTask(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.stopBackgroundTask, req, callOptions);
+        },
+        deleteBackgroundTask(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deleteBackgroundTask, req, callOptions);
+        },
         ping(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ping, req, callOptions);
         },
@@ -623,8 +638,17 @@ export function createDesktopServiceClient(options) {
         inspectTurnContinuation(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.inspectTurnContinuation, req, callOptions);
         },
+        getSessionActivity(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSessionActivity, req, callOptions);
+        },
         abortSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.abortSession, req, callOptions);
+        },
+        cancelPromptSuggestion(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion, req, callOptions);
+        },
+        getPromptSuggestion(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getPromptSuggestion, req, callOptions);
         },
         steerSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.steerSession, req, callOptions);

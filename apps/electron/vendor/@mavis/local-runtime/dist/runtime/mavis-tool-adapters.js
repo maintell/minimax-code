@@ -1,3 +1,5 @@
+import { createSessionWithFirstMessage } from './mavis-session-create.js';
+import { interruptLocalSession } from './mavis-session-interrupt.js';
 import { sendToLocalSession } from './mavis-session-send.js';
 export { buildMavisCronAdapter } from './mavis-cron-adapter.js';
 export function buildMavisSessionAdapter(deps) {
@@ -32,6 +34,14 @@ export function buildMavisSessionAdapter(deps) {
             return { ...(session ? { session: await deps.serializeSession(session) } : {}) };
         },
         updateSession: async (req) => {
+            const invalid = invalidUpdateField(req);
+            if (invalid) {
+                throw Object.assign(new Error(`${invalid} is not a valid value`), {
+                    status: 400,
+                    code: 'SESSION_UPDATE_INVALID_FIELD',
+                    field: invalid,
+                });
+            }
             const current = await deps.getSessionById(req.sessionId);
             if (!current) {
                 throw Object.assign(new Error(`Session not found: ${req.sessionId}`), {
@@ -39,26 +49,8 @@ export function buildMavisSessionAdapter(deps) {
                     code: 'SESSION_NOT_FOUND',
                 });
             }
-            const updated = await deps.updateSession(req.sessionId, {
-                ...(Object.hasOwn(req, 'title') ? { title: req.title } : {}),
-                ...(Object.hasOwn(req, 'archived') ? { archived: req.archived } : {}),
-            });
+            const updated = await writeSessionUpdate(deps, req);
             return { session: await deps.serializeSession(updated ?? current), success: true };
-        },
-        deleteSession: async (req) => {
-            const session = await deps.getSessionById(req.sessionId);
-            if (!session) {
-                throw Object.assign(new Error(`Session not found: ${req.sessionId}`), {
-                    status: 404,
-                    code: 'SESSION_NOT_FOUND',
-                });
-            }
-            await deps.deleteSession(req.sessionId);
-            await deps.deleteMessageState(req.sessionId);
-            await deps.deleteQueuedMessages(req.sessionId);
-            await deps.markMigratedLegacySessionDeleted(req.sessionId);
-            deps.clearRootSessionIf(req.sessionId);
-            return { success: true };
         },
         listMessages: async (req, signal) => {
             if (req.source === 'cloud') {
@@ -77,7 +69,25 @@ export function buildMavisSessionAdapter(deps) {
             };
         },
         sendSession: (req, signal) => sendToLocalSession(deps, req, signal),
+        interruptSession: (req) => interruptLocalSession(deps, req),
+        createSession: (req, signal) => createSessionWithFirstMessage(deps, req, signal),
     };
+}
+/**
+ * The model-facing values the lifecycle does not reject on its own. A failure
+ * here happens before any write, so the rest of the update never lands.
+ */
+function invalidUpdateField(req) {
+    if (req.model !== undefined && !/^[^/\s]+\/[^/\s]+$/.test(req.model))
+        return 'model';
+    return undefined;
+}
+function writeSessionUpdate(deps, req) {
+    return deps.updateSession(req.sessionId, {
+        ...(Object.hasOwn(req, 'title') ? { title: req.title } : {}),
+        ...(Object.hasOwn(req, 'archived') ? { archived: req.archived } : {}),
+        ...(Object.hasOwn(req, 'model') ? { effectiveModel: req.model } : {}),
+    });
 }
 function pageBySessionCursor(items, cursor, limit) {
     const start = cursor === undefined

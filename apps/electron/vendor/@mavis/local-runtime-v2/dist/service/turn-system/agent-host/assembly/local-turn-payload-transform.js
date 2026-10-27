@@ -94,6 +94,14 @@ export function buildLocalRequestPayloadTransform(input, runtime) {
         supportsJsonObjectOutput: input.llm.supportsJsonObjectOutput === true,
     });
 }
+/**
+ * Optional next-message calls reuse the main request transform unchanged, so
+ * thinking and effort follow exactly what the user selected for the Turn. Only
+ * the main Turn's output contract is dropped: the suggestion is plain text.
+ */
+export function buildPromptSuggestionPayloadTransform(input, runtime) {
+    return buildLocalRequestPayloadTransform({ ...input, outputContract: undefined }, runtime);
+}
 export function buildTurnPayloadTransforms(input, outputContract, options) {
     const transformInput = {
         agentConfig: input.preparation.agentConfig,

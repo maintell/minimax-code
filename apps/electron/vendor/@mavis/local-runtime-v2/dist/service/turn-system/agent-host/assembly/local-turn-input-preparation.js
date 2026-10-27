@@ -60,7 +60,7 @@ export class LocalTurnInputPreparer {
                             .filter((item) => keys.has(item.key))
                             .map((item) => item.attachment);
                         return {
-                            text: promptTexts[index],
+                            text: peerSessionEnvelope(member.messages, promptTexts[index]),
                             ...(inline.length > 0 ? { attachments: inline } : {}),
                             ...backgroundTaskOrigin(member.messages),
                         };
@@ -68,7 +68,11 @@ export class LocalTurnInputPreparer {
                     initialBatchGenuineUserQueryTexts: genuineUserQueryTexts,
                 }
                 : {}),
-            promptText,
+            // The executor sends initialBatchMessages and drops this joined prompt
+            // whenever a batch exists, so wrapping it would label text nobody reads.
+            promptText: batchInputs
+                ? promptText
+                : peerSessionEnvelope(canonicalUserInput.messages, promptText),
             genuineUserQueryText,
             userMessage: {
                 ...(selectedMedia.attachments.length > 0 ? { attachments: selectedMedia.attachments } : {}),
@@ -174,7 +178,7 @@ export class LocalTurnInputPreparer {
         }
         return {
             userMessage: {
-                text: [...reminderBlocks, projected.content].filter(Boolean).join('\n\n'),
+                text: peerSessionEnvelope(canonical.messages, [...reminderBlocks, projected.content].filter(Boolean).join('\n\n')),
                 ...(selectedMedia.attachments.length > 0 ? { attachments: selectedMedia.attachments } : {}),
                 ...backgroundTaskOrigin(canonical.messages),
             },
@@ -317,6 +321,41 @@ function validateBackgroundReminder(value) {
     }
     return value;
 }
+/**
+ * The stored message stays the original text. The model sees who sent it only
+ * here, from the origin frozen at send time. A sender can otherwise close the
+ * envelope and open a second one naming any session, so those tags are
+ * neutralized inside the body.
+ */
+function peerSessionEnvelope(messages, text) {
+    const origin = messages.map((message) => message.origin).find(isPeerSessionOrigin);
+    if (!origin)
+        return text;
+    const title = origin.fromTitle?.trim();
+    const attributes = [
+        `from_session_id="${escapeXmlAttribute(origin.fromSession)}"`,
+        ...(origin.fromAgent ? [`from_agent="${escapeXmlAttribute(origin.fromAgent)}"`] : []),
+        ...(title ? [`from_title="${escapeXmlAttribute(title)}"`] : []),
+    ];
+    return `<cross-session-message ${attributes.join(' ')}>\n${neutralizeEnvelope(text)}\n</cross-session-message>`;
+}
+/** Narrows the union only; trust was already decided in `createCanonicalUserInput`. */
+function isPeerSessionOrigin(origin) {
+    return (origin !== undefined &&
+        'command' in origin &&
+        origin.command === 'session send' &&
+        origin.fromSession.trim().length > 0);
+}
+function neutralizeEnvelope(content) {
+    return content.replace(/<\s*\/?\s*cross-session-message/gi, (tag) => tag.replace('<', '&lt;'));
+}
+function escapeXmlAttribute(value) {
+    return value
+        .replaceAll('&', '&amp;')
+        .replaceAll('"', '&quot;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+}
 function backgroundTaskOrigin(messages) {
     const origins = messages.flatMap((message) => message.origin?.kind === 'background-task-terminal' ? [message.origin] : []);
     if (origins.length === 0)
@@ -458,7 +497,7 @@ export function prepareSteeringTeardownCanonicalInput(input) {
     });
     const reminder = buildAttachmentReminder(entries, inlinedKeys, TEARDOWN_ATTACHMENT_CAPABILITIES);
     return {
-        text: [reminder, canonical.text].filter(Boolean).join('\n\n'),
+        text: peerSessionEnvelope(canonical.messages, [reminder, canonical.text].filter(Boolean).join('\n\n')),
         attachments: inline,
     };
 }

@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { miniAppPermissionId } from '@mavis/shared/miniapp-surface';
 import { ConnectorGatewayError, } from '../../../host-connector-system/index.js';
 import { bindMiniAppIpcChannel, encodeMiniAppIpcMessage, sendMiniAppIpcMessage, } from '../node-runtime/ipc-transport.js';
+import { raceWithSignal } from './host-connector-abort.js';
 import { createHostAgentSession } from './host-connector-agent.js';
+import { createHostToolSession } from './host-connector-tool.js';
 import { createHostConnectorGatewayRelease, HostConnectorSessionLifecycle, } from './host-connector-quiesce.js';
-import { HostConnectorCancelledError, HostConnectorProtocolError, HostConnectorRequestTimeoutError, normalizeGatewayError, providerWireError, serviceRestartedWireError, staleToolWireError, unavailableWireError, } from './host-connector-errors.js';
-import { hasExactKeys, hasHostConnectorRequestCapacity, isAgentMethod, isAgentTurnMethod, isBoundedIdentifier, isRecord, isRequestId, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, } from './host-connector-wire.js';
+import { HostConnectorCancelledError, HostConnectorProtocolError, HostConnectorRequestTimeoutError, normalizeGatewayError, notPermittedWireError, providerWireError, serviceRestartedWireError, staleToolWireError, unavailableWireError, } from './host-connector-errors.js';
+import { hasExactKeys, hasHostConnectorRequestCapacity, isAgentMethod, isAgentSessionReadMethod, isAgentStreamMethod, isBoundedIdentifier, isCancelMethod, isRecord, isRequestId, isToolMethod, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, } from './host-connector-wire.js';
 export { createMiniAppHostConnectorRuntimeClient, } from './host-connector-client.js';
 function requireHostRequestAdmission(id, method, highestRequestId, requests) {
     const numericId = BigInt(id);
@@ -36,7 +39,7 @@ function registerActiveHostRequest(requests, id, controller, method) {
         method,
         controller,
         completion,
-        agent: isAgentTurnMethod(method),
+        endsOnCutover: isAgentStreamMethod(method) || isAgentSessionReadMethod(method),
         dispatched: false,
         complete: () => {
             requests.delete(id);
@@ -46,12 +49,26 @@ function registerActiveHostRequest(requests, id, controller, method) {
     requests.set(id, request);
     return request;
 }
-/** Agent turns never hold a cutover open; they settle through their own terminal frame. */
+/**
+ * Agent turns, observers and session reads never hold a cutover open: once it commits they are
+ * cancelled, so the retired generation receives no more of the user's sessions.
+ */
 function abortAgentRequests(requests) {
     for (const request of requests.values()) {
-        if (request.agent) {
+        if (request.endsOnCutover) {
             request.controller.abort(new HostConnectorCancelledError('Mini App Agent run cancelled'));
         }
+    }
+}
+/**
+ * A forced cutover stops waiting for dispatched work that missed the drain deadline. Responses
+ * still publish, so each child caller gets its terminal outcome (unknown after dispatch for a
+ * call) before the root stops.
+ */
+function abortDispatchedRequests(requests) {
+    for (const request of requests.values()) {
+        if (request.dispatched)
+            request.controller.abort();
     }
 }
 /** Host-side generation-bound session backed only by the ConnectorGateway seam. */
@@ -72,29 +89,23 @@ function createHostConnectorSession(options, input) {
     let refs = new Map();
     let refsByHandle = new Map();
     const lifecycle = new HostConnectorSessionLifecycle();
+    const connectorSwitches = createConnectorSwitchView(options.permissionSwitches, input.pluginId);
     let handshakeStarted = false;
     let fatalReported = false;
     let publishResponses = true;
     let retirePromise;
-    const releaseGateway = createHostConnectorGatewayRelease(options.gateway, input);
     const makeToolRef = options.makeToolRef ?? randomUUID;
     const makeInvocationId = options.makeInvocationId ?? randomUUID;
     const timeouts = hostSessionTimeouts(options);
     const writer = createHostResponseWriter(input.transport, () => publishResponses && !lifecycle.isRetired() && input.transport.connected !== false);
     const enqueueResponse = writer.enqueue;
-    const agent = createHostAgentSession({
-        gateway: options.agentGateway,
-        identity: input,
+    const { agent, tool, releaseBindings } = createHostSessionBindings({
+        options,
+        input,
         lifecycle,
         makeInvocationId: () => requireInvocationId(makeInvocationId()),
-        maxFrameBytes: RESPONSE_MAX_BYTES,
         enqueueResponse,
-        ...(options.logger ? { logger: options.logger } : {}),
     });
-    const releaseBindings = () => {
-        releaseGateway();
-        agent.release();
-    };
     const detach = bindMiniAppIpcChannel(input.transport, {
         type: 'miniapp:connector',
         maxBytes: REQUEST_MAX_BYTES,
@@ -108,7 +119,7 @@ function createHostConnectorSession(options, input) {
     });
     function handleFrame(value) {
         const frame = decodeRequest(value);
-        if (frame.method === 'connector.cancel' || frame.method === 'agent.cancel') {
+        if (isCancelMethod(frame.method)) {
             cancelHostRequest(requests, frame.id, highestRequestId);
             return;
         }
@@ -118,7 +129,7 @@ function createHostConnectorSession(options, input) {
         request.execution = runTimedHostRequest({
             frame,
             controller,
-            timeoutMs: isAgentTurnMethod(frame.method) ? undefined : timeouts.requestMs,
+            timeoutMs: isAgentStreamMethod(frame.method) ? undefined : requestTimeoutMs(frame, timeouts),
             dispatch,
             fail,
             complete: request.complete,
@@ -128,6 +139,10 @@ function createHostConnectorSession(options, input) {
         if (isAgentMethod(frame.method)) {
             const markDispatched = () => markHostRequestDispatched(requests, frame.id);
             return agent.handle({ ...frame, method: frame.method }, signal, markDispatched);
+        }
+        if (isToolMethod(frame.method)) {
+            const markDispatched = () => markHostRequestDispatched(requests, frame.id);
+            return tool.handle({ ...frame, method: frame.method }, signal, markDispatched);
         }
         const gate = lifecycle.gate();
         if (gate !== 'open') {
@@ -151,6 +166,7 @@ function createHostConnectorSession(options, input) {
             arguments: callParams.arguments,
             signal,
             refs,
+            isPermitted: connectorSwitches.permits,
             gateway: options.gateway,
             pluginId: input.pluginId,
             processGeneration: input.processGeneration,
@@ -166,17 +182,15 @@ function createHostConnectorSession(options, input) {
         try {
             const inventory = await listHostConnectorTools({
                 gateway: options.gateway,
-                pluginId: input.pluginId,
-                processGeneration: input.processGeneration,
-                providers: input.providers,
+                session: input,
                 signal,
                 makeToolRef,
                 previousRefs: refsByHandle,
                 markDispatched: () => markHostRequestDispatched(requests, id),
             });
-            refs = inventory.refs;
-            refsByHandle = inventory.refsByHandle;
-            await respond(id, { tools: inventory.tools, partial: inventory.partial });
+            ({ refs, refsByHandle } = inventory);
+            const tools = connectorSwitches.visible(inventory.tools);
+            await respond(id, { tools, partial: inventory.partial });
         }
         catch (error) {
             await respondError(id, normalizeGatewayError(error));
@@ -235,8 +249,10 @@ function createHostConnectorSession(options, input) {
                 signal: quiesceInput.signal,
                 // Agent turns are aborted only once the switch is final: a `busy` or resumed quiesce
                 // leaves the old generation running, and its in-flight turns must survive that.
-                commit: () => {
+                commit: (forced) => {
                     abortAgentRequests(requests);
+                    if (forced)
+                        abortDispatchedRequests(requests);
                     refs.clear();
                     refsByHandle.clear();
                     releaseBindings();
@@ -255,10 +271,64 @@ function createHostConnectorSession(options, input) {
         },
     };
 }
+/**
+ * The `connector:<provider>` switches as one session applies them. A switched-off provider is
+ * hidden from `list` but its refs stay valid: calls with them are refused until it is back on.
+ */
+function createConnectorSwitchView(switches, pluginId) {
+    let providersByRef = new Map();
+    const isOn = (provider) => switches?.isEnabled(pluginId, miniAppPermissionId('connector', provider)) ?? true;
+    return {
+        /** Records which provider each listed ref belongs to; returns the tools the user allows. */
+        visible(tools) {
+            providersByRef = new Map(tools.map(({ toolRef, provider }) => [toolRef, provider]));
+            return tools.filter(({ provider }) => isOn(provider));
+        },
+        permits(toolRef) {
+            const provider = providersByRef.get(toolRef);
+            return provider === undefined || isOn(provider);
+        },
+    };
+}
+/** Agent and tool handlers sharing the session's lifecycle, identity and response queue. */
+function createHostSessionBindings(binding) {
+    const { options, input, lifecycle, makeInvocationId, enqueueResponse } = binding;
+    const releaseGateway = createHostConnectorGatewayRelease(options.gateway, input);
+    const agent = createHostAgentSession({
+        gateway: options.agentGateway,
+        identity: input,
+        lifecycle,
+        makeInvocationId,
+        maxFrameBytes: RESPONSE_MAX_BYTES,
+        enqueueResponse,
+        ...(options.logger ? { logger: options.logger } : {}),
+    });
+    const tool = createHostToolSession({
+        gateway: options.toolGateway,
+        identity: input,
+        lifecycle,
+        makeInvocationId,
+        maxFrameBytes: RESPONSE_MAX_BYTES,
+        enqueueResponse,
+    });
+    return {
+        agent,
+        tool,
+        releaseBindings: () => {
+            releaseGateway();
+            agent.release();
+            tool.release();
+        },
+    };
+}
 async function dispatchHostConnectorCall(input) {
     const handle = input.refs.get(input.toolRef);
     if (!handle) {
         await input.respondError(input.id, staleToolWireError());
+        return;
+    }
+    if (!input.isPermitted(input.toolRef)) {
+        await input.respondError(input.id, notPermittedWireError());
         return;
     }
     let invocationId;
@@ -301,7 +371,17 @@ function hostSessionTimeouts(options) {
         graceMs: Math.max(1, options.graceTimeoutMs ?? 4_000),
         settleMs: Math.max(1, options.settleTimeoutMs ?? 1_000),
         requestMs: Math.max(1, options.requestTimeoutMs ?? 30_000),
+        mcpToolMs: Math.max(1, options.mcpToolRequestTimeoutMs ?? 120_000),
     };
+}
+/**
+ * `tool.call` / `tool.request` wait for the user's approval, so the tool gateway bounds each of
+ * their phases itself; `tool.list` discovers MCP servers and gets the MCP bound.
+ */
+function requestTimeoutMs(frame, timeouts) {
+    if (frame.method === 'tool.call' || frame.method === 'tool.request')
+        return undefined;
+    return frame.method === 'tool.list' ? timeouts.mcpToolMs : timeouts.requestMs;
 }
 async function runTimedHostRequest(input) {
     const timer = input.timeoutMs === undefined
@@ -321,11 +401,11 @@ async function runTimedHostRequest(input) {
 }
 async function listHostConnectorTools(input) {
     const operation = input.gateway.list({
-        providerAllowlist: input.providers,
+        providerAllowlist: input.session.providers,
         caller: {
             kind: 'host-process',
-            pluginId: input.pluginId,
-            processGeneration: input.processGeneration,
+            pluginId: input.session.pluginId,
+            processGeneration: input.session.processGeneration,
         },
         signal: input.signal,
     });
@@ -442,22 +522,6 @@ async function writeHostResponse(previous, shouldPublish, transport, value) {
         return;
     await sendMiniAppIpcMessage(transport, encodeMiniAppIpcMessage('miniapp:connector', value, RESPONSE_MAX_BYTES));
 }
-async function raceWithSignal(operation, signal) {
-    if (signal.aborted)
-        return Promise.reject(signal.reason);
-    let rejectOnAbort = () => undefined;
-    const aborted = new Promise((_resolve, reject) => {
-        rejectOnAbort = reject;
-    });
-    const onAbort = () => rejectOnAbort(signal.reason);
-    try {
-        signal.addEventListener('abort', onAbort, { once: true });
-        return await Promise.race([operation, aborted]);
-    }
-    finally {
-        signal.removeEventListener('abort', onAbort);
-    }
-}
 async function ignoreFailure(operation) {
     try {
         await operation;
@@ -478,8 +542,7 @@ function decodeCallParams(params) {
 function decodeRequest(value) {
     if (!isRecord(value) || value.v !== 1 || !isRequestId(value.id))
         throw protocolParamsError();
-    if ((value.method === 'connector.cancel' || value.method === 'agent.cancel') &&
-        hasExactKeys(value, ['v', 'id', 'method'])) {
+    if (isCancelMethod(value.method) && hasExactKeys(value, ['v', 'id', 'method'])) {
         return { id: value.id, method: value.method };
     }
     if (!isParamsMethod(value.method) ||
@@ -492,7 +555,7 @@ function decodeRequest(value) {
 function isParamsMethod(value) {
     return (value === 'connector.list' ||
         value === 'connector.call' ||
-        (typeof value === 'string' && isAgentMethod(value)));
+        (typeof value === 'string' && (isAgentMethod(value) || isToolMethod(value))));
 }
 function parseJson(json, maxBytes) {
     if (Buffer.byteLength(json) > maxBytes) {

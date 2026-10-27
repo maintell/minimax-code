@@ -1,8 +1,8 @@
-import { CRON_TOOL_NAMES, agentNameDescription, } from '@mavis/agent-tools/desktop';
+import { MAVIS_CAPABILITY_TOOL_NAMES, agentNameDescription, } from '@mavis/agent-tools/desktop';
 import { AGENT_BUILTIN_TOOL_IDS, isAgentBuiltinToolEnabled, } from '@mavis/config';
 export function filterLocalBuiltinCapabilityTools(tools, capabilities) {
     const configurableToolNames = new Set(AGENT_BUILTIN_TOOL_IDS);
-    const capabilityFiltered = tools.filter((tool) => (!['mavis', ...CRON_TOOL_NAMES].includes(tool.def.name) || capabilities.features.mavis) &&
+    const capabilityFiltered = tools.filter((tool) => (!MAVIS_CAPABILITY_TOOL_NAMES.includes(tool.def.name) || capabilities.features.mavis) &&
         (!configurableToolNames.has(tool.def.name) ||
             isAgentBuiltinToolEnabled(capabilities, tool.def.name)));
     return capabilities.features.mavis

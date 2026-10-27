@@ -1,4 +1,5 @@
 import { buildRunningSessionStatusEvent } from '../event-bridge/index.js';
+import { isLLMRequestStoppedMessage } from './llm-retry.js';
 import { immediateSendBatchId } from './outbound-message-normalizer.js';
 export async function emitRunning(turn) {
     try {
@@ -130,6 +131,21 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         }
         return 'emit';
     };
+    /**
+     * A request the host refused to send (its request budget closed while a
+     * steering, retry or regeneration path still asked for one) ends the Turn
+     * normally: Pi reports it as a run failure, which is dropped here and not
+     * shown, and `runAgent` does not treat it as a failure.
+     */
+    const isRefusedRequestFailure = (message) => {
+        if (message.role !== 'assistant' ||
+            message.stopReason !== 'error' ||
+            !isLLMRequestStoppedMessage(message.errorMessage)) {
+            return false;
+        }
+        turn.requestStoppedBeforeSend = true;
+        return true;
+    };
     const discardAssistantMessage = (event) => {
         // Agent.state and Pi's private loop context are distinct arrays containing
         // the same final message object. Remove the public transcript copy now and
@@ -174,8 +190,12 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                 // The poll reports whether more steps already follow. At an exit
                 // boundary the host may withhold messages so the close below hands
                 // them back to the session instead of extending a finished answer.
-                const boundary = hasToolCalls || agent.hasQueuedMessages() ? 'mid-turn' : 'exit';
-                const steering = [...((await turn.input.getSteeringMessages?.({ boundary })) ?? [])];
+                // Once the host closed the Turn's work, every poll is an exit.
+                const workClosed = (await turn.input.isWorkClosed?.()) === true;
+                const boundary = !workClosed && (hasToolCalls || agent.hasQueuedMessages()) ? 'mid-turn' : 'exit';
+                const steering = [
+                    ...((await turn.input.getSteeringMessages?.(workClosed ? { boundary, workClosed } : { boundary })) ?? []),
+                ];
                 enqueueSteering(agent, steering);
                 if (steering.length > 0 || hasToolCalls || agent.hasQueuedMessages())
                     return;
@@ -183,6 +203,7 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                     return;
                 if (await turn.input.tryBeginClose({
                     ...lastAssistantMessageContext(event.message),
+                    ...(workClosed ? { workClosed } : {}),
                 })) {
                     continuationsClosed = true;
                     return;
@@ -197,14 +218,51 @@ export function subscribeEvents(agent, turn, history, nowMs) {
             failContinuationPoll(error);
         }
     };
+    /**
+     * A refused request ends the Turn: no further request can carry steering
+     * into it. Close once anyway, as a final close the host cannot refuse for
+     * pending steering, so user steering this Turn never consumed goes back to
+     * the session instead of being dropped when the Turn completes (Goal spec
+     * §5.5). Steering that keeps arriving cannot loop: nothing continues.
+     */
+    const closeAfterRefusedRequest = async () => {
+        if (continuationsClosed ||
+            !turn.requestStoppedBeforeSend ||
+            forcedTermination !== undefined ||
+            turn.input.signal?.aborted === true) {
+            return;
+        }
+        continuationsClosed = true;
+        await turn.input.tryBeginClose?.({
+            ...lastAssistantMessageContext(lastAssistantMessage(agent)),
+            workClosed: true,
+            final: true,
+        });
+    };
     const convergeAtIdle = async () => {
-        if (!turn.input.tryBeginClose || continuationsClosed || cannotContinueAtIdle())
+        if (!turn.input.tryBeginClose || continuationsClosed)
             return;
         try {
             let closeRefused = false;
             while (!continuationsClosed && !cannotContinueAtIdle()) {
-                const boundary = agent.hasQueuedMessages() ? 'mid-turn' : 'exit';
-                const steering = [...((await turn.input.getSteeringMessages?.({ boundary })) ?? [])];
+                // A Turn whose work is closed only closes here: its pending user
+                // steering is handed back to the session by the close (spec: no
+                // input lost, none run inside a Turn that can only wrap up). When
+                // other steering refuses that close, the poll below stays a
+                // work-closed exit so it still leaves user steering to the session.
+                const workClosed = (await turn.input.isWorkClosed?.()) === true;
+                if (workClosed &&
+                    (await turn.input.tryBeginClose?.({
+                        ...lastAssistantMessageContext(lastAssistantMessage(agent)),
+                        workClosed: true,
+                    }))) {
+                    continuationsClosed = true;
+                    return;
+                }
+                const boundary = !workClosed && agent.hasQueuedMessages() ? 'mid-turn' : 'exit';
+                const steering = [
+                    ...((await turn.input.getSteeringMessages?.(workClosed ? { boundary, workClosed } : { boundary })) ?? []),
+                ];
                 if (steering.length > 0) {
                     enqueueSteering(agent, steering);
                     closeRefused = false;
@@ -212,9 +270,8 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                     continue;
                 }
                 if (await turn.input.tryBeginClose({
-                    ...lastAssistantMessageContext([...agent.state.messages]
-                        .reverse()
-                        .find((message) => message.role === 'assistant')),
+                    ...lastAssistantMessageContext(lastAssistantMessage(agent)),
+                    ...(workClosed ? { workClosed } : {}),
                 })) {
                     continuationsClosed = true;
                     return;
@@ -224,6 +281,7 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                 }
                 closeRefused = true;
             }
+            await closeAfterRefusedRequest();
         }
         catch (error) {
             failContinuationPoll(error);
@@ -275,7 +333,9 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         let discardMessage = false;
         try {
             if (event.type === 'message_end') {
-                discardMessage = (await applyAfterLlmControl(event)) === 'discard';
+                discardMessage =
+                    isRefusedRequestFailure(event.message) ||
+                        (await applyAfterLlmControl(event)) === 'discard';
                 if (discardMessage)
                     discardAssistantMessage(event);
             }
@@ -349,6 +409,11 @@ function enqueueSteering(agent, messages) {
     else {
         messages.forEach((message) => agent.steer(message));
     }
+}
+function lastAssistantMessage(agent) {
+    return [...agent.state.messages]
+        .reverse()
+        .find((message) => message.role === 'assistant');
 }
 function lastAssistantMessageContext(message) {
     if (!message)

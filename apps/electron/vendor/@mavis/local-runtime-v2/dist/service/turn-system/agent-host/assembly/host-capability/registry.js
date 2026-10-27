@@ -1,7 +1,9 @@
 /** Host-owned registry. Plugin packages can request these ids but cannot register adapters. */
 export class HostCapabilityRegistry {
     adapters;
-    constructor(adapters) {
+    reserveInlineGateway;
+    constructor(adapters, options = {}) {
+        this.reserveInlineGateway = options.reserveInlineGateway ?? true;
         const byCapability = new Map();
         for (const adapter of adapters) {
             const key = capabilityKey(adapter.capability.id, adapter.capability.version);
@@ -16,12 +18,14 @@ export class HostCapabilityRegistry {
         const { targets, claimedTools } = claimAdapterTargets(this.adapters, input.tools);
         const referenceRegistry = new Map();
         const exposedTools = new Map();
-        const bindings = input.bindings.filter((binding) => binding.allowedSurfaces.some((surface) => surface === input.surface) &&
-            binding.requiredSkillRuntimeNames.every((name) => input.availableSkillRuntimeNames.has(name)));
+        const bindings = input.bindings.filter((binding) => binding.requiredSkillRuntimeNames.every((name) => input.availableSkillRuntimeNames.has(name)));
         for (const binding of bindings) {
             const key = capabilityKey(binding.hostCapability.id, binding.hostCapability.version);
             const adapter = this.adapters.get(key);
             if (!adapter)
+                continue;
+            const surface = resolveBindingSurface(adapter, input.surface);
+            if (!binding.allowedSurfaces.some((allowed) => allowed === surface))
                 continue;
             for (const target of targets.get(key) ?? []) {
                 if (referenceRegistry.has(binding.toolRef) || exposedTools.has(target))
@@ -51,6 +55,9 @@ export class HostCapabilityRegistry {
             referenceRegistry,
         };
     }
+}
+function resolveBindingSurface(adapter, surface) {
+    return adapter.resolveBindingSurface?.(surface) ?? surface;
 }
 function assertPublicToolNamesAvailable(exposedTools, tools) {
     const publicNames = new Set();

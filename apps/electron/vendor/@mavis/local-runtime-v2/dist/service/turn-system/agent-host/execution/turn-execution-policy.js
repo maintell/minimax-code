@@ -23,7 +23,27 @@ export function contentReviewOptions(input, options) {
         ? { contentReviewRequired: input.preparation.llm.managedProvider === true }
         : {};
 }
-export async function resolveLlmRetryOptions(input, options) {
+/**
+ * Retry options, plus the request barrier and step stop of a Turn its owner
+ * accounts in logical requests (Goal main execution).
+ */
+export async function requestControlledRunOptions(input, options) {
+    const turn = { sessionId: input.lease.sessionId, turnId: input.lease.turnId };
+    const usageRecorder = options.resolveTurnUsageRecorder?.(turn);
+    const llmRetry = {
+        ...(await resolveLlmRetryOptions(input, options)),
+        ...(usageRecorder ? { usageRecorder } : {}),
+    };
+    const control = options.resolveTurnRequestControl?.(turn);
+    if (!control)
+        return { llmRetry };
+    return {
+        llmRetry: { ...llmRetry, requestLifecycle: control.requestLifecycle },
+        shouldStopAfterTurn: control.shouldStopAfterStep,
+        isWorkClosed: control.isWorkClosed,
+    };
+}
+async function resolveLlmRetryOptions(input, options) {
     return (await options.resolveLlmRetry?.(input)) ?? {};
 }
 export function attachCommittedFacts(outcome, fileChangeObservation, backgroundTaskReadCandidates) {

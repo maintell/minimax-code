@@ -1,14 +1,18 @@
+import { backgroundTaskNotificationReceiptId, } from '@mavis/agent-tools/desktop';
+import { createV1CommerceCompatibility, createV1AttachmentRegistration, createDeferredAgentRuntimeTelemetry as createAgentTelemetryAdapter, legacyCollisionMigrationId, resolveDelegatableAgentReference, createV1AgentHostProductCapabilities, createV1MiniAppToolRules, } from './agent-host.js';
 import { createDeferredPluginHookPermissionCapability, } from '@mavis/permission/plugin-hook-permission-port';
 import { createDeferredContentSafetyCapability } from '@mavis/shared/local-runtime-safety';
 import { createDeferredSkillRuntimeCapability } from '@mavis/shared/local-runtime-skills';
-import { backgroundTaskNotificationReceiptId, closeAgentDb, emitSubagentTelemetry, roleClass, SUBAGENT_TELEMETRY_EVENT, resolveTaskTarget, createUserStopCascade, createLocalWorkspaceGitFacade, isTaskDeliverySuppressed, listFileTree, ManagedWorktreeService, managedBackendRoutingHeaders, LocalQuestionnaireService, readLocalPermissionMode, replyLocalPermissionRequests, searchFiles, ThreadGoalContractError, withAgentNameConflictMigrationLock, registerLocalAsset, scanWorkspace, updateLocalConfigFile, } from '@mavis/local-runtime';
+import { closeAgentDb, emitSubagentTelemetry, roleClass, SUBAGENT_TELEMETRY_EVENT, resolveTaskTarget, createLocalWorkspaceGitFacade, listFileTree, ManagedWorktreeService, managedBackendRoutingHeaders, LocalQuestionnaireService, LocalMatrixClient, SqliteQuestionnaireRequestStore, discardLocalAssetRegistrations, loadUserImages, registerMessageAttachments, resolveSessionLocalAsset, readLocalPermissionMode, replyLocalPermissionRequests, searchFiles, withAgentNameConflictMigrationScope, registerLocalAsset, scanWorkspace, updateLocalConfigFile, } from '@mavis/local-runtime';
 import { createV1CronAgentCleanupBridge, createV1MavisCronAdapterBridge } from './cron.js';
-import { createV1AttachmentRegistration, createDeferredAgentRuntimeTelemetry as createAgentTelemetryAdapter, legacyCollisionMigrationId, resolveDelegatableAgentReference, createV1AgentHostProductCapabilities, } from './agent-host.js';
 import { createV1SessionCompatibility } from './session.js';
-import { createV1WorkspaceLocalActionsPort } from './workspace-local-actions.js';
-/** Cross-process cutover lock shared with the legacy conflict migration. */
-export function withAgentStorageLock(dataDir, operation) {
-    return withAgentNameConflictMigrationLock(dataDir, async (legacyScope) => {
+import { createV1WorkspaceLocalActionsPort, createV1WorkspaceIndexingWorker, } from './workspace-local-actions.js';
+/**
+ * Legacy Agent storage scope for the V2 cutover. Takes no lock: the caller
+ * must hold the dataDir startup migration lock for the whole operation.
+ */
+export function withAgentStorageScope(dataDir, operation) {
+    return withAgentNameConflictMigrationScope(dataDir, async (legacyScope) => {
         let active = true;
         const applyCollision = (nowMs) => {
             if (!active)
@@ -123,16 +127,12 @@ function backgroundTaskNotificationState(api, task, binding) {
     if (binding)
         return { state: 'settled', turnId: binding.turnId };
     // A result already read by a completed Turn, or a stop the user asked for, never wakes it.
-    if (task.deliveredAt !== undefined || isTaskDeliverySuppressed(api, task.taskId)) {
+    if (task.deliveredAt !== undefined || api.backgroundTasks.isDeliverySuppressed(task.taskId)) {
         return { state: 'settled' };
     }
     return { state: 'pending' };
 }
-/**
- * V1-owned background task seam. Extracted from the composition function purely
- * to keep it readable; the user-stop cascade lives here because V1 holds the
- * task runners and their per-process admissions.
- */
+/** Binds legacy Goal/session capabilities to the injected V2 background owner. */
 function buildBackgroundTaskCompatibility(api, notifications) {
     return {
         bindRuntimeOwner: (owner) => api.backgroundTaskService.bindRuntimeOwner(owner),
@@ -142,12 +142,9 @@ function buildBackgroundTaskCompatibility(api, notifications) {
             return api.backgroundTaskService.hasPendingStartupRecovery();
         },
         pollRecovery: () => api.backgroundTaskService.pollStartupLostTasks(),
-        userStop: createUserStopCascade({
-            host: api,
-            // Pause before any task is stopped: a terminal task wakes the Session queue,
-            // and a live Goal would otherwise sail through its gate and start a Turn.
-            pauseActiveGoal: (sessionId) => api.threadGoal.pauseActiveGoalForAbort(sessionId),
-        }),
+        // Pause before any task is stopped: a terminal task wakes the Session queue,
+        // and a live Goal would otherwise sail through its gate and start a Turn.
+        createUserStop: ({ pauseActiveGoal }) => api.backgroundTasks.createUserStopCascade(pauseActiveGoal),
     };
 }
 function createQuestionnaireService(host) {
@@ -182,6 +179,7 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
             skillEnabledState: ports.skillEnabledState,
             runLegacyImCredentialMigration: ports.runLegacyImCredentialMigration,
             cliSunsetNotice: ports.cliSunsetNotice,
+            createBackgroundTaskRuntime: ports.createBackgroundTaskRuntime,
         }),
         createServiceCompatibility: (host, options, hostedCloudHandoff) => {
             const api = host.apiHost;
@@ -194,6 +192,10 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                 .map((session) => session.runLocation?.resolvedDir ?? session.workspaceDir);
             return {
                 ...processLocal,
+                bindQuestionnaireGoalProbe: (probe) => {
+                    host.apiHost.isQuestionnaireGoalActive = probe;
+                },
+                goalHost: createV1GoalHostCapabilities(host),
                 sandbox: {
                     eval: host.evalReporterFactory,
                     writeConfig: async (candidate) => {
@@ -250,7 +252,6 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                 backgroundTasks: buildBackgroundTaskCompatibility(api, notifications),
                 conversation: {
                     bind: async (service) => {
-                        await api.recoverThreadGoalKickoffs(service);
                         conversation.bind(service);
                     },
                     fail: (error) => conversation.fail(error),
@@ -258,6 +259,7 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                 },
                 events: { bindPublisher: globalEvents.bindPublisher },
                 ...(options.miniAppSurface ? { miniAppSurface: options.miniAppSurface } : {}),
+                miniAppToolRules: createV1MiniAppToolRules(() => host.apiHost.permissionRouteContext()),
                 safety: {
                     bind: safety.bind,
                     apiVersion: 'v2',
@@ -278,6 +280,7 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                     bindRequestAdmission: (admission) => api.bindQuestionnaireRequestAdmission(admission),
                 },
                 sessionV2: createV1SessionCompatibility(host),
+                commerce: createV1CommerceCompatibility(api, (config) => new LocalMatrixClient(config)),
                 sessionHandoff: {
                     hosted: hostedCloudHandoff,
                     workspace: {
@@ -426,7 +429,6 @@ function createPeripheralApplication(host, notifications) {
             : requested;
     };
     return {
-        goals: createThreadGoalApplication(host.apiHost.threadGoal, (sessionId) => host.apiHost.isReadOnlyLegacySession(sessionId)),
         questionnaires: {
             begin: async (input) => {
                 const result = await questionnaires.begin(input);
@@ -444,6 +446,10 @@ function createPeripheralApplication(host, notifications) {
                 ...input,
                 agentName: await resolveQuestionnaireAgentName(input.agentName),
             }))?.request ?? undefined,
+            listUnanswered: async (input) => (await questionnaires.listUnansweredV2({
+                ...input,
+                agentName: await resolveQuestionnaireAgentName(input.agentName),
+            })).map((record) => record.request),
             getLatestPlanReview: async (input) => toQuestionnaireRecord(await questionnaires.getLatestPlanReview({
                 ...input,
                 agentName: await resolveQuestionnaireAgentName(input.agentName),
@@ -495,6 +501,13 @@ function createPeripheralApplication(host, notifications) {
         configuration: {
             getPermissionMode: async () => readLocalPermissionMode(host.apiHost.configGetter().permissionMode),
             setPermissionMode: ({ mode }) => host.apiHost.setProcessLocalPermissionMode(mode),
+            getPromptSuggestionEnabled: async () => host.apiHost.configGetter().promptSuggestion?.enabled === true,
+            setPromptSuggestionEnabled: async ({ enabled }) => {
+                // The same validated, lock-protected writer as the Desktop setting; an
+                // explicit value then wins over every surface's default.
+                await host.apiHost.updateConfig({ field: 'promptSuggestion.enabled', set: enabled });
+                return host.apiHost.configGetter().promptSuggestion?.enabled === true;
+            },
         },
         backgroundTasks: {
             list: async ({ ownerSessionId, statuses, kinds, undeliveredOnly, limit, includeNotification, }) => {
@@ -511,129 +524,6 @@ function createPeripheralApplication(host, notifications) {
             },
         },
     };
-}
-/** Process-local facade over the authoritative v1 Thread Goal integration. */
-function createThreadGoalApplication(integration, isReadOnlyLegacySession) {
-    const requireEnabled = () => {
-        if (!integration.isEnabled())
-            throw new Error('Thread Goal is disabled.');
-    };
-    const assertMutable = async (sessionId) => {
-        if (await isReadOnlyLegacySession(sessionId)) {
-            throw new Error('Legacy opencode sessions are read-only in clean local-runtime mode.');
-        }
-    };
-    return {
-        isEnabled: () => integration.isEnabled(),
-        get: async (sessionId) => {
-            requireEnabled();
-            const state = await integration.getGoalForResponse(requireGoalSessionId(sessionId));
-            return state ? toGlobalThreadGoal(state) : undefined;
-        },
-        create: async ({ sessionId, objective: rawObjective, tokenBudget, kickoffAttachments }) => {
-            requireEnabled();
-            const normalizedSessionId = requireGoalSessionId(sessionId);
-            await assertMutable(normalizedSessionId);
-            const objective = requireGoalObjective(rawObjective);
-            const input = {
-                sessionId: normalizedSessionId,
-                objective,
-                ...(tokenBudget !== undefined ? { tokenBudget } : {}),
-                ...(kickoffAttachments?.length ? { kickoffAttachments } : {}),
-            };
-            const created = await integration.createGoal(input, { requireKickoffAdmission: true });
-            return toGlobalThreadGoal(created);
-        },
-        patch: async (sessionId, patch) => {
-            requireEnabled();
-            const normalizedSessionId = requireGoalSessionId(sessionId);
-            await assertMutable(normalizedSessionId);
-            // Same intent split as the HTTP route: a bare `paused` is the user
-            // leaving the Goal and must take the atomic lifecycle transition, not
-            // the generic field patch.
-            const updated = isBareUserPause(patch)
-                ? await integration.pauseGoalByUser(normalizedSessionId)
-                : await integration.patchGoal(normalizedSessionId, normalizeProcessLocalGoalPatch(patch));
-            if (!updated)
-                throw goalNotFound(normalizedSessionId);
-            return toGlobalThreadGoal(updated);
-        },
-        clear: async (sessionId) => {
-            requireEnabled();
-            const normalizedSessionId = requireGoalSessionId(sessionId);
-            await assertMutable(normalizedSessionId);
-            if (!(await integration.deleteGoal(normalizedSessionId))) {
-                throw goalNotFound(normalizedSessionId);
-            }
-            return true;
-        },
-    };
-}
-function goalNotFound(sessionId) {
-    return new ThreadGoalContractError(404, `Goal not found for session: ${sessionId}`, 'GOAL_NOT_FOUND');
-}
-function normalizeGoalObjectivePatch(objective) {
-    return objective === undefined ? undefined : requireGoalObjective(objective);
-}
-/**
- * A bare `status: 'paused'` carries the user's intent to leave the Goal.
- * Anything paired with an objective or budget edit stays a field patch.
- */
-function isBareUserPause(patch) {
-    return (patch.status === 'paused' && patch.objective === undefined && patch.tokenBudget === undefined);
-}
-function normalizeProcessLocalGoalPatch(patch) {
-    const objective = normalizeGoalObjectivePatch(patch.objective);
-    if (patch.status === undefined && objective === undefined && patch.tokenBudget === undefined) {
-        throw new Error('Goal patch must include status, objective, or tokenBudget.');
-    }
-    return {
-        ...(patch.status ? { status: patch.status } : {}),
-        ...(objective !== undefined ? { objective } : {}),
-        ...(patch.tokenBudget !== undefined ? { tokenBudget: patch.tokenBudget } : {}),
-    };
-}
-function toGlobalThreadGoal(state) {
-    return {
-        goalId: state.goalId,
-        sessionId: state.sessionId,
-        objective: state.objective,
-        status: state.status,
-        createdAt: state.createdAt,
-        updatedAt: state.updatedAt,
-        ...(state.dismissedAt !== undefined ? { dismissedAt: state.dismissedAt } : {}),
-        tokensUsed: state.tokensUsed,
-        turnsUsed: state.turnsUsed,
-        timeUsedSeconds: state.timeUsedSeconds,
-        tokenBudget: state.tokenBudget,
-        statusReason: state.statusReason,
-        executionWait: state.executionWait,
-        ...(state.lastVerification !== undefined
-            ? {
-                lastVerification: {
-                    backend: state.lastVerification.backend,
-                    verdict: state.lastVerification.verdict,
-                    reason: state.lastVerification.reason,
-                    missing: [...state.lastVerification.missing],
-                    notMetStreak: state.lastVerification.notMetStreak,
-                    at: state.lastVerification.at,
-                },
-            }
-            : {}),
-        hasKickoffAttachments: state.kickoffAttachments.length > 0,
-    };
-}
-function requireGoalSessionId(value) {
-    const sessionId = value.trim();
-    if (!sessionId)
-        throw new Error('sessionId is required.');
-    return sessionId;
-}
-function requireGoalObjective(value) {
-    const objective = value.trim();
-    if (!objective)
-        throw new Error('goal objective must not be empty');
-    return objective;
 }
 /** Only forwards old consumers to the V2 instance; has no settings, pool or registry. */
 function createDeferredMcpRuntimeCapability() {
@@ -686,15 +576,63 @@ function createV1SkillRuntimeOptions(host, options, bindRuntime) {
         bindRuntime,
     };
 }
-function createV1WorkspaceIndexingWorker(api) {
+/** Upper bound of one dependency scan; the task store caps a page at this size. */
+const UNFINISHED_BACKGROUND_TASK_SCAN_LIMIT = 500;
+function createV1GoalHostCapabilities(host) {
+    const api = host.apiHost;
+    const questionnaireStore = new SqliteQuestionnaireRequestStore(() => host.dataDir);
     return {
-        prepareSessionStart: (input) => api.workspaceIndexingService.prepareSessionStart(input),
-        captureRevisionAfterTurn: (input) => api.workspaceIndexingService.captureRevisionIfChanged(input),
-        prewarm: async (workspaceDir) => {
-            await api.workspaceIndexingService.prewarmWorkspace(workspaceDir);
+        questionnaires: () => new LocalQuestionnaireService(api.questionnaireServiceDeps()).ownedOperations(),
+        hasUnresolvedQuestionnaire: (sessionId) => questionnaireStore.hasUnresolvedBySession(sessionId),
+        hasPendingPermission: (sessionId) => api.hasPendingPermissionForSession(sessionId),
+        hasActiveTeamOwner: (sessionId) => api.hasActiveTeamOwner(sessionId),
+        listUnfinishedBackgroundTasks: async (sessionId, kinds) => (await api.backgroundTaskService.list({
+            ownerSessionId: sessionId,
+            kinds: [...kinds],
+            statuses: ['queued', 'running', 'stopping'],
+            limit: UNFINISHED_BACKGROUND_TASK_SCAN_LIMIT,
+        })).items.map((task) => {
+            // Every local task row records the Turn whose tool call started it.
+            const parentTurnId = task.metadata?.parentTurnId;
+            return {
+                kind: task.kind,
+                ...(typeof parentTurnId === 'string' && parentTurnId
+                    ? { startedByTurnId: parentTurnId }
+                    : {}),
+            };
+        }),
+        readSessionFacts: async (sessionId) => {
+            const session = await api.getSessionById(sessionId);
+            return session
+                ? {
+                    agentName: session.agentName,
+                    parentSessionId: session.parentSessionId,
+                    sessionType: session.sessionType,
+                    sessionKind: session.sessionKind,
+                    ...(session.purpose ? { purpose: session.purpose } : {}),
+                }
+                : undefined;
         },
-        closePrewarm: () => api.workspaceIndexingService.closeWorkspacePrewarm(),
-        deleteSession: (sessionId, completeDeletion) => api.workspaceIndexingService.deleteSession(sessionId, completeDeletion),
+        isReadOnlyLegacySession: (sessionId) => api.isReadOnlyLegacySession(sessionId),
+        bindQuestionnaireWorkOwner: (owner) => api.bindQuestionnaireWorkOwner(owner),
+        bindSubSessionRoundAttribution: (port) => api.bindSubSessionRoundAttribution(port),
+        objectiveAssets: {
+            resolve: ({ sessionId, assetId }) => resolveSessionLocalAsset({ dataDir: host.dataDir, sessionId, assetId }),
+            register: ({ sessionId, attachments }) => registerMessageAttachments({ dataDir: host.dataDir, sessionId, attachments }),
+            discard: async ({ sessionId, receipts }) => {
+                await discardLocalAssetRegistrations({ dataDir: host.dataDir, sessionId, receipts });
+            },
+        },
+        loadObjectiveImages: loadUserImages,
+        verifierTaskRunner: {
+            hasSession: async (sessionId) => Boolean(await api.getSessionById(sessionId)),
+            inheritSessionRestrictions: (input) => api.inheritSessionPermissionRestrictions(input),
+            runForeground: (input) => api.runForegroundDelegation(input),
+        },
+        observability: {
+            logger: host.observability,
+            ...(host.evalReporterFactory ? { evalReporterFactory: host.evalReporterFactory } : {}),
+        },
     };
 }
 export function createDeferredAgentRuntimeTelemetry() {

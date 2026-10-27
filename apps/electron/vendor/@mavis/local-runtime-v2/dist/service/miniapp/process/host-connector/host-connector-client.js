@@ -1,8 +1,12 @@
 import { format } from 'node:util';
+import { MiniAppAgentError, } from '../../agent/contracts.js';
+import { MINIAPP_TOOL_ERROR_MESSAGES, } from '../../contracts.js';
 import { bindMiniAppIpcChannel, encodeMiniAppIpcMessage, sendMiniAppIpcMessage, } from '../node-runtime/ipc-transport.js';
-import { agentClientError, decodeAgentResult, decodeAgentRunEvent, decodeAgentWireError, encodeAgentAnswerParams, encodeAgentCreateParams, encodeAgentReplyParams, encodeAgentRunParams, } from './host-connector-agent.js';
+import { agentClientError, decodeAgentResult, decodeAgentWireError, encodeAgentAnswerParams, encodeAgentCreateParams, encodeAgentObserveParams, encodeAgentReplyParams, encodeAgentRunParams, } from './host-connector-agent.js';
+import { decodeAgentRunEvent } from './host-connector-agent-events.js';
+import { decodeToolResult, encodeToolCallParams, encodeToolRequestParams, toolClientError, toolRequestOutcome, } from './host-connector-tool.js';
 import { HostConnectorError, HostConnectorProtocolError, isSafeHostConnectorDiagnosticConstraint, isSafeHostConnectorDiagnosticPath, } from './host-connector-errors.js';
-import { hasExactKeys, hasHostConnectorRequestCapacity, isAgentMethod, isAgentShortMethod, isAgentTurnMethod, isBoundedIdentifier, isRecord, isRequestId, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, } from './host-connector-wire.js';
+import { hasExactKeys, hasHostConnectorRequestCapacity, isAgentMethod, isAgentSessionReadMethod, isAgentStreamMethod, isBoundedIdentifier, isRecord, isRequestId, isToolMethod, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, } from './host-connector-wire.js';
 /** Child-side implementation injected into `start(context)`. */
 export function createMiniAppHostConnectorRuntimeClient(options) {
     const pending = new Map();
@@ -22,7 +26,7 @@ export function createMiniAppHostConnectorRuntimeClient(options) {
         const normalized = error instanceof Error ? error : new HostConnectorProtocolError('Host Connector failed');
         for (const [id, entry] of pending) {
             entry.abortCleanup?.();
-            entry.reject(disconnectedError(id, entry));
+            entry.reject(familyOf(entry.method).disconnected(entry, id));
         }
         pending.clear();
         detach();
@@ -54,13 +58,15 @@ export function createMiniAppHostConnectorRuntimeClient(options) {
         else
             entry.resolve(result);
     }
-    function send(method, params, signal, onEvent) {
+    function send(method, params, signal, events) {
         if (closed)
-            return Promise.reject(childUnavailableError(method));
+            return Promise.reject(familyOf(method).unavailable(false));
         if (signal?.aborted)
-            return Promise.reject(childCancelledError(method));
+            return Promise.reject(familyOf(method).cancelled());
         if (!hasHostConnectorRequestCapacity(method, pending.values())) {
-            return Promise.reject(childUnavailableError(method, true));
+            return Promise.reject(method === 'agent.observe'
+                ? new MiniAppAgentError('BUSY', 'Mini App Agent is busy', true, 'observer_limit')
+                : familyOf(method).unavailable(true));
         }
         const id = allocateRequestId();
         let frame;
@@ -68,7 +74,7 @@ export function createMiniAppHostConnectorRuntimeClient(options) {
             frame = encodeMiniAppIpcMessage('miniapp:connector', { v: 1, id, method, params }, REQUEST_MAX_BYTES);
         }
         catch {
-            return Promise.reject(childEncodeError(method));
+            return Promise.reject(familyOf(method).invalidArguments(method));
         }
         return new Promise((resolve, reject) => {
             const entry = {
@@ -76,17 +82,18 @@ export function createMiniAppHostConnectorRuntimeClient(options) {
                 resolve,
                 reject,
                 written: false,
-                ...(onEvent ? { onEvent } : {}),
+                ...(events ? { events } : {}),
+                ...(signal ? { signal } : {}),
             };
             pending.set(id, entry);
             const onAbort = () => {
                 if (!entry.written) {
-                    settle(id, entry, childCancelledError(method));
+                    settle(id, entry, familyOf(method).cancelled());
                     return;
                 }
                 enqueueWrite(async () => {
                     if (pending.has(id)) {
-                        await sendMiniAppIpcMessage(options.transport, encodeMiniAppIpcMessage('miniapp:connector', { v: 1, id, method: isAgentMethod(method) ? 'agent.cancel' : 'connector.cancel' }, REQUEST_MAX_BYTES));
+                        await sendMiniAppIpcMessage(options.transport, encodeMiniAppIpcMessage('miniapp:connector', { v: 1, id, method: familyOf(method).cancelMethod }, REQUEST_MAX_BYTES));
                     }
                 });
             };
@@ -127,11 +134,24 @@ export function createMiniAppHostConnectorRuntimeClient(options) {
             return (await send('connector.call', { toolRef, arguments: arguments_ }, callOptions?.signal));
         },
     });
+    const agent = createChildAgentClient(send);
+    const tool = createToolClient(send);
+    return {
+        client,
+        agent,
+        tool,
+        close() {
+            fatal(new HostConnectorProtocolError('Host Connector client closed'));
+        },
+    };
+}
+/** Child-side `context.agent` over one connector channel's `send`. */
+function createChildAgentClient(send) {
     async function sendAgentTurn(method, params, turnOptions) {
         const onEvent = typeof turnOptions?.onEvent === 'function' ? turnOptions.onEvent : undefined;
         // Without `observe` the Host runs the turn with no listener, so its approvals are denied.
         const wireParams = onEvent ? { ...params, observe: true } : params;
-        return (await send(method, wireParams, turnOptions?.signal, onEvent));
+        return (await send(method, wireParams, turnOptions?.signal, onEvent ? { observed: false, onEvent } : undefined));
     }
     const agent = Object.freeze({
         async run(input, runOptions) {
@@ -152,14 +172,50 @@ export function createMiniAppHostConnectorRuntimeClient(options) {
         async create(input) {
             return (await send('agent.create', encodeAgentCreateParams(input)));
         },
-    });
-    return {
-        client,
-        agent,
-        close() {
-            fatal(new HostConnectorProtocolError('Host Connector client closed'));
+        async observe(target, observeOptions) {
+            const params = encodeAgentObserveParams(target, observeOptions);
+            const { onEvent, signal } = observeOptions;
+            return endObservation(send('agent.observe', params, signal, { observed: true, onEvent }), signal);
         },
-    };
+        async sessions() {
+            return (await send('agent.sessions', {}));
+        },
+        async session(sessionId) {
+            if (!isBoundedIdentifier(sessionId))
+                throw agentClientError('INVALID_ARGUMENTS');
+            return (await send('agent.session', { sessionId }));
+        },
+    });
+    return agent;
+}
+/** A subscription the author cancelled ended normally, even if it never reached the Host. */
+async function endObservation(sending, cancelled) {
+    try {
+        await sending;
+    }
+    catch (error) {
+        if (cancelled?.aborted &&
+            error instanceof MiniAppAgentError &&
+            error.code === 'REQUEST_CANCELLED') {
+            return;
+        }
+        throw error;
+    }
+}
+function createToolClient(send) {
+    return Object.freeze({
+        async list(listOptions) {
+            return (await send('tool.list', {}, listOptions?.signal));
+        },
+        async call(name, arguments_, callOptions) {
+            const params = encodeToolCallParams(name, arguments_);
+            return (await send('tool.call', params, callOptions?.signal));
+        },
+        async request(names, requestOptions) {
+            const params = encodeToolRequestParams(names);
+            return toolRequestOutcome(await send('tool.request', params, requestOptions?.signal));
+        },
+    });
 }
 async function runChildWrite(previous, operation, fatal) {
     try {
@@ -176,14 +232,13 @@ function decodeChildOutcome(entry, value) {
     if (!hasExactKeys(value, keys)) {
         throw new HostConnectorProtocolError('Host Connector response shape is invalid');
     }
+    const family = familyOf(entry.method);
     if (success) {
-        const result = decodeChildResult(entry.method, value.result);
+        const result = family.decodeResult(entry.method, value.result);
         assertInvocationIdentity(entry, result);
         return { result };
     }
-    if (isAgentMethod(entry.method))
-        return { error: decodeAgentWireError(value.error) };
-    const error = decodeWireError(value.error);
+    const error = family.decodeError(value.error);
     assertInvocationIdentity(entry, error);
     return { error };
 }
@@ -191,19 +246,28 @@ function deliverAgentEvent(value, entry) {
     if (!hasExactKeys(value, ['v', 'id', 'event'])) {
         throw new HostConnectorProtocolError('Host Connector notification shape is invalid');
     }
-    if (!isAgentTurnMethod(entry.method))
+    if (!isAgentStreamMethod(entry.method))
         return;
-    const event = decodeAgentRunEvent(value.event);
-    if (!event)
+    // Decoded before the handler runs: a malformed frame is a protocol error, a handler failure not.
+    const deliver = entry.method === 'agent.observe'
+        ? observedEventDelivery(decodeAgentRunEvent(value.event, true), entry.events)
+        : runEventDelivery(decodeAgentRunEvent(value.event), entry.events);
+    if (entry.signal?.aborted)
         return;
     try {
-        entry.onEvent?.(event);
+        deliver?.();
     }
     catch (error) {
         // A Mini App callback failure must not tear down the shared connector channel or end the
         // run, but the author still needs to see it; child stderr is collected into runtime logs.
         reportAgentEventHandlerError(error);
     }
+}
+function runEventDelivery(event, events) {
+    return event && events && !events.observed ? () => events.onEvent(event) : undefined;
+}
+function observedEventDelivery(event, events) {
+    return event && events?.observed ? () => events.onEvent(event) : undefined;
 }
 function reportAgentEventHandlerError(error) {
     try {
@@ -213,9 +277,7 @@ function reportAgentEventHandlerError(error) {
         // Diagnostics are best-effort; a broken stderr must not fail the run either.
     }
 }
-function decodeChildResult(method, value) {
-    if (isAgentMethod(method))
-        return decodeAgentResult(method, value);
+function decodeConnectorResult(method, value) {
     if (!isRecord(value))
         throw new HostConnectorProtocolError('Host Connector result is invalid');
     if (method === 'connector.list') {
@@ -267,7 +329,8 @@ function isHostConnectorDisposition(value) {
 }
 function isInvalidArgumentsWireError(value) {
     return (value.code === 'INVALID_ARGUMENTS' &&
-        value.message === 'Connector arguments are invalid' &&
+        (value.message === 'Connector arguments are invalid' ||
+            value.message === MINIAPP_TOOL_ERROR_MESSAGES.INVALID_ARGUMENTS) &&
         value.disposition === 'not_dispatched' &&
         !value.retryable);
 }
@@ -296,8 +359,7 @@ function decodeWireDiagnosticIssue(value) {
     };
 }
 function recordAdmissionReceipt(value, entry) {
-    if (entry.method === 'connector.list' ||
-        isAgentShortMethod(entry.method) ||
+    if (!familyOf(entry.method).receiptMethods.has(entry.method) ||
         entry.invocationId ||
         !hasExactKeys(value, ['v', 'id', 'receipt', 'invocationId']) ||
         !isBoundedIdentifier(value.invocationId)) {
@@ -306,7 +368,8 @@ function recordAdmissionReceipt(value, entry) {
     entry.invocationId = value.invocationId;
 }
 function assertInvocationIdentity(entry, value) {
-    if (entry.method !== 'connector.call')
+    const family = familyOf(entry.method);
+    if (!family.pinsInvocation || !family.receiptMethods.has(entry.method))
         return;
     let actual;
     if (value instanceof HostConnectorError)
@@ -318,30 +381,57 @@ function assertInvocationIdentity(entry, value) {
         return;
     throw new HostConnectorProtocolError('Host Connector invocation identity is invalid');
 }
-function disconnectedError(id, request) {
-    if (isAgentMethod(request.method)) {
-        return request.written
-            ? agentClientError('AGENT_OUTCOME_UNKNOWN')
-            : agentClientError('AGENT_UNAVAILABLE', true);
-    }
-    return request.method === 'connector.call' && request.written
-        ? new HostConnectorError('CONNECTOR_OUTCOME_UNKNOWN', 'Host Connector transport ended after dispatch became possible', 'unknown_after_dispatch', { retryable: false, invocationId: request.invocationId ?? id })
-        : unavailableError(true);
-}
-function childUnavailableError(method, retryable = false) {
-    return isAgentMethod(method)
-        ? agentClientError('AGENT_UNAVAILABLE', retryable)
-        : unavailableError(retryable);
-}
-function childCancelledError(method) {
-    return isAgentMethod(method) ? agentClientError('REQUEST_CANCELLED') : cancelledError();
-}
-function childEncodeError(method) {
-    if (isAgentMethod(method))
-        return agentClientError('INVALID_ARGUMENTS');
-    return method === 'connector.call'
+const CONNECTOR_FAMILY = {
+    cancelMethod: 'connector.cancel',
+    receiptMethods: new Set(['connector.call']),
+    pinsInvocation: true,
+    decodeResult: decodeConnectorResult,
+    decodeError: decodeWireError,
+    unavailable: (retryable) => unavailableError(retryable),
+    cancelled: cancelledError,
+    invalidArguments: (method) => method === 'connector.call'
         ? invalidArgumentsError()
-        : new HostConnectorProtocolError('Host Connector list request is invalid');
+        : new HostConnectorProtocolError('Host Connector list request is invalid'),
+    disconnected: (request, id) => request.method === 'connector.call' && request.written
+        ? new HostConnectorError('CONNECTOR_OUTCOME_UNKNOWN', 'Host Connector transport ended after dispatch became possible', 'unknown_after_dispatch', { retryable: false, invocationId: request.invocationId ?? id })
+        : unavailableError(true),
+};
+const AGENT_FAMILY = {
+    cancelMethod: 'agent.cancel',
+    receiptMethods: new Set(['agent.run', 'agent.answer']),
+    pinsInvocation: false,
+    decodeResult: (method, value) => decodeAgentResult(method, value),
+    decodeError: decodeAgentWireError,
+    unavailable: (retryable) => agentClientError('AGENT_UNAVAILABLE', retryable),
+    cancelled: () => agentClientError('REQUEST_CANCELLED'),
+    invalidArguments: () => agentClientError('INVALID_ARGUMENTS'),
+    // Reads and observers change nothing, so losing them is never an unknown outcome.
+    disconnected: (request) => request.written && !isAgentSessionReadMethod(request.method)
+        ? agentClientError('AGENT_OUTCOME_UNKNOWN')
+        : agentClientError('AGENT_UNAVAILABLE', true),
+};
+const TOOL_FAMILY = {
+    cancelMethod: 'tool.cancel',
+    receiptMethods: new Set(['tool.call']),
+    pinsInvocation: true,
+    decodeResult: (method, value) => decodeToolResult(method, value),
+    decodeError: decodeWireError,
+    unavailable: (retryable) => toolClientError('TOOL_UNAVAILABLE', { retryable }),
+    cancelled: () => toolClientError('REQUEST_CANCELLED'),
+    invalidArguments: (method) => method === 'tool.list'
+        ? new HostConnectorProtocolError('Host Connector list request is invalid')
+        : toolClientError('INVALID_ARGUMENTS'),
+    disconnected: (request, id) => request.method === 'tool.call' && request.written
+        ? toolClientError('TOOL_OUTCOME_UNKNOWN', {
+            disposition: 'unknown_after_dispatch',
+            invocationId: request.invocationId ?? id,
+        })
+        : toolClientError('TOOL_UNAVAILABLE', { retryable: true }),
+};
+function familyOf(method) {
+    if (isAgentMethod(method))
+        return AGENT_FAMILY;
+    return isToolMethod(method) ? TOOL_FAMILY : CONNECTOR_FAMILY;
 }
 function unavailableError(retryable = false) {
     return new HostConnectorError('CONNECTOR_UNAVAILABLE', 'Host Connector is unavailable', 'not_dispatched', { retryable });

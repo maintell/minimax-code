@@ -158,7 +158,8 @@ function createDiscardCreated(registration, sessionId, registered) {
         }
     };
 }
-function registrationFailureReason(error) {
+/** Classifies a registration failure caused by the source itself, not by the asset store. */
+export function registrationFailureReason(error) {
     if (!error || typeof error !== 'object')
         return undefined;
     const message = Reflect.get(error, 'message');

@@ -248,6 +248,7 @@ export class PluginDesktopFacade {
                 installationPolicy: response.installationPolicy ?? PluginInstallationPolicy.USER_MANAGED,
                 ...(response.package ? { package: response.package } : {}),
             }, scope);
+            this.forgetMiniAppPermissions(action, response.installExists, requestedName, 'official');
             return response;
         }
         catch (error) {
@@ -258,6 +259,12 @@ export class PluginDesktopFacade {
             throw error;
         }
     }
+    /** A confirmed uninstall drops the Mini App switches; a reinstall starts fully enabled. */
+    forgetMiniAppPermissions(action, installExists, pluginName, source) {
+        if (action !== 'uninstall' || installExists)
+            return;
+        this.options.system.miniAppPublication.forgetPermissions(pluginName, source);
+    }
     async mutateLocal(req, action) {
         if (action === 'install') {
             throw new PluginDesktopFacadeError('LOCAL_PLUGIN_INSTALL_UNSUPPORTED');
@@ -265,6 +272,7 @@ export class PluginDesktopFacade {
         const result = action === 'uninstall'
             ? await this.options.system.uninstallLocalPlugin(req.pluginName)
             : await this.options.system.setLocalPluginEnabled(req.pluginName, action === 'enable');
+        this.forgetMiniAppPermissions(action, result.installExists, req.pluginName, 'local');
         return {
             source: InstalledPluginSource.LOCAL,
             installExists: result.installExists,

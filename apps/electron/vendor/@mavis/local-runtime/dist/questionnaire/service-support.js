@@ -6,7 +6,8 @@ export class QuestionnaireServiceSupport {
     constructor(deps) {
         this.deps = deps;
     }
-    async injectGoalReply(record, reply) {
+    /** Resume the owner's Turn with the answer; a questionnaire reply never enters the Queue. */
+    async injectOwnedReply(record, reply) {
         const goalId = record.request.goalId;
         if (!goalId) {
             throw new LocalQuestionnaireError(409, 'QUESTIONNAIRE_GOAL_OWNER_MISSING', 'Goal questionnaire is missing its owning Goal identity');
@@ -43,6 +44,28 @@ export class QuestionnaireServiceSupport {
         });
         return { completed: true };
     }
+    createOwnedOperations(reply) {
+        const { store } = this.deps;
+        return {
+            primaryAgentName: this.deps.primaryAgentName,
+            get: (requestId) => store.get(requestId),
+            findLatestBySession: (sessionId) => store.findLatestBySession(sessionId),
+            findLatestPendingBySession: (sessionId) => store.findLatestPendingBySession(sessionId),
+            findAllPendingForRecovery: () => store.findAllPendingForRecovery(),
+            findAnsweredPendingInject: () => store.findAnsweredPendingInject(),
+            delete: (requestId) => store.delete(requestId),
+            hasSession: async (sessionId) => Boolean(await this.deps.getSessionById(sessionId)),
+            canStartAutoReply: (sessionId) => this.canStartAutoReply(sessionId),
+            tryAcquireReplyInjection: (requestId) => this.tryAcquireReplyInjection(requestId),
+            injectPersistedReply: (record, payload, failureEvent, automatic) => this.injectPersistedReply(record, payload, failureEvent, automatic),
+            reply,
+            isSettledReplyError: (error) => error instanceof LocalQuestionnaireError &&
+                (error.status === 404 || error.status === 409 || error.status === 410),
+            supersedeStale: (record, currentOwnerId) => this.supersedeStaleOwnedRequest(record, currentOwnerId),
+            supersedeReplaced: (record, keepRequestId) => this.supersedeReplacedQuestionnaire(record, keepRequestId),
+            emitBusEvent: (type, payload) => this.deps.emitBusEvent(type, payload),
+        };
+    }
     async requireMutableRecord(requestId, agentName, action) {
         const record = await this.deps.store.get(requestId);
         if (!record) {
@@ -73,11 +96,11 @@ export class QuestionnaireServiceSupport {
     async injectPersistedReply(record, reply, failureEvent, automatic = false) {
         try {
             // Fast-path lifecycle check before entering runtime-owned admission.
-            // Automatic retries revalidate Goal identity in autoReply().
+            // Automatic retries revalidate the owner's identity before calling here.
             if (automatic && !this.canStartAutoReply(record.sessionId))
                 return false;
             const replyForMessage = reply.source || !automatic ? reply : { ...reply, source: 'automatic_timeout' };
-            const result = await this.injectGoalReply(record, replyForMessage);
+            const result = await this.injectOwnedReply(record, replyForMessage);
             if (!result.completed) {
                 this.deps.emitBusEvent(failureEvent, {
                     requestId: record.requestId,
@@ -119,7 +142,7 @@ export class QuestionnaireServiceSupport {
         this.localReplyInjections.add(requestId);
         return () => this.localReplyInjections.delete(requestId);
     }
-    async supersedeStaleGoalRequest(record, currentGoalId) {
+    async supersedeStaleOwnedRequest(record, currentGoalId) {
         this.deps.autoReplyScheduler?.cancel(record.requestId);
         const superseded = await this.markUninjectedRecordSuperseded(record);
         if (!superseded)

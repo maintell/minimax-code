@@ -12,9 +12,12 @@ export function createRuntimeQueueSelection(input) {
                 // injected marker, deferring it would deadlock the whole queue.
                 if (isOrdinaryQuestionnaireResponseOrigin(item.message.origin))
                     return 'ready';
+                // Only legacy questionnaires hold queued messages: an unanswered
+                // AskUser v2 question stays answerable while the conversation goes on.
                 const pendingQuestionnaire = await input.questionnaires.getPending({
                     agentName: item.agentName,
                     sessionId: item.sessionId,
+                    legacyOnly: true,
                 });
                 if (pendingQuestionnaire)
                     return 'defer';

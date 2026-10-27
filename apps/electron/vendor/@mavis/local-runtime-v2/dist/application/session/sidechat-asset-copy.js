@@ -2,6 +2,7 @@ import { basename, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { collectMessageAssetItems } from '@mavis/shared/asset-markup';
 import { rewriteForkAssetMarkup } from '../../service/session-system/index.js';
+import { registrationFailureReason, } from '../conversation/attachment-registration.js';
 /** Registration creates child-owned assets; both history and display use the same exact mapping. */
 export async function copySideChatAssets(input) {
     const { sources, markupValues } = collectAssetSources(input.display, input.history);
@@ -18,12 +19,12 @@ export async function copySideChatAssets(input) {
                 : resolve(input.workspaceDir, original);
             // Dropping the source asset identity prevents the ordinary registration fast path from reusing Main ownership.
             const { assetId: oldId, ...attachment } = source;
-            const registered = (await input.registration.register({
-                sessionId: input.sessionId,
-                attachments: [{ ...attachment, filePath }],
-            }))[0];
+            const registered = await registerInheritedSource(input.registration, input.sessionId, {
+                ...attachment,
+                filePath,
+            });
             if (!registered)
-                throw new Error('Attachment registration returned no asset');
+                continue;
             if (registered.registrationReceipt)
                 receipts.push(registered.registrationReceipt);
             replacements.set(original, registered.filePath);
@@ -49,6 +50,24 @@ export async function copySideChatAssets(input) {
         }
         throw error;
     }
+}
+/**
+ * Inherited history is copied best-effort, like an ordinary fork: a file Main already lost
+ * (renamed, moved, deleted) or cannot persist keeps the reference Main shows.
+ */
+async function registerInheritedSource(registration, sessionId, attachment) {
+    let registered;
+    try {
+        registered = await registration.register({ sessionId, attachments: [attachment] });
+    }
+    catch (error) {
+        if (registrationFailureReason(error))
+            return undefined;
+        throw error;
+    }
+    if (!registered[0])
+        throw new Error('Attachment registration returned no asset');
+    return registered[0];
 }
 function rewriteAssetReferences(value, replacements) {
     if (typeof value === 'string')

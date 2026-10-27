@@ -11,7 +11,8 @@ import { buildInlineReviewReminder } from './reminder.js';
 import { createReviewToolGuard } from './tool-guard.js';
 import { ReviewTurnState } from './turn-state.js';
 import { projectReviewResultEvent } from './result-event-projection.js';
-import { isProjectedReviewResult, normalizeSubagentFinalText, waitForReviewCompletion, } from './subagent-result.js';
+import { reviewSubagentResult, waitForReviewCompletion } from './subagent-result.js';
+import { attributeReviewRound } from './round-attribution.js';
 export class HostedReviewCapability {
     options;
     turns = new Map();
@@ -76,7 +77,7 @@ export class HostedReviewCapability {
                             instruction: [reminder, '', prepared.request].join('\n'),
                         };
                     }
-                    const result = await this.runSubagent(turn, session, preparedRead, signal);
+                    const result = await this.runSubagent(turn, session, preparedRead, identity.turnId, signal);
                     if (result.status === 'succeeded') {
                         turn.state.setSubagentResult(result.finalText);
                         return { status: 'succeeded', mode: 'subagent' };
@@ -127,7 +128,7 @@ export class HostedReviewCapability {
             this.activateReview(turn, { ...prepared, mode: 'inline' }, turn.state.delivery);
             return ((await this.contextAdmission.evaluate(input, turn.state, identity)) ?? { type: 'continue' });
         }
-        const result = await this.runSubagent(turn, parent, { prepared, promptRead: turn.promptRead }, input.signal);
+        const result = await this.runSubagent(turn, parent, { prepared, promptRead: turn.promptRead }, identity.turnId, input.signal);
         if (result.status === 'aborted') {
             await this.settleActivity(turn, input, identity, 'review_aborted');
             return { type: 'abort', reason: 'review_subagent_aborted' };
@@ -258,17 +259,17 @@ export class HostedReviewCapability {
             ...(input.runtimeSeqGenerator ? { runtimeSeq: input.runtimeSeqGenerator() } : {}),
         });
     }
-    runSubagent(turn, parent, preparedRead, signal) {
+    runSubagent(turn, parent, preparedRead, parentTurnId, signal) {
         if (turn.subagentRun)
             return turn.subagentRun;
-        const run = this.executeSubagent(parent, preparedRead, signal).catch((error) => ({
+        const run = this.executeSubagent(parent, preparedRead, parentTurnId, signal).catch((error) => ({
             status: 'failed',
             errorMessage: error instanceof Error ? error.message : String(error),
         }));
         turn.subagentRun = run;
         return run;
     }
-    async executeSubagent(parent, preparedRead, signal) {
+    async executeSubagent(parent, preparedRead, parentTurnId, signal) {
         const conversation = this.options.conversation;
         if (!conversation)
             return { status: 'failed', errorMessage: 'Conversation is unavailable.' };
@@ -311,6 +312,15 @@ export class HostedReviewCapability {
             },
         });
         this.activateReview(childTurn, { ...preparedRead.prepared, mode: 'inline' }, 'full');
+        // The review child round is submitted below; its parent Turn is reported
+        // first so the Goal owner can charge the round's very first request.
+        const attribution = await attributeReviewRound(this.options, {
+            parentSessionId: parent.sessionId,
+            parentTurnId,
+            childSessionId: child.sessionId,
+            childTurnId: requestedTurnId,
+        });
+        let submitted = false;
         try {
             rememberReviewPromptRead(promptReadHandoff);
             const accepted = await conversation.ingress.submit({
@@ -330,33 +340,18 @@ export class HostedReviewCapability {
                     },
                 },
             });
+            submitted = true;
             if (accepted.turnId !== requestedTurnId) {
+                attribution?.forgetRound(requestedTurnId);
                 rebindReviewPromptRead(promptReadHandoff, accepted.turnId);
                 registeredTurnId = accepted.turnId;
             }
             const result = await waitForReviewCompletion(conversation, child.sessionId, accepted.completion, signal);
-            if (result.status !== 'completed') {
-                return result.status === 'aborted'
-                    ? { status: 'aborted' }
-                    : { status: 'failed', errorMessage: result.error ?? 'Review subagent failed.' };
-            }
-            const finalText = [...result.messages]
-                .reverse()
-                .find((message) => message.role === 'assistant' && message.text?.trim())
-                ?.text?.trim();
-            if (!finalText) {
-                return { status: 'failed', errorMessage: 'Review subagent returned no final response.' };
-            }
-            const normalized = normalizeSubagentFinalText(finalText);
-            if (!isProjectedReviewResult(normalized)) {
-                return {
-                    status: 'failed',
-                    errorMessage: 'Review subagent did not return a projected annotation result.',
-                };
-            }
-            return { status: 'succeeded', finalText: normalized };
+            return reviewSubagentResult(result);
         }
         catch (error) {
+            if (!submitted)
+                attribution?.forgetRound(requestedTurnId);
             discardReviewPromptRead(promptReadHandoff, registeredTurnId);
             throw error;
         }

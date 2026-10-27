@@ -111,6 +111,20 @@ function serializeGoal(goal) {
         tokensUsed: goal.tokensUsed,
         timeUsedSeconds: goal.timeUsedSeconds,
         tokenBudget: goal.tokenBudget,
+        ...(goal.accounting ? serializeRequestAccounting(goal.accounting) : {}),
+    };
+}
+/** The request ledger the Goal's budget is counted in (accounting version 2). */
+function serializeRequestAccounting(accounting) {
+    return {
+        accountingVersion: accounting.version,
+        requestsUsed: accounting.requestsUsed,
+        workRequests: accounting.workRequests,
+        graceRequests: accounting.graceRequests,
+        legacyTurns: accounting.legacyTurns,
+        reservedRequests: accounting.reservedRequests,
+        unknownRequests: accounting.unknownRequests,
+        usageIncomplete: accounting.usageIncomplete,
     };
 }
 // ─── create_goal ───────────────────────────────────────────────────────

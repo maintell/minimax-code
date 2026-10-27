@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createExecutionCoordinator, } from './execution/execution.coordinator.js';
+import { hasUserQueueInputSince } from './execution/message-query-authorship.js';
 import { createSteerSessionService } from './execution/steering/steer-session.service.js';
 import { createTurnController } from './execution/turn-controller/turn.controller.js';
 import { createTurnExecutionService } from './execution/turn-execution.service.js';
@@ -22,6 +23,7 @@ export async function initializeTurnSystem(options) {
     const released = createTurnReleasedSignal();
     const steeringRequeue = createRuntimeSteeringRequeue(options, released);
     const { controller, completions } = createQueuedTurnControl(options, repository, steeringRequeue);
+    const prepareQueuedExecution = createQueuedExecutionPreparation(options, completions);
     const operations = createSessionOperationGate();
     // A Session lifecycle fence owns the in-process admission gate, but its archive commit still
     // needs the persistent maintenance lease. Async context makes that re-entry owner-scoped while
@@ -80,7 +82,7 @@ export async function initializeTurnSystem(options) {
     const dispatcher = createQueueDispatcher({
         queue,
         executor: messageDelivery.queue,
-        onPreparing: completions.prepareExecution,
+        onPreparing: prepareQueuedExecution,
         onExecution: (claim, result) => completions.observe(claim, result),
         isCancellationRequested: (item) => item.requestedTurnId !== undefined &&
             completions.cancellationReason(item.sessionId, item.requestedTurnId) !== undefined,
@@ -152,7 +154,7 @@ export async function initializeTurnSystem(options) {
     let closePromise;
     return {
         turns,
-        ...subagentOccupancyCapability(options.subagentConcurrency),
+        ...subagentCapabilities(options.subagentConcurrency, recovery),
         sessionLifecycle: {
             runExclusive: async (sessionId, operation) => {
                 const lease = operations.tryAcquireExclusive(sessionId);
@@ -168,17 +170,16 @@ export async function initializeTurnSystem(options) {
             tryRunExclusive: (sessionId, operation) => sessionEndMaintenance.tryRunExclusive(sessionId, operation),
         },
         pluginHookSessionOwnership: pluginHookSessionOwnership(repository),
-        queueSteer: createRuntimeQueueSteer(queue, completions),
+        queueSteer: createRuntimeQueueSteer(queue, completions, prepareQueuedExecution),
         inspection: {
+            backgroundTaskWait: (sessionId) => controller.backgroundTaskWait(sessionId),
             activeTurnId: (sessionId) => execution.activeTurnId(sessionId),
             hasPendingUserSteering: (sessionId) => controller.hasPendingUserSteering(sessionId),
+            hasQueuedUserInputSince: async (sessionId, sinceMs) => hasUserQueueInputSince(await options.sessions.queue.submission.list(sessionId), sinceMs),
             activeTurn: async (sessionId) => {
                 const active = await repository.findActiveTurn(sessionId);
                 return active
-                    ? {
-                        ...active,
-                        locallyOwned: execution.activeTurnId(sessionId) === active.turnId,
-                    }
+                    ? { ...active, locallyOwned: execution.activeTurnId(sessionId) === active.turnId }
                     : undefined;
             },
             latestTurnActivity: (sessionId) => repository.findLatestTurnActivity(sessionId),
@@ -211,10 +212,27 @@ export async function initializeTurnSystem(options) {
         },
     };
 }
-function createRuntimeQueueSteer(queue, completions) {
+/**
+ * Prepares a claimed queue item to run as `turnId` and tells the
+ * `onQueuedTurnIdentity` owner when that id differs from the ids the item was
+ * asked for or tried under before (a redelivery mints a fresh one).
+ */
+function createQueuedExecutionPreparation(options, completions) {
+    return (claim, turnId) => {
+        completions.prepareExecution(claim, turnId);
+        const previousTurnIds = [
+            ...(claim.item.requestedTurnId ? [claim.item.requestedTurnId] : []),
+            ...(claim.item.deliveryAttempts ?? []).map((attempt) => attempt.turnId),
+        ].filter((previous) => previous !== turnId);
+        if (previousTurnIds.length === 0)
+            return;
+        options.onQueuedTurnIdentity?.({ sessionId: claim.sessionId, turnId, previousTurnIds });
+    };
+}
+function createRuntimeQueueSteer(queue, completions, prepareExecution) {
     return {
         prepareDelivery: (claim, turnId) => {
-            completions.prepareExecution(claim, turnId);
+            prepareExecution(claim, turnId);
             return queue.prepareDelivery({
                 sessionId: claim.sessionId,
                 claimId: claim.claimId,
@@ -233,10 +251,15 @@ function createRuntimeQueueSteer(queue, completions) {
         release: (claim) => queue.release({ sessionId: claim.sessionId, claimId: claim.claimId }),
     };
 }
-function subagentOccupancyCapability(subagentConcurrency) {
-    return subagentConcurrency
-        ? { subagentOccupancy: (parentSessionId) => subagentConcurrency.occupancy(parentSessionId) }
-        : {};
+function subagentCapabilities(subagentConcurrency, recovery) {
+    return {
+        recoverQueuedSubagents: recovery.recoverQueuedSubagents,
+        ...(subagentConcurrency
+            ? {
+                subagentOccupancy: (parentSessionId) => subagentConcurrency.occupancy(parentSessionId),
+            }
+            : {}),
+    };
 }
 function createSubagentSiblingWake(subagentConcurrency) {
     let wakeQueuedSiblings;
@@ -258,13 +281,14 @@ function createSubagentSiblingWake(subagentConcurrency) {
                 queue,
                 dispatch: (sessionId) => dispatcher.dispatch(sessionId),
             });
-            recoverQueuedTaskChildren = () => subagentConcurrency.recoverQueuedTaskChildren({
+            recoverQueuedTaskChildren = (signal) => subagentConcurrency.recoverQueuedTaskChildren({
+                ...(signal ? { signal } : {}),
                 queue,
                 dispatch: (sessionId) => dispatcher.dispatch(sessionId),
                 recoverTaskOwners: nextRecoverTaskOwners,
             });
         },
-        recoverQueuedTaskChildren: async () => (await recoverQueuedTaskChildren?.()) ?? false,
+        recoverQueuedTaskChildren: async (signal) => (await recoverQueuedTaskChildren?.(signal)) ?? false,
         handleFacts: (facts) => {
             if (facts.some((fact) => fact.kind === 'requeued' &&
                 fact.admissionReason === 'policy:subagent:concurrency-limit')) {
@@ -312,6 +336,9 @@ function createRuntimeSteeringRequeue(options, released) {
                     canonicalHistory: options.sessions.canonicalHistory,
                     ...(options.nowMs ? { nowMs: options.nowMs } : {}),
                     ...(options.logger ? { logger: options.logger } : {}),
+                    ...(options.onSteeringTeardownCommitted
+                        ? { onMessageDurable: options.onSteeringTeardownCommitted }
+                        : {}),
                 }),
             }
             : {}),
@@ -358,6 +385,11 @@ function createRuntimeRecoveryCoordinator(options, repository, subagentQueueWake
     let liveSessionsRemain = false;
     let pendingTaskOwners = false;
     let retryDesktopSubagentQueue = false;
+    // Queued Task children are dispatched only once startup recovery reached
+    // them, or a wake of this process asked for a retry: a reconciliation retry
+    // (a failed deletion, live Sessions) must not start them earlier, nor at all
+    // under the quarantined startup policy.
+    let subagentQueueReleased = false;
     let lastTaskRecoveryState;
     const pendingRecoveredTurnIds = new Set();
     let closed = false;
@@ -419,13 +451,15 @@ function createRuntimeRecoveryCoordinator(options, repository, subagentQueueWake
         await recoverDispatcher();
         if (closed)
             return;
-        retryDesktopSubagentQueue = false;
-        retryDesktopSubagentQueue ||= await subagentQueueWake.recoverQueuedTaskChildren();
+        if (subagentQueueReleased) {
+            retryDesktopSubagentQueue = false;
+            retryDesktopSubagentQueue ||= await subagentQueueWake.recoverQueuedTaskChildren();
+        }
         await resumePendingDeletions();
         if (liveSessionsRemain ||
             pendingTaskOwners ||
             pendingDeletionSessionIds.size > 0 ||
-            retryDesktopSubagentQueue) {
+            (retryDesktopSubagentQueue && subagentQueueReleased)) {
             schedule();
         }
     };
@@ -451,6 +485,17 @@ function createRuntimeRecoveryCoordinator(options, repository, subagentQueueWake
             schedule();
         }
     };
+    const recoverQueuedSubagents = async (signal) => {
+        if (closed || signal?.aborted)
+            return;
+        subagentQueueReleased = true;
+        const retry = await subagentQueueWake.recoverQueuedTaskChildren(signal);
+        if (closed || signal?.aborted)
+            return;
+        retryDesktopSubagentQueue = retry;
+        if (retryDesktopSubagentQueue)
+            schedule();
+    };
     const recoverSubagentTaskOwners = async (sessionIds) => {
         if (sessionIds.length === 0)
             return;
@@ -465,11 +510,13 @@ function createRuntimeRecoveryCoordinator(options, repository, subagentQueueWake
     return {
         recoverState,
         recoverPending,
+        recoverQueuedSubagents,
         bind: (dispatcher) => {
             recoverDispatcher = () => dispatcher.recoverPending({ processStartedAtMs: options.processStartedAtMs });
         },
         requestSubagentRetry: () => {
             retryDesktopSubagentQueue = true;
+            subagentQueueReleased = true;
             schedule();
         },
         recoverSubagentTaskOwners,
@@ -521,6 +568,7 @@ function createQueuedTurnControl(options, repository, steeringRequeue) {
     const completions = createQueuedTurnCompletionRegistry();
     const controller = createTurnController({
         renew: repository.renew,
+        onBackgroundTaskWaitChanged: options.onBackgroundTaskWaitChanged,
         onRegister: completions.beginExecution,
         onSteeringDiscarded: (batch) => steeringRequeue.discard(batch),
         ...(options.logger ? { logger: options.logger } : {}),
@@ -531,6 +579,7 @@ function createTurnFacade(input) {
     return {
         prepareSideChat: (request) => input.historyMutation.prepareSideChat(request),
         fork: (request) => input.historyMutation.fork(request),
+        inspectForkBoundary: (request) => input.historyMutation.inspectForkBoundary(request),
         rewind: (request) => input.historyMutation.rewind(request),
         submit: (request) => input.submission.submit(request),
         resumeUserInput: (request) => input.submission.resumeUserInput(request),

@@ -1,6 +1,6 @@
 import { buildPluginId, parsePluginMentions } from '@mavis/shared/plugin-mention';
 import { attachPluginCapabilityAttribution, normalizedPluginSkillAttributionKey, selectPreferredAppPluginOwners, } from '@mavis/agent-core/event-bridge';
-import { authorizeMcpInvokeReference, createMcpInvokeTool, revokeMcpInvokeReferenceAuthorization, resolveMcpInvokeTarget, } from '@mavis/agent-tools';
+import { authorizeMcpInvokeReference, buildToolLoadingCatalog, createMcpInvokeTool, getMcpInvokeRegistries, revokeMcpInvokeReferenceAuthorization, resolveMcpInvokeTarget, } from '@mavis/agent-tools';
 import { buildPluginReferenceReminder, detectPluginReferencesForMessages, } from '@mavis/system-reminder';
 import { InstalledPluginSource, PluginCapabilityType, } from '@mavis/protocol';
 import { withHostSkillContracts } from './host-capability/skill-disclosure.js';
@@ -15,6 +15,31 @@ export function authorizeDelegatedToolReference(tool, input) {
 /** Removes a Host admission that cannot cross the final delivery seam. */
 export function revokeDelegatedToolReferenceAuthorization(tool, input) {
     revokeMcpInvokeReferenceAuthorization(tool, input);
+}
+/** Resolve Hook ownership from the selected implementation, including hidden named targets. */
+export function exactPluginMcpToolOwners(bindings, tools) {
+    const selected = new Map(tools.map((tool) => [tool.def.name, tool]));
+    const gateway = selected.get('mcp_invoke');
+    const deferred = gateway ? getMcpInvokeRegistries(gateway)?.registry : undefined;
+    const owners = new Map();
+    const ambiguous = new Set();
+    for (const binding of bindings) {
+        if (binding.kind !== 'mcp' || !binding.pluginName?.trim())
+            continue;
+        const toolName = binding.tool.def.name;
+        const target = selected.get(toolName) ?? deferred?.get(toolName);
+        if (target?.impl !== binding.tool.impl)
+            continue;
+        const existing = owners.get(toolName);
+        if (existing && existing !== binding.pluginName) {
+            owners.delete(toolName);
+            ambiguous.add(toolName);
+            continue;
+        }
+        if (!ambiguous.has(toolName))
+            owners.set(toolName, binding.pluginName);
+    }
+    return owners;
 }
 /** Resolves explicit references to trusted official or builtin host capabilities. */
 export function detectReferencedOfficialHostCapabilityPlugins(input) {
@@ -58,9 +83,9 @@ export function mergeAgentHostTurnCapabilities(input) {
         capabilities,
         effectivePluginSkills: input.effectivePluginSkills,
         // Attribution decorates relevant tools with cloned wrapper objects.
-        // Inventory filtering must retain the pre-decoration identities used by Runtime bindings.
+        // Inventory filtering retains pre-decoration binding identities.
         finalTools: merged.tools,
-        deferredToolNames: new Set(attributed.plan.deferred ? attributed.plan.deferredRegistry.keys() : []),
+        plan: merged.plan,
     });
     const delegable = delegablePluginIds(capabilities.agents, merged.tools);
     const unavailable = [
@@ -171,24 +196,26 @@ function appendProvenances(target, key, values) {
 }
 function mergeTools(input) {
     const capabilities = input.capabilities;
+    const baseNames = new Set();
+    const baseTools = input.tools.filter((tool) => {
+        const name = toolNameKey(tool.def.name);
+        if (!name || baseNames.has(name))
+            return false;
+        baseNames.add(name);
+        return true;
+    });
     const preparedHost = input.hostCapabilityRegistry?.prepare({
-        tools: input.tools,
+        tools: baseTools,
         bindings: capabilities?.hostBindings ?? [],
         surface: input.surface ?? 'interactive',
         availableSkillRuntimeNames: new Set(input.effectivePluginSkills.map((skill) => skill.name)),
     });
     const hostReferences = preparedHost?.referenceRegistry ?? new Map();
-    const hostTools = preparedHost?.publicTools ?? input.tools;
-    const tools = withHostSkillContracts(replaceMcpInvoke(hostTools, input.plan, hostReferences), hostReferences);
-    if (!capabilities)
-        return { tools, plan: input.plan };
-    const bindingByTool = new Map(capabilities.runtimeToolBindings.map((binding) => [binding.tool, binding]));
+    const hostTools = preparedHost?.publicTools ?? baseTools;
+    const tools = withHostSkillContracts(replaceMcpInvoke(hostTools, hostReferences), hostReferences);
+    const bindingByTool = new Map(capabilities?.runtimeToolBindings.map((binding) => [binding.tool, binding]));
     const usedNames = new Set(tools.map((tool) => toolNameKey(tool.def.name)));
-    if (input.plan.deferred) {
-        for (const name of input.plan.deferredRegistry.keys())
-            usedNames.add(toolNameKey(name));
-    }
-    const selected = capabilities.runtimeTools.filter((tool) => {
+    const selected = capabilities?.runtimeTools.filter((tool) => {
         // Use source identity, not a name prefix: a Plugin MCP may use the same name.
         if (bindingByTool.get(tool)?.kind === 'app')
             return false;
@@ -197,11 +224,20 @@ function mergeTools(input) {
             return false;
         usedNames.add(name);
         return true;
+    }) ?? [];
+    return buildToolLoadingCatalog({
+        tools: [...tools, ...selected],
+        entries: [
+            ...(input.mcpEntries ?? []),
+            ...selected.map((tool) => ({ tool, source: 'configured' })),
+        ],
+        model: input.model,
+        options: input.options,
+        alwaysExpose: true,
     });
-    return { tools: [...tools, ...selected], plan: input.plan };
 }
-function replaceMcpInvoke(tools, plan, hostReferences) {
-    const invoke = createMcpInvokeTool(plan.deferred ? plan.deferredRegistry : new Map(), hostReferences);
+function replaceMcpInvoke(tools, hostReferences) {
+    const invoke = createMcpInvokeTool(new Map(), hostReferences);
     const hasInvoke = tools.some((tool) => tool.def.name === 'mcp_invoke');
     if (!hasInvoke && hostReferences.size === 0)
         return tools;
@@ -218,8 +254,19 @@ function buildCapabilityInventory(input) {
     const finalTools = new Set(input.finalTools);
     const searchableToolsAvailable = input.finalTools.some((tool) => tool.def.name === 'tool_search') &&
         input.finalTools.some((tool) => tool.def.name === 'mcp_invoke');
+    const access = (tool) => {
+        if (finalTools.has(tool))
+            return 'direct';
+        if (searchableToolsAvailable &&
+            input.plan.deferred &&
+            input.plan.deferredRegistry.get(tool.def.name) === tool) {
+            return 'tool_search';
+        }
+        return undefined;
+    };
     return input.capabilities.plugins.map((plugin) => ({
         name: plugin.name,
+        ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
         pluginId: buildPluginId(plugin.name, plugin.source),
         ...((plugin.source === 'official' || plugin.source === 'builtin') &&
             plugin.hostCapabilities?.includes('computer-use')
@@ -236,28 +283,22 @@ function buildCapabilityInventory(input) {
             : {}),
         appTools: [],
         appCliProviders: plugin.appProviders,
-        mcpTools: [
-            ...groupMcpTools(input.capabilities.runtimeToolBindings.filter((binding) => binding.kind === 'mcp' &&
-                binding.pluginName === plugin.name &&
-                finalTools.has(binding.tool))),
-            ...(searchableToolsAvailable
-                ? groupMcpTools(input.capabilities.runtimeToolBindings.filter((binding) => binding.kind === 'mcp' &&
-                    binding.pluginName === plugin.name &&
-                    !finalTools.has(binding.tool) &&
-                    input.deferredToolNames.has(binding.tool.def.name))).map((group) => ({ ...group, access: 'tool_search' }))
-                : []),
-        ],
+        mcpTools: groupTools(input.capabilities.runtimeToolBindings.filter((binding) => binding.kind === 'mcp' && binding.pluginName === plugin.name), access),
         skills: input.effectivePluginSkills.flatMap((skill) => skill.pluginName === plugin.name ? [skill.name] : []),
     }));
 }
-function groupMcpTools(bindings) {
-    const grouped = bindings.reduce((result, binding) => {
-        const tools = result.get(binding.source) ?? [];
-        tools.push(binding.tool.def.name);
-        result.set(binding.source, tools);
-        return result;
-    }, new Map());
-    return [...grouped].map(([source, tools]) => ({ source, tools }));
+function groupTools(bindings, access) {
+    const groups = new Map();
+    for (const binding of bindings) {
+        const mode = access(binding.tool);
+        if (!mode)
+            continue;
+        const key = `${binding.source}\0${mode}`;
+        const group = groups.get(key) ?? { source: binding.source, tools: [], access: mode };
+        group.tools.push(binding.tool.def.name);
+        groups.set(key, group);
+    }
+    return [...groups.values()];
 }
 /** MCP names are case-sensitive; retain existing precedence for other tools. */
 function toolNameKey(name) {

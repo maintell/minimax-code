@@ -1,8 +1,10 @@
-import { realpath, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { LOCAL_BROWSER_ACTION_NAMES, } from '@mavis/agent-tools/desktop';
 const MAX_BROWSER_UPLOAD_FILES = 20;
 const MAX_BROWSER_UPLOAD_TOTAL_BYTES = 512 * 1024 * 1024;
+const MAX_BROWSER_SCRIPT_BYTES = 200 * 1024;
+const BROWSER_SCRIPT_EXTENSIONS = { '.js': true, '.mjs': true };
 const LEGACY_BROWSER_ACTIONS = [
     'wait_for',
     'get_dom',
@@ -34,12 +36,51 @@ export function createWorkspaceBrowserAssetAdapter(delegate, options) {
         },
         async execute(ctx, action, input, signal) {
             throwIfAborted(signal);
+            if (action === 'run_script' && typeof input.path === 'string') {
+                return delegate.execute(ctx, action, await readWorkspaceScript(input, options.workspaceRoot), signal);
+            }
             if (action !== 'upload_files')
                 return delegate.execute(ctx, action, input, signal);
             const files = await resolveAuthorizedUploadPaths(ctx, input, options.workspaceRoot, signal);
             return delegate.execute({ ...ctx, browserAssets: files }, action, { ...input, paths: files.map((file) => file.filePath) }, signal);
         },
     };
+}
+/**
+ * Replace a workspace script path with its source. The script keeps its
+ * workspace-relative filename so error locations point at the saved file.
+ */
+async function readWorkspaceScript(input, workspaceRoot) {
+    const submitted = String(input.path).trim();
+    const root = await realpath(workspaceRoot);
+    const candidate = isAbsolute(submitted) ? submitted : resolve(root, submitted);
+    let fileRealPath;
+    try {
+        fileRealPath = await realpath(candidate);
+    }
+    catch {
+        throw new Error('SCRIPT_NOT_FOUND: run_script path does not exist');
+    }
+    if (!isPathInside(root, fileRealPath)) {
+        throw new Error('SCRIPT_NOT_AUTHORIZED: run_script path must be inside the active workspace');
+    }
+    if (!BROWSER_SCRIPT_EXTENSIONS[extname(fileRealPath).toLowerCase()]) {
+        throw new Error('SCRIPT_NOT_AUTHORIZED: run_script path must be a .js or .mjs file');
+    }
+    const fileStat = await stat(fileRealPath);
+    if (!fileStat.isFile())
+        throw new Error('SCRIPT_NOT_AUTHORIZED: run_script path is not a file');
+    if (fileStat.size > MAX_BROWSER_SCRIPT_BYTES) {
+        throw new Error(`SCRIPT_TOO_LARGE: run_script file exceeds ${MAX_BROWSER_SCRIPT_BYTES} bytes`);
+    }
+    const code = await readFile(fileRealPath, 'utf8');
+    const forwarded = {
+        ...input,
+        code,
+        filename: relative(root, fileRealPath).split(sep).join('/'),
+    };
+    delete forwarded.path;
+    return forwarded;
 }
 async function resolveAuthorizedUploadPaths(ctx, input, workspaceRoot, signal) {
     const submittedPaths = requireSubmittedPaths(input.paths);

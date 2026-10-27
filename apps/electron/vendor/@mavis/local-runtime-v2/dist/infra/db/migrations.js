@@ -1,4 +1,3 @@
-import { migration as m0044 } from './migrations/session/migration-0044-converge-rc-sidechat-version-collision.js';
 import { migration as m0014 } from './migrations/agent/migration-0014-create-agents.js';
 import { migration as m0024 } from './migrations/canvas/migration-0024-create-canvas.js';
 import { migration as m0031 } from './migrations/canvas/migration-0031-repair-canvas-version-collision.js';
@@ -8,6 +7,8 @@ import { migration as m0002 } from './migrations/cron/migration-0002-copy-legacy
 import { migration as m0004 } from './migrations/cron/migration-0004-copy-legacy-cron-run-history.js';
 import { migration as m0036 } from './migrations/cron/migration-0036-repair-cron-manual-request-index.js';
 import { migration as m0005 } from './migrations/plugin/migration-0005-adopt-plugin-state.js';
+import { migration as m0050 } from './migrations/plugin/migration-0050-create-plugin-miniapp-permission.js';
+import { migration as m0051 } from './migrations/goal/migration-0051-add-goal-cache-write-unreported.js';
 import { migration as m0023 } from './migrations/miniapp/migration-0023-create-miniapp-state.js';
 import { migration as m0030 } from './migrations/miniapp/migration-0030-repair-liveboard-state-version-collision.js';
 import { migration as m0001 } from './migrations/runtime/migration-0001-runtime-v2-baseline.js';
@@ -41,6 +42,12 @@ import { migration as m0039 } from './migrations/memory/migration-0039-memory-go
 import { migration as m0040 } from './migrations/memory/migration-0040-memory-executions.js';
 import { migration as m0042 } from './migrations/session/migration-0042-repair-session-sidechats-version-collision.js';
 import { migration as m0043 } from './migrations/cron/migration-0043-cron-deferred-delivery.js';
+import { migration as m0044 } from './migrations/session/migration-0044-converge-rc-sidechat-version-collision.js';
+import { migration as m0045 } from './migrations/goal/migration-0045-repair-goal-branch-version-collision.js';
+import { migration as m0046 } from './migrations/goal/migration-0046-create-goal-owner-table.js';
+import { migration as m0047 } from './migrations/goal/migration-0047-create-goal-request-ledger.js';
+import { migration as m0048 } from './migrations/goal/migration-0048-add-goal-token-usage.js';
+import { migration as m0049 } from './migrations/background-task/migration-0049-adopt-background-tasks.js';
 export const ALL_MIGRATIONS = [
     m0001,
     m0002,
@@ -85,5 +92,12 @@ export const ALL_MIGRATIONS = [
     m0042,
     m0043,
     m0044,
+    m0045,
+    m0046,
+    m0047,
+    m0048,
+    m0049,
+    m0050,
+    m0051,
 ];
 //# sourceMappingURL=migrations.js.map

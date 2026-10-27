@@ -1,6 +1,6 @@
 import { convertToLlm } from '@earendil-works/pi-coding-agent/messages';
 import { imageDimensions } from './image-dimensions.js';
-import { limitRequestImages, resolveMaxImagesPerRequest } from './request-image-limit.js';
+import { keepsRequestImages, limitRequestImages, resolveMaxImagesPerRequest, } from './request-image-limit.js';
 const PRIOR_THINKING_OPEN = '<|prior-thinking|>';
 const PRIOR_THINKING_CLOSE = '<|/prior-thinking|>';
 const SIBLING_NATIVE_THINKING_APIS = new Set([
@@ -38,8 +38,11 @@ export function projectAgentMessagesForModel(messages, targetModel) {
         .map(projectVideoBlocks)
         .map((message) => projectUndersizedImageBlocks(message, undetermined));
     // Last, so the ceiling counts exactly the images that would be sent: video
-    // frames projected to images count, undersized placeholders do not.
-    const limited = limitRequestImages(projected, resolveMaxImagesPerRequest(targetModel));
+    // frames projected to images count, undersized placeholders do not. Models
+    // that cache by prefix keep every image; compaction removes them instead.
+    const limited = keepsRequestImages(targetModel)
+        ? { messages: projected, omittedCount: 0 }
+        : limitRequestImages(projected, resolveMaxImagesPerRequest(targetModel));
     return {
         removedCount: compatible.removedCount,
         messages: limited.messages,

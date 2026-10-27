@@ -998,6 +998,7 @@ function evaluateSingleSubcommand(command, bashRules, mode, bashCtx) {
                 : undefined,
             permReasonType: result.reason.type,
             cmdPreview,
+            sessionId: bashCtx?.sessionId,
             ...extras,
         }, `[permission] subcommand layer=${layer} mode=${mode} verdict=${result.verdict}`);
         return result;

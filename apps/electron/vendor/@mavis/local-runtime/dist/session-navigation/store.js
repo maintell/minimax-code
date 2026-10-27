@@ -82,13 +82,19 @@ function buildSummaries(rows, assets, turnDiffs) {
         if (!message)
             continue;
         if (isNavigableUserInput(message)) {
-            if (current)
-                summaries.push(finishSummary(current));
-            current = {
-                userInput: messageHead(row, message),
-                artifactsByKey: new Map(),
-                fileChangePaths: new Set(),
-            };
+            if (message.kind === 'steered_user' && current) {
+                current.steeredInputs.push(messageHead(row, message));
+            }
+            else {
+                if (current)
+                    summaries.push(...finishSummary(current));
+                current = {
+                    userInput: messageHead(row, message),
+                    steeredInputs: [],
+                    artifactsByKey: new Map(),
+                    fileChangePaths: new Set(),
+                };
+            }
         }
         if (!current)
             continue;
@@ -105,7 +111,7 @@ function buildSummaries(rows, assets, turnDiffs) {
         }
     }
     if (current)
-        summaries.push(finishSummary(current));
+        summaries.push(...finishSummary(current));
     return summaries;
 }
 function groupAssetsByMessageRow(rows) {
@@ -175,12 +181,15 @@ function messageHead(row, message) {
     };
 }
 function finishSummary(summary) {
-    return {
-        userInput: summary.userInput,
+    const result = {
         ...(summary.assistantResponse ? { assistantResponse: summary.assistantResponse } : {}),
         artifacts: [...summary.artifactsByKey.values()].sort((left, right) => left.messageRowId - right.messageRowId || left.assetIndex - right.assetIndex),
         fileChangeCount: summary.fileChangePaths.size,
     };
+    return [summary.userInput, ...summary.steeredInputs].map((userInput) => ({
+        userInput,
+        ...result,
+    }));
 }
 function paginateSummaries(summaries, options) {
     const end = options.beforeRowId === undefined

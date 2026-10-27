@@ -19,6 +19,7 @@ const FAILURE_MESSAGES = {
     ENTRY_OUTSIDE_ARTIFACT: 'Mini App entry is outside its package.',
     HOST_CONNECTOR_PROTOCOL_VIOLATION: 'Mini App violated the Host Connector protocol.',
     HOST_CONNECTOR_UNAVAILABLE: 'The required Host Connector is unavailable.',
+    LISTEN_EACCES: 'The operating system refused to bind the selected runtime port.',
     NO_CANDIDATE_PORT: 'No Host-approved runtime port is available.',
     PERSISTENCE_COMPENSATION_FAILED: 'Host could not restore the previous Mini App state.',
     PERSISTENCE_WRITE_FAILED: 'Host could not save Mini App state.',

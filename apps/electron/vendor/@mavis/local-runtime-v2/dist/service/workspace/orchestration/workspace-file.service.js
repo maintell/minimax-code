@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_INLINE_FILE_BYTES, getFileSystemGitInfo, getWorkspaceFileMetadata, listFileSystemDirectories, listWorkspaceFileTree, previewWorkspaceFile, readWorkspaceFile, resolveWorkspaceFileWritePath, saveWorkspaceFile, searchWorkspaceFiles, } from '../operations/filesystem/files.js';
+import { DEFAULT_MAX_INLINE_FILE_BYTES, getFileSystemGitInfo, listFileSystemDirectories, listWorkspaceFileTree, previewWorkspaceFile, readWorkspaceFile, resolveWorkspaceFileWritePath, saveWorkspaceFile, searchWorkspaceFiles, } from '../operations/filesystem/files.js';
 export class WorkspaceFileServiceImpl {
     options;
     maxInlineFileBytes;
@@ -13,9 +13,6 @@ export class WorkspaceFileServiceImpl {
     }
     listFileTree(input) {
         return listWorkspaceFileTree(input);
-    }
-    getFileMetadata(workspace, filePath) {
-        return getWorkspaceFileMetadata(workspace, filePath);
     }
     readFile(workspace, filePath, options) {
         return readWorkspaceFile(workspace, filePath, options, this.maxInlineFileBytes);

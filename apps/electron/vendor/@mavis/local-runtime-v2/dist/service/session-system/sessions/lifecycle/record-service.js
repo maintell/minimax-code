@@ -458,10 +458,13 @@ export class SessionRecordService {
         return session;
     }
     async createRecord(input) {
-        const agentShell = await this.captureAgentShell?.(input.parentSessionId);
+        const capture = await this.captureAgentShell?.(input.parentSessionId);
         const created = await this.deps.metadata.create({
             ...input,
-            ...(agentShell ? { agentShell } : {}),
+            ...(capture?.agentShell ? { agentShell: capture.agentShell } : {}),
+            ...(capture?.agentShellPreference
+                ? { agentShellPreference: capture.agentShellPreference }
+                : {}),
         });
         try {
             await this.deps.artifacts?.initialize(created.sessionId);
@@ -539,6 +542,7 @@ function toInternalMetadataCreateInput(context) {
         ...internalModelFields(context.input, context.taskCapture, context.forkedAgentDefinition),
         ...internalBindingFields(context.taskCapture, context.forkedAgentDefinition),
         origin: context.input.origin ?? 'user',
+        ...whenPresent('createdBySessionId', context.input.createdBySessionId),
     };
 }
 function metadataIdentityFields(context, sessionKind) {

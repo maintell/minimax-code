@@ -1,6 +1,6 @@
 import { toPiUserMessage, } from '@mavis/agent-core/pi-turn-runner';
 import { emitLocalPluginHookWarnings, localPluginHookCoordinator as pluginHookCoordinator, renderPluginHookRejectionReminder, } from '../assembly/local-turn-plugin-hooks.js';
-import { isUserSteeringProducer } from '../runner/contracts.js';
+import { isHandedBackOnClose, isUserSteeringProducer } from '../runner/contracts.js';
 import { AgentHostTurnCloseError } from '../runner/turn-close-error.js';
 import { joinUserPrompt } from './prompt.js';
 const MAX_PLUGIN_STOP_CONTINUATIONS = 8;
@@ -32,8 +32,10 @@ export function createContinuationControl(input, prepare, onConsumed) {
             };
             try {
                 for (const [index, message] of messages.entries()) {
-                    if (deferUserProducers && isUserSteeringProducer(message.producerId))
+                    if (deferUserProducers &&
+                        isHandedBackOnClose(message.producerId, context?.workClosed === true)) {
                         continue;
+                    }
                     const result = await preparePluginSteeringMessage(input, message, prepare);
                     if (result.kind === 'stop') {
                         stopAfterSteering = true;
@@ -76,9 +78,15 @@ export function createContinuationControl(input, prepare, onConsumed) {
         },
         shouldStopAfterSteering: () => stopAfterSteering,
         tryBeginClose: (closeContext) => {
-            const result = control.tryBeginClose();
+            const closeOptions = {
+                ...(closeContext.workClosed === true ? { workClosed: true } : {}),
+                ...(closeContext.final === true ? { final: true } : {}),
+            };
+            const result = control.tryBeginClose(Object.keys(closeOptions).length > 0 ? closeOptions : undefined);
             if (result.closed) {
-                if (input.pluginHooks?.length) {
+                // A final close follows a refused request: a Stop hook asking to
+                // continue could not be honored, so the Turn just ends.
+                if (input.pluginHooks?.length && closeContext.final !== true) {
                     return finishPluginStopAndTrack(input, hookFollowUps, closeContext, pluginStopState);
                 }
                 pluginHookCoordinator.completeTurn(input.lease.sessionId);
@@ -188,7 +196,11 @@ async function finishPluginStop(input, hookFollowUps, context) {
         return true;
     }
     if (decision.continuePrompt) {
-        if (context.stopContinuationCount >= MAX_PLUGIN_STOP_CONTINUATIONS) {
+        // The Stop hook runs after the close was won, so continuing must reopen
+        // the Turn first; otherwise every tool call in the continuation is
+        // refused at the closed tool-result seam.
+        if (context.stopContinuationCount >= MAX_PLUGIN_STOP_CONTINUATIONS ||
+            !input.control.cancelClose()) {
             pluginHookCoordinator.completeTurn(input.lease.sessionId);
             return true;
         }
@@ -240,11 +252,11 @@ export function prepareInitialImmediateSendBatch(input, preparedBatch, ordinary,
     });
 }
 export function withGenuineQueryProvenance(input, genuineUserQueryText) {
-    const startOffset = input.text.length - genuineUserQueryText.length;
-    if (startOffset >= 0 && input.text.slice(startOffset) === genuineUserQueryText) {
+    const startOffset = locateGenuineQuery(input.text, genuineUserQueryText);
+    if (startOffset !== undefined) {
         return {
             ...input,
-            canonicalTextRange: { startOffset, endOffset: input.text.length },
+            canonicalTextRange: { startOffset, endOffset: startOffset + genuineUserQueryText.length },
         };
     }
     return {
@@ -253,9 +265,26 @@ export function withGenuineQueryProvenance(input, genuineUserQueryText) {
         genuineUserQueryText,
     };
 }
+/**
+ * The assembled text appends reminders and, for a peer message, wraps the body
+ * in an envelope, so the original query is no longer a suffix. A trailing
+ * match still wins, which keeps a reminder that repeats the query from moving
+ * the range; otherwise the single interior occurrence is used. Repeated
+ * occurrences stay unresolved and fall back to the stored query text. An
+ * empty query always matches at the end, as it did before the envelope.
+ */
+function locateGenuineQuery(text, query) {
+    const trailing = text.length - query.length;
+    if (trailing >= 0 && text.slice(trailing) === query)
+        return trailing;
+    const first = text.indexOf(query);
+    if (first < 0 || text.indexOf(query, first + 1) >= 0)
+        return undefined;
+    return first;
+}
 /** Pending child Bash keeps the Turn active, so user input must not be deferred to a future Turn. */
 export async function resolveChildBashSteeringContext(context, childBash) {
-    if (context?.boundary === 'exit' && (await childBash?.hasPending())) {
+    if (context?.boundary === 'exit' && !context.workClosed && (await childBash?.hasPending())) {
         return { boundary: 'mid-turn' };
     }
     return context;

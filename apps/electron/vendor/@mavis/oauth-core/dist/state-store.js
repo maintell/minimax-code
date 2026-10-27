@@ -45,7 +45,8 @@ function parseState(value) {
             (typeof state.expiresAtMs === 'number' && Number.isFinite(state.expiresAtMs))) &&
         Number.isSafeInteger(state.generation) &&
         state.generation >= 0 &&
-        (state.authorization === undefined || isAuthorizationLease(state.authorization));
+        (state.authorization === undefined || isAuthorizationLease(state.authorization)) &&
+        (state.refresh === undefined || isRefreshTransaction(state.refresh));
     if (!valid)
         throw new TypeError('Invalid OAuth state.');
     assertNoSensitiveKeys(state);
@@ -56,6 +57,22 @@ function isOptionalAuthScope(buildEnv, region) {
         return true;
     return ((buildEnv === 'dev' || buildEnv === 'test' || buildEnv === 'staging' || buildEnv === 'prod') &&
         (region === 'cn' || region === 'en'));
+}
+function isRefreshTransaction(value) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value))
+        return false;
+    const transaction = value;
+    if (typeof transaction.id !== 'string' || !transaction.id.length)
+        return false;
+    if (transaction.owner === undefined)
+        return true;
+    if (typeof transaction.owner !== 'object' || transaction.owner === null)
+        return false;
+    const owner = transaction.owner;
+    return (Number.isSafeInteger(owner.pid) &&
+        owner.pid > 0 &&
+        Number.isSafeInteger(owner.startedAtMs) &&
+        owner.startedAtMs > 0);
 }
 function isAuthorizationLease(value) {
     if (typeof value !== 'object' || value === null || Array.isArray(value))

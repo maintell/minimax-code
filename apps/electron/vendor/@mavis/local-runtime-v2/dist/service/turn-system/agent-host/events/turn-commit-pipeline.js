@@ -475,6 +475,7 @@ function reconcileMutation(lease, intent) {
                 id: `agent-host:${lease.turnId}:history:${reason.kind}`,
                 kind: 'output-recall',
                 variant: intent.variant,
+                ...(intent.slowNetworkRead ? { slowNetworkRead: true } : {}),
             },
         };
     }
@@ -489,6 +490,9 @@ function reconcileMutation(lease, intent) {
             id: `agent-host:${lease.turnId}:history:${intent.kind}`,
             kind: intent.kind,
             ...(mode === 'network' ? { variant: 'network' } : {}),
+            ...(intent.kind === 'network-reconcile' && intent.slowNetworkRead
+                ? { slowNetworkRead: true }
+                : {}),
         },
     };
 }

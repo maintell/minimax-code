@@ -27,7 +27,9 @@ export const CreateGoalToolDef = {
             minimum: 1,
             description: 'Optional positive token budget for the goal. Omit unless the user explicitly asked for a cap. ' +
                 'When set, the runtime automatically marks the goal as `budget_limited` and stops auto-continuation ' +
-                'the moment cumulative model tokens reach this value.',
+                'the moment cumulative model tokens reach this value. ' +
+                'Token usage counts input, cache writes, cache reads and output of every request, and each request ' +
+                're-reads the cached context, so usage grows much faster than the new text exchanged; size the budget for that.',
         })),
     }),
 };
@@ -39,7 +41,7 @@ export const UpdateGoalToolDef = {
         'Always set `mode` to choose exactly one operation per call; fields belonging to the other mode are ignored.\n' +
         'Terminal mode (`mode: "status"`): pass `status` and optional `summary`; follow the rules documented on the `status` field. The host settles the proposal after this turn. An accepted `blocked` proposal ends the turn. ' +
         'After an accepted `complete` proposal, do not call any more tools (they are refused): write one final reply to the user in the same turn that says what was accomplished, where each deliverable file is, and how to use it when that is not obvious; declare every deliverable file with delivery markup (<media /> tags inside <deliver-assets>) and write its path in the text; do not claim that verification has passed or that the result is verified, because the host verifies after this reply; describe checks you ran as checks, not as verification.\n' +
-        'Budget mode (`mode: "token_budget"`): call `get_goal` immediately before `update_goal`, then pass only `token_budget`, `expected_goal_id`, and `expected_updated_at`. Use a positive integer token count, or `null` to clear the cap. A successful update does not end the turn and may reactivate a token-limited goal.\n' +
+        'Budget mode (`mode: "token_budget"`): call `get_goal` immediately before `update_goal`, then pass only `token_budget`, `expected_goal_id`, and `expected_updated_at`. Use a positive integer token count, or `null` to clear the cap. Token usage counts cache reads too: each request re-reads the cached context, so set the cap with that in mind. A successful update does not end the turn and may reactivate a token-limited goal.\n' +
         'Do not combine the two modes. This tool cannot directly pause, resume, or edit the objective.',
     schema: Type.Object({
         mode: Type.Optional(Type.Union([Type.Literal('status'), Type.Literal('token_budget')], {

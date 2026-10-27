@@ -32,7 +32,10 @@ export function createComputerUsePortClient(input) {
             waiter.resolve(response.result);
         }
         else {
-            waiter.reject(new Error(response.error?.code ?? 'computer_driver_error'));
+            waiter.reject(Object.assign(new Error(response.error?.message ?? response.error?.code ?? 'computer_driver_error'), {
+                code: response.error?.code ?? 'computer_driver_error',
+                completion: response.error?.completion ?? 'unknown',
+            }));
         }
     });
     input.port.on('close', () => {
@@ -86,6 +89,7 @@ export function createComputerUsePortClient(input) {
                         requestId,
                         kind: request.kind,
                         sessionId: request.sessionId,
+                        ...(request.sessionTitle !== undefined ? { sessionTitle: request.sessionTitle } : {}),
                         ...(request.turnId ? { turnId: request.turnId } : {}),
                         generation: input.generation,
                         ...(request.leaseId ? { leaseId: request.leaseId } : {}),
@@ -229,7 +233,7 @@ function editableSnapshotFidelityText(record) {
             ['AXTextArea', 'AXTextField', 'AXComboBox'].includes(String(element.role)))) {
         return '';
     }
-    return "Text fidelity limitation: CUA Driver 0.22.1 macOS AX snapshots may trim leading/trailing whitespace, including the final newline. The displayed value is not a lossless copy of the document. For a partial edit, use the application's targeted find/replace or a verified selection; do not rebuild the entire document from this snapshot. Whole-value replacement is appropriate only when the user explicitly supplies or authorizes the complete replacement. AX readback alone cannot prove that untouched whitespace was preserved.";
+    return "Text fidelity limitation: macOS AX snapshots may trim leading/trailing whitespace, including the final newline. The displayed value is not a lossless copy of the document. For a partial edit, use the application's targeted find/replace or a verified selection; do not rebuild the entire document from this snapshot. Whole-value replacement is appropriate only when the user explicitly supplies or authorizes the complete replacement. AX readback alone cannot prove that untouched whitespace was preserved.";
 }
 /** Window prerequisites do not prove a particular element's ancestry or writability. */
 /** Keep current per-window state adjacent to its identity, without dropping native fields. */

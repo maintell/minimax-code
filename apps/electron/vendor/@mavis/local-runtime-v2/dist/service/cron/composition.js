@@ -53,11 +53,7 @@ export function composeCronService(options) {
         logger: options.executionLogger ?? NOOP_EXECUTION_LOGGER,
         metrics,
     });
-    options.scheduler.registerHandler(CRON_SCHEDULER_HANDLER_KEY, (schedulerId) => {
-        const job = options.scheduler.get(schedulerId);
-        if (!job)
-            return;
-        const metricTask = resolveScheduledMetricTask(definitions, job);
+    const acceptScheduledTrigger = (schedulerId, job, metricTask) => {
         const accepted = executor.acceptScheduledTrigger({
             schedulerId,
             triggerId: `${schedulerId}:${job.scheduleGeneration}:${job.runCount}`,
@@ -69,6 +65,19 @@ export function composeCronService(options) {
         if (!accepted.accepted && accepted.errorCode === 'CRON_PERSIST_FAILED') {
             throw new Error('Cron scheduled trigger persistence failed');
         }
+    };
+    options.scheduler.registerHandler(CRON_SCHEDULER_HANDLER_KEY, async (schedulerId) => {
+        const job = options.scheduler.get(schedulerId);
+        if (!job)
+            return;
+        const metricTask = resolveScheduledMetricTask(definitions, job);
+        const definition = definitions.getBySchedulerId(schedulerId);
+        if (definition && (await executor.isTargetArchived(definition))) {
+            if (metricTask)
+                metrics.taskTriggered(metricTask, 'schedule', 'skipped');
+            return;
+        }
+        acceptScheduledTrigger(schedulerId, job, metricTask);
     });
     const service = createCronService({
         reviewContent: options.reviewContent,

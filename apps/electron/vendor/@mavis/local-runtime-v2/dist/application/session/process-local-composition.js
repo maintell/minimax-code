@@ -19,14 +19,25 @@ export function composeProcessLocalApplication(input) {
         plan: { isEntryEnabled: input.planEntryEnabled },
         ...(input.sessionReports ? { sessionReports: input.sessionReports } : {}),
         instructions: input.instructions,
-        peripherals: { ...input.compatibility.peripherals, mcp: input.mcp },
+        peripherals: { ...input.compatibility.peripherals, mcp: input.mcp, goals: input.goals },
         modelProvider: input.modelProvider,
     });
-    return input.miniAppAgent
-        ? {
-            ...application,
-            miniAppAgent: createProcessLocalMiniAppAgentApplication(input.miniAppAgent),
-        }
-        : application;
+    const tools = input.miniAppTools;
+    return {
+        ...application,
+        ...(input.miniAppAgent
+            ? { miniAppAgent: createProcessLocalMiniAppAgentApplication(input.miniAppAgent) }
+            : {}),
+        ...(tools
+            ? {
+                miniAppTools: {
+                    request: ({ signal, ...request }) => tools.requestForPlugin({
+                        ...request,
+                        signal: signal ?? new AbortController().signal,
+                    }),
+                },
+            }
+            : {}),
+    };
 }
 //# sourceMappingURL=process-local-composition.js.map

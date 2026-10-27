@@ -1,4 +1,4 @@
-import { translateRuntimeText } from '@mavis/shared/runtime-i18n';
+export { formatAnswersAsText, resolveQuestionnaireAnswers, serializeQuestionnaireResponse, serializeQuestionnaireResponseMessage, } from '@mavis/shared/questionnaire-response';
 export function serializeQuestionnaireAsk(request) {
     const lines = [
         '<questionnaire-ask>',
@@ -41,61 +41,6 @@ export function findQuestionnaireAskBlockOutsideMarkdownCode(xml) {
 export function extractQuestionnaireRequestIdFromXml(xml) {
     return findQuestionnaireAskBlockOutsideMarkdownCode(xml)?.requestId;
 }
-export function serializeQuestionnaireResponse(payload, request) {
-    const lines = [
-        '<questionnaire-response>',
-        `  <requestId>${escapeXml(payload.requestId)}</requestId>`,
-        `  <schemaVersion>${payload.schemaVersion}</schemaVersion>`,
-        `  <submittedAt>${payload.submittedAt}</submittedAt>`,
-    ];
-    if (request?.mode)
-        lines.push(`  <mode>${escapeXml(request.mode)}</mode>`);
-    if (payload.source) {
-        lines.push(`  <responseSource>${escapeXml(payload.source)}</responseSource>`);
-        lines.push(`  <explicitUserConfirmation>${payload.source === 'user' ? 'true' : 'false'}</explicitUserConfirmation>`);
-    }
-    if (request?.mode === 'feature-enable' && request.modePayload?.featureKey) {
-        lines.push(`  <featureKey>${escapeXml(request.modePayload.featureKey)}</featureKey>`);
-    }
-    lines.push('  <answers>');
-    for (const answer of payload.answers)
-        lines.push(serializeAnswer(answer));
-    lines.push('  </answers>');
-    lines.push('</questionnaire-response>');
-    return lines.join('\n');
-}
-export function serializeQuestionnaireResponseMessage(request, reply, locale) {
-    const response = serializeQuestionnaireResponse(reply, request);
-    return request.mode === 'feature-enable'
-        ? response
-        : `${response}\n\n${formatAnswersAsText(request, reply.answers, locale)}`;
-}
-export function formatAnswersAsText(request, answers, locale) {
-    const noAnswer = translateRuntimeText(locale, 'questionnaire.noAnswer');
-    const others = translateRuntimeText(locale, 'questionnaire.others');
-    const stepById = new Map(request.steps.map((step) => [step.id, step]));
-    const blocks = [];
-    for (const answer of answers) {
-        const step = stepById.get(answer.stepId);
-        if (!step)
-            continue;
-        const optionLabel = (optionId) => step.options.find((option) => option.id === optionId)?.label ?? optionId;
-        const questionLine = `Q: ${escapeMarkdown(step.question)}`;
-        let answerLine;
-        if (answer.skipped) {
-            answerLine = `A: ${noAnswer}`;
-        }
-        else {
-            const parts = answer.selectedOptionIds.map((id) => escapeMarkdown(optionLabel(id)));
-            if (answer.selectedOther && answer.otherText) {
-                parts.push(`${others}: ${escapeMarkdown(answer.otherText)}`);
-            }
-            answerLine = `A: ${parts.length > 0 ? parts.join(', ') : noAnswer}`;
-        }
-        blocks.push(`${questionLine}  \n${answerLine}`);
-    }
-    return blocks.join('\n\n');
-}
 function serializeStep(step) {
     const lines = ['  <step>'];
     lines.push(`    <id>${escapeXml(step.id)}</id>`);
@@ -119,28 +64,6 @@ function serializeStep(step) {
         lines.push('    </options>');
     }
     lines.push('  </step>');
-    return lines.join('\n');
-}
-function serializeAnswer(answer) {
-    const lines = ['  <answer>'];
-    lines.push(`    <stepId>${escapeXml(answer.stepId)}</stepId>`);
-    if (answer.skipped) {
-        lines.push('    <skipped>true</skipped>');
-        lines.push('  </answer>');
-        return lines.join('\n');
-    }
-    if (answer.selectedOptionIds.length > 0) {
-        lines.push('    <selectedOptions>');
-        for (const id of answer.selectedOptionIds)
-            lines.push(`      <item>${escapeXml(id)}</item>`);
-        lines.push('    </selectedOptions>');
-    }
-    if (answer.selectedOther) {
-        lines.push('    <selectedOther>true</selectedOther>');
-        if (answer.otherText)
-            lines.push(`    <otherText>${escapeXml(answer.otherText)}</otherText>`);
-    }
-    lines.push('  </answer>');
     return lines.join('\n');
 }
 function extractElement(xml, tagName) {
@@ -174,8 +97,5 @@ function unescapeXml(text) {
         .replace(/&gt;/g, '>')
         .replace(/&lt;/g, '<')
         .replace(/&amp;/g, '&');
-}
-function escapeMarkdown(text) {
-    return text.replace(/([\\`*_[~])/g, '\\$1');
 }
 //# sourceMappingURL=serializer.js.map

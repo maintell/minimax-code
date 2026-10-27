@@ -1,4 +1,5 @@
 import { isRuntimeToolInputValid } from '@mavis/agent-core/tools';
+import { resolveAskUserReminder, } from '../preparation/config/ask-user-reminder.js';
 import { LocalTurnPermissionGate } from '../runner/policy/local-turn-permission-gate.js';
 import { LocalTurnInputPreparer } from './local-turn-input-preparation.js';
 import { readTrustedBuiltinAgentProfileIdentity } from './local-turn-tool-catalog-source.js';
@@ -11,9 +12,15 @@ import { emitLocalPluginHookWarnings, localPluginHookCoordinator, } from './loca
 export class NativeLocalTurnExecutionPreparationSource {
     inputPreparer;
     permission;
-    constructor(inputPreparer, permission) {
+    askUserPolicy;
+    logger;
+    constructor(inputPreparer, permission, 
+    /** Absent for hosts without Goal/config ports; AskUser reminders are then skipped. */
+    askUserPolicy, logger) {
         this.inputPreparer = inputPreparer;
         this.permission = permission;
+        this.askUserPolicy = askUserPolicy;
+        this.logger = logger;
     }
     async prepare(input) {
         const prepared = await this.inputPreparer.prepare({
@@ -30,10 +37,20 @@ export class NativeLocalTurnExecutionPreparationSource {
                 : {}),
             history: (input.execution.runnerHistory ?? input.execution.history)?.messages ?? [],
         });
+        const askUserReminder = await resolveAskUserReminder(input.execution, this.askUserPolicy, this.logger);
         const browserAssets = [...(prepared.browserAssets ?? [])];
         const context = createToolContext(input.execution, input.eventWriter, browserAssets, prepared.channelContext);
         let nextSteeringMessageIndex = input.execution.request.immediateSendBatch?.members.length ??
             input.execution.canonicalUserInput.messages.length;
+        // One per-Turn readiness guard for native bash. The guard is fresh
+        // per Turn so resolved state and in-flight batches do not leak between
+        // turns on a shared gate instance; on non-Windows hosts the injected
+        // resolver is absent and the guard is a no-op for the existing Bash
+        // permission path.
+        const shellReadinessGuard = this.permission.createShellReadinessGuard({
+            hasShell: Boolean(input.execution.preparation.agentShell),
+            sessionId: input.execution.lease.sessionId,
+        });
         return {
             promptText: prepared.promptText,
             genuineUserQueryText: prepared.genuineUserQueryText,
@@ -41,7 +58,11 @@ export class NativeLocalTurnExecutionPreparationSource {
             initialBatchGenuineUserQueryTexts: prepared.initialBatchGenuineUserQueryTexts,
             userMessage: prepared.userMessage,
             caller: prepared.caller,
-            reminderBlocks: prepared.reminderBlocks,
+            // AskUser blocks trail the other Turn reminders; order only matters for
+            // readability because history detection matches complete blocks.
+            reminderBlocks: askUserReminder
+                ? [...prepared.reminderBlocks, askUserReminder]
+                : prepared.reminderBlocks,
             loadBackgroundReminder: prepared.loadBackgroundReminder,
             ...(prepared.systemReminderDiagnostic !== undefined
                 ? { systemReminderDiagnostic: prepared.systemReminderDiagnostic }
@@ -68,27 +89,36 @@ export class NativeLocalTurnExecutionPreparationSource {
             toolResolution: {
                 context,
                 disableBuiltinToolFallback: true,
-                permissionGuard: (toolContext, signal) => this.permission.beforeToolCall({
-                    sessionId: input.execution.lease.sessionId,
-                    turnId: input.execution.lease.turnId,
-                    agentName: input.execution.agent.agentName,
-                    model: `${input.execution.preparation.llm.model.provider}/${input.execution.preparation.llm.model.id}`,
-                    cwd: input.execution.session.workspaceDir,
-                    toolContext,
-                    trustedExactWritePaths: context.trustedExactWritePaths,
-                    signal: signal ?? input.execution.lease.signal,
-                    preToolPermission: input.execution.pluginApprovalRequests?.get(toolContext.toolCall.id),
-                    sessionLineage: {
-                        miniApp: input.execution.session.miniAppOrigin !== undefined,
-                        parentSessionId: input.execution.session.parentSessionId,
-                    },
-                    ...(prepared.channelContext ? { channelContext: prepared.channelContext } : {}),
-                    ...(input.execution.pluginHooks?.length
-                        ? {
-                            beforeApproval: createPluginPermissionRequestHook(input.execution),
-                        }
-                        : {}),
-                }),
+                permissionGuard: async (toolContext, signal) => {
+                    // Readiness runs FIRST so a missing binding can never reach the
+                    // permission engine. A signal cancellation must not release the
+                    // block; the guard keeps the call out of `beforeToolCall` and the
+                    // tool executor regardless.
+                    const readinessBlock = await shellReadinessGuard(toolContext, signal ?? input.execution.lease.signal);
+                    if (readinessBlock)
+                        return readinessBlock;
+                    return this.permission.beforeToolCall({
+                        sessionId: input.execution.lease.sessionId,
+                        turnId: input.execution.lease.turnId,
+                        agentName: input.execution.agent.agentName,
+                        model: `${input.execution.preparation.llm.model.provider}/${input.execution.preparation.llm.model.id}`,
+                        cwd: input.execution.session.workspaceDir,
+                        toolContext,
+                        trustedExactWritePaths: context.trustedExactWritePaths,
+                        signal: signal ?? input.execution.lease.signal,
+                        preToolPermission: input.execution.pluginApprovalRequests?.get(toolContext.toolCall.id),
+                        sessionLineage: {
+                            miniApp: input.execution.session.miniAppOrigin !== undefined,
+                            parentSessionId: input.execution.session.parentSessionId,
+                        },
+                        ...(prepared.channelContext ? { channelContext: prepared.channelContext } : {}),
+                        ...(input.execution.pluginHooks?.length
+                            ? {
+                                beforeApproval: createPluginPermissionRequestHook(input.execution),
+                            }
+                            : {}),
+                    });
+                },
             },
         };
     }
@@ -101,7 +131,7 @@ function createPluginPermissionRequestHook(execution) {
             turnId: execution.lease.turnId,
             cwd: execution.session.workspaceDir,
             ...execution.pluginHookRuntimeContext,
-            ...pluginToolProvenance(execution.pluginMcpToolOwners, execution.pluginHostApprovalTargets, approval.toolUseId, approval.toolName),
+            ...pluginToolProvenance(execution.pluginMcpToolOwners, execution.pluginToolApprovalTargets, approval.toolUseId, approval.toolName),
             matcherValue: approval.toolName,
             payload: {
                 tool_name: approval.toolName,
@@ -134,13 +164,17 @@ function createPluginPermissionRequestHook(execution) {
     };
 }
 function isValidPluginPermissionRewrite(execution, toolUseId, toolName, updatedInput) {
-    const hostTarget = execution.pluginHostApprovalTargets?.get(toolUseId);
+    const approvalTarget = execution.pluginToolApprovalTargets?.get(toolUseId);
     return (updatedInput === undefined ||
-        (hostTarget
+        (approvalTarget
             ? isRuntimeToolInputValid([
                 {
-                    ...hostTarget.tool,
-                    def: { ...hostTarget.tool.def, name: toolName, schema: hostTarget.inputSchema },
+                    ...approvalTarget.tool,
+                    def: {
+                        ...approvalTarget.tool.def,
+                        name: toolName,
+                        schema: approvalTarget.inputSchema,
+                    },
                 },
             ], toolName, updatedInput)
             : isRuntimeToolInputValid(execution.assembly.tools, toolName, updatedInput)));
@@ -163,11 +197,11 @@ function toPluginPermissionDecision(decision, updatedInput) {
             : {}),
     };
 }
-function pluginToolProvenance(owners, hostTargets, toolUseId, toolName) {
-    const hostTarget = hostTargets?.get(toolUseId);
-    if (hostTarget) {
+function pluginToolProvenance(owners, approvalTargets, toolUseId, toolName) {
+    const approvalTarget = approvalTargets?.get(toolUseId);
+    if (approvalTarget?.pluginName) {
         return {
-            toolProvenance: { kind: 'plugin_host', pluginName: hostTarget.pluginName },
+            toolProvenance: { kind: 'plugin_host', pluginName: approvalTarget.pluginName },
         };
     }
     const pluginName = owners?.get(toolName);
@@ -188,6 +222,9 @@ function createToolContext(execution, eventWriter, browserAssets, channelContext
         trustedExactWritePaths: execution.assemblyContext.plan
             ? [execution.assemblyContext.plan.canonicalPath]
             : [],
+        // ask_user picks the Plan policy from the same fact the ask-user-policy
+        // reminder reads (assemblyContext.plan), so the two cannot disagree.
+        ...(execution.assemblyContext.plan?.active === true ? { askUserPlanActive: true } : {}),
         ...(channelContext ? { channelContext } : {}),
     };
 }

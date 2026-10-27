@@ -697,6 +697,7 @@ class DrizzleSessionRepository {
                     sessionOrigin: current.sessionOrigin,
                     originCronId: current.originCronId,
                     miniAppOrigin: current.miniAppOrigin,
+                    createdBySessionId: current.createdBySessionId,
                     createdAtMs: current.createdAtMs,
                     historyRelativeDir: current.historyRelativeDir,
                 };

@@ -1,8 +1,8 @@
 import { AgentShellController } from './agent-shell.controller.js';
+import { BackgroundTaskController } from './background-task.controller.js';
 import { SkillEvolveController, } from './skill-evolve.controller.js';
 import { SandboxControllerBase } from '../generated/sandbox-controller-base.gen.js';
 import { AgentShellControllerBase } from '../generated/agent-shell-controller-base.gen.js';
-import { HookControllerBase } from '../generated/hook-controller-base.gen.js';
 import { WebsiteControllerBase } from '../generated/website-controller-base.gen.js';
 import { LlmContextInspectorController } from './llm-context-inspector.controller.js';
 import { agentController, createAgentController } from './agent.controller.js';
@@ -11,9 +11,10 @@ import { channelController, createChannelController } from './channel.controller
 import { createCronController } from './cron.controller.js';
 import { demoController } from './demo.controller.js';
 import { createEventsController } from './events.controller.js';
-import { goalController } from './goal.controller.js';
+import { GoalController, goalController } from './goal.controller.js';
 import { MemoryController } from './memory.controller.js';
 import { createMcpController } from './mcp.controller.js';
+import { createHookController } from './hook.controller.js';
 import { createModelProviderController, modelProviderController, } from './model-provider.controller.js';
 import { createPermissionController, permissionController } from './permission.controller.js';
 import { PinController } from './pin.controller.js';
@@ -50,14 +51,15 @@ export function createControllers(services) {
         events: createEventsController(services.globalEvents ?? CLOSED_GLOBAL_EVENTS),
         plugin: createPluginAdapter(services),
         mcp: createMcpController(services.mcp, services.mcpRuntime),
-        hook: new HookControllerBase(),
+        hook: createHookController(services.hookConfig),
         modelProvider: createModelProviderAdapter(services),
         agent: createAgentAdapter(services),
         pin: new PinController(services.applications),
+        backgroundTask: new BackgroundTaskController(services.applications),
         preference: createPreferenceAdapter(services),
         workspaceIndexing: createWorkspaceIndexingAdapter(services),
         cron: createCronAdapter(services),
-        goal: goalController,
+        goal: services.goal ? new GoalController(services.goal) : goalController,
         channel: services.channelSystem
             ? createChannelController(services.channelSystem.legacyHttp)
             : channelController,

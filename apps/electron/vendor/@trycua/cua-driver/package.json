@@ -1,6 +1,6 @@
 {
   "name": "@trycua/cua-driver",
-  "version": "0.22.1",
+  "version": "0.34.1",
   "description": "Rust-backed Cua Driver SDK and embedded Node host",
   "type": "module",
   "license": "MIT",
@@ -14,6 +14,9 @@
     },
     "./electron": {
       "import": "./dist/electron.js"
+    },
+    "./fleet": {
+      "import": "./dist/fleet.js"
     }
   },
   "dependencies": {
@@ -22,10 +25,10 @@
   },
   "optionalDependencies": {
     "@trycua/cua-driver-darwin-arm64": "file:../cua-driver-darwin-arm64",
-    "@trycua/cua-driver-darwin-x64": "0.22.1",
-    "@trycua/cua-driver-linux-arm64-gnu": "0.22.1",
-    "@trycua/cua-driver-linux-x64-gnu": "0.22.1",
-    "@trycua/cua-driver-win32-arm64-msvc": "0.22.1",
+    "@trycua/cua-driver-darwin-x64": "0.34.1",
+    "@trycua/cua-driver-linux-arm64-gnu": "0.34.1",
+    "@trycua/cua-driver-linux-x64-gnu": "0.34.1",
+    "@trycua/cua-driver-win32-arm64-msvc": "0.34.1",
     "@trycua/cua-driver-win32-x64-msvc": "file:../cua-driver-win32-x64-msvc"
   }
 }

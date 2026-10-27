@@ -24,7 +24,7 @@ export const LOCAL_MAVIS_COMMANDS = [
     'session get',
     'session send',
     'session update',
-    'session delete',
+    'session interrupt',
     'session messages',
     'session help',
     'mcp list',

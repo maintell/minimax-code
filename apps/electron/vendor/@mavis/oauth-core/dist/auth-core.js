@@ -1,11 +1,24 @@
 import { randomUUID } from 'node:crypto';
 import { watchFile, unwatchFile } from 'node:fs';
+import { unlink } from 'node:fs/promises';
+import { join } from 'node:path';
 import { MCODE_OAUTH_AUDIENCE, MCODE_OAUTH_CLIENT_ID, MCODE_OAUTH_SCOPES, } from './contracts.js';
 import { CrossProcessAuthLock } from './cross-process-lock.js';
+import { FileStore } from './credential-store/file-store.js';
+import { persistAuth, reportAuthDiagnostic, } from './diagnostics.js';
+import { currentRefreshOwner, isRefreshOwnerAlive } from './refresh-owner.js';
 import { OAuthProtocolError, } from './oauth-client.js';
 import { AUTH_STATE_SCHEMA_VERSION, AuthStateStore, } from './state-store.js';
 const DEFAULT_AUTHORIZATION_LEASE_MS = 10 * 60 * 1_000;
 const DEFAULT_STATE_POLL_INTERVAL_MS = 250;
+/** Storage/recovery failure, never evidence that Account rejected the login. */
+export class AuthRefreshCommitPendingError extends Error {
+    code = 'AUTH_REFRESH_COMMIT_PENDING';
+    constructor() {
+        super('OAuth refresh recovery is pending. Retry, or explicitly sign in again if recovery is unavailable.');
+        this.name = 'AuthRefreshCommitPendingError';
+    }
+}
 export class AuthRequiredError extends Error {
     code = 'AUTH_REQUIRED';
     constructor(options) {
@@ -76,10 +89,18 @@ export class MCodeOAuthCore {
     loginPromise;
     loginAbortController;
     initializePromise;
+    refreshStore;
+    pendingRefresh;
+    pendingRefreshRollback;
+    pendingRefreshInvalidation;
     constructor(options) {
         this.options = options;
         this.stateStore = new AuthStateStore(options.namespace.statePath);
         this.lock = new CrossProcessAuthLock(options.namespace.lockPath);
+        // Keep the existing auth.json privacy/exclusion contract for this journal.
+        this.refreshStore = new FileStore({
+            authHome: join(options.namespace.namespaceHome, 'refresh'),
+        });
         this.now = options.now ?? Date.now;
         this.sleep =
             options.sleep ?? ((durationMs) => new Promise((resolve) => setTimeout(resolve, durationMs)));
@@ -92,7 +113,9 @@ export class MCodeOAuthCore {
         const state = await this.stateStore.read();
         if (!state)
             return { status: 'anonymous', generation: 0, scopes: [] };
-        if (state.status === 'authorizing' || state.status === 'refreshing') {
+        if (state.status === 'authorizing' ||
+            state.status === 'refreshing' ||
+            this.matchesPendingInvalidation(state)) {
             const recovered = await this.recoverInterruptedCredentialCommit(state);
             return toStatusSnapshot(recovered);
         }
@@ -164,13 +187,14 @@ export class MCodeOAuthCore {
             }
         }
         catch (error) {
-            if (!(error instanceof AuthRequiredError))
+            if (!(error instanceof AuthRequiredError) &&
+                !(error instanceof AuthRefreshCommitPendingError))
                 throw error;
             // A concurrent writer may have committed credentials before their state.
             // Recheck under the domain lock before reporting authentication as missing.
         }
         return this.lock.withLock(async () => {
-            const current = await this.readUsableCredential(options.requiredScopes);
+            const current = await this.readUsableCredential(options.requiredScopes, true);
             if (this.satisfiesMinValidity(current, options.minValidityMs)) {
                 return toAccessTokenLease(current.credential);
             }
@@ -191,7 +215,7 @@ export class MCodeOAuthCore {
         await this.initialize();
         try {
             return await this.lock.withLock(async () => {
-                const current = await this.readUsableCredential([...MCODE_OAUTH_SCOPES]);
+                const current = await this.readUsableCredential([...MCODE_OAUTH_SCOPES], true);
                 if (context.loginEpoch !== undefined) {
                     assertSameLoginEpoch(context.loginEpoch, current.credential.loginEpoch);
                 }
@@ -217,27 +241,34 @@ export class MCodeOAuthCore {
         await this.initialize();
         return this.lock.withLock(async () => {
             const state = await this.stateStore.read();
-            const credential = await this.options.credentialStore.get(this.options.namespace.credentialKey);
+            const committed = await this.options.credentialStore.get(this.options.namespace.credentialKey);
+            const credential = (state?.refresh && (await this.readPendingRefresh(state))) || committed;
             const currentGeneration = Math.max(state?.generation ?? 0, credential?.generation ?? 0);
             if (!credential && (!state || state.status === 'anonymous')) {
                 return { status: 'anonymous', generation: currentGeneration };
             }
             const logoutGeneration = currentGeneration + 1;
-            await this.stateStore.write(baseState({
-                status: 'logging_out',
-                generation: logoutGeneration,
-                storeKind: this.options.credentialStore.kind,
-            }, this.options.namespace));
+            await this.stateStore.write({
+                ...baseState({
+                    status: 'logging_out',
+                    generation: logoutGeneration,
+                    storeKind: this.options.credentialStore.kind,
+                }, this.options.namespace),
+                ...(state?.refresh ? { refresh: state.refresh } : {}),
+            });
             if (options.revoke && credential) {
                 try {
                     await this.options.oauthClient.revokeToken(credential.refreshToken);
                 }
                 catch {
-                    await this.stateStore.write(baseState({
-                        status: 'logout_pending',
-                        generation: logoutGeneration,
-                        storeKind: this.options.credentialStore.kind,
-                    }, this.options.namespace));
+                    await this.stateStore.write({
+                        ...baseState({
+                            status: 'logout_pending',
+                            generation: logoutGeneration,
+                            storeKind: this.options.credentialStore.kind,
+                        }, this.options.namespace),
+                        ...(state?.refresh ? { refresh: state.refresh } : {}),
+                    });
                     return { status: 'logout_pending', generation: logoutGeneration };
                 }
             }
@@ -247,17 +278,30 @@ export class MCodeOAuthCore {
                 generation: logoutGeneration,
                 storeKind: this.options.credentialStore.kind,
             }, this.options.namespace));
+            await this.clearPendingRefresh();
             return { status: 'anonymous', generation: logoutGeneration };
         });
     }
     watch(listener) {
+        let sequence = 0;
+        let deliveredSequence = 0;
+        let stopped = false;
         const onChange = () => {
+            const observation = ++sequence;
             void this.getStatus()
-                .then(listener)
+                .then((status) => {
+                if (stopped || observation < deliveredSequence)
+                    return;
+                deliveredSequence = observation;
+                listener(status);
+            })
                 .catch(() => undefined);
         };
         watchFile(this.options.namespace.statePath, { interval: this.statePollIntervalMs }, onChange);
-        return () => unwatchFile(this.options.namespace.statePath, onChange);
+        return () => {
+            stopped = true;
+            unwatchFile(this.options.namespace.statePath, onChange);
+        };
     }
     initialize() {
         this.initializePromise ??= (async () => {
@@ -274,8 +318,20 @@ export class MCodeOAuthCore {
             assertLoginNotCancelled(signal);
             const leaseId = this.createLeaseId();
             const decision = await this.lock.withLock(async () => {
-                const state = await this.stateStore.read();
+                let state = await this.stateStore.read();
                 assertLoginStateDomain(state, this.options.namespace);
+                if (state?.status === 'refreshing' && state.refresh) {
+                    try {
+                        state = await this.resumeRefreshCommit(state);
+                    }
+                    catch (error) {
+                        // Explicit login can replace a lost grant or failed invalidation.
+                        // New-login writes still have to succeed; never replay the old RT.
+                        if (!(error instanceof AuthRefreshCommitPendingError) &&
+                            !(error instanceof AuthRequiredError))
+                            throw error;
+                    }
+                }
                 const credential = await this.options.credentialStore.get(this.options.namespace.credentialKey);
                 if (state &&
                     credential &&
@@ -314,6 +370,7 @@ export class MCodeOAuthCore {
                         leaseExpiresAtMs: this.now() + this.authorizationLeaseMs,
                     },
                 });
+                await this.clearPendingRefresh();
                 return { kind: 'owner' };
             });
             if (decision.kind === 'authenticated') {
@@ -322,7 +379,7 @@ export class MCodeOAuthCore {
             if (decision.kind === 'refresh') {
                 try {
                     await this.lock.withLock(async () => {
-                        const current = await this.readUsableCredential([...MCODE_OAUTH_SCOPES]);
+                        const current = await this.readUsableCredential([...MCODE_OAUTH_SCOPES], true);
                         if (current.credential.generation > decision.generation &&
                             this.satisfiesMinValidity(current, 1))
                             return;
@@ -460,6 +517,40 @@ export class MCodeOAuthCore {
         });
     }
     async recoverInterruptedCredentialCommit(observedState) {
+        if (this.matchesPendingInvalidation(observedState)) {
+            return this.lock.withLock(async () => {
+                const state = await this.stateStore.read();
+                const pending = this.pendingRefreshInvalidation;
+                if (!state || !pending || !this.matchesPendingInvalidation(state))
+                    return state ?? observedState;
+                return this.observeRefreshInvalidation(pending);
+            });
+        }
+        if (observedState.status === 'refreshing' && observedState.refresh) {
+            const credential = await this.options.credentialStore.get(this.options.namespace.credentialKey);
+            // Status remains a non-blocking observation while the HTTP request is in
+            // flight. Token consumers still wait/recover under the shared lock.
+            if (credential?.generation !== observedState.generation &&
+                !(await this.readPendingRefresh(observedState)) &&
+                this.pendingRefreshRollback?.id !== observedState.refresh.id &&
+                isRefreshOwnerAlive(observedState.refresh.owner)) {
+                return observedState;
+            }
+            return this.lock.withLock(async () => {
+                const state = await this.stateStore.read();
+                if (state?.status !== 'refreshing' || !state.refresh)
+                    return state ?? observedState;
+                try {
+                    return await this.resumeRefreshCommit(state);
+                }
+                catch (error) {
+                    if (error instanceof AuthRequiredError && this.matchesPendingInvalidation(state)) {
+                        return this.refreshInvalidatedState(state);
+                    }
+                    throw error;
+                }
+            });
+        }
         const observedCredential = await this.options.credentialStore.get(this.options.namespace.credentialKey);
         if (!observedCredential || observedCredential.generation <= observedState.generation) {
             return observedState;
@@ -480,53 +571,226 @@ export class MCodeOAuthCore {
             return recovered;
         });
     }
-    async readUsableCredential(requiredScopes) {
-        const state = await this.stateStore.read();
+    async readUsableCredential(requiredScopes, locked = false) {
+        let state = await this.stateStore.read();
+        const pending = this.pendingRefreshInvalidation;
+        if (state && pending && this.matchesPendingInvalidation(state)) {
+            if (locked)
+                await this.finishRefreshInvalidation(pending);
+            throw new AuthRequiredError();
+        }
         if (!state ||
             (state.status !== 'authenticated' &&
                 state.status !== 'expired' &&
                 state.status !== 'refreshing')) {
             throw new AuthRequiredError();
         }
-        const credential = await this.options.credentialStore.get(this.options.namespace.credentialKey);
+        let credential = await this.options.credentialStore.get(this.options.namespace.credentialKey);
+        if (state.status === 'refreshing' && state.refresh) {
+            if (!locked)
+                throw new AuthRefreshCommitPendingError();
+            state = await this.resumeRefreshCommit(state);
+            if (state.status === 'anonymous')
+                throw new AuthRequiredError();
+            credential = await this.options.credentialStore.get(this.options.namespace.credentialKey);
+        }
         if (!credential || state.generation !== credential.generation)
             throw new AuthRequiredError();
         assertCredentialContract(credential, requiredScopes);
         return { state, credential };
     }
     async refreshCredential(current, options = {}) {
-        await this.stateStore.write({ ...current.state, status: 'refreshing' });
+        const transactionId = randomUUID();
+        const refreshing = {
+            ...current.state,
+            status: 'refreshing',
+            generation: Math.max(current.state.generation, current.credential.generation) + 1,
+            refresh: { id: transactionId, owner: currentRefreshOwner() },
+        };
+        // Reserve the next generation before Account can consume the old RT. Even
+        // an older Core cannot reuse a credential behind this durable fence.
+        await this.persistRefresh(refreshing, 'prepare_refresh', 'auth-state.json', null, () => this.stateStore.write(refreshing));
         let grant;
         try {
             grant = await this.options.oauthClient.refreshToken(current.credential.refreshToken);
+            reportAuthDiagnostic({
+                phase: 'refresh_response',
+                file: 'oauth',
+                correlationId: transactionId,
+                generation: refreshing.generation,
+                refreshResponseSucceeded: true,
+            }, this.options.onDiagnostic, 'success');
         }
         catch (error) {
+            reportAuthDiagnostic({
+                phase: 'refresh_response',
+                file: 'oauth',
+                correlationId: transactionId,
+                generation: refreshing.generation,
+                refreshResponseSucceeded: false,
+            }, this.options.onDiagnostic, 'failure', error);
             if (isInvalidRefreshGrant(error)) {
-                // Publish the invalidation before deleting the secret. Both mutations
-                // use the caller's lock, so another owner cannot commit a login between them.
-                await this.stateStore.write(baseState({
-                    status: 'anonymous',
-                    generation: current.credential.generation + 1,
-                    storeKind: this.options.credentialStore.kind,
-                }, this.options.namespace));
-                await this.options.credentialStore.delete(this.options.namespace.credentialKey);
+                // Account already rejected this login. Storage failure must not turn it
+                // back into an apparently recoverable refresh or lose the cleanup task.
+                this.pendingRefreshInvalidation = { state: refreshing, refreshResponseSucceeded: false };
+                await this.finishRefreshInvalidation(this.pendingRefreshInvalidation);
                 throw new AuthRequiredError({ cause: error });
             }
             else {
                 const preserveSession = !options.rejected &&
                     current.state.status === 'authenticated' &&
                     current.credential.expiresAtMs > this.now();
-                await this.stateStore.write({
-                    ...current.state,
-                    status: preserveSession ? 'authenticated' : 'expired',
-                });
+                // Keep the unsaved rollback in the original owner. A failed state write
+                // must not strand this known failed request behind the refresh fence.
+                // This is never set for a successful grant or invalid_grant.
+                this.pendingRefreshRollback = {
+                    id: transactionId,
+                    state: {
+                        ...current.state,
+                        status: preserveSession ? 'authenticated' : 'expired',
+                    },
+                };
+                await this.resumeRefreshCommit(refreshing);
             }
             throw error;
         }
-        const stored = credentialFromGrant(grant, Math.max(current.state.generation, current.credential.generation) + 1, this.now(), current.credential.loginEpoch);
-        await this.options.credentialStore.put(this.options.namespace.credentialKey, stored);
-        await this.stateStore.write(authenticatedState(stored, this.options.credentialStore.kind, this.options.namespace));
+        const stored = credentialFromGrant(grant, refreshing.generation, this.now(), current.credential.loginEpoch);
+        this.pendingRefresh = { id: transactionId, credential: stored };
+        await this.resumeRefreshCommit(refreshing);
         return toAccessTokenLease(stored);
+    }
+    async readPendingRefresh(state) {
+        if (!state.refresh)
+            return null;
+        return this.pendingRefresh?.id === state.refresh.id
+            ? this.pendingRefresh.credential
+            : this.refreshStore.get({
+                ...this.options.namespace.credentialKey,
+                account: state.refresh.id,
+            });
+    }
+    /** Caller holds auth.lock. Only the fenced transaction may publish its grant. */
+    async resumeRefreshCommit(state) {
+        const transactionId = state.refresh?.id;
+        if (!transactionId)
+            throw new AuthRefreshCommitPendingError();
+        await this.assertRefreshCurrent(state);
+        const invalidation = this.pendingRefreshInvalidation;
+        if (invalidation?.state.refresh?.id === transactionId) {
+            return this.finishRefreshInvalidation(invalidation);
+        }
+        const rollback = this.pendingRefreshRollback;
+        if (rollback?.id === transactionId) {
+            await this.persistRefresh(state, 'restore_state', 'auth-state.json', false, () => this.stateStore.write(rollback.state));
+            this.pendingRefreshRollback = undefined;
+            return rollback.state;
+        }
+        const committed = await this.options.credentialStore.get(this.options.namespace.credentialKey);
+        const credential = committed?.generation === state.generation ? committed : await this.readPendingRefresh(state);
+        if (!credential || credential.generation !== state.generation) {
+            if (!isRefreshOwnerAlive(state.refresh?.owner)) {
+                // The owner cannot have a surviving memory-only grant. Keep the fence
+                // until anonymous is durable; never retry the uncertain predecessor RT.
+                this.pendingRefreshInvalidation = { state, refreshResponseSucceeded: null };
+                return this.finishRefreshInvalidation(this.pendingRefreshInvalidation);
+            }
+            throw new AuthRefreshCommitPendingError();
+        }
+        assertCredentialContract(credential, [...MCODE_OAUTH_SCOPES]);
+        if (committed?.generation !== state.generation) {
+            // Journal first: another process/restart can finish the canonical replace.
+            // Keep the in-memory grant as well if even the journal cannot be written.
+            this.pendingRefresh = { id: transactionId, credential };
+            const recoveryKey = { ...this.options.namespace.credentialKey, account: transactionId };
+            const staged = await this.refreshStore.get(recoveryKey);
+            if (staged?.generation !== credential.generation ||
+                staged.accessToken !== credential.accessToken ||
+                staged.refreshToken !== credential.refreshToken ||
+                staged.loginEpoch !== credential.loginEpoch) {
+                await this.persistRefresh(state, 'stage_credentials', 'refresh/auth.json', true, () => this.refreshStore.put(recoveryKey, credential));
+            }
+            await this.assertRefreshCurrent(state);
+            await this.persistRefresh(state, 'commit_credentials', 'auth.json', true, () => this.options.credentialStore.put(this.options.namespace.credentialKey, credential));
+        }
+        const authenticated = authenticatedState(credential, this.options.credentialStore.kind, this.options.namespace);
+        await this.assertRefreshCurrent(state);
+        await this.persistRefresh(state, 'commit_state', 'auth-state.json', true, () => this.stateStore.write(authenticated));
+        await this.clearPendingRefresh();
+        return authenticated;
+    }
+    refreshInvalidatedState(state) {
+        return baseState({
+            status: 'anonymous',
+            generation: state.generation,
+            storeKind: this.options.credentialStore.kind,
+        }, this.options.namespace);
+    }
+    matchesPendingInvalidation(state) {
+        const pending = this.pendingRefreshInvalidation?.state;
+        return (pending !== undefined &&
+            state.generation === pending.generation &&
+            (state.status === 'anonymous' ||
+                (state.status === 'refreshing' && state.refresh?.id === pending.refresh?.id)));
+    }
+    /** Caller holds auth.lock; a later login must never be cleared by old cleanup. */
+    async finishRefreshInvalidation(invalidation) {
+        const { state: expected, refreshResponseSucceeded } = invalidation;
+        const anonymous = this.refreshInvalidatedState(expected);
+        try {
+            const current = await this.stateStore.read();
+            if (!current || !this.matchesPendingInvalidation(current))
+                throw new AuthSessionChangedError();
+            if (current.status !== 'anonymous') {
+                await this.persistRefresh(expected, 'invalidate_state', 'auth-state.json', refreshResponseSucceeded, () => this.stateStore.write(anonymous));
+            }
+            const latest = await this.stateStore.read();
+            if (latest?.status !== 'anonymous' || latest.generation !== expected.generation) {
+                throw new AuthSessionChangedError();
+            }
+            await this.persistRefresh(expected, 'delete_credentials', 'auth.json', refreshResponseSucceeded, () => this.options.credentialStore.delete(this.options.namespace.credentialKey));
+        }
+        catch (cause) {
+            if (cause instanceof AuthSessionChangedError)
+                throw cause;
+            throw new AuthRequiredError({ cause });
+        }
+        await this.clearPendingRefresh();
+        return anonymous;
+    }
+    async observeRefreshInvalidation(expected) {
+        try {
+            return await this.finishRefreshInvalidation(expected);
+        }
+        catch (error) {
+            if (error instanceof AuthRequiredError)
+                return this.refreshInvalidatedState(expected.state);
+            throw error;
+        }
+    }
+    persistRefresh(state, phase, file, refreshResponseSucceeded, operation) {
+        return persistAuth({
+            phase,
+            file,
+            correlationId: state.refresh?.id ?? randomUUID(),
+            generation: state.generation,
+            refreshResponseSucceeded,
+        }, this.options.onDiagnostic, operation);
+    }
+    async assertRefreshCurrent(expected) {
+        const state = await this.stateStore.read();
+        if (state?.status !== 'refreshing' ||
+            state.generation !== expected.generation ||
+            state.refresh?.id !== expected.refresh?.id) {
+            throw new AuthSessionChangedError();
+        }
+    }
+    async clearPendingRefresh() {
+        this.pendingRefresh = undefined;
+        this.pendingRefreshRollback = undefined;
+        this.pendingRefreshInvalidation = undefined;
+        // State is authoritative; an undeletable stale journal is never adopted by
+        // a later login/refresh because each transaction has a distinct random id.
+        await unlink(join(this.options.namespace.namespaceHome, 'refresh', 'auth.json')).catch(() => undefined);
     }
 }
 function assertLoginNotCancelled(signal) {

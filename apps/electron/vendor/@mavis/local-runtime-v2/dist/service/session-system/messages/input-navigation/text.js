@@ -4,7 +4,9 @@ const INTERNAL_USER_SOURCES = new Set(['system', 'communication', 'team-engine']
 const SYNTHETIC_RESPONSE_RE = /<(questionnaire|permission)-response\b/u;
 const QUESTIONNAIRE_RESPONSE_RE = /<questionnaire-response\b/u;
 export function isNavigableUserInput(message) {
-    if (message.role !== 'user' || message.kind != null)
+    if (message.role !== 'user')
+        return false;
+    if (message.kind != null && message.kind !== 'steered_user')
         return false;
     if (message.source && INTERNAL_USER_SOURCES.has(message.source))
         return false;

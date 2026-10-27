@@ -54,6 +54,7 @@ function permissionReasonLogFields(reason, includeSafetyDetail = false) {
         safetyCheck: 'safety_check',
         workingDirectory: 'working_directory_boundary',
         internalWhitelist: 'internal_whitelist',
+        sessionOwnedReadablePath: 'session_owned_readable_path',
         trustedExactWrite: 'trusted_exact_write',
         tempDirectory: 'temp_directory',
         sandbox: 'sandbox',
@@ -289,6 +290,12 @@ export class LocalPermissionFacade {
     }
     async withShell(params) {
         if (!this.shellResolver || !params.sessionId)
+            return params;
+        // Non-Bash tools never wait for a session shell binding: read, edit, write, etc.
+        // do not need an executor shell, and forcing a probe here would unnecessarily
+        // block the deterministic permission path. Only Bash carries an executor
+        // shell, so only Bash resolves the binding.
+        if (params.toolName !== 'bash')
             return params;
         return { ...params, trustedShellFamily: await this.shellResolver(params.sessionId) };
     }
@@ -526,6 +533,7 @@ export class LocalPermissionFacade {
             allowedWorkingPaths: [...pluginContext.directories],
             sandboxAllowPaths: this.resolveSandboxAllowPaths(params.toolName, workingDirectory, params.agentName),
             trustedExactWritePaths: params.trustedExactWritePaths,
+            sessionOwnedReadablePaths: params.sessionOwnedReadablePaths,
             dataDir: this.deps.configGetter().dataDir,
             homeDir: homedir(),
             isFile: (p) => {
@@ -561,7 +569,14 @@ export class LocalPermissionFacade {
         const permissionSettingsKey = `${new Date().toDateString()}\n${JSON.stringify(permissionSettings)}`;
         if (this.loggedPermissionContexts.get(params.sessionId ?? '') !== permissionSettingsKey) {
             this.loggedPermissionContexts.set(params.sessionId ?? '', permissionSettingsKey);
-            logger.info({ ...(params.sessionId ? { session_id: params.sessionId } : {}), ...permissionSettings }, 'permission.context');
+            logger.info({
+                ...(params.sessionId ? { session_id: params.sessionId } : {}),
+                ...permissionSettings,
+                // Count only: the Session read grants carry user attachment file
+                // names (raw user assets) and grow with every attachment, so they
+                // neither enter the log nor the change-detection key above.
+                session_owned_readable_path_count: ctx.sessionOwnedReadablePaths.length,
+            }, 'permission.context');
         }
         // Local-runtime-only safety net. Splits into two kinds so we don't
         // regress "始终允许":

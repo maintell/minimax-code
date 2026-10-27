@@ -78,6 +78,8 @@ export function createRuntimeCronSessionPorts(options) {
                 }
                 return result;
             },
+            // Level-triggered: the Queue re-checks every gate on this wake.
+            ownerReleased: (sessionId) => turns.dispatchQueue(sessionId),
         },
         delivery: {
             deliver: (request) => deliverRuntimeCron(turns, {

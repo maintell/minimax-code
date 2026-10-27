@@ -11,17 +11,13 @@
  *   rejects prefixed names since MR0); labels are low-cardinality only.
  */
 import { normalizeLLMError, toLLMMetricErrorKind, } from '@mavis/shared/llm-error-classifier';
+import { LLMRequestStoppedError, } from './llm-retry.js';
 import { normalizeAbortSource, } from './types.js';
 import { createToolContextHistogramBucketsByName, measureToolArguments, measureToolContext, measureToolResult, } from './tool-context-size.js';
 import { fingerprintAssembly } from './assembly-fingerprint.js';
 const LARGE_TOOL_IO_TOKEN_THRESHOLD = 8_000;
 const MAX_ASSEMBLY_FINGERPRINT_BASELINES = 2_048;
 const MAX_LLM_REQUEST_GAP_BASELINES = 2_048;
-const LLM_TOKENS_PER_SECOND_BUCKETS = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200];
-const LLM_GAP_MS_BUCKETS = [
-    100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000,
-    1_800_000, 3_600_000,
-];
 const MAX_TOOL_OPERATION_VALUES = 128;
 const MAX_TOOL_OPERATION_VALUE_LENGTH = 64;
 const FIRST_TOKEN_EVENT_TYPES = new Set([
@@ -41,11 +37,7 @@ export function newPiTurnMetrics(client, nowMs, onLLMRequestFailure, observeLLMR
     return new PiTurnMetrics(client ?? noopMetricsClient, nowMs, client !== undefined, onLLMRequestFailure, observeLLMRequest);
 }
 export function createPiTurnHistogramBucketsByName() {
-    return {
-        pi_llm_tokens_per_second: [...LLM_TOKENS_PER_SECOND_BUCKETS],
-        pi_llm_inter_request_gap_ms: [...LLM_GAP_MS_BUCKETS],
-        ...createToolContextHistogramBucketsByName(),
-    };
+    return createToolContextHistogramBucketsByName();
 }
 /**
  * Record the final outcome of one logical LLM call without conflating it with
@@ -244,9 +236,6 @@ export class TurnMetricsRecorder {
                 model: String(model.id),
                 caller: this.caller,
             }));
-            if (interRequestGapMs !== undefined) {
-                swallow(() => this.owner.client.histogram('pi_llm_inter_request_gap_ms', interRequestGapMs, labels));
-            }
             let providerError;
             let hasProviderError = false;
             const callerOnProviderError = streamOptions?.onProviderError;
@@ -548,7 +537,6 @@ export class TurnMetricsRecorder {
         client.histogram('pi_tool_io_bytes', measured.bytes, labels);
         const tokens = measured.tokens;
         if (tokens !== undefined) {
-            client.histogram('pi_tool_io_tokens', tokens, labels);
             if (tokens >= LARGE_TOOL_IO_TOKEN_THRESHOLD) {
                 this.diagnostics.logger.info?.({
                     session_id: this.diagnostics.sessionId,
@@ -572,7 +560,8 @@ export class TurnMetricsRecorder {
         }
     }
     recordToolContextResidency(model, messages) {
-        const breakdown = measureToolContext(messages, this.diagnostics.estimator, (toolName) => this.metricToolName(toolName));
+        // 驻留量只记 bytes：不传估算器，避免每次 provider 请求都对整段历史重新估算 token。
+        const breakdown = measureToolContext(messages, undefined, (toolName) => this.metricToolName(toolName));
         const labels = {
             provider: String(model.provider),
             model: String(model.id),
@@ -586,39 +575,19 @@ export class TurnMetricsRecorder {
             kind: 'result',
             ...labels,
         });
-        if (breakdown.argumentTokens !== undefined) {
-            this.owner.client.histogram('pi_tool_context_resident_tokens', breakdown.argumentTokens, {
-                kind: 'arguments',
-                ...labels,
-            });
-        }
-        if (breakdown.resultTokens !== undefined) {
-            this.owner.client.histogram('pi_tool_context_resident_tokens', breakdown.resultTokens, {
-                kind: 'result',
-                ...labels,
-            });
-        }
         for (const [toolName, contribution] of breakdown.byTool) {
-            this.recordResidentContribution(toolName, 'arguments', {
-                bytes: contribution.argumentBytes,
-                ...(contribution.argumentTokens !== undefined
-                    ? { tokens: contribution.argumentTokens }
-                    : {}),
-            });
-            this.recordResidentContribution(toolName, 'result', {
-                bytes: contribution.resultBytes,
-                ...(contribution.resultTokens !== undefined ? { tokens: contribution.resultTokens } : {}),
-            });
+            this.recordResidentBytes(toolName, 'arguments', contribution.argumentBytes);
+            this.recordResidentBytes(toolName, 'result', contribution.resultBytes);
         }
     }
-    recordResidentContribution(toolName, kind, measured) {
-        const labels = { kind, toolName, caller: this.caller };
-        if (measured.bytes > 0) {
-            this.owner.client.counter('pi_tool_context_resident_bytes_total', measured.bytes, labels);
-        }
-        if (measured.tokens !== undefined && measured.tokens > 0) {
-            this.owner.client.counter('pi_tool_context_resident_tokens_total', measured.tokens, labels);
-        }
+    recordResidentBytes(toolName, kind, bytes) {
+        if (bytes <= 0)
+            return;
+        this.owner.client.counter('pi_tool_context_resident_bytes_total', bytes, {
+            kind,
+            toolName,
+            caller: this.caller,
+        });
     }
     recordLLMSettled(labels, requestStartedAt, model, final, thrown, providerError, recordTerminalFailure = true, interRequestGapMs, settlementObserver) {
         const { client } = this.owner;
@@ -650,9 +619,6 @@ export class TurnMetricsRecorder {
             emitCacheTokens(client, labels, 'read', final.usage.cacheRead);
             emitCacheTokens(client, labels, 'write', final.usage.cacheWrite);
             emitTokens(client, labels, 'output', final.usage.output);
-            if (!observation) {
-                emitOutputTokensPerSecond(client, labels, final.usage.output, requestStartedAt, responseCompletedAt);
-            }
         }
         if (observation) {
             if (recordTerminalFailure) {
@@ -671,6 +637,8 @@ export class TurnMetricsRecorder {
             if (observation.metricKind !== 'abort' && this.owner.onLLMRequestFailure) {
                 const hook = this.owner.onLLMRequestFailure;
                 swallow(() => hook({
+                    sessionId: this.diagnostics.sessionId,
+                    turnId: this.diagnostics.turnId,
                     ...(thrown !== undefined ? { error: thrown } : {}),
                     ...(providerError !== undefined ? { providerError } : {}),
                     ...(final?.errorMessage ? { errorMessage: final.errorMessage } : {}),
@@ -688,6 +656,10 @@ export class TurnMetricsRecorder {
         }
     }
     recordLogicalLLMFailure(final, thrown) {
+        // A request the host refused to send never reached a provider and ends
+        // the Turn normally; it is neither an LLM failure nor a Turn failure.
+        if (thrown instanceof LLMRequestStoppedError)
+            return;
         const observation = observeLLMFailure(final, thrown);
         if (!observation)
             return;
@@ -716,18 +688,6 @@ function emitTokens(client, labels, kind, count) {
     if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0)
         return;
     client.counter('pi_llm_tokens_total', count, { ...labels, kind });
-}
-function emitOutputTokensPerSecond(client, labels, outputTokens, requestStartedAt, responseCompletedAt) {
-    if (typeof outputTokens !== 'number' || !Number.isFinite(outputTokens) || outputTokens <= 0) {
-        return;
-    }
-    const requestDurationMs = responseCompletedAt - requestStartedAt;
-    if (!Number.isFinite(requestDurationMs) || requestDurationMs <= 0)
-        return;
-    const tokensPerSecond = outputTokens / (requestDurationMs / 1_000);
-    if (!Number.isFinite(tokensPerSecond) || tokensPerSecond <= 0)
-        return;
-    client.histogram('pi_llm_tokens_per_second', tokensPerSecond, labels);
 }
 function emitCacheTokens(client, labels, operation, count) {
     if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0)

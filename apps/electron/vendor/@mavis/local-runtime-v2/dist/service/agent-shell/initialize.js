@@ -9,11 +9,12 @@ export function bindAgentShellService(service, ports) {
     ports.records.bindAgentShellCapture((parent) => service.captureNew(parent));
     ports.preparation.bindAgentShellResolver((id) => service.resolveSession(id));
     ports.bindPermissions?.(async (id) => {
-        const shell = await service.resolveSession(id);
+        const shell = await service.ensureSession(id);
         if (!shell)
             return undefined;
         return shell.family === 'git-bash' ? 'posix' : 'powershell';
     });
+    service.warmup();
 }
 export function initializeAgentShellService(options) {
     return new AgentShellService({

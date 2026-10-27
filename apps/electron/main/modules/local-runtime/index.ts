@@ -1,7 +1,7 @@
 import { DEFAULT_COLLECTION_POLICY, parseCollectionPolicy } from "@mavis/shared/collection-policy";
 import { createCollectionPolicyMatcher } from "@mavis/shared/collection-policy/matcher";
 import { resolveSessionClioCaptureEnabled } from "@mavis/shared/session-clio";
-import { parseRunawayGuardOverride } from "@mavis/config";
+import { parseRunawayGuardOverride, parsePromptSuggestionRemotePolicy } from "@mavis/config";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
@@ -17,6 +17,7 @@ import { DOMAIN_URL, IPC_CHANNELS } from "../../config/constants";
 import { resolveDesktopPromptConfigKey } from "../../config/prompt-config-key";
 import { buildEmbeddedBrowserToolAdapter } from "../browser/browser-tool-adapter";
 import { openManagedMiniAppSurface, closeManagedMiniAppSurface } from "../browser/miniapp-surface";
+import { requestMiniAppToolPermission } from "../browser/miniapp-tool-permission";
 import { resolveLocalRuntimeDataDir, LOCAL_RUNTIME_DATA_DIR_SOURCE_ENV } from "./data-dir";
 import { bootstrapLoginShellEnv } from "./login-shell-env";
 import { resolveElectronNetFetch } from "./electron-net-fetch";
@@ -25,7 +26,7 @@ import { resolveLocalRuntimeLaunchPlan } from "./test-data-isolation";
 import { pcm16LeToWav, consumeAmadeusAsrSse } from "./amadeus-asr";
 import { resolveAmadeusProxyBaseURL, issueAmadeusProxySessionToken, postAmadeusProxyWav } from "./asr-proxy-http";
 import { routeProjectRuntimeMediaRequest } from "../protocol/project-runtime-media";
-import { setUtilityRuntimeRoutingContext, ensureUtilityRuntimeStarted, getUtilityRuntimeStartupToken, stopUtilityRuntime, isUtilityRuntimeReady, getUtilityRuntimeTerminalFailure, getUtilityRuntimeFailReason, fetchViaUtilityRuntime, setUtilityRuntimeAuthContext, setUtilityRuntimeContextWindowUsageEnabled, setUtilityRuntimeRunawayGuardConfig, setUtilityRuntimeToolResultCompactionConfig, setUtilityRuntimeCollectionPolicy, registerUtilityRuntimeMainHooks } from "./utility";
+import { setUtilityRuntimeRoutingContext, ensureUtilityRuntimeStarted, getUtilityRuntimeStartupToken, stopUtilityRuntime, isUtilityRuntimeReady, getUtilityRuntimeTerminalFailure, getUtilityRuntimeFailReason, fetchViaUtilityRuntime, setUtilityRuntimeAuthContext, setUtilityRuntimeContextWindowUsageEnabled, setUtilityRuntimeRunawayGuardConfig, setUtilityRuntimePromptSuggestionPolicy, setUtilityRuntimeToolResultCompactionConfig, setUtilityRuntimeCollectionPolicy, registerUtilityRuntimeMainHooks } from "./utility";
 export { ensureComputerUseUtilityStarted } from "./utility";
 
 export { releaseComputerUseLease } from "./utility";
@@ -51,6 +52,7 @@ let startupExecutionPolicy = 'enabled';
 let swimLaneListenerRegistered = false;
 let contextWindowUsageEnabled = true;
 let runawayGuardConfig = {};
+let promptSuggestionPolicy = {};
 let toolResultCompactionConfig = {};
 /**
  * Effective collection policy. Seeded from the built-in policy, restored from
@@ -575,15 +577,17 @@ function createLocalAsrClientSession(clientTransport) {
             if (stopStarted)
                 return;
             stopStarted = true;
+            const userToken = authContext.accessToken?.trim();
+            if (!userToken) {
+                // Nothing was uploaded; keep the code so a client can tell sign-in from a provider failure.
+                failBrowser(localAsrError('AUTH_REQUIRED', 'Please sign in before using voice input.'));
+                return;
+            }
             const pcm = amadeusPcmChunks.length > 0 ? Buffer.concat(amadeusPcmChunks) : Buffer.alloc(0);
             const wav = pcm16LeToWav(pcm);
             const requestController = new AbortController();
             amadeusAbortController = requestController;
             try {
-                const userToken = authContext.accessToken?.trim();
-                if (!userToken) {
-                    throw localAsrError('AUTH_REQUIRED', 'Please sign in before using voice input.');
-                }
                 const managedBaseURL = DOMAIN_URL.replace(/\/+$/, '');
                 const proxyBaseURL = resolveAmadeusProxyBaseURL(readNonEmptyEnv('ASR_PROXY_BASE_URL'), managedBaseURL);
                 const routingHeaders = currentManagedRoutingHeaders();
@@ -953,6 +957,11 @@ export function setLocalRuntimeRunawayGuardConfig(value) {
     runawayGuardConfig = parseRunawayGuardOverride(value);
     setUtilityRuntimeRunawayGuardConfig(runawayGuardConfig);
 }
+/** Stores the validated Apollo prompt-suggestion rollout policy for live updates and Utility restarts. */
+export function setLocalRuntimePromptSuggestionPolicy(value) {
+    promptSuggestionPolicy = parsePromptSuggestionRemotePolicy(value);
+    setUtilityRuntimePromptSuggestionPolicy(promptSuggestionPolicy);
+}
 /** Applies a validated, non-persistent Apollo threshold snapshot to the live Desktop runtime. */
 export function setLocalRuntimeToolResultCompactionConfig(value) {
     toolResultCompactionConfig = normalizeToolResultCompactionConfig(value);
@@ -1041,6 +1050,9 @@ function normalizeToolResultCompactionConfig(value) {
         record.keep_recent_rounds > 0
         ? record.keep_recent_rounds
         : undefined;
+    const checkpointSharedPrefix = typeof record.checkpoint_shared_prefix === 'boolean'
+        ? record.checkpoint_shared_prefix
+        : undefined;
     return {
         ...(enabled !== undefined ? { enabled } : {}),
         ...(maxInlineBytes !== undefined ? { maxInlineBytes } : {}),
@@ -1049,6 +1061,7 @@ function normalizeToolResultCompactionConfig(value) {
         ...(minSavingsBytes !== undefined ? { minSavingsBytes } : {}),
         ...(minCandidateBytes !== undefined ? { minCandidateBytes } : {}),
         ...(keepRecentRounds !== undefined ? { keepRecentRounds } : {}),
+        ...(checkpointSharedPrefix !== undefined ? { checkpointSharedPrefix } : {}),
     };
 }
 function kibToPositiveSafeBytes(value) {
@@ -1206,6 +1219,7 @@ registerUtilityRuntimeMainHooks({
     getPromptConfigKey: () => resolveDesktopPromptConfigKey({ packaged: app.isPackaged, appPath: app.getAppPath() }),
     getContextWindowUsageEnabled: () => contextWindowUsageEnabled,
     getRunawayGuardConfig: () => runawayGuardConfig,
+    getPromptSuggestionPolicy: () => promptSuggestionPolicy,
     getToolResultCompactionConfig: () => toolResultCompactionConfig,
     getCollectionPolicy: () => collectionPolicy,
     getStartupExecutionPolicy: () => startupExecutionPolicy,
@@ -1256,6 +1270,7 @@ registerUtilityRuntimeMainHooks({
         broadcastEmbeddedBrowserAgentAction({ sessionId, action: 'open_miniapp' });
     },
     closeMiniAppSurface: ({ pluginId, isGenerationCurrent }) => closeManagedMiniAppSurface({ pluginId, isGenerationCurrent }),
+    requestMiniAppToolApproval: (input) => requestMiniAppToolPermission(input),
     getHostDiagnosticsProvider: () => maybeCreateElectronDiagnosticsProvider(),
     prepareForkEnv: async () => {
         // Keep ASR credentials in Electron main. The manager snapshots

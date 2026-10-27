@@ -95,13 +95,12 @@ export function createSecretFreeModelContextAssemblyContext(scope) {
         },
         model,
         history,
+        ...(session.miniAppOrigin
+            ? { sessionOrigin: { miniApp: { pluginId: session.miniAppOrigin.pluginId } } }
+            : {}),
     };
 }
 function projectTurnIntent(provenance) {
-    const origin = readRecord(provenance.sourceContext?.origin);
-    const goalSummaryIntent = projectGoalSummaryIntent(provenance, origin);
-    if (goalSummaryIntent)
-        return goalSummaryIntent;
     const cloudHandoff = readRecord(provenance.sourceContext?.cloudHandoff);
     if (cloudHandoff.trigger === 'slash') {
         return { kind: 'cloud-handoff', attributes: { trigger: 'slash' } };
@@ -109,8 +108,9 @@ function projectTurnIntent(provenance) {
     // The Goal verifier child is an ordinary `task` delegation; the run id in its
     // origin is what lets the host attach the verification contract and this
     // run's execution caps to that one Turn.
-    if (provenance.source === 'task')
-        return projectGoalVerifierIntent(origin);
+    if (provenance.source === 'task') {
+        return projectGoalVerifierIntent(readRecord(provenance.sourceContext?.origin));
+    }
     if (provenance.source === 'code_review') {
         return projectCodeReviewIntent(readRecord(provenance.sourceContext?.review));
     }
@@ -141,16 +141,6 @@ function projectCodeReviewIntent(review) {
             scope: 'local_changes',
         },
     };
-}
-function isGoalBudgetSummaryOrigin(origin) {
-    return origin.type === 'thread-goal-continuation' && origin.kind === 'budget-limit';
-}
-function projectGoalSummaryIntent(provenance, origin) {
-    if (provenance.source === 'thread-goal' &&
-        origin.type === 'thread-goal-continuation' &&
-        origin.kind === 'completion-summary')
-        return { kind: 'goal-completion-summary' };
-    return isGoalBudgetSummaryOrigin(origin) ? { kind: 'goal-budget-summary' } : undefined;
 }
 function projectResolvedModel(preparation) {
     const configured = readRecord(preparation.agentConfig.model);

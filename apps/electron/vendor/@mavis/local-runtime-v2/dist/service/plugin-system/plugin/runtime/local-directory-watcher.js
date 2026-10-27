@@ -1,10 +1,14 @@
 import { watch } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
+import path from 'node:path';
 import { deferred, settleInBackground, waitUntilSettledOrDeadline, } from '../../plugin-system-helpers.js';
 const DEFAULT_DEBOUNCE_MS = 150;
 const EVENT_DELIVERY_GRACE_MS = 20;
 const DEFAULT_ADMISSION_WAIT_TIMEOUT_MS = 20_000;
-/** Coalesces external changes below `<dataDir>/plugins` into one runtime rebuild. */
+/**
+ * Coalesces external changes below `<dataDir>/plugins` into one runtime rebuild.
+ * @internal Exported for focused watcher tests; owners use `createLocalPluginDirectoryWatcher`.
+ */
 export class LocalPluginDirectoryWatcher {
     root;
     onChange;
@@ -123,5 +127,11 @@ export class LocalPluginDirectoryWatcher {
         this.idle?.resolve();
         this.idle = undefined;
     }
+}
+/** Watches `<dataDir>/plugins` unless the owner supplies its own watcher (test seam). */
+export function createLocalPluginDirectoryWatcher(owner, onChange) {
+    return owner.localDirectoryWatcherFactory
+        ? owner.localDirectoryWatcherFactory(onChange)
+        : new LocalPluginDirectoryWatcher(path.join(owner.dataDir, 'plugins'), onChange);
 }
 //# sourceMappingURL=local-directory-watcher.js.map

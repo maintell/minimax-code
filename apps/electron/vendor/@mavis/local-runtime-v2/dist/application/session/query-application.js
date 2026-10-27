@@ -74,8 +74,12 @@ export class SessionQueryApplication {
                 cursor: req.sideChatsCursor,
             })
             : undefined;
+        const view = toSessionInfoView(session, this.options.sideChats.relation(session.sessionId));
+        const wait = this.options.backgroundTaskWait?.(session.sessionId);
+        if (view.status && wait)
+            view.status.backgroundTaskWait = wait;
         return {
-            session: toSessionInfoView(session, this.options.sideChats.relation(session.sessionId)),
+            session: view,
             ...(page
                 ? {
                     sideChats: {

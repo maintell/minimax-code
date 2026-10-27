@@ -1,5 +1,6 @@
 export { isUserSteeringProducer } from './agent-host/contracts.js';
 export { digestTurnInput } from './execution/turn-input-identity.js';
+export { THREAD_GOAL_PAUSED_ABORT_REASON } from './execution/queue-pause-on-abort.js';
 export { agentHostModelFromQueue, queueModelFromAgentHost } from './agent-host/index.js';
 export { parseBackgroundTaskOriginMetadata } from './agent-host/contracts.js';
 export { queueClaimDeliveryInput } from './queue.dispatcher.js';
@@ -15,13 +16,16 @@ export { composeTurnSubmissionPreparations, createGoalTurnSubmissionPreparation,
 export { hasPriorityUserQueueItem, resolveGenuineUserQueryText, } from './execution/message-query-authorship.js';
 export { DEFAULT_RETRY_CONTINUATION_PROMPT } from './agent-host/preparation/config/prompt-templates.js';
 export { HistoryMutationError, } from './lifecycle/history-mutation-capability.js';
-export { combineAgentEventObservers, createLocalAgentHost, createProductionAgentPreparation, createGlobalMemoryModelCompletion, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionLLMRetryEventObserver, } from './production-composition.js';
+export { combineAgentEventObservers, createContentReviewSlowEventObserver, createLocalAgentHost, createProductionAgentPreparation, createGlobalMemoryModelCompletion, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionLLMRetryEventObserver, } from './production-composition.js';
 export { ModelRouteAvailabilityError, createSessionModelRepair, } from './agent-host/preparation/config/session-model-selection.js';
 export { AgentHostTurnCapabilityLifecycle, } from './agent-host/assembly/turn-capability-lifecycle.js';
 export { createLocalAgentCapabilitySelector, filterLocalTurnCapabilityInventory, } from './agent-host/assembly/local-turn-tool-catalog.js';
 export { resolveAgentPromptSurface } from './agent-host/preparation/agent-prompt-surface.js';
-export { configureLocalPluginHookEnabledResolver, configureLocalPluginHookObservability, configureLocalPluginHookSessionEndFence, deactivateLocalPluginHooks, abortLocalPluginHookSessionTurn, disposeLocalPluginHookSessions, endAllLocalPluginHookSessionsForLogout, endLocalPluginHookSession, markNextLocalPluginHookSessionStart, } from './agent-host/assembly/local-turn-plugin-hooks.js';
+export { configureLocalConfigHookSource, configureLocalPluginHookEnabledResolver, configureLocalPluginHookObservability, configureLocalPluginHookSessionEndFence, deactivateLocalPluginHooks, abortLocalPluginHookSessionTurn, disposeLocalPluginHookSessions, endAllLocalPluginHookSessionsForLogout, endLocalPluginHookSession, markNextLocalPluginHookSessionStart, } from './agent-host/assembly/local-turn-plugin-hooks.js';
 export { buildLocalTurnPayloadTransform } from './agent-host/index.js';
 export { toQueueInput } from './turn-submission.service.js';
 export { normalizeModelSelection } from './agent-host/index.js';
+export { createPromptSuggestionService, } from './agent-host/runner/prompt-suggestion/prompt-suggestion-service.js';
+export { evaluatePromptSuggestionPolicy, PROMPT_SUGGESTION_VERSION, promptSuggestionInstruction, } from './agent-host/runner/prompt-suggestion/prompt-suggestion-policy.js';
+export { createPromptSuggestionEligibility, isEligibleMembership, } from './agent-host/runner/prompt-suggestion/prompt-suggestion-eligibility.js';
 //# sourceMappingURL=index.js.map

@@ -1,19 +1,14 @@
 /** Strictest known per-image provider limit; a larger image is never sent. */
 const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024;
 export const REQUEST_MEDIA_DEFAULTS = {
-    recoveryDivisor: 2,
-    image: { max_width: 2_000, max_height: 2_000, max_base64_bytes: 4.5 * 1024 * 1024 },
+    image: { max_width: 2_000, max_height: 2_000, max_base64_bytes: 3.5 * 1024 * 1024 },
 };
 /** Resolves the user-facing `requestMedia` config.yaml block. */
 export function parseRequestMediaConfig(raw) {
     const value = isRecord(raw) ? raw : {};
-    const divisor = value.recoveryDivisor;
     const image = isRecord(value.image) ? value.image : {};
     const defaults = REQUEST_MEDIA_DEFAULTS.image;
     return {
-        recoveryDivisor: typeof divisor === 'number' && Number.isFinite(divisor) && divisor > 1
-            ? divisor
-            : REQUEST_MEDIA_DEFAULTS.recoveryDivisor,
         image: {
             max_width: positiveInteger(image.max_width) ?? defaults.max_width,
             max_height: positiveInteger(image.max_height) ?? defaults.max_height,

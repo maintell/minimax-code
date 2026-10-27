@@ -140,10 +140,25 @@ export class SessionControllerBase {
         void req;
         throw new NotImplementedError('inspectTurnContinuation');
     }
+    async getSessionActivity(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getSessionActivity');
+    }
     async abortSession(ctx, req) {
         void ctx;
         void req;
         throw new NotImplementedError('abortSession');
+    }
+    async cancelPromptSuggestion(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('cancelPromptSuggestion');
+    }
+    async getPromptSuggestion(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getPromptSuggestion');
     }
     async steerSession(ctx, req) {
         void ctx;

@@ -1,9 +1,8 @@
-import { getConfig } from '@mavis/config';
+import { getConfig, resolveBetaFeature } from '@mavis/config';
 import { json, readFirstString, readJsonBody, sanitizeConfig, sanitizeProviderConfig, splitModelId, } from '../host-helpers.js';
 import { buildPermissionModeOptionsResponse, isLocalPermissionModeString, normalizePermissionModeConfigBody, } from '../permission-mode-mapping.js';
 import { listLocalRuntimeModels } from '../host-support.js';
 import { isPeekEnabled } from '../../peek/gate.js';
-import { isThreadGoalEnabled } from '../../thread-goal/gate.js';
 /**
  * Entry point — handles every URL under `/config/**` plus the
  * `/external/llm-provider-discovery` GET. Returns `undefined` when the
@@ -108,7 +107,9 @@ function resolvedLocalConfigBeta(config) {
     return {
         ...parsedBeta,
         ...(config.beta ?? {}),
-        threadGoal: isThreadGoalEnabled(() => config),
+        threadGoal: resolveBetaFeature('threadGoal', config.beta?.threadGoal, {
+            internalBuild: process.env.__MAVIS_BUILD_INTERNAL === 'true',
+        }),
         // peek is prodReady:false: force-off in prod regardless of any inline
         // `beta.peek: true` opt-in, while still honouring an explicit dev/test
         // opt-out (`beta.peek: false`).

@@ -1,13 +1,11 @@
-import path from 'node:path';
-import { EMPTY_CONNECTOR_RUNTIME } from './app/runtime.js';
 import { PluginSystemError } from './errors.js';
 import { PluginSystemMetrics } from './metrics.js';
 import { PluginCapabilityGenerationRegistry } from './mcp/generation-registry.js';
 import { PluginMcpRuntime } from './mcp/runtime.js';
 import { PluginMiniAppPublicationController } from './plugin/runtime/miniapp/controller.js';
 import { prepareMiniAppTurn } from './plugin/runtime/miniapp/turn-preparation.js';
-import { deferred, assertOfficialMutationScope, assertPluginNameAvailable, revokeOfficialPluginSelection, assertPluginSystemPublicationAttached, capturePluginSystemTurnCapabilities, findLocalPlugin, ignoreFailure, normalizedPluginName, preparePluginSystemTurnCapabilities, runAfter, scopeKey, resolvePluginRepositoryScope, settleInBackground, waitForScopedOperation, } from './plugin-system-helpers.js';
-import { LocalPluginDirectoryWatcher, } from './plugin/runtime/local-directory-watcher.js';
+import { deferred, assertOfficialMutationScope, assertPluginNameAvailable, revokeOfficialPluginSelection, assertPluginSystemPublicationAttached, capturePluginSystemTurnCapabilities, findLocalPlugin, ignoreFailure, normalizedPluginName, runAfter, scopeKey, resolvePluginRepositoryScope, settleInBackground, waitForScopedOperation, } from './plugin-system-helpers.js';
+import { createLocalPluginDirectoryWatcher, } from './plugin/runtime/local-directory-watcher.js';
 import { MarketplacePreviewCache, PluginMarketplacePreview, } from './plugin/runtime/marketplace-preview.js';
 import { decidePreparedOfficialSync, handleIncompleteOfficialSync, OfficialPluginRecovery, prepareOfficialFullState, prepareOfficialMutation, waitForOfficialPublication, } from './plugin/runtime/official-operations.js';
 import { buildCustomOnlySnapshot, localSnapshotInventory, readPluginSnapshotInputs, removedPluginHookNames, } from './plugin/runtime/snapshot-inputs.js';
@@ -54,12 +52,13 @@ export class PluginSystem {
     mcpRuntime;
     capabilityGenerations;
     metrics;
-    connectorRuntime;
     packageStorage;
     localDirectoryWatcher;
     constructor(options) {
         this.options = options;
-        this.builder = new PluginSnapshotBuilder(options.mcpNames);
+        this.builder = new PluginSnapshotBuilder(options.mcpNames, {
+            ...(options.miniAppHostVersion ? { hostVersion: options.miniAppHostVersion } : {}),
+        });
         this.metrics = new PluginSystemMetrics(options.metrics);
         this.packageStorage = new PluginPackageStorage({
             dataDir: options.dataDir,
@@ -87,6 +86,7 @@ export class PluginSystem {
             packageStorage: this.packageStorage,
             builder: this.builder,
             isLocalEnabled: (root) => this.options.repository.isLocalPluginEnabled(root),
+            miniAppPermissions: this.options.repository,
             recordReservations: (snapshot, reservations) => this.snapshotReservations.set(snapshot, reservations),
             initializeStarted: () => this.initializeStarted,
             isDisposed: () => this.disposed,
@@ -103,14 +103,12 @@ export class PluginSystem {
                 this.localStateRevision += 1;
                 this.marketplacePreview.invalidate();
             },
+            requestCachedRebuild: () => this.scheduleCachedRebuild(),
+            officialReconciler: options.officialReconciler,
         });
-        const onLocalDirectoryChange = () => this.publishExternalLocalPluginChanges();
-        this.localDirectoryWatcher = options.localDirectoryWatcherFactory
-            ? options.localDirectoryWatcherFactory(onLocalDirectoryChange)
-            : new LocalPluginDirectoryWatcher(path.join(options.dataDir, 'plugins'), onLocalDirectoryChange);
+        this.localDirectoryWatcher = createLocalPluginDirectoryWatcher(options, () => this.publishExternalLocalPluginChanges());
         this.mcpRuntime = options.mcpRuntime ?? new PluginMcpRuntime();
         this.capabilityGenerations = new PluginCapabilityGenerationRegistry(this.snapshot.revision, this.mcpRuntime);
-        this.connectorRuntime = options.connectorRuntime ?? EMPTY_CONNECTOR_RUNTIME;
         this.officialRecovery = new OfficialPluginRecovery({
             delaysMs: options.officialRecoveryDelaysMs,
             isCurrentScope: (requested) => !this.disposed && requested === this.desiredScopeKey,
@@ -162,12 +160,9 @@ export class PluginSystem {
             inventory: this.mcpRuntime.exportInventory?.(),
         }));
     }
-    async prepareTurnCapabilities(signal) {
+    captureTurnCapabilities() {
         this.assertUsable();
-        return preparePluginSystemTurnCapabilities(this.connectorRuntime, signal);
-    }
-    captureTurnCapabilities(preparation) {
-        return capturePluginSystemTurnCapabilities(this.snapshot.turnCapabilities, preparation);
+        return capturePluginSystemTurnCapabilities(this.snapshot.turnCapabilities);
     }
     retainTurnCapabilities(capabilities) {
         this.capabilityGenerations.retain(capabilities.revision);
@@ -440,6 +435,7 @@ export class PluginSystem {
             this.desiredScopeKey = scopeKey(this.readScope());
             await this.localDirectoryWatcher.start();
             this.scheduleCachedRestore(true);
+            settleInBackground(this.options.officialReconciler?.pruneUnreferencedCaches?.());
             this.initialization.resolve();
         }
         catch (error) {

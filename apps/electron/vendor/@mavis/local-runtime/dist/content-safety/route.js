@@ -6,6 +6,9 @@ export async function routeLocalContentSafetyApi(input) {
     if (input.method === 'POST' && input.parts.length === 2 && input.parts[1] === 'image') {
         return routeLocalImageSafetyCheck(input);
     }
+    if (input.method === 'POST' && input.parts.length === 2 && input.parts[1] === 'text') {
+        return routeLocalTextSafetyCheck(input);
+    }
     if (input.method !== 'POST' || input.parts.length !== 1) {
         return json({ error: 'Local content safety route not found' }, { status: 404 });
     }
@@ -129,6 +132,47 @@ function isHttpImageUrl(value) {
     }
     catch {
         return false;
+    }
+}
+// POST /content/text — V2 text review forwarder for user-authored names that
+// are persisted outside the runtime (e.g. desktop project aliases send
+// ProjectName=211). Like the image route, the caller owns the scene and the
+// text: this route only validates the envelope and forwards `content_text`
+// unchanged to biz-gateway `/mavis/api/v2/content`. Scene-value policy stays
+// with chat-server.
+async function routeLocalTextSafetyCheck(input) {
+    const body = (await readJsonBody(input.request));
+    const contentText = body.content_text;
+    if (typeof contentText !== 'string' || !contentText.trim()) {
+        return json({ error: 'content_text must be a non-empty string' }, { status: 400 });
+    }
+    const scene = body.scene;
+    if (typeof scene !== 'number' || !Number.isInteger(scene) || scene <= 0) {
+        return json({ error: 'scene must be a positive integer' }, { status: 400 });
+    }
+    try {
+        const result = await input.safety.reviewV2({
+            scene: scene,
+            content_text: contentText,
+        });
+        // Name writes need an explicit allow; a replace/guide action still means the
+        // text must not be persisted, so anything but allow is a policy block.
+        if (result.action === 'allow')
+            return json({ pass: true });
+        return json({
+            pass: false,
+            reason: 'request rejected',
+            errorCode: CONTENT_POLICY_VIOLATION,
+        });
+    }
+    catch {
+        // No verdict fails CLOSED — the text is not persisted — but surfaces as
+        // service unavailable, never as a policy violation (same split as images).
+        return json({
+            pass: false,
+            reason: 'Service unavailable',
+            errorCode: CONTENT_SERVICE_UNAVAILABLE,
+        });
     }
 }
 //# sourceMappingURL=route.js.map

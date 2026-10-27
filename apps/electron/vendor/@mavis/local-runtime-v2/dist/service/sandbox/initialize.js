@@ -30,10 +30,11 @@ export function composeLocalSandboxService(input) {
         // fallback only serves tests/embedders. The v2 service layer must not
         // import v1 runtime values (depcruise: v1-runtime-values-only-runtime-or-index),
         // so the shim PATH policy cannot be resolved here.
-        resolveBashEnvPolicy());
+        resolveBashEnvPolicy(), input.getSkipParentDeathGuard);
     return initializeLocalSandboxService({
         config,
         operationsFactory,
+        getSkipParentDeathGuard: input.getSkipParentDeathGuard,
         configWriter: input.configWriter,
         eventSink: input.eventSink ?? createSandboxEvalEventSink(input.evalReporter),
         log: input.log ??
@@ -65,7 +66,7 @@ function initializeLocalSandboxService(input) {
         ...(input.platform ? { platform: input.platform } : {}),
         descriptors: input.descriptors ?? [SRT_MACOS_BACKEND_DESCRIPTOR],
     });
-    input.operationsFactory.bind(createSandboxBashOperationsFactory(service, input.operationsFactory.resolveShell.bind(input.operationsFactory)));
+    input.operationsFactory.bind(createSandboxBashOperationsFactory(service, input.operationsFactory.resolveShell.bind(input.operationsFactory), input.getSkipParentDeathGuard));
     return service;
 }
 //# sourceMappingURL=initialize.js.map

@@ -114,7 +114,7 @@ export class LocalAgentConfigBuilder {
         else if (this.resolveAgentShell && environment?.platform === 'win32') {
             environment = {
                 ...environment,
-                shell: 'unavailable. Continue conversation and use non-shell tools. Shell detection can be retried on a later invocation.',
+                shell: 'pending background discovery. Continue conversation and use non-shell tools without waiting. Do not assume Bash or PowerShell syntax. The first bash call waits for discovery before permissions and returns shell instructions without executing a command. Rewrite the command for that resolved shell in a new tool-call batch before retrying. If discovery fails, non-shell tools remain available.',
             };
         }
         const systemPrompt = buildSystemPrompt({

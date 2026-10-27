@@ -69,6 +69,21 @@ export class CronExecutor {
         }
     }
     /**
+     * 固定会话已归档时，触发在写入运行记录之前就被拦下：归档的对话收不到投递，
+     * 留下一条必然失败的记录只会堆积在历史里。查询失败按未归档处理，交给执行时的会话校验。
+     */
+    async isTargetArchived(definition) {
+        const target = definition.sessionTarget;
+        if (target.mode !== 'sessionId' || !target.sessionId)
+            return false;
+        try {
+            return (await this.deps.sessionCreation.isTargetArchived?.(target.sessionId)) === true;
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
      * Scheduler 回调入口。在 Cron 事务中持久化 pending 调度运行，已有记录时则收敛到
      * 同一记录，随后加入队列；该入口不等待会话工作。
      */
@@ -170,6 +185,10 @@ export class CronExecutor {
         const pending = this.listPendingRuns();
         const outcomes = [];
         for (const run of pending) {
+            // Startup recovery runs after the runtime is ready; a run this process
+            // is executing is not one a previous process abandoned.
+            if (this.inFlight.has(run.runId))
+                continue;
             if (run.executionClaimedAtMs === undefined || (run.deliveryInput && run.sessionId)) {
                 this.enqueue(run.runId);
                 continue;

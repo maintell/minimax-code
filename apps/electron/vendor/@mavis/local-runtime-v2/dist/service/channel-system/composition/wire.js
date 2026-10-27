@@ -29,6 +29,7 @@ import { migrateRootlessChannelState } from '../migration/rootless-startup-migra
 async function runChannelStartupSteps(scope) {
     const { input, channelApis, channelBridgeInfra } = scope;
     if (input.runLegacyImCredentialMigration) {
+        logChannelStartupStage('legacy_credential_migration');
         await input.runLegacyImCredentialMigration(() => migrateLegacyImCredentialsOnStartup({
             dataDir: input.dataDir,
             nowMs: input.nowMs,
@@ -43,6 +44,7 @@ async function runChannelStartupSteps(scope) {
     if (scope.isStopped())
         return;
     if (input.rootlessV2) {
+        logChannelStartupStage('rootless_state_migration');
         await migrateRootlessChannelState({
             dataDir: input.dataDir(),
             defaultAgentName: input.agentName,
@@ -56,6 +58,7 @@ async function runChannelStartupSteps(scope) {
         });
         if (scope.isStopped())
             return;
+        logChannelStartupStage('legacy_connection_migration');
         await migrateLegacyImConnectionState({
             dataDir: input.dataDir(),
             bindingStore: channelBridgeInfra.bindingStore,
@@ -83,11 +86,20 @@ async function runChannelStartupSteps(scope) {
     }
     if (scope.isStopped())
         return;
+    logChannelStartupStage('primary_family_convergence');
     scope.installPrimaryFamilyHooks();
     await runPrimaryFamilyConvergence(scope);
     if (scope.isStopped())
         return;
+    logChannelStartupStage('restore_inbound_loops');
     await channelApis.restartInboundLoops();
+}
+/**
+ * One fixed INFO per §5.3 step, so an uncoded startup rejection can be placed
+ * after the last stage entered. Observation only: no ordering or error effect.
+ */
+function logChannelStartupStage(stage) {
+    imLogger.info({ stage }, 'IM startup stage entered');
 }
 /**
  * Plan §5.5: startup reconcile converges persisted ownership only. Root /

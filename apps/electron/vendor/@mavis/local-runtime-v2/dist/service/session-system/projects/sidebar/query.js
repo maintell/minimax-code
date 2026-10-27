@@ -1,6 +1,6 @@
 import { listInternalDefaultRootIds } from '../../shared/internal-default-roots.js';
 import { projectActivityExpression } from '../repo/activity.js';
-import { and, asc, desc, eq, exists as sqlExists, getTableColumns, gt, inArray, lte, sql, } from 'drizzle-orm';
+import { and, asc, desc, eq, exists as sqlExists, getTableColumns, gt, inArray, lte, or, sql, } from 'drizzle-orm';
 import { sessions as s } from '../../../../infra/db/schema/sessions.js';
 import { projects as p } from '../../../../infra/db/schema/projects.js';
 import { decodeSessionRow } from '../../sessions/repo/codec.js';
@@ -33,18 +33,22 @@ export class SidebarQueryService {
             const count = tx.$count(s, and(eq(s.projectId, p.projectId), sidebarPredicate(q)));
             // Project existence includes pinned sessions, but never internal sessions.
             // Preview/count still exclude pinned sessions through sidebarPredicate.
-            const hasEligibleSession = sqlExists(tx
+            const hasEligibleSession = (includeArchived) => sqlExists(tx
                 .select({ id: s.sessionId })
                 .from(s)
-                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds)))
+                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds, includeArchived)))
                 .limit(1));
+            // A workspace project stays listed after all of its conversations are
+            // archived; only an explicit removal (hidden) takes it out of the sidebar.
+            // The default "no project" bucket still needs an active conversation.
+            const isListedProject = or(hasEligibleSession(false), and(eq(p.projectKind, 'workspace'), hasEligibleSession(true)));
             const rows = tx
                 .select({
                 project: { ...getTableColumns(p), latestActivityAtMs: projectActivityExpression },
                 matchedCount: count,
             })
                 .from(p)
-                .where(and(sidebarProjectPredicate(q), hasFilters ? gt(count, 0) : hasEligibleSession, tupleAfter([
+                .where(and(sidebarProjectPredicate(q), hasFilters ? gt(count, 0) : isListedProject, tupleAfter([
                 sql `${p.pinned}`,
                 sql `${p.orderIndex}`,
                 projectActivityExpression,

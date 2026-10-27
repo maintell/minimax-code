@@ -5,7 +5,7 @@ import { taskTurnId } from './turn-id.js';
 import { createSubagentFinishTelemetrySink } from '../agent/subagent-telemetry.js';
 import { logger } from '../common/logger.js';
 import { resolveV2SessionArtifactPathsSync } from '../persistence/layout/v2-session-artifacts.js';
-import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, readTaskOccupancy, runInjectedConversationTaskTurn, } from '../api/injected-conversation-task-turn.js';
+import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, logTaskAdmissionRejectedAfterPrecheck, precheckTaskConcurrency, readTaskOccupancy, runInjectedConversationTaskTurn, } from '../api/injected-conversation-task-turn.js';
 import { requireTaskConversation, } from '../api/local-task-host.js';
 import { normalizeLocalTaskInput, taskModelSelectionFor } from '../api/local-task-input.js';
 import { resolveLocalTaskAgentTarget, taskSessionOwner } from '../api/local-task-subagents.js';
@@ -32,6 +32,15 @@ async function startAdmittedBackgroundLocalTask(input, admission, shutdownSignal
     }
     const agentName = target.resolvedAgentName;
     const taskModelSelection = taskModelSelectionFor(taskInput);
+    // Admission needs the child Session to find its parent, so a full parent is
+    // checked here first to avoid leaving an empty child Session behind.
+    const precheckFailure = await precheckTaskConcurrency({
+        conversation: input.host.runtimeConversation,
+        parentSessionId: input.parentSession.sessionId,
+        requestedAgentName: target.requestedName,
+    });
+    if (precheckFailure)
+        return { status: 'failed', ...precheckFailure };
     const taskId = createBackgroundTaskId();
     // Claim the row for this process before it exists durably, so a Session stop
     // cascade can tell "our task" from a row owned by another client process.
@@ -176,9 +185,19 @@ async function startAdmittedBackgroundLocalTask(input, admission, shutdownSignal
                     shutdownSignal,
                 });
             }
-            const admissionFailure = localTaskAdmissionFailure(error, isSubagentConcurrencyLimitRejection(error)
+            const concurrencyRejected = isSubagentConcurrencyLimitRejection(error);
+            const occupancy = concurrencyRejected
                 ? await readTaskOccupancy(input.host.runtimeConversation, input.parentSession.sessionId)
-                : undefined);
+                : undefined;
+            if (concurrencyRejected) {
+                logTaskAdmissionRejectedAfterPrecheck({
+                    parentSessionId: input.parentSession.sessionId,
+                    taskId,
+                    childSessionId: startedChildSession.sessionId,
+                    occupancy,
+                });
+            }
+            const admissionFailure = localTaskAdmissionFailure(error, occupancy);
             const failure = {
                 status: 'failed',
                 requestedAgentName: target.requestedName,
@@ -210,7 +229,9 @@ async function startAdmittedBackgroundLocalTask(input, admission, shutdownSignal
         taskId,
         subSessionId: startedChildSession.sessionId,
         subTurnId: turnId,
-        ...(concurrency ? { concurrency } : {}),
+        ...(concurrency
+            ? { concurrency: { active: concurrency.active, limit: concurrency.limit } }
+            : {}),
     };
 }
 async function cancelAdmittedTaskSetup(input) {

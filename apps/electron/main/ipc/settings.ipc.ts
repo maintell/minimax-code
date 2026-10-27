@@ -5,6 +5,8 @@
  */
 import os from "os";
 import path from "path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { app, globalShortcut, BrowserWindow, shell, ipcMain } from "electron";
 import { createTray, getTray, destroyTray } from "../modules/tray";
 import { toggleArchonMiniChatWindow } from "../windows";
@@ -191,19 +193,39 @@ function getLoginItemSettings() {
     const settings = app.getLoginItemSettings();
     return settings.openAtLogin;
 }
-export const openSystemNotificationSettings = () => {
+export const openSystemNotificationSettings = async () => {
     if (process.platform === 'darwin') {
         const release = os.release();
         const majorVersion = parseInt(release.split('.')[0]);
         if (majorVersion >= 22) {
-            shell.openExternal(`x-apple.systempreferences:com.apple.Notifications-Settings.extension`);
+            const settingsUrl = 'x-apple.systempreferences:com.apple.Notifications-Settings.extension';
+            let bundleId = '';
+            try {
+                // Read the running bundle identity, including worktree-specific development apps.
+                const { stdout } = await promisify(execFile)('/usr/bin/plutil', [
+                    '-extract',
+                    'CFBundleIdentifier',
+                    'raw',
+                    '-o',
+                    '-',
+                    path.resolve(process.execPath, '../../Info.plist'),
+                ], { encoding: 'utf8', timeout: 2000, maxBuffer: 4096 });
+                bundleId = stdout.trim();
+            }
+            catch {
+                logger.warn('[DesktopSettings] Could not read notification bundle identity; opening general settings');
+            }
+            await shell.openExternal(bundleId ? `${settingsUrl}?id=${encodeURIComponent(bundleId)}` : settingsUrl);
         }
         else {
-            shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
+            await shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
         }
     }
     else if (process.platform === 'win32') {
-        shell.openExternal('ms-settings:notifications');
+        await shell.openExternal('ms-settings:notifications');
+    }
+    else {
+        throw new Error('System notification settings are not supported on this platform');
     }
 };
 
@@ -347,9 +369,15 @@ export function setupDesktopSettingsIPC(options = {}) {
         }
     });
     // 打开系统通知设置
-    ipcMain.handle(IPC_CHANNELS.DESKTOP_OPEN_NOTIFICATION_SETTINGS, () => {
-        (0, openSystemNotificationSettings)();
-        return { success: true };
+    ipcMain.handle(IPC_CHANNELS.DESKTOP_OPEN_NOTIFICATION_SETTINGS, async () => {
+        try {
+            await (0, openSystemNotificationSettings)();
+            return { success: true };
+        }
+        catch (error) {
+            logger.error('[DesktopSettings] Failed to open system notification settings:', error);
+            return { success: false };
+        }
     });
     // 设置语言（需要重启生效）
     ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_LANGUAGE, (_, language) => {
@@ -371,7 +399,7 @@ export function setupDesktopSettingsIPC(options = {}) {
             ...getLocalRuntimeDataDirInfo(config),
         };
     });
-    ipcMain.handle(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, async (_, parentDir) => {
+    ipcMain.handle(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, async (_, parentDir, relocateOptions) => {
         if (process.platform !== 'win32') {
             return {
                 success: false,
@@ -394,6 +422,10 @@ export function setupDesktopSettingsIPC(options = {}) {
             const config = getDesktopConfig();
             const result = await relocateLocalRuntimeDataDir({
                 targetParentDir: parentDir,
+                cloudSyncRiskAcknowledged: typeof relocateOptions === 'object' &&
+                    relocateOptions !== null &&
+                    relocateOptions
+                        .cloudSyncRiskAcknowledged === true,
                 appInstallDir: process.platform === 'win32' ? path.dirname(app.getPath('exe')) : undefined,
                 previousParentDirs: Array.isArray(config.localRuntimePreviousDataParentDirs)
                     ? config.localRuntimePreviousDataParentDirs.filter((dir) => typeof dir === 'string')

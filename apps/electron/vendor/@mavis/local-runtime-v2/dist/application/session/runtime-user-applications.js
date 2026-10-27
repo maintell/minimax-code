@@ -12,7 +12,7 @@ export function createRuntimeUserApplications(input) {
                 await input.workspaceIndexing.prepareSessionStart(sessionId);
             },
             attachmentRegistration: input.options.compatibility.attachmentRegistration,
-            pauseActiveForAbort: input.options.compatibility.sessionV2.goals.pauseActiveForAbort,
+            pauseActiveForAbort: input.goalPort.pauseActiveForAbort,
             metrics: input.options.metrics,
             queryCollapseKeys: input.queryCollapseKeys,
         }),
@@ -20,8 +20,9 @@ export function createRuntimeUserApplications(input) {
     };
 }
 export function createRuntimeProcessLocalApplication(input) {
-    const { options, owners, sessionSystem, skill, planEntryEnabled, modelSystem, modelProviderApplication, } = input;
+    const { goals, options, owners, sessionSystem, skill, planEntryEnabled, modelSystem, modelProviderApplication, } = input;
     return composeProcessLocalApplication({
+        goals,
         eventBus: options.eventBus,
         usageCommits: sessionSystem.usage.commits,
         compatibility: options.compatibility,
@@ -31,6 +32,9 @@ export function createRuntimeProcessLocalApplication(input) {
         pluginControl: owners.plugin,
         miniApp: owners.miniAppComposition.services.miniApp,
         miniAppAgent: owners.miniAppAgent,
+        ...(owners.miniAppComposition.services.miniAppTools
+            ? { miniAppTools: owners.miniAppComposition.services.miniAppTools }
+            : {}),
         planEntryEnabled,
         sessionReports: sessionSystem.reporting,
         instructions: {

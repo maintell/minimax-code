@@ -60,6 +60,10 @@
  * | 42  | repair_session_sidechats_version_collision        | no     | CREATE table/index if missing; contract assert |
  * | 43  | cron_deferred_delivery                            | no     | ADD COLUMN |
  * | 44  | converge_rc_sidechat_version_collision            | YES    | replays m33's channel backfill (rewrites session_kind/visibility) plus 34/42 repairs |
+ * | 45  | repair_goal_branch_version_collision              | no     | conditional ADD COLUMN (m43's) |
+ * | 46  | create_goal_owner_table                           | no     | CREATE + INSERT-only copy; legacy source rows retained |
+ * | 47  | create_goal_request_ledger                        | no     | CREATE IF NOT EXISTS |
+ * | 48  | add_goal_token_usage                              | no     | ADD COLUMN (with defaults); CREATE IF NOT EXISTS |
  *
  * The Memory version-collision adoption (`memory-migration-recovery.ts`) is
  * not a catalog entry but replays m33, so initialize treats a pending

@@ -65,7 +65,7 @@ export class SqliteQuestionnaireRequestQueries {
             .map(toCompatibleQuestionnaireRequestRecord)
             .filter((record) => isOwnedActionRequest(record.request)));
     }
-    async findLatestPendingBySession(sessionId, createdAtCutoff = Number.MIN_SAFE_INTEGER) {
+    async findLatestPendingBySession(sessionId, createdAtCutoff = Number.MIN_SAFE_INTEGER, options = {}) {
         return this.withDb((db) => {
             const row = db
                 .prepare(`
@@ -74,6 +74,7 @@ export class SqliteQuestionnaireRequestQueries {
           WHERE session_id = ?
             AND status = 'pending'
             AND created_at >= ?
+            ${options.legacyOnly ? 'AND response_mode IS NULL' : ''}
           ORDER BY created_at DESC, rowid DESC
           LIMIT 1
         `)
@@ -81,13 +82,31 @@ export class SqliteQuestionnaireRequestQueries {
             return row ? toCompatibleQuestionnaireRequestRecord(row) : null;
         });
     }
+    async findUnansweredV2BySession(sessionId, createdAtCutoff) {
+        // Same 24h cutoff as the single `request`: an older pending row is about to
+        // be expired and can no longer be answered.
+        return this.withDb((db) => db
+            .prepare(`
+            SELECT ${QUESTIONNAIRE_ROW_SELECT}
+            FROM questionnaire_requests
+            WHERE session_id = ?
+              AND status = 'pending'
+              AND created_at >= ?
+              AND response_mode IS NOT NULL
+            ORDER BY created_at DESC, rowid DESC
+          `)
+            .all(sessionId, createdAtCutoff).map(toCompatibleQuestionnaireRequestRecord));
+    }
     async findLatestBySession(sessionId) {
+        // Goal guards only: v2 rows never carry Goal ownership and never replace a
+        // legacy row, so they must not stand in for "the latest questionnaire".
         return this.withDb((db) => {
             const row = db
                 .prepare(`
           SELECT ${QUESTIONNAIRE_ROW_SELECT}
           FROM questionnaire_requests
           WHERE session_id = ?
+            AND response_mode IS NULL
           ORDER BY created_at DESC, rowid DESC
           LIMIT 1
         `)
@@ -123,6 +142,7 @@ export class SqliteQuestionnaireRequestQueries {
             SELECT 1 AS present
             FROM questionnaire_requests
             WHERE session_id = ?
+              AND response_mode IS NULL
               AND (
                 status = 'pending'
                 OR (status = 'answered' AND injected_at IS NULL)

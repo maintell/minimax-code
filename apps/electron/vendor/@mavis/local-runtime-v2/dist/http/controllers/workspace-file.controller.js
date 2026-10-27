@@ -1,3 +1,4 @@
+import { encodeWorkspaceGitObservation, WORKSPACE_GIT_OBSERVATION_HEADER, } from '@mavis/shared/runtime-transport';
 // Scaffolded by @mavis/thrift-gen — this file is yours after generation; edit freely.
 // Regeneration never overwrites an existing controller file.
 import { HTTPException } from 'hono/http-exception';
@@ -12,6 +13,10 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
     }
     async listWorkspaceFileTree(ctx, req) {
         void ctx;
+        // Per-entry metadata probed user files (including `.asar` archives that
+        // Electron then keeps locked) and has no caller; reject it explicitly.
+        if (req.includeMetadata)
+            throw new NotImplementedError('listWorkspaceFileTree.includeMetadata');
         const service = this.requireWorkspaceFile();
         try {
             return await service.listFileTree(req);
@@ -33,15 +38,6 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
             return await (Object.keys(options).length > 0
                 ? service.readFile(req.workspace, req.path, options)
                 : service.readFile(req.workspace, req.path));
-        }
-        catch (error) {
-            throw mapWorkspaceFileError(error);
-        }
-    }
-    async getWorkspaceFileMetadata(ctx, req) {
-        void ctx;
-        try {
-            return await this.requireWorkspaceFile().getFileMetadata(req.workspace, req.path);
         }
         catch (error) {
             throw mapWorkspaceFileError(error);
@@ -260,8 +256,16 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
         return this.requireWorkspaceGit().probe(req.workspace);
     }
     async getWorkspaceGitChanges(ctx, req) {
-        void ctx;
-        return this.requireWorkspaceGit().getChanges(req.workspace, readMode(req.mode));
+        return this.requireWorkspaceGit().getChanges(req.workspace, readMode(req.mode), (observation) => {
+            try {
+                const encoded = encodeWorkspaceGitObservation(observation);
+                if (encoded)
+                    ctx.observationHeaders?.set(WORKSPACE_GIT_OBSERVATION_HEADER, encoded);
+            }
+            catch {
+                /* A failed observation must not affect the Git response. */
+            }
+        });
     }
     async getWorkspaceGitMetadata(ctx, req) {
         void ctx;

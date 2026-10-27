@@ -1,4 +1,3 @@
-import { buildLocalBashAdapter } from '../background-task/bash-runner.js';
 import { buildLocalTurnToolSources } from './local-native-tools.js';
 import { buildLocalTaskAdapter } from './local-task-runner.js';
 import { buildLocalTaskAppendAdapter } from './local-task-append.js';
@@ -30,13 +29,12 @@ export async function buildLocalTurnToolSourcesForHost(input) {
         fetchImpl: input.host.fetchImpl,
         nativeWebSearchEnabled: ['electron', 'tui', 'cli'].includes(input.host.getRuntimeOwnerKind()),
         mcpService: input.host.mcpService,
-        threadGoal: input.host.threadGoal,
         questionnaireContext: input.host.supportsInteraction('questionnaireReply')
             ? input.host.questionnaireServiceDeps()
             : undefined,
         emitBusEvent: (type, payload) => input.host.emitBusEvent(type, payload),
         enableTaskTool: shouldEnableLocalTaskTool(input.session),
-        bashAdapter: buildLocalBashAdapter(input.host, input.session, input.sandboxOperationsFactory),
+        bashAdapter: input.host.backgroundTasks.buildBashAdapter(input.session, input.sandboxOperationsFactory),
         sandboxOperationsFactory: input.sandboxOperationsFactory,
         taskAdapter: buildLocalTaskAdapter(input.host, input.session),
         taskAppendAdapter: buildLocalTaskAppendAdapter(input.host),

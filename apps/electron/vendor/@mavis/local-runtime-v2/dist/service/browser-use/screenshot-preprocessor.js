@@ -25,6 +25,9 @@ export function createBrowserScreenshotPreprocessor(options) {
         if (preprocessOptions?.purpose === 'post-action') {
             const prepared = await prepareScreenshot(screenshot, postActionEncoding(options.getImageEncoding()));
             throwIfAborted(signal);
+            // Script captures are deliberate observations, including unchanged frames.
+            if (preprocessOptions.action === 'run_script')
+                return prepared.result;
             return preprocessPostActionScreenshot(prepared, ctx.sessionId, lastPostActionFingerprintBySession);
         }
         const prepared = await prepareScreenshot(screenshot);

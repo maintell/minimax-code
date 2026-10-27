@@ -9,9 +9,9 @@ import { sandboxErrorOutcome } from './observability/invocation-trace.js';
  */
 export function createDeferredLocalSandboxBashOperationsFactory(desiredEnabled, 
 /** Carries the runtime's PATH shims into background bash; see ensureRmShim. */
-envPolicy) {
+envPolicy, getSkipParentDeathGuard = () => false) {
     let current;
-    const fallback = createUnavailableSandboxBashOperationsFactory(desiredEnabled, (id) => port.resolveShell(id));
+    const fallback = createUnavailableSandboxBashOperationsFactory(desiredEnabled, (id) => port.resolveShell(id), getSkipParentDeathGuard);
     let executor;
     let resolveShell;
     const port = {
@@ -36,14 +36,14 @@ envPolicy) {
     return port;
 }
 /** Temporary owner adapter until the concrete operation factory is wired. */
-function createUnavailableSandboxBashOperationsFactory(effectiveEnabled, resolveShell) {
+function createUnavailableSandboxBashOperationsFactory(effectiveEnabled, resolveShell, getSkipParentDeathGuard) {
     return {
         create: (input) => {
             if (effectiveEnabled()) {
                 throw new SandboxError('SANDBOX_UNAVAILABLE', 'invocation', 'Sandbox Bash operations are unavailable');
             }
             const nativeOperations = createLocalBashOperations({
-                parentDeathGuard: input.identity.operationClass !== 'direct_foreground',
+                parentDeathGuard: input.identity.operationClass !== 'direct_foreground' && !getSkipParentDeathGuard(),
             });
             // Unbound and disabled still has to report admission, or a background
             // task started through this fallback would stay `queued` forever.
@@ -54,7 +54,8 @@ function createUnavailableSandboxBashOperationsFactory(effectiveEnabled, resolve
                     const operations = shell
                         ? createLocalBashOperations({
                             shellConfig: toShellConfig(shell),
-                            parentDeathGuard: input.identity.operationClass !== 'direct_foreground',
+                            parentDeathGuard: input.identity.operationClass !== 'direct_foreground' &&
+                                !getSkipParentDeathGuard(),
                         })
                         : nativeOperations;
                     await input.onPreflightComplete?.();
@@ -65,11 +66,11 @@ function createUnavailableSandboxBashOperationsFactory(effectiveEnabled, resolve
     };
 }
 /** Build the single operations path shared by all local Bash operation classes. */
-export function createSandboxBashOperationsFactory(service, resolveShell) {
+export function createSandboxBashOperationsFactory(service, resolveShell = undefined, getSkipParentDeathGuard = () => false) {
     return {
         create: (input) => {
             const nativeOperations = createLocalBashOperations({
-                parentDeathGuard: input.identity.operationClass !== 'direct_foreground',
+                parentDeathGuard: input.identity.operationClass !== 'direct_foreground' && !getSkipParentDeathGuard(),
             });
             return {
                 separatesOutputStreams: nativeOperations.separatesOutputStreams,
@@ -78,7 +79,8 @@ export function createSandboxBashOperationsFactory(service, resolveShell) {
                     const operations = shell
                         ? createLocalBashOperations({
                             shellConfig: toShellConfig(shell),
-                            parentDeathGuard: input.identity.operationClass !== 'direct_foreground',
+                            parentDeathGuard: input.identity.operationClass !== 'direct_foreground' &&
+                                !getSkipParentDeathGuard(),
                         })
                         : nativeOperations;
                     const lease = await service.beginInvocation({

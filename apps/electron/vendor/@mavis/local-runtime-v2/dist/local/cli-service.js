@@ -1,4 +1,4 @@
-import { PermissionReply, QuestionnairePurpose, QuestionnaireSelectionMode, QuestionnaireStatus, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { PermissionReply, QuestionnairePurpose, QuestionnaireReopenReason, QuestionnaireSelectionMode, QuestionnaireStatus, } from '@mavis/thrift-gen/generated/desktop-service/types';
 /** Process-local entrypoint that reuses generated wire contracts and existing Applications. */
 export class CliService {
     options;
@@ -98,11 +98,19 @@ export class CliService {
     async getPendingQuestionnaire(req, ctx = {}) {
         void ctx;
         const questionnaires = this.requireQuestionnaires();
-        const request = await questionnaires.getPending({
-            agentName: req.name,
-            sessionId: req.sessionId,
-        });
-        return request ? { request: toQuestionnaireRequestView(request) } : {};
+        const scope = { agentName: req.name, sessionId: req.sessionId };
+        let unanswered;
+        if (req.includeUnanswered) {
+            if (!questionnaires.listUnanswered) {
+                throw new Error('Runtime does not expose unanswered Questionnaire recovery.');
+            }
+            unanswered = await questionnaires.listUnanswered(scope);
+        }
+        const request = await questionnaires.getPending(scope);
+        return {
+            ...(request ? { request: toQuestionnaireRequestView(request) } : {}),
+            ...(unanswered ? { unansweredRequests: unanswered.map(toQuestionnaireRequestView) } : {}),
+        };
     }
     async getLatestPlanReview(req, ctx = {}) {
         void ctx;
@@ -127,7 +135,7 @@ export class CliService {
     }
     async replyQuestionnaire(req, ctx = {}) {
         void ctx;
-        return this.requireQuestionnaires().reply({
+        const result = await this.requireQuestionnaires().reply({
             agentName: req.name,
             requestId: req.requestId,
             answers: req.answers.map((answer) => ({
@@ -136,9 +144,16 @@ export class CliService {
                 selectedOther: answer.selectedOther === true,
                 ...(answer.otherText ? { otherText: answer.otherText } : {}),
                 ...(answer.skipped === true ? { skipped: true } : {}),
+                ...(answer.contextImages?.length ? { contextImages: answer.contextImages } : {}),
             })),
             submittedAt: req.submittedAt ?? Date.now(),
         });
+        return {
+            ...result,
+            state: result.state
+                ? { ...result.state, status: toQuestionnaireStatus(result.state.status) }
+                : undefined,
+        };
     }
     dismissQuestionnaire(req, ctx = {}) {
         void ctx;
@@ -230,8 +245,14 @@ export class CliService {
     patchGoal(sessionId, patch) {
         return this.requireCapability('goals', 'Goal').patch(sessionId, patch);
     }
+    resumeGoal(sessionId) {
+        return this.requireCapability('goals', 'Goal').resume(sessionId);
+    }
     clearGoal(sessionId) {
         return this.requireCapability('goals', 'Goal').clear(sessionId);
+    }
+    getRunningGoalTurnId(sessionId) {
+        return this.requireCapability('goals', 'Goal').runningTurnId(sessionId);
     }
     getWorkspaceGitMetadata(workspaceDir) {
         return this.requireCapability('workspace', 'Workspace').git.getMetadata(workspaceDir);
@@ -303,6 +324,14 @@ export class CliService {
     }
     setPermissionMode(input) {
         return this.requireCapability('configuration', 'Configuration').setPermissionMode(input);
+    }
+    /** Undefined when this host cannot read the next-message suggestion switch. */
+    getPromptSuggestionEnabled() {
+        return this.options.application.configuration?.getPromptSuggestionEnabled?.();
+    }
+    /** Undefined when this host cannot persist the next-message suggestion switch. */
+    setPromptSuggestionEnabled(enabled) {
+        return this.options.application.configuration?.setPromptSuggestionEnabled?.({ enabled });
     }
     listModels(input) {
         return this.requireCapability('models', 'Model').list(input);
@@ -436,6 +465,25 @@ function toQuestionnaireRequestView(request) {
         ...(request.modePayload
             ? { modePayload: toQuestionnaireModePayloadView(request.modePayload) }
             : {}),
+        ...toQuestionnaireLifecycleView(request),
+    };
+}
+function toQuestionnaireLifecycleView(request) {
+    return {
+        ...(request.responseMode ? { responseMode: request.responseMode } : {}),
+        ...(request.countdownSeconds !== undefined
+            ? { countdownSeconds: request.countdownSeconds }
+            : {}),
+        ...(request.syncWaiting !== undefined ? { syncWaiting: request.syncWaiting } : {}),
+        ...(request.originTurnRunning !== undefined
+            ? { originTurnRunning: request.originTurnRunning }
+            : {}),
+        ...(request.answeredAt !== undefined ? { answeredAt: request.answeredAt } : {}),
+        ...(request.injectedAt !== undefined ? { injectedAt: request.injectedAt } : {}),
+        ...(request.reopenReason === 'content_recall'
+            ? { reopenReason: QuestionnaireReopenReason.ContentRecall }
+            : {}),
+        ...(request.prefillAnswers ? { prefillAnswers: request.prefillAnswers } : {}),
     };
 }
 function toQuestionnaireStepView(step) {

@@ -106,9 +106,9 @@ export async function listWorkspaceFileTree(input) {
     if (!directoryStat.isDirectory()) {
         throw new WorkspaceFileError('NOT_A_DIRECTORY', 'Workspace path is not a directory');
     }
+    // Tree entries come from Dirent types only. Probing each child would make
+    // Electron open user `.asar` files as archives and keep them locked.
     const dirents = await withFileAccessErrors(() => readdir(directory, { withFileTypes: true }));
-    // Directory membership is O(N); content hashing is deferred until after
-    // sorting, cursor validation and page selection.
     const entries = dirents
         .map((entry) => readTreeEntry({
         root,
@@ -124,59 +124,19 @@ export async function listWorkspaceFileTree(input) {
         root,
         path: toRelativePath(root, directory),
         includeHidden: input.includeHidden !== false,
-        // The cursor remains valid when a caller toggles metadata projection;
-        // the directory membership/type is the stable page identity.
+        // Directory membership/type is the stable page identity.
         entries: entries.map((entry) => [entry.path, entry.type]),
     }));
     const offset = decodeCursor(input.cursor, snapshotId);
     const limit = clamp(input.limit, 1, 200, 50);
     const page = entries.slice(offset, offset + limit);
     const nextOffset = offset + page.length;
-    const projected = [];
-    if (input.includeMetadata) {
-        // Bound open/read/hash work even for the maximum page of 200 entries.
-        for (let start = 0; start < page.length; start += 8) {
-            const batch = await Promise.all(page.slice(start, start + 8).map(async (entry) => {
-                return optional(async () => {
-                    const absolute = join(directory, entry.name);
-                    const info = await lstat(absolute);
-                    if (info.isSymbolicLink() || fileType(info) !== entry.type)
-                        return undefined;
-                    const target = await existingPath(root, absolute);
-                    if (!target)
-                        return undefined;
-                    return {
-                        ...entry,
-                        sizeBytes: info.size,
-                        modifiedMs: Math.trunc(info.mtimeMs),
-                        revision: await revisionForPath(target, info),
-                    };
-                });
-            }));
-            projected.push(...batch.filter((entry) => entry !== undefined));
-        }
-    }
     return {
-        entries: input.includeMetadata ? projected : page,
+        entries: page,
         snapshotId,
         ...(nextOffset < entries.length
             ? { nextCursor: encodeCursor({ snapshotId, offset: nextOffset }) }
             : {}),
-    };
-}
-export async function getWorkspaceFileMetadata(workspace, filePath) {
-    const root = await existingRoot(workspace);
-    const target = await existingPath(root, filePath);
-    if (!target)
-        return { exists: false, reason: 'file_not_found' };
-    const info = await withFileAccessErrors(() => stat(target));
-    const type = fileType(info);
-    return {
-        exists: true,
-        type,
-        sizeBytes: info.size,
-        modifiedMs: Math.trunc(info.mtimeMs),
-        revision: await revisionForPath(target, info),
     };
 }
 export async function readWorkspaceFile(workspace, filePath, options = {}, maxInlineFileBytes = DEFAULT_MAX_INLINE_FILE_BYTES) {
@@ -346,12 +306,10 @@ export async function listFileSystemDirectories(input) {
     const limit = clamp(input.limit, 1, 200, 50);
     const needle = (input.query ?? '').toLowerCase();
     const entries = [];
-    await walkDirectories(root, maxDepth, Boolean(input.hideDotFiles ?? true), async (absolute, info, depth) => {
+    await walkDirectories(root, maxDepth, Boolean(input.hideDotFiles ?? true), async (absolute, entry, depth) => {
         // The V1 directory picker returns children of the requested directory;
-        // the root itself is context, not an entry in the result.
-        if (depth === 0)
-            return;
-        if (!info.isDirectory() || depth > maxDepth)
+        // the walk never visits the root itself.
+        if (!entry.isDirectory() || depth > maxDepth)
             return;
         const rel = relative(root, absolute);
         if (input.hideDotFiles !== false && basename(absolute).startsWith('.'))
@@ -582,8 +540,8 @@ async function searchDirectoryCandidates(root, isGit) {
 }
 async function fsSearchCandidates(root) {
     const result = [];
-    await walkDirectories(root, 20, true, async (absolute, info) => {
-        if (info.isFile()) {
+    await walkDirectories(root, 20, true, async (absolute, entry) => {
+        if (entry.isFile()) {
             const rel = toRelativePath(root, absolute);
             if (isSearchablePath(rel))
                 result.push(rel);
@@ -591,25 +549,26 @@ async function fsSearchCandidates(root) {
     });
     return result;
 }
+/**
+ * Visits descendants of `root` using Dirent types only (as V1 did). Never
+ * stat each entry: inside Electron that opens user `.asar` files as archives,
+ * walks into them and keeps the file locked on Windows until process exit.
+ */
 async function walkDirectories(root, maxDepth, hideDotFiles, visit) {
-    const visitEntry = async (absolute, depth) => {
-        const info = await optional(() => stat(absolute));
-        if (!info)
+    const walk = async (directory, depth) => {
+        if (depth >= maxDepth)
             return;
-        await visit(absolute, info, depth);
-        if (shouldStopWalking(info, depth, maxDepth))
-            return;
-        const entries = (await optional(() => readdir(absolute, { withFileTypes: true }))) ?? [];
+        const entries = (await optional(() => readdir(directory, { withFileTypes: true }))) ?? [];
         for (const entry of entries) {
             if (shouldSkipWalkEntry(entry, hideDotFiles))
                 continue;
-            await visitEntry(join(absolute, entry.name), depth + 1);
+            const absolute = join(directory, entry.name);
+            await visit(absolute, entry, depth + 1);
+            if (entry.isDirectory())
+                await walk(absolute, depth + 1);
         }
     };
-    await visitEntry(root, 0);
-}
-function shouldStopWalking(info, depth, maxDepth) {
-    return !info.isDirectory() || depth >= maxDepth;
+    await walk(root, 0);
 }
 function shouldSkipWalkEntry(entry, hideDotFiles) {
     if (entry.isSymbolicLink() || entry.name === '.git')

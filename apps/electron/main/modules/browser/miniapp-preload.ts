@@ -1,6 +1,6 @@
 require("./preload.js");
 import { ipcRenderer, contextBridge } from "electron";
-import { readMiniAppAgentRunEvent, parseMiniAppAgentRunResult, MINIAPP_SURFACE_ID_ARGUMENT_PREFIX, MINIAPP_COMPOSER_MAX_TEXT_LENGTH, parseMiniAppComposerAppendResult, readMiniAppAgentRunRequest, readMiniAppAgentReplyRequest, parseMiniAppAgentReplyResult, readMiniAppAgentAnswerRequest, readMiniAppAgentOpenRequest, parseMiniAppAgentOpenResult, parseMiniAppAgentModelsResult, parseMiniAppAgentAgentsResult, readMiniAppAgentCreateRequest, parseMiniAppAgentCreateResult, parseMiniAppWindowResult, parseMiniAppWindowPatch } from "@mavis/shared/miniapp-surface";
+import { isMiniAppSpeechAudioFormat, readMiniAppSpeechAudio, readMiniAppSpeechPartialMessage, MINIAPP_SPEECH_AUDIO_FORMAT, parseMiniAppSpeechTranscribeResponse, readMiniAppAgentObserveRequest, readMiniAppAgentObservedEvent, parseMiniAppAgentObserveResult, parseMiniAppAgentSessionsResult, readMiniAppAgentSessionRequest, parseMiniAppAgentSessionResult, readMiniAppAgentRunEvent, parseMiniAppAgentRunResult, MINIAPP_SURFACE_ID_ARGUMENT_PREFIX, MINIAPP_COMPOSER_MAX_TEXT_LENGTH, parseMiniAppComposerAppendResult, readMiniAppAgentRunRequest, readMiniAppAgentReplyRequest, parseMiniAppAgentReplyResult, readMiniAppAgentAnswerRequest, readMiniAppAgentOpenRequest, parseMiniAppAgentOpenResult, parseMiniAppAgentModelsResult, parseMiniAppAgentAgentsResult, readMiniAppAgentCreateRequest, parseMiniAppAgentCreateResult, MINIAPP_TOOL_REQUEST_MAX_NAMES, hasMiniAppHostCapability, parseMiniAppWindowResult, parseMiniAppWindowPatch } from "@mavis/shared/miniapp-surface";
 const MINIAPP_COMPOSER_APPEND = 'miniapp:composer-append';
 const MINIAPP_AGENT_RUN = 'miniapp:agent-run';
 const MINIAPP_AGENT_CANCEL = 'miniapp:agent-cancel';
@@ -11,25 +11,100 @@ const MINIAPP_AGENT_OPEN = 'miniapp:agent-open';
 const MINIAPP_AGENT_MODELS = 'miniapp:agent-models';
 const MINIAPP_AGENT_AGENTS = 'miniapp:agent-agents';
 const MINIAPP_AGENT_CREATE = 'miniapp:agent-create';
+const MINIAPP_AGENT_OBSERVE = 'miniapp:agent-observe';
+const MINIAPP_AGENT_SESSIONS = 'miniapp:agent-sessions';
+const MINIAPP_AGENT_SESSION = 'miniapp:agent-session';
+const MINIAPP_TOOL_REQUEST = 'miniapp:tool-request';
+const TOOL_PERMISSIONS = new Set(['allow', 'ask', 'deny']);
+const MINIAPP_SPEECH_TRANSCRIBE = 'miniapp:speech-transcribe';
+const MINIAPP_SPEECH_PARTIAL = 'miniapp:speech-partial';
+let speechRequestSequence = 0;
+/**
+ * `window.mcode.miniapp.speech.transcribe`: one utterance of PCM in, its text out. The audio is
+ * validated here so a page learns about a wrong format or an encoded container at the call;
+ * Main re-validates. Partial text arrives on a shared channel keyed by this call's request id.
+ */
+async function transcribeSpeech(input, options) {
+    if (!input || typeof input !== 'object')
+        throw new Error('invalid_request');
+    const { audio, format } = input;
+    if (!isMiniAppSpeechAudioFormat(format))
+        throw new Error('invalid_request');
+    const read = readMiniAppSpeechAudio(audio);
+    if (!read.ok)
+        throw new Error(read.code);
+    // Structured clone copies a view's whole backing buffer; send only the samples.
+    const samples = read.audio.byteLength === read.audio.buffer.byteLength ? read.audio : read.audio.slice();
+    const requestId = `speech-${++speechRequestSequence}`;
+    const onPartial = typeof options?.onPartial === 'function' ? options.onPartial : undefined;
+    const listener = (_event, message) => {
+        const partial = readMiniAppSpeechPartialMessage(message);
+        if (!onPartial || partial?.requestId !== requestId)
+            return;
+        try {
+            onPartial(partial.text);
+        }
+        catch (error) {
+            // A page callback failure must not end the transcription; its author sees it in DevTools.
+            console.error('[miniapp] speech onPartial handler threw', error);
+        }
+    };
+    if (onPartial)
+        ipcRenderer.on(MINIAPP_SPEECH_PARTIAL, listener);
+    let response;
+    try {
+        response = await ipcRenderer.invoke(MINIAPP_SPEECH_TRANSCRIBE, {
+            requestId,
+            audio: samples,
+            format: MINIAPP_SPEECH_AUDIO_FORMAT,
+        });
+    }
+    catch {
+        throw new Error('result_unknown');
+    }
+    finally {
+        if (onPartial)
+            ipcRenderer.removeListener(MINIAPP_SPEECH_PARTIAL, listener);
+    }
+    const result = parseMiniAppSpeechTranscribeResponse(response);
+    if (!result)
+        throw new Error('result_unknown');
+    if (!result.ok)
+        throw new Error(result.code);
+    return result.result;
+}
 const agentRequestPrefix = Math.random().toString(36).slice(2, 10);
 let agentRequestSequence = 0;
 const inFlightAgentRequests = new Set();
 /**
- * One turn-following request (`run` or `answer`): forwards only this request's events and
- * keeps `requestId` cancellable until Main settles it.
+ * A subscribed request ends on its event channel: after the request's last event Main sends
+ * `{ requestId, settled }` there and only then answers the invoke. Electron may deliver that
+ * answer before earlier `send`s, so the stream settles the request and the reply only reports a
+ * lost channel (`lost`). Should no settlement follow a reply, the reply stands after a guard
+ * delay, logged, rather than hanging the page.
  */
-async function invokeAgentTurn(channel, requestId, payload, options) {
-    // Two turns sharing one id would also share its event stream.
-    if (inFlightAgentRequests.has(requestId))
-        throw new Error('busy');
-    const onEvent = typeof options?.onEvent === 'function' ? options.onEvent : undefined;
+const SETTLEMENT_GUARD_MS = 10000;
+async function followAgentStream(input) {
+    const { requestId, onEvent, read } = input;
+    let isSettled = false;
+    let settle = () => undefined;
+    const settled = new Promise((resolve) => {
+        settle = (response) => {
+            isSettled = true;
+            resolve(response);
+        };
+    });
     const listener = (_event, message) => {
-        if (!onEvent || !message || typeof message !== 'object')
+        if (!message || typeof message !== 'object')
             return;
         const envelope = message;
         if (envelope.requestId !== requestId)
             return;
-        const event = readMiniAppAgentRunEvent(envelope.event);
+        if ('settled' in envelope) {
+            settle(envelope.settled);
+            return;
+        }
+        const event = read(envelope.event);
         if (!event)
             return;
         try {
@@ -41,23 +116,142 @@ async function invokeAgentTurn(channel, requestId, payload, options) {
             console.error('[miniapp] agent onEvent handler threw', error);
         }
     };
+    ipcRenderer.on(MINIAPP_AGENT_EVENT, listener);
+    let guard;
+    try {
+        let reply;
+        try {
+            reply = await input.invoke();
+        }
+        catch {
+            if (isSettled)
+                return await settled;
+            throw new Error(input.lost);
+        }
+        return await Promise.race([
+            settled,
+            new Promise((resolve) => {
+                guard = setTimeout(() => {
+                    console.error('[miniapp] agent request answered without a settlement on its event channel', requestId);
+                    resolve(reply);
+                }, SETTLEMENT_GUARD_MS);
+            }),
+        ]);
+    }
+    finally {
+        if (guard !== undefined)
+            clearTimeout(guard);
+        ipcRenderer.removeListener(MINIAPP_AGENT_EVENT, listener);
+    }
+}
+/**
+ * Long-lived subscription keyed by `requestId` (generated when the page omits it), which
+ * `cancel(requestId)` takes. Resolves once it ended (cancelled, the session was deleted, the
+ * Mini App stopped, `session.read` switched off) and rejects with a failure code when it could
+ * not start or failed.
+ */
+async function observeAgent(input, options) {
+    const fields = (input && typeof input === 'object' ? input : {});
+    const request = readMiniAppAgentObserveRequest({
+        ...fields,
+        requestId: fields.requestId ?? `${agentRequestPrefix}-${++agentRequestSequence}`,
+    });
+    const onEvent = options?.onEvent;
+    if (!request || typeof onEvent !== 'function')
+        throw new Error('invalid_request');
+    const { requestId } = request;
+    // Two streams sharing one id would also share their events.
+    if (inFlightAgentRequests.has(requestId))
+        throw new Error('busy');
+    inFlightAgentRequests.add(requestId);
+    let response;
+    try {
+        response = await followAgentStream({
+            requestId,
+            onEvent: onEvent,
+            read: readMiniAppAgentObservedEvent,
+            invoke: () => ipcRenderer.invoke(MINIAPP_AGENT_OBSERVE, request),
+            // Observing changes nothing, so a lost settlement is simply retryable.
+            lost: 'runtime_unavailable',
+        });
+    }
+    finally {
+        inFlightAgentRequests.delete(requestId);
+    }
+    const result = parseMiniAppAgentObserveResult(response);
+    if (!result.ok)
+        throw new Error(result.code);
+}
+async function listAgentSessions() {
+    let response;
+    try {
+        response = await ipcRenderer.invoke(MINIAPP_AGENT_SESSIONS);
+    }
+    catch {
+        throw new Error('runtime_unavailable');
+    }
+    const result = parseMiniAppAgentSessionsResult(response);
+    if (!result.ok)
+        throw new Error(result.code);
+    return { sessions: result.sessions };
+}
+/** Without `sessionId`: the session of the chat this tab is in, undefined outside a chat. */
+async function getAgentSession(sessionId) {
+    const request = readMiniAppAgentSessionRequest(sessionId === undefined ? {} : { sessionId });
+    if (!request)
+        throw new Error('invalid_request');
+    let response;
+    try {
+        response = await ipcRenderer.invoke(MINIAPP_AGENT_SESSION, request);
+    }
+    catch {
+        throw new Error('runtime_unavailable');
+    }
+    const result = parseMiniAppAgentSessionResult(response);
+    if (!result.ok)
+        throw new Error(result.code);
+    // Only the chat's session can be missing; a named session either is returned or fails.
+    if (!result.session && request.sessionId !== undefined)
+        throw new Error('runtime_unavailable');
+    return result.session;
+}
+/**
+ * One turn-following request (`run` or `answer`): forwards only this request's events and
+ * keeps `requestId` cancellable until Main settles it. With `onEvent` the request is subscribed
+ * and settles on its event channel, after its last event.
+ */
+async function invokeAgentTurn(channel, requestId, payload, options) {
+    // Two turns sharing one id would also share its event stream.
+    if (inFlightAgentRequests.has(requestId))
+        throw new Error('busy');
+    const onEvent = typeof options?.onEvent === 'function' ? options.onEvent : undefined;
     inFlightAgentRequests.add(requestId);
     // Without `onEvent` Main does not subscribe the run, so the runtime does not count this
     // page as able to answer the run's asks.
     const observe = onEvent !== undefined;
-    if (observe)
-        ipcRenderer.on(MINIAPP_AGENT_EVENT, listener);
+    const invoke = () => ipcRenderer.invoke(channel, { requestId, ...payload, observe });
     let response;
     try {
-        response = await ipcRenderer.invoke(channel, { requestId, ...payload, observe });
-    }
-    catch {
-        // The turn may already have been submitted; never retry implicitly.
-        throw new Error('result_unknown');
+        if (onEvent) {
+            response = await followAgentStream({
+                requestId,
+                onEvent,
+                read: readMiniAppAgentRunEvent,
+                invoke,
+                // The turn may already have been submitted; never retry implicitly.
+                lost: 'result_unknown',
+            });
+        }
+        else {
+            try {
+                response = await invoke();
+            }
+            catch {
+                throw new Error('result_unknown');
+            }
+        }
     }
     finally {
-        if (observe)
-            ipcRenderer.removeListener(MINIAPP_AGENT_EVENT, listener);
         inFlightAgentRequests.delete(requestId);
     }
     const result = parseMiniAppAgentRunResult(response);
@@ -144,16 +338,18 @@ if (process.isMainFrame) {
                         sessionId: input?.sessionId,
                         model: input?.model,
                         agent: input?.agent,
+                        whenBusy: input?.whenBusy,
                         requestId: input?.requestId ?? `${agentRequestPrefix}-${++agentRequestSequence}`,
                     });
                     if (!request)
                         throw new Error('invalid_request');
-                    const { requestId, text, sessionId, model, agent } = request;
+                    const { requestId, text, sessionId, model, agent, whenBusy } = request;
                     return invokeAgentTurn(MINIAPP_AGENT_RUN, requestId, {
                         text,
                         ...(sessionId !== undefined ? { sessionId } : {}),
                         ...(model ? { model } : {}),
                         ...(agent !== undefined ? { agent } : {}),
+                        ...(whenBusy !== undefined ? { whenBusy } : {}),
                     }, options);
                 },
                 // AbortSignal cannot cross contextBridge, so cancellation is an explicit id-based call.
@@ -221,10 +417,63 @@ if (process.isMainFrame) {
                         throw new Error('invalid_request');
                     return invokeAgentCall(MINIAPP_AGENT_CREATE, request, parseMiniAppAgentCreateResult);
                 },
+                // Need `session.read` for anything but this Mini App's own sessions.
+                observe: observeAgent,
+                sessions: listAgentSessions,
+                session: getAgentSession,
+            },
+            // Only `request`: listing and calling tools is Node `context.tool`.
+            tool: {
+                async request(names) {
+                    // Like Chrome's permissions.request(): only inside a user gesture.
+                    if (windowGlobal.navigator?.userActivation?.isActive !== true) {
+                        throw new Error('invalid_request');
+                    }
+                    if (!Array.isArray(names) ||
+                        names.length === 0 ||
+                        names.length > MINIAPP_TOOL_REQUEST_MAX_NAMES ||
+                        !names.every((name) => typeof name === 'string')) {
+                        throw new Error('invalid_request');
+                    }
+                    let response;
+                    try {
+                        response = await ipcRenderer.invoke(MINIAPP_TOOL_REQUEST, { names: [...names] });
+                    }
+                    catch {
+                        throw new Error('result_unknown');
+                    }
+                    return readToolRequestResponse(response);
+                },
             },
             window: createMiniAppWindowHandle(surfaceId),
+            // Requires `deviceAccess: ["microphone"]` and that switch on; Main decides per call.
+            speech: {
+                transcribe(input, options) {
+                    return transcribeSpeech(input, options);
+                },
+            },
+            // Fixed per Host version; answers nothing about this Mini App's manifest or grants.
+            capabilities: {
+                has(name) {
+                    return typeof name === 'string' && hasMiniAppHostCapability(name);
+                },
+            },
         },
     });
+}
+/** The page only gets the permission map or the failure code; never Host detail. */
+function readToolRequestResponse(response) {
+    const value = (response ?? {});
+    if (value.success === false && typeof value.code === 'string')
+        throw new Error(value.code);
+    const permissions = value.permissions;
+    if (value.success !== true ||
+        !permissions ||
+        typeof permissions !== 'object' ||
+        !Object.values(permissions).every((verdict) => TOOL_PERMISSIONS.has(verdict))) {
+        throw new Error('result_unknown');
+    }
+    return { ...permissions };
 }
 /**
  * `window.mcode.miniapp.window` (proposed — see

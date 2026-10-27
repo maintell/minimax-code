@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { createMiniAppToolGateway } from './tool-gateway.js';
 import { initializeMiniAppSupervisor, } from './initialize.js';
 export function resolveRuntimeMiniAppOptions(input) {
     if (input.runtimeOwnerKind !== undefined && input.runtimeOwnerKind !== 'electron') {
@@ -28,12 +29,16 @@ export function createDeferredRuntimeOwnersLifecycle() {
 /** Owns optional Supervisor initialization and ordered shutdown at the Host composition boundary. */
 export async function composeMiniAppRuntimeCapability(input) {
     let miniApp;
+    let miniAppTools;
     try {
         if (input.options) {
-            miniApp = initializeMiniAppSupervisor({
+            miniAppTools = composeMiniAppToolGateway(input);
+            const supervisor = initializeMiniAppSupervisor({
                 ...input.options,
                 db: input.db,
                 connectorGateway: input.plugin.hostConnectorGateway,
+                permissionSwitches: input.plugin.miniAppPermissionSwitches,
+                toolGateway: miniAppTools,
                 ...(input.agentGateway ? { agentGateway: input.agentGateway } : {}),
                 ...(input.logger ? { logger: input.logger } : {}),
                 verifyCandidate: (candidate) => input.plugin.verifyMiniAppCandidate(candidate),
@@ -42,7 +47,11 @@ export async function composeMiniAppRuntimeCapability(input) {
                 resolvePluginDataDir: (pluginId) => join(input.dataDir, 'v2', 'plugin-data', 'liveboards', encodeURIComponent(pluginId)),
                 nowMs: input.nowMs,
             });
-            input.plugin.attachMiniAppPublication({ supervisor: miniApp });
+            miniApp = supervisor;
+            input.plugin.attachMiniAppPublication({
+                supervisor,
+                onRuntimeExit: (listener) => supervisor.onRuntimeExit(listener),
+            });
         }
     }
     catch (error) {
@@ -50,10 +59,29 @@ export async function composeMiniAppRuntimeCapability(input) {
         throw error;
     }
     return {
-        services: miniApp ? { miniApp } : {},
+        services: miniApp ? { miniApp, ...(miniAppTools ? { miniAppTools } : {}) } : {},
         ready: createCombinedReady(miniApp, input.readyOwners),
         close: createCombinedClose(input.closeOwners, miniApp),
     };
+}
+function composeMiniAppToolGateway(input) {
+    const { tools, logger } = input;
+    return createMiniAppToolGateway({
+        connectorGateway: input.plugin.hostConnectorGateway,
+        pluginMcp: input.plugin.miniAppPluginMcp,
+        ...(tools?.localMcp ? { localMcp: tools.localMcp } : {}),
+        ...(tools?.permissions ? { permissions: tools.permissions } : {}),
+        ...(tools?.approvals ? { approvals: tools.approvals } : {}),
+        // The same switches the Connector and Agent gateways read (`tool:call`).
+        permissionSwitches: input.plugin.miniAppPermissionSwitches,
+        audit: {
+            // Audit is log-only; a logger without `info` still records it as a warning.
+            record: (event) => {
+                const write = logger?.info ?? logger?.warn;
+                write?.call(logger, { ...event }, 'Mini App tool audit');
+            },
+        },
+    });
 }
 function createCombinedReady(miniApp, readyOwners) {
     let readyPromise;

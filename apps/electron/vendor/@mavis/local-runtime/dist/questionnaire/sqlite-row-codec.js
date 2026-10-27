@@ -1,12 +1,13 @@
+import { logger } from '../common/logger.js';
 export const QUESTIONNAIRE_ROW_SELECT = `
   request_id, session_id, agent_name, msg_id, origin_channel_context_json, request_json,
-  status, created_at, answered_at, reply_payload, injected_at, dismissed_at
+  status, created_at, answered_at, reply_payload, injected_at, dismissed_at, response_mode
 `;
 export const QUALIFIED_QUESTIONNAIRE_ROW_SELECT = `
   qr.request_id, qr.session_id, qr.agent_name, qr.msg_id, qr.origin_channel_context_json,
   qr.request_json,
   qr.status, qr.created_at, qr.answered_at, qr.reply_payload, qr.injected_at,
-  qr.dismissed_at
+  qr.dismissed_at, qr.response_mode
 `;
 export function toQuestionnaireRequestRecord(row) {
     const requestId = requireString(row.request_id, 'request_id');
@@ -39,6 +40,7 @@ export function toQuestionnaireRequestRecord(row) {
         }
     }
     const originChannelContext = parseQuestionnaireOriginChannelContext(row.origin_channel_context_json);
+    const responseMode = parseResponseMode(row.response_mode, requestId);
     return {
         requestId,
         sessionId,
@@ -46,6 +48,7 @@ export function toQuestionnaireRequestRecord(row) {
         ...(row.msg_id ? { msgId: row.msg_id } : {}),
         ...(originChannelContext ? { originChannelContext } : {}),
         request,
+        ...(responseMode ? { responseMode } : {}),
         status: isValidStatus(row.status) ? row.status : 'pending',
         createdAt: Number(row.created_at ?? 0),
         ...(typeof row.answered_at === 'number' ? { answeredAt: row.answered_at } : {}),
@@ -85,6 +88,19 @@ export function parseQuestionnaireOriginChannelContext(raw) {
     catch {
         return undefined;
     }
+}
+/**
+ * The column is written only by the runtime, so an unknown value means a
+ * newer or corrupted row. Treat it as legacy: the legacy lifecycle is the
+ * conservative one (it keeps every gate), and it is what older builds did.
+ */
+function parseResponseMode(value, requestId) {
+    if (value === 'sync' || value === 'async')
+        return value;
+    if (value !== null && value !== undefined) {
+        logger.warn({ requestId, rawResponseMode: String(value), reason: 'unknown_response_mode' }, 'Questionnaire row has an unknown response_mode; treating it as legacy');
+    }
+    return undefined;
 }
 function isValidStatus(value) {
     return (value === 'pending' ||

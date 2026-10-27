@@ -105,13 +105,53 @@ function diagnosticWarningMessage(pluginName, event, code) {
     const outcome = event === 'PreToolUse' || event === 'PermissionRequest' || event === 'PostToolUse'
         ? 'The tool execution and result were not changed by this Hook.'
         : 'The conversation continued without this Hook.';
+    const owner = describeHookOwner(pluginName);
     if (code === 'HOOK_INVALID_INPUT') {
-        return `A compatibility-limited Hook from Plugin "${pluginName}" was skipped during ${event}. ${outcome}`;
+        return `A compatibility-limited ${owner.subject} was skipped during ${event}. ${outcome}`;
     }
     if (code === 'HOOK_TIMEOUT') {
-        return `Plugin "${pluginName}" Hook timed out and was skipped during ${event}. ${outcome}`;
+        return `${owner.title} timed out and was skipped during ${event}. ${outcome}`;
     }
-    return `Plugin "${pluginName}" Hook could not complete and was skipped during ${event}. ${outcome}`;
+    return `${owner.title} could not complete and was skipped during ${event}. ${outcome}`;
+}
+/** Config-file hooks use host owner ids (`@user/...`, `@project/...`), never Plugin names. */
+function describeHookOwner(pluginName) {
+    if (pluginName.startsWith('@user/'))
+        return { title: 'A user Hook', subject: 'user Hook' };
+    if (pluginName.startsWith('@project/')) {
+        return { title: 'A project Hook', subject: 'project Hook' };
+    }
+    return { title: `Plugin "${pluginName}" Hook`, subject: `Hook from Plugin "${pluginName}"` };
+}
+let localConfigHookSource;
+/** Binds user/project config hooks; they are read once per turn after preflight. */
+export function configureLocalConfigHookSource(source) {
+    localConfigHookSource = source;
+}
+/** Fail-open: config hooks never prevent a turn from running. */
+export async function loadLocalConfigHooks(session) {
+    if (!localConfigHookSource || !session.workspaceDir)
+        return [];
+    try {
+        return await localConfigHookSource.load({
+            workspaceDir: session.workspaceDir,
+            ...(session.runLocation?.parentRepoDir
+                ? { parentRepoDir: session.runLocation.parentRepoDir }
+                : {}),
+            ...(session.isDefaultWorkspace ? { isDefaultWorkspace: true } : {}),
+        });
+    }
+    catch {
+        return [];
+    }
+}
+function localConfigHookOwnerNames() {
+    return localConfigHookSource?.enabledOwnerNames() ?? new Set();
+}
+/** SessionEnd keeps config owners alongside enabled Plugins. */
+function withConfigHookOwners(pluginNames) {
+    const owners = localConfigHookOwnerNames();
+    return owners.size ? new Set([...pluginNames, ...owners]) : pluginNames;
 }
 async function withWarningEmissionLane(reporter, emit) {
     let state = warningEmissionStates.get(reporter);
@@ -241,6 +281,7 @@ export function configureLocalPluginHookObservability(input) {
                             runtime: 'desktop',
                             event: event.event,
                             format: event.format,
+                            origin: event.origin,
                             outcome: event.outcome,
                         };
                         input.metrics?.counter('plugin_hook_handler_total', 1, labels);
@@ -263,7 +304,7 @@ export function configureLocalPluginHookObservability(input) {
     });
 }
 export function configureLocalPluginHookEnabledResolver(resolve) {
-    localPluginHookCoordinator.setEnabledPluginResolver(resolve);
+    localPluginHookCoordinator.setEnabledPluginResolver(() => withConfigHookOwners(resolve()));
 }
 export function configureLocalPluginHookSessionEndFence(fence) {
     localPluginHookCoordinator.setSessionEndFence(fence);
@@ -275,7 +316,7 @@ export function markNextLocalPluginHookSessionStart(sessionId, source) {
     localPluginHookCoordinator.markNextSessionStart(sessionId, source);
 }
 export async function endLocalPluginHookSession(sessionId, reason, enabledPluginNames) {
-    await localPluginHookCoordinator.endSession(sessionId, reason, undefined, enabledPluginNames);
+    await localPluginHookCoordinator.endSession(sessionId, reason, undefined, enabledPluginNames && withConfigHookOwners(enabledPluginNames));
 }
 export async function abortLocalPluginHookSessionTurn(sessionId, abortSession) {
     await settleWithin(Promise.allSettled(localPluginHookCoordinator
@@ -308,7 +349,7 @@ async function endAllAfterBoundedAbort(enabledPluginNames, abortSession) {
             .activeExecutionSessionIds()
             .map((sessionId) => abortSession(sessionId))), SESSION_END_DRAIN_BUDGET_MS);
     }
-    await localPluginHookCoordinator.endAllSessions('logout', undefined, enabledPluginNames);
+    await localPluginHookCoordinator.endAllSessions('logout', undefined, enabledPluginNames && withConfigHookOwners(enabledPluginNames));
 }
 async function settleWithin(value, timeoutMs) {
     let timer;

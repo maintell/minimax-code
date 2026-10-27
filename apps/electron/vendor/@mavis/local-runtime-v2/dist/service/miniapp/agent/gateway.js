@@ -1,11 +1,11 @@
 import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isMiniAppAgentPermissionDecision, MINIAPP_AGENT_MAX_TEXT_LENGTH, } from '@mavis/shared/miniapp-surface';
 import { detach } from '../../channel-system/settle.js';
-import { MINIAPP_AGENT_NAME, MINIAPP_AGENT_QUEUE_FACTOR, MiniAppAgentError, } from './contracts.js';
-import { readMiniAppAgentModelSelection } from './model-selection.js';
-const MAX_REQUEST_ID_LENGTH = 256;
-const AUDIT_MESSAGE = 'Mini App Agent run';
+import { MINIAPP_AGENT_MAX_STARTS_PER_MINUTE, MINIAPP_AGENT_RATE_PER_SLOT, MINIAPP_AGENT_RATE_WINDOW_MS, MINIAPP_AGENT_NAME, MiniAppAgentError, } from './contracts.js';
+import { invalidAnswer, invalidReply, invalidText, isId, readRequestedAgent, readRequestedModel, readWhenBusy, } from './gateway-input.js';
+import { bindSlot, createRunSlotPool, drain, hasFreeSlot, joinSlot, occupy, releasePool, releaseSlot, runningSlot, } from './run-slots.js';
+import { AUDIT_MESSAGE, BUSY_MESSAGES, READ_PERMISSION, RUN_PERMISSION, authorize, declares, errorName, isSwitchedOn, reject, unavailable, } from './gateway-admission.js';
+import { endObservers, getSession, listSessions, observe } from './gateway-reads.js';
 /**
  * Host-side admission for Mini App Agent runs: policy, per-plugin run slots with a bounded FIFO
  * of waiting calls, ownership, audit.
@@ -14,6 +14,8 @@ export function createMiniAppAgentGateway(options) {
     const state = {
         options,
         arenas: new Map(),
+        recentStartsMs: new Map(),
+        observers: new Map(),
         listeners: new Map(),
         panels: new Map(),
     };
@@ -23,10 +25,19 @@ export function createMiniAppAgentGateway(options) {
             state.ports = next;
             state.unsubscribeAsks = next.subscribePermissionAsks((ask) => forwardAsk(state, ask));
         },
+        bindPermissionSwitches(switches) {
+            state.unsubscribeSwitches?.();
+            state.switches = switches;
+            state.unsubscribeSwitches = switches.subscribe((change) => {
+                if (!change.enabled)
+                    onPermissionRevoked(state, change.pluginId, change.permission);
+            });
+        },
         registerArena: (arena) => registerArena(state, arena),
         async run(caller, input, runOptions = {}) {
             const requested = readRequestedModel(input.model);
             const agent = readRequestedAgent(input.agent, input.sessionId);
+            const whenBusy = readWhenBusy(input.whenBusy, input.sessionId);
             return startTurn(state, {
                 caller,
                 operation: 'run',
@@ -34,8 +45,9 @@ export function createMiniAppAgentGateway(options) {
                 runOptions,
                 ...requested.call,
                 ...agent.call,
-                start: (bound, turn) => bound.runTurn({ ...turn, text: input.text }),
-            }, invalidText(input.text) ?? requested.invalid ?? agent.invalid);
+                ...whenBusy.call,
+                start: (bound, turn) => bound.runTurn({ ...turn, text: input.text, ...whenBusy.call }),
+            }, invalidText(input.text) ?? requested.invalid ?? agent.invalid ?? whenBusy.invalid);
         },
         async answer(caller, input, runOptions = {}) {
             const requested = readRequestedModel(input.model);
@@ -53,6 +65,9 @@ export function createMiniAppAgentGateway(options) {
         create: (caller, input = {}) => createBoundSession(state, caller, input.agent),
         reply: (caller, input) => replyPermission(state, caller, input),
         open: (caller, input) => openSession(state, caller, input),
+        observe: (caller, input, observeOptions) => observe(state, caller, input, observeOptions),
+        sessions: (caller) => listSessions(state, caller),
+        session: (caller, input) => getSession(state, caller, input),
         panelOpened({ sessionId, hostSessionId }) {
             const hosts = state.panels.get(sessionId) ?? new Set();
             hosts.add(hostSessionId);
@@ -98,62 +113,59 @@ function canAnswer(state, rootSessionId) {
 function registerArena(state, arena) {
     const previous = state.arenas.get(arena.pluginId);
     if (previous)
-        releaseEntry(previous);
+        releaseArena(previous);
     const maxConcurrent = arena.policy.kind === 'allowlist' ? arena.policy.maxConcurrent : 0;
     const entry = {
+        ...createRunSlotPool(maxConcurrent),
         processGeneration: arena.processGeneration,
         policy: arena.policy,
-        maxConcurrent,
-        maxQueued: maxConcurrent * MINIAPP_AGENT_QUEUE_FACTOR,
-        inflight: new Set(),
-        runningSessions: new Set(),
-        queue: [],
+        observers: new Set(),
     };
     state.arenas.set(arena.pluginId, entry);
     return () => {
-        releaseEntry(entry);
+        releaseArena(entry);
         if (state.arenas.get(arena.pluginId) === entry)
             state.arenas.delete(arena.pluginId);
     };
 }
-/** Nothing waits on a released arena: queued calls are cancelled, in-flight runs aborted. */
-function releaseEntry(entry) {
-    for (const queued of entry.queue.splice(0))
-        queued.cancel();
-    for (const controller of entry.inflight)
+/** Nothing waits on a released arena: its run slots are released and its observers end. */
+function releaseArena(entry) {
+    releasePool(entry);
+    for (const controller of entry.observers)
         controller.abort();
 }
-function reject(state, caller, error, fields = {}) {
-    state.options.logger.warn({
-        pluginId: caller.pluginId,
-        processGeneration: caller.processGeneration,
-        source: caller.source,
-        phase: 'rejected',
-        errorCode: error.code,
-        ...fields,
-    }, AUDIT_MESSAGE);
-    return error;
-}
 /**
- * Fails closed until bound, then checks the caller's arena and its policy. A caller of an
- * older generation (its page `runId` is stale or the Node process restarted) is unavailable,
- * not refused: the current generation may run.
+ * The user switched a permission off. For `agent:session.run` the plugin's in-flight runs are
+ * aborted and its waiting calls refused; for `agent:session.read` its observers end (they
+ * resolve, like a cancel). The arena stays registered, so switching back on admits new calls
+ * without a restart.
  */
-function authorize(state, caller) {
-    if (!state.ports) {
-        throw new MiniAppAgentError('AGENT_UNAVAILABLE', 'Mini App Agent is not available');
+function onPermissionRevoked(state, pluginId, permission) {
+    if (permission === READ_PERMISSION) {
+        endObservers(state, pluginId, permission);
+        return;
     }
-    const arena = state.arenas.get(caller.pluginId);
-    const refused = (reason) => reject(state, caller, new MiniAppAgentError('NOT_PERMITTED', 'Mini App is not permitted to run the Agent'), { reason });
-    // No arena: never authorized, or retired / revoked.
+    if (permission !== RUN_PERMISSION)
+        return;
+    const arena = state.arenas.get(pluginId);
     if (!arena)
-        throw refused('no-arena');
-    if (!allowsRun(arena.policy))
-        throw refused('policy');
-    if (arena.processGeneration !== caller.processGeneration) {
-        throw reject(state, caller, new MiniAppAgentError('AGENT_UNAVAILABLE', 'Mini App Agent caller is out of date', true), { reason: 'generation-mismatch' });
+        return;
+    // An observer of the plugin's own session may rest on `session.run` alone.
+    if (!isSwitchedOn(state, pluginId, 'session.read') || !declares(arena.policy, 'session.read')) {
+        endObservers(state, pluginId, permission);
     }
-    return { bound: state.ports, arena };
+    const queued = arena.queue.splice(0);
+    for (const entry of queued)
+        entry.refuse();
+    for (const controller of arena.calls)
+        controller.abort();
+    state.options.logger.info({
+        pluginId,
+        processGeneration: arena.processGeneration,
+        permission,
+        aborted: arena.calls.size,
+        refused: queued.length,
+    }, 'Mini App Agent runs stopped by a permission switch');
 }
 function admit(state, call, invalid) {
     const { caller, sessionId } = call;
@@ -161,46 +173,73 @@ function admit(state, call, invalid) {
     if (invalid !== undefined) {
         throw reject(state, caller, new MiniAppAgentError('INVALID_ARGUMENTS', invalid));
     }
-    if (sessionId !== undefined && admitted.arena.runningSessions.has(sessionId)) {
+    if (sessionId !== undefined &&
+        call.whenBusy === undefined &&
+        admitted.arena.runningSessions.has(sessionId)) {
         throw busy(state, call, 'session_busy');
     }
     return admitted;
 }
+/**
+ * Caps how many turns one plugin may start per minute, counted when a slot is taken or a
+ * `whenBusy` call joins one (a call that only waited or was refused does not count), so a runaway
+ * page or Node loop cannot keep the Agent busy. The cap scales with `agentConcurrency`.
+ */
+function rateLimit(state, call, arena) {
+    const { pluginId } = call.caller;
+    const now = state.options.nowMs();
+    const starts = state.recentStartsMs.get(pluginId) ?? [];
+    let oldest = starts[0];
+    while (oldest !== undefined && now - oldest >= MINIAPP_AGENT_RATE_WINDOW_MS) {
+        starts.shift();
+        oldest = starts[0];
+    }
+    const limit = Math.max(MINIAPP_AGENT_MAX_STARTS_PER_MINUTE, MINIAPP_AGENT_RATE_PER_SLOT * arena.maxConcurrent);
+    if (starts.length >= limit)
+        throw busy(state, call, 'rate_limited');
+    starts.push(now);
+    state.recentStartsMs.set(pluginId, starts);
+}
 function busy(state, call, reason) {
-    const message = reason === 'session_busy'
-        ? 'Mini App Agent session is already running'
-        : 'Too many Mini App Agent runs are waiting';
+    const message = BUSY_MESSAGES[reason];
     return reject(state, call.caller, new MiniAppAgentError('BUSY', message, true, reason), {
         reason,
     });
 }
 /**
  * Admits a `run` / `answer` into a free slot, or queues it behind the calls already waiting so
- * runs start in strict FIFO order.
+ * runs start in strict FIFO order. A `whenBusy` call on a session holding a slot shares it.
  */
 async function startTurn(state, call, invalid) {
     const admitted = admit(state, call, invalid);
     const { arena } = admitted;
-    const slot = arena.inflight.size < arena.maxConcurrent && arena.queue.length === 0
-        ? occupy(arena, call.sessionId)
-        : await enqueue(state, arena, call);
+    const running = runningSlot(arena, call.sessionId);
+    let slot;
+    if (running)
+        slot = joinOrBusy(state, arena, call, { session: running });
+    else if (hasFreeSlot(arena))
+        slot = takeSlot(state, arena, call);
+    else
+        slot = await enqueue(state, arena, call);
     return execute(state, admitted, call, slot);
 }
-function occupy(arena, sessionId, queuedAt) {
-    const controller = new AbortController();
-    arena.inflight.add(controller);
-    if (sessionId !== undefined)
-        arena.runningSessions.add(sessionId);
-    return { controller, ...(queuedAt === undefined ? {} : { queuedAt }) };
+/** Takes a free run slot; the per-minute cap is charged here, so only turns that start count. */
+function takeSlot(state, arena, call, queuedAt) {
+    rateLimit(state, call, arena);
+    return occupy(arena, call.sessionId, queuedAt);
 }
-/** Hands each free slot to the oldest waiting call; a refused call leaves the slot to the next. */
-function drain(arena) {
-    while (arena.inflight.size < arena.maxConcurrent) {
-        const next = arena.queue.shift();
-        if (!next)
-            return;
-        next.dequeue();
-    }
+/**
+ * A `whenBusy` call shares its session's slot unless too many joined calls are in flight; joining
+ * is charged to the per-minute cap like taking a slot.
+ */
+function joinOrBusy(state, arena, call, target) {
+    if (arena.joined >= arena.maxQueued)
+        throw busy(state, call, 'queue_full');
+    rateLimit(state, call, arena);
+    const slot = joinSlot(arena, target.session, target.queuedAt);
+    if (!slot)
+        throw busy(state, call, 'queue_full');
+    return slot;
 }
 /**
  * Waits for a slot. The slot is taken synchronously in `drain`, so no later call can overtake;
@@ -219,17 +258,20 @@ function enqueue(state, arena, call) {
         const entry = {
             dequeue() {
                 leave();
-                const { sessionId } = call;
-                // An earlier waiting call for the same session started first.
-                if (sessionId !== undefined && arena.runningSessions.has(sessionId)) {
-                    rejectWait(busy(state, call, 'session_busy'));
-                    return;
+                try {
+                    resolve(takeDequeuedSlot(state, arena, call, position));
                 }
-                resolve(occupy(arena, sessionId, position));
+                catch (error) {
+                    rejectWait(error);
+                }
             },
             cancel() {
                 leave();
                 rejectWait(cancelledWhileQueued(state, call));
+            },
+            refuse() {
+                leave();
+                rejectWait(reject(state, call.caller, new MiniAppAgentError('NOT_PERMITTED', 'Mini App is not permitted to run the Agent'), { reason: 'switched-off', stage: 'queue', operation: call.operation }));
             },
         };
         const onAbort = () => {
@@ -243,6 +285,18 @@ function enqueue(state, arena, call) {
         arena.queue.push(entry);
         notifyQueued(state, call, position);
     });
+}
+/**
+ * A dequeued call takes the free slot, or joins its session's when an earlier call for that
+ * session started meanwhile (only with `whenBusy`; otherwise it is `BUSY`).
+ */
+function takeDequeuedSlot(state, arena, call, position) {
+    const running = runningSlot(arena, call.sessionId);
+    if (!running)
+        return takeSlot(state, arena, call, position);
+    if (call.whenBusy === undefined)
+        throw busy(state, call, 'session_busy');
+    return joinOrBusy(state, arena, call, { session: running, queuedAt: position });
 }
 function cancelledWhileQueued(state, call) {
     return reject(state, call.caller, new MiniAppAgentError('REQUEST_CANCELLED', 'Mini App Agent run was cancelled'), {
@@ -280,6 +334,31 @@ function listen(state, sessionId, onEvent) {
             if (state.listeners.get(sessionId) === listener)
                 state.listeners.delete(sessionId);
         },
+    };
+}
+/**
+ * The events a call's turn reports to its caller. A call without `whenBusy` answers the session's
+ * asks from the start; a `whenBusy` call only once its own text opened a turn (`onOwnTurn`), so
+ * text steered into another call's turn never takes that turn's asks.
+ */
+function followTurn(state, sessionId, call) {
+    const { onEvent } = call.runOptions;
+    if (call.whenBusy === undefined) {
+        const listener = listen(state, sessionId, onEvent);
+        return {
+            turn: listener.onEvent ? { onEvent: listener.onEvent } : {},
+            dispose: listener.dispose,
+        };
+    }
+    let listener;
+    return {
+        turn: {
+            ...(onEvent ? { onEvent: (event) => (listener?.onEvent ?? onEvent)(event) } : {}),
+            onOwnTurn: () => {
+                listener ??= listen(state, sessionId, onEvent);
+            },
+        },
+        dispose: () => listener?.dispose(),
     };
 }
 /**
@@ -341,9 +420,8 @@ function deliverAsk(state, listener, ask) {
 async function execute(state, admitted, call, slot) {
     const { bound, arena } = admitted;
     const { runOptions } = call;
-    const { controller, queuedAt } = slot;
-    let runningSessionId = call.sessionId;
-    let listener;
+    const { controller, queuedAt, joined } = slot;
+    let events;
     const signal = runOptions.signal
         ? AbortSignal.any([controller.signal, runOptions.signal])
         : controller.signal;
@@ -351,10 +429,8 @@ async function execute(state, admitted, call, slot) {
         // Before the session exists: an unusable model must not leave a new session behind.
         const requested = await resolveRequestedModel(state, bound, call);
         const { sessionId, agentName, model } = await resolveSession(state, bound, call, requested);
-        if (runningSessionId === undefined) {
-            runningSessionId = sessionId;
-            arena.runningSessions.add(sessionId);
-        }
+        if (slot.session.sessionId === undefined)
+            bindSlot(arena, slot.session, sessionId);
         if (signal.aborted) {
             // The session may be new and hidden; leave a trace of it with the cancel.
             throw reject(state, call.caller, new MiniAppAgentError('REQUEST_CANCELLED', 'Mini App Agent run was cancelled'), {
@@ -368,16 +444,31 @@ async function execute(state, admitted, call, slot) {
         if (call.sessionId !== undefined) {
             await saveSessionModel(state, bound, call, { sessionId, model: requested });
         }
-        listener = listen(state, sessionId, runOptions.onEvent);
-        const turn = { sessionId, signal, ...(listener.onEvent ? { onEvent: listener.onEvent } : {}) };
-        return await dispatch(state, call, { sessionId, agentName, model: requested ?? model, queuedAt }, () => call.start(bound, turn));
+        events = followTurn(state, sessionId, call);
+        const turn = {
+            sessionId,
+            signal,
+            ...events.turn,
+            beforeDelivery: () => confirmDelivery(state, call.caller, signal),
+        };
+        return await dispatch(state, call, { sessionId, agentName, model: requested ?? model, queuedAt, joined }, () => call.start(bound, turn));
     }
     finally {
-        listener?.dispose();
-        arena.inflight.delete(controller);
-        if (runningSessionId !== undefined)
-            arena.runningSessions.delete(runningSessionId);
+        events?.dispose();
+        releaseSlot(arena, slot);
         drain(arena);
+    }
+}
+/**
+ * The call was admitted before its lookups; a switch turned off or a cancel since then must stop
+ * the text before it reaches a turn.
+ */
+function confirmDelivery(state, caller, signal) {
+    if (!(state.switches?.isEnabled(caller.pluginId, RUN_PERMISSION) ?? true)) {
+        throw new MiniAppAgentError('NOT_PERMITTED', 'Mini App is not permitted to run the Agent');
+    }
+    if (signal.aborted) {
+        throw new MiniAppAgentError('REQUEST_CANCELLED', 'Mini App Agent run was cancelled');
     }
 }
 /**
@@ -423,8 +514,8 @@ function modelFailure(state, call, error, context) {
 }
 async function dispatch(state, call, admission, start) {
     const { options } = state;
-    const { caller } = call;
-    const { sessionId, agentName, model, queuedAt } = admission;
+    const { caller, whenBusy } = call;
+    const { sessionId, agentName, model, queuedAt, joined } = admission;
     const startedAtMs = options.nowMs();
     const audit = {
         pluginId: caller.pluginId,
@@ -440,6 +531,8 @@ async function dispatch(state, call, admission, start) {
         ...(agentName ? { agentName } : {}),
         ...(model ? { model: `${model.providerId}/${model.modelId}` } : {}),
         ...(queuedAt === undefined ? {} : { queued: true, position: queuedAt }),
+        ...(whenBusy ? { whenBusy } : {}),
+        ...(joined ? { joined: true } : {}),
     }, AUDIT_MESSAGE);
     try {
         const result = await start();
@@ -711,63 +804,5 @@ async function isDirectory(path) {
     catch {
         return false;
     }
-}
-function unavailable(state, caller, error, context) {
-    // Every caller fails before a turn is dispatched, so the request can be retried as a whole.
-    return reject(state, caller, new MiniAppAgentError('AGENT_UNAVAILABLE', 'Mini App Agent session is unavailable', true), { ...context, errorName: errorName(error) });
-}
-function errorName(error) {
-    return error instanceof Error ? error.name : typeof error;
-}
-function allowsRun(policy) {
-    return policy.kind === 'allowlist' && policy.capabilities.includes('session.run');
-}
-function invalidText(text) {
-    return typeof text === 'string' && text.trim() && text.length <= MINIAPP_AGENT_MAX_TEXT_LENGTH
-        ? undefined
-        : 'Mini App Agent text must be non-empty and bounded';
-}
-/** `model` is optional; once given, it must have the contract shape (availability is checked later). */
-function readRequestedModel(value) {
-    if (value === undefined)
-        return { call: {} };
-    const model = readMiniAppAgentModelSelection(value);
-    return model
-        ? { call: { model } }
-        : {
-            call: {},
-            invalid: 'Mini App Agent model must be { providerId, modelId, variant?, thinking?: { effort } }',
-        };
-}
-/**
- * `agent` is optional and only chooses the agent of a session that is being created; once given it
- * must be a non-empty string (that it names an offered agent is checked later).
- */
-function readRequestedAgent(value, sessionId) {
-    if (value === undefined)
-        return { call: {} };
-    if (sessionId !== undefined) {
-        return { call: {}, invalid: 'Mini App Agent agent can only be chosen when creating a session' };
-    }
-    return typeof value === 'string' && value.trim()
-        ? { call: { agent: value } }
-        : { call: {}, invalid: 'Mini App Agent agent must be a non-empty agent name' };
-}
-function invalidAnswer(input) {
-    if (!isId(input.sessionId) || !isId(input.requestId) || !Array.isArray(input.answers)) {
-        return 'Mini App Agent answer needs a sessionId, a requestId and an answers list';
-    }
-    return undefined;
-}
-function invalidReply(input) {
-    if (!isId(input.sessionId) || !isId(input.requestId)) {
-        return 'Mini App Agent reply needs a sessionId and a requestId';
-    }
-    return isMiniAppAgentPermissionDecision(input.decision)
-        ? undefined
-        : 'Mini App Agent reply decision must be allowOnce or deny';
-}
-function isId(value) {
-    return typeof value === 'string' && value.length > 0 && value.length <= MAX_REQUEST_ID_LENGTH;
 }
 //# sourceMappingURL=gateway.js.map

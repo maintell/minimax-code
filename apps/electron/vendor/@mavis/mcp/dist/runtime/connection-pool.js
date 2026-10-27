@@ -26,12 +26,34 @@
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ErrorCode, ListRootsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { createTransport } from './transport/factory.js';
 import { MCP_DEFAULTS, NOOP_MCP_RUNTIME_LOGGER, } from './types.js';
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
 const IDLE_CHECK_INTERVAL_MS = 60_000;
 const STDERR_BUFFER_SAFETY_VALVE = 64 * 1024;
+/**
+ * The call provably never reached the server (aborted before or while waiting for a permit).
+ * Callers decide "safe to retry" with `instanceof`, never by matching the message.
+ */
+export class McpToolCallNotDispatchedError extends Error {
+    constructor(serverName, toolName) {
+        super(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+        this.name = 'McpToolCallNotDispatchedError';
+    }
+}
+/**
+ * The call was dispatched and the server did not answer within its timeout (the pool's own bound
+ * or the SDK request timeout), while the caller's signal was not aborted. The tool may have run.
+ */
+export class McpToolCallTimeoutError extends Error {
+    timeoutMs;
+    constructor(serverName, toolName, timeoutMs) {
+        super(`MCP tool call failed: MCP tool call "${toolName}" on "${serverName}" timed out after ${timeoutMs}ms`);
+        this.timeoutMs = timeoutMs;
+        this.name = 'McpToolCallTimeoutError';
+    }
+}
 class Semaphore {
     max;
     // Each waiter holds its own resolve/reject pair so `acquire(signal)` can
@@ -196,7 +218,7 @@ export class McpConnectionPool {
         // would otherwise sit until an in-flight callTool releases it — turning an
         // "immediate cancel" into "wait for the head of the queue to finish".
         if (options?.signal?.aborted) {
-            throw new Error(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+            throw new McpToolCallNotDispatchedError(serverName, toolName);
         }
         // Abortable acquire: while queued behind an in-flight long-running call
         // (e.g. `image_synthesize`), an abort on `options.signal` splices this
@@ -212,7 +234,7 @@ export class McpConnectionPool {
             // Normalise to the same wire-shape as the other pre-dispatch aborts so
             // callers see a consistent "aborted before dispatch" surface regardless
             // of whether the abort landed on the pre-check or on the queue splice.
-            throw new Error(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+            throw new McpToolCallNotDispatchedError(serverName, toolName);
         }
         // Metrics cover DISPATCHED calls only (permit acquired): the pre-acquire
         // abort short-circuits above never reached a connection and are pure
@@ -223,7 +245,7 @@ export class McpConnectionPool {
         const startMs = Date.now();
         try {
             if (options?.signal?.aborted) {
-                throw new Error(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+                throw new McpToolCallNotDispatchedError(serverName, toolName);
             }
             const conn = await this.ensureConnection(serverName, connectionKey, tokenOverrides);
             conn.lastUsed = Date.now();
@@ -257,6 +279,9 @@ export class McpConnectionPool {
                 return shaped;
             }
             catch (err) {
+                if (!options?.signal?.aborted && isToolCallTimeout(err)) {
+                    throw new McpToolCallTimeoutError(serverName, toolName, timeoutMs);
+                }
                 throw new Error(`MCP tool call failed: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
@@ -750,12 +775,19 @@ async function closeConnectionSafely(connection, logger, serverName) {
         });
     }
 }
+/** Raised by `withTimeout` when the pool's own bound fires. */
+class PoolTimeoutError extends Error {
+}
+function isToolCallTimeout(error) {
+    return (error instanceof PoolTimeoutError ||
+        (error instanceof McpError && error.code === ErrorCode.RequestTimeout));
+}
 function withTimeout(promise, ms, message) {
     if (ms <= 0 || !Number.isFinite(ms))
         return promise;
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-            reject(new Error(message));
+            reject(new PoolTimeoutError(message));
         }, ms);
         promise.then((value) => {
             clearTimeout(timer);

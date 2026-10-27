@@ -22,12 +22,13 @@
  */
 export { CONTINUATION_STATUSES, THREAD_GOAL_STATUSES, THREAD_GOAL_STATUS_REASONS, THREAD_GOAL_WAIT_REASONS, THREAD_GOAL_VERIFICATIONS, TERMINAL_STATUSES, isContinuationStatus, isTerminalStatus, validateThreadGoalObjective, } from './types.js';
 export { ThreadGoalAlreadyExistsError, ThreadGoalBudgetLimitedError, ThreadGoalEpochConflictError, ThreadGoalObjectiveConflictError, ThreadGoalStatusConflictError, ThreadGoalTokenBudgetExhaustedError, } from './store-port.js';
+export { THREAD_GOAL_AUTO_RECOVERABLE_USAGE_REASON, THREAD_GOAL_USAGE_RECOVERY_MAX_HORIZON_MS, isAwaitingUsageRecovery, normalizeUsageRecoveryAtMs, usageRecoveryDelayMs, } from './usage-recovery.js';
 export { DEFAULT_GOAL_CONTINUATION_TEMPLATE, DEFAULT_GOAL_RECOVERY_TEMPLATE, DEFAULT_GOAL_RECOVERY_TERMINAL_AUDIT_TEMPLATE, DEFAULT_GOAL_TERMINAL_AUDIT_TEMPLATE, renderKickoffPrompt, renderContinuationPrompt, renderNudgePrompt, renderRecoveryPrompt, renderRecoveryTerminalAuditPrompt, renderTerminalAuditPrompt, } from './continuation.js';
 export { DEFAULT_OBJECTIVE_UPDATED_TEMPLATE, renderObjectiveUpdatedPrompt, } from './objective-updated.js';
 export { DEFAULT_BUDGET_LIMIT_TEMPLATE, renderBudgetLimitPrompt } from './budget-limit.js';
-export { DEFAULT_GOAL_COMPLETION_SUMMARY_TEMPLATE, renderCompletionSummaryPrompt, } from './completion-summary.js';
-export { fingerprintThreadGoalReply } from './reply-fingerprint.js';
+export { compareThreadGoalReplyFingerprints, fingerprintThreadGoalReply, fingerprintThreadGoalToolCall, } from './reply-fingerprint.js';
 export { digestThreadGoalObjective } from './objective-digest.js';
+export { THREAD_GOAL_KICKOFF_ORIGIN_TYPE, THREAD_GOAL_KICKOFF_PREFIX, isThreadGoalKickoffQueueItem, readThreadGoalKickoffOriginRecord, } from './kickoff-identity.js';
 export { boundVerificationTranscript, } from './verification/transcript-window.js';
 export { assembleVerificationEvidence, MAX_EVALUATOR_TAIL_CHARS, MAX_EVALUATOR_TAIL_MESSAGES, MAX_SUBAGENT_VERIFICATION_PROMPT_CHARS, MAX_TRANSCRIPT_FALLBACK_CHARS, MAX_TRANSCRIPT_FALLBACK_MESSAGES, MAX_VERIFICATION_BRIEF_CHARS, } from './verification/evidence-brief.js';
 export { VerificationDispatchError } from './verification/verifier-port.js';
@@ -37,5 +38,6 @@ export { verificationModeForRoute } from './verification/verification-policy.js'
 export { INTERNAL_CONTEXT_OPEN_PREFIX, INTERNAL_CONTEXT_CLOSE_TAG, wrapInternalContext, isInternalContextMessage, } from './internal-context-fragment.js';
 export { CreateGoalToolDef, UpdateGoalToolDef, GetGoalToolDef, hasUpdateGoalTokenBudgetIntent, resolveUpdateGoalMode, } from './tool-defs.js';
 export { CreateGoalTool, UpdateGoalTool, GetGoalTool } from './tool-impls.js';
-export { GOAL_COMPLETION_TOOL_REFUSAL, GOAL_FINAL_REPLY_INSTRUCTION, GOAL_FINAL_REPLY_RETRY_PROMPT, GOAL_FINAL_REPLY_RETRY_REASON, createGoalFinalReplyGate, isAcceptedGoalCompletionResult, } from './final-reply.js';
+export { GOAL_BUDGET_WRAP_UP_INSTRUCTION, GOAL_TOKEN_BUDGET_WRAP_UP_INSTRUCTION, GOAL_COMPLETION_TOOL_REFUSAL, GOAL_FINAL_REPLY_INSTRUCTION, GOAL_FINAL_REPLY_RETRY_PROMPT, GOAL_FINAL_REPLY_RETRY_REASON, createGoalFinalReplyGate, isAcceptedGoalCompletionResult, } from './final-reply.js';
+export { isVerificationInterruptedReason, renderVerificationInterruptedNotice, } from './verification-interrupted.js';
 //# sourceMappingURL=index.js.map

@@ -1,10 +1,11 @@
 import path from 'node:path';
-import { validateMiniAppSurfaceWindow } from '@mavis/shared/miniapp-surface';
+import { MINIAPP_DEVICE_ACCESS_ITEMS, isMiniAppAgentAccess, isMiniAppDeviceAccessItem, validateMiniAppSurfaceWindow, } from '@mavis/shared/miniapp-surface';
 import { MINIAPP_AGENT_MAX_CONCURRENCY } from '../../../../miniapp/index.js';
 import { isRecord, resolvePluginDirectory, resolvePluginFile, } from '../filesystem.js';
 import { validatePluginPortablePath } from '../package-contract.js';
 import { PluginReaderError, readerFail } from '../reader-errors.js';
 import { isMiniAppRuntimePayloadExcludedPath, isPathCoveredByRoots } from './path.js';
+import { parseMcodeEngineRequirement } from './engines.js';
 const MINIAPP_FIELDS = new Set([
     'schemaVersion',
     'artifacts',
@@ -14,16 +15,24 @@ const MINIAPP_FIELDS = new Set([
     'hostConnectorAccess',
     'agentAccess',
     'agentConcurrency',
+    'engines',
+    'toolAccess',
+    'deviceAccess',
 ]);
 const ARTIFACT_FIELDS = new Set(['client', 'node']);
 const PROCESS_RUNTIME_FIELDS = new Set(['kind', 'entry', 'lifecycle']);
 const SURFACE_FIELDS = new Set(['path', 'window']);
 const MCP_ENDPOINT_FIELDS = new Set(['server', 'path']);
 const HOST_CONNECTOR_ACCESS_FIELDS = new Set(['providers']);
+const ENGINES_FIELDS = new Set(['mcode']);
 const CONNECTOR_PROVIDER = /^[a-z0-9_-]{1,64}$/u;
 const MCP_SERVER = /^[a-zA-Z0-9_-]{1,128}$/u;
 export async function readMiniAppManifest(root, value, mcpServerNames, payloadDirectory) {
-    if (hasUnknownField(value, MINIAPP_FIELDS) || value.schemaVersion !== 1) {
+    const unsupported = Object.keys(value).filter((key) => !MINIAPP_FIELDS.has(key));
+    if (unsupported.length > 0) {
+        miniAppFail('MANIFEST_FIELD_UNSUPPORTED', `Mini App manifest field(s) not supported by this MCode version: ${unsupported.sort().join(', ')}. Update MCode or remove the field.`);
+    }
+    if (value.schemaVersion !== 1) {
         miniAppFail('MANIFEST_SCHEMA_INVALID', 'Mini App manifest must use strict schemaVersion 1');
     }
     const artifacts = await readArtifacts(root, value.artifacts, payloadDirectory);
@@ -33,6 +42,9 @@ export async function readMiniAppManifest(root, value, mcpServerNames, payloadDi
     const hostConnectorAccess = readHostConnectorAccess(value.hostConnectorAccess);
     const agentAccess = readAgentAccess(value.agentAccess);
     const agentConcurrency = readAgentConcurrency(value.agentConcurrency);
+    const engines = readEngines(value.engines);
+    const toolAccess = readToolAccess(value.toolAccess);
+    const deviceAccess = readDeviceAccess(value.deviceAccess);
     return {
         artifacts,
         runtime,
@@ -41,6 +53,9 @@ export async function readMiniAppManifest(root, value, mcpServerNames, payloadDi
         ...(hostConnectorAccess ? { hostConnectorAccess } : {}),
         ...(agentAccess ? { agentAccess } : {}),
         ...(agentConcurrency === undefined ? {} : { agentConcurrency }),
+        ...(engines ? { engines } : {}),
+        ...(toolAccess ? { toolAccess } : {}),
+        ...(deviceAccess ? { deviceAccess } : {}),
     };
 }
 async function readArtifacts(root, value, payloadDirectory) {
@@ -166,8 +181,8 @@ function readHostConnectorAccess(value) {
 function readAgentAccess(value) {
     if (value === undefined)
         return undefined;
-    if (!Array.isArray(value) || value.some((capability) => capability !== 'session.run')) {
-        miniAppFail('AGENT_ACCESS_INVALID', 'agentAccess may only contain session.run');
+    if (!Array.isArray(value) || !value.every(isMiniAppAgentAccess)) {
+        miniAppFail('AGENT_ACCESS_INVALID', 'agentAccess may only contain session.run and session.read');
     }
     return [...new Set(value)];
 }
@@ -182,6 +197,35 @@ function readAgentConcurrency(value) {
         miniAppFail('AGENT_CONCURRENCY_INVALID', `agentConcurrency must be an integer from 1 to ${MINIAPP_AGENT_MAX_CONCURRENCY}`);
     }
     return value;
+}
+function readEngines(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value) ||
+        hasUnknownField(value, ENGINES_FIELDS) ||
+        typeof value.mcode !== 'string' ||
+        parseMcodeEngineRequirement(value.mcode) === undefined) {
+        miniAppFail('ENGINES_INVALID', 'engines.mcode must be ">=MAJOR.MINOR.PATCH"');
+    }
+    return { mcode: value.mcode.trim() };
+}
+/** `toolAccess` grants one ability, like `agentAccess`; which tools may run is the Host's rules. */
+function readToolAccess(value) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value) || value.some((capability) => capability !== 'call')) {
+        miniAppFail('TOOL_ACCESS_INVALID', 'toolAccess may only contain call');
+    }
+    return [...new Set(value)];
+}
+/** `deviceAccess` lists the device permissions the page may hold, each a user switch. */
+function readDeviceAccess(value) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value) || !value.every(isMiniAppDeviceAccessItem)) {
+        miniAppFail('DEVICE_ACCESS_INVALID', `deviceAccess may only contain ${MINIAPP_DEVICE_ACCESS_ITEMS.join(', ')}`);
+    }
+    return [...new Set(value)];
 }
 async function resolveFileOrDirectory(root, relativePath) {
     try {

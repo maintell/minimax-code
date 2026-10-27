@@ -98,6 +98,12 @@ export class SessionController extends SessionControllerBase {
     async abortSession(ctx, req) {
         return this.requireConversation().abortSession(ctx, req);
     }
+    async cancelPromptSuggestion(ctx, req) {
+        return this.requireConversation().cancelPromptSuggestion(ctx, req);
+    }
+    async getPromptSuggestion(ctx, req) {
+        return this.requireConversation().getPromptSuggestion(ctx, req);
+    }
     async steerSession(ctx, req) {
         return this.requireConversation().steerSession(ctx, req);
     }

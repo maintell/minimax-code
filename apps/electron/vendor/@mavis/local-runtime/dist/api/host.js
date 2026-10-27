@@ -1,6 +1,5 @@
-import { createDeferredPluginHookPermissionCapability, } from '@mavis/permission';
 import { CloudSessionReader, managedBackendRoutingHeaders, resolveLocalBashShell, } from '@mavis/agent-tools/desktop';
-import { closeLocalBackgroundTaskDelivery } from '../background-task/delivery.js';
+import { createDeferredPluginHookPermissionCapability, } from '@mavis/permission';
 import { join } from 'node:path';
 import { getConfig } from '@mavis/config';
 import { resolveBuiltinReviewPromptDir } from '../review/preparation.js';
@@ -16,12 +15,6 @@ import { LocalDynamicMaxTokensState } from '../runtime/dynamic-max-tokens.js';
 import { LocalBashCompletionCorrelation, } from '../runtime/bash-completion-correlation.js';
 import { createLocalFileApiGitChangesCoordinator, routeLocalFileApi } from '../files/api.js';
 import { readBooleanSearchParam } from './host-agent-paging.js';
-import { LocalThreadGoalIntegration, } from '../thread-goal/host-integration.js';
-import { createThreadGoalEvalEventSink } from '../thread-goal/eval-observability.js';
-import { isGoalVerifierChildSession } from '../thread-goal/verifier-session.js';
-import { LocalThreadGoalKickoffQueue } from '../thread-goal/kickoff-host.js';
-import { createLocalGoalVerifierExecution, } from '../thread-goal/verifier-execution.js';
-import { threadGoalContinuationClientRequestId, } from '../thread-goal/kickoff.js';
 import { routeLocalConfigApi } from './routes/config.js';
 import { routeLocalModelApi } from './routes/models.js';
 import { routeLocalWebsiteSettingsApi } from './routes/website-settings.js';
@@ -33,15 +26,13 @@ import { buildDesktopServiceHandler as buildDesktopHandler } from './desktop-ser
 import { buildMavisSessionAdapter } from '../runtime/mavis-tool-adapters.js';
 import { createSessionSendWaitGraph, } from '../runtime/mavis-session-send-wait-graph.js';
 import { createFailClosedAgentRuntimePort, createLocalMavisAgentAdapter, } from '../agent/runtime-port.js';
-import { LocalQuestionnaireService, } from '../questionnaire/service.js';
 import { startQuestionnaireRecovery } from '../questionnaire/recovery.js';
 import { isLocalRuntimeStartupExecutionEnabled } from '../runtime/startup-execution-policy.js';
 import { SqliteQuestionnaireRequestStore } from '../questionnaire/sqlite-questionnaire-request-store.js';
-import { QuestionnaireAutoReplyScheduler } from '../questionnaire/auto-reply-scheduler.js';
 import { copyPendingQuestionnaireForFork as copyPendingQuestionnaire, } from '../questionnaire/fork.js';
+import { reopenQuestionnaireAfterSafetyRecall as reopenQuestionnaire, } from '../questionnaire/reopen.js';
 import { LocalHookService } from '../hooks/api.js';
 import { LocalBrowserBroker, routeLocalBrowserApi } from '../browser/api.js';
-import { createLocalBackgroundTaskService } from '../background-task/index.js';
 import { createDeferredContentSafetyCapability, } from '@mavis/shared/local-runtime-safety';
 import { createLLMFailureReportHook } from '../error-reporting/index.js';
 import { routeLocalContentSafetyApi } from '../content-safety/route.js';
@@ -74,21 +65,19 @@ import { requestConversationCompaction } from './routes/compaction.js';
 import { deliverQuestionnaireAskToChannel as deliverQuestionnaireAskToChannelHelper } from './host-questionnaire-delivery.js';
 import { routeLocalMatrixApi } from '../matrix/index.js';
 import { splitPath, json, notFound, readJsonBody, makeId, readLocalPermissionMode, routeDiagnosticsApi, } from './host-helpers.js';
-import { observeSteerCompletion } from './conversation-steer.js';
 import { mayHaveSetAcceptEditsMode } from './host-model-helpers.js';
 import { isReadOnlyLegacySession, markMigratedLegacySessionDeleted, } from './host-legacy-helpers.js';
 import { LocalApiAgentRoutes } from './routes/agents.js';
 import { buildLocalLegacyMigrationCheck, buildLegacyRuntimeUnavailableResponse, buildLocalRuntimeStatus, buildRuntimeDoctorSnapshot, dispatchLocalTeamTask, formatUnknownError, makeRuntimeOwnerId, routeLocalRuntimeCronApi, resolveDefaultLocalWorkspaceDir, resolveLocalTeamTaskAgentName, } from './host-support.js';
 import { resolveLocalApiHostEntryPath, resolveStrictMavisApiPath, routeLocalRuntimeRequest, } from './host-routing.js';
 import { buildLocalTurnToolSourcesForHost, } from './host-turn-tools.js';
+import { runForegroundLocalTask } from './local-task-runner.js';
 import { createHostedCapabilities, isCliRestrictedRuntime, } from './hosted-agent-capability-factory.js';
 import { handleMemoryBusEvent } from '../memory/local-memory-orchestration.js';
 import { createLocalMemorySubsystem } from './host-memory.js';
 import { createDeferredSkillRuntimeCapability, } from '@mavis/shared/local-runtime-skills';
 import { initSessionFilesService } from '../session-assets/session-files-service.js';
 import { initSessionInputSummaryService } from '../session-navigation/service.js';
-import { stopBackgroundLocalBashTask } from '../background-task/bash-runner.js';
-import { abortAdmittedBackgroundTask, beginBackgroundTaskShutdown, drainBackgroundTasks, } from '../background-task/lifecycle.js';
 import { createGlobalEventSource } from '../events/global-events.js';
 import { toAgentMessages } from './conversation-message-adapter.js';
 import { createWorkspaceIndexingHostSubsystem, hostCaptureWorkspaceRevisionAfterTurn, hostLogWorkspaceSemanticSearchUnavailable, hostPrewarmWorkspaceIndexingForWorkspace, hostPrepareWorkspaceIndexingForSessionStart, } from '../workspace-indexing/index.js';
@@ -106,6 +95,10 @@ export class LocalRuntimeApiHost {
      * Read through `buildQuestionnaireServiceDeps` at each tool assembly.
      */
     hasPendingUserSteeringProbe;
+    isQuestionnaireGoalActive;
+    isQuestionnaireOriginTurnRunning;
+    /** AskUser v2 sync-wait probe: user input queued at/after `sinceMs` (late-bound by V2). */
+    hasQueuedUserInputSinceProbe;
     /** Read-only projection from the V2 Pin owner for legacy Session responses. */
     readSessionPinned;
     legacyRuntime;
@@ -171,11 +164,20 @@ export class LocalRuntimeApiHost {
     tokenUsageStore;
     turnDiffStore;
     turnFileChanges;
-    backgroundTaskService;
+    backgroundTaskRuntime;
+    get backgroundTasks() {
+        if (!this.backgroundTaskRuntime)
+            throw new Error('Background tasks require the V2 runtime owner');
+        return this.backgroundTaskRuntime;
+    }
+    get backgroundTaskService() {
+        return this.backgroundTasks.service;
+    }
     cronStore;
-    threadGoal;
-    threadGoalKickoffQueue;
-    threadGoalCronOwnerConflictReader;
+    /** Late-bound local-runtime-v2 Goal owner; see `bindQuestionnaireWorkOwner`. */
+    boundQuestionnaireWorkOwner;
+    /** Late-bound local-runtime-v2 Goal owner; see `bindSubSessionRoundAttribution`. */
+    boundSubSessionRoundAttribution;
     cronRuntime;
     contentSafety;
     contentSafetyChecker;
@@ -198,7 +200,6 @@ export class LocalRuntimeApiHost {
     systemReminderService;
     dynamicMaxTokensState;
     questionnaireStore;
-    questionnaireAutoReplyScheduler;
     mcpRuntime;
     get mcpService() {
         if (!this.mcpRuntime)
@@ -443,32 +444,12 @@ export class LocalRuntimeApiHost {
             makeId,
             reportFailure: (sessionId, message) => this.reportPiTurnFailure(sessionId, message),
         });
-        this.backgroundTaskService = createLocalBackgroundTaskService(() => this.configGetter().dataDir, this.nowMs, async (task, reason) => {
-            abortAdmittedBackgroundTask(this, task.taskId, reason ?? (task.kind === 'bash' ? 'Background bash stopped' : 'Background task stopped'));
-            await stopBackgroundLocalBashTask(task, reason);
-            const childSessionId = task.metadata?.childSessionId;
-            const subTurnId = task.metadata?.subTurnId;
-            if (typeof childSessionId !== 'string' ||
-                !childSessionId ||
-                typeof subTurnId !== 'string' ||
-                !subTurnId) {
-                return;
-            }
-            await this.requireRuntimeConversation('background task abort').ingress.abort(childSessionId, 'lifecycle', subTurnId);
-        }, ({ ownerSessionId }) => this.wakeSessionQueueAfterDependencyRelease(ownerSessionId));
+        this.backgroundTaskRuntime = options.createBackgroundTaskRuntime?.(this);
         this.cronStore =
             options.cronStore ?? new SqliteLocalCronStore(this.configGetter().dataDir, this.nowMs);
         this.questionnaireStore =
             options.questionnaireStore ??
                 new SqliteQuestionnaireRequestStore(() => this.configGetter().dataDir);
-        this.questionnaireAutoReplyScheduler = new QuestionnaireAutoReplyScheduler({
-            nowMs: this.nowMs,
-            run: async (requestId) => {
-                const service = new LocalQuestionnaireService(this.questionnaireServiceDeps());
-                return service.autoReply(requestId);
-            },
-            retryDelayMs: 1_000,
-        });
         this.lockOwner = {
             ownerId: options.runtimeOwnerId ?? makeRuntimeOwnerId(options.runtimeOwnerKind ?? 'runtime'),
             ownerKind: options.runtimeOwnerKind ?? 'runtime',
@@ -477,113 +458,6 @@ export class LocalRuntimeApiHost {
             (this.lockOwner.ownerKind === 'electron' && this.capabilities.electronHost === true) ||
                 isCliRestrictedRuntime(this.lockOwner.ownerKind, this.capabilities.cliEmbedded) ||
                 (this.lockOwner.ownerKind === 'app-server' && this.capabilities.cliEmbedded === true);
-        this.threadGoalKickoffQueue = new LocalThreadGoalKickoffQueue({
-            ...(this.runtimeConversation ? { conversation: this.runtimeConversation } : {}),
-            getIntegration: () => this.threadGoal,
-            reportFailure: (sessionId, message) => this.reportPiTurnFailure(sessionId, message),
-            reportRecoveryFailure: (error) => this.emitBusEvent('thread_goal.kickoff_recovery_failed', { error }),
-        });
-        this.threadGoal = new LocalThreadGoalIntegration({
-            dataDir: () => this.configGetter().dataDir,
-            sessionExists: async (sessionId) => Boolean(await this.getSessionById(sessionId)),
-            nowMs: this.nowMs,
-            turnTimingReader: this.controller.activeTurnTimingReader,
-            publishGlobalEvent: (event) => this.publishGlobalEvent(event),
-            promptSnapshots: () => this.promptSnapshots,
-            hasPendingQuestionnaire: (sessionId, expectedGoalId) => expectedGoalId
-                ? new LocalQuestionnaireService(this.questionnaireServiceDeps()).blocksGoalContinuation(sessionId, expectedGoalId)
-                : this.questionnaireStore.hasUnresolvedBySession(sessionId),
-            retireGoalQuestionnaire: (sessionId, goalId) => new LocalQuestionnaireService(this.questionnaireServiceDeps()).retireGoalQuestionnaire(sessionId, goalId),
-            hasPendingPermission: (sessionId) => this.permissionApprovalService
-                .listPending()
-                .some((request) => request.sessionId === sessionId),
-            isGoalVerifierChildSession: async (sessionId) => isGoalVerifierChildSession(await this.getSessionById(sessionId)),
-            hasAutomationOwnerConflict: async (sessionId) => (await hasActiveLocalTeamOwner(this.configGetter().dataDir, sessionId)) ||
-                (await this.threadGoalCronOwnerConflictReader?.(sessionId)) === true,
-            hasRequiredBackgroundWork: async (sessionId) => (await this.backgroundTaskService.list({
-                ownerSessionId: sessionId,
-                statuses: ['queued', 'running', 'stopping'],
-                limit: 1,
-            })).items.length > 0,
-            startContinuationTurn: async (sessionId, message, displayContent, internalPromptRead) => {
-                const conversation = this.requireRuntimeConversation('thread-goal continuation');
-                try {
-                    const accepted = await conversation.ingress.submit({
-                        sessionId,
-                        source: 'thread-goal',
-                        allowQueue: true,
-                        ...(internalPromptRead ? { requestedTurnId: internalPromptRead.requestedTurnId } : {}),
-                        message: {
-                            ...message,
-                            hideUserMessage: true,
-                            ...(displayContent ? { displayContent } : {}),
-                        },
-                    });
-                    if (internalPromptRead && accepted.turnId !== internalPromptRead.requestedTurnId) {
-                        this.threadGoal.rebindInternalPromptRead(internalPromptRead, accepted.turnId);
-                    }
-                    return 'started';
-                }
-                catch (error) {
-                    if (internalPromptRead)
-                        this.threadGoal.discardInternalPromptRead(internalPromptRead);
-                    throw error;
-                }
-            },
-            steerContinuationTurn: async ({ sessionId, message, idempotencyKey, internalPromptRead, onAccepted, }) => {
-                const conversation = this.requireRuntimeConversation('thread-goal objective steering');
-                try {
-                    const result = await conversation.ingress.steer({
-                        sessionId,
-                        source: 'thread-goal',
-                        producerId: 'thread-goal-objective',
-                        idempotencyKey,
-                        ...(internalPromptRead ? { requestedTurnId: internalPromptRead.requestedTurnId } : {}),
-                        message: {
-                            content: message.content,
-                            attachments: message.attachments.map((attachment) => ({ ...attachment })),
-                            origin: message.origin,
-                            hideUserMessage: true,
-                        },
-                        preDelivery: {
-                            accept: async (accepted) => {
-                                if (internalPromptRead) {
-                                    if (accepted.mode === 'activated') {
-                                        this.threadGoal.rebindInternalPromptRead(internalPromptRead, accepted.turnId);
-                                    }
-                                    else {
-                                        this.threadGoal.discardInternalPromptRead(internalPromptRead);
-                                    }
-                                }
-                                await onAccepted(accepted);
-                            },
-                        },
-                    });
-                    observeSteerCompletion(result, {
-                        sessionId,
-                        producer: 'Thread Goal objective steering',
-                        matrixLogger: this.matrixLogger,
-                    });
-                    return result;
-                }
-                catch (error) {
-                    if (internalPromptRead)
-                        this.threadGoal.discardInternalPromptRead(internalPromptRead);
-                    throw error;
-                }
-            },
-            enqueuePostTurnContinuation: (input) => this.enqueueInjectedThreadGoalContinuation(input),
-            abortThreadGoalTurn: (sessionId, turnId) => this.requireRuntimeConversation('thread-goal pause').ingress.abort(sessionId, 'thread-goal-paused', turnId),
-            internalTurnPromptReads: () => this.internalTurnPromptReads,
-            ...this.threadGoalKickoffQueue.integrationDeps(),
-            reportFailure: (sessionId, message) => this.reportPiTurnFailure(sessionId, message),
-            formatError: formatUnknownError,
-            ...(options.threadGoalRuntimeEventSink
-                ? { emitRuntimeEvent: options.threadGoalRuntimeEventSink }
-                : options.evalReporterFactory
-                    ? { emitRuntimeEvent: createThreadGoalEvalEventSink(options.evalReporterFactory) }
-                    : {}),
-        });
         this.mcpRuntime = options.mcpService;
         this.hookService =
             options.hookService ??
@@ -743,15 +617,7 @@ export class LocalRuntimeApiHost {
             status: 503,
             headers: { 'Content-Type': 'application/json' },
         }), options.metricsReporter, this.runtimeConversation ? options.cronConsumerEnabled : false, options.startupExecutionPolicy);
-        this.desktopServiceHandler = buildDesktopHandler(this, {
-            store: this.threadGoal.store,
-            createGoal: (input, createOptions) => this.threadGoal.createGoal(input, createOptions),
-            patchGoal: (sessionId, patch) => this.threadGoal.patchGoal(sessionId, patch),
-            pauseGoalByUser: (sessionId) => this.threadGoal.pauseGoalByUser(sessionId),
-            deleteGoal: (sessionId) => this.threadGoal.deleteGoal(sessionId),
-            dismissGoal: (sessionId, goalId) => this.threadGoal.dismissGoal(sessionId, goalId),
-            isReadOnlyLegacySession: (sessionId) => this.isReadOnlyLegacySession(sessionId),
-        });
+        this.desktopServiceHandler = buildDesktopHandler(this);
         if (this.startupExecutionEnabled && this.cronRuntime.cronConsumerEnabled) {
             void this.cronRuntime.ensureStarted('host_init').catch((err) => {
                 this.emitBusEvent('cron.startup_failed', {
@@ -770,8 +636,6 @@ export class LocalRuntimeApiHost {
                 }
                 startQuestionnaireRecovery(this, Promise.resolve());
             }
-            if (!this.runtimeConversation)
-                void this.threadGoalKickoffQueue.recover();
         }
         this.workspaceIndexingRemoteWorker.start();
     }
@@ -801,27 +665,6 @@ export class LocalRuntimeApiHost {
     }
     createHostedAgentCapabilities() {
         return createHostedCapabilities(this, this.lockOwner.ownerKind, this.capabilities.cliEmbedded, this.capabilityProfile);
-    }
-    beginHostedTurn(input) {
-        this.controller.beginTurnTiming(input.sessionId, input.turnId, input.source);
-    }
-    checkHostedTurnBudget(input) {
-        return this.threadGoal.checkTurnBudget(input);
-    }
-    async settleHostedTurn(input) {
-        this.controller.markTurnTimingSettling(input.sessionId, input.turnId);
-        await this.threadGoal.settleInjectedTurn(input);
-        this.controller.finishTurnTiming(input.sessionId, input.turnId);
-    }
-    /**
-     * Release the Turn timing frozen for settlement once TurnSystem has spent
-     * every settle retry. Without it the session stays `settling` forever, so
-     * automatic Goal continuation reads it as busy until a new user Turn or a
-     * process restart. Settlement itself must not do this in a `finally`: the
-     * first failed attempt is still followed by a retry that needs the timing.
-     */
-    abandonHostedTurn(input) {
-        this.controller.finishTurnTiming(input.sessionId, input.turnId);
     }
     createHostedChannelCapabilities() {
         // The port already accepts the conversation-level channel context, so the
@@ -869,39 +712,6 @@ export class LocalRuntimeApiHost {
             this.reportPiTurnFailure(sessionId, `thread_goal_dependency_wake_failed:${formatUnknownError(error)}`);
         });
     }
-    async enqueueInjectedThreadGoalContinuation(input) {
-        const conversation = this.runtimeConversation;
-        if (!conversation)
-            throw new Error('Runtime conversation is not bound');
-        try {
-            const accepted = await conversation.ingress.submit({
-                sessionId: input.sessionId,
-                source: 'thread-goal',
-                allowQueue: true,
-                ...(input.internalPromptRead
-                    ? { requestedTurnId: input.internalPromptRead.requestedTurnId }
-                    : {}),
-                message: {
-                    ...input.message,
-                    hideUserMessage: true,
-                },
-                clientRequestId: input.clientRequestId ?? threadGoalContinuationClientRequestId(input.turnId),
-            });
-            if (input.internalPromptRead &&
-                accepted.turnId !== input.internalPromptRead.requestedTurnId) {
-                this.threadGoal.rebindInternalPromptRead(input.internalPromptRead, accepted.turnId);
-            }
-            if (!accepted.queue) {
-                throw new Error(`Thread Goal continuation submit did not queue: ${input.sessionId}`);
-            }
-        }
-        catch (error) {
-            if (input.internalPromptRead) {
-                this.threadGoal.discardInternalPromptRead(input.internalPromptRead);
-            }
-            throw error;
-        }
-    }
     async listChannelSessionIds() {
         return this.requireChannelPort('channel session ids').listBindingSessionIds();
     }
@@ -914,6 +724,15 @@ export class LocalRuntimeApiHost {
     copyPendingQuestionnaireForFork(input) {
         return copyPendingQuestionnaire(this.questionnaireStore, input);
     }
+    /** 返回重开问卷的 request id；没有重开时返回 undefined。 */
+    async reopenQuestionnaireAfterSafetyRecall(input) {
+        const reopened = await reopenQuestionnaire({
+            store: this.questionnaireStore,
+            nowMs: this.nowMs,
+            publishGlobalEvent: (event) => this.publishGlobalEvent(event),
+        }, input);
+        return reopened?.requestId;
+    }
     async deletePermissionStateForSession(sessionId) {
         this.abortLocalSessionPermissions(sessionId);
         this.requireChannelPort('permission session cleanup').forgetPermissionSession(sessionId);
@@ -925,44 +744,48 @@ export class LocalRuntimeApiHost {
     inheritSessionPermissionRestrictions(input) {
         return this.permissionRules.inheritSessionRestrictions(input.sourceSessionId, input.targetSessionId);
     }
-    async deleteThreadGoalForSession(sessionId) {
-        const goal = await this.threadGoal.store.getBySession(sessionId);
-        if (!goal)
-            return false;
-        await this.threadGoal.store.delete(goal.goalId);
-        this.threadGoal.handleChanged({
-            type: 'deleted',
-            goalId: goal.goalId,
-            sessionId,
-        });
-        return true;
+    /**
+     * Bind the local-runtime-v2 Goal owner as the owner of Goal questionnaires.
+     * Questionnaire creation, reply and automatic answers ask it about the Goal;
+     * the Goal table and policy belong to local-runtime-v2 and are never read here.
+     */
+    bindQuestionnaireWorkOwner(owner) {
+        this.boundQuestionnaireWorkOwner = owner;
     }
-    classifyThreadGoalQueuedItem(item, hasPendingPlan) {
-        return this.threadGoal.classifyQueuedItem(item, hasPendingPlan);
-    }
-    prepareThreadGoalTurnAdmission(input) {
-        return this.threadGoal.prepareTurnAdmission(input);
-    }
-    bindThreadGoalAutomationOwnerConflictReader(reader) {
-        this.threadGoalCronOwnerConflictReader = reader;
-    }
-    bindThreadGoalVerifier(verifier, transcriptWindowReader) {
-        this.threadGoal.bindVerifier(verifier, transcriptWindowReader);
+    get questionnaireWorkOwner() {
+        return this.boundQuestionnaireWorkOwner;
     }
     /**
-     * Runs the Goal verifier child on this host's ordinary foreground delegation
-     * path. The caller owns the per-run counter the child's Turn hooks feed, so
-     * the two halves stay in the runtime that hosts each of them.
+     * Bind the local-runtime-v2 Goal owner as the receiver of sub-session round
+     * attribution: subagent tasks (and the Goal verifier), activated
+     * `task_append` rounds, hosted code review children and `session send` rounds
+     * started in a descendant Session report which parent Turn asked for them.
      */
-    createThreadGoalVerifierExecution(registry) {
-        return createLocalGoalVerifierExecution(this, registry, {
-            onChildStarted: (input) => this.threadGoal.recordVerifierChildStarted(input),
-        });
+    bindSubSessionRoundAttribution(port) {
+        this.boundSubSessionRoundAttribution = port;
     }
-    recoverThreadGoalKickoffs(conversation) {
-        if (!this.startupExecutionEnabled)
-            return Promise.resolve();
-        return this.threadGoalKickoffQueue.recover(conversation);
+    get subSessionRoundAttribution() {
+        return this.boundSubSessionRoundAttribution;
+    }
+    hasPendingPermissionForSession(sessionId) {
+        return this.permissionApprovalService
+            .listPending()
+            .some((request) => request.sessionId === sessionId);
+    }
+    hasActiveTeamOwner(sessionId) {
+        return hasActiveLocalTeamOwner(this.configGetter().dataDir, sessionId);
+    }
+    /**
+     * Run one foreground delegation on this host's ordinary task path (hidden
+     * child Session, task row, abort plumbing, verdict parsing), on behalf of a
+     * caller that owns what the child is asked to do.
+     */
+    async runForegroundDelegation(input) {
+        const parentSession = await this.getSessionById(input.parentSessionId);
+        if (!parentSession)
+            throw new Error(`Parent Session not found: ${input.parentSessionId}`);
+        const { parentSessionId: _parentSessionId, ...rest } = input;
+        return runForegroundLocalTask({ ...rest, host: this, parentSession });
     }
     buildOwnerMavisCronAdapter() {
         return this.mavisCronAdapterProvider?.();
@@ -993,17 +816,13 @@ export class LocalRuntimeApiHost {
             }),
             conversation,
             sessionSendWaitGraph: this.sessionSendWaitGraph,
+            subSessionRoundAttribution: () => this.boundSubSessionRoundAttribution,
             ...(this.composerSendBehavior ? { getComposerSendBehavior: this.composerSendBehavior } : {}),
             listAllSessions: (agentName, options) => this.listAllSessions(agentName, options),
             getSessionById: (sessionId) => this.getSessionById(sessionId),
             serializeSessions: (sessions) => this.serializeSessions(sessions),
             serializeSession: (record) => this.serializeSession(record),
             updateSession: (sessionId, fields) => conversation.lifecycle.updateSession(sessionId, fields),
-            deleteSession: (sessionId) => conversation.lifecycle.deleteSession(sessionId),
-            deleteMessageState: () => Promise.resolve(),
-            deleteQueuedMessages: () => Promise.resolve(),
-            markMigratedLegacySessionDeleted: () => Promise.resolve(false),
-            clearRootSessionIf: (sessionId) => this.agentRoutes.clearRootSessionIf(sessionId),
             listDisplayMessages: (sessionId, opts) => this.listDisplayMessages(sessionId, opts),
         });
     }
@@ -1034,16 +853,14 @@ export class LocalRuntimeApiHost {
             return;
         this.closed = true;
         this.workspaceIndexingService.closeWorkspacePrewarm();
-        closeLocalBackgroundTaskDelivery(this);
-        beginBackgroundTaskShutdown(this, 'runtime-shutdown');
+        this.backgroundTaskRuntime?.beginShutdown();
     }
     async closeResources() {
         let firstError;
         const cleanups = [
-            () => this.questionnaireAutoReplyScheduler.close(),
             () => this.globalEvents.close(),
             () => this.workspaceIndexingRemoteWorker.close(),
-            () => drainBackgroundTasks(this),
+            async () => this.backgroundTaskRuntime?.drain(),
             () => this.errorReporter?.close(),
         ];
         for (const close of cleanups) {

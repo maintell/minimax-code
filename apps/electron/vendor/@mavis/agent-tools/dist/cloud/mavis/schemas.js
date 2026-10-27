@@ -189,7 +189,6 @@ export const sessionUpdateSchema = z.object({
     agent_name: optionalString,
     archived: optionalBoolean,
 });
-export const sessionDeleteSchema = z.object({ session_id: idString });
 /**
  * `session messages` —— read recent messages of a session. Implementation
  * lives in Track B (`commands/session.ts handleSessionMessages`).
@@ -311,7 +310,6 @@ export const COMMAND_SCHEMAS = {
     'session list': sessionListSchema,
     'session get': sessionGetSchema,
     'session update': sessionUpdateSchema,
-    'session delete': sessionDeleteSchema,
     'session messages': sessionMessagesSchema,
     'session help': helpSchema,
     // Disabled: the `mavis communication peers/send/messages` subcommands have

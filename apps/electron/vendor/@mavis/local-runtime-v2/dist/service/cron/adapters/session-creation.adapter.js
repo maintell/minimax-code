@@ -16,6 +16,7 @@ export function createHostCronSessionCreation(host) {
     const detachCronSessions = host.detachCronSessions;
     return {
         create: (request) => createSession(host, request),
+        isTargetArchived: async (sessionId) => (await host.getSession(requireIdentifier(sessionId)))?.archived === true,
         rename: (sessionId, title, signal) => host.renameSession(requireIdentifier(sessionId), requireIdentifier(title), signal),
         discard: (sessionId) => host.discardSession(requireIdentifier(sessionId)),
         ...(detachCronSessions

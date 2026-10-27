@@ -125,7 +125,7 @@ export async function runAgent(agent, turn, convergeAtIdle) {
         if (turn.input.signal?.aborted) {
             return { kind: 'aborted' };
         }
-        if (agent.state.errorMessage) {
+        if (agent.state.errorMessage && !turn.requestStoppedBeforeSend) {
             return failureReason(agent.state.errorMessage, turn.metrics.getLLMFailureObservation()?.normalized);
         }
         return undefined;

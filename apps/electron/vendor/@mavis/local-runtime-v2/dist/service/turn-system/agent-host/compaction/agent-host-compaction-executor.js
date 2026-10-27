@@ -7,9 +7,10 @@ import { copyCanonicalHistoryForPiCompatibility, validateCanonicalHistoryChange,
 import { AgentHostCommittedHistoryWriter } from '../history/committed-history-writer.js';
 import { captureSemanticSnapshot } from '../history/semantic-identity.js';
 import { captureContextCompactionResult, ContextCompactionAttemptFactory, ContextCompactionResultValidationError, createCompactionTokenUsageAccumulator, describeUnknownError, logCheckpointGeneratedBestEffort, logCompactionFailureBestEffort, observeCompactionBestEffort, recordCheckpointAttemptBestEffort, } from './context-compaction.js';
+import { recordSharedPrefixFallbackBestEffort, resolveCheckpointRequestShape, } from './checkpoint-request-shape.js';
 import { createCompactionLifecycleMetadata, createManualCompactionChange, } from './compaction-history.js';
-import { joinPrompt, readPreparedSystemPrompt, resolveProviderContextMode, } from '../execution/prompt.js';
-import { localPluginHookCoordinator } from '../assembly/local-turn-plugin-hooks.js';
+import { joinPrompt, readPreparedContextUsagePromptRanges, readPreparedSystemPrompt, resolveProviderContextMode, } from '../execution/prompt.js';
+import { loadLocalConfigHooks, localPluginHookCoordinator, } from '../assembly/local-turn-plugin-hooks.js';
 import { createAgentHostPluginHookTranscript, } from '../tools/index.js';
 export class AgentHostCompactionLeaseError extends Error {
     reason;
@@ -43,10 +44,13 @@ export class AgentCompactionSnapshotError extends Error {
         this.field = field;
     }
 }
-async function preCompactHookRejection(input, capabilities, cwd, runtimeContext) {
-    if (!capabilities?.hooks?.length)
+async function manualCompactionHooks(session, capabilities) {
+    return [...(await loadLocalConfigHooks(session)), ...(capabilities?.hooks ?? [])];
+}
+async function preCompactHookRejection(input, hooks, cwd, runtimeContext) {
+    if (!hooks.length)
         return undefined;
-    const result = await localPluginHookCoordinator.runEvent(capabilities.hooks, {
+    const result = await localPluginHookCoordinator.runEvent(hooks, {
         event: 'PreCompact',
         sessionId: input.lease.sessionId,
         turnId: input.lease.turnId,
@@ -66,10 +70,10 @@ async function preCompactHookRejection(input, capabilities, cwd, runtimeContext)
     return result.decision.reason ?? 'deferred by Plugin Hook';
 }
 async function notifyPostCompact(plan) {
-    const { input, capabilities, cwd, runtimeContext, compactSummary } = plan;
-    if (!capabilities?.hooks?.length)
+    const { input, hooks, cwd, runtimeContext, compactSummary } = plan;
+    if (!hooks.length)
         return undefined;
-    const result = await localPluginHookCoordinator.runEvent(capabilities.hooks, {
+    const result = await localPluginHookCoordinator.runEvent(hooks, {
         event: 'PostCompact',
         sessionId: input.lease.sessionId,
         turnId: input.lease.turnId,
@@ -82,7 +86,7 @@ async function notifyPostCompact(plan) {
         },
     }, input.lease.signal);
     localPluginHookCoordinator.completeAutomaticCompaction(input.lease.sessionId);
-    localPluginHookCoordinator.markCompacted(input.lease.sessionId, capabilities.hooks);
+    localPluginHookCoordinator.markCompacted(input.lease.sessionId, hooks);
     return result.decision.continue === false
         ? (result.decision.stopReason ?? 'Processing stopped by PostCompact Plugin Hook.')
         : undefined;
@@ -173,8 +177,9 @@ export class AgentHostCompactionExecutor {
                 transcriptPath: null,
                 codexTranscriptPath: null,
             };
+        const hooks = await manualCompactionHooks(session, desktopCapabilities);
         try {
-            const hookRejection = await preCompactHookRejection(input, desktopCapabilities, session.workspaceDir, pluginHookRuntimeContext);
+            const hookRejection = await preCompactHookRejection(input, hooks, session.workspaceDir, pluginHookRuntimeContext);
             if (hookRejection)
                 return { status: 'aborted', reason: hookRejection };
             const prepared = await this.prepareManualCompaction({
@@ -224,7 +229,7 @@ export class AgentHostCompactionExecutor {
             });
             return this.finishCommittedPluginCompaction({
                 input,
-                capabilities: desktopCapabilities,
+                hooks,
                 cwd: session.workspaceDir,
                 runtimeContext: pluginHookRuntimeContext,
                 summary: prepared.value.compaction.summary ?? '',
@@ -276,13 +281,16 @@ export class AgentHostCompactionExecutor {
                 sessionId: input.lease.sessionId,
                 signal: input.lease.signal,
             });
+            const baseSystemPrompt = readPreparedSystemPrompt(preparation.agentConfig);
+            const contextUsagePromptRanges = readPreparedContextUsagePromptRanges(preparation.agentConfig, assembly.systemPromptPrefix, baseSystemPrompt);
             const providerContext = resolveProviderContextMode(session, {
-                systemPrompt: joinPrompt(assembly.systemPromptPrefix, readPreparedSystemPrompt(preparation.agentConfig)),
+                systemPrompt: joinPrompt(assembly.systemPromptPrefix, baseSystemPrompt),
                 tools: assembly.tools.map(({ def }) => ({
                     name: def.name,
                     description: def.description,
                     parameters: def.schema,
                 })),
+                ...(contextUsagePromptRanges === undefined ? {} : { contextUsagePromptRanges }),
             }, 'compaction');
             const compaction = captureContextCompactionResult(await compactionDependencies.manual.compactManual(createManualCompactionRequest({
                 input,
@@ -293,6 +301,8 @@ export class AgentHostCompactionExecutor {
                 payloadTransform,
                 systemPrompt: providerContext.systemPrompt,
                 tools: [...providerContext.tools],
+                contextUsagePromptRanges: providerContext.contextUsagePromptRanges,
+                checkpointRequestShape: resolveCheckpointRequestShape(preparation.llm, compactionDependencies.checkpointSharedPrefixEnabled),
             }), {
                 onStarted: () => observeCompactionBestEffort(compactionDependencies.observer, {
                     context,
@@ -316,6 +326,13 @@ export class AgentHostCompactionExecutor {
                     thinkingLevel,
                     checkpoint: metadata,
                 }),
+                onCheckpointSharedPrefixFallback: (reason) => recordSharedPrefixFallbackBestEffort(this.dependencies.logger, compactionDependencies.metricsClient, {
+                    context,
+                    attemptId,
+                    phase: 'manual',
+                    api: preparation.llm.model.api,
+                    reason,
+                }),
                 onProviderRequestSettled: state.tokenUsage.observe,
                 getProviderTokenUsage: state.tokenUsage.snapshot,
             }), history.messages.length);
@@ -333,7 +350,7 @@ export class AgentHostCompactionExecutor {
         const runtimeContext = await updateManualCompactionHookTranscript(plan.transcript, plan.runtimeContext, plan.input, plan.replacementMessages);
         const hookStopReason = await notifyPostCompact({
             input: plan.input,
-            capabilities: plan.capabilities,
+            hooks: plan.hooks,
             cwd: plan.cwd,
             runtimeContext,
             compactSummary: plan.summary,
@@ -440,6 +457,12 @@ function createManualCompactionRequest(plan) {
         ...(input.customInstructions ? { customInstructions: input.customInstructions } : {}),
         systemPrompt,
         tools: plan.tools,
+        ...(plan.contextUsagePromptRanges === undefined
+            ? {}
+            : { contextUsagePromptRanges: plan.contextUsagePromptRanges }),
+        ...(plan.checkpointRequestShape === 'isolated'
+            ? {}
+            : { checkpointRequestShape: plan.checkpointRequestShape }),
     };
 }
 async function createManualCompactionHookTranscript(hostTranscriptPath, sessionId, cwd, messages) {

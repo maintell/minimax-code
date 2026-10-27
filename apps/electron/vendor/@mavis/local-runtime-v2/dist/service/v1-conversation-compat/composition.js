@@ -28,6 +28,7 @@ export function composeV1Conversation(input) {
                 deleteSession: (sessionId) => input.deletion.deleteSessionById(sessionId),
             },
             root: input.root,
+            sideChats: input.sessions.sideChats,
         },
         submission,
         attachmentMaterializer,

@@ -62,52 +62,6 @@ export async function recordLocalTokenUsageFromPiMessages(input) {
         });
     }
 }
-/**
- * Sum the per-turn billable tokens that count against `token_budget`
- * across a batch of Pi messages (e.g. one `onHistoryChangedHook` delta
- * or the full per-turn flush).
- *
- *   delta = input + output
- *
- * `pi-ai` Messages-compatible provider writes `usage.input` verbatim from
- * the provider SSE `input_tokens` field, which per the wire
- * protocol is "fresh input AFTER the last cache breakpoint" — already
- * disjoint from `cache_read_input_tokens` and `cache_creation_input_tokens`.
- * pi-ai's own `totalTokens = input + output + cacheRead + cacheWrite`
- * (provider implementation) only adds up correctly when the four are
- * disjoint, which is the additional proof.
- *
- * IMPORTANT — DO NOT subtract `cacheRead` here. Codex's
- * `goal_token_delta_for_usage` (`ext/goal/src/accounting.rs:328`)
- * subtracts `cached_input_tokens` because codex's `TokenUsage.input_tokens`
- * comes from OpenAI Responses, where `input_tokens` is a TOTAL that
- * INCLUDES cached. The Messages-compatible provider + pi-ai's `usage.input` is the opposite
- * shape — already fresh — so subtracting cacheRead here would
- * double-undercount and clamp the entire fresh input to zero on any
- * cache-heavy turn (verified against prod gateway:
- * `{input_tokens:42, cache_read_input_tokens:128, output_tokens:2}`
- * billable = 44, NOT 2).
- *
- * `cacheWrite` is NOT added either — the provider charges 1.25× for cache
- * creation, but the multiplier lives in pricing, not in token counts;
- * counting them 1:1 with input here would over-charge for normal turns
- * vs cache-write turns. If pricing-accurate accounting is needed later,
- * compute it from `usage.cacheWriteTokens` in a separate pass.
- *
- * Used by {@link LocalApiHost.recordThreadGoalTurnAccounting} (Thread
- * Goal accounting, MR-1). Caller is responsible for accumulating across
- * a turn's worth of `onHistoryChangedHook` deltas.
- */
-export function sumPiTurnUsageTokens(messages) {
-    let total = 0;
-    for (const message of messages) {
-        const usage = readPiUsage(message);
-        if (!usage)
-            continue;
-        total += usage.inputTokens + usage.outputTokens;
-    }
-    return total;
-}
 function parseUsageRange(url) {
     const from = parseTimestampQuery(url.searchParams.get('from'), 'from');
     const to = parseTimestampQuery(url.searchParams.get('to'), 'to');

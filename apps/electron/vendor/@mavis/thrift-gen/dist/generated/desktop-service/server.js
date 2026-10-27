@@ -35,6 +35,66 @@ function createDesktopServiceRouter(service) {
         console.error(error);
         return new Response('Internal Server Error', { status: 500 });
     });
+    app.get(DESKTOP_SERVICE_ROUTES.listBackgroundTasks.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listBackgroundTasks, c.req.raw, c.req.param());
+        const resp = await service.listBackgroundTasks(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listBackgroundTasks, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.getBackgroundTask.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getBackgroundTask, c.req.raw, c.req.param());
+        const resp = await service.getBackgroundTask(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getBackgroundTask, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput, c.req.raw, c.req.param());
+        const resp = await service.readBackgroundTaskOutput(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.stopBackgroundTask.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.stopBackgroundTask, c.req.raw, c.req.param());
+        const resp = await service.stopBackgroundTask(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.stopBackgroundTask, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.delete(DESKTOP_SERVICE_ROUTES.deleteBackgroundTask.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.deleteBackgroundTask, c.req.raw, c.req.param());
+        const resp = await service.deleteBackgroundTask(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.deleteBackgroundTask, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.post(DESKTOP_SERVICE_ROUTES.ping.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.ping, c.req.raw, c.req.param());
@@ -2507,11 +2567,47 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.get(DESKTOP_SERVICE_ROUTES.getSessionActivity.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getSessionActivity, c.req.raw, c.req.param());
+        const resp = await service.getSessionActivity(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getSessionActivity, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.post(DESKTOP_SERVICE_ROUTES.abortSession.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.abortSession, c.req.raw, c.req.param());
         const resp = await service.abortSession(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.abortSession, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion, c.req.raw, c.req.param());
+        const resp = await service.cancelPromptSuggestion(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.getPromptSuggestion.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getPromptSuggestion, c.req.raw, c.req.param());
+        const resp = await service.getPromptSuggestion(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getPromptSuggestion, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {

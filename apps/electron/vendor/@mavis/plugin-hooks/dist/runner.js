@@ -51,6 +51,7 @@ export class PluginHookRunner {
             observeHandler(this.observer, {
                 event: input.event,
                 format: handler.sourceFormat,
+                origin: handler.origin ?? 'plugin',
                 outcome: 'error',
                 durationMs: 0,
                 processKilled: false,
@@ -73,6 +74,7 @@ export class PluginHookRunner {
                 observeHandler(this.observer, {
                     event: input.event,
                     format: handler.sourceFormat,
+                    origin: handler.origin ?? 'plugin',
                     outcome: diagnosticOutcome(outcome.diagnostic.code),
                     durationMs: Date.now() - handlerStartedAt,
                     processKilled: outcome.processKilled,
@@ -82,6 +84,7 @@ export class PluginHookRunner {
                 observeHandler(this.observer, {
                     event: input.event,
                     format: handler.sourceFormat,
+                    origin: handler.origin ?? 'plugin',
                     outcome: outcome.decision.decision === 'deny'
                         ? 'deny'
                         : outcome.decision.decision === 'ask' || outcome.decision.decision === 'defer'
@@ -166,12 +169,16 @@ export class PluginHookRunner {
             await mkdir(pluginDataDir, { recursive: true, mode: 0o700 });
             const env = {
                 ...safeHookEnvironment(),
-                MINIMAX_PLUGIN_ROOT: handler.pluginRoot,
-                CLAUDE_PLUGIN_ROOT: handler.pluginRoot,
-                CODEX_PLUGIN_ROOT: handler.pluginRoot,
-                PLUGIN_ROOT: handler.pluginRoot,
-                CLAUDE_PLUGIN_DATA: pluginDataDir,
-                PLUGIN_DATA: pluginDataDir,
+                ...(handler.origin
+                    ? { MINIMAX_HOOKS_DIR: handler.pluginRoot, MINIMAX_HOOKS_DATA: pluginDataDir }
+                    : {
+                        MINIMAX_PLUGIN_ROOT: handler.pluginRoot,
+                        CLAUDE_PLUGIN_ROOT: handler.pluginRoot,
+                        CODEX_PLUGIN_ROOT: handler.pluginRoot,
+                        PLUGIN_ROOT: handler.pluginRoot,
+                        CLAUDE_PLUGIN_DATA: pluginDataDir,
+                        PLUGIN_DATA: pluginDataDir,
+                    }),
                 MINIMAX_PROJECT_DIR: input.cwd,
                 CLAUDE_PROJECT_DIR: input.cwd,
                 CODEX_PROJECT_DIR: input.cwd,
@@ -224,14 +231,14 @@ export class PluginHookRunner {
             }
             const killedDescendants = await terminateRemainingProcessGroup(child);
             // Codex only interprets structured stdout from a successful command.
-            // Compatible intentionally parses JSON on every exit code; exit 2 then adds
-            // the event-specific blocking effect which JSON cannot override.
+            // MiniMax and Compatible intentionally parse JSON on every exit code; exit 2
+            // then adds the event-specific blocking effect which JSON cannot override.
             const parsesStdout = !(handler.sourceFormat === 'CODEX' && input.event === 'SessionEnd') &&
                 (handler.sourceFormat !== 'CODEX' || result.code === 0);
             const parsed = parsesStdout
                 ? parseDecision(captured.stdout, handler, input)
                 : { kind: 'empty', decision: defaultDecision(input.event) };
-            const exitDecision = result.code === 2 && handler.sourceFormat !== 'MINIMAX'
+            const exitDecision = result.code === 2
                 ? explicitExitTwoDecision(input.event, captured.stderr, handler.sourceFormat)
                 : undefined;
             if (parsed.kind === 'invalid') {
@@ -592,17 +599,17 @@ function explicitExitTwoDecision(event, stderr, sourceFormat) {
     if (event === 'Stop' || event === 'SubagentStop') {
         return { decision: 'allow', continuePrompt: reason };
     }
-    if (event === 'PreCompact' && sourceFormat === 'CLAUDE') {
+    if (event === 'PreCompact' && sourceFormat !== 'CODEX') {
         return { decision: 'allow', defer: true, reason };
     }
     return undefined;
 }
 function mergeExitTwoDecision(parsed, exitDecision, event, sourceFormat, hasStructuredBlock) {
-    if (event === 'PermissionRequest' && sourceFormat === 'CLAUDE')
+    if (event === 'PermissionRequest' && sourceFormat !== 'CODEX')
         return parsed;
-    if (sourceFormat === 'CLAUDE' && hasStructuredBlock) {
-        // Compatible keeps exit-code 2 blocking, but a structured blocking reason wins
-        // over stderr. `parsed` already carries the event-specific blocking effect.
+    if (sourceFormat !== 'CODEX' && hasStructuredBlock) {
+        // MiniMax and Compatible keep exit-code 2 blocking, but a structured blocking
+        // reason wins over stderr. `parsed` already carries the event-specific effect.
         return parsed;
     }
     if (event === 'PostToolUse' && sourceFormat === 'CODEX') {
@@ -1967,8 +1974,13 @@ function withPostToolAdapterEvidence(handler, input) {
         payload: { ...(input.payload ?? {}), ...evidence },
     };
 }
+const ORIGIN_RANK = { user: 0, project: 1, plugin: 2 };
 function compareHandlers(left, right) {
-    return (left.pluginName.localeCompare(right.pluginName) ||
+    const originOrder = ORIGIN_RANK[left.origin ?? 'plugin'] - ORIGIN_RANK[right.origin ?? 'plugin'];
+    if (originOrder)
+        return originOrder;
+    // Config owner names embed content digests; file order is the declared order.
+    return ((left.origin ? 0 : left.pluginName.localeCompare(right.pluginName)) ||
         left.sourcePath.localeCompare(right.sourcePath) ||
         left.declarationOrder - right.declarationOrder);
 }

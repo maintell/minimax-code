@@ -1,5 +1,6 @@
 /* eslint-disable */
-// AUTO-GENERATED from weaver/idl/matrix/archon_server/archon_protocol.thrift via
+// AUTO-GENERATED from weaver/idl/matrix/archon_server/archon_protocol.thrift
+// and SafetyAction in the sibling archon_server.thrift via
 // @creditkarma/thrift-typescript. Do NOT edit by hand. Run `pnpm gen:ts` in
 // packages/protocol to regenerate.
 //
@@ -18,6 +19,13 @@ export var PluginCapabilityType;
     PluginCapabilityType[PluginCapabilityType["MCP"] = 2] = "MCP";
     PluginCapabilityType[PluginCapabilityType["SKILL"] = 3] = "SKILL";
 })(PluginCapabilityType || (PluginCapabilityType = {}));
+export var SafetyAction;
+(function (SafetyAction) {
+    SafetyAction[SafetyAction["Pass"] = 1] = "Pass";
+    SafetyAction[SafetyAction["Block"] = 2] = "Block";
+    SafetyAction[SafetyAction["Replace"] = 3] = "Replace";
+    SafetyAction[SafetyAction["Guide"] = 4] = "Guide";
+})(SafetyAction || (SafetyAction = {}));
 export var ProtocolErrorCode;
 (function (ProtocolErrorCode) {
     ProtocolErrorCode[ProtocolErrorCode["INVALID_REQUEST"] = 1] = "INVALID_REQUEST";
@@ -128,7 +136,13 @@ export var RuntimeEventType;
     RuntimeEventType[RuntimeEventType["TURN_TERMINAL"] = 4] = "TURN_TERMINAL";
     RuntimeEventType[RuntimeEventType["DEBUG_TRACE"] = 5] = "DEBUG_TRACE";
     RuntimeEventType[RuntimeEventType["MESSAGE_PERSISTED"] = 6] = "MESSAGE_PERSISTED";
+    RuntimeEventType[RuntimeEventType["SAFETY_RECALL"] = 7] = "SAFETY_RECALL";
 })(RuntimeEventType || (RuntimeEventType = {}));
+export var SafetyRecallScope;
+(function (SafetyRecallScope) {
+    SafetyRecallScope[SafetyRecallScope["ATTEMPT"] = 1] = "ATTEMPT";
+    SafetyRecallScope[SafetyRecallScope["TURN"] = 2] = "TURN";
+})(SafetyRecallScope || (SafetyRecallScope = {}));
 export var RuntimeDebugTraceLevel;
 (function (RuntimeDebugTraceLevel) {
     RuntimeDebugTraceLevel[RuntimeDebugTraceLevel["DEBUG"] = 1] = "DEBUG";
@@ -144,7 +158,18 @@ export var HarnessControlMode;
     HarnessControlMode[HarnessControlMode["REWIND"] = 4] = "REWIND";
     HarnessControlMode[HarnessControlMode["INJECT"] = 5] = "INJECT";
     HarnessControlMode[HarnessControlMode["START_TRANSFER"] = 6] = "START_TRANSFER";
+    HarnessControlMode[HarnessControlMode["EXECUTION_ATTACH"] = 7] = "EXECUTION_ATTACH";
+    HarnessControlMode[HarnessControlMode["EXECUTION_STOP"] = 8] = "EXECUTION_STOP";
+    HarnessControlMode[HarnessControlMode["EXECUTION_STATUS"] = 9] = "EXECUTION_STATUS";
+    HarnessControlMode[HarnessControlMode["EXECUTION_SNAPSHOT"] = 10] = "EXECUTION_SNAPSHOT";
+    HarnessControlMode[HarnessControlMode["EXECUTION_READ_SNAPSHOT"] = 11] = "EXECUTION_READ_SNAPSHOT";
 })(HarnessControlMode || (HarnessControlMode = {}));
+export var SessionExecutionAdmissionKind;
+(function (SessionExecutionAdmissionKind) {
+    SessionExecutionAdmissionKind[SessionExecutionAdmissionKind["TURN"] = 1] = "TURN";
+    SessionExecutionAdmissionKind[SessionExecutionAdmissionKind["SHELL"] = 2] = "SHELL";
+    SessionExecutionAdmissionKind[SessionExecutionAdmissionKind["CONTROL"] = 3] = "CONTROL";
+})(SessionExecutionAdmissionKind || (SessionExecutionAdmissionKind = {}));
 export var AgentToolMode;
 (function (AgentToolMode) {
     AgentToolMode[AgentToolMode["OMIT"] = 1] = "OMIT";

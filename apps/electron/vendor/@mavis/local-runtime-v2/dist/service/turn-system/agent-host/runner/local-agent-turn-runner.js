@@ -3,7 +3,7 @@ import { buildCompletedTerminalStatusEvent, buildAbortedTerminalStatusEvent, } f
 import { getRuntimeBuildEnv } from '@mavis/config';
 import { RuntimeEventStatus, RuntimeEventType } from '@mavis/protocol';
 import { isInputSafetyDecisionFor, reviewBlocks, reviewBlocksInput, } from '../../../content-safety/index.js';
-import { LocalOutputSafetyEventWriter } from './output-safety-event-writer.js';
+import { LocalOutputSafetyEventWriter, SAFETY_REVIEW_SLOW_READ_MS, } from './output-safety-event-writer.js';
 import { runWithLocalEvalReporter } from './eval-reporter.js';
 import { deriveLocalTurnRuntimeOutcome } from './turn-outcome.js';
 import { appendSafetyReplacement } from './safety-replacement.js';
@@ -25,12 +25,28 @@ export class LocalAgentTurnRunner {
             (input.caller === undefined || input.caller === 'chat' || input.caller === 'channel_feishu');
         const observation = { regenerations: 0 };
         try {
-            return await runWithLocalEvalReporter(this.options.evalReporterFactory, input, (reportedInput) => this.runTurnCore(reportedInput, observation), this.options.logger);
+            const capture = this.resolveComputerUseCapture(input);
+            return await runWithLocalEvalReporter(this.options.evalReporterFactory, { ...input, computerUseCapture: capture ? await capture : undefined }, (reportedInput) => this.runTurnCore(reportedInput, observation), this.options.logger);
         }
         finally {
             if (isUserTurn)
                 this.recordRegenerations(input, observation.regenerations);
         }
+    }
+    resolveComputerUseCapture(input) {
+        const toolNames = input.tools?.map((tool) => tool.def.name) ?? [];
+        if (input.signal?.aborted || !toolNames.some((name) => name.startsWith('computer_')))
+            return undefined;
+        return this.options.resolveComputerUseCapture?.({
+            sessionId: input.sessionId,
+            turnId: input.turnId,
+            model: {
+                id: input.llm.model.id,
+                provider: input.llm.model.provider,
+                api: input.llm.model.api,
+            },
+            toolNames,
+        });
     }
     async runTurnCore(input, observation) {
         const baseToolContext = requireToolContext(input);
@@ -80,8 +96,22 @@ export class LocalAgentTurnRunner {
             }
             if (rejected || state.inputCorrectionPending)
                 state.activeWriter?.block();
-        });
+        }, (slow) => {
+            state.slowNetworkRead = slow;
+        }, () => this.notifySlowReview(input, state));
         return state;
+    }
+    /** 本轮第一次出现慢送审时通知一次；通知只用于展示，出错也不能影响本轮。 */
+    notifySlowReview(input, state) {
+        if (state.slowReviewNotified)
+            return;
+        state.slowReviewNotified = true;
+        try {
+            this.options.onSlowReview?.({ sessionId: input.sessionId, turnId: input.turnId });
+        }
+        catch {
+            // 慢送审提示只是展示用，不能改变本轮结果。
+        }
     }
     async runAttempts(scope) {
         const { input, toolContext, observedLlm, state, observation } = scope;
@@ -145,6 +175,7 @@ export class LocalAgentTurnRunner {
                         : this.options.reviewContent,
                 }),
             onBlocked: () => safetyAbort.abort(state.inputRejected ? 'input_safety' : 'output_safety'),
+            onSlowReview: () => this.notifySlowReview(input, state),
             ...(this.options.outputSafetyRetryDelay
                 ? { retryDelay: this.options.outputSafetyRetryDelay }
                 : {}),
@@ -235,7 +266,11 @@ export class LocalAgentTurnRunner {
         state.retractionVariant ??= 'content';
         await appendSyntheticCompleted(input, `local-input-retracted-${input.turnId}-status`);
     }
-    async reviewInput(input, observe) {
+    async reviewInput(input, observe, 
+    // 只在输入审核失败、走网络撤回时调用：告诉调用方这次审核是否等了 15 秒以上。
+    observeNetworkFailure, 
+    // 审核返回或抛错时等了 15 秒以上就调用，不管成功失败。
+    observeSlowReview) {
         if (input.signal?.aborted)
             return false;
         if (input.contentReviewRequired === false) {
@@ -250,23 +285,39 @@ export class LocalAgentTurnRunner {
         }
         if (!input.reviewUserInput?.trim())
             return false;
+        const startMs = Date.now();
         try {
             const result = normalizeInputReviewResult(await this.options.reviewContent(input.reviewUserInput, 300));
             if (input.signal?.aborted)
                 return false;
+            const slow = observeReviewElapsed(startMs, observeSlowReview);
             const rejected = reviewBlocksInput(result);
-            observe(rejected, inputReviewVariant(rejected, result.errorKind, input.contentReviewRequired === true), result.errorKind === 'api_error', result);
+            const variant = inputReviewVariant(rejected, result.errorKind, input.contentReviewRequired === true);
+            if (variant === 'network')
+                observeNetworkFailure(slow);
+            observe(rejected, variant, result.errorKind === 'api_error', result);
             reportInputReviewResolution(input, reviewBlocks(result));
             return rejected;
         }
         catch {
             if (input.signal?.aborted)
                 return false;
+            observeNetworkFailure(observeReviewElapsed(startMs, observeSlowReview));
             observe(true, 'network', false);
             reportInputReviewResolution(input, true);
             return true;
         }
     }
+}
+function isSlowReview(startMs) {
+    return Date.now() - startMs >= SAFETY_REVIEW_SLOW_READ_MS;
+}
+/** 审核返回（或抛错）时看耗时：等了 15 秒以上先通知慢送审，再把是否慢交给调用方。 */
+function observeReviewElapsed(startMs, observeSlowReview) {
+    const slow = isSlowReview(startMs);
+    if (slow)
+        observeSlowReview();
+    return slow;
 }
 function reportInputReviewResolution(input, rejected) {
     if (input.deferInputReviewResolution !== true) {
@@ -304,6 +355,8 @@ function createMutableRunnerState(input) {
         inputReview: Promise.resolve(false),
         retracted: false,
         networkStopped: false,
+        slowNetworkRead: false,
+        slowReviewNotified: false,
         inputSafetyReviewUnknown: false,
         finalAttemptEventStart: input.eventWriter.events.length,
         eventIdGenerator: input.eventIdGenerator ??
@@ -445,6 +498,7 @@ async function settleNetworkStop(input, state, safetyWriter, logger) {
     }, '[content-safety] output review stopped turn');
     state.networkStopped = true;
     state.retractionVariant = safetyWriter.reviewStopVariant;
+    state.slowNetworkRead = safetyWriter.slowNetworkRead;
     state.approvedPartial = safetyWriter.getApprovedPartial();
     await appendSyntheticCompleted(input, `local-output-network-stopped-${input.turnId}-status`);
 }
@@ -503,14 +557,20 @@ function buildRunnerResult(input, state) {
 }
 function deriveReconcile(state, status) {
     if (state.retracted) {
+        const variant = state.retractionVariant ?? 'content';
         return {
             kind: 'output-recall',
             source: state.retractionSource ?? 'output-review',
-            variant: state.retractionVariant ?? 'content',
+            variant,
+            ...(variant === 'network' && state.slowNetworkRead ? { slowNetworkRead: true } : {}),
         };
     }
     if (state.networkStopped) {
-        return { kind: 'network-reconcile', approvedContent: state.approvedPartial?.content };
+        return {
+            kind: 'network-reconcile',
+            approvedContent: state.approvedPartial?.content,
+            ...(state.slowNetworkRead ? { slowNetworkRead: true } : {}),
+        };
     }
     if (status === 'aborted') {
         return { kind: 'abort-reconcile', approvedContent: state.approvedPartial?.content };
@@ -559,6 +619,7 @@ function toPiControlInput(input) {
             ? { shouldStopAfterSteering: input.shouldStopAfterSteering }
             : {}),
         ...(input.shouldStopAfterTurn ? { shouldStopAfterTurn: input.shouldStopAfterTurn } : {}),
+        ...(input.isWorkClosed ? { isWorkClosed: input.isWorkClosed } : {}),
         ...(input.tryBeginClose ? { tryBeginClose: input.tryBeginClose } : {}),
         ...(input.unexpectedToolCallFallback
             ? { unexpectedToolCallFallback: input.unexpectedToolCallFallback }

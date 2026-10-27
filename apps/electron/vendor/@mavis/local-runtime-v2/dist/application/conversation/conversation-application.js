@@ -157,6 +157,52 @@ export class ConversationApplication {
         }
         return mapV2TurnStreamResult(await this.options.continuation.open(req.id));
     }
+    /**
+     * Cancels the optional next-message suggestion for one exact settled Turn.
+     * It never aborts the main agent Turn, and a stale Turn id cannot cancel a
+     * newer Turn of the same Session.
+     */
+    async cancelPromptSuggestion(_ctx, req) {
+        const turnId = req.turnId.trim();
+        if (!turnId)
+            throw new ApplicationError(400, 'local_prompt_suggestion_turn_required', `turn_id is required to cancel a prompt suggestion: ${req.id}`);
+        // The tombstone is recorded even when nothing is in flight, so a cancel that
+        // beats its own schedule still blocks that late schedule.
+        return { cancelled: this.options.turn.promptSuggestion?.cancel(req.id, turnId) === true };
+    }
+    /**
+     * Restores the optional next-message suggestion for one exact settled Turn.
+     * This is a pure read of an existing result: it issues no model request and
+     * spends no quota. An empty suggestion is a normal response, not an error, so
+     * the status explains every case where nothing is returned.
+     */
+    async getPromptSuggestion(_ctx, req) {
+        const turnId = req.turnId.trim();
+        if (!turnId)
+            throw new ApplicationError(400, 'local_prompt_suggestion_turn_required', `turn_id is required to read a prompt suggestion: ${req.id}`);
+        if (!(await this.options.sessionReader.find(req.id)))
+            throw sessionNotFound(req.id);
+        const result = this.options.turn.promptSuggestion?.read(req.id, turnId);
+        // Absent suggestion is expressed by omission, so the wire shape never
+        // implies an available suggestion the runtime refused to return.
+        return {
+            status: result?.status ?? 'absent',
+            ...(result?.suggestion
+                ? {
+                    suggestion: result.suggestion,
+                    promptVersion: result.promptVersion,
+                    generatedAt: result.generatedAt,
+                    elapsedMs: result.elapsedMs,
+                    usage: result.usage
+                        ? {
+                            inputTokens: result.usage.inputTokens,
+                            outputTokens: result.usage.outputTokens,
+                        }
+                        : undefined,
+                }
+                : {}),
+        };
+    }
     async abortSession(_ctx, req) {
         const abortSource = normalizeAbortSource(req.reason);
         const result = await this.withSessionLifecycle('abort', async () => {

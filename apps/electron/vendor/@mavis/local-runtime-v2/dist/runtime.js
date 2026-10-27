@@ -1,14 +1,15 @@
 import { LocalQuestionnaireService, acquireLocalRuntimeMigrationLock, createLocalRuntimeHost as createLocalRuntimeHostV1, ensureCurrentLocalRuntimeDataMigratedToV2OrThrow, isLocalRuntimeStartupExecutionEnabled, createDeferredLocalAgentRuntimePort, resolveAgentBashEnvPolicy, buildLocalTrajectoryId, } from '@mavis/local-runtime';
 import { DeferredRuntimeConversation } from '@mavis/conversation-contract';
-import { ownsElectronRuntimeCapabilities } from './application/index.js';
+import { ownsElectronRuntimeCapabilities, startupRecoveryFaultOption, } from './application/index.js';
 import { logger } from '@mavis/shared/local-runtime-logging';
+import { redactErrorForLog } from '@mavis/shared/logging/redact-log-secret';
 import { createBackgroundRuntime } from './background-runtime.js';
-import { cleanupFailedV1Startup, createV1RuntimeCompatibility, createDeferredAgentRuntimeTelemetry, withAgentStorageLock, } from './compat/v1/runtime.js';
+import { cleanupFailedV1Startup, createV1RuntimeCompatibility, createDeferredAgentRuntimeTelemetry, withAgentStorageScope, } from './compat/v1/runtime.js';
 import { createLocalRuntimeV2FrontDoor, createV2AgentRuntimeManagementPort, ownerCapabilitiesForServices, } from './http/app.js';
 import { DatabaseClient } from './infra/db/client.js';
 import { databaseInitializationTimingFields, initializeDatabase, migrationSafeModeWarning, } from './infra/db/initialize.js';
 import { createCliService } from './local/app.js';
-import { createRuntimeAgentComposition, createDeferredLocalSandboxBashOperationsFactory, createRuntimeServices, prepareRuntimeServices, } from './services.js';
+import { createRuntimeAgentComposition, bindAskUserRuntimeProbes, createDeferredLocalSandboxBashOperationsFactory, createRuntimeServices, prepareRuntimeServices, } from './services.js';
 const V2_LAYOUT_MIGRATION_RECEIPT_CARRIER = Symbol.for('mavis.local-runtime.v2-layout-migration-receipt');
 /** Creates a fully initialized local runtime. The returned compatibility `ready` is resolved. */
 export function createLocalRuntimeHostV2(options) {
@@ -17,13 +18,6 @@ export function createLocalRuntimeHostV2(options) {
 /** @internal Direct-module test seam; intentionally absent from the package facade. */
 export function createLocalRuntimeHostV2ForTest(options, overrides = {}) {
     return createLocalRuntimeHostV2Internal(options, overrides);
-}
-function bindAskUserSuppressionProbe(apiHost, turnSystem) {
-    const turnInspection = turnSystem?.inspection;
-    if (!turnInspection?.hasPendingUserSteering)
-        return;
-    const hasPendingUserSteering = turnInspection.hasPendingUserSteering.bind(turnInspection);
-    apiHost.hasPendingUserSteeringProbe = (sessionId) => hasPendingUserSteering(sessionId);
 }
 function bindV2AgentRuntimeManagementPort(agentRuntimePort, ownerRuntime, agentOwner) {
     agentRuntimePort.bindManagement(createV2AgentRuntimeManagementPort({
@@ -41,7 +35,7 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
     let ownerRuntime;
     const agentRuntimePort = createDeferredLocalAgentRuntimePort();
     const getConfig = () => v1?.apiHost.configGetter() ?? options.configGetter?.();
-    const sandboxOperationsFactory = createDeferredLocalSandboxBashOperationsFactory(() => options.configGetter?.().sandbox?.enabled ?? false, (plan) => resolveAgentBashEnvPolicy(options.dataDir, process.platform, plan?.nativeDelete ?? getConfig()?.permission?.nativeDelete === true));
+    const sandboxOperationsFactory = createRuntimeSandboxOperationsFactory(options, getConfig);
     const agentTelemetry = createDeferredAgentRuntimeTelemetry();
     let database;
     let preparedServices;
@@ -56,11 +50,13 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
         // (a 17G dataDir starved the 600s bootstrap watchdog six times in a row).
         // The rootless-v2-generation module remains for the CLI, which acquires
         // its own operation fence.
-        // Exactly one process per dataDir may run the migration segment (layout
-        // migration through database initialization); competitors wait behind the
-        // cross-process lock and effectively no-op once the receipt and schema
-        // are current. Lock failures propagate: fail-stop beats concurrent
-        // migration.
+        // Exactly one process per dataDir may run the startup storage segment
+        // (layout migration, database initialization and the Agent cutover);
+        // competitors wait behind the cross-process lock and effectively no-op
+        // once the receipt, schema and Agent target are current. The lock records
+        // its holder pid, so a holder that dies inside the segment (app.exit, a
+        // forced kill) is reclaimed by the next startup instead of blocking it.
+        // Lock failures propagate: fail-stop beats concurrent migration.
         const migrationLock = await measureStageAsync('migration_lock_ms', () => acquireLocalRuntimeMigrationLock({ dataDir: options.dataDir }));
         // Layout migration must complete before the authoritative V2 target is
         // opened.  The services composition below gates all legacy access on the
@@ -81,6 +77,30 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
                 dataDir: options.dataDir,
                 onMigration: options.onDatabaseMigration,
             }));
+            reportLegacySessionRecovery({
+                recoveredLegacySessionCount: initialization.recoveredLegacySessionCount,
+                degradedLegacySessionCount: initialization.degradedLegacySessionCount,
+            });
+            reportProjectMigrationRecovery({
+                recoveredProjectPreferenceCount: initialization.recoveredProjectPreferenceCount,
+                skippedSessionProjectRepairCount: initialization.skippedSessionProjectRepairCount,
+            });
+            reportDatabaseInitializationWarnings(initialization);
+            // The Agent cutover reads and rewrites legacy Agent storage, so it runs
+            // under this lock instead of taking a lock of its own.
+            agentOwner = await measureStageAsync('agent_composition_ms', () => createRuntimeAgentComposition({
+                db: lockedDatabase.db,
+                dataDir: options.dataDir,
+                ...(options.promptMode
+                    ? { promptMode: options.promptMode, promptVersion: options.appVersion }
+                    : {}),
+                ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+                withAgentStorageLock: (operation) => withAgentStorageScope(options.dataDir, operation),
+                reportCutover: reportAgentCutover,
+                reportIdentityDetach: reportAgentIdentityDetach,
+                reportLegacyCustomMaterialization: reportLegacyCustomAgentMaterialization,
+                facts: agentTelemetry.facts,
+            }));
         }
         finally {
             migrationLock.release();
@@ -88,33 +108,11 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
         const resolvedDatabase = database;
         if (!resolvedDatabase)
             throw new Error('V2 database was not initialized');
-        reportLegacySessionRecovery({
-            recoveredLegacySessionCount: initialization.recoveredLegacySessionCount,
-            degradedLegacySessionCount: initialization.degradedLegacySessionCount,
-        });
-        reportProjectMigrationRecovery({
-            recoveredProjectPreferenceCount: initialization.recoveredProjectPreferenceCount,
-            skippedSessionProjectRepairCount: initialization.skippedSessionProjectRepairCount,
-        });
-        reportDatabaseInitializationWarnings(initialization);
-        agentOwner = await measureStageAsync('agent_composition_ms', () => createRuntimeAgentComposition({
-            db: resolvedDatabase.db,
-            dataDir: options.dataDir,
-            ...(options.promptMode
-                ? { promptMode: options.promptMode, promptVersion: options.appVersion }
-                : {}),
-            ...(options.nowMs ? { nowMs: options.nowMs } : {}),
-            withAgentStorageLock: (operation) => withAgentStorageLock(options.dataDir, operation),
-            reportCutover: reportAgentCutover,
-            reportIdentityDetach: reportAgentIdentityDetach,
-            reportLegacyCustomMaterialization: reportLegacyCustomAgentMaterialization,
-            facts: agentTelemetry.facts,
-        }));
         agentRuntimePort.bindResolver(agentOwner.service);
         preparedServices = compatibility
             ? prepareRuntimeServices({
+                ...options,
                 db: database.db,
-                runtimeOwnerKind: options.runtimeOwnerKind,
             })
             : undefined;
         const configuredOptions = configureV1HostOptions(options, compatibility, agentRuntimePort, {
@@ -201,6 +199,10 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
         }
         ownerCompromiseGuard.publish();
         ownerRuntime?.background.startMaintenance();
+        // Assembled: left-over work resumes in the background (test-only seam, like `channelBridgeInfra`).
+        if (ownerRuntime) {
+            Reflect.set(v1.apiHost, 'startupRecovery', ownerRuntime.services.startStartupRecovery());
+        }
         return createStartedHost(v1, ownerRuntime, v1.ready);
     }
     catch (error) {
@@ -236,6 +238,7 @@ async function startChannelSubsystemAfterOwnerAgentDefinitions(ownerRuntime, api
             logger.error({
                 event: 'rootless_im_startup_detached_rejected',
                 error_code: runtimeOwnerErrorCode(error),
+                ...detachedStartupErrorFields(error),
             }, 'Detached Rootless IM startup rejected after core Runtime became ready');
         }
         catch {
@@ -339,11 +342,23 @@ async function closeCompromisedRuntime(instanceId, error, close) {
         }, 'V2 Runtime failed to close after owner lease compromise');
     }
 }
+/** Log-only error code: string `code`, else the string `key` an `AppError` carries. */
 function runtimeOwnerErrorCode(error) {
-    if (!error || typeof error !== 'object' || !('code' in error))
+    if (!error || typeof error !== 'object')
         return 'UNKNOWN';
-    const code = error.code;
-    return typeof code === 'string' && code.length > 0 ? code : 'UNKNOWN';
+    const { code, key } = error;
+    if (typeof code === 'string' && code.length > 0)
+        return code;
+    return typeof key === 'string' && key.length > 0 ? key : 'UNKNOWN';
+}
+/** Bounded, redacted name / message / top frames of an uncoded IM startup failure. */
+function detachedStartupErrorFields(error) {
+    const facts = redactErrorForLog(error, { messageChars: 300, stackFrames: 3 });
+    return {
+        error_name: facts.errorName,
+        error_message: facts.errorMessage,
+        error_stack_top: facts.errorStackTop,
+    };
 }
 function isV2RuntimeOwner(options) {
     return ((options.runtimeOwnerKind === 'electron' && options.capabilities?.electronHost === true) ||
@@ -523,7 +538,7 @@ function bindOwnerRuntimeIntegrations(input) {
     // Decision v3: late-bind the ask_user suppression probe now that the
     // V2 Turn system exists. V1-only hosts (and partial test graphs) keep
     // the probe unset, which means never suppress.
-    bindAskUserSuppressionProbe(apiHost, ownerRuntime.services.turnSystem);
+    bindAskUserRuntimeProbes(apiHost, ownerRuntime.services.turnSystem);
 }
 /**
  * MR2 two-phase assembly, phase 2: hand the v2-owned channel subsystem to
@@ -555,6 +570,7 @@ function configureV1HostOptions(options, compatibility, agentRuntimePort, owners
     // V2 owns the channel startup point: the V1 shell must build stores, APIs,
     // runner and registries without restoring a single transport.
     delete v1Options.computerUseClient;
+    delete v1Options.resolveComputerUseCapture;
     if (compatibility) {
         if (!prepared)
             throw new Error('V2 owner services were not prepared before V1 construction');
@@ -656,6 +672,7 @@ async function initializeOwnerRuntime(input) {
             ...(options.configSource ? { configSource: options.configSource } : {}),
             ...(options.nowMs ? { nowMs: options.nowMs } : {}),
             recoverPersistedState: startupExecutionEnabled,
+            ...startupRecoveryFaultOption(options.configGetter?.().startupRecoveryFault, logger),
             greetingEnabled: electronOwner && startupExecutionEnabled,
             runtimeOwnerKind: options.runtimeOwnerKind,
             runtimeCapabilities: options.capabilities,
@@ -665,6 +682,10 @@ async function initializeOwnerRuntime(input) {
             capabilityProfile: options.capabilityProfile,
             systemPromptOverrides: options.systemPromptOverrides,
             getRunawayGuardConfig: options.getRunawayGuardConfig,
+            getPromptSuggestionPolicy: options.getPromptSuggestionPolicy,
+            promptSuggestionSurface: options.promptSuggestionSurface,
+            promptSuggestionUngated: options.promptSuggestionUngated,
+            resolveComputerUseCapture: options.resolveComputerUseCapture,
             ...(options.getToolResultCompactionConfig
                 ? {
                     getToolResultCompactionConfig: options.getToolResultCompactionConfig,
@@ -706,14 +727,23 @@ async function initializeOwnerRuntime(input) {
 function exposeComputerUseClient(client) {
     return client ? { computerUseClient: client } : {};
 }
+function createRuntimeSandboxOperationsFactory(options, getConfig) {
+    return createDeferredLocalSandboxBashOperationsFactory(() => options.configGetter?.().sandbox?.enabled ?? false, (plan) => resolveAgentBashEnvPolicy(options.dataDir, process.platform, plan?.nativeDelete ?? getConfig()?.permission?.nativeDelete === true), () => options.runtimeOwnerKind === 'tui' && getConfig()?.skipParentDeathGuard === true);
+}
 function sandboxRuntimeOptions(options) {
     const sandboxConfig = options.configGetter?.().sandbox;
-    return sandboxConfig ? { sandboxConfig } : {};
+    return {
+        ...(sandboxConfig ? { sandboxConfig } : {}),
+        getSkipParentDeathGuard: () => options.runtimeOwnerKind === 'tui' && options.configGetter?.().skipParentDeathGuard === true,
+    };
 }
 function createSharedClose(state) {
     let closePromise;
     return () => {
         if (!closePromise) {
+            // Fence admission before stopping background tasks releases sibling capacity.
+            state.ownerRuntime?.services.processLifecycle.beginDrain();
+            state.ownerRuntime?.services.stopStartupRecovery(); // no recovery step starts once close begins
             state.v1?.apiHost.beginShutdown();
             closePromise = closeRuntime(state);
         }

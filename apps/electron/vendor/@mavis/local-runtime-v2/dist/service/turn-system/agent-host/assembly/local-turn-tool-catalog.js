@@ -1,9 +1,9 @@
-import { CRON_TOOL_NAMES, createLocalBashToolDefinition, resolveLocalBashShell, applyToolLoading, filterCanonicalBuiltinMcpEntries, filterCanonicalNativeToolCeiling, createMcpInvokeTool, createToolSearchTool, getSuppressedToolNamesForModelCapabilities, isCanonicalBuiltinTurn, modelInWhitelist, planMcpDisclosure, renderMcpToolSearchHintBlock, } from '@mavis/agent-tools';
+import { MAVIS_CAPABILITY_TOOL_NAMES, createLocalBashToolDefinition, resolveLocalBashShell, filterCanonicalBuiltinMcpEntries, filterCanonicalNativeToolCeiling, createMcpInvokeTool, getSuppressedToolNamesForModelCapabilities, isCanonicalBuiltinTurn, modelInWhitelist, renderMcpToolSearchHintBlock, } from '@mavis/agent-tools';
 import { AGENT_BUILTIN_MCP_TOOL_IDS, AGENT_BUILTIN_TOOL_IDS } from '@mavis/config';
 import { mergeAgentHostTurnCapabilities } from './local-turn-plugin-capabilities.js';
 export function prepareBashTurnTools(admittedTools, background, nativeDelete = false, agentShell) {
     const hasNativeBash = admittedTools.some((tool) => tool.def.name === 'bash' && (tool.source === undefined || tool.source === 'builtin'));
-    const unboundShell = process.platform === 'win32' ? 'unavailable' : undefined;
+    const unboundShell = process.platform === 'win32' ? 'pending' : undefined;
     const sessionShell = agentShell
         ? { 'git-bash': 'bash', 'windows-powershell': 'powershell', pwsh: 'pwsh' }[agentShell.family]
         : unboundShell;
@@ -71,28 +71,12 @@ export function buildLocalTurnToolCatalog(input) {
     const inventory = filterLocalTurnCapabilityInventory(input);
     const { nativeTools, mcpEntries, threadGoalTools } = inventory;
     const model = input.llmModel;
-    const plan = planMcpDisclosure({
-        entries: mcpEntries,
-        model,
-        options,
-    });
-    const tools = plan.deferred
-        ? [
-            ...nativeTools,
-            ...plan.inlineTools,
-            createToolSearchTool(plan.index, {
-                topKDefault: options.topKDefault,
-                topKMax: options.topKMax,
-            }),
-            createMcpInvokeTool(plan.deferredRegistry),
-            ...threadGoalTools,
-        ]
-        : [
-            ...nativeTools,
-            ...plan.inlineTools,
-            ...(input.hostCapabilityRegistry ? [createMcpInvokeTool(new Map())] : []),
-            ...threadGoalTools,
-        ];
+    const tools = [
+        ...nativeTools,
+        ...mcpEntries.map(({ tool }) => tool),
+        ...createInlineHostGateway(input),
+        ...threadGoalTools,
+    ];
     if (excludedNames.size > 0) {
         input.emitDiagnostic?.('mcp.tools_suppressed_by_model_capability', {
             sessionId: input.sessionId,
@@ -105,7 +89,7 @@ export function buildLocalTurnToolCatalog(input) {
     const effectivePluginSkills = filterExtensionSkills(input.effectivePluginSkills ?? [], inventory.selector);
     const merged = mergeAgentHostTurnCapabilities({
         tools,
-        plan,
+        mcpEntries,
         model,
         options,
         effectivePluginSkills,
@@ -124,16 +108,24 @@ export function buildLocalTurnToolCatalog(input) {
         ...(merged.plan.deferred ? merged.plan.stats : {}),
     });
     return {
-        tools: applyToolLoading(merged.tools),
-        userPromptPrefix: renderUserPromptPrefix([merged.reminder, renderComputerUseHint(merged.tools)].filter(Boolean).join('\n\n'), merged.plan.deferred, options.systemHint),
+        tools: merged.tools,
+        userPromptPrefix: renderUserPromptPrefix([merged.reminder, renderComputerUseHint(merged.tools)].filter(Boolean).join('\n\n'), true, options.systemHint),
     };
+}
+function createInlineHostGateway(input) {
+    // Preserve Desktop's gateway; CLI and its children add it only for real refs/deferred tools.
+    if (!input.hostCapabilityRegistry || input.hostCapabilityRegistry.reserveInlineGateway === false)
+        return [];
+    return [createMcpInvokeTool(new Map())];
 }
 function isReadyTurnToolAllowed(input) {
     if (input.excludedNames.has(input.tool.def.name))
         return false;
     if (!isComputerToolAvailable(input.tool, input.cuRuntimeAvailable))
         return false;
-    if (!input.selector.allowsTool(input.tool.def.name, input.options.selectorAlias))
+    if (!input.selector.allowsTool(input.tool.def.name, input.options.selectorAlias, {
+        featureOwned: isFeatureOwnedBuiltinTool(input.profile, input.tool.def.name, input.source),
+    }))
         return false;
     if (!isMcpServerAllowed(input.selector, input.options))
         return false;
@@ -145,6 +137,17 @@ function isReadyTurnToolAllowed(input) {
     if (!input.profile)
         return true;
     return isProfileToolAllowed(input.profile, input.tool, input.source);
+}
+/**
+ * Builtin `web_search` (native or Matrix) is owned by `features.webSearch` on a
+ * trusted builtin role, whose `agent.md` `tools` can only name native tools.
+ * Custom and Plugin Agents may name `web_search` in `tools`, so their
+ * allowlist still decides it.
+ */
+function isFeatureOwnedBuiltinTool(profile, name, source) {
+    return (profile?.trustedBuiltin === true &&
+        name === 'web_search' &&
+        (source === 'builtin' || source === 'builtin-matrix'));
 }
 function isComputerToolAvailable(tool, cuRuntimeAvailable) {
     return cuRuntimeAvailable || !tool.def.name.startsWith('computer_');
@@ -158,7 +161,7 @@ function isProfileToolAllowed(profile, tool, source) {
     if (profile.surface === 'task-child' && TASK_CHILD_BLOCKED_TOOL_NAMES.has(tool.def.name)) {
         return false;
     }
-    if (isBuiltinSubagentTaskChild(profile) && ['mavis', ...CRON_TOOL_NAMES].includes(tool.def.name))
+    if (isBuiltinSubagentTaskChild(profile) && MAVIS_CAPABILITY_TOOL_NAMES.includes(tool.def.name))
         return false;
     return isProfileCapabilityEnabled(profile.capabilityCeiling, tool.def.name, source);
 }
@@ -179,14 +182,16 @@ export function createLocalAgentCapabilitySelector(selection) {
     const allowedSkills = normalizeSelector(selection?.skills);
     const allowedExtensionSkills = normalizeSelector(selection?.extensionSkills);
     return {
-        allowsTool(name, hostAlias) {
+        allowsTool(name, hostAlias, options) {
             const names = [
                 name,
-                ...(CRON_TOOL_NAMES.includes(name) ? ['mavis'] : []),
+                ...(name !== 'mavis' && MAVIS_CAPABILITY_TOOL_NAMES.includes(name) ? ['mavis'] : []),
                 ...(hostAlias ? [hostAlias] : []),
             ].map(normalizedSelectorName);
             return (!names.some((candidate) => blockedTools.has(candidate)) &&
-                (!allowedTools || names.some((candidate) => allowedTools.has(candidate))));
+                (options?.featureOwned === true ||
+                    !allowedTools ||
+                    names.some((candidate) => allowedTools.has(candidate))));
         },
         allowsMcpServer(serverName) {
             if (!allowedMcpServers)
@@ -304,7 +309,7 @@ function isProfileCapabilityEnabled(ceiling, toolName, source) {
     return true;
 }
 function isFeatureEnabled(ceiling, toolName) {
-    if (['mavis', ...CRON_TOOL_NAMES].includes(toolName))
+    if (MAVIS_CAPABILITY_TOOL_NAMES.includes(toolName))
         return ceiling.features.mavis;
     if (DELEGATION_TOOL_NAMES.has(toolName))
         return ceiling.features.delegation;
@@ -331,7 +336,7 @@ function resolveModelWhitelist(envValue, raw) {
     const parsed = parseStringList(envValue);
     if (parsed)
         return parsed;
-    return raw?.modelWhitelist ? [...raw.modelWhitelist] : [];
+    return raw?.modelWhitelist ? [...raw.modelWhitelist] : ['*'];
 }
 function parseBoolean(value) {
     const normalized = value?.trim().toLowerCase();

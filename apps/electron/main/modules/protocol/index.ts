@@ -309,10 +309,17 @@ export function setupProtocolHandler(options = {}) {
         ? path.join(process.resourcesPath, 'resources', 'pptx-core')
         : (process.env.MAVIS_PPTX_CORE_RUNTIME_ROOT ??
             path.resolve(app.getAppPath(), '..', '..', 'packages', 'pptx-core', 'wasm-dist'));
+    // Packaged Electron apps keep the short `r/` physical layout for the
+    // PPTX core runtime (Windows MAX_PATH budget); unpackaged dev / hot-update
+    // runs read the historical `wasm-dist/<hash>/...` tree. The layout is
+    // chosen once at startup and is never probed per request. A missing
+    // `runtime.json` only downgrades the response to 503, never the layout.
+    const pptxCoreLayout = app.isPackaged ? 'packaged' : 'dev';
     const handlePptxCoreRuntime = createPptxCoreRuntimeProtocolHandler({
         runtimeRoot: fs.existsSync(path.join(pptxCoreRuntimeRoot, 'runtime.json'))
             ? pptxCoreRuntimeRoot
             : null,
+        layout: pptxCoreLayout,
     });
     logger_1.default.info(`[Protocol] Renderer root: ${rendererRoot} (source=${bootRenderer.source}, ` +
         `version=${bootRenderer.version ?? 'bundled'})`);

@@ -124,13 +124,17 @@ function buildSummaries(rows, assets, diffs) {
         completed: [],
     });
     const all = state.current ? [...state.completed, state.current] : state.completed;
-    return all.map(finishSummary);
+    return all.flatMap(finishSummary);
 }
 function reduceMessageRow(state, row, assetsByRowId, filesByRowId) {
     const message = parseMessage(row);
     if (!message)
         return state;
-    const next = isNavigableUserInput(message)
+    const navigable = isNavigableUserInput(message);
+    const continuesQuery = navigable && message.kind === 'steered_user' && state.current !== undefined;
+    if (continuesQuery)
+        state.current?.steeredInputs.push(messageHead(row));
+    const next = navigable && !continuesQuery
         ? {
             completed: state.current ? [...state.completed, state.current] : state.completed,
             current: newMutableSummary(messageHead(row)),
@@ -155,6 +159,7 @@ function updateAssistantBoundary(summary, row, message) {
 function newMutableSummary(userInput) {
     return {
         userInput,
+        steeredInputs: [],
         artifactsByKey: new Map(),
         fileChangePaths: new Set(),
     };
@@ -214,12 +219,16 @@ function messageHead(row) {
     };
 }
 function finishSummary(summary) {
-    return {
-        userInput: summary.userInput,
+    // Every steer keeps its own navigation anchor and shares the query result.
+    const result = {
         ...(summary.assistantResponse ? { assistantResponse: summary.assistantResponse } : {}),
         artifacts: [...summary.artifactsByKey.values()].sort((left, right) => left.messageRowId - right.messageRowId || left.assetIndex - right.assetIndex),
         fileChangeCount: summary.fileChangePaths.size,
     };
+    return [summary.userInput, ...summary.steeredInputs].map((userInput) => ({
+        userInput,
+        ...result,
+    }));
 }
 function toPage(sessionId, summaries, limit, beforeRowId) {
     const end = exclusiveEndIndex(summaries, beforeRowId);

@@ -13,8 +13,5 @@
   },
   "engines": {
     "node": ">=20"
-  },
-  "dependencies": {
-    "@mavis/oauth-lease-protocol": "file:../oauth-lease-protocol"
   }
 }

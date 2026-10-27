@@ -17,8 +17,9 @@ import { createAgentHostPluginHookTranscript, } from '../tools/index.js';
 import { withPluginAutomaticCompactionLifecycle } from './plugin-hook-compaction-lifecycle.js';
 import { createControlledToolHooks } from './plugin-hook-tool-lifecycle.js';
 import { createExecutionBudgetReminder } from '../runner/execution-budget-reminder.js';
+import { createTurnPromptSuggestionCapture, PromptSuggestionCommitRelay, readPromptSuggestionScope, withPromptSuggestionHooks, } from '../runner/prompt-suggestion/capture.js';
 import { withExecutionObservability } from './execution-observability.js';
-import { ackCommittedToolResultTailClaims, attachCommittedFacts, attachWaitingForUser, continuationRunMode, contentReviewOptions, hostOutputTokenCap, providerHistory, resolveLlmRetryOptions, } from './turn-execution-policy.js';
+import { ackCommittedToolResultTailClaims, attachCommittedFacts, attachWaitingForUser, continuationRunMode, contentReviewOptions, hostOutputTokenCap, providerHistory, requestControlledRunOptions, } from './turn-execution-policy.js';
 async function emitComputerUseDefaultWarning(input, reporter) {
     if (input.preparation.agentConfig.computerUseDefaultUnavailable !== true)
         return;
@@ -45,8 +46,19 @@ async function emitComputerUseDefaultWarning(input, reporter) {
  * fail before runtime invocation stays inside `execute()`, so LocalAgentHost
  * can commit exactly one failed terminal before receipt/release.
  */
+/**
+ * Wait for the Turn's own background shell only at a natural exit with
+ * nothing else to run; never once the Turn's work is closed.
+ */
+function waitsForChildBash(context, messageCount, continuation) {
+    return (context?.boundary === 'exit' &&
+        context.workClosed !== true &&
+        messageCount === 0 &&
+        !continuation.shouldStopAfterSteering?.());
+}
 export class LocalRuntimeTurnExecutor {
     options;
+    promptSuggestions = new PromptSuggestionCommitRelay(() => this.options.promptSuggestion);
     constructor(options) {
         this.options = options;
         validateOptions(options);
@@ -198,6 +210,9 @@ export class LocalRuntimeTurnExecutor {
         const continuation = createContinuationControl(input, prepared.prepareSteering, this.options.onSteeringConsumed);
         const toolSafetyGuard = this.options.createTurnToolSafetyGuard?.();
         const payloadTransforms = buildTurnPayloadTransforms(input, outputContract, this.options);
+        // Short-lived internal state. When the feature is off nothing is captured
+        // and no extra Hook is installed, so the main Turn behaves exactly as before.
+        const promptSuggestion = createTurnPromptSuggestionCapture(input, prepared, this.options);
         const childBash = this.options.createChildBashLifecycle?.({
             session: input.session,
             turnId: input.lease.turnId,
@@ -235,7 +250,7 @@ export class LocalRuntimeTurnExecutor {
                 tools: prepared.tools,
                 disableBuiltinToolFallback: prepared.toolResolution.disableBuiltinToolFallback,
                 toolContext: prepared.toolContext,
-                hooks: withExecutionObservability(mergeHooks({
+                hooks: withExecutionObservability(withPromptSuggestionHooks(mergeHooks({
                     input,
                     toolResolution: prepared.toolResolution,
                     pendingToolResultTailClaims,
@@ -246,7 +261,7 @@ export class LocalRuntimeTurnExecutor {
                     toolSafetyGuard,
                     toolPolicyGuard: this.options.toolPolicyGuard,
                     finalizeToolResultForHistory: this.options.finalizeToolResultForHistory,
-                }), input.request.provenance.sourceContext?.executionDiagnostics === true),
+                }), promptSuggestion?.capture), input.request.provenance.sourceContext?.executionDiagnostics === true),
                 caller: prepared.caller,
                 ...(prepared.unexpectedToolCallFallback
                     ? { unexpectedToolCallFallback: prepared.unexpectedToolCallFallback }
@@ -258,10 +273,9 @@ export class LocalRuntimeTurnExecutor {
                         const steeringContext = await resolveChildBashSteeringContext(context, childBash);
                         const messages = (await continuation.getSteeringMessages?.(steeringContext)) ?? [];
                         const notice = await childBash?.poll({
-                            wait: context?.boundary === 'exit' &&
-                                messages.length === 0 &&
-                                !continuation.shouldStopAfterSteering?.(),
+                            wait: waitsForChildBash(context, messages.length, continuation),
                             readTaskIds: terminalTaskOutputReadIds,
+                            onWaitingChanged: input.control.setBackgroundTaskWaiting,
                             ...(steeringSignal ? { steeringSignal } : {}),
                         });
                         if (notice)
@@ -272,7 +286,7 @@ export class LocalRuntimeTurnExecutor {
                 },
                 shouldStopAfterSteering: continuation.shouldStopAfterSteering,
                 tryBeginClose: continuation.tryBeginClose,
-                llmRetry: await resolveLlmRetryOptions(input, this.options),
+                ...(await requestControlledRunOptions(input, this.options)),
                 // Desktop and TUI both consume provider-measured output throughput.
                 ...(this.options.cliProductPolicy !== true || this.options.tuiProductPolicy === true
                     ? { includeDetailedUsage: true }
@@ -307,7 +321,12 @@ export class LocalRuntimeTurnExecutor {
             prepared,
             readTaskOutputTaskIds,
             runnerResult,
+            promptSuggestion: readPromptSuggestionScope(input, prepared, promptSuggestion?.capture),
         };
+    }
+    /** Fires the optional next-message suggestion once the Host durably committed the Turn. */
+    afterSuccessfulCommit(outcome) {
+        this.promptSuggestions.committed(outcome);
     }
     async settleTurn(input, settled) {
         try {
@@ -318,7 +337,9 @@ export class LocalRuntimeTurnExecutor {
                     ? { assistantMessageId: settled.runnerResult.outcome.messageId }
                     : {}),
             });
-            return attachCommittedFacts(settled.outcome, observation, settled.readTaskOutputTaskIds);
+            const committed = attachCommittedFacts(settled.outcome, observation, settled.readTaskOutputTaskIds);
+            this.promptSuggestions.remember(committed, settled.promptSuggestion);
+            return committed;
         }
         catch (error) {
             return this.throwWithFileFailure(input, error);
@@ -596,9 +617,18 @@ function reconcileIntent(result) {
         return undefined;
     switch (signal.kind) {
         case 'output-recall':
-            return { kind: 'output-recall', source: signal.source, variant: signal.variant };
+            return {
+                kind: 'output-recall',
+                source: signal.source,
+                variant: signal.variant,
+                ...(signal.slowNetworkRead ? { slowNetworkRead: true } : {}),
+            };
         case 'network-reconcile':
-            return { kind: 'network-reconcile', approvedContent: signal.approvedContent ?? '' };
+            return {
+                kind: 'network-reconcile',
+                approvedContent: signal.approvedContent ?? '',
+                ...(signal.slowNetworkRead ? { slowNetworkRead: true } : {}),
+            };
         case 'abort-reconcile':
             return { kind: 'abort-reconcile', approvedContent: signal.approvedContent ?? '' };
         default:

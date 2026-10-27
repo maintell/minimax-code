@@ -104,7 +104,6 @@ export async function buildLocalTurnToolSources(input) {
         return {
             nativeTools: [],
             mcpEntries: [],
-            threadGoalTools: [],
             cuRuntimeAvailable: false,
         };
     }
@@ -182,11 +181,9 @@ export async function buildLocalTurnToolSources(input) {
         ? selectedBuiltinMcpEntries
         : selectedBuiltinMcpEntries.filter((entry) => !(entry.source === 'builtin-matrix' && entry.tool.def.name === MatrixWebSearchToolDef.name));
     const mcpEntries = selectedMcpEntries;
-    const threadGoalTools = (await input.threadGoal.runtimeToolsFor(false, input.sessionId));
     return {
         nativeTools: gatedNativeTools,
         mcpEntries,
-        threadGoalTools,
         cuRuntimeAvailable,
     };
 }

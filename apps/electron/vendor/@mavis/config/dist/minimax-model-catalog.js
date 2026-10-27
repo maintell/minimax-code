@@ -3,7 +3,7 @@
  * First-run default before any official snapshot is synced. After a sync the
  * delivered `model_order` decides the default (see `model-availability.ts`).
  */
-export const MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID = 'MiniMax-M3.1-Flash-Preview';
+export const MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID = 'MiniMax-M3.1-Flash';
 const MINIMAX_M3_FILE_API_CAPABILITIES = {
     support_files_api: true,
     files_api_upload_endpoint: '/v1/files/upload',
@@ -32,8 +32,8 @@ export const MINIMAX_MODELS = {
         },
         capabilities: MINIMAX_M3_FILE_API_CAPABILITIES,
     },
-    'MiniMax-M3.1-Flash-Preview': {
-        name: 'M3.1-Flash-Preview',
+    'MiniMax-M3.1-Flash': {
+        name: 'M3.1-Flash',
         attachment: true,
         reasoning: true,
         tool_call: true,

@@ -1,4 +1,5 @@
 import { createMiniAppControlExtension } from '@mavis/agent-extension';
+import { prepareBackgroundTasks, } from './background-task-composition.js';
 import { createRuntimeCronSessionPorts, initializeCronService, } from '../../service/cron/index.js';
 import { composeTurnAdmissionPolicies, createDesktopSubagentConcurrency, } from '../../service/turn-system/index.js';
 import { composeLocalSandboxService, } from '../../service/sandbox/index.js';
@@ -98,6 +99,7 @@ export function createRuntimeTurnAdmissionOptions(input, planAdmission) {
             tasks: input.sessionSystem.sessions.taskExecutionAdmission,
             readMaxConcurrentPerSession: () => input.options.compatibility.agentHost.preparation.configBuilder.config().subagent
                 ?.maxConcurrentPerSession,
+            ...(input.options.logger ? { logger: input.options.logger } : {}),
         })
         : undefined;
     return {
@@ -115,18 +117,21 @@ function isTrustedLocalSubagentRuntime(input) {
         capabilities?.cliEmbedded === true);
 }
 export function prepareRuntimeServices(options) {
+    const backgroundTasks = prepareBackgroundTasks(options);
     const workspaceIndexingPolicy = new WorkspaceIndexingPolicy(options.db);
     const skillEnabledState = new SkillEnabledState(options.db);
     const legacyCredentialMigrationReceipt = new LegacyCredentialMigrationReceipt(options.db);
     const cliSunsetNotice = new CliSunsetNotice(options.db);
     const composerSendBehavior = new ComposerSendBehaviorPreference(options.db);
     return {
+        backgroundTasks,
         workspaceIndexingPolicy,
         skillEnabledState,
         legacyCredentialMigrationReceipt,
         cliSunsetNotice,
         composerSendBehavior,
         v1: {
+            createBackgroundTaskRuntime: backgroundTasks.createRuntime,
             workspaceIndexing: { isEnabled: () => workspaceIndexingPolicy.isEnabled() },
             skillEnabledState,
             runLegacyImCredentialMigration: (action) => legacyCredentialMigrationReceipt.run(action),
@@ -166,6 +171,7 @@ export function createRuntimeSessionComposition(input) {
     return createProductionSessionComposition({
         ...options,
         compatibility: options.compatibility.sessionV2,
+        goalHost: options.compatibility.goalHost,
         refreshOfficialModels: options.compatibility.modelProvider?.refreshOfficialModels,
         modelConfig: createLocalModelSystemConfigPort(options.compatibility.agentHost.preparation.configBuilder.config),
         ...dependencies,

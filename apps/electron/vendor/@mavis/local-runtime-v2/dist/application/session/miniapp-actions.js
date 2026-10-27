@@ -9,9 +9,13 @@ export function createSessionMiniAppLifecycle(plugins, supervisor, sessions, opt
     const { surface, diagnostics } = options;
     const definition = async (pluginId) => {
         const miniApp = (await plugins.listAvailableMiniApps()).find((candidate) => candidate.pluginId === pluginId);
-        if (!miniApp)
-            throw lifecycleError('NOT_FOUND');
-        return miniApp;
+        if (miniApp)
+            return miniApp;
+        // An installed package the engines gate withheld is not "not found": say why.
+        if ((await plugins.withheldMiniAppReason(pluginId)) === 'host_too_old') {
+            throw lifecycleError('PREPARATION_FAILED', 'MINIAPP_HOST_TOO_OLD');
+        }
+        throw lifecycleError('NOT_FOUND');
     };
     const inspectDefinition = (miniApp) => ({
         miniApp: summary(miniApp, statusByPlugin(supervisor.inspect()).get(miniApp.pluginId)),
@@ -344,6 +348,11 @@ const PREPARATION_REASON_BY_HOST_CODE = {
     MINIAPP_HOST_CONNECTOR_ACCESS_INVALID: 'MINIAPP_CONNECTOR_ACCESS_INVALID',
     MINIAPP_AGENT_ACCESS_INVALID: 'MINIAPP_AGENT_ACCESS_INVALID',
     MINIAPP_AGENT_CONCURRENCY_INVALID: 'MINIAPP_AGENT_CONCURRENCY_INVALID',
+    MINIAPP_DEVICE_ACCESS_INVALID: 'MINIAPP_DEVICE_ACCESS_INVALID',
+    MINIAPP_MANIFEST_FIELD_UNSUPPORTED: 'MINIAPP_MANIFEST_FIELD_UNSUPPORTED',
+    MINIAPP_ENGINES_INVALID: 'MINIAPP_ENGINES_INVALID',
+    MINIAPP_TOOL_ACCESS_INVALID: 'MINIAPP_TOOL_ACCESS_INVALID',
+    MINIAPP_HOST_TOO_OLD: 'MINIAPP_HOST_TOO_OLD',
     WORKSPACE_INSTALL_FAILED: 'WORKSPACE_INSTALL_FAILED',
     CANDIDATE_CHANGED: 'WORKSPACE_CHANGED',
     RUNNER_START_FAILED: 'RUNTIME_START_FAILED',

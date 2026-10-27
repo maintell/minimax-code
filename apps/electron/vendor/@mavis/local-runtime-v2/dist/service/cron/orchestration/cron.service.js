@@ -83,6 +83,7 @@ class SchedulerBackedCronService {
         const model = resolveDefinitionModel(command.model, this.deps.modelSelection);
         await assertCronContentSafe(this.deps.reviewContent, command);
         this.assertOpen();
+        const ownedBefore = this.ownedSessionId(this.deps.definitions.get(command.cronId));
         const updated = this.deps.lifecycle.update({
             cronId: command.cronId,
             ...(command.name === undefined ? {} : { name: command.name }),
@@ -94,9 +95,10 @@ class SchedulerBackedCronService {
             ...(command.project === undefined ? {} : { project: command.project }),
             nowMs,
         });
-        if (command.name !== undefined) {
+        if (command.name !== undefined || command.sessionTarget !== undefined) {
             this.trackDetached((signal) => syncSingleSessionTitle(this.deps.sessionCreation, updated, signal));
         }
+        this.releaseOwner(ownedBefore, this.ownedSessionId(updated));
         const view = this.toDefinitionView(updated);
         this.deps.metrics.taskUpdated(view, context.mutationSource);
         return view;
@@ -105,6 +107,7 @@ class SchedulerBackedCronService {
         this.assertOpen();
         const definition = this.deps.definitions.get(command.cronId);
         const metricTask = definition ? this.toMetricTask(definition) : undefined;
+        const ownedBefore = this.ownedSessionId(definition);
         // Product deletion is retention-safe: tombstone the definition, cancel its
         // Scheduler job, and keep every Cron Run and conversation for history.
         this.deps.lifecycle.delete({
@@ -112,6 +115,7 @@ class SchedulerBackedCronService {
             nowMs: this.deps.nowMs(),
             deleteRuns: false,
         });
+        this.releaseOwner(ownedBefore, undefined);
         if (metricTask)
             this.deps.metrics.taskDeleted(metricTask, context.mutationSource);
         return this.trackReconciliation((signal) => this.deps.sessionCreation.detach?.(command.cronId, definition?.sessionTarget.mode === 'sessionId'
@@ -137,11 +141,13 @@ class SchedulerBackedCronService {
         } while (before);
         for (const definition of definitions) {
             const metricTask = this.toMetricTask(definition);
+            const ownedBefore = this.ownedSessionId(definition);
             this.deps.lifecycle.delete({
                 cronId: definition.cronId,
                 nowMs: this.deps.nowMs(),
                 deleteRuns: false,
             });
+            this.releaseOwner(ownedBefore, undefined);
             this.trackDetached((signal) => this.deps.sessionCreation.detach?.(definition.cronId, definition.sessionTarget.mode === 'sessionId'
                 ? definition.sessionTarget.sessionId
                 : undefined, signal));
@@ -158,6 +164,9 @@ class SchedulerBackedCronService {
         const definition = this.deps.definitions.get(cronId);
         if (!definition) {
             throw new CronRepositoryError('CRON_NOT_FOUND', 'Cron definition not found');
+        }
+        if (await this.deps.executor.isTargetArchived(definition)) {
+            throw new CronRepositoryError('CRON_SESSION_TARGET_ARCHIVED', 'Cron target session is archived');
         }
         const metricTask = this.toMetricTask(definition);
         const prepared = await this.deps.executor.prepareManual({
@@ -198,6 +207,31 @@ class SchedulerBackedCronService {
             ...(job.nextRunAtMs === undefined ? {} : { nextRunAtMs: job.nextRunAtMs }),
             ...(definition.deletedAtMs === undefined ? {} : { deletedAtMs: definition.deletedAtMs }),
         };
+    }
+    /**
+     * The Session an enabled definition owns as its automation owner — the same
+     * rule as `hasActiveCronSessionOwner`, which gates Goal continuations.
+     */
+    ownedSessionId(definition) {
+        if (!definition || isSelfReminderId(definition.cronId))
+            return undefined;
+        if (definition.sessionTarget.mode !== 'sessionId')
+            return undefined;
+        try {
+            return this.deps.scheduler.inspect(definition.schedulerId)?.state === 'active'
+                ? definition.sessionTarget.sessionId
+                : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    /** A blocked Goal starts once its owner conflict clears (spec §6), not on the next unrelated wake. */
+    releaseOwner(before, after) {
+        if (!before || before === after)
+            return;
+        // Best-effort: the committed Cron mutation stands; a later wake re-checks.
+        this.trackDetached(() => this.deps.sessionCreation.ownerReleased?.(before));
     }
     toMetricTask(definition) {
         try {

@@ -1,3 +1,4 @@
+import { addGitObservation, measureGitRead } from '../git-read-observation.js';
 import { createReadStream } from 'node:fs';
 import { resolve } from 'node:path';
 import { TextDecoder } from 'node:util';
@@ -7,12 +8,14 @@ const UNTRACKED_LINE_COUNT_CONCURRENCY = 4;
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024;
 const MAX_RECENT_BRANCHES = 100;
 const MAX_BRANCH_SEARCH_RESULTS = 20;
-export async function captureGitChangesBase(workspace) {
-    if (!(await isGitRepo(workspace))) {
+export async function captureGitChangesBase(workspace, trace) {
+    if (!(await isGitRepo(workspace, undefined, trace))) {
         return { changes: emptyChanges(false), untrackedPaths: new Set() };
     }
-    const hasHead = (await git(['rev-parse', '--verify', 'HEAD'], workspace)).code === 0;
-    const status = await git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], workspace);
+    const hasHead = (await git(['rev-parse', '--verify', 'HEAD'], workspace, { trace })).code === 0;
+    const status = await git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], workspace, {
+        trace,
+    });
     if (status.code !== 0) {
         return {
             changes: { ...emptyChanges(true), hasHead, error: status.stderr || status.stdout },
@@ -36,22 +39,25 @@ export async function captureGitChangesBase(workspace) {
         untrackedPaths: parsedStatus.untrackedPaths,
     };
 }
-export async function enrichGitChanges(workspace, base) {
+export async function enrichGitChanges(workspace, base, trace) {
     if (!base.changes.isGitRepo || base.changes.error)
         return base.changes;
     const files = base.changes.files.map((file) => ({ ...file }));
     const statsByScope = new Map();
     let lineStatsComplete = true;
     const untrackedFiles = files.filter((file) => file.status === 'added' && base.untrackedPaths.has(file.path));
+    addGitObservation(trace, 'untracked_files', untrackedFiles.length);
     const [, untrackedLineCounts] = await Promise.all([
         Promise.all(gitDiffScopes('all').map(async (scope) => {
-            const numstat = await git(gitNumstatArgs(scope, base.changes.hasHead), workspace);
+            const numstat = await git(gitNumstatArgs(scope, base.changes.hasHead), workspace, {
+                trace,
+            });
             const parsedNumstat = parseNumstat(numstat.stdout);
             if (numstat.code !== 0 || !parsedNumstat.complete)
                 lineStatsComplete = false;
             statsByScope.set(scope, parsedNumstat.stats);
         })),
-        mapWithConcurrency(untrackedFiles, UNTRACKED_LINE_COUNT_CONCURRENCY, async (file) => [file.path, await countWorkspaceTextLines(workspace, file.path)]),
+        measureGitRead(trace, 'untracked_ms', () => mapWithConcurrency(untrackedFiles, UNTRACKED_LINE_COUNT_CONCURRENCY, async (file) => [file.path, await countWorkspaceTextLines(workspace, file.path, trace)])),
     ]);
     const untrackedLineCountsByPath = new Map(untrackedLineCounts);
     for (const file of files) {
@@ -218,8 +224,11 @@ function chooseDefaultBranch(local, current) {
         return 'master';
     return current;
 }
-export async function isGitRepo(workspace, signal) {
-    return ((await git(['rev-parse', '--is-inside-work-tree'], workspace, signal ? { signal } : {})).stdout.trim() === 'true');
+export async function isGitRepo(workspace, signal, trace) {
+    return ((await git(['rev-parse', '--is-inside-work-tree'], workspace, {
+        ...(signal ? { signal } : {}),
+        trace,
+    })).stdout.trim() === 'true');
 }
 export async function classifyWorkspacePathsIgnored(workspace, paths) {
     if (paths.length === 0)
@@ -370,7 +379,7 @@ function parseStatValue(value) {
         ? { value: parsed, complete: true }
         : { value: 0, complete: false };
 }
-async function countWorkspaceTextLines(workspace, filePath) {
+async function countWorkspaceTextLines(workspace, filePath, trace) {
     const absolute = await resolveWorkspacePath(workspace, filePath);
     if (!absolute || isKnownBinaryExtension(filePath))
         return undefined;
@@ -388,6 +397,7 @@ async function countWorkspaceTextLines(workspace, filePath) {
             end: UNTRACKED_LINE_COUNT_MAX_BYTES,
         })) {
             const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+            addGitObservation(trace, 'untracked_bytes', chunk.length);
             if (!consumeTextChunk(chunk, decoder, state))
                 return undefined;
         }

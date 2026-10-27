@@ -1,10 +1,13 @@
 import { getDesktopConfig } from "./storage.ipc";
-import { ipcMain, BrowserWindow, nativeImage, clipboard } from "electron";
+import { BrowserWindow, ipcMain, nativeImage, clipboard } from "electron";
 import { withTimeout, BROWSER_TIMEOUTS, browserOperationFailure } from "@mavis/browser-core";
 import { LOCAL_DESKTOP_RUNTIME_ID } from "@mavis/shared/desktop-runtime";
 import { getActiveShortcutOverrides } from "@mavis/shared/keyboard-shortcuts";
-import { IPC_CHANNELS } from "../config/constants";
+import { isDev } from "../config";
+import { DEV_SERVER_URL, IPC_CHANNELS } from "../config/constants";
+import { isBrowserPreviewScope, isBrowserPreviewLayout, isBrowserDevicePreviewRequest } from "@mavis/shared/browser-device-preview";
 import { getEmbeddedBrowserManager, openEmbeddedBrowserExternally } from "../modules/browser/embedded-browser-manager";
+import { normalizeCommentKeys, normalizeCommentRevisions, validateCommentKey } from "../modules/browser/embedded-browser-manager-helpers";
 import { createNewEmbeddedBrowserTab } from "../modules/browser/embedded-browser-new-tab";
 import { getLocalServerRegistry } from "../modules/local-servers/registry";
 import { getTerminalManager } from "../modules/terminal";
@@ -39,6 +42,22 @@ function normalizeCommentThemePalette(value) {
     }
     return Object.fromEntries(COMMENT_THEME_PALETTE_KEYS.map((key) => [key, raw[key].trim()]));
 }
+const COMMENT_STRING_KEYS = [
+    'propsOnlyFeedback',
+    'autosaved',
+    'undo',
+    'pending',
+    'done',
+    'voice',
+];
+/** Copy only the known UI strings; the bridge renders them as text, never HTML. */
+function normalizeCommentStrings(value) {
+    if (!value || typeof value !== 'object')
+        return undefined;
+    const raw = value;
+    const entries = COMMENT_STRING_KEYS.flatMap((key) => typeof raw[key] === 'string' ? [[key, raw[key].slice(0, 200)]] : []);
+    return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
 function normalizeBounds(value) {
     const raw = value && typeof value === 'object' ? value : {};
     return {
@@ -59,6 +78,53 @@ function normalizeBrowserTarget(value) {
 }
 function normalizeDestroyParams(value) {
     return normalizeBrowserTarget(value);
+}
+function trustedPreviewHost(event) {
+    if (event.sender.isDestroyed() ||
+        !event.senderFrame ||
+        event.senderFrame !== event.sender.mainFrame)
+        return false;
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || owner.isDestroyed() || owner.webContents.id !== event.sender.id)
+        return false;
+    try {
+        const url = new URL(event.sender.getURL());
+        if (url.pathname !== '/archon' && url.pathname !== '/archon/')
+            return false;
+        return isDev
+            ? url.origin === new URL(DEV_SERVER_URL).origin
+            : url.protocol === 'app:' && url.hostname === '.';
+    }
+    catch {
+        return false;
+    }
+}
+function validPreviewTarget(value) {
+    if (!value || typeof value !== 'object')
+        return false;
+    const raw = value;
+    return (typeof raw.sessionId === 'string' &&
+        raw.sessionId.length > 0 &&
+        raw.sessionId.length <= 256 &&
+        typeof raw.tabId === 'number' &&
+        Number.isSafeInteger(raw.tabId) &&
+        raw.tabId > 0);
+}
+function validPreviewLayoutRequest(event, bounds, params) {
+    const raw = params;
+    if (raw?.previewLayout === undefined)
+        return true;
+    return (trustedPreviewHost(event) &&
+        validPreviewTarget(params) &&
+        isBrowserPreviewScope(raw.previewScope) &&
+        (raw.previewLayout === null || isBrowserPreviewLayout(raw.previewLayout)) &&
+        Boolean(bounds) &&
+        ['x', 'y', 'width', 'height'].every((key) => {
+            const value = bounds[key];
+            return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 30000;
+        }) &&
+        bounds.width > 0 &&
+        bounds.height > 0);
 }
 function normalizeDevicePreviewMode(value) {
     return value === 'responsive' ||
@@ -240,6 +306,8 @@ export function setupEmbeddedBrowserIPC() {
         }
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SHOW, async (event, bounds, params) => {
+        if (!validPreviewLayoutRequest(event, bounds, params))
+            return { success: false, error: 'Invalid device preview layout' };
         const layoutCommandId = issueLayoutCommandId();
         manager.setHostWindow(BrowserWindow.fromWebContents(event.sender), event.sender.id, getHostZoomFactor(event));
         const normalizedBounds = normalizeBounds(bounds);
@@ -250,9 +318,11 @@ export function setupEmbeddedBrowserIPC() {
             tabId: target.tabId ?? null,
             bounds: normalizedBounds,
         });
-        return manager.show(normalizedBounds, target, viewport, getBrowserLayoutContext(event), layoutCommandId);
+        return manager.show(normalizedBounds, target, viewport, getBrowserLayoutContext(event), layoutCommandId, ...(params?.previewLayout !== undefined ? [params.previewLayout] : []));
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SET_BOUNDS, async (event, bounds, params) => {
+        if (!validPreviewLayoutRequest(event, bounds, params))
+            return { success: false, error: 'Invalid device preview layout' };
         const layoutCommandId = issueLayoutCommandId();
         // Refresh the host because a hot reload/window switch can leave the
         // manager with a stale BrowserWindow even when create is not re-issued.
@@ -266,6 +336,7 @@ export function setupEmbeddedBrowserIPC() {
         const layoutOptions = {
             layoutCommandId,
             layoutContext: getBrowserLayoutContext(event),
+            ...(params?.previewLayout !== undefined ? { previewLayout: params.previewLayout } : {}),
         };
         logIpcReceipt('set-bounds', event, {
             sessionId: target.sessionId ?? null,
@@ -282,6 +353,19 @@ export function setupEmbeddedBrowserIPC() {
         if (!mode)
             return { success: false, error: 'Invalid device preview mode' };
         return manager.setDevicePreviewMode(mode, normalizeBrowserTarget(params));
+    });
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_UPDATE_DEVICE_PREVIEW, async (event, params) => {
+        if (!trustedPreviewHost(event) || !validPreviewTarget(params)) {
+            return { success: false, error: 'Invalid device preview host or target' };
+        }
+        const raw = params;
+        if (!isBrowserPreviewScope(raw.previewScope) || !isBrowserDevicePreviewRequest(raw.request)) {
+            return { success: false, error: 'Invalid local device preview request' };
+        }
+        return manager.updateDevicePreview(raw.request, {
+            sessionId: params.sessionId,
+            tabId: params.tabId,
+        });
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION, async (_event, params) => {
         const raw = params && typeof params === 'object' ? params : {};
@@ -368,6 +452,17 @@ export function setupEmbeddedBrowserIPC() {
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_CACHE, async (_event, params) => manager.clearCache(normalizeBrowserTarget(params)));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SET_COMMENT_MODE, async (_event, params) => {
         const palette = normalizeCommentThemePalette(params?.palette);
+        const strings = normalizeCommentStrings(params?.strings);
+        // Only a missing field opts into legacy full-page handling.
+        // Explicit malformed values must never widen the operation.
+        let selectiveKeys;
+        if (params && 'commentKeys' in params) {
+            const result = normalizeCommentKeys(params.commentKeys);
+            if (!result.ok)
+                return { success: false, error: result.error };
+            if (result.selective)
+                selectiveKeys = result.keys;
+        }
         return manager.setCommentMode(Boolean(params?.enabled), typeof params?.placeholder === 'string' ? params.placeholder : undefined, {
             clearComments: Boolean(params?.clearComments),
             ...(params?.selectionMode === 'dom_node' || params?.selectionMode === 'free_rect'
@@ -377,10 +472,92 @@ export function setupEmbeddedBrowserIPC() {
                 ? { theme: params.theme }
                 : {}),
             ...(palette ? { palette } : {}),
+            ...(strings ? { strings } : {}),
+            ...(typeof params?.locale === 'string' && params.locale
+                ? { locale: params.locale.slice(0, 20) }
+                : {}),
+            ...(params?.markSent === true ? { markSent: true } : {}),
+            ...(selectiveKeys !== undefined ? { commentKeys: selectiveKeys } : {}),
+            ...(typeof params?.propsExpanded === 'boolean'
+                ? { propsExpanded: params.propsExpanded }
+                : {}),
             ...normalizeBrowserTarget(params),
         });
     });
-    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_COMMENTS, async (_event, params) => manager.clearComments(normalizeBrowserTarget(params)));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_RESOLVE_SENT_COMMENTS, async (_event, params) => {
+        let selectiveKeys;
+        if (params && 'commentKeys' in params) {
+            const result = normalizeCommentKeys(params.commentKeys);
+            if (!result.ok)
+                return { success: false, error: result.error };
+            if (result.selective)
+                selectiveKeys = result.keys;
+        }
+        let revisions;
+        if (params && 'commentRevisions' in params) {
+            const result = normalizeCommentRevisions(params.commentRevisions, selectiveKeys);
+            if (!result.ok)
+                return { success: false, error: result.error };
+            revisions = result.revisions;
+        }
+        return manager.resolveSentComments(params?.status === 'done' ? 'done' : 'cancelled', normalizeBrowserTarget(params), selectiveKeys !== undefined
+            ? { commentKeys: selectiveKeys, ...(revisions ? { commentRevisions: revisions } : {}) }
+            : undefined);
+    });
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_REMOVE_COMMENT, async (_event, params) => {
+        const commentId = Number(params?.commentId);
+        if (!Number.isInteger(commentId) || commentId <= 0) {
+            return { success: false, error: 'Invalid comment id' };
+        }
+        // An explicit bad `commentKey` must be refused outright: a stale or
+        // malformed key cannot fall back to the mutable commentId, and we
+        // must not silently strip it. The host should retry with a valid
+        // (or omitted) key.
+        let validatedKey;
+        if (params && 'commentKey' in params) {
+            const result = validateCommentKey(params.commentKey);
+            if (!result.ok)
+                return { success: false, error: result.error };
+            validatedKey = result.key;
+        }
+        return manager.removeComment({
+            commentId,
+            ...(validatedKey !== undefined ? { commentKey: validatedKey } : {}),
+            ...(typeof params?.selector === 'string' ? { selector: params.selector } : {}),
+            ...(typeof params?.pageUrl === 'string' ? { pageUrl: params.pageUrl } : {}),
+        }, normalizeBrowserTarget(params));
+    });
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE, async (_event, params) => manager.updateCommentVoice({
+        state: params?.state === 'listening' || params?.state === 'transcribing'
+            ? params.state
+            : 'idle',
+        ...(typeof params?.text === 'string' ? { text: params.text.slice(0, 4000) } : {}),
+    }, normalizeBrowserTarget(params)));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_COMMENTS, async (_event, params) => {
+        // Only a missing field opts into legacy full-page handling. An
+        // explicit malformed `commentKeys` array must fail closed without
+        // ever widening into a full clear.
+        let selectiveKeys;
+        if (params && 'commentKeys' in params) {
+            const result = normalizeCommentKeys(params.commentKeys);
+            if (!result.ok)
+                return { success: false, error: result.error };
+            if (result.selective)
+                selectiveKeys = result.keys;
+        }
+        let revisions;
+        if (params && 'commentRevisions' in params) {
+            const result = normalizeCommentRevisions(params.commentRevisions, selectiveKeys);
+            if (!result.ok)
+                return { success: false, error: result.error };
+            revisions = result.revisions;
+        }
+        return manager.clearComments(normalizeBrowserTarget(params), {
+            ...(params?.markSent === true ? { markSent: true } : {}),
+            ...(selectiveKeys !== undefined ? { commentKeys: selectiveKeys } : {}),
+            ...(revisions ? { commentRevisions: revisions } : {}),
+        });
+    });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_ACK_COMMENT_EVENTS, async (_event, params) => manager.ackCommentEvents({
         ...normalizeBrowserTarget(params),
         ...(typeof params?.throughEventId === 'number'

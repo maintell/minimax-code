@@ -69,6 +69,8 @@ const SESSION_TURN_METHODS = new Set([
     'enqueueMessage',
     'requestCompaction',
     'steerSession',
+    'cancelPromptSuggestion',
+    'getPromptSuggestion',
 ]);
 /** Desktop Plugin Marketplace and standalone Skill management. */
 const PLUGIN_SERVICE_METHODS = new Set([
@@ -254,6 +256,13 @@ const MEMORY_V2_METHODS = new Set([
     'getMemoryV2Onboarding',
     'completeMemoryV2Onboarding',
 ]);
+const GOAL_OWNER_METHODS = new Set([
+    'createGoal',
+    'getGoal',
+    'patchGoal',
+    'deleteGoal',
+    'dismissGoal',
+]);
 const OWNER_METHOD_GROUPS = {
     agent: AGENT_OWNER_METHODS,
     canvas: CANVAS_OWNER_METHODS,
@@ -274,6 +283,7 @@ const OWNER_METHOD_GROUPS = {
     globalInstructions: GLOBAL_INSTRUCTIONS_METHODS,
     channel: CHANNEL_OWNER_METHODS,
     memoryV2: MEMORY_V2_METHODS,
+    goal: GOAL_OWNER_METHODS,
 };
 /** Worktree routes are always owned by the V2 front door and never fall through. */
 const WORKTREE_METHODS = new Set([
@@ -302,6 +312,15 @@ const MCP_METHODS = new Set([
     'getLocalMcpRuntimeSyncStatus',
     'callLocalMcpRuntimeTool',
 ]);
+/** User/project hooks.json settings have no v1 owner; absent services answer 503. */
+const HOOK_METHODS = new Set([
+    'listLocalHooks',
+    'createLocalHook',
+    'updateLocalHook',
+    'deleteLocalHook',
+    'setLocalHookEnabled',
+    'setLocalHookScopeEnabled',
+]);
 /**
  * 只有生产组装提供完整 Application 依赖图时，Session/Application 路由才会启用。
  * 该能力与 Cron/event owner 分开判断，避免依赖不完整的 host 在此次整体切换中声明这些方法。
@@ -309,6 +328,11 @@ const MCP_METHODS = new Set([
 const SESSION_APPLICATION_METHODS = new Set([
     'pinAgent',
     'pinSession',
+    'listBackgroundTasks',
+    'getBackgroundTask',
+    'readBackgroundTaskOutput',
+    'stopBackgroundTask',
+    'deleteBackgroundTask',
     'getPinnedItemsOrder',
     'putPinnedItemsOrder',
     'getRootSession',
@@ -381,7 +405,12 @@ const RETIRED_CRON_METHODS = new Set([
 ]);
 export function migratedMethodsForHost(hasOwnerServices, hasSessionApplications = false) {
     // 每个 host 都挂载始终可用的探针和 worktree 路由；缺失 facade 时明确返回 503。
-    const migrated = new Set([...ALWAYS_MOUNTED_METHODS, ...WORKTREE_METHODS, ...MCP_METHODS]);
+    const migrated = new Set([
+        ...ALWAYS_MOUNTED_METHODS,
+        ...WORKTREE_METHODS,
+        ...MCP_METHODS,
+        ...HOOK_METHODS,
+    ]);
     if (typeof hasOwnerServices === 'boolean') {
         if (!hasOwnerServices)
             return migrated;

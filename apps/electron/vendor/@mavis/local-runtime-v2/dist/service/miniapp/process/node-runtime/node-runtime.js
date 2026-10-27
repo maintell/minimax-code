@@ -9,12 +9,20 @@ import { MAX_RUNNING_MINIAPP_SERVICES, MINIAPP_LOOPBACK_HEALTH_PATH, MINIAPP_LOO
 import { selectFailureAfterCleanup } from '../../supervisor/cleanup-settlement.js';
 import { MiniAppCleanupUnprovenError, markMiniAppRootTerminationProven } from '../../errors.js';
 import { sanitizeMiniAppRuntimeLogEvent } from '../../runtime-log.js';
+import { isMiniAppListenPortErrorCode } from './host-runner.js';
 import { createDirectNodeRootTerminator, } from './direct-root.js';
 import { attachStartupFailureDetail, captureStartupError, isRunnerErrorMessage, MiniAppNodeRuntimeError, runnerFailure, } from './node-runtime-startup-error.js';
 const LOOPBACK_HOST = '127.0.0.1';
 const PORT_MIN = 49_152;
 const PORT_MAX = 65_535;
 const PORT_COUNT = PORT_MAX - PORT_MIN + 1;
+/**
+ * Odd, so it is coprime with PORT_COUNT (2^14): one launch walks a full permutation of the
+ * range without repeats. The first five raw candidates are pairwise >= 1637 ports apart, which
+ * keeps a Windows excluded-port block from swallowing the whole retry budget. Skipping reserved
+ * ports advances the cursor, so attempted ports keep the no-repeat guarantee but not the spacing.
+ */
+const PORT_STRIDE = 6_007;
 const runtimeObservations = new Set();
 export function createMiniAppNodeRuntimeAdapter(options) {
     const resolved = resolveOptions(options);
@@ -81,8 +89,12 @@ async function prepareRuntime(input) {
     // One credential per process generation; port retries reuse it with a fresh startupToken.
     const loopbackToken = input.options.makeLoopbackToken();
     let lastError;
+    const candidates = candidatePortSequence(input);
     for (let index = 0; index < input.options.maxPortAttempts; index += 1) {
-        const port = candidatePort(input, index);
+        const port = candidates.next();
+        if (port === undefined) {
+            throw new MiniAppNodeRuntimeError('NO_CANDIDATE_PORT', 'No Host-approved port is available');
+        }
         const reservation = input.options.reservePort?.({
             pluginId: input.candidate.pluginId,
             port,
@@ -162,6 +174,7 @@ async function spawnAttempt(input, port, loopbackToken) {
         loopbackToken,
         hostConnectorPolicy: input.candidate.hostConnectorPolicy,
         agentPolicy: input.candidate.agentPolicy ?? { kind: 'deny-all' },
+        toolPolicy: input.candidate.toolPolicy ?? { kind: 'deny-all' },
     };
     const physicalRoot = input.physicalRoots.acquire(input.candidate.pluginId);
     let child;
@@ -309,7 +322,7 @@ async function ignoreClosedRejection(closed) {
     }
 }
 function createConnectorSession(input, child, fatal) {
-    const { hostConnectorPolicy, agentPolicy } = input.candidate;
+    const { hostConnectorPolicy, agentPolicy, toolPolicy } = input.candidate;
     if (!needsConnectorChannel(input.candidate))
         return undefined;
     if (!child.send || child.connected === false || !input.options.hostConnectorSessionFactory) {
@@ -320,6 +333,7 @@ function createConnectorSession(input, child, fatal) {
         processGeneration: input.processGeneration,
         providers: hostConnectorPolicy.kind === 'allowlist' ? hostConnectorPolicy.providers : [],
         ...(agentPolicy ? { agentPolicy } : {}),
+        ...(toolPolicy ? { toolPolicy } : {}),
         transport: child,
         onFatal: (error) => fatal.abort(error),
     });
@@ -597,7 +611,7 @@ function resolveOptions(options) {
         runnerStartTimeoutMs: 10_000,
         readinessProbeTimeoutMs: 500,
         readinessRetryMs: 50,
-        maxPortAttempts: 3,
+        maxPortAttempts: 5,
     };
     const defined = Object.fromEntries(Object.entries(options).filter((entry) => entry[1] !== undefined));
     return {
@@ -617,11 +631,15 @@ function assertCapabilities(options, candidate) {
     if (candidate.agentPolicy?.kind === 'allowlist' && !options.hostConnectorSessionFactory) {
         throw new MiniAppNodeRuntimeError('HOST_CONNECTOR_UNAVAILABLE', 'Mini App Agent IPC session is unavailable');
     }
+    if (candidate.toolPolicy?.kind === 'allowlist' && !options.hostConnectorSessionFactory) {
+        throw new MiniAppNodeRuntimeError('HOST_CONNECTOR_UNAVAILABLE', 'Mini App tool IPC session is unavailable');
+    }
 }
-/** Connector and Agent access share one `miniapp:connector` IPC session. */
+/** Connector, Agent and tool access share one `miniapp:connector` IPC session. */
 function needsConnectorChannel(candidate) {
     return (candidate.hostConnectorPolicy.kind === 'allowlist' ||
-        candidate.agentPolicy?.kind === 'allowlist');
+        candidate.agentPolicy?.kind === 'allowlist' ||
+        candidate.toolPolicy?.kind === 'allowlist');
 }
 async function resolveDataDir(options, pluginId) {
     const requested = await options.resolvePluginDataDir(pluginId);
@@ -630,22 +648,30 @@ async function resolveDataDir(options, pluginId) {
     await options.ensureDirectory(requested);
     return options.resolveRealPath(requested);
 }
-function candidatePort(input, index) {
+/**
+ * Candidate 0 is the persisted preferred port (or the plugin's stable hash, unchanged from
+ * earlier releases). The sequence is created once per launch and only moves forward, so a port
+ * that already failed is never retried even when other reservations change meanwhile.
+ */
+function candidatePortSequence(input) {
+    const pluginId = input.candidate.pluginId;
     const preferred = input.preferredPort;
-    const digest = createHash('sha256').update(input.candidate.pluginId).digest();
-    const base = preferred !== undefined && preferred >= PORT_MIN && preferred <= PORT_MAX
+    const digest = createHash('sha256').update(pluginId).digest();
+    const first = preferred !== undefined && preferred >= PORT_MIN && preferred <= PORT_MAX
         ? preferred
         : PORT_MIN + (digest.readUInt32BE(0) % PORT_COUNT);
-    let available = 0;
-    for (let offset = 0; offset < PORT_COUNT; offset += 1) {
-        const port = PORT_MIN + ((base - PORT_MIN + offset) % PORT_COUNT);
-        if (input.options.isPortReserved({ pluginId: input.candidate.pluginId, port }))
-            continue;
-        if (available === index)
-            return port;
-        available += 1;
-    }
-    throw new MiniAppNodeRuntimeError('NO_CANDIDATE_PORT', 'No Host-approved port is available');
+    let step = 0;
+    return {
+        next() {
+            while (step < PORT_COUNT) {
+                const port = PORT_MIN + ((first - PORT_MIN + step * PORT_STRIDE) % PORT_COUNT);
+                step += 1;
+                if (!input.options.isPortReserved({ pluginId, port }))
+                    return port;
+            }
+            return undefined;
+        },
+    };
 }
 function runnerEnvironment(env) {
     const result = { ELECTRON_RUN_AS_NODE: '1' };
@@ -744,8 +770,9 @@ function throwIfAborted(signal) {
     if (signal.aborted)
         throw signal.reason;
 }
+/** Only runner-confirmed listen failures are retryable; Host-side spawn/fs errors keep their raw code. */
 function retryablePortError(error) {
-    return errorCode(error) === 'EADDRINUSE';
+    return isMiniAppListenPortErrorCode(errorCode(error));
 }
 function errorCode(error) {
     return isRecord(error) && typeof error.code === 'string' ? error.code : 'RUNTIME_START_FAILED';

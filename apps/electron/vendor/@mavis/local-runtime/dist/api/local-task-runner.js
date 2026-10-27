@@ -4,7 +4,7 @@ import { startBackgroundLocalTask } from '../background-task/runner.js';
 import { createLocalSubagentTaskRow } from '../background-task/subagent-task-row.js';
 import { persistLocalSubagentTaskTerminal } from '../background-task/terminal.js';
 import { taskTurnId } from '../background-task/turn-id.js';
-import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, readTaskOccupancy, runInjectedConversationTaskTurn, } from './injected-conversation-task-turn.js';
+import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, logTaskAdmissionRejectedAfterPrecheck, precheckTaskConcurrency, readTaskOccupancy, runInjectedConversationTaskTurn, } from './injected-conversation-task-turn.js';
 import { requireTaskConversation } from './local-task-host.js';
 import { normalizeLocalTaskInput, taskModelSelectionFor } from './local-task-input.js';
 import { resolveLocalTaskAgentTarget, taskSessionOwner } from './local-task-subagents.js';
@@ -32,6 +32,21 @@ export async function runForegroundLocalTask(input) {
     }
     const agentName = target.resolvedAgentName;
     const taskModelSelection = taskModelSelectionFor(taskInput);
+    // Admission needs the child Session to find its parent, so a full parent is
+    // checked here first to avoid leaving an empty child Session behind.
+    const precheckFailure = await precheckTaskConcurrency({
+        conversation: input.host.runtimeConversation,
+        parentSessionId: input.parentSession.sessionId,
+        requestedAgentName: target.requestedName,
+    });
+    if (precheckFailure) {
+        return {
+            status: 'failed',
+            requestedAgentName: target.requestedName,
+            resolvedAgentName: agentName,
+            ...precheckFailure,
+        };
+    }
     // A foreground run uses the same task state machine as a background one, so
     // an exception anywhere below still leaves a terminal row with an output the
     // owner can re-read through task_output.
@@ -119,9 +134,18 @@ export async function runForegroundLocalTask(input) {
     catch (error) {
         if (childSession)
             input.toolCtx.pluginSubagentLifecycle?.cancel(childSession.sessionId);
-        const occupancy = isSubagentConcurrencyLimitRejection(error)
+        const concurrencyRejected = isSubagentConcurrencyLimitRejection(error);
+        const occupancy = concurrencyRejected
             ? await readTaskOccupancy(input.host.runtimeConversation, input.parentSession.sessionId)
             : undefined;
+        if (concurrencyRejected) {
+            logTaskAdmissionRejectedAfterPrecheck({
+                parentSessionId: input.parentSession.sessionId,
+                taskId,
+                childSessionId: childSession?.sessionId,
+                occupancy,
+            });
+        }
         const failure = {
             status: 'failed',
             requestedAgentName: target.requestedName,

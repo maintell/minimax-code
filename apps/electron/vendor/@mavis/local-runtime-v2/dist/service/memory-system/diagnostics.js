@@ -4,7 +4,7 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open } from 'node:fs/promises';
 import { join } from 'node:path';
 const MEMORIES_DIR = 'memories';
-/** 详细日志目录（相对 dataDir，正斜杠便于报告链接复用）；V2 只写 memories/，Reset 与留存清理只作用于 scopes/、staging/、tmp/。 */
+/** 详细日志目录（相对 dataDir，正斜杠便于报告链接复用）；V2 只写 memories/，Reset 与留存清理只作用于 scopes/、tmp/ 与用户资料迁移副本 legacy/user.md。 */
 export const MEMORY_DIAGNOSTICS_DIR = `${MEMORIES_DIR}/logs`;
 /** 完整本地调试记录；业务调用只观察结果，日志失败独立降级。 */
 export class MemoryDiagnostics {

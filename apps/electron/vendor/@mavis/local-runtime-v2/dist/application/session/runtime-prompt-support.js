@@ -56,6 +56,8 @@ export async function createRuntimePromptSessionSupport(input) {
                             : undefined;
                     },
                     client: options.computerUseClient,
+                    readSessionTitle: async (sessionId) => (await productionSessionComposition.sessionSystem.sessions.repository.get(sessionId))
+                        ?.title,
                     logger: options.logger,
                 }),
             },

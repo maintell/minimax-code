@@ -1,3 +1,4 @@
+import { parsePluginMentions } from '@mavis/shared/plugin-mention';
 import { createSecretFreeTurnAssemblyContext } from '../assembly-context.js';
 import { createCanonicalAgentHostUserInput } from '../canonical-user-input.js';
 import { detectReferencedOfficialHostCapabilityPlugins } from '../assembly/local-turn-plugin-capabilities.js';
@@ -180,13 +181,11 @@ function validateAgentAssociation(expectedAgentName, agent) {
     }
 }
 async function resolveTaskComputerUseSelection(input) {
-    const trustedEnabled = input.capabilities?.plugins.some((plugin) => plugin.name === 'computer-use' &&
-        plugin.source === 'official' &&
-        plugin.hostCapabilities?.includes('computer-use') === true) === true;
-    if (!trustedEnabled)
+    const admission = computerUseSelectionAdmission(input);
+    if (!admission.allowed)
         return { active: false };
     const requestSelection = input.request.request.input.computerUse?.enable;
-    const explicitSelection = requestSelection === true && input.referenced;
+    const explicitSelection = requestSelection === true && admission.referenced;
     if (!input.runtimeFacts?.resolveComputerUseSelection)
         return { active: explicitSelection };
     const selection = requestSelection === false || explicitSelection ? { selection: explicitSelection } : {};
@@ -204,6 +203,26 @@ async function resolveTaskComputerUseSelection(input) {
     return {
         active: defaultSelection === 'enabled',
         unavailable: defaultSelection === 'unavailable',
+    };
+}
+function computerUseSelectionAdmission(input) {
+    const trustedEnabled = input.capabilities?.plugins.some((plugin) => plugin.name === 'computer-use' &&
+        plugin.source === 'official' &&
+        plugin.hostCapabilities?.includes('computer-use') === true) === true;
+    if (!trustedEnabled)
+        return { allowed: false, referenced: false };
+    if (!input.runtimeFacts?.snapshot().computerUseRequiresInteractiveTurn) {
+        return { allowed: true, referenced: input.referenced };
+    }
+    // Interactive Bindings do not authorize task children, cron, or channel turns.
+    const userInput = input.request.request.input;
+    const canonicalReference = [
+        userInput.text,
+        ...(userInput.queuedMessages ?? []).map((m) => m.text),
+    ].some((text) => parsePluginMentions(text).some((mention) => mention.pluginId === 'computer-use@official'));
+    return {
+        allowed: isComputerUseDefaultEligible(input.session, input.request.request),
+        referenced: input.referenced && canonicalReference,
     };
 }
 // Positive admission only: background producers can target ordinary sessions too.

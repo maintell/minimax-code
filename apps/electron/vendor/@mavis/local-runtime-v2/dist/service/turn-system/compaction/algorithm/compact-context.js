@@ -8,17 +8,7 @@ export async function compactContext(input) {
     validateInput(input);
     input.signal?.throwIfAborted();
     const instructions = input.instructions?.trim() || undefined;
-    let planning;
-    if (input.allowLegacyToolTrim === false) {
-        planning = instructions
-            ? { candidate: input.toolResultCompactionCandidate }
-            : await planDirectToolResultCompaction(input, input.toolResultCompactionCandidate);
-    }
-    else {
-        planning = instructions
-            ? { candidate: captureToolTrimCandidate(input.history) }
-            : await planDirectTrim(input);
-    }
+    const planning = await planCompaction(input, instructions);
     input.signal?.throwIfAborted();
     if (planning.decision)
         return planning.decision;
@@ -76,6 +66,22 @@ function buildCheckpointReplacement(input, summary, { reminder, subagents, earli
         }),
         ...(reminder ? [reminder] : []),
     ];
+}
+/**
+ * Tool-result admission may decide the compaction without a checkpoint, unless
+ * the user gave instructions or the caller requires a checkpoint; the
+ * candidate then only serves as smaller checkpoint input.
+ */
+async function planCompaction(input, instructions) {
+    const directAllowed = !instructions && input.checkpointRequired !== true;
+    if (input.allowLegacyToolTrim === false) {
+        return directAllowed
+            ? await planDirectToolResultCompaction(input, input.toolResultCompactionCandidate)
+            : { candidate: input.toolResultCompactionCandidate };
+    }
+    return directAllowed
+        ? await planDirectTrim(input)
+        : { candidate: captureToolTrimCandidate(input.history) };
 }
 async function captureSubagents(input) {
     if (!input.captureSubagents)

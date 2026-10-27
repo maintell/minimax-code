@@ -204,6 +204,14 @@ function isUtilityRunawayGuardConfig(value) {
         hasOnlyKeys(value, ['enabled']) &&
         (value.enabled === undefined || typeof value.enabled === 'boolean'));
 }
+/**
+ * Main parses fields with `parsePromptSuggestionRemotePolicy` before posting,
+ * so the utility boundary only checks the envelope shape. Staying lenient keeps
+ * a newer field from failing `runtime-init` and blocking the runtime start.
+ */
+function isUtilityPromptSuggestionPolicy(value) {
+    return isRecord(value) && !Array.isArray(value);
+}
 function isUtilityToolResultCompactionConfig(value) {
     if (value === undefined)
         return true;
@@ -216,6 +224,7 @@ function isUtilityToolResultCompactionConfig(value) {
             'minSavingsBytes',
             'minCandidateBytes',
             'keepRecentRounds',
+            'checkpointSharedPrefix',
         ])) {
         return false;
     }
@@ -226,7 +235,9 @@ function isUtilityToolResultCompactionConfig(value) {
         (value.watermarkBytes === undefined || isPositiveSafeInteger(value.watermarkBytes)) &&
         (value.minSavingsBytes === undefined || isPositiveSafeInteger(value.minSavingsBytes)) &&
         (value.minCandidateBytes === undefined || isPositiveSafeInteger(value.minCandidateBytes)) &&
-        (value.keepRecentRounds === undefined || isPositiveSafeInteger(value.keepRecentRounds)));
+        (value.keepRecentRounds === undefined || isPositiveSafeInteger(value.keepRecentRounds)) &&
+        (value.checkpointSharedPrefix === undefined ||
+            typeof value.checkpointSharedPrefix === 'boolean'));
 }
 function isPromptConfigKey(value) {
     return (value === undefined ||
@@ -247,6 +258,7 @@ export function isUtilityControlMessage(value) {
                 'contextWindowUsageEnabled',
                 'toolResultCompactionConfig',
                 'runawayGuardConfig',
+                'promptSuggestionPolicy',
                 'startupExecutionPolicy',
                 'collectionPolicy',
                 'computerUseGeneration',
@@ -273,6 +285,8 @@ export function isUtilityControlMessage(value) {
                 isUtilityToolResultCompactionConfig(value.toolResultCompactionConfig) &&
                 (value.runawayGuardConfig === undefined ||
                     isUtilityRunawayGuardConfig(value.runawayGuardConfig)) &&
+                (value.promptSuggestionPolicy === undefined ||
+                    isUtilityPromptSuggestionPolicy(value.promptSuggestionPolicy)) &&
                 (value.collectionPolicy === undefined || isCollectionPolicy(value.collectionPolicy)) &&
                 (value.contextWindowUsageEnabled === undefined ||
                     typeof value.contextWindowUsageEnabled === 'boolean') &&
@@ -294,6 +308,8 @@ export function isUtilityControlMessage(value) {
             return (hasMessageKeys(value, ['type', 'generation']) && isPositiveSafeInteger(value.generation));
         case 'runtime-runaway-guard-config':
             return hasMessageKeys(value, ['type', 'config']) && isUtilityRunawayGuardConfig(value.config);
+        case 'runtime-prompt-suggestion-policy':
+            return (hasMessageKeys(value, ['type', 'policy']) && isUtilityPromptSuggestionPolicy(value.policy));
         case 'runtime-tool-result-compaction-config':
             return (hasMessageKeys(value, ['type', 'config']) &&
                 isUtilityToolResultCompactionConfig(value.config));
@@ -413,6 +429,7 @@ export let BROWSER_BROKER_ACTIONS = [
     'click',
     'click_and_wait_for_navigation',
     'double_click',
+    'triple_click',
     'drag',
     'fill',
     'type',

@@ -12,9 +12,12 @@ import { Type } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
 import { normalizeLLMError, toLLMMetricErrorKind, } from '@mavis/shared/llm-error-classifier';
 import { redactMemorySecrets } from '../secret-redactor.js';
+import { estimateCaptureTokens } from '../contracts/token-estimate.js';
 import { MANAGED_MINIMAX_PROVIDER_ID } from '../../model-system/index.js';
 import { createConsolidationWorkdirTools, } from './consolidation-workdir-tools.js';
 const MAX_CACHED_CONTRACTS = 16;
+/** 产物结构版本：3 起抽取与迁移都经提交工具输出，整理经工作目录文件输出。 */
+const OUTPUT_SCHEMA_VERSION = 3;
 // Leave headroom between the model's generation target and publication limits.
 const CONSOLIDATION_PROMPT_BUDGET_RATIO = 0.8;
 export class MemoryV2ModelGateway {
@@ -39,22 +42,25 @@ export class MemoryV2ModelGateway {
         const modelName = model.modelName;
         const reasoningEffort = configuredEffort(kind, config);
         const promptSha256 = sha256(prompt);
-        const maxInputTokens = Math.min(contractInputLimit(kind, config), positiveInteger(model.maxInputTokens, 'model input token limit'));
+        const maxInputTokens = Math.max(1, Math.min(contractInputLimit(kind, config), positiveInteger(model.maxInputTokens, 'model input token limit') -
+            singleCallOverheadTokens(kind, prompt)));
         const maxOutputTokens = positiveInteger(model.maxOutputTokens, 'model output token limit');
         // contractId 参与 digest：其中任何一项变化都必须触发重抽或重建(§5.4/§2.4)。
         const contractId = sha256(stableStringify({
             schemaVersion: 2,
             kind,
-            modelName,
-            reasoningEffort,
-            modelParameters: model.parameters,
+            ...contractModelFields(kind, {
+                modelName,
+                reasoningEffort,
+                modelParameters: model.parameters,
+                maxInputTokens,
+                maxOutputTokens,
+            }),
             promptSha256,
-            outputSchemaVersion: kind === 'migration' ? 2 : 3,
-            ...(kind === 'capture' ? { outputTool: CAPTURE_OUTPUT_TOOL } : {}),
-            maxInputTokens,
-            maxOutputTokens,
+            outputSchemaVersion: OUTPUT_SCHEMA_VERSION,
+            ...outputToolField(kind),
             ...contractConfigFields(kind, config),
-            canonicalInputVersion: kind === 'consolidation' ? 6 : 5,
+            canonicalInputVersion: kind === 'consolidation' ? 6 : CAPTURE_CANONICAL_INPUT_VERSION,
         }));
         const contract = {
             kind,
@@ -62,7 +68,7 @@ export class MemoryV2ModelGateway {
             modelName,
             reasoningEffort,
             promptSha256,
-            outputSchemaVersion: kind === 'migration' ? 2 : 3,
+            outputSchemaVersion: OUTPUT_SCHEMA_VERSION,
             maxInputTokens,
             maxOutputTokens,
             prompt,
@@ -81,6 +87,7 @@ export class MemoryV2ModelGateway {
             buildPayload: () => stableStringify({
                 snapshot: input.snapshot,
                 forgetRules: input.forgetRules,
+                previousDocument: input.previousDocument,
                 maxDocBytes: input.maxDocBytes,
             }),
         });
@@ -125,7 +132,8 @@ export class MemoryV2ModelGateway {
             kind: 'migration',
             contractId: input.contractId,
             callerSignal: input.signal,
-            parse: parseDocumentOutput,
+            parse: parseMigrationOutput,
+            outputTool: MIGRATION_OUTPUT_TOOL,
             buildPayload: () => stableStringify({
                 source: input.source,
                 agentName: input.agentName,
@@ -174,11 +182,7 @@ export class MemoryV2ModelGateway {
             const latest = await this.resolveContract(kind);
             if (latest.contractId !== contractId)
                 return { status: 'stale-contract' };
-            if (options.outputTool)
-                return { status: 'ok', output: parse(raw) };
-            if (typeof raw !== 'string')
-                throw new InvalidModelOutputError('Expected response text');
-            return { status: 'ok', output: parse(JSON.parse(raw)) };
+            return { status: 'ok', output: parse(raw) };
         }
         catch (error) {
             return classifyFailure(error);
@@ -204,10 +208,35 @@ function configuredEffort(kind, config) {
         ? config.consolidationReasoningEffort
         : config.captureReasoningEffort;
 }
+/**
+ * 单发调用（抽取与迁移）的系统提示与输出工具定义也占模型输入窗口，合同上限先扣掉这部分，
+ * 剩余额度才分给 payload；整理是多轮工具循环，上下文随读取增长，按自身预算约束。
+ */
+function singleCallOverheadTokens(kind, prompt) {
+    if (kind === 'consolidation')
+        return 0;
+    return estimateCaptureTokens(prompt) + estimateCaptureTokens(JSON.stringify(outputTool(kind)));
+}
+/** 单发调用一律经工具提交产物；工具定义决定输出结构，因此进入合同。 */
+function outputTool(kind) {
+    return kind === 'capture' ? CAPTURE_OUTPUT_TOOL : MIGRATION_OUTPUT_TOOL;
+}
+function outputToolField(kind) {
+    return kind === 'consolidation' ? {} : { outputTool: outputTool(kind) };
+}
 function contractInputLimit(kind, config) {
     if (kind === 'consolidation')
         return config.maxConsolidationInputTokens;
     return config.maxCaptureInputTokens;
+}
+/**
+ * 执行模型的身份与容量。抽取的指纹只含会话修订、不含输入快照，模型或输入预算变化只能经合同
+ * 触发重抽，因此全部进入抽取与迁移合同。整理合同只描述产物的格式与规则：选集变化由 inputDigest
+ * 覆盖，换模型、调推理强度或 token 上限都不改变产物语义，不让已有 MEMORY.md 失效、触发全量 INIT；
+ * 新模型从下一次整理起生效。
+ */
+function contractModelFields(kind, fields) {
+    return kind === 'consolidation' ? {} : fields;
 }
 function contractConfigFields(kind, config) {
     if (kind === 'consolidation') {
@@ -277,13 +306,16 @@ const CONSOLIDATION_AGENT_HARNESS = [
     '你在临时工作目录中执行任务简报指定的 INIT 或 INCREMENTAL 模式。两种模式都通过文件工具写入产物，最终回复正文不承担交付。可用工具：',
     '- `list_files`：列出工作目录中的全部文件。',
     '- `read_file`：按 path 与可选 line_offset 读取最多 200 行，沿 next_line_offset 续读，null 表示末尾。',
-    '- `write_file`：只可整体覆写 MEMORY.md 与 memory_summary.md，输入文件只读。',
+    '- `write_file`：整体覆写 MEMORY.md 或 memory_summary.md。',
+    '- `edit_file`：把 MEMORY.md 或 memory_summary.md 中唯一出现的 old_string 替换为 new_string，new_string 为空即删除。',
+    '- 其余文件只读。',
     '',
     '约定：',
     '1. 先完整读取 `changes.md`；INIT 分段读完全部当前材料与规则，INCREMENTAL 按变化清单读取相关材料。',
     '2. 直接编辑 `MEMORY.md` 与 `memory_summary.md`；这是本轮唯一需要产出的两个文件。',
-    '3. 编辑完成后结束工具调用，最终回复无格式要求；宿主读取文件校验结果。',
-    '4. 轮次与 token 预算有限，避免重复读取同一文件。',
+    '3. INCREMENTAL 用 `edit_file` 只改变化的条目，不要整份重写 MEMORY.md；单次回复的输出有长度上限，超出时其中的工具调用会被截断且不会执行。',
+    '4. 编辑完成后结束工具调用，最终回复无格式要求；宿主读取文件校验结果。',
+    '5. 轮次与 token 预算有限，避免重复读取同一文件。',
 ].join('\n');
 /** 首条用户简报：程序合成的变更事实与预算；逐行 diff 在工作目录 changes.md。 */
 function renderConsolidationBriefing(input) {
@@ -330,30 +362,38 @@ function parseCaptureOutput(value) {
     const summary = normalize(value.rollout_summary);
     const memory = normalize(value.raw_memory);
     const slug = normalize(value.rollout_slug ?? '');
-    if (!summary && !memory && !slug)
+    // 原始记忆为空即模型判定无事可记；摘要与名称只是复盘，单独留存对整理没有价值。
+    if (!memory)
         return { document: '' };
-    if (!summary || !memory)
-        throw new InvalidModelOutputError('Expected both summary and raw memory');
+    if (!summary)
+        throw new InvalidModelOutputError('Expected a summary for the raw memory');
     return {
         document: `# ${slug.split('\n')[0] || '会话记忆'}\n\n## 简短名称\n${slug}\n\n## 会话摘要\n${summary}\n\n## 原始记忆\n${memory}`,
     };
 }
+const MIGRATION_OUTPUT_TOOL = {
+    name: 'submit_migrated_memory',
+    description: '提交该旧记忆文件迁移后的会话记忆文档。仅调用一次；document 为空表示没有值得迁移的内容。',
+    parameters: Type.Object({
+        document: Type.String({
+            description: '迁移后的 Markdown 会话记忆文档，不含 frontmatter。',
+        }),
+    }, { additionalProperties: false }),
+};
 /** 旧记忆迁移返回一份文档字符串；输出侧脱敏与换行归一在此完成。 */
-function parseDocumentOutput(value) {
-    const root = asRecord(value);
-    if (typeof root.document !== 'string') {
-        throw new InvalidModelOutputError('Expected document to be a string');
+function parseMigrationOutput(value) {
+    if (!Value.Check(MIGRATION_OUTPUT_TOOL.parameters, value)) {
+        throw new InvalidModelOutputError('Invalid memory migration tool arguments');
     }
-    const normalized = root.document.replace(/\r\n?/gu, '\n');
+    const normalized = value.document.replace(/\r\n?/gu, '\n');
     return { document: redactMemorySecrets(normalized).content };
 }
-function asRecord(value) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-        throw new InvalidModelOutputError('Expected an object');
-    }
-    return value;
-}
 /** 键排序的稳定序列化:相同输入必须产生相同字节(§2.4)。 */
+/**
+ * 抽取输入投影版本：6 起工具结果按首尾截断，并随输入附带上一版会话记忆文档。
+ * 版本进入 contractId，变化后全部会话按新输入重抽一次。
+ */
+const CAPTURE_CANONICAL_INPUT_VERSION = 6;
 function stableStringify(value) {
     return JSON.stringify(sortKeys(value));
 }

@@ -42,6 +42,28 @@ export function modelSelectionFromRecord(record) {
         ...(effort ? { thinking: { effort } } : {}),
     };
 }
+/**
+ * The selection a queue item froze at admission; undefined when it froze none. Admission keeps
+ * the thinking switch as `reasoning`, which the turn runs on ahead of any `variant`; it maps back
+ * to the public variant the way the runtime itself projects it (`thinking` / `''`).
+ */
+export function modelSelectionFromQueue(model) {
+    if (!model?.provider_id || !model.model_id)
+        return undefined;
+    const effort = model.thinking?.effort;
+    const variant = frozenVariant(model);
+    return {
+        providerId: model.provider_id,
+        modelId: model.model_id,
+        ...(typeof variant === 'string' ? { variant } : {}),
+        ...(effort ? { thinking: { effort } } : {}),
+    };
+}
+function frozenVariant(model) {
+    if (model.reasoning === undefined)
+        return model.variant;
+    return model.reasoning ? 'thinking' : '';
+}
 export function sessionModelFields(selection) {
     return {
         effectiveModel: `${selection.providerId}/${selection.modelId}`,

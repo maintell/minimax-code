@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { MINIAPP_AGENT_FAILURE_CODES, readMiniAppAgentRunEvent, readMiniAppAgentRunResult, toMiniAppAgentFailureCode, isMiniAppAgentBusyReason, readMiniAppAgentModelSelection, MINIAPP_AGENT_MAX_TEXT_LENGTH, isMiniAppAgentPermissionDecision, readMiniAppAgentAnswers, readMiniAppAgentModels, readMiniAppAgentAgents, readMiniAppAgentCreateResponse, validateMiniAppSurfaceWindow } from "@mavis/shared/miniapp-surface";
+import { MINIAPP_AGENT_FAILURE_CODES, readMiniAppAgentObservedEvent, readMiniAppAgentRunEvent, readMiniAppAgentRunResult, toMiniAppAgentFailureCode, isMiniAppAgentBusyReason, parseMiniAppPermissionId, readMiniAppAgentModelSelection, MINIAPP_AGENT_MAX_TEXT_LENGTH, isMiniAppAgentWhenBusy, isMiniAppAgentPermissionDecision, readMiniAppAgentAnswers, readMiniAppAgentObserveTarget, readMiniAppAgentSessionList, readMiniAppAgentSessionDetail, readMiniAppAgentModels, readMiniAppAgentAgents, readMiniAppAgentCreateResponse, validateMiniAppSurfaceWindow, parseMiniAppPermissionList } from "@mavis/shared/miniapp-surface";
 import { parseMiniAppLoopbackOrigin } from "../../browser/miniapp-loopback-origin";
 import { isSafeBrokerRequestId } from "./control";
 const UTILITY_CONSOLE_LOGGER = {
@@ -15,6 +15,10 @@ const MINIAPP_ERROR_MESSAGES = {
     start_failed: 'Mini App failed to start',
     detach_failed: 'Mini App page could not open in its own window',
     attach_failed: 'Mini App page could not return to the panel',
+    no_update: 'Mini App has no pending update',
+    update_failed: 'Mini App update failed',
+    permission_unknown: 'Mini App does not declare this permission',
+    permission_failed: 'Mini App permission could not be changed',
     not_permitted: 'Mini App Agent access is not permitted',
     session_not_found: 'Mini App Agent session was not found',
     cancelled: 'Mini App Agent run was cancelled',
@@ -30,11 +34,42 @@ const MINIAPP_SURFACE_ERROR_CODE_SET = new Set([
     'refresh_failed',
     'stop_failed',
     'start_failed',
+    'no_update',
+    'update_failed',
+    'permission_unknown',
+    'permission_failed',
 ]);
 const REQUEST_TIMEOUT_MS = 60000;
 const REQUEST_SETTLEMENT_TIMEOUT_MS = 15000;
 function isAgentTurnMethod(method) {
     return method === 'agent.run' || method === 'agent.answer';
+}
+/** The one place a method's settlement rules are decided; every settlement path reads it. */
+const AGENT_METHOD_TRAITS = {
+    'agent.run': { stream: true, unknownOnLoss: true },
+    'agent.answer': { stream: true, unknownOnLoss: true },
+    'agent.observe': { stream: true, unknownOnLoss: false },
+    'agent.reply': { stream: false, unknownOnLoss: true },
+    'agent.open': { stream: false, unknownOnLoss: true },
+    'agent.panelOpened': { stream: false, unknownOnLoss: true },
+    'agent.panelClosed': { stream: false, unknownOnLoss: true },
+    'agent.models': { stream: false, unknownOnLoss: true },
+    'agent.agents': { stream: false, unknownOnLoss: true },
+    'agent.create': { stream: false, unknownOnLoss: true },
+    'agent.sessions': { stream: false, unknownOnLoss: false },
+    'agent.session': { stream: false, unknownOnLoss: false },
+};
+function isAgentStreamMethod(method) {
+    return isAgentMethod(method) && AGENT_METHOD_TRAITS[method].stream;
+}
+function isAgentReadMethod(method) {
+    return method === 'agent.sessions' || method === 'agent.session';
+}
+/** How a lost Agent settlement is reported; `undefined` for a surface method. */
+function lostAgentSettlementCode(method) {
+    if (!isAgentMethod(method))
+        return undefined;
+    return AGENT_METHOD_TRAITS[method].unknownOnLoss ? 'result_unknown' : 'runtime_unavailable';
 }
 function isAgentPanelMethod(method) {
     return method === 'agent.panelOpened' || method === 'agent.panelClosed';
@@ -43,12 +78,7 @@ function isAgentCatalogMethod(method) {
     return method === 'agent.models' || method === 'agent.agents' || method === 'agent.create';
 }
 function isAgentMethod(method) {
-    return (method === 'agent.run' ||
-        method === 'agent.answer' ||
-        method === 'agent.reply' ||
-        method === 'agent.open' ||
-        isAgentCatalogMethod(method) ||
-        isAgentPanelMethod(method));
+    return (typeof method === 'string' && Object.prototype.hasOwnProperty.call(AGENT_METHOD_TRAITS, method));
 }
 function isAgentCatalogRequest(message) {
     return isAgentCatalogMethod(message.method);
@@ -140,6 +170,23 @@ export class MainMiniAppBrokerClient {
         }
         return this.dispatch(target, message, signal);
     }
+    /** Short request; resolves with the stored permission list. */
+    setPermission(target, input) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'permissions.set',
+            payload: {
+                pluginId: input.pluginId,
+                permission: input.permission,
+                enabled: input.enabled,
+            },
+        };
+        if (!isMiniAppBrokerRequestMessage(message)) {
+            return Promise.reject(miniAppError('invalid_request'));
+        }
+        return this.dispatch(target, message);
+    }
     /** Agent turns can run for minutes: no request deadline, only caller cancellation or target loss. */
     runAgent(target, input, options = {}) {
         return this.dispatchAgentTurn(target, {
@@ -152,6 +199,7 @@ export class MainMiniAppBrokerClient {
                 ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
                 ...copyAgentModel(input.model),
                 ...(input.agent !== undefined ? { agent: input.agent } : {}),
+                ...(input.whenBusy !== undefined ? { whenBusy: input.whenBusy } : {}),
                 observe: options.onEvent !== undefined,
             },
         }, options);
@@ -242,6 +290,53 @@ export class MainMiniAppBrokerClient {
             throw miniAppError('invalid_request');
         await this.dispatch(target, message);
     }
+    /**
+     * Streams events until the caller cancels (then rejects with an AbortError) or the Utility
+     * ends the subscription (resolves). No request deadline.
+     */
+    async observeAgent(target, input, options) {
+        if (options.signal?.aborted)
+            throw abortError();
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'agent.observe',
+            payload: { caller: copyAgentCaller(input.caller), target: copyObserveTarget(input.target) },
+        };
+        if (!isMiniAppBrokerRequestMessage(message))
+            throw miniAppError('invalid_request');
+        await this.dispatch(target, message, options.signal, {
+            observed: true,
+            onEvent: options.onEvent,
+        });
+    }
+    /** Short request under the ordinary request deadline. */
+    async listAgentSessions(target, input) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'agent.sessions',
+            payload: { caller: copyAgentCaller(input.caller) },
+        };
+        if (!isMiniAppBrokerRequestMessage(message))
+            throw miniAppError('invalid_request');
+        return (await this.dispatch(target, message));
+    }
+    /** Short request under the ordinary request deadline. */
+    async getAgentSession(target, input) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'agent.session',
+            payload: {
+                caller: copyAgentCaller(input.caller),
+                ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+            },
+        };
+        if (!isMiniAppBrokerRequestMessage(message))
+            throw miniAppError('invalid_request');
+        return (await this.dispatch(target, message)).session;
+    }
     dispatchAgentTurn(target, message, options) {
         const { signal, onEvent } = options;
         if (signal?.aborted)
@@ -249,12 +344,12 @@ export class MainMiniAppBrokerClient {
         if (!isMiniAppBrokerRequestMessage(message)) {
             return Promise.reject(miniAppError('invalid_request'));
         }
-        return this.dispatch(target, message, signal, onEvent);
+        return this.dispatch(target, message, signal, onEvent ? { observed: false, onEvent } : undefined);
     }
-    dispatch(target, message, signal, onEvent) {
+    dispatch(target, message, signal, events) {
         const { requestId, method } = message;
         return new Promise((resolve, reject) => {
-            const timeout = isAgentTurnMethod(method)
+            const timeout = isAgentStreamMethod(method)
                 ? undefined
                 : setTimeout(() => {
                     this.cancelRequest(requestId, target, 'deadline');
@@ -266,7 +361,7 @@ export class MainMiniAppBrokerClient {
                 reject,
                 ...(timeout ? { timeout } : {}),
                 ...(signal ? { signal } : {}),
-                ...(onEvent ? { onEvent } : {}),
+                ...(events ? { events } : {}),
                 requestPosted: false,
             };
             if (signal) {
@@ -331,7 +426,7 @@ export class MainMiniAppBrokerClient {
             if (pending.target !== target)
                 continue;
             // A submitted Agent request may still have applied; never let the page retry it implicitly.
-            this.reject(requestId, target, miniAppError(isAgentMethod(pending.method) ? 'result_unknown' : 'runtime_unavailable'));
+            this.reject(requestId, target, miniAppError(lostAgentSettlementCode(pending.method) ?? 'runtime_unavailable'));
         }
     }
     forwardEvent(target, value) {
@@ -340,13 +435,20 @@ export class MainMiniAppBrokerClient {
         if (!isSafeBrokerRequestId(value.requestId))
             return;
         const pending = this.pending.get(value.requestId);
-        if (!pending || pending.target !== target || !isAgentTurnMethod(pending.method))
+        if (!pending || pending.target !== target || !isAgentStreamMethod(pending.method))
             return;
-        const event = readMiniAppAgentRunEvent(value.event);
-        if (!event)
-            return;
+        const { events } = pending;
         try {
-            pending.onEvent?.(event);
+            if (events?.observed) {
+                const event = readMiniAppAgentObservedEvent(value.event);
+                if (event)
+                    events.onEvent(event);
+            }
+            else if (events) {
+                const event = readMiniAppAgentRunEvent(value.event);
+                if (event)
+                    events.onEvent(event);
+            }
         }
         catch {
             // Event delivery is best-effort and never settles the run.
@@ -373,7 +475,10 @@ export class MainMiniAppBrokerClient {
         const current = this.pending.get(requestId);
         if (!current || current.target !== target)
             return;
-        if ((current.method === 'stop' || isAgentTurnMethod(current.method)) && current.requestPosted) {
+        if ((current.method === 'stop' ||
+            current.method === 'applyUpdate' ||
+            isAgentTurnMethod(current.method)) &&
+            current.requestPosted) {
             this.cancelRequest(requestId, target, 'caller');
             return;
         }
@@ -390,6 +495,7 @@ export class MainMiniAppBrokerClient {
             return;
         const awaitAuthoritativeSettlement = pending.requestPosted &&
             (pending.method === 'stop' ||
+                pending.method === 'applyUpdate' ||
                 isAgentTurnMethod(pending.method) ||
                 (pending.method === 'open' && cancellation === 'deadline'));
         if (!awaitAuthoritativeSettlement) {
@@ -486,7 +592,7 @@ export class UtilityMiniAppBrokerServer {
             if (!this.takePending(requestId, pending))
                 return;
             if (!isMiniAppBrokerResult(result)) {
-                this.postError(requestId, 'start_failed');
+                this.postError(requestId, isPermissionMethod(value.method) ? 'permission_failed' : 'start_failed');
                 return;
             }
             this.postResult(requestId, value.method, result);
@@ -558,6 +664,14 @@ export class UtilityMiniAppBrokerServer {
             });
             return;
         }
+        if (request.method === 'agent.observe') {
+            this.observeAgent(agent, request, pending);
+            return;
+        }
+        if (request.method === 'agent.sessions' || request.method === 'agent.session') {
+            this.readAgentSessions(agent, request, pending);
+            return;
+        }
         if (request.method === 'agent.open') {
             void Promise.resolve()
                 .then(() => agent.open(request.payload))
@@ -586,19 +700,7 @@ export class UtilityMiniAppBrokerServer {
         const onEvent = (value) => {
             if (this.pending.get(requestId) !== pending)
                 return;
-            const event = readMiniAppAgentRunEvent(value);
-            if (!event)
-                return;
-            try {
-                this.target.postMessage({
-                    type: 'miniapp-event',
-                    requestId,
-                    event,
-                });
-            }
-            catch {
-                // Uncloneable frame data or a closing port drops this event only.
-            }
+            this.postEvent(requestId, readMiniAppAgentRunEvent(value));
         };
         // Only a page that registered `onEvent` is a listener the runtime may wait on.
         const options = {
@@ -615,6 +717,7 @@ export class UtilityMiniAppBrokerServer {
                     ...(payload.sessionId !== undefined ? { sessionId: payload.sessionId } : {}),
                     ...(payload.model ? { model: payload.model } : {}),
                     ...(payload.agent !== undefined ? { agent: payload.agent } : {}),
+                    ...(payload.whenBusy !== undefined ? { whenBusy: payload.whenBusy } : {}),
                     ...options,
                 });
             }
@@ -672,12 +775,74 @@ export class UtilityMiniAppBrokerServer {
             this.postAgentError(requestId, error);
         });
     }
+    /** Events flow until the subscription ends; a cancel just aborts it (nothing to confirm). */
+    observeAgent(agent, request, pending) {
+        const { requestId, payload } = request;
+        const onEvent = (value) => {
+            if (this.pending.get(requestId) !== pending)
+                return;
+            this.postEvent(requestId, readMiniAppAgentObservedEvent(value));
+        };
+        void Promise.resolve()
+            .then(() => agent.observe({
+            caller: payload.caller,
+            target: payload.target,
+            signal: pending.controller.signal,
+            onEvent,
+        }))
+            .then(() => {
+            if (!this.takePending(requestId, pending))
+                return;
+            this.postResult(requestId, request.method, { ended: true });
+        }, (error) => {
+            if (!this.takePending(requestId, pending))
+                return;
+            this.postError(requestId, normalizeAgentReadErrorCode(error));
+        });
+    }
+    /** Only contract fields cross the port; a read changes nothing, so a malformed value is retryable. */
+    readAgentSessions(agent, request, pending) {
+        const { requestId } = request;
+        void Promise.resolve()
+            .then(async () => request.method === 'agent.sessions'
+            ? readAgentSessionsResult(await agent.sessions(request.payload))
+            : readAgentSessionResult(sessionResult(await agent.session(request.payload))))
+            .then((result) => {
+            if (!this.takePending(requestId, pending))
+                return;
+            if (!result) {
+                this.postError(requestId, 'runtime_unavailable');
+                return;
+            }
+            this.postResult(requestId, request.method, result);
+        }, (error) => {
+            if (!this.takePending(requestId, pending))
+                return;
+            this.postError(requestId, normalizeAgentReadErrorCode(error));
+        });
+    }
+    /** `event` is the allowlist copy of what the runtime emitted; null drops it. */
+    postEvent(requestId, event) {
+        if (!event)
+            return;
+        try {
+            this.target.postMessage({
+                type: 'miniapp-event',
+                requestId,
+                event,
+            });
+        }
+        catch {
+            // Uncloneable frame data or a closing port drops this event only.
+        }
+    }
     cancelRequest(requestId) {
         const pending = this.pending.get(requestId);
         if (!pending || pending.controller.signal.aborted)
             return;
         if (pending.method !== 'open' &&
             pending.method !== 'stop' &&
+            pending.method !== 'applyUpdate' &&
             !isAgentTurnMethod(pending.method)) {
             this.pending.delete(requestId);
             pending.controller.abort();
@@ -720,7 +885,7 @@ export class UtilityMiniAppBrokerServer {
                 errorName: readErrorName(error),
             });
             // Surface requests have no `result_unknown`; their callers treat target loss the same way.
-            this.postError(requestId, isAgentMethod(method) ? 'result_unknown' : 'runtime_unavailable');
+            this.postError(requestId, lostAgentSettlementCode(method) ?? 'runtime_unavailable');
         }
     }
     postAgentError(requestId, error) {
@@ -756,6 +921,9 @@ export function readMiniAppBrokerFailureDiagnostic(error) {
 async function execute(application, request, signal) {
     if (request.method === 'list')
         return application.list();
+    if (request.method === 'permissions.set') {
+        return { permissions: await application.setPermission(request.payload) };
+    }
     const pluginId = request.pluginId;
     if (!pluginId)
         throw miniAppError('invalid_request');
@@ -763,6 +931,11 @@ async function execute(application, request, signal) {
         return application.open({ pluginId, signal });
     if (request.method === 'credential')
         return application.credential({ pluginId, signal });
+    if (request.method === 'applyUpdate')
+        return application.applyUpdate({ pluginId, signal });
+    if (request.method === 'permissions.list') {
+        return { permissions: await application.listPermissions({ pluginId }) };
+    }
     await application.stop({ pluginId, signal });
     return { stopped: true };
 }
@@ -782,6 +955,11 @@ function normalizeAgentBusyReason(error) {
         : undefined;
     return isMiniAppAgentBusyReason(reason) ? reason : undefined;
 }
+/** Reads and observers change nothing: an unrecognised failure is retryable, never unknown. */
+function normalizeAgentReadErrorCode(error) {
+    const code = normalizeAgentErrorCode(error);
+    return code === 'result_unknown' ? 'runtime_unavailable' : code;
+}
 function normalizeErrorCode(error, method) {
     if (error instanceof Error && error.name === 'AbortError') {
         return 'runtime_unavailable';
@@ -792,13 +970,22 @@ function normalizeErrorCode(error, method) {
     if (code === 'NOT_FOUND' || code === 'PLUGIN_NOT_FOUND' || code === 'PLUGIN_NOT_ENABLED') {
         return 'not_found';
     }
+    if (code === 'MINIAPP_NO_UPDATE')
+        return 'no_update';
     if (code === 'BUSY' || code === 'PUBLICATION_SUPERSEDED')
         return 'busy';
     if (code === 'RUNTIME_UNAVAILABLE')
         return 'runtime_unavailable';
     if (code === 'INVALID_REQUEST')
         return 'invalid_request';
-    return method === 'stop' ? 'stop_failed' : 'start_failed';
+    if (isPermissionMethod(method)) {
+        return code === 'PERMISSION_UNKNOWN' ? 'permission_unknown' : 'permission_failed';
+    }
+    if (method === 'stop')
+        return 'stop_failed';
+    if (method === 'applyUpdate')
+        return 'update_failed';
+    return 'start_failed';
 }
 function normalizeBusyReason(error) {
     const busyReason = error && typeof error === 'object' && 'busyReason' in error
@@ -817,11 +1004,13 @@ function abortError() {
 }
 /**
  * A settlement frame Main cannot read. A submitted Agent request may already have applied, so
- * the caller must not conclude its parameters were wrong and resend.
+ * the caller must not conclude its parameters were wrong and resend; a session read or observer
+ * changed nothing and is simply retryable.
  */
 function unreadableSettlementError(pending) {
-    if (isAgentMethod(pending.method))
-        return miniAppError('result_unknown');
+    const lost = lostAgentSettlementCode(pending.method);
+    if (lost)
+        return miniAppError(lost);
     return pending.cancellation === 'caller' ? abortError() : miniAppError('invalid_request');
 }
 function readErrorName(error) {
@@ -916,6 +1105,9 @@ const AGENT_PAYLOAD_VALIDATORS = {
     'agent.open': isAgentOpenPayload,
     'agent.panelOpened': isAgentPanelPayload,
     'agent.panelClosed': isAgentPanelPayload,
+    'agent.observe': isAgentObservePayload,
+    'agent.sessions': isAgentSessionsPayload,
+    'agent.session': isAgentSessionReadPayload,
 };
 function isMiniAppBrokerRequestMessage(value) {
     if (!isRecord(value) || value.type !== 'miniapp-request')
@@ -925,6 +1117,11 @@ function isMiniAppBrokerRequestMessage(value) {
             isSafeBrokerRequestId(value.requestId) &&
             AGENT_PAYLOAD_VALIDATORS[value.method](value.payload));
     }
+    if (value.method === 'permissions.set') {
+        return (hasOnlyKeys(value, ['type', 'requestId', 'method', 'payload']) &&
+            isSafeBrokerRequestId(value.requestId) &&
+            isPermissionSetPayload(value.payload));
+    }
     if (!hasOnlyKeys(value, ['type', 'requestId', 'method', 'pluginId']))
         return false;
     if (!isSafeBrokerRequestId(value.requestId))
@@ -932,10 +1129,22 @@ function isMiniAppBrokerRequestMessage(value) {
     if (value.method !== 'list' &&
         value.method !== 'open' &&
         value.method !== 'stop' &&
-        value.method !== 'credential') {
+        value.method !== 'credential' &&
+        value.method !== 'applyUpdate' &&
+        value.method !== 'permissions.list') {
         return false;
     }
     return value.method === 'list' ? value.pluginId === undefined : isSafePluginId(value.pluginId);
+}
+function isPermissionMethod(method) {
+    return method === 'permissions.list' || method === 'permissions.set';
+}
+function isPermissionSetPayload(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['pluginId', 'permission', 'enabled']) &&
+        isSafePluginId(value.pluginId) &&
+        parseMiniAppPermissionId(value.permission) !== null &&
+        typeof value.enabled === 'boolean');
 }
 function isAgentCaller(caller) {
     return (isRecord(caller) &&
@@ -963,7 +1172,7 @@ function isOptionalSafeLabel(value) {
 }
 function isAgentRunPayload(value) {
     if (!isRecord(value) ||
-        !hasOnlyKeys(value, ['caller', 'text', 'sessionId', 'model', 'agent', 'observe'])) {
+        !hasOnlyKeys(value, ['caller', 'text', 'sessionId', 'model', 'agent', 'whenBusy', 'observe'])) {
         return false;
     }
     return (isAgentCaller(value.caller) &&
@@ -972,6 +1181,7 @@ function isAgentRunPayload(value) {
         isOptionalSafeLabel(value.sessionId) &&
         isOptionalModel(value.model) &&
         isOptionalSafeLabel(value.agent) &&
+        (value.whenBusy === undefined || isMiniAppAgentWhenBusy(value.whenBusy)) &&
         isOptionalBoolean(value.observe));
 }
 function isAgentCatalogPayload(value) {
@@ -1008,10 +1218,52 @@ function isAgentAnswerPayload(value) {
         isOptionalBoolean(value.observe));
 }
 function isAgentOpenPayload(value) {
+    return isAgentSessionReadPayload(value) && value.sessionId !== undefined;
+}
+/** `{ caller, sessionId? }`: a call about one session (`agent.open` needs the id). */
+function isAgentSessionReadPayload(value) {
     return (isRecord(value) &&
         hasOnlyKeys(value, ['caller', 'sessionId']) &&
         isAgentCaller(value.caller) &&
-        isSafeLabel(value.sessionId));
+        (value.sessionId === undefined || isSafeLabel(value.sessionId)));
+}
+function isAgentObservePayload(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['caller', 'target']) &&
+        isAgentCaller(value.caller) &&
+        isObserveTarget(value.target));
+}
+/** Exactly `{ sessionId }` or `{ all: true }`. */
+function isObserveTarget(value) {
+    const target = readMiniAppAgentObserveTarget(value);
+    if (!target || !isRecord(value))
+        return false;
+    return 'sessionId' in target
+        ? hasOnlyKeys(value, ['sessionId']) && isSafeLabel(target.sessionId)
+        : hasOnlyKeys(value, ['all']);
+}
+function copyObserveTarget(target) {
+    return 'sessionId' in target ? { sessionId: target.sessionId } : { all: true };
+}
+function isAgentSessionsPayload(value) {
+    return isRecord(value) && hasOnlyKeys(value, ['caller']) && isAgentCaller(value.caller);
+}
+function readAgentSessionsResult(value) {
+    if (!isRecord(value) || !hasOnlyKeys(value, ['sessions']))
+        return undefined;
+    const sessions = readMiniAppAgentSessionList(value.sessions);
+    return sessions ? { sessions } : undefined;
+}
+function sessionResult(session) {
+    return session === undefined ? {} : { session };
+}
+function readAgentSessionResult(value) {
+    if (!isRecord(value) || !hasOnlyKeys(value, ['session']))
+        return undefined;
+    if (value.session === undefined)
+        return {};
+    const session = readMiniAppAgentSessionDetail(value.session);
+    return session ? { session } : undefined;
 }
 function isAgentPanelPayload(value) {
     return (isRecord(value) &&
@@ -1043,7 +1295,7 @@ function isMiniAppBrokerCancelMessage(value) {
 function isMiniAppSurfaceSummary(value) {
     if (!isRecord(value))
         return false;
-    if (!hasOnlyKeys(value, ['pluginId', 'displayName', 'description', 'iconUrl', 'runtime'])) {
+    if (!hasOnlyKeys(value, ['pluginId', 'displayName', 'description', 'iconUrl', 'runtime', 'update'])) {
         return false;
     }
     if (!isSafePluginId(value.pluginId))
@@ -1066,7 +1318,19 @@ function isMiniAppSurfaceSummary(value) {
         value.runtime.status !== 'failed') {
         return false;
     }
+    if (value.update !== undefined && !isMiniAppSurfaceUpdate(value.update))
+        return false;
     return value.runtime.errorCode === undefined || isSafeLabel(value.runtime.errorCode);
+}
+function isMiniAppSurfaceUpdate(value) {
+    if (!isRecord(value))
+        return false;
+    if (!hasOnlyKeys(value, ['state', 'currentVersion', 'version']))
+        return false;
+    if (value.state !== 'available' && value.state !== 'applying')
+        return false;
+    return ((value.currentVersion === undefined || isSafeLabel(value.currentVersion)) &&
+        (value.version === undefined || isSafeLabel(value.version)));
 }
 function isSafeLabel(value) {
     return (typeof value === 'string' &&
@@ -1111,6 +1375,9 @@ function isMiniAppBrokerResult(value) {
         return hasOnlyKeys(value, ['stopped']) && value.stopped === true;
     if ('running' in value)
         return hasOnlyKeys(value, ['running']) && value.running === false;
+    if ('permissions' in value) {
+        return (hasOnlyKeys(value, ['permissions']) && parseMiniAppPermissionList(value.permissions) !== null);
+    }
     if ('credential' in value) {
         return (hasOnlyKeys(value, ['credential']) &&
             isRecord(value.credential) &&
@@ -1155,6 +1422,17 @@ function readBrokerResultMessage(value, method) {
         return readAgentOpenResult(value.result);
     if (isAgentCatalogMethod(method))
         return readAgentCatalogResult(method, value.result) ?? undefined;
+    if (method === 'agent.observe') {
+        return isRecord(value.result) &&
+            hasOnlyKeys(value.result, ['ended']) &&
+            value.result.ended === true
+            ? { ended: true }
+            : undefined;
+    }
+    if (method === 'agent.sessions')
+        return readAgentSessionsResult(value.result);
+    if (method === 'agent.session')
+        return readAgentSessionResult(value.result);
     if (isAgentPanelMethod(method)) {
         return isRecord(value.result) &&
             hasOnlyKeys(value.result, ['acknowledged']) &&

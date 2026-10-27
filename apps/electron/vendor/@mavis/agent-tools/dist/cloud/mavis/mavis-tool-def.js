@@ -31,7 +31,7 @@ const MavisArgsSchema = Type.Object({
     avatar: Type.Optional(Type.String({ description: 'Avatar URL or asset id.' })),
     // session
     mode: Type.Optional(Type.Union([Type.Literal('sessions'), Type.Literal('peers')], {
-        description: 'session list mode.',
+        description: 'session_list mode. sessions is the default; peers lists reachable peers.',
     })),
     session_id: Type.Optional(Type.String({ description: 'Session id, or "me".' })),
     parent_session_id: Type.Optional(Type.String({ description: 'Parent session id, or "me".' })),
@@ -60,7 +60,7 @@ const MavisArgsSchema = Type.Object({
 export const MavisBaseToolDef = {
     name: 'mavis',
     operationClassifier: createMavisOperationClassifier(CLOUD_MAVIS_COMMANDS),
-    description: `CLI-style management tool for Mavis Agent. Run agent / session / drive CRUD on behalf of the current user. For sending messages to peer sessions use the standalone \`communicate\` tool; for team plans use the standalone \`team\` tool.
+    description: `CLI-style management tool for Mavis Agent. Run agent / drive CRUD on behalf of the current user. Session list, get, update, and messages are standalone on-demand tools: search for session_* with tool_search, then call mcp_invoke. For sending messages to peer sessions use the standalone \`communicate\` tool; for team plans use the standalone \`team\` tool.
 
 USAGE
   mavis({ command: "<group> <action> [subaction]", args: { ... } })
@@ -81,12 +81,9 @@ agent — your roster
   agent delete    args: { agent_name: string }
 
 session — conversations
-  session list      args:
-                     sessions (default): { agent_name?: string, parent_session_id?: string, archive_filter?: "Unarchived"|"Archived", cursor?: string, limit?: number }
-                     peers:              { mode: "peers", session_id: string } → reachable peers for the standalone \`communicate\` tool. Use session_id:"me" for the current session.
-  session get       args: { session_id: string }
-  session messages  args: { session_id: string, limit?: number (default 20), before?: string (cursor) } → recent message history for a session.
-  session help      → list create / update / delete and their args
+  Moved to on-demand tools session_list, session_get, session_update, session_messages.
+  Search for session_* with tool_search, then call mcp_invoke.
+  session help      → same migration note
 
 drive — files, folders, websites, quota
   drive files list         args: { parent_id?: string (empty=root), node_type?: "Folder"|"File", offset?: number, limit?: number }
@@ -112,14 +109,11 @@ ID fields (task_id, template_id, plan_id, node_id, ...) are always JSON strings 
 EXAMPLES
   mavis({ command: "agent list", args: { limit: 20 } })
   mavis({ command: "agent get", args: { agent_name: "me" } })
-  mavis({ command: "session list", args: { agent_name: "me" } })
-  mavis({ command: "session list", args: { mode: "peers", session_id: "me" } })
-  mavis({ command: "session messages", args: { session_id: "me", limit: 50 } })
   mavis({ command: "drive files list", args: { parent_id: "" } })
   mavis({ command: "agent help" })                  // expand agent update / delete spec`,
     schema: Type.Object({
         command: Type.String({
-            description: 'Subcommand in "<group> <action> [subaction]" form, e.g. "agent list", "session messages", "agent help". Call "<group> help" (or "<group> -h") for less-used commands not listed inline. Team plans use the standalone `team` tool; sending messages to peers uses the standalone `communicate` tool.',
+            description: 'Subcommand in "<group> <action> [subaction]" form, e.g. "agent list", "drive files list", "agent help". Call "<group> help" (or "<group> -h") for less-used commands not listed inline. Session tools are session_list, session_get, session_update, and session_messages. Team plans use the standalone `team` tool; sending messages to peers uses the standalone `communicate` tool.',
         }),
         args: Type.Optional(MavisArgsSchema),
     }),

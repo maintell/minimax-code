@@ -89,7 +89,9 @@ export function isAgentCursorVisible(options) {
         return false;
     if (typeof hostWindow.isMinimized === 'function' && hostWindow.isMinimized())
         return false;
-    if (typeof hostWindow.isFocused === 'function' && !hostWindow.isFocused())
+    if (typeof hostWindow.isFocused === 'function' &&
+        !hostWindow.isFocused() &&
+        !tab.controller.isDevicePreviewWindowFocused?.())
         return false;
     return true;
 }
@@ -144,10 +146,19 @@ export async function captureFrameWithoutAgentCursor(options) {
         return { success: false, error: 'WebContents not available' };
     }
     try {
-        const image = await options.withTabOperation(tab, 'capture-frame', () => withAgentCursorHiddenForCapture(tab, () => webContents.capturePage()));
+        const { image, previewFrameBounds } = await options.withTabOperation(tab, 'capture-frame', () => withAgentCursorHiddenForCapture(tab, async () => {
+            const image = await webContents.capturePage();
+            // Read before the background host releases its lease; only the foreground
+            // fixed-preview window has a placement in the File Panel's coordinate space.
+            return { image, previewFrameBounds: tab.controller.getDevicePreviewFrameBounds() };
+        }));
         if (image.isEmpty())
             return { success: false, error: 'Capture returned an empty frame' };
-        return { success: true, dataUrl: image.toDataURL() };
+        return {
+            success: true,
+            dataUrl: image.toDataURL(),
+            ...(previewFrameBounds ? { previewFrameBounds } : {}),
+        };
     }
     catch (error) {
         return { success: false, error: options.safeError(error) };

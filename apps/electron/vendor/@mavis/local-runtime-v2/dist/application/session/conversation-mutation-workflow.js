@@ -21,7 +21,7 @@ export function createProductionConversationMutationWorkflow(input) {
     const rewindEdit = createRewindEditService(input);
     return {
         recoverPendingForks: () => recoverPending(input, fork, operations, rewindEdit),
-        getSessionForkOptions: (_ctx, request) => getForkOptions(request, input.sessionFork, input.worktree, input.mutationPlanState),
+        getSessionForkOptions: (_ctx, request) => getForkOptions(request, fork, input),
         createSideSession: (request) => fork.forkSideSession(request),
         forkSession: (_ctx, request) => mapFork(request, fork, input),
         getSessionRewindPreview: (_ctx, request) => mapRewindPreview(request, input),
@@ -70,6 +70,9 @@ function createForkService(input, operations) {
                 const result = await input.turn.fork(request);
                 return { historyRevision: result.historyRevision };
             },
+            ...(input.turn.inspectForkBoundary
+                ? { inspectBoundary: input.turn.inspectForkBoundary.bind(input.turn) }
+                : {}),
         },
     });
 }
@@ -268,7 +271,8 @@ function toRewindEditOperation(row, kind) {
         ...(row.lastError ? { error: row.lastError } : {}),
     };
 }
-async function getForkOptions(request, capability, worktree, planStateReader) {
+async function getForkOptions(request, historyPreflight, input) {
+    const capability = input.sessionFork;
     const source = await capability.sessions.get(request.id);
     if (!source)
         return missingForkSourceOptions();
@@ -286,10 +290,10 @@ async function getForkOptions(request, capability, worktree, planStateReader) {
             ? {}
             : { assistantDisplayMessageId: request.assistantMessageId }),
     });
-    const planState = await planStateReader?.readPlanState(request.id);
-    const boundaryAvailability = forkBoundaryAvailability(boundary, source.status, planState?.active);
+    const planState = await input.mutationPlanState?.readPlanState(request.id);
+    const boundaryAvailability = await confirmForkHistoryBoundary(forkBoundaryAvailability(boundary, source.status, planState?.active), request.id, boundary, historyPreflight);
     const suggestion = await suggestForkTitle(source, capability.sessions);
-    const worktreeEligible = source.appMode === 'coding' && (await worktree.isEligible(source));
+    const worktreeEligible = source.appMode === 'coding' && (await input.worktree.isEligible(source));
     return {
         ...boundaryAvailability,
         suggestedTitle: suggestion.title,
@@ -325,6 +329,26 @@ function forkBoundaryAvailability(boundary, sourceStatus, planActive = false) {
 }
 function isCanonicalForkBoundaryMissing(boundary) {
     return !boundary.canonicalBoundaryReachable;
+}
+/** Downgrades an available boundary that `history.fork` would reject, e.g. a split tool call. */
+async function confirmForkHistoryBoundary(availability, sessionId, boundary, historyPreflight) {
+    if (!availability.canFork || !boundary)
+        return availability;
+    try {
+        if (await historyPreflight.isHistoryBoundarySettled(sessionId, boundary))
+            return availability;
+        return { canFork: false, unavailableReason: 'message-boundary-invalid' };
+    }
+    catch (error) {
+        if (!(error instanceof HistoryMutationError))
+            throw error;
+        return {
+            canFork: false,
+            unavailableReason: error.code === 'boundary-not-found'
+                ? 'message-boundary-not-found'
+                : 'message-boundary-invalid',
+        };
+    }
 }
 function isForkBoundaryAvailable(boundary, sourceStatus, planActive) {
     if (!planActive) {

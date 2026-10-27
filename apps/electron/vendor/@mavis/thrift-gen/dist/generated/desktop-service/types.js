@@ -13,6 +13,25 @@ export const TurnContinuationState = {
     Running: 2,
     WaitingForUser: 3,
 };
+export const SessionActivityState = {
+    Idle: 0,
+    Running: 1,
+    WaitingForUser: 2,
+    Scheduled: 3,
+};
+export const SessionActivityKind = {
+    Turn: 1,
+    QueuedMessages: 2,
+    BackgroundTask: 3,
+    TaskNotification: 4,
+    ThreadGoal: 5,
+    TeamPlan: 6,
+    CronRun: 7,
+    CronSchedule: 8,
+    Questionnaire: 9,
+    Permission: 10,
+    PausedQueue: 11,
+};
 export const SessionTypeView = {
     Branch: 0,
     Root: 1,
@@ -184,6 +203,15 @@ export const CronTriggerSource = {
     Manual: 0,
     Scheduled: 1,
 };
+export const DesktopBackgroundTaskStatus = {
+    Queued: 0,
+    Running: 1,
+    Stopping: 2,
+    Succeeded: 3,
+    Failed: 4,
+    Canceled: 5,
+    Lost: 6,
+};
 export const PinnedItemType = {
     Session: 1,
     Agent: 2,
@@ -213,6 +241,9 @@ export const QuestionnaireStatus = {
     Expired: 2,
     Superseded: 3,
     Dismissed: 4,
+};
+export const QuestionnaireReopenReason = {
+    ContentRecall: 1,
 };
 export const LocalMcpTransport = {
     Stdio: 1,

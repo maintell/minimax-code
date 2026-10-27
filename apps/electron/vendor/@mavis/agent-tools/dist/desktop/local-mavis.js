@@ -201,8 +201,12 @@ const sessionUpdateSchema = z.object({
     session_id: idString,
     title: optionalString,
     archived: optionalBoolean,
+    model: optionalString,
 });
-const sessionDeleteSchema = z.object({ session_id: idString });
+const sessionInterruptSchema = z.object({
+    session_id: idString,
+    turn_id: idString.optional(),
+});
 const sessionMessagesSchema = z.object({
     session_id: idString,
     source: sessionReadSource,
@@ -301,7 +305,7 @@ const COMMAND_SCHEMAS = {
     'session get': sessionGetSchema,
     'session send': sessionSendSchema,
     'session update': sessionUpdateSchema,
-    'session delete': sessionDeleteSchema,
+    'session interrupt': sessionInterruptSchema,
     'session messages': sessionMessagesSchema,
     'session help': helpSchema,
     'mcp list': mcpListSchema,
@@ -334,7 +338,7 @@ const HANDLERS = {
     'session get': handleSessionGet,
     'session send': handleSessionSend,
     'session update': handleSessionUpdate,
-    'session delete': handleSessionDelete,
+    'session interrupt': handleSessionInterrupt,
     'session messages': handleSessionMessages,
     'session help': handleSessionHelp,
     'mcp list': handleMcpList,
@@ -369,6 +373,33 @@ let LocalMavisTool = (() => {
             this.mcpAdapter = mcpAdapter;
         }
         async execute(ctx, input, signal) {
+            if (normalizeCommand(input.command) === 'session create') {
+                const text = JSON.stringify({
+                    ok: false,
+                    command: 'session create',
+                    error: {
+                        kind: 'validation',
+                        code: 'SESSION_CREATE_MOVED',
+                        message: 'Search for session_create with tool_search, then call mcp_invoke.',
+                    },
+                });
+                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+            }
+            if (normalizeCommand(input.command) === 'session delete') {
+                // Deletion stays a user action. Answering here, before the unknown-command
+                // branch, keeps the command out of the advertised vocabulary while still
+                // telling the model what to do instead.
+                const text = JSON.stringify({
+                    ok: false,
+                    command: 'session delete',
+                    error: {
+                        kind: 'validation',
+                        code: 'SESSION_DELETE_NOT_ALLOWED',
+                        message: 'Deleting a session is reserved for the user. Ask the user to delete it in the app, or archive it with session update (archived: true).',
+                    },
+                });
+                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+            }
             if (normalizeCommand(input.command).startsWith('cron ')) {
                 const text = JSON.stringify({
                     ok: false,
@@ -399,6 +430,7 @@ let LocalMavisTool = (() => {
                 ...(this.mcpAdapter ? { mcpAdapter: this.mcpAdapter } : {}),
                 currentAgentName: ctx.agentName,
                 currentSessionId: ctx.sessionId,
+                currentTurnId: ctx.turnId,
                 currentModel: currentLocalCronModel(ctx),
             }, input.command, input.args, signal);
             const text = JSON.stringify(output, null, 2);
@@ -535,7 +567,7 @@ const LOCAL_MAVIS_MUTATION_COMMANDS = new Set([
     'cron delete',
     'cron trigger',
     'session update',
-    'session delete',
+    'session interrupt',
     'session send',
     'mcp create',
     'mcp update',
@@ -976,6 +1008,9 @@ async function handleSessionSend(ctx, args, signal) {
     const sessionId = resolveSessionId(ctx, args.session_id);
     return success(ctx.command, await requireSessionAdapter(ctx).sendSession({
         callerSessionId: ctx.currentSessionId,
+        // The caller Turn lets the runtime attribute a new round it starts in a
+        // sub-session to that Turn (Goal token accounting).
+        ...(ctx.currentTurnId ? { callerTurnId: ctx.currentTurnId } : {}),
         sessionId,
         content: args.content,
         // Both switches are passed only when the caller set them, so the
@@ -990,11 +1025,25 @@ async function handleSessionUpdate(ctx, args, signal) {
         sessionId,
         ...(Object.hasOwn(args, 'title') ? { title: args.title } : {}),
         ...(Object.hasOwn(args, 'archived') ? { archived: args.archived } : {}),
+        ...(Object.hasOwn(args, 'model') ? { model: args.model } : {}),
     }, signal));
 }
-async function handleSessionDelete(ctx, args, signal) {
-    const sessionId = resolveSessionId(ctx, args.session_id);
-    return success(ctx.command, await requireSessionAdapter(ctx).deleteSession({ sessionId }, signal));
+async function handleSessionInterrupt(ctx, args, signal) {
+    if (!ctx.currentSessionId) {
+        return failure(ctx.command, 'validation', 'session interrupt requires a caller session', {
+            code: 'SESSION_INTERRUPT_NO_CALLER',
+        });
+    }
+    // The Turn making this call cannot stop itself through a tool: the result
+    // would land in the Turn being torn down. The user stops it from the UI.
+    if (isMeSentinel(args.session_id) || args.session_id === ctx.currentSessionId) {
+        return failure(ctx.command, 'validation', 'A session cannot interrupt itself. Ask the user to stop it from the app.', { code: 'SESSION_INTERRUPT_SELF', session_id: ctx.currentSessionId });
+    }
+    return success(ctx.command, await requireSessionAdapter(ctx).interruptSession({
+        callerSessionId: ctx.currentSessionId,
+        sessionId: args.session_id,
+        ...(args.turn_id ? { turnId: args.turn_id } : {}),
+    }, signal));
 }
 async function handleSessionMessages(ctx, args, signal) {
     const sessionId = resolveSessionId(ctx, args.session_id);
@@ -1025,8 +1074,16 @@ async function handleSessionHelp(ctx) {
                     'mavis({ command: "session send", args: { session_id: "mvs_target", content: "Also cover the rollback path.", force_steer: true } })',
                 ],
             },
-            { command: 'session update', args: ['session_id', 'title?', 'archived?'] },
-            { command: 'session delete', args: ['session_id'] },
+            {
+                command: 'session update',
+                args: ['session_id', 'title?', 'archived?', 'model?'],
+            },
+            {
+                command: 'session interrupt',
+                args: ['session_id', 'turn_id?'],
+                summary: 'Stop the target session\'s current turn and keep the session. Queued messages still run afterwards; background work and the goal are untouched. Returns outcome aborted or not_running. Cannot target the calling session.',
+                examples: ['mavis({ command: "session interrupt", args: { session_id: "mvs_target" } })'],
+            },
             {
                 command: 'session messages',
                 args: [
@@ -1393,6 +1450,27 @@ class LocalMavisRuntimeError extends Error {
         this.code = details.code;
     }
 }
+const INPUT_CONDITION_ERROR_CODES = new Set([
+    'SESSION_UPDATE_INVALID_FIELD',
+    'SESSION_INTERRUPT_SELF',
+    'SESSION_INTERRUPT_TURN_MISMATCH',
+    'SESSION_CREATE_NO_CALLER',
+    'SESSION_CREATE_INVALID_CONTENT',
+    'SESSION_CREATE_UNKNOWN_AGENT',
+    'SESSION_CREATE_INVALID_WORKSPACE',
+    'SESSION_CREATE_MODEL_UNRESOLVED',
+]);
+/**
+ * Kind for a session error code. Input and precondition codes are validation;
+ * an admission failure is validation only when the same input would fail again.
+ * Everything else is a runtime failure. Status is not consulted.
+ */
+export function sessionCommandErrorKind(code, reason) {
+    if (code === 'SESSION_CREATE_ADMISSION_FAILED') {
+        return reason === 'invalid-input' ? 'validation' : 'local_runtime';
+    }
+    return INPUT_CONDITION_ERROR_CODES.has(code) ? 'validation' : 'local_runtime';
+}
 function errorToFailure(command, error) {
     if (error instanceof LocalMavisValidationError) {
         return failure(command, 'validation', error.message, error.details);
@@ -1413,11 +1491,17 @@ function errorToFailure(command, error) {
         });
     }
     if (isLocalRuntimeError(error)) {
-        return failure(command, 'local_runtime', error.message, {
+        // These codes name bad input or a precondition, even though the runtime
+        // reports them with a status. Everything else with a status stays a runtime failure.
+        const kind = sessionCommandErrorKind(error.code ?? '', error.reason);
+        return failure(command, kind, error.message, {
             status: error.status,
             code: error.code,
             ...(error.sessionId ? { session_id: error.sessionId } : {}),
             ...(error.turnId ? { turn_id: error.turnId } : {}),
+            ...(error.requestedTurnId ? { requested_turn_id: error.requestedTurnId } : {}),
+            ...(error.reason ? { reason: error.reason } : {}),
+            ...(error.field ? { field: error.field } : {}),
         });
     }
     if (error instanceof Error) {

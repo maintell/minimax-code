@@ -1,4 +1,4 @@
-import { parseResolvedAgentShell } from '../../../../agent-shell/index.js';
+import { parseAgentShellPreference, parseResolvedAgentShell, } from '../../../../agent-shell/index.js';
 import { canonicalProjectWorkspaceDir } from '../../../shared/workspace.js';
 import { SESSION_KINDS, SESSION_RUN_LOCATION_MODES, SESSION_RUNTIMES, SESSION_STATUSES, SESSION_VISIBILITIES, } from '../contract.js';
 import { normalizePersistedSessionKind, normalizeSessionType } from './normalization.js';
@@ -96,6 +96,7 @@ function nativeSessionDataVersion(row, extra) {
 export function sessionExtraDataFromRecord(record) {
     return compactExtraData({
         agentShell: record.agentShell,
+        agentShellPreference: record.agentShellPreference,
         titleSource: record.titleSource,
         runLocation: record.runLocation,
         appMode: record.sessionType === 'branch' ? record.appMode : undefined,
@@ -115,6 +116,7 @@ export function sessionExtraDataFromRecord(record) {
         sessionDataVersion: record.sessionDataVersion,
         sessionOrigin: record.sessionOrigin,
         miniAppOrigin: record.miniAppOrigin,
+        createdBySessionId: record.createdBySessionId,
     });
 }
 export function withoutRootAppMode(record) {
@@ -138,6 +140,9 @@ export function parseSessionExtraData(raw) {
         appMode: readOptionalEnum(record, 'appMode', ['coding', 'work'], 'extra_data_json'),
         interactionMode: readOptionalEnum(record, 'interactionMode', ['plan', 'goal'], 'extra_data_json'),
         agentShell: record.agentShell === undefined ? undefined : parseResolvedAgentShell(record.agentShell),
+        agentShellPreference: record.agentShellPreference === undefined
+            ? undefined
+            : parseAgentShellPreference(record.agentShellPreference),
         memoryPolicy: readOptionalSessionMemoryPolicy(record, 'memoryPolicy', 'extra_data_json'),
         errorSource: readOptionalString(record, 'errorSource', 'extra_data_json'),
         errorDetail: readOptionalString(record, 'errorDetail', 'extra_data_json'),
@@ -152,6 +157,7 @@ export function parseSessionExtraData(raw) {
         sessionDataVersion: readOptionalSafeInteger(record, 'sessionDataVersion', 'extra_data_json'),
         sessionOrigin: readOptionalEnum(record, 'sessionOrigin', ['local-runtime', 'legacy-opencode', 'unknown'], 'extra_data_json'),
         miniAppOrigin: readMiniAppOrigin(record.miniAppOrigin),
+        createdBySessionId: readOptionalString(record, 'createdBySessionId', 'extra_data_json'),
     });
 }
 /** Lenient: an unrecognized origin shape means "not a Mini App session", never a decode failure. */

@@ -19,6 +19,7 @@ export class DefaultMiniAppSupervisor {
     quarantined = new Set();
     explicitlyStopped = new Set();
     quiescing = new Map();
+    pendingRuntimeOperations = new Map();
     publicationMemory = {
         disabled: this.disabled,
         cold: this.cold,
@@ -28,6 +29,7 @@ export class DefaultMiniAppSupervisor {
     };
     diagnostics;
     observations = new Set();
+    runtimeExitListeners = new Set();
     cutover;
     closed = false;
     closePromise;
@@ -129,11 +131,13 @@ export class DefaultMiniAppSupervisor {
             this.assertCurrentPreparation(candidate.pluginId, preparation);
         }
         catch (error) {
-            this.clearPreparation(candidate.pluginId, preparation);
-            const reason = preparation.controller.signal.reason;
-            const cleanupFailed = this.quarantineCleanupFailure(candidate.pluginId, error);
-            const primary = cleanupFailed || !(reason instanceof Error) ? error : reason;
-            const failure = await cleanup.selectFailureAfterCleanup(primary, () => this.cleanupOrQuarantine(candidate.pluginId, ownsRuntime ? runtime : undefined));
+            const failure = await cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, candidate.pluginId, async () => {
+                this.clearPreparation(candidate.pluginId, preparation);
+                const reason = preparation.controller.signal.reason;
+                const cleanupFailed = this.quarantineCleanupFailure(candidate.pluginId, error);
+                const primary = cleanupFailed || !(reason instanceof Error) ? error : reason;
+                return cleanup.selectFailureAfterCleanup(primary, () => this.cleanupOrQuarantine(candidate.pluginId, ownsRuntime ? runtime : undefined));
+            });
             if (crossedPonr && !errors.isMiniAppExpectedCancellation(errors.miniAppErrorCode(failure))) {
                 this.recordFailure(candidate.pluginId, errors.miniAppErrorCode(failure));
             }
@@ -197,7 +201,7 @@ export class DefaultMiniAppSupervisor {
                     return target;
                 });
             },
-            rollback: async () => {
+            rollback: () => cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, candidate.pluginId, async () => {
                 if (commitOwner.promise)
                     await commitOwner.promise;
                 if (state === 'prepared') {
@@ -232,7 +236,7 @@ export class DefaultMiniAppSupervisor {
                 finally {
                     state = 'rolled-back';
                 }
-            },
+            }),
             finalize: async () => {
                 if (state !== 'committed' || finalized)
                     return;
@@ -609,6 +613,15 @@ export class DefaultMiniAppSupervisor {
             state.nodeDigest === input.nodeDigest &&
             persistedErrorDetail(state.lastErrorJson).code !== 'PERSISTENCE_COMPENSATION_FAILED');
     }
+    hasRuntimeCustody(pluginId) {
+        return (this.closed ||
+            this.active.has(pluginId) ||
+            this.preparations.has(pluginId) ||
+            this.quiescing.has(pluginId) ||
+            (this.retiring.get(pluginId)?.length ?? 0) > 0 ||
+            this.quarantined.has(pluginId) ||
+            this.pendingRuntimeOperations.has(pluginId));
+    }
     inspect(pluginId) {
         const ids = pluginId
             ? [pluginId]
@@ -634,6 +647,12 @@ export class DefaultMiniAppSupervisor {
             cold: this.cold,
         };
         return ids.map((id) => statusFor(statusState, this.diagnostics, id));
+    }
+    onRuntimeExit(listener) {
+        this.runtimeExitListeners.add(listener);
+        return () => {
+            this.runtimeExitListeners.delete(listener);
+        };
     }
     close() {
         this.closePromise ??= this.closeOwned();
@@ -732,7 +751,7 @@ export class DefaultMiniAppSupervisor {
         const candidate = generation.candidate;
         const controller = new AbortController();
         generation.startController = controller;
-        const operation = this.startOnDemandRuntime(pluginId, generation, candidate, controller);
+        const operation = cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, pluginId, () => this.startOnDemandRuntime(pluginId, generation, candidate, controller));
         generation.startPromise = operation;
         const clear = () => {
             if (generation.startPromise === operation) {
@@ -941,14 +960,24 @@ export class DefaultMiniAppSupervisor {
         this.recordFailure(pluginId, 'RUNTIME_EXITED');
         generation.runtime = undefined;
         generation.view = publishedView(generation.candidate, generation.view.miniAppGeneration, undefined);
-        await this.cleanupExitedRuntime(pluginId, runtime);
-    }
-    async cleanupExitedRuntime(pluginId, runtime, terminalFailure) {
-        for (const error of await cleanup.collectRuntimeCleanupFailures(runtime, terminalFailure)) {
-            if (!this.quarantineCleanupFailure(pluginId, error)) {
-                this.recordFailure(pluginId, errors.miniAppErrorCode(error));
+        for (const listener of this.runtimeExitListeners) {
+            try {
+                listener({ pluginId });
+            }
+            catch (error) {
+                this.options.logger?.error({ pluginId, error }, 'Mini App runtime exit listener failed');
             }
         }
+        await this.cleanupExitedRuntime(pluginId, runtime);
+    }
+    cleanupExitedRuntime(pluginId, runtime, terminalFailure) {
+        return cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, pluginId, async () => {
+            for (const error of await cleanup.collectRuntimeCleanupFailures(runtime, terminalFailure)) {
+                if (!this.quarantineCleanupFailure(pluginId, error)) {
+                    this.recordFailure(pluginId, errors.miniAppErrorCode(error));
+                }
+            }
+        });
     }
     assertCurrentPreparation(pluginId, preparation) {
         if (this.preparations.get(pluginId) === preparation && !preparation.controller.signal.aborted) {

@@ -443,7 +443,13 @@ function sideChatApplicationError(error) {
         const mapped = attachmentRegistrationResponse(error);
         return new AppError(mapped.status, mapped.key, mapped.message);
     }
-    return error;
+    if (error instanceof AppError)
+        return error;
+    // Preparation rolls back staged history and copied assets before failing, so even an
+    // unexpected error is a definite rejection the client may retry, never an unknown outcome.
+    const failure = new AppError(503, 'SIDECHAT_PREPARATION_FAILED', 'SideChat preparation failed', true);
+    failure.cause = error;
+    return failure;
 }
 function sideChatInitialTitle(input) {
     const messages = input.immediateSendBatch?.members.map((member) => member.message) ?? [

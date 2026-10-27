@@ -207,6 +207,7 @@ managed_outputs=(
   ledger.tail.jsonl
   display.tail.jsonl
   runtime.log
+  session-runtime.log
   im-runtime.log
   events.jsonl
   local-proxy.tail.jsonl
@@ -325,9 +326,10 @@ slice_by_session_id() {
   [[ -d "$root" ]] || return 0
   local file line
   local -a files=()
+  # Per-Session runtime files under <root>/sessions are sliced on their own.
   while IFS= read -r -d '' file; do
     files+=("$file")
-  done < <(find "$root" -type f -name "$name_pattern" -print0 2>/dev/null)
+  done < <(find "$root" -path "$root/sessions" -prune -o -type f -name "$name_pattern" -print0 2>/dev/null)
   (( ${#files[@]} > 0 )) || return 0
   {
     # Read older files first and keep a global tail. Modification time handles
@@ -352,6 +354,7 @@ if [[ -n "$session_dir" ]]; then
 fi
 
 slice_by_session_id "$logs_dir" 'runtime.log' 'runtime-*.log' 'runtime-text'
+slice_by_session_id "$logs_dir/sessions/$stored_session_id" 'session-runtime.log' 'runtime-*.log' 'runtime-text'
 slice_by_session_id "$logs_dir" 'im-runtime.log' 'im-runtime-*.log' 'runtime-text'
 slice_by_session_id "$events_dir" 'events.jsonl' '*.jsonl' 'event-jsonl'
 if [[ -n "$local_proxy_log_dir" ]]; then
@@ -363,6 +366,7 @@ fi
   printf 'v2 database: %s\n' "$db_path"
   printf 'v2 Session artifacts: %s\n' "${session_dir:-not found}"
   printf 'runtime logs root: %s\n' "$logs_dir"
+  printf 'runtime Session logs: %s\n' "$logs_dir/sessions/$stored_session_id"
   printf 'runtime events root: %s\n' "$events_dir"
   if [[ -n "$local_proxy_log_dir" ]]; then
     printf 'local-proxy compatibility root: %s\n' "$local_proxy_log_dir"
@@ -397,6 +401,7 @@ $(file_row messages.tail.jsonl "last 200 canonical history lines")
 $(file_row display.tail.jsonl "last 200 display-event lines")
 $(file_row ledger.tail.jsonl "last 200 durable ledger lines")
 $(file_row runtime.log "last 200 runtime-* matches, prefixed by source path")
+$(file_row session-runtime.log "last 200 lines of this Session's own runtime files (permission checks), prefixed by source path")
 $(file_row im-runtime.log "last 200 im-runtime-* matches, prefixed by source path")
 $(file_row events.jsonl "last 200 v2 event matches, preserved as valid JSONL")
 $(file_row local-proxy.tail.jsonl "last 200 optional local-proxy matches, preserved as compatibility JSONL")

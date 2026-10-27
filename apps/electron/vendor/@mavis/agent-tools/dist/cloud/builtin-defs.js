@@ -144,7 +144,7 @@ export const CLOUD_TASK_TOOL_DESCRIPTION = `Launch a cloud sub-agent to handle c
 
 Use this for broad research, parallelizable investigation, or delegated implementation. Do not use it for targeted file reads, grep-style code searches, or work that is simpler to do directly.
 
-When background execution is enabled, invocations start in the background by default and return a task id immediately. A started task is not a completed result. Set run_in_background=false when you need the child agent's final result before continuing. Use the background task control tools to query, read output, or stop background work.`;
+When background execution is enabled, invocations start in the background by default and return a task id immediately. A started task is not a completed result. To run several child agents at once, start them all in one response and omit run_in_background, even when you need every result before continuing; then read each result with task_output. Set run_in_background=false only for a single child whose result you need before doing anything else. Use the background task control tools to query, read output, or stop background work.`;
 export const CloudTaskToolDef = {
     name: 'task',
     executionMode: 'sequential',
@@ -163,7 +163,7 @@ export const CloudTaskToolDef = {
             description: 'Legacy specialized-agent alias. Prefer agent_name for new calls.',
         })),
         run_in_background: Type.Optional(Type.Boolean({
-            description: 'Optional; defaults to background execution when it is enabled. Set false to wait for the final result. True starts background execution and returns a task id immediately. Inspect or control a background task with task_query, task_output, and task_stop.',
+            description: "Optional; defaults to background execution when it is enabled. Omit it when starting several child agents in parallel. Set false only to wait for a single child's final result. True starts background execution and returns a task id immediately. Inspect or control a background task with task_query, task_output, and task_stop.",
         })),
     }),
 };

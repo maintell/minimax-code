@@ -8,12 +8,27 @@
  * cycle). The host calls every builder with `this`; the structural typing
  * keeps the contract explicit without ballooning the surface area.
  */
+import { QuestionnaireSyncWaitRegistry } from '../questionnaire/sync-wait-registry.js';
 import { resolveLocalPermissionService } from '../permissions/service.js';
 // preview_train read this from the v1 agent templates module, which the Agent
 // cutover deletes. `resolveLocalRuntimeLocale` is the surviving byte-identical
 // implementation.
 import { resolveLocalRuntimeLocale } from '../runtime/locale.js';
 const questionnaireOwnedActionBindings = new WeakMap();
+/**
+ * One AskUser v2 sync-wait table per host. Questionnaire deps (and the
+ * service instances built from them) are recreated per call, but the ask_user
+ * tool and the reply/dismiss routes must see the same waiters.
+ */
+const questionnaireSyncWaits = new WeakMap();
+function syncWaitsFor(host) {
+    let registry = questionnaireSyncWaits.get(host);
+    if (!registry) {
+        registry = new QuestionnaireSyncWaitRegistry();
+        questionnaireSyncWaits.set(host, registry);
+    }
+    return registry;
+}
 const questionnaireRequestAdmissionBindings = new WeakMap();
 export function createQuestionnaireOwnedActionBinder(host) {
     return (...[ownedActionHandler, onFailure]) => {
@@ -52,19 +67,21 @@ export function buildQuestionnaireServiceDeps(host) {
         emitBusEvent: (type, payload) => host.emitBusEvent(type, payload),
         publishGlobalEvent: (event) => host.publishGlobalEvent(event),
         resolveLocale: () => resolveLocalRuntimeLocale(),
-        resolveGoal: async (sessionId) => {
-            const goal = await host.threadGoal.store.getBySession(sessionId);
-            return goal ? { goalId: goal.goalId, status: goal.status } : undefined;
-        },
-        autoReplyScheduler: host.questionnaireAutoReplyScheduler,
+        isGoalActive: (sessionId) => host.isQuestionnaireGoalActive?.(sessionId) ?? Promise.resolve(false),
         hasPendingUserSteering: (sessionId) => host.hasPendingUserSteeringProbe?.(sessionId) ?? false,
+        hasQueuedUserInputSince: async (sessionId, sinceMs) => (await host.hasQueuedUserInputSinceProbe?.(sessionId, sinceMs)) ?? false,
+        // AskUser v2 is a Desktop protocol: only the electron-owned runtime creates
+        // sync/async questionnaires. CLI/TUI-owned runtimes keep the legacy
+        // turn-ending lifecycle; IM Turns are excluded per call by channel context.
+        ...(host.getRuntimeOwnerKind?.() === 'electron' ? { responseModeEnabled: true } : {}),
+        syncWaits: syncWaitsFor(host),
         // Drives the queue drain after a questionnaire dismiss so messages the
         // user enqueued while the ask_user card was pending get promoted instead
         // of stalling in SQLite. Dismiss injects no synthetic turn by design
         // ("close is silent"), so nothing else kicks the queue. v1 fanned this out
         // through `host.notifySessionTurnFinished`, which died with the v1 Session
-        // routes — kick the surviving owner's ingress directly, the same port
-        // `thread-goal/kickoff-host.ts` uses. Left undefined for headless callers
+        // routes — kick the surviving owner's ingress directly, the same port the
+        // local-runtime-v2 Goal kickoff host uses. Left undefined for headless callers
         // with no conversation wired.
         ...(host.runtimeConversation
             ? {
@@ -81,6 +98,19 @@ export function buildQuestionnaireServiceDeps(host) {
             }
             : {}),
     };
+    // The Goal owner binds after TUI facades captured these deps, so read it live.
+    Object.defineProperties(deps, {
+        // Peripheral facades are created before the Turn owner binds this probe.
+        isOriginTurnRunning: {
+            enumerable: true,
+            get: () => host.isQuestionnaireOriginTurnRunning,
+        },
+        workOwner: { enumerable: true, get: () => host.questionnaireWorkOwner },
+        autoReplyScheduler: {
+            enumerable: true,
+            get: () => host.questionnaireWorkOwner?.autoReplies,
+        },
+    });
     Object.defineProperty(deps, 'requestAdmission', {
         enumerable: true,
         get: () => questionnaireRequestAdmissionBindings.get(host),

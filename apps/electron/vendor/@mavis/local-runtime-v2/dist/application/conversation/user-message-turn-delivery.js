@@ -76,7 +76,8 @@ async function executeDelivery(options, input) {
             requestedTurnId: input.requestedTurnId,
             executionStart: start.promise,
             genuineUserQueryText,
-            requiresInputReview: visibleQuery,
+            // A completion summary is visible, but its input remains an internal continuation.
+            requiresInputReview: visibleQuery && input.provenance.source !== 'background-task',
         });
         if (!result.accepted) {
             if (result.reason !== 'duplicate') {

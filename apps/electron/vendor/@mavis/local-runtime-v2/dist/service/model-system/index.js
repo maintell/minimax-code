@@ -16,6 +16,6 @@ export * from './management/provider-key.js';
 export * from './management/service.js';
 export { LocalModelResolver, lookupLocalModelLimits, resolveLocalProviderCredentials, } from './resolution/local-model-resolver.js';
 export { capabilitiesFromModelConfig, isMiniMaxM3ModelId, isMiniMaxM3ThinkingMode, MINIMAX_M3_MODEL_ID, modelLimitsFromConfig, modelRefForModel, normalizeModelThinkingEffort, normalizeModelThinkingEffortOptions, resolveMiniMaxM3ThinkingProtocol, resolveModelThinkingMiddleEffort, resolveModelThinkingProtocol, resolveThinkingLevel, } from './resolution/model-ref.js';
-export { AgentModelSelectionError, resolveBuiltinAgentModelGroup, resolveEffectiveAgentModelSelection, previewAgentModelSelection, resolveAgentModelSelection, } from './catalog/agent-model-selection.js';
-export { formatModelKey, parseSourceQualifiedModelKey, parseProviderId, } from './resolution/model-key.js';
+export { AgentModelSelectionError, canonicalSelectionModelKey, resolveBuiltinAgentModelGroup, resolveEffectiveAgentModelSelection, previewAgentModelSelection, resolveAgentModelSelection, } from './catalog/agent-model-selection.js';
+export { formatModelKey, formatRuntimeModelIdentity, parseSourceQualifiedModelKey, parseProviderId, readRuntimeModelId, } from './resolution/model-key.js';
 //# sourceMappingURL=index.js.map

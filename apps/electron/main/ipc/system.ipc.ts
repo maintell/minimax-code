@@ -7,8 +7,9 @@ import * as path from "path";
 import * as os from "os";
 import { ipcMain, nativeTheme, shell } from "electron";
 import { logger, isLogFile, getLogFilePath, getCategoryLogger, flushLogs, getLogDir } from "../utils";
-import { getExtraLogSources } from "../utils/extra-log-source";
+import { getExtraLogSources, resolveRuntimeLogsDir } from "../utils/extra-log-source";
 import { getDesktopAppInstallDir } from "../utils/install-dir";
+import { importEsm } from "../utils/import-esm";
 import { IPC_CHANNELS } from "../config/constants";
 import { uploadToOSS } from "../modules/oss";
 import { getUserInfo } from "./storage.ipc";
@@ -22,14 +23,6 @@ import { collectDesktopEnvironment } from "../modules/diagnostics/desktop-enviro
 configureUtilityRuntimeDiagnosticsLogger(logger);
 const UPLOAD_LOG_MAX_FILES = 256;
 const UPLOAD_LOG_MAX_BYTES = 512 * 1024 * 1024;
-function importEsm(specifier) {
-    if (process.env.VITEST === 'true') {
-        return import(specifier);
-    }
-    // eslint-disable-next-line no-new-func -- Preserve native dynamic import in Electron's CJS main process.
-    const dynamicImport = new Function('specifier', 'return import(specifier)');
-    return dynamicImport(specifier);
-}
 /**
  * The runtime disk log transports (`runtime-*.log` / `im-runtime-*.log`)
  * live inside the utility process, so flushing them requires a control-plane
@@ -67,6 +60,8 @@ function toSharedFileSource(runtime, source) {
 }
 async function collectUploadDiagnosticBundle(input) {
     const runtime = await importEsm('@mavis/local-runtime');
+    const goalDiagnostics = await importEsm('@mavis/local-runtime-v2');
+    const runtimeDataDir = resolveLocalRuntimeDataDir();
     const requiredArtifacts = [];
     const skippedArtifacts = [];
     if (input.extraFiles && input.extraFiles.length > 0) {
@@ -104,8 +99,9 @@ async function collectUploadDiagnosticBundle(input) {
             uploadDefault: 'consent-required',
         }),
         new runtime.LocalAssetManifestDiagnosticSource(resolveLocalRuntimeDataDir()),
-        new runtime.ThreadGoalDecisionDiagnosticSource(resolveLocalRuntimeDataDir()),
+        new goalDiagnostics.ThreadGoalDecisionDiagnosticSource((query) => goalDiagnostics.readGoalDiagnosticRows(runtimeDataDir, query)),
         ...getExtraLogSources().map((source) => toSharedFileSource(runtime, source)),
+        runtime.createRuntimeSessionLogSource(resolveRuntimeLogsDir(), input.sessionId),
     ];
     const bundle = await runtime.collectDiagnosticBundle({
         sources,
@@ -284,7 +280,7 @@ export function setupSystemIPC(options = {}) {
  * 上传日志到 OSS
  * 可在主进程中直接调用
  */
-export async function uploadLog(extraFiles) {
+export async function uploadLog(extraFiles, sessionId) {
     try {
         logger.info('[UploadLog] Starting log upload...');
         // Snapshot synchronously before the original parallel flush. Both drains
@@ -347,6 +343,7 @@ export async function uploadLog(extraFiles) {
             logDir,
             sinceMs,
             extraFiles,
+            sessionId,
         });
         if (bundle.artifacts.length === 0) {
             return { success: false, error: 'No diagnostic artifacts found in the last 2 days' };
@@ -425,7 +422,7 @@ async function uploadFeedbackLog(data) {
         await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
         logger.info(`[UploadFeedbackLog] Wrote feedback metadata: ${fileName}`);
         // Now run the standard upload flow, injecting the metadata file
-        const result = await uploadLog([{ name: fileName, path: filePath }, ...sessionReport]);
+        const result = await uploadLog([{ name: fileName, path: filePath }, ...sessionReport], data.session_id);
         // Clean up the metadata file after upload (success or failure)
         try {
             await fs.promises.unlink(filePath).catch(() => { });

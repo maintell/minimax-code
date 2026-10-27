@@ -7,12 +7,25 @@ export const CRON_TOOL_NAMES = [
     'cron_update',
     'cron_delete',
 ];
+/**
+ * Tools that exist only while the mavis capability is on. Disabling mavis,
+ * disallowing the `mavis` tool, or running a built-in subagent removes all of
+ * them together.
+ */
+export const MAVIS_CAPABILITY_TOOL_NAMES = [
+    'mavis',
+    'session_create',
+    ...CRON_TOOL_NAMES,
+];
 const nonblank = (description) => Type.String({ minLength: 1, description });
 /** 创建入口的 session 目标：`fixed` 建立任务专用会话，需要 `agent_name`。 */
 const creationSession = Type.Object({
     mode: Type.String({
         enum: ['new', 'sessionId'],
-        description: 'new starts a new conversation on every run; sessionId reuses one conversation across runs.',
+        description: 'new starts a new conversation on every run; sessionId reuses one conversation across runs. ' +
+            'Choose from the task itself; neither is the default. Use sessionId when a run builds on ' +
+            'earlier runs, such as tracking changes, continuing progress or keeping a running record. ' +
+            'Use new when each run stands alone, such as a reminder or a fresh daily digest.',
     }),
     session_id: Type.Optional(nonblank(`In sessionId mode: "${CRON_FIXED_SESSION_ID}" or omitted creates a separate task-owned conversation on the first run, then reuses it. A real ID binds the user-selected existing conversation. "me" is invalid.`)),
 }, { additionalProperties: false });

@@ -1,8 +1,14 @@
 import { basename, extname } from 'node:path';
-import { discardLocalAssetRegistrations, registerMessageAttachments, resolveSessionLocalAssetSource, } from '../assets/store.js';
+import { createSessionAssetPathIndex, discardLocalAssetRegistrations, registerMessageAttachments, resolveSessionLocalAssetSource, } from '../assets/store.js';
 import { loadUserMediaCandidatesForMessages, } from '../messages/input.js';
 export function createHostedAttachmentCapabilities(host) {
+    const sessionAssets = createSessionAssetPathIndex(() => host.configGetter().dataDir);
     return {
+        /**
+         * Asset files the given Sessions registered (attachments, generated media).
+         * The runtime hands the Agent these paths, so they become its read grant.
+         */
+        listSessionReadablePaths: async (sessionIds) => sessionAssets.listSessionAssetPaths(sessionIds),
         register: (input) => registerAttachments(host, input),
         discard: (input) => discardLocalAssetRegistrations({
             dataDir: host.configGetter().dataDir,

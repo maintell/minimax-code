@@ -106,6 +106,7 @@ export function ownerCapabilitiesForServices(services) {
         // Memory V2 管理面只在 memory.v2 分支装配出 application 时接管；
         // 其余宿主回落 v1 的 memory-v2-disabled 降级实现。
         memoryV2: Boolean(services?.memoryV2),
+        goal: Boolean(services?.goal),
     };
 }
 function inferOwnerCapabilities(services) {

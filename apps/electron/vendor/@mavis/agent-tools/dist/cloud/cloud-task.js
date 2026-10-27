@@ -47,6 +47,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     }
     return useValue ? value : void 0;
 };
+import { cloudToolHookTargets, withCloudToolTargetHooks } from './cloud-tool-target-hooks.js';
 import { randomUUID } from 'node:crypto';
 import { withMcodeToolsMasterReminder } from '@mavis/system-reminder';
 import { bindTool, isRuntimeToolInputValid, } from '@mavis/agent-core/tools';
@@ -821,7 +822,9 @@ let CloudTaskTool = (() => {
                         ? { skillLookup: ctx.skillLookup }
                         : {}),
                 ...(ctx.pluginHooks ? { pluginHooks: ctx.pluginHooks } : {}),
-                ...(ctx.pluginMcpToolOwners ? { pluginMcpToolOwners: ctx.pluginMcpToolOwners } : {}),
+                ...((resolved.pluginMcpToolOwners ?? ctx.pluginMcpToolOwners)
+                    ? { pluginMcpToolOwners: resolved.pluginMcpToolOwners ?? ctx.pluginMcpToolOwners }
+                    : {}),
                 ...(ctx.pluginSubagentLifecycle
                     ? { pluginSubagentLifecycle: ctx.pluginSubagentLifecycle }
                     : {}),
@@ -898,7 +901,7 @@ let CloudTaskTool = (() => {
                         }
                     },
                 };
-                const pluginControl = buildSubagentPluginHooks(ctx, subSessionId, subTurnId, resolved.tools, childController.signal, pluginTranscript, resolved.config.model.model_id, cloudPluginHookEffort(resolved.config.model), agentType);
+                const pluginControl = buildSubagentPluginHooks(subToolContext, subSessionId, subTurnId, resolved.tools, childController.signal, pluginTranscript, resolved.config.model.model_id, cloudPluginHookEffort(resolved.config.model), agentType);
                 const hooks = {
                     ...(pluginControl?.hooks ?? {}),
                     ...(beforeToolCall
@@ -947,7 +950,7 @@ let CloudTaskTool = (() => {
                         disableBuiltinToolFallback: true,
                         context: subToolContext,
                     },
-                    hooks,
+                    hooks: withCloudToolTargetHooks(resolved.tools, hooks),
                     ...(pluginControl
                         ? {
                             getSteeringMessages: pluginControl.getSteeringMessages,
@@ -1047,6 +1050,7 @@ function buildSubagentPluginHooks(ctx, subSessionId, subTurnId, tools, signal, t
     const lifecycle = ctx.pluginSubagentLifecycle;
     if (handlers.length === 0 || !lifecycle)
         return undefined;
+    const hookTargets = cloudToolHookTargets(tools);
     const toolContexts = new Map();
     const toolStartedAtMs = new Map();
     let stopHookActive = false;
@@ -1075,7 +1079,7 @@ function buildSubagentPluginHooks(ctx, subSessionId, subTurnId, tools, signal, t
                 agent_type: agentType,
             },
         }, signal);
-        const invalidRewrite = applyPluginToolRewrite(tools, toolContext, result.decision.updatedInput);
+        const invalidRewrite = applyPluginToolRewrite(hookTargets, toolContext, result.decision.updatedInput);
         if (invalidRewrite) {
             toolContexts.delete(toolContext.toolCall.id);
             return { block: true, reason: invalidRewrite };
@@ -1118,7 +1122,7 @@ function buildSubagentPluginHooks(ctx, subSessionId, subTurnId, tools, signal, t
                 },
             }, signal);
             const permissionUpdatedInputIsValid = !permission.decision.updatedInput ||
-                isRuntimeToolInputValid(tools, toolContext.toolCall.name, permission.decision.updatedInput);
+                isRuntimeToolInputValid(hookTargets, toolContext.toolCall.name, permission.decision.updatedInput);
             const permissionUpdatesAreSupported = !permission.decision.updatedPermissions?.length;
             if (permission.decision.updatedInput &&
                 permissionUpdatedInputIsValid &&

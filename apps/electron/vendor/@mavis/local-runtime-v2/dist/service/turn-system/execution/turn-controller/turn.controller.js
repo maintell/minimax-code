@@ -1,9 +1,10 @@
 import { waitForRelease } from './wait-for-release.js';
-import { isUserSteeringProducer } from '../../agent-host/contracts.js';
+import { isHandedBackOnClose, isUserSteeringProducer, } from '../../agent-host/contracts.js';
 const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
 const DEFAULT_RENEWAL_INTERVAL_MS = 10_000;
 export function createTurnController(options) {
     const entries = new Map();
+    const publishWait = options.onBackgroundTaskWaitChanged;
     const abortTimeoutMs = positiveInteger(options.abortTimeoutMs, DEFAULT_ABORT_TIMEOUT_MS);
     const renewalIntervalMs = positiveInteger(options.renewalIntervalMs, DEFAULT_RENEWAL_INTERVAL_MS);
     let closed = false;
@@ -25,7 +26,7 @@ export function createTurnController(options) {
         };
     };
     let closePromise;
-    const discardSteering = (entry, messages, cause) => {
+    const discardSteering = (entry, messages, cause, workClosed) => {
         if (messages.length === 0)
             return;
         try {
@@ -35,6 +36,7 @@ export function createTurnController(options) {
                 messages,
                 cause,
                 ...(entry.abortReason ? { abortReason: entry.abortReason } : {}),
+                ...(workClosed ? { workClosed } : {}),
                 turnReleased: entry.released,
             });
         }
@@ -68,6 +70,7 @@ export function createTurnController(options) {
         };
         entry.renewalTimer.unref?.();
         entries.set(input.sessionId, entry);
+        clearBackgroundTaskWaitOnAbort(entry, abortController.signal, publishWait);
         const cancellationReason = options.onRegister?.(input.sessionId, input.turnId);
         if (cancellationReason !== undefined)
             abortEntry(entry, cancellationReason, discardSteering);
@@ -100,6 +103,7 @@ export function createTurnController(options) {
     }
     function scope(lease) {
         return {
+            setBackgroundTaskWaiting: (waiting) => setBackgroundTaskWaiting(matchingEntry(entries, lease), waiting, publishWait),
             setComputerUseAvailable: (available) => {
                 const entry = matchingEntry(entries, lease);
                 if (entry?.phase === 'running')
@@ -109,7 +113,8 @@ export function createTurnController(options) {
             steeringSignal: () => matchingEntry(entries, lease)?.steeringWake.signal,
             ackSteering: (messages) => ackSteering(entries, lease, messages),
             restoreSteering: (messages) => restoreSteering(entries, lease, messages, discardSteering),
-            tryBeginClose: () => tryBeginClose(entries, lease, discardSteering),
+            tryBeginClose: (closeOptions) => tryBeginClose(entries, lease, discardSteering, closeOptions),
+            cancelClose: () => cancelClose(entries, lease),
             sealAbnormalTerminal: () => sealAbnormalTerminal(entries, lease, discardSteering),
             openToolResultTail: () => openToolResultTail(entries, lease),
             closeAndClaimToolResultTail: (toolCallId) => closeAndClaimToolResultTail(entries, lease, toolCallId),
@@ -141,6 +146,7 @@ export function createTurnController(options) {
         },
         register,
         scope,
+        backgroundTaskWait: (sessionId) => entries.get(sessionId)?.backgroundTaskWait,
         abort: async ({ sessionId, turnId, reason, onAccepted, onReleased }) => {
             const entry = entries.get(sessionId);
             if (!entry)
@@ -151,6 +157,7 @@ export function createTurnController(options) {
             // hook is still running, and the release moment must not be missed.
             watchRelease(entry, onReleased);
             if (entry.phase === 'closing') {
+                entry.closeAbortRequested = true;
                 await onAccepted?.();
                 const released = await waitForRelease(entry.released, abortTimeoutMs);
                 return released
@@ -178,6 +185,7 @@ export function createTurnController(options) {
             const entry = matchingEntry(entries, turn);
             if (!entry)
                 return;
+            setBackgroundTaskWaiting(entry, false, publishWait);
             clearInterval(entry.renewalTimer);
             entries.delete(turn.sessionId);
             clearControl(entry);
@@ -276,7 +284,7 @@ function steer(entries, input, lane) {
     if (entry.turn.busyReason !== 'turn') {
         return Promise.resolve({ status: 'unsupported-delivery' });
     }
-    if (entry.phase !== 'running')
+    if (isClosedToSteer(entry, input.message, lane))
         return Promise.resolve({ status: 'closing' });
     if (lane === 'tool-result-tail' && entry.toolResultTailOpen === 0) {
         return Promise.resolve({ status: 'delivery-closed' });
@@ -297,6 +305,18 @@ function steer(entries, input, lane) {
     entry.steeringIdentities.add(identity);
     wakeOrdinarySteering(entry, lane);
     return Promise.resolve({ status: 'accepted', turnId: input.turnId });
+}
+/**
+ * A closing Turn takes no steering. After a Stop continuation reopened it, user
+ * steering still waits: the close already requeued earlier user input, which
+ * newer input must not overtake. Machine delivery joins the continuation.
+ */
+function isClosedToSteer(entry, message, lane) {
+    if (entry.phase !== 'running')
+        return true;
+    return (lane === 'ordinary' &&
+        entry.reopenedAfterClose === true &&
+        isUserSteeringProducer(message.producerId));
 }
 function requiresComputerUseTurn(entry, message, lane) {
     if (lane !== 'ordinary' || entry.computerUseAvailable === true)
@@ -367,7 +387,9 @@ function closeAndClaimToolResultTail(entries, lease, toolCallId) {
 function ackToolResultTail(entries, lease, toolCallId) {
     matchingEntry(entries, lease)?.toolResultTailClaims.delete(toolCallId);
 }
-function tryBeginClose(entries, lease, onDiscarded) {
+function tryBeginClose(entries, lease, onDiscarded, options) {
+    const workClosed = options?.workClosed === true;
+    const final = options?.final === true;
     const entry = matchingEntry(entries, lease);
     if (!entry)
         return { closed: false, reason: 'stale-lease' };
@@ -378,22 +400,42 @@ function tryBeginClose(entries, lease, onDiscarded) {
             ...(entry.abortReason ? { abortReason: entry.abortReason } : {}),
         };
     }
-    if (hasInFlightConsumption(entry))
+    // A final close comes after the runner's last poll, when no request is left
+    // to consume anything: holding it would only let `complete` drop the user
+    // steering the close hands back below.
+    if (!final && hasInFlightConsumption(entry))
         return { closed: false, reason: 'steer-pending' };
     // Acknowledged non-user steering (cron, communication, task appends) has no
     // requeue lane: hold the close so the runner polls again and consumes it,
     // matching the pre-exit-boundary contract. Losing delivered machine input
     // outweighs finishing the answer one step earlier.
-    if (entry.steering.some((message) => !isUserSteeringProducer(message.producerId))) {
+    if (!final &&
+        entry.steering.some((message) => !isHandedBackOnClose(message.producerId, workClosed))) {
         return { closed: false, reason: 'steer-pending' };
     }
     // Exit-boundary rule: user steering that was not consumed by the final step
     // never extends the finished answer. The batch goes to the discard callback
     // (user producers are requeued as plain queries) and the close proceeds.
-    if (entry.steering.length > 0)
-        onDiscarded(entry, entry.steering.splice(0), 'exit-close');
+    if (entry.steering.length > 0) {
+        onDiscarded(entry, entry.steering.splice(0), 'exit-close', workClosed);
+    }
     entry.phase = 'closing';
     return { closed: true };
+}
+/**
+ * Reverts a won close when the Turn keeps running after all (a Stop hook asked
+ * the Agent to continue). Refused once the Turn was aborted, or a stop arrived
+ * while it was closing: that stop already promised the user the Turn ends.
+ */
+function cancelClose(entries, lease) {
+    const entry = matchingEntry(entries, lease);
+    if (!entry || entry.phase !== 'closing' || entry.closeAbortRequested)
+        return false;
+    if (entry.turn.signal.aborted)
+        return false;
+    entry.phase = 'running';
+    entry.reopenedAfterClose = true;
+    return true;
 }
 function sealAbnormalTerminal(entries, lease, onDiscarded) {
     const entry = matchingEntry(entries, lease);
@@ -453,5 +495,30 @@ function deferred() {
 }
 function positiveInteger(value, fallback) {
     return Math.max(1, Math.floor(value ?? fallback));
+}
+function setBackgroundTaskWaiting(entry, waiting, publish) {
+    if (!entry)
+        return;
+    const nextWaiting = waiting && entry.phase === 'running';
+    if ((entry.backgroundTaskWait?.waiting ?? false) === nextWaiting)
+        return;
+    const state = {
+        turnId: entry.turn.turnId,
+        turnSequence: entry.turn.acceptedSequence,
+        revision: (entry.backgroundTaskWait?.revision ?? 0) + 1,
+        waiting: nextWaiting,
+    };
+    entry.backgroundTaskWait = state;
+    try {
+        publish?.({ sessionId: entry.turn.sessionId, ...state });
+    }
+    catch {
+        // Display notification failure cannot interrupt an accepted Turn.
+    }
+}
+function clearBackgroundTaskWaitOnAbort(entry, signal, publish) {
+    signal.addEventListener('abort', () => setBackgroundTaskWaiting(entry, false, publish), {
+        once: true,
+    });
 }
 //# sourceMappingURL=turn.controller.js.map

@@ -3,6 +3,7 @@ export function recordFromCreate(input, nowMs) {
     const sessionType = normalizeSessionType(input.sessionType ?? 'branch');
     return {
         ...(input.agentShell ? { agentShell: input.agentShell } : {}),
+        ...whenPresentAgentShellPreference(input.agentShellPreference),
         ...recordIdentityFields(input, sessionType),
         ...recordStateFields(input),
         ...recordErrorFields(input),
@@ -61,6 +62,7 @@ function recordProvenanceFields(input, nowMs) {
         sideChatOrigin: input.sideChatOrigin,
         sessionOrigin: input.sessionOrigin,
         sessionDataVersion: input.sessionDataVersion,
+        ...(input.createdBySessionId ? { createdBySessionId: input.createdBySessionId } : {}),
         scratchpadPath: input.scratchpadPath,
         createdAtMs: input.createdAtMs ?? nowMs,
         updatedAtMs: input.updatedAtMs ?? nowMs,
@@ -70,5 +72,8 @@ function appModeFields(sessionType, appMode) {
     if (sessionType === 'root' || appMode === undefined)
         return {};
     return { appMode };
+}
+function whenPresentAgentShellPreference(preference) {
+    return preference ? { agentShellPreference: preference } : {};
 }
 //# sourceMappingURL=record-create.js.map

@@ -18,6 +18,7 @@ export * from './sessions/repo/normalization.js';
 export * from './sessions/representation/serialization.js';
 export * from './shared/user-message-id.js';
 export * from './shared/sidechat-mode.js';
+export { canonicalProjectWorkspaceDir } from './shared/workspace.js';
 export * from './fork/index.js';
 export { initializeSessionSystem } from './owner.js';
 export { createSessionOperationIntentRepository } from './mutation/index.js';

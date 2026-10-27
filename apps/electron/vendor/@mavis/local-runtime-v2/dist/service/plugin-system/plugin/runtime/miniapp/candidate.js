@@ -1,7 +1,13 @@
-import { MINIAPP_AGENT_DEFAULT_CONCURRENCY } from '../../../../miniapp/index.js';
+import { MINIAPP_AGENT_DEFAULT_CONCURRENCY, } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
 export function sameMiniAppCandidate(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
+}
+/** A cold projection has no process identity or Host-private runtime credential. */
+export function isColdMiniAppTarget(target, loopbackToken) {
+    return (target.origin === undefined &&
+        target.processGeneration === undefined &&
+        loopbackToken === undefined);
 }
 /** A published definition is running only while the exact process generation remains current. */
 export function sameRunningGeneration(current, accepted) {
@@ -25,6 +31,7 @@ export function listEnabledMiniAppDefinitions(snapshot) {
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
         ...(plugin.description ? { description: plugin.description } : {}),
         ...(plugin.iconPath ? { iconPath: plugin.iconPath } : {}),
+        ...(plugin.version ? { version: plugin.version } : {}),
         candidate: miniAppCandidateFromPackage({ plugin }),
     }))
         .sort((left, right) => left.candidate.pluginId.localeCompare(right.candidate.pluginId));
@@ -59,6 +66,9 @@ export function miniAppCandidateFromPackage(packageEntry) {
                 capabilities: [...miniapp.agentAccess],
                 maxConcurrent: miniapp.agentConcurrency ?? MINIAPP_AGENT_DEFAULT_CONCURRENCY,
             }
+            : { kind: 'deny-all' },
+        toolPolicy: miniapp.toolAccess?.length
+            ? { kind: 'allowlist', capabilities: [...miniapp.toolAccess] }
             : { kind: 'deny-all' },
     };
 }

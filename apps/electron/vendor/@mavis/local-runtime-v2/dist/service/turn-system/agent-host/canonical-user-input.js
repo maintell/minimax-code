@@ -1,5 +1,6 @@
 import { normalizeModelSelection } from './preparation/config/model-selection-input.js';
 import { isInputSafetyDecision } from '../../content-safety/index.js';
+import { parsePeerSessionOrigin } from './contracts.js';
 import { captureSemanticSnapshot } from './history/semantic-identity.js';
 const USER_MESSAGE_ID_RE = /^msg-user-v1-[A-Za-z0-9_-]+$/u;
 export class AgentHostUserInputValidationError extends TypeError {
@@ -229,11 +230,36 @@ export function createCanonicalAgentHostSteeringInput(input) {
     return createCanonicalUserInput(captureAgentHostSteeringInput(input));
 }
 function createCanonicalUserInput(input) {
-    const messages = [snapshotMessage(input.input), ...(input.input.queuedMessages ?? [])];
+    // Companions in `queuedMessages` keep no peer origin: no v2 path builds them
+    // for a session send, and attributing them would need their own provenance.
+    const messages = [
+        peerAttributedMessage(snapshotMessage(input.input), input.provenance),
+        ...(input.input.queuedMessages ?? []),
+    ];
     return captureSemanticSnapshot({
         text: renderCanonicalText(messages, input.provenance.source),
         messages,
     }).value;
+}
+/**
+ * The one place a peer origin becomes model-visible.
+ *
+ * Trust comes from the producer, not the payload: `source: 'communication'`
+ * is written only by the runtime's own session send. The legacy
+ * `/communication/send` route refuses every command except `prompt`, and the
+ * parser requires `command: 'session send'`, so that route never qualifies.
+ * Every other source drops the peer origin, which is what stops an external
+ * caller from forging an envelope through sourceContext. Queued companions of
+ * one request share that request's provenance; v2 queue drains carry each row
+ * on its own request instead.
+ */
+function peerAttributedMessage(message, provenance) {
+    if (provenance.source !== 'communication')
+        return message;
+    const origin = parsePeerSessionOrigin(provenance.sourceContext?.['origin']);
+    if (!origin)
+        return message;
+    return { ...message, origin };
 }
 function snapshotUserInput(value) {
     if (!isRecord(value)) {

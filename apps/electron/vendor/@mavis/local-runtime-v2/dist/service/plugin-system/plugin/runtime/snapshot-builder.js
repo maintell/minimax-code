@@ -1,15 +1,22 @@
 import path from 'node:path';
 import { McpNameRegistry, configuredMcpNameKey, pluginMcpNameKey } from '@mavis/mcp';
 import { buildPluginSkillRuntimeName } from '@mavis/shared';
+import { hostWithholdsMiniApp } from '../package/miniapp/engines.js';
 export class PluginSnapshotBuilder {
     names;
-    constructor(names = new McpNameRegistry()) {
+    options;
+    constructor(names = new McpNameRegistry(), options = {}) {
         this.names = names;
+        this.options = options;
+    }
+    /** The version the engines gate compares against; undefined means the gate is off. */
+    get miniAppHostVersion() {
+        return this.options.hostVersion;
     }
     build(input) {
         const state = createSnapshotBuildState(input.reservations);
-        appendOfficialPackages(input.officialPackages, state);
-        appendLocalPackages(input, state);
+        appendOfficialPackages(input.officialPackages, state, this.options);
+        appendLocalPackages(input, state, this.options);
         const allocated = this.names.assignServers([
             ...input.reservations.mcpServerNames.map((name) => ({
                 key: configuredMcpNameKey(name),
@@ -116,12 +123,30 @@ function createSnapshotBuildState(reservations) {
         skillNames: new Set(reservations.skillNames.map(normalizedSkillKey)),
     };
 }
-function appendOfficialPackages(packages, state) {
+/** True when the Host is a parsable release older than the package's `engines.mcode`. */
+export function withholdsMiniAppForHost(plugin, hostVersion) {
+    return hostWithholdsMiniApp(hostVersion, plugin.miniapp?.engines?.mcode);
+}
+/**
+ * Withholds the Mini App and the MCP servers it would have served when the Host is too old.
+ * The package stays installed and listed; the diagnostic is the only trace.
+ */
+function gateMiniAppEngines(plugin, options, diagnostics) {
+    if (!withholdsMiniAppForHost(plugin, options.hostVersion))
+        return plugin;
+    diagnostics.push(freeze({ code: 'MINIAPP_HOST_TOO_OLD', pluginName: plugin.name }));
+    const managed = new Set(plugin.miniapp?.mcpEndpoints.map(({ server }) => server));
+    const { miniapp, ...rest } = plugin;
+    void miniapp;
+    return { ...rest, mcpServers: rest.mcpServers.filter(({ name }) => !managed.has(name)) };
+}
+function appendOfficialPackages(packages, state, options) {
     const sorted = [...packages].sort((left, right) => collisionKey(left.plugin.name).localeCompare(collisionKey(right.plugin.name)) ||
         left.contentDigest.localeCompare(right.contentDigest));
     for (const entry of sorted) {
+        const plugin = gateMiniAppEngines(entry.plugin, options, state.diagnostics);
         const accepted = acceptPackageCapabilities({
-            plugin: entry.plugin,
+            plugin,
             packageContentDigest: entry.contentDigest,
             sourceKind: 'official',
             includeRuntimeCapabilities: true,
@@ -130,28 +155,28 @@ function appendOfficialPackages(packages, state) {
         if (!accepted)
             continue;
         state.officialPackages.push(freeze({
-            name: entry.plugin.name,
-            ...(entry.plugin.version ? { version: entry.plugin.version } : {}),
-            rootPath: entry.plugin.rootPath,
+            name: plugin.name,
+            ...(plugin.version ? { version: plugin.version } : {}),
+            rootPath: plugin.rootPath,
             contentDigest: entry.contentDigest,
-            ...(entry.plugin.miniapp ? { plugin: entry.plugin } : {}),
+            ...(plugin.miniapp ? { plugin } : {}),
         }));
-        state.enabledPlugins.push(enabledProjection(entry.plugin));
+        state.enabledPlugins.push(enabledProjection(plugin));
         state.skills.push(...accepted.skills);
         for (const skill of accepted.skills)
-            state.skillOwners.set(skill, entry.plugin.name);
+            state.skillOwners.set(skill, plugin.name);
         state.mcpServers.push(...accepted.mcpServers);
         state.hooks.push(...accepted.hooks);
         state.hostBindings.push(...accepted.hostBindings);
     }
 }
-function appendLocalPackages(input, state) {
+function appendLocalPackages(input, state, options) {
     const sorted = [...input.localPackages].sort((left, right) => normalizedPath(left.plugin.rootPath).localeCompare(normalizedPath(right.plugin.rootPath)));
     for (const entry of sorted)
-        appendLocalPlugin(entry, input.isLocalEnabled, state);
+        appendLocalPlugin(entry, input.isLocalEnabled, state, options);
 }
-function appendLocalPlugin(entry, isLocalEnabled, state) {
-    const { plugin } = entry;
+function appendLocalPlugin(entry, isLocalEnabled, state, options) {
+    const plugin = gateMiniAppEngines(entry.plugin, options, state.diagnostics);
     const enabled = isLocalEnabled(plugin.rootPath);
     if (state.pluginNames.has(collisionKey(plugin.name))) {
         state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NAME_CONFLICT', pluginName: plugin.name }));
@@ -166,11 +191,12 @@ function appendLocalPlugin(entry, isLocalEnabled, state) {
     });
     if (!accepted)
         return;
-    if (!hasSupportedLocalCapability(plugin)) {
+    // A package whose only capability is a withheld Mini App stays visible and uninstallable.
+    if (!hasSupportedLocalCapability(entry.plugin)) {
         state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NO_SUPPORTED_CAPABILITY', pluginName: plugin.name }));
         return;
     }
-    state.localPlugins.push(localProjection(plugin, entry.contentDigest, enabled));
+    state.localPlugins.push(localProjection(entry.plugin, plugin, entry.contentDigest, enabled));
     if (!enabled)
         return;
     state.enabledPlugins.push(enabledProjection(plugin));
@@ -189,7 +215,7 @@ function hasSupportedLocalCapability(plugin) {
         (plugin.agents?.length ?? 0) > 0 ||
         Boolean(plugin.miniapp));
 }
-function localProjection(plugin, contentDigest, enabled) {
+function localProjection(authoredPlugin, plugin, contentDigest, enabled) {
     return freeze({
         name: plugin.name,
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
@@ -203,6 +229,7 @@ function localProjection(plugin, contentDigest, enabled) {
         source: plugin.source,
         enabled,
         plugin,
+        ...(authoredPlugin === plugin ? {} : { authoredPlugin }),
     });
 }
 function capabilityCollisionState(state) {

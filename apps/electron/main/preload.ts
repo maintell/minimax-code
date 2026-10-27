@@ -46,6 +46,8 @@ const IPC_CHANNELS = {
     RUNTIME_MEMORY_MONITOR_START_HEAP_SAMPLING: 'runtime-memory-monitor:start-heap-sampling',
     RUNTIME_MEMORY_MONITOR_STOP_HEAP_SAMPLING: 'runtime-memory-monitor:stop-heap-sampling',
     RUNTIME_MEMORY_MONITOR_REVEAL_PROFILE: 'runtime-memory-monitor:reveal-profile',
+    GOAL_DIAGNOSTICS_EXPORT: 'goal-diagnostics:export',
+    GOAL_DIAGNOSTICS_REVEAL: 'goal-diagnostics:reveal',
     ASR_PUSH_TO_TALK_KEY_UP: 'asr:push-to-talk-key-up',
     // 菜单事件
     MENU_NEW_CHAT: 'menu:new-chat',
@@ -147,6 +149,7 @@ const IPC_CHANNELS = {
     EMBEDDED_BROWSER_SHOW: 'embedded-browser:show',
     EMBEDDED_BROWSER_SET_BOUNDS: 'embedded-browser:set-bounds',
     EMBEDDED_BROWSER_SET_DEVICE_PREVIEW_MODE: 'embedded-browser:set-device-preview-mode',
+    EMBEDDED_BROWSER_UPDATE_DEVICE_PREVIEW: 'embedded-browser:update-device-preview',
     EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION: 'embedded-browser:set-native-overlay-occlusion',
     EMBEDDED_BROWSER_HIDE: 'embedded-browser:hide',
     EMBEDDED_BROWSER_DESTROY: 'embedded-browser:destroy',
@@ -163,6 +166,12 @@ const IPC_CHANNELS = {
     EMBEDDED_BROWSER_CLEAR_CACHE: 'embedded-browser:clear-cache',
     EMBEDDED_BROWSER_SET_COMMENT_MODE: 'embedded-browser:set-comment-mode',
     EMBEDDED_BROWSER_CLEAR_COMMENTS: 'embedded-browser:clear-comments',
+    EMBEDDED_BROWSER_RESOLVE_SENT_COMMENTS: 'embedded-browser:resolve-sent-comments',
+    EMBEDDED_BROWSER_REMOVE_COMMENT: 'embedded-browser:remove-comment',
+    /** main → renderer: the page composer's mic was pressed. */
+    EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST: 'embedded-browser:comment-voice-request',
+    /** renderer → main: ASR state/transcript for the page composer. */
+    EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE: 'embedded-browser:comment-voice-update',
     EMBEDDED_BROWSER_ACK_COMMENT_EVENTS: 'embedded-browser:ack-comment-events',
     EMBEDDED_BROWSER_OPEN_EXTERNAL: 'embedded-browser:open-external',
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
@@ -175,8 +184,14 @@ const IPC_CHANNELS = {
     MINIAPP_STOP: 'miniapp:stop',
     MINIAPP_DETACH: 'miniapp:detach',
     MINIAPP_ATTACH: 'miniapp:attach',
+    MINIAPP_APPLY_UPDATE: 'miniapp:apply-update',
+    MINIAPP_PERMISSIONS_LIST: 'miniapp:permissions-list',
+    MINIAPP_PERMISSIONS_SET: 'miniapp:permissions-set',
     MINIAPP_COMPOSER_REQUEST: 'miniapp:composer-request',
     MINIAPP_COMPOSER_REPLY: 'miniapp:composer-reply',
+    MINIAPP_TOOL_PERMISSION_REQUEST: 'miniapp:tool-permission-request',
+    MINIAPP_TOOL_PERMISSION_REPLY: 'miniapp:tool-permission-reply',
+    MINIAPP_TOOL_PERMISSION_CANCEL: 'miniapp:tool-permission-cancel',
     MINIAPP_AGENT_OPEN_SESSION: 'miniapp:agent-open-session',
     MINIAPP_AGENT_OPEN_SESSION_REPLY: 'miniapp:agent-open-session-reply',
     MINIAPP_AGENT_PANEL_CLOSED: 'miniapp:agent-panel-closed',
@@ -272,6 +287,7 @@ const IPC_CHANNELS = {
     RUNTIME_FAILED: 'runtime:failed',
     RUNTIME_CHECK_READY: 'runtime:check-ready',
     RUNTIME_SET_RUNAWAY_GUARD_CONFIG: 'runtime:set-runaway-guard-config',
+    RUNTIME_SET_PROMPT_SUGGESTION_POLICY: 'runtime:set-prompt-suggestion-policy',
     RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG: 'runtime:set-tool-result-compaction-config',
     RUNTIME_SET_COLLECTION_POLICY_CONFIG: 'runtime:set-collection-policy-config',
     // Always-on Electron utility-process runtime transport.
@@ -641,6 +657,8 @@ const electronAPI = {
     startRuntimeHeapSampling: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_MEMORY_MONITOR_START_HEAP_SAMPLING),
     stopRuntimeHeapSampling: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_MEMORY_MONITOR_STOP_HEAP_SAMPLING),
     revealRuntimeHeapProfile: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_MEMORY_MONITOR_REVEAL_PROFILE),
+    exportGoalDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.GOAL_DIAGNOSTICS_EXPORT),
+    revealGoalDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.GOAL_DIAGNOSTICS_REVEAL),
     onFullScreenChanged: (callback) => {
         const handler = (_, isFullScreen) => callback(isFullScreen);
         ipcRenderer.on(IPC_CHANNELS.WINDOW_FULL_SCREEN_CHANGED, handler);
@@ -834,10 +852,11 @@ const electronAPI = {
     // 语言设置（需要重启）
     setLanguage: (language) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_LANGUAGE, language),
     getLocalRuntimeDataDirInfo: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_LOCAL_RUNTIME_DATA_DIR_INFO),
-    relocateLocalRuntimeDataDir: (parentDir) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, parentDir),
+    relocateLocalRuntimeDataDir: (parentDir, options) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, parentDir, options),
     // Runtime lifecycle
     checkRuntimeReady: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_CHECK_READY),
     setRunawayGuardConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_RUNAWAY_GUARD_CONFIG, config),
+    setPromptSuggestionPolicy: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_PROMPT_SUGGESTION_POLICY, config),
     setToolResultCompactionConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG, config),
     // `config` is the raw Apollo value (object, JSON string, or `undefined` when
     // the key is absent). Main owns validation and the last-valid fallback.
@@ -1490,6 +1509,7 @@ const embeddedBrowserAPI = {
     show: (bounds, params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SHOW, bounds, params),
     setBounds: (bounds, params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_BOUNDS, bounds, params),
     setDevicePreviewMode: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_DEVICE_PREVIEW_MODE, params),
+    updateDevicePreview: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_UPDATE_DEVICE_PREVIEW, params),
     setNativeOverlayOcclusion: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION, params),
     hide: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_HIDE, params),
     destroy: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_DESTROY, params),
@@ -1507,6 +1527,23 @@ const embeddedBrowserAPI = {
     clearCache: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_CACHE, params),
     setCommentMode: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_COMMENT_MODE, params),
     clearComments: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_COMMENTS, params),
+    resolveSentComments: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_RESOLVE_SENT_COMMENTS, params),
+    removeComment: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_REMOVE_COMMENT, params),
+    updateCommentVoice: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE, params),
+    onCommentVoiceRequest: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, tabId, action } = payload;
+            if (typeof tabId !== 'number')
+                return;
+            if (action !== 'start' && action !== 'stop' && action !== 'cancel')
+                return;
+            callback({ sessionId: typeof sessionId === 'string' ? sessionId : null, tabId, action });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST, handler);
+    },
     ackCommentEvents: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_ACK_COMMENT_EVENTS, params),
     openExternal: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_OPEN_EXTERNAL, params),
     listLocalServers: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_LIST_LOCAL_SERVERS, params),
@@ -1556,6 +1593,50 @@ const miniAppComposer = {
         };
     },
 };
+let miniAppToolPermissionHandler = null;
+let miniAppToolPermissionCancelHandler = null;
+// Install before React mounts so Main learns "no Host UI" (null) instead of waiting.
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_TOOL_PERMISSION_REQUEST, async (_event, request) => {
+    let result = null;
+    try {
+        if (miniAppToolPermissionHandler)
+            result = await miniAppToolPermissionHandler(request);
+    }
+    catch {
+        // A Host UI failure never allows; Main reads a malformed answer as a deny.
+        result = { decision: 'deny' };
+    }
+    try {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_TOOL_PERMISSION_REPLY, {
+            requestId: request.requestId,
+            result,
+        });
+    }
+    catch {
+        // The Host document may be exiting. Main settles its outstanding request on document teardown.
+    }
+});
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_TOOL_PERMISSION_CANCEL, (_event, message) => {
+    const requestId = message?.requestId;
+    if (typeof requestId === 'string')
+        miniAppToolPermissionCancelHandler?.(requestId);
+});
+const miniAppToolPermission = {
+    onRequest: (handler) => {
+        miniAppToolPermissionHandler = handler;
+        return () => {
+            if (miniAppToolPermissionHandler === handler)
+                miniAppToolPermissionHandler = null;
+        };
+    },
+    onCancel: (handler) => {
+        miniAppToolPermissionCancelHandler = handler;
+        return () => {
+            if (miniAppToolPermissionCancelHandler === handler)
+                miniAppToolPermissionCancelHandler = null;
+        };
+    },
+};
 let miniAppOpenSessionHandler = null;
 const isNonEmptyString = (value) => typeof value === 'string' && value.length > 0;
 // Install before React mounts so Main learns "no Host UI yet" instead of waiting out its bound.
@@ -1602,12 +1683,16 @@ const miniAppAgentSessions = {
 const miniAppAPI = {
     agentSessions: miniAppAgentSessions,
     composer: miniAppComposer,
+    toolPermission: miniAppToolPermission,
     list: () => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_LIST),
     open: openMiniApp,
     refresh: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_REFRESH, params),
     stop: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_STOP, params),
     detach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_DETACH, params),
     attach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_ATTACH, params),
+    applyUpdate: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_APPLY_UPDATE, params),
+    listPermissions: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PERMISSIONS_LIST, params),
+    setPermission: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PERMISSIONS_SET, params),
 };
 contextBridge.exposeInMainWorld('miniAppAPI', miniAppAPI);
 const browserProfileImportAPI = {
@@ -2057,4 +2142,6 @@ catch {
 }
 contextBridge.exposeInMainWorld('cuPreviewAPI', {
     inspect: (sessionId, capture) => ipcRenderer.invoke('cu:preview:inspect', sessionId, capture),
+    desktopPermission: () => ipcRenderer.invoke('cu:preview:desktopPermission'),
+    openDesktopPermissionSettings: () => ipcRenderer.invoke('cu:preview:openDesktopPermissionSettings'),
 });

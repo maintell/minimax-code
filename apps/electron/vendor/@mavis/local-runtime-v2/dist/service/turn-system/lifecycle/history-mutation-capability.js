@@ -17,6 +17,7 @@ export function createHistoryMutationCapability(options) {
     return {
         prepareSideChat: (input) => prepareSideChat(options, input),
         fork: (input) => fork(options, input),
+        inspectForkBoundary: (input) => inspectForkBoundary(options, input),
         rewind: (input) => rewind(options, input),
     };
 }
@@ -120,19 +121,7 @@ function rewriteSideChatAssets(frozen, replacements) {
     return { active: rewrite(frozen.active), snapshots };
 }
 async function fork(options, input) {
-    const inclusiveBoundary = input.throughMessageId ?? input.throughAssistantMessageId;
-    const boundary = inclusiveBoundary ?? input.beforeUserMessageId;
-    const source = await readBoundarySource(options, input.sourceSessionId, boundary, input.beforeUserMessageId);
-    const sourceArtifact = findForkArtifact(source, boundary, Boolean(input.throughMessageId));
-    if (!sourceArtifact)
-        boundaryNotFound(boundary);
-    const index = boundary
-        ? sourceArtifact.records.findIndex((envelope) => envelope.message_id === boundary)
-        : sourceArtifact.records.length;
-    if (index < 0)
-        boundaryNotFound(boundary);
-    const prefixEnd = inclusiveBoundary ? index + 1 : index;
-    const prefix = withoutSourceBackgroundReminders(sourceArtifact.records.slice(0, prefixEnd));
+    const { source, sourceArtifact, boundary, prefix } = await selectForkPrefix(options, input);
     if (boundary && !isSettledPrefix(prefix)) {
         throw new HistoryMutationError('boundary-invalid', 'History fork target prefix is not settled');
     }
@@ -161,6 +150,70 @@ async function fork(options, input) {
         generation: sourceArtifact.generation,
         historyRevision: canonicalActiveHistoryRevision(active),
     };
+}
+/** Read-only preflight: reports whether `fork()` would accept this boundary, without staging. */
+async function inspectForkBoundary(options, input) {
+    const { boundary, prefix } = await selectForkPrefix(options, input);
+    return { settled: !boundary || isSettledPrefix(prefix) };
+}
+/** Single source of the Fork prefix rule shared by `fork()` and its preflight. */
+async function selectForkPrefix(options, input) {
+    const inclusiveBoundary = input.throughMessageId ?? input.throughAssistantMessageId;
+    const boundary = inclusiveBoundary ?? input.beforeUserMessageId;
+    const source = await readBoundarySource(options, input.sourceSessionId, boundary, input.beforeUserMessageId);
+    const sourceArtifact = findForkArtifact(source, boundary, Boolean(input.throughMessageId));
+    if (!sourceArtifact)
+        boundaryNotFound(boundary);
+    const index = boundary
+        ? sourceArtifact.records.findIndex((envelope) => envelope.message_id === boundary)
+        : sourceArtifact.records.length;
+    if (index < 0)
+        boundaryNotFound(boundary);
+    const prefixEnd = forkPrefixEnd(sourceArtifact.records, index, input);
+    const prefix = withoutSourceBackgroundReminders(sourceArtifact.records.slice(0, prefixEnd));
+    return { source, sourceArtifact, boundary, prefix };
+}
+function forkPrefixEnd(records, index, input) {
+    if (input.throughMessageId)
+        return index + 1;
+    if (input.throughAssistantMessageId)
+        return assistantBoundaryEnd(records, index);
+    return index;
+}
+/**
+ * An Assistant boundary owns the results of its own tool calls. Pi commits each result as a
+ * separate record right after the call, so cutting between them would leave an unsettled prefix
+ * (e.g. Fork from a `task_output` or ask_user card). Only contiguous results for this Assistant's
+ * calls are included; any other record ends the boundary.
+ */
+function assistantBoundaryEnd(records, index) {
+    const pendingCallIds = new Set(assistantToolCallIds(records[index]?.message));
+    let end = index + 1;
+    while (pendingCallIds.size > 0) {
+        const callId = toolResultCallId(records[end]?.message);
+        if (!callId || !pendingCallIds.delete(callId))
+            break;
+        end += 1;
+    }
+    return end;
+}
+function assistantToolCallIds(message) {
+    if (!message || Reflect.get(message, 'role') !== 'assistant')
+        return [];
+    const content = Reflect.get(message, 'content');
+    if (!Array.isArray(content))
+        return [];
+    return content.flatMap((block) => {
+        if (!isRecord(block) || block.type !== 'toolCall')
+            return [];
+        return typeof block.id === 'string' && block.id ? [block.id] : [];
+    });
+}
+function toolResultCallId(message) {
+    if (!message || Reflect.get(message, 'role') !== 'toolResult')
+        return undefined;
+    const callId = Reflect.get(message, 'toolCallId');
+    return typeof callId === 'string' && callId ? callId : undefined;
 }
 function createForkActiveHistory(prefix, input) {
     return [

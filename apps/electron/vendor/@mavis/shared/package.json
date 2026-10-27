@@ -56,11 +56,23 @@
     "./questionnaire": {
       "import": "./dist/questionnaire.js"
     },
+    "./questionnaire-response": {
+      "import": "./dist/questionnaire-response.js"
+    },
+    "./sidechat-send-origin": {
+      "import": "./dist/sidechat-send-origin.js"
+    },
+    "./local-user-input": {
+      "import": "./dist/local-user-input.js"
+    },
     "./keyed-operation-lane": {
       "import": "./dist/keyed-operation-lane.js"
     },
     "./turn-identity": {
       "import": "./dist/turn-identity.js"
+    },
+    "./turn-message-kind": {
+      "import": "./dist/turn-message-kind.js"
     },
     "./session-clio": {
       "import": "./dist/session-clio/index.js",
@@ -74,6 +86,9 @@
     },
     "./cron-purpose": {
       "import": "./dist/cron-purpose.js"
+    },
+    "./goal-verifier-purpose": {
+      "import": "./dist/goal-verifier-purpose.js"
     },
     "./mcode-context-mode": {
       "import": "./dist/mcode-context-mode.js"
@@ -172,6 +187,10 @@
     "./desktop-typography": {
       "import": "./dist/desktop-typography.js",
       "default": "./dist/desktop-typography.js"
+    },
+    "./browser-device-preview": {
+      "import": "./dist/browser-device-preview.js",
+      "default": "./dist/browser-device-preview.js"
     },
     "./desktop-appearance": {
       "import": "./dist/desktop-appearance.js",
@@ -287,11 +306,17 @@
       "questionnaire": [
         "src/questionnaire.ts"
       ],
+      "questionnaire-response": [
+        "src/questionnaire-response.ts"
+      ],
       "keyed-operation-lane": [
         "src/keyed-operation-lane.ts"
       ],
       "turn-identity": [
         "src/turn-identity.ts"
+      ],
+      "turn-message-kind": [
+        "src/turn-message-kind.ts"
       ],
       "global-events": [
         "src/global-events.ts"
@@ -301,6 +326,9 @@
       ],
       "cron-purpose": [
         "src/cron-purpose.ts"
+      ],
+      "goal-verifier-purpose": [
+        "src/goal-verifier-purpose.ts"
       ],
       "mcode-context-mode": [
         "src/mcode-context-mode.ts"
@@ -380,6 +408,9 @@
       "desktop-typography": [
         "src/desktop-typography.ts"
       ],
+      "browser-device-preview": [
+        "src/browser-device-preview.ts"
+      ],
       "desktop-appearance": [
         "src/desktop-appearance.ts"
       ],
@@ -425,7 +456,6 @@
     }
   },
   "dependencies": {
-    "@mavis/thrift-gen-client": "file:../thrift-gen-client",
     "mdast-util-from-markdown": "^2.0.3",
     "minimatch": "10.2.6",
     "pino": "^9",

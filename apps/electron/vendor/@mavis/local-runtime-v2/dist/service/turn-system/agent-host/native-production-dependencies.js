@@ -2,7 +2,7 @@ import { createAgentRuntime } from '@mavis/agent-runtime';
 import { getLocalBashEnvironment } from '@mavis/agent-tools';
 import { buildLocalTurnToolCatalog, } from './assembly/local-turn-tool-catalog.js';
 import { createLocalTurnToolCatalogInput, } from './assembly/local-turn-tool-catalog-source.js';
-import { NativeLocalTurnExecutionPreparationSource } from './assembly/local-turn-execution-preparation.js';
+import { NativeLocalTurnExecutionPreparationSource, } from './assembly/local-turn-execution-preparation.js';
 import { LocalTurnInputPreparer, } from './assembly/local-turn-input-preparation.js';
 import {} from './execution/executor.js';
 import { LocalAgentConfigBuilder, LocalAgentPreparationService, } from './preparation/index.js';
@@ -25,15 +25,6 @@ export async function createNativeAgentHostProductionDependencies(options) {
         },
         async assembleTurn(context, desktopCapabilities) {
             const logContext = { sessionId: context.sessionId, turnId: context.turnId };
-            if (context.turnIntent?.kind === 'goal-completion-summary') {
-                const assembly = await observeAgentTurnSetupStage(options.runner.logger, logContext, 'agent_runtime_assembly', () => normalRuntime.assembleTurn(context, {
-                    tools: [],
-                    userPromptPrefix: '',
-                }));
-                // Include extension reminders, but expose no native, plugin, or extension tools.
-                // The host's Goal budget policy is a second execution-time fence.
-                return { ...assembly, tools: [], diagnostic: { ...assembly.diagnostic, toolCount: 0 } };
-            }
             const seed = await observeAgentTurnSetupStage(options.runner.logger, logContext, 'tool_catalog_build', () => toolCatalog.build(createLocalTurnToolCatalogInput(context, desktopCapabilities)));
             return observeAgentTurnSetupStage(options.runner.logger, logContext, 'agent_runtime_assembly', () => normalRuntime.assembleTurn(context, seed));
         },
@@ -42,7 +33,7 @@ export async function createNativeAgentHostProductionDependencies(options) {
     const executionPreparation = new NativeLocalTurnExecutionPreparationSource(new LocalTurnInputPreparer({
         ...options.inputPreparation,
         persistComputerUseSelection: options.turnRuntimeFacts?.persistComputerUseSelection,
-    }), new LocalTurnPermissionGate(createPermissionGateOptions(options)));
+    }), new LocalTurnPermissionGate(createPermissionGateOptions(options)), options.askUserPolicy, options.runner.logger);
     const dependencies = createNativeAgentHostDependencies(options, normal, runtime, executionPreparation);
     return {
         ...dependencies,
@@ -69,6 +60,7 @@ function createNativeAgentHostDependencies(options, normal, runtime, executionPr
         turnControl: options.turnControl,
         ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
         ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
+        promptSuggestion: options.promptSuggestion,
         canonicalHistory: options.canonicalHistory,
         ...(options.runner.logger ? { logger: options.runner.logger } : {}),
         ...(options.usage ? { usage: options.usage } : {}),

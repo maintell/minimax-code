@@ -73,6 +73,7 @@ export function createV1SessionCompatibility(host) {
         },
         questionnaires: {
             copyPendingForFork: (input) => api.copyPendingQuestionnaireForFork(input),
+            reopenAfterSafetyRecall: (input) => api.reopenQuestionnaireAfterSafetyRecall(input),
             deleteSession: async (sessionId) => {
                 await api.deleteQuestionnairesForSession(sessionId);
             },
@@ -80,21 +81,6 @@ export function createV1SessionCompatibility(host) {
         permissions: {
             copyForFork: (input) => api.copyPermissionStateForFork(input),
             deleteSession: (sessionId) => api.deletePermissionStateForSession(sessionId),
-        },
-        goals: {
-            deleteSession: async (sessionId) => {
-                await api.deleteThreadGoalForSession(sessionId);
-            },
-            getBySession: async (sessionId) => {
-                const goal = await api.threadGoal.store.getBySession(sessionId);
-                return goal ? { goalId: goal.goalId, status: goal.status } : undefined;
-            },
-            classifyQueuedItem: (item, hasPendingPlan) => api.classifyThreadGoalQueuedItem(item, hasPendingPlan),
-            prepareTurnAdmission: (input) => api.prepareThreadGoalTurnAdmission(input),
-            pauseActiveForAbort: (sessionId) => api.threadGoal.pauseActiveGoalForAbort(sessionId),
-            bindAutomationOwnerConflictReader: (reader) => api.bindThreadGoalAutomationOwnerConflictReader(reader),
-            bindVerifier: (verifier, transcriptWindowReader) => api.bindThreadGoalVerifier(verifier, transcriptWindowReader),
-            createSubagentExecution: (registry) => api.createThreadGoalVerifierExecution(registry),
         },
         workspace: {
             defaultDirectory: () => api.resolveDefaultWorkspaceDir(),

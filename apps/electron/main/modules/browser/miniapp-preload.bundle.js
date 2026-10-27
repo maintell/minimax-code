@@ -88,7 +88,99 @@ function parseMiniAppComposerAppendResult(value) {
   const code = MINIAPP_COMPOSER_FAILURE_CODES.find((candidate) => candidate === result.code);
   return result.success === false && code ? { success: false, code } : null;
 }
+var MINIAPP_TOOL_REQUEST_MAX_NAMES = 10;
 var MINIAPP_AGENT_MAX_TEXT_LENGTH = 1e5;
+var MINIAPP_SPEECH_AUDIO_FORMAT = Object.freeze({
+  sampleRate: 16e3,
+  channelCount: 1,
+  sampleFormat: "s16"
+});
+var MINIAPP_SPEECH_MAX_AUDIO_BYTES = 16e6;
+var MINIAPP_SPEECH_FAILURE_CODES = [
+  "invalid_request",
+  "not_permitted",
+  "audio_too_large",
+  "busy",
+  "runtime_unavailable",
+  "transcription_failed",
+  "result_unknown"
+];
+function isMiniAppSpeechFailureCode(value) {
+  return MINIAPP_SPEECH_FAILURE_CODES.includes(value);
+}
+function isMiniAppSpeechAudioFormat(value) {
+  if (!isPlainRecord(value))
+    return false;
+  const keys = Object.keys(value);
+  const expected = Object.keys(MINIAPP_SPEECH_AUDIO_FORMAT);
+  return keys.length === expected.length && expected.every((key) => value[key] === MINIAPP_SPEECH_AUDIO_FORMAT[key]);
+}
+var MINIAPP_SPEECH_CONTAINER_MAGIC = [
+  [82, 73, 70, 70],
+  // RIFF (WAV)
+  [26, 69, 223, 163],
+  // EBML (WebM / Matroska)
+  [79, 103, 103, 83],
+  // OggS
+  [102, 76, 97, 67],
+  // fLaC
+  [73, 68, 51]
+  // ID3 (MP3)
+];
+function isSharedArrayBuffer(buffer) {
+  return typeof SharedArrayBuffer !== "undefined" && buffer instanceof SharedArrayBuffer;
+}
+function readMiniAppSpeechAudio(value) {
+  let audio;
+  if (value instanceof ArrayBuffer)
+    audio = new Uint8Array(value);
+  else if (ArrayBuffer.isView(value) && !isSharedArrayBuffer(value.buffer)) {
+    audio = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  } else
+    return { ok: false, code: "invalid_request" };
+  if (audio.byteLength > MINIAPP_SPEECH_MAX_AUDIO_BYTES)
+    return { ok: false, code: "audio_too_large" };
+  if (audio.byteLength === 0 || audio.byteLength % 2 !== 0) {
+    return { ok: false, code: "invalid_request" };
+  }
+  const container = MINIAPP_SPEECH_CONTAINER_MAGIC.some((magic) => magic.every((byte, index) => audio[index] === byte));
+  return container ? { ok: false, code: "invalid_request" } : { ok: true, audio };
+}
+function parseMiniAppSpeechTranscribeResponse(value) {
+  if (!isPlainRecord(value))
+    return null;
+  if (value.ok === true) {
+    const text = isPlainRecord(value.result) ? value.result.text : void 0;
+    return typeof text === "string" ? { ok: true, result: { text } } : null;
+  }
+  return value.ok === false && isMiniAppSpeechFailureCode(value.code) ? { ok: false, code: value.code } : null;
+}
+function readMiniAppSpeechPartialMessage(value) {
+  if (!isPlainRecord(value))
+    return null;
+  const { requestId, text } = value;
+  return typeof requestId === "string" && requestId && typeof text === "string" ? { requestId, text } : null;
+}
+var MINIAPP_HOST_CAPABILITIES = Object.freeze([
+  "agent.agents",
+  "agent.create",
+  "agent.models",
+  "agent.observe",
+  "agent.open",
+  "agent.run",
+  "agent.session",
+  "agent.sessions",
+  "hostConnector",
+  "message.append",
+  "speech.transcribe",
+  "tool",
+  "tool.request",
+  "window"
+]);
+function hasMiniAppHostCapability(name) {
+  return MINIAPP_HOST_CAPABILITIES.includes(name);
+}
+var MINIAPP_DEVICE_ACCESS_ITEMS = Object.freeze(["microphone"]);
 var MINIAPP_AGENT_FAILURE_CODES = [
   "invalid_request",
   "not_permitted",
@@ -103,6 +195,9 @@ function isMiniAppAgentBusyReason(value) {
   return value === "session_busy" || value === "queue_full";
 }
 var MINIAPP_AGENT_MAX_REQUEST_ID_LENGTH = 128;
+function isMiniAppAgentWhenBusy(value) {
+  return value === "queue" || value === "steer";
+}
 function isMiniAppAgentRequestId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= MINIAPP_AGENT_MAX_REQUEST_ID_LENGTH && !/[\u0000-\u001f\u007f]/u.test(value);
 }
@@ -184,7 +279,7 @@ function readMiniAppAgentRunRequest(value) {
   if (!value || typeof value !== "object")
     return null;
   const input = value;
-  const { text, sessionId, requestId, agent } = input;
+  const { text, sessionId, requestId, agent, whenBusy } = input;
   const observe = readMiniAppAgentObserveFlag(input.observe);
   const model = readOptionalModel(input.model);
   if (typeof text !== "string" || text.length > MINIAPP_AGENT_MAX_TEXT_LENGTH)
@@ -193,12 +288,16 @@ function readMiniAppAgentRunRequest(value) {
     return null;
   if (!isOptionalNonEmptyString(sessionId) || !isOptionalNonEmptyString(agent))
     return null;
+  if (whenBusy !== void 0 && (!isMiniAppAgentWhenBusy(whenBusy) || sessionId === void 0)) {
+    return null;
+  }
   return {
     requestId,
     text,
     ...sessionId !== void 0 ? { sessionId } : {},
     ...model ? { model } : {},
     ...agent !== void 0 ? { agent } : {},
+    ...whenBusy !== void 0 ? { whenBusy } : {},
     observe
   };
 }
@@ -310,6 +409,88 @@ function readMiniAppAgentOpenRequest(value) {
   const { sessionId } = value;
   return isNonEmptyString(sessionId) ? { sessionId } : null;
 }
+function readMiniAppAgentSessionRequest(value) {
+  if (!value || typeof value !== "object")
+    return null;
+  return value.sessionId === void 0 ? {} : readMiniAppAgentOpenRequest(value);
+}
+var MINIAPP_AGENT_MAX_SESSIONS = 100;
+function isMiniAppAgentSessionStatus(value) {
+  return value === "idle" || value === "running" || value === "error" || value === "aborted";
+}
+function readMiniAppAgentSessionSummary(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return null;
+  const record = value;
+  const { sessionId, title, agent, status, workspaceDir, isDefaultWorkspace } = record;
+  const { createdAtMs, updatedAtMs } = record;
+  if (!isNonEmptyString(sessionId) || title !== void 0 && typeof title !== "string" || !isNonEmptyString(agent) || !isMiniAppAgentSessionStatus(status) || typeof workspaceDir !== "string" || typeof isDefaultWorkspace !== "boolean" || !isFiniteNumber(createdAtMs) || !isFiniteNumber(updatedAtMs)) {
+    return null;
+  }
+  return {
+    sessionId,
+    ...title !== void 0 ? { title } : {},
+    agent,
+    status,
+    workspaceDir,
+    isDefaultWorkspace,
+    createdAtMs,
+    updatedAtMs
+  };
+}
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+function readMiniAppAgentSessionList(value) {
+  if (!Array.isArray(value) || value.length > MINIAPP_AGENT_MAX_SESSIONS)
+    return null;
+  const sessions = [];
+  for (const entry of value) {
+    const summary = readMiniAppAgentSessionSummary(entry);
+    if (!summary)
+      return null;
+    sessions.push(summary);
+  }
+  return sessions;
+}
+function readMiniAppAgentSessionDetail(value) {
+  const summary = readMiniAppAgentSessionSummary(value);
+  if (!summary)
+    return null;
+  const record = value;
+  const { lastAssistantText } = record;
+  if (lastAssistantText !== void 0 && typeof lastAssistantText !== "string")
+    return null;
+  const model = readOptionalModel(record.model);
+  const error = readSessionError(record.error);
+  if (model === null || error === null)
+    return null;
+  return {
+    ...summary,
+    ...model ? { model } : {},
+    ...error ? { error } : {},
+    ...lastAssistantText !== void 0 ? { lastAssistantText } : {}
+  };
+}
+function readSessionError(value) {
+  if (value === void 0)
+    return void 0;
+  return isPlainRecord(value) && isNonEmptyString(value.message) ? { message: value.message } : null;
+}
+function readMiniAppAgentObserveTarget(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return null;
+  const { sessionId, all } = value;
+  if (sessionId !== void 0) {
+    return isNonEmptyString(sessionId) && all === void 0 ? { sessionId } : null;
+  }
+  return all === true ? { all: true } : null;
+}
+function readMiniAppAgentObserveRequest(value) {
+  const target = readMiniAppAgentObserveTarget(value);
+  const { requestId } = value ?? {};
+  return target && isMiniAppAgentRequestId(requestId) ? { ...target, requestId } : null;
+}
 function isMiniAppAgentFailureCode(value) {
   return MINIAPP_AGENT_FAILURE_CODES.some((code) => code === value);
 }
@@ -356,7 +537,7 @@ function isQuestionnaireRequest(value) {
   return request.schemaVersion === 2 && isNonEmptyString(request.id) && Array.isArray(request.steps);
 }
 function readRunOutcome(input) {
-  if (input.status !== "finished" && input.status !== "error" && input.status !== "aborted") {
+  if (input.status !== "finished" && input.status !== "error" && input.status !== "aborted" && input.status !== "steered") {
     return null;
   }
   if (input.text !== void 0 && typeof input.text !== "string")
@@ -377,38 +558,54 @@ function readRunOutcome(input) {
   };
 }
 function readMiniAppAgentRunEvent(value) {
+  return readAgentStreamEvent(value, false);
+}
+function readMiniAppAgentObservedEvent(value) {
+  return readAgentStreamEvent(value, true);
+}
+function readAgentStreamEvent(value, observed) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return null;
   const input = value;
   if (input.type === "run.queued")
-    return readRunQueuedEvent(input);
+    return observed ? null : readRunQueuedEvent(input);
   const { sessionId } = input;
   if (!isNonEmptyString(sessionId))
     return null;
-  if (input.type === "question.requested")
-    return readQuestionRequestedEvent(sessionId, input);
-  if (input.type === "permission.requested") {
-    return readPermissionRequestedEvent(sessionId, input);
+  if (input.type === "question.requested") {
+    return observed ? null : readQuestionRequestedEvent(sessionId, input);
   }
-  const { turnId } = input;
+  if (input.type === "permission.requested") {
+    return observed ? null : readPermissionRequestedEvent(sessionId, input);
+  }
+  const { turnId, title } = input;
   if (!isNonEmptyString(turnId))
     return null;
+  if (observed && title !== void 0 && typeof title !== "string")
+    return null;
+  const titled = observed && typeof title === "string" ? { title } : {};
   switch (input.type) {
     case "turn.started": {
       const model = readMiniAppAgentModelSelection(input.model);
-      return model ? { type: "turn.started", sessionId, turnId, model } : null;
+      if (model)
+        return { type: "turn.started", sessionId, turnId, model, ...titled };
+      return observed && input.model === void 0 ? { type: "turn.started", sessionId, turnId, ...titled } : null;
     }
     case "text.delta":
+      return typeof input.text === "string" ? { type: "text.delta", sessionId, turnId, text: input.text } : null;
     case "message.committed":
-      return typeof input.text === "string" ? { type: input.type, sessionId, turnId, text: input.text } : null;
+      return typeof input.text === "string" ? { type: "message.committed", sessionId, turnId, text: input.text, ...titled } : null;
     case "tool.started":
       return typeof input.name === "string" ? { type: "tool.started", sessionId, turnId, name: input.name } : null;
     case "tool.finished":
       return typeof input.name === "string" && typeof input.ok === "boolean" ? { type: "tool.finished", sessionId, turnId, name: input.name, ok: input.ok } : null;
     case "turn.finished": {
       const outcome = readRunOutcome(input);
-      return outcome ? { type: "turn.finished", sessionId, turnId, ...outcome } : null;
+      return outcome ? { type: "turn.finished", sessionId, turnId, ...outcome, ...titled } : null;
     }
+    case "message.pending":
+    case "message.steered":
+      return { type: input.type, sessionId, turnId };
     default:
       return null;
   }
@@ -503,6 +700,35 @@ function parseMiniAppAgentCreateResult(value) {
 }
 function parseMiniAppAgentOpenResult(value) {
   return parseMiniAppAgentReplyResult(value);
+}
+function parseMiniAppAgentObserveResult(value) {
+  if (!value || typeof value !== "object")
+    return { ok: false, code: "runtime_unavailable" };
+  const response = value;
+  return response.ok === true ? { ok: true } : readReadFailure(response);
+}
+function readReadFailure(response) {
+  return response.ok === false && isMiniAppAgentFailureCode(response.code) ? { ok: false, code: response.code } : { ok: false, code: "runtime_unavailable" };
+}
+function parseMiniAppAgentSessionsResult(value) {
+  if (!value || typeof value !== "object")
+    return { ok: false, code: "runtime_unavailable" };
+  const response = value;
+  if (response.ok !== true)
+    return readReadFailure(response);
+  const sessions = readMiniAppAgentSessionList(response.sessions);
+  return sessions ? { ok: true, sessions } : { ok: false, code: "runtime_unavailable" };
+}
+function parseMiniAppAgentSessionResult(value) {
+  if (!value || typeof value !== "object")
+    return { ok: false, code: "runtime_unavailable" };
+  const response = value;
+  if (response.ok !== true)
+    return readReadFailure(response);
+  if (response.session === void 0)
+    return { ok: true };
+  const session = readMiniAppAgentSessionDetail(response.session);
+  return session ? { ok: true, session } : { ok: false, code: "runtime_unavailable" };
 }
 var MINIAPP_SURFACE_ID_ARGUMENT_PREFIX = "--mavis-miniapp-surface-id=";
 var MINIAPP_SURFACE_WINDOW_DIMENSION_FIELDS = [
@@ -653,17 +879,73 @@ var MINIAPP_AGENT_OPEN = "miniapp:agent-open";
 var MINIAPP_AGENT_MODELS = "miniapp:agent-models";
 var MINIAPP_AGENT_AGENTS = "miniapp:agent-agents";
 var MINIAPP_AGENT_CREATE = "miniapp:agent-create";
+var MINIAPP_AGENT_OBSERVE = "miniapp:agent-observe";
+var MINIAPP_AGENT_SESSIONS = "miniapp:agent-sessions";
+var MINIAPP_AGENT_SESSION = "miniapp:agent-session";
+var MINIAPP_TOOL_REQUEST = "miniapp:tool-request";
+var TOOL_PERMISSIONS = /* @__PURE__ */ new Set(["allow", "ask", "deny"]);
+var MINIAPP_SPEECH_TRANSCRIBE = "miniapp:speech-transcribe";
+var MINIAPP_SPEECH_PARTIAL = "miniapp:speech-partial";
+var speechRequestSequence = 0;
+async function transcribeSpeech(input, options) {
+  if (!input || typeof input !== "object") throw new Error("invalid_request");
+  const { audio, format } = input;
+  if (!isMiniAppSpeechAudioFormat(format)) throw new Error("invalid_request");
+  const read = readMiniAppSpeechAudio(audio);
+  if (!read.ok) throw new Error(read.code);
+  const samples = read.audio.byteLength === read.audio.buffer.byteLength ? read.audio : read.audio.slice();
+  const requestId = `speech-${++speechRequestSequence}`;
+  const onPartial = typeof options?.onPartial === "function" ? options.onPartial : void 0;
+  const listener = (_event, message) => {
+    const partial = readMiniAppSpeechPartialMessage(message);
+    if (!onPartial || partial?.requestId !== requestId) return;
+    try {
+      onPartial(partial.text);
+    } catch (error) {
+      console.error("[miniapp] speech onPartial handler threw", error);
+    }
+  };
+  if (onPartial) import_electron2.ipcRenderer.on(MINIAPP_SPEECH_PARTIAL, listener);
+  let response;
+  try {
+    response = await import_electron2.ipcRenderer.invoke(MINIAPP_SPEECH_TRANSCRIBE, {
+      requestId,
+      audio: samples,
+      format: MINIAPP_SPEECH_AUDIO_FORMAT
+    });
+  } catch {
+    throw new Error("result_unknown");
+  } finally {
+    if (onPartial) import_electron2.ipcRenderer.removeListener(MINIAPP_SPEECH_PARTIAL, listener);
+  }
+  const result = parseMiniAppSpeechTranscribeResponse(response);
+  if (!result) throw new Error("result_unknown");
+  if (!result.ok) throw new Error(result.code);
+  return result.result;
+}
 var agentRequestPrefix = Math.random().toString(36).slice(2, 10);
 var agentRequestSequence = 0;
 var inFlightAgentRequests = /* @__PURE__ */ new Set();
-async function invokeAgentTurn(channel, requestId, payload, options) {
-  if (inFlightAgentRequests.has(requestId)) throw new Error("busy");
-  const onEvent = typeof options?.onEvent === "function" ? options.onEvent : void 0;
+var SETTLEMENT_GUARD_MS = 1e4;
+async function followAgentStream(input) {
+  const { requestId, onEvent, read } = input;
+  let isSettled = false;
+  let settle = () => void 0;
+  const settled = new Promise((resolve) => {
+    settle = (response) => {
+      isSettled = true;
+      resolve(response);
+    };
+  });
   const listener = (_event, message) => {
-    if (!onEvent || !message || typeof message !== "object") return;
+    if (!message || typeof message !== "object") return;
     const envelope = message;
     if (envelope.requestId !== requestId) return;
-    const event = readMiniAppAgentRunEvent(envelope.event);
+    if ("settled" in envelope) {
+      settle(envelope.settled);
+      return;
+    }
+    const event = read(envelope.event);
     if (!event) return;
     try {
       onEvent(event);
@@ -671,16 +953,110 @@ async function invokeAgentTurn(channel, requestId, payload, options) {
       console.error("[miniapp] agent onEvent handler threw", error);
     }
   };
+  import_electron2.ipcRenderer.on(MINIAPP_AGENT_EVENT, listener);
+  let guard;
+  try {
+    let reply;
+    try {
+      reply = await input.invoke();
+    } catch {
+      if (isSettled) return await settled;
+      throw new Error(input.lost);
+    }
+    return await Promise.race([
+      settled,
+      new Promise((resolve) => {
+        guard = setTimeout(() => {
+          console.error(
+            "[miniapp] agent request answered without a settlement on its event channel",
+            requestId
+          );
+          resolve(reply);
+        }, SETTLEMENT_GUARD_MS);
+      })
+    ]);
+  } finally {
+    if (guard !== void 0) clearTimeout(guard);
+    import_electron2.ipcRenderer.removeListener(MINIAPP_AGENT_EVENT, listener);
+  }
+}
+async function observeAgent(input, options) {
+  const fields = input && typeof input === "object" ? input : {};
+  const request = readMiniAppAgentObserveRequest({
+    ...fields,
+    requestId: fields.requestId ?? `${agentRequestPrefix}-${++agentRequestSequence}`
+  });
+  const onEvent = options?.onEvent;
+  if (!request || typeof onEvent !== "function") throw new Error("invalid_request");
+  const { requestId } = request;
+  if (inFlightAgentRequests.has(requestId)) throw new Error("busy");
   inFlightAgentRequests.add(requestId);
-  const observe = onEvent !== void 0;
-  if (observe) import_electron2.ipcRenderer.on(MINIAPP_AGENT_EVENT, listener);
   let response;
   try {
-    response = await import_electron2.ipcRenderer.invoke(channel, { requestId, ...payload, observe });
-  } catch {
-    throw new Error("result_unknown");
+    response = await followAgentStream({
+      requestId,
+      onEvent,
+      read: readMiniAppAgentObservedEvent,
+      invoke: () => import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_OBSERVE, request),
+      // Observing changes nothing, so a lost settlement is simply retryable.
+      lost: "runtime_unavailable"
+    });
   } finally {
-    if (observe) import_electron2.ipcRenderer.removeListener(MINIAPP_AGENT_EVENT, listener);
+    inFlightAgentRequests.delete(requestId);
+  }
+  const result = parseMiniAppAgentObserveResult(response);
+  if (!result.ok) throw new Error(result.code);
+}
+async function listAgentSessions() {
+  let response;
+  try {
+    response = await import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_SESSIONS);
+  } catch {
+    throw new Error("runtime_unavailable");
+  }
+  const result = parseMiniAppAgentSessionsResult(response);
+  if (!result.ok) throw new Error(result.code);
+  return { sessions: result.sessions };
+}
+async function getAgentSession(sessionId) {
+  const request = readMiniAppAgentSessionRequest(sessionId === void 0 ? {} : { sessionId });
+  if (!request) throw new Error("invalid_request");
+  let response;
+  try {
+    response = await import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_SESSION, request);
+  } catch {
+    throw new Error("runtime_unavailable");
+  }
+  const result = parseMiniAppAgentSessionResult(response);
+  if (!result.ok) throw new Error(result.code);
+  if (!result.session && request.sessionId !== void 0) throw new Error("runtime_unavailable");
+  return result.session;
+}
+async function invokeAgentTurn(channel, requestId, payload, options) {
+  if (inFlightAgentRequests.has(requestId)) throw new Error("busy");
+  const onEvent = typeof options?.onEvent === "function" ? options.onEvent : void 0;
+  inFlightAgentRequests.add(requestId);
+  const observe = onEvent !== void 0;
+  const invoke = () => import_electron2.ipcRenderer.invoke(channel, { requestId, ...payload, observe });
+  let response;
+  try {
+    if (onEvent) {
+      response = await followAgentStream({
+        requestId,
+        onEvent,
+        read: readMiniAppAgentRunEvent,
+        invoke,
+        // The turn may already have been submitted; never retry implicitly.
+        lost: "result_unknown"
+      });
+    } else {
+      try {
+        response = await invoke();
+      } catch {
+        throw new Error("result_unknown");
+      }
+    }
+  } finally {
     inFlightAgentRequests.delete(requestId);
   }
   const result = parseMiniAppAgentRunResult(response);
@@ -745,10 +1121,11 @@ if (process.isMainFrame) {
             sessionId: input?.sessionId,
             model: input?.model,
             agent: input?.agent,
+            whenBusy: input?.whenBusy,
             requestId: input?.requestId ?? `${agentRequestPrefix}-${++agentRequestSequence}`
           });
           if (!request) throw new Error("invalid_request");
-          const { requestId, text, sessionId, model, agent } = request;
+          const { requestId, text, sessionId, model, agent, whenBusy } = request;
           return invokeAgentTurn(
             MINIAPP_AGENT_RUN,
             requestId,
@@ -756,7 +1133,8 @@ if (process.isMainFrame) {
               text,
               ...sessionId !== void 0 ? { sessionId } : {},
               ...model ? { model } : {},
-              ...agent !== void 0 ? { agent } : {}
+              ...agent !== void 0 ? { agent } : {},
+              ...whenBusy !== void 0 ? { whenBusy } : {}
             },
             options
           );
@@ -820,11 +1198,54 @@ if (process.isMainFrame) {
           const request = readMiniAppAgentCreateRequest(input ?? {});
           if (!request) throw new Error("invalid_request");
           return invokeAgentCall(MINIAPP_AGENT_CREATE, request, parseMiniAppAgentCreateResult);
+        },
+        // Need `session.read` for anything but this Mini App's own sessions.
+        observe: observeAgent,
+        sessions: listAgentSessions,
+        session: getAgentSession
+      },
+      // Only `request`: listing and calling tools is Node `context.tool`.
+      tool: {
+        async request(names) {
+          if (windowGlobal.navigator?.userActivation?.isActive !== true) {
+            throw new Error("invalid_request");
+          }
+          if (!Array.isArray(names) || names.length === 0 || names.length > MINIAPP_TOOL_REQUEST_MAX_NAMES || !names.every((name) => typeof name === "string")) {
+            throw new Error("invalid_request");
+          }
+          let response;
+          try {
+            response = await import_electron2.ipcRenderer.invoke(MINIAPP_TOOL_REQUEST, { names: [...names] });
+          } catch {
+            throw new Error("result_unknown");
+          }
+          return readToolRequestResponse(response);
         }
       },
-      window: createMiniAppWindowHandle(surfaceId)
+      window: createMiniAppWindowHandle(surfaceId),
+      // Requires `deviceAccess: ["microphone"]` and that switch on; Main decides per call.
+      speech: {
+        transcribe(input, options) {
+          return transcribeSpeech(input, options);
+        }
+      },
+      // Fixed per Host version; answers nothing about this Mini App's manifest or grants.
+      capabilities: {
+        has(name) {
+          return typeof name === "string" && hasMiniAppHostCapability(name);
+        }
+      }
     }
   });
+}
+function readToolRequestResponse(response) {
+  const value = response ?? {};
+  if (value.success === false && typeof value.code === "string") throw new Error(value.code);
+  const permissions = value.permissions;
+  if (value.success !== true || !permissions || typeof permissions !== "object" || !Object.values(permissions).every((verdict) => TOOL_PERMISSIONS.has(verdict))) {
+    throw new Error("result_unknown");
+  }
+  return { ...permissions };
 }
 function createMiniAppWindowHandle(surfaceId) {
   let pendingFrame = null;

@@ -1,4 +1,5 @@
 import { TRUSTED_LEGACY_IM_ROOT_PURPOSE_MARKER } from '@mavis/conversation-contract';
+import { isAgentNotFoundError } from '../agent/runtime-port.js';
 import { applyPermissionReplyFromChannel } from '../permissions/reply.js';
 import { LocalQuestionnaireError, LocalQuestionnaireService, } from '../questionnaire/service.js';
 import { classifyQuestionnaireReplyError } from '../questionnaire/reply-outcome.js';
@@ -86,7 +87,17 @@ export function buildHostChannelWireInput(host, options) {
             ? {
                 imConversationModel: true,
                 legacyImCredentialAgent: async (agentName) => {
-                    const detail = (await host.agentRuntimePort.getAgent({ name: agentName })).agent;
+                    // A deleted Agent can leave `credentials/<agent>/*.json` behind.
+                    // Report it as missing so the migration skips that row instead of
+                    // aborting startup; any other read failure still propagates.
+                    const detail = await host.agentRuntimePort
+                        .getAgent({ name: agentName })
+                        .then((response) => response.agent)
+                        .catch((error) => {
+                        if (isAgentNotFoundError(error))
+                            return undefined;
+                        throw error;
+                    });
                     if (!detail)
                         return undefined;
                     const workspaceDir = canonicalProjectWorkspaceDir(detail.defaultWorkspaceDir);

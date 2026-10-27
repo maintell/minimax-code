@@ -258,6 +258,13 @@ export class MemoryGovernanceService {
                 catch {
                     // 清空纪元已经提交，文件清理由下一次协调唤醒重试。
                 }
+                try {
+                    // Reset 即清空：旧记忆迁移随纪元变化停止，用户资料的迁移副本一并删除。
+                    await this.deps.fileStore.deleteLegacyUserSnapshot();
+                }
+                catch {
+                    // 副本不参与召回，删除失败不影响 Reset 结果。
+                }
                 return {
                     status: 'reset',
                     scopeKey: resetRow.scopeKey,

@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { dataDirFs, dataDirFsConstants } from "./data-dir-fs.js";
 import { resolveLocalRuntimeDataDir, getDefaultLocalRuntimeDataParentDir, resolveLocalRuntimeDataDirFromParent, getConfiguredLocalRuntimeDataParentDir, setConfiguredLocalRuntimeDataParentDir } from "./data-dir";
 import { blockUtilityRuntimeStart } from "./runtime-start-guard";
-import { assertInternalDataDirStorage, DataDirStorageError, probeDataDirWrites } from "./data-dir-storage";
+import { assertInternalDataDirStorage, DataDirStorageError, probeDataDirWrites, looksLikeCloudSyncedPath } from "./data-dir-storage";
 export class LocalRuntimeDataDirRelocationError extends Error {
     constructor(code, message, cause) {
         super(message);
@@ -169,7 +169,15 @@ class DataDirCopyError extends Error {
         this.cause = cause;
     }
 }
-async function copyDataDirEntry(sourcePath, targetPath, pendingSymlinks) {
+// Process-scoped Runtime state that is only valid for the Runtime that created it. The
+// Runtime has exited before copying, recreates these directories on start, and a sync client
+// or antivirus can keep the stale files locked, so copying them only risks failing migration.
+const RUNTIME_PROCESS_STATE_DIRS = [path.join('v2', 'runtime-owner-leases')];
+function isRuntimeProcessStateDir(sourceRoot, sourcePath) {
+    const relative = path.relative(sourceRoot, sourcePath);
+    return RUNTIME_PROCESS_STATE_DIRS.some((dir) => relative.toLowerCase() === dir.toLowerCase());
+}
+async function copyDataDirEntry(sourceRoot, sourcePath, targetPath, pendingSymlinks) {
     let operation = 'lstat';
     try {
         const stat = await dataDirFs.lstat(sourcePath);
@@ -183,12 +191,14 @@ async function copyDataDirEntry(sourcePath, targetPath, pendingSymlinks) {
             return;
         }
         if (stat.isDirectory()) {
+            if (isRuntimeProcessStateDir(sourceRoot, sourcePath))
+                return;
             operation = 'mkdir';
             await dataDirFs.mkdir(targetPath, { recursive: true, mode: stat.mode });
             operation = 'readdir';
             const entries = await dataDirFs.readdir(sourcePath);
             for (const entry of entries) {
-                await copyDataDirEntry(path.join(sourcePath, entry), path.join(targetPath, entry), pendingSymlinks);
+                await copyDataDirEntry(sourceRoot, path.join(sourcePath, entry), path.join(targetPath, entry), pendingSymlinks);
             }
             await dataDirFs.utimes(targetPath, stat.atime, stat.mtime).catch(() => { });
             return;
@@ -239,7 +249,7 @@ async function copyPendingSymlink(pending, sourceRoot, targetRoot, platform, tar
 }
 async function copyLocalRuntimeDataDirEntries(sourceRoot, targetRoot) {
     const pendingSymlinks = [];
-    await copyDataDirEntry(sourceRoot, targetRoot, pendingSymlinks);
+    await copyDataDirEntry(sourceRoot, sourceRoot, targetRoot, pendingSymlinks);
     return pendingSymlinks;
 }
 function captureDataDirEnv() {
@@ -364,6 +374,12 @@ export async function relocateLocalRuntimeDataDir(options) {
     }
     catch (error) {
         throw new LocalRuntimeDataDirRelocationError('TARGET_UNAVAILABLE', `Target write probe failed: ${String(error)}`);
+    }
+    // Asked last so that a confirmed warning is not followed by another rejection.
+    if (!options.cloudSyncRiskAcknowledged &&
+        (looksLikeCloudSyncedPath(targetParentDir) ||
+            looksLikeCloudSyncedPath(requestedTargetParentDir))) {
+        throw new LocalRuntimeDataDirRelocationError('TARGET_CLOUD_SYNC_SUSPECTED', 'Target folder name looks like a cloud sync folder; user confirmation is required');
     }
     const nextPreviousParentDirs = uniqueDirs([currentParentDir, ...previousParentDirs], platform);
     const tmpDataDir = path.join(targetParentDir, `${currentDataDirName}.tmp-${process.pid}-${Date.now().toString(36)}`);
