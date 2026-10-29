@@ -76,14 +76,34 @@ patchFile("@mavis/agent-core/dist/pi-turn-runner/llm-retry.js", [
     return policy.baseDelayMs;`,
   },
   {
-    label: "retry-everything terminal kinds",
-    find: `        !normalized.facts.signals.has('refusal') &&
-        !isLLMDeterministicRequestRejection(normalized) &&`,
-    replace: `        !normalized.facts.signals.has('refusal') &&
-        // Local patch: a wrong credential or an exhausted usage plan cannot be
-        // fixed by waiting; those stay terminal under the unbounded budget.
-        !['auth', 'usage_limit', 'credits_exhausted'].includes(toLLMMetricErrorKind(normalized.facts)) &&
-        !isLLMDeterministicRequestRejection(normalized) &&`,
+    label: "retry decision for every provider",
+    find: `    const decision = input.retryAllErrors &&
+        !normalized.facts.explicitAbort &&
+        !normalized.facts.signals.has('refusal') &&
+        !isLLMDeterministicRequestRejection(normalized) &&
+        !(input.final && isContextOverflow(input.final))
+        ? { retryable: true, reason: 'network' }
+        : toLLMRetryDecision(normalized);`,
+    replace: `    // Local patch: one classification for every provider, not only BYOK. The
+    // strict decision keeps its precise transient reason (timeout, network, 429,
+    // overload, 5xx, empty response); the failure it used to fail closed on — an
+    // upstream fault no signal matched — is retried as well. Task-level outcomes
+    // stay terminal: cancellation, a refusal, a wrong credential, an exhausted
+    // usage plan or credits, a deterministic rejection and a context overflow.
+    const strictDecision = toLLMRetryDecision(normalized);
+    const taskLevelTerminal = normalized.facts.explicitAbort ||
+        normalized.facts.signals.has('refusal') ||
+        ['auth', 'usage_limit', 'credits_exhausted'].includes(toLLMMetricErrorKind(normalized.facts)) ||
+        isLLMDeterministicRequestRejection(normalized) ||
+        !!(input.final && isContextOverflow(input.final));
+    const decision = strictDecision.retryable || taskLevelTerminal
+        ? strictDecision
+        : { retryable: true, reason: 'network' };`,
+  },
+  {
+    label: "commit boundary without a done shortcut",
+    find: `        if (commitsOutput(next.value) || (!retryAllErrors && next.value.type === 'done')) {`,
+    replace: `        if (commitsOutput(next.value)) {`,
   },
 ]);
 
@@ -93,6 +113,9 @@ patchFile("@mavis/shared/dist/llm-error-classifier.js", [
     label: "network code set",
     find: `    'ERR_HTTP2_PROTOCOL_ERROR',`,
     replace: `    'ERR_HTTP2_PROTOCOL_ERROR',
+    // Local patch: HTTP/3 failed below the request layer (a proxy, VPN or
+    // middlebox mangling QUIC); the resend normally renegotiates over TCP.
+    'ERR_QUIC_PROTOCOL_ERROR',
     // Local patch: a response body that ends early is the classic flaky-upstream
     // shape (the server or an intermediary dropped the connection mid-stream).
     'ERR_INCOMPLETE_CHUNKED_ENCODING',
@@ -101,7 +124,7 @@ patchFile("@mavis/shared/dist/llm-error-classifier.js", [
   {
     label: "chromium network message pattern",
     find: `HTTP2_PROTOCOL_ERROR|SSL_BAD_RECORD_MAC_ALERT)`,
-    replace: `HTTP2_PROTOCOL_ERROR|INCOMPLETE_CHUNKED_ENCODING|EMPTY_RESPONSE|SSL_BAD_RECORD_MAC_ALERT)`,
+    replace: `HTTP2_PROTOCOL_ERROR|QUIC_PROTOCOL_ERROR|INCOMPLETE_CHUNKED_ENCODING|EMPTY_RESPONSE|SSL_BAD_RECORD_MAC_ALERT)`,
   },
   {
     label: "retry decision tail",

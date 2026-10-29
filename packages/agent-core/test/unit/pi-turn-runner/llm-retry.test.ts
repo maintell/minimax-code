@@ -13,6 +13,7 @@ import {
   isLLMDeterministicRequestRejection,
   isLLMImageLimitMessage,
   normalizeLLMError,
+  toLLMRetryDecision,
 } from "@mavis/shared/llm-error-classifier";
 import { UNBOUNDED_RETRY_ATTEMPTS } from "@mavis/shared/llm-retry-event";
 import {
@@ -519,6 +520,33 @@ describe("withLLMRetry", () => {
     expect(attempts).toBe(2);
   });
 
+  it("retries a Chromium HTTP/3 protocol failure for a provider outside retry-everything", async () => {
+    let attempts = 0;
+    const settled: LLMCallSettledEvent[] = [];
+    const inner = (async () => {
+      attempts += 1;
+      return attempts === 1
+        ? errorStream("[Error] net::ERR_QUIC_PROTOCOL_ERROR")
+        : successStream("ok");
+    }) as StreamFn;
+    const wrapped = withLLMRetry(
+      inner,
+      retryOptions({
+        onCallSettled: (event: LLMCallSettledEvent) => settled.push(event),
+      }),
+    );
+
+    const result = await wrapped(fakeModel(), CONTEXT, {});
+    expect((await collectEvents(result)).at(-1)?.type).toBe("done");
+
+    // HTTP/3 failed at the framing layer, like a dropped HTTP/2 stream: the
+    // resend normally lands on a working transport path.
+    expect(attempts).toBe(2);
+    expect(settled).toMatchObject([
+      { retryTriggered: true, retryReason: "network", requestAttempts: 2 },
+    ]);
+  });
+
   it("emits exhausted once an explicit retry budget is spent", async () => {
     let attempts = 0;
     const observed: LLMRetryEvent[] = [];
@@ -617,6 +645,59 @@ describe("withLLMRetry", () => {
     expect(attempts).toBe(1);
     expect(sleep).not.toHaveBeenCalled();
   });
+
+  // A provider outside the BYOK set used to fail closed on a failure no signal
+  // matched, so a managed or first-party endpoint reported "LLM request failed"
+  // and stopped. Every provider now shares one classification.
+  it.each(["fake-provider", "openai-codex", "minimax"])(
+    "retries an unclassified upstream failure for %s",
+    async (provider) => {
+      let attempts = 0;
+      const settled: LLMCallSettledEvent[] = [];
+      const sleep = vi.fn(async () => {});
+      const inner = (async () => {
+        attempts += 1;
+        return attempts === 1
+          ? errorStream("[Error] upstream gateway refused the request")
+          : successStream("recovered");
+      }) as StreamFn;
+      const wrapped = withLLMRetry(
+        inner,
+        retryOptions({
+          sleep,
+          onCallSettled: (event: LLMCallSettledEvent) => settled.push(event),
+        }),
+      );
+
+      const events = await collectEvents(await wrapped(fakeModel(provider), CONTEXT, {}));
+
+      expect(attempts).toBe(2);
+      expect(sleep).toHaveBeenCalledOnce();
+      expect(events.at(-1)?.type).toBe("done");
+      expect(settled).toMatchObject([
+        { retryTriggered: true, retryReason: "network", requestAttempts: 2 },
+      ]);
+    },
+  );
+
+  it.each(["fake-provider", "openai-codex"])(
+    "keeps a wrong credential terminal for %s",
+    async (provider) => {
+      let attempts = 0;
+      const sleep = vi.fn(async () => {});
+      const inner = (async () => {
+        attempts += 1;
+        return errorStream("[Error] 401 invalid api key");
+      }) as StreamFn;
+      const wrapped = withLLMRetry(inner, retryOptions({ sleep }));
+
+      await collectEvents(await wrapped(fakeModel(provider), CONTEXT, {}));
+
+      expect(attempts).toBe(1);
+      expect(sleep).not.toHaveBeenCalled();
+    },
+  );
+
 
   // #425: a request the provider deterministically rejects (too many images,
   // invalid_request_error) fails the same way on every resend, so the BYOK
@@ -1287,5 +1368,37 @@ describe("deterministic request rejection classification", () => {
     expect(rejection(byok("413 Payload Too Large"))).toBe(true);
     expect(rejection(byok("400 invalid params, context window exceeds limit (2013)"))).toBe(true);
     expect(rejection(byok("503 Service Unavailable"))).toBe(false);
+  });
+});
+
+describe("Chromium transport classification", () => {
+  it("treats an HTTP/3 protocol failure as a transient network error", () => {
+    expect(
+      toLLMRetryDecision(normalizeLLMError({ errorMessage: "[Error] net::ERR_QUIC_PROTOCOL_ERROR" })),
+    ).toEqual({ retryable: true, reason: "network" });
+    // Chromium hands the same failure over as a structured `code` when the throw
+    // carries no message text.
+    expect(
+      toLLMRetryDecision(
+        normalizeLLMError({
+          raw: Object.assign(new Error("request failed"), { code: "ERR_QUIC_PROTOCOL_ERROR" }),
+        }),
+      ),
+    ).toEqual({ retryable: true, reason: "network" });
+  });
+
+  it("keeps the BYOK attribution prefix from masking the HTTP/3 failure", () => {
+    const detail = "net::ERR_QUIC_PROTOCOL_ERROR";
+    const attributed = `BYOK upstream error: ${JSON.stringify({
+      errorCode: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+      message: `BYOK provider custom_provider:wb upstream error: ${detail}`,
+      errorSource: "byok_upstream",
+      errorDetail: detail,
+      errorProviderId: "custom_provider:wb",
+    })}`;
+    const normalized = normalizeLLMError({ errorMessage: attributed });
+
+    expect(toLLMRetryDecision(normalized)).toEqual({ retryable: true, reason: "network" });
+    expect(isLLMDeterministicRequestRejection(normalized)).toBe(false);
   });
 });

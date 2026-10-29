@@ -49,7 +49,7 @@ Never merge internal Git history or cherry-pick internal commits into this repos
 
 Adding a workspace package: add it to `pnpm-workspace.yaml` and to `packageRoots` in `release/extraction.json`, then run `pnpm gen:tsconfig` and `node scripts/source-inventory.mjs --write`.
 
-Changing the desktop client: build and verify it inside `apps/electron` (`pnpm build`, `pnpm package`); its files are inventoried like any other published file, and any new internal-reference string it carries must be reviewed and, when it comes from the shipped build, declared in `scripts/lib/published-client-exceptions.mjs`.
+Changing the desktop client: build and verify it inside `apps/electron` (`pnpm build`, `pnpm package`); its files are inventoried like any other published file, and any new internal-reference string it carries must be reviewed and, when it comes from the shipped build, declared in `scripts/lib/published-client-exceptions.mjs`. A change under `apps/electron/vendor/**` only reaches the packaged app after `pnpm install --ignore-workspace` in that directory: the `file:` dependencies are copies in `node_modules`, so `pnpm package` otherwise ships the stale copy and the installer silently lacks the fix — verify the marker inside `dist/installers/win-unpacked/resources/app.asar` afterwards.
 
 Releasing the desktop client: commit the change, then let GitHub Actions package it — run the `Desktop release` workflow (or push a `desktop-v<version>` tag matching `apps/electron/package.json`). Do not hand-publish installer builds from a workstation; the workflow uploads the installer, its blockmap and `latest.yml` to the release.
 

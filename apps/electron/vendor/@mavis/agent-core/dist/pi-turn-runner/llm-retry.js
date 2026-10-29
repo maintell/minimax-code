@@ -501,7 +501,7 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
         // would either buffer the whole response or replay duplicate content.
         // BYOK keeps its broader pre-output retry classification, but a later
         // stream failure must stay on the already-committed attempt.
-        if (commitsOutput(next.value) || (!retryAllErrors && next.value.type === 'done')) {
+        if (commitsOutput(next.value)) {
             return {
                 kind: 'committed',
                 stream: observeRequestSettlement(replayStream(stream, iterator, buffered), requestAttempt, onRequestSettled, options?.signal),
@@ -605,16 +605,21 @@ function failureResult(input) {
     // the whole backoff window. The deterministic check excludes anything that
     // also looks transient (timeout, network, 408/429/5xx). A context overflow,
     // by tokens or by request bytes, is left to context management as in Pi.
-    const decision = input.retryAllErrors &&
-        !normalized.facts.explicitAbort &&
-        !normalized.facts.signals.has('refusal') &&
-        // Local patch: a wrong credential or an exhausted usage plan cannot be
-        // fixed by waiting; those stay terminal under the unbounded budget.
-        !['auth', 'usage_limit', 'credits_exhausted'].includes(toLLMMetricErrorKind(normalized.facts)) &&
-        !isLLMDeterministicRequestRejection(normalized) &&
-        !(input.final && isContextOverflow(input.final))
-        ? { retryable: true, reason: 'network' }
-        : toLLMRetryDecision(normalized);
+    // Local patch: one classification for every provider, not only BYOK. The
+    // strict decision keeps its precise transient reason (timeout, network, 429,
+    // overload, 5xx, empty response); the failure it used to fail closed on — an
+    // upstream fault no signal matched — is retried as well. Task-level outcomes
+    // stay terminal: cancellation, a refusal, a wrong credential, an exhausted
+    // usage plan or credits, a deterministic rejection and a context overflow.
+    const strictDecision = toLLMRetryDecision(normalized);
+    const taskLevelTerminal = normalized.facts.explicitAbort ||
+        normalized.facts.signals.has('refusal') ||
+        ['auth', 'usage_limit', 'credits_exhausted'].includes(toLLMMetricErrorKind(normalized.facts)) ||
+        isLLMDeterministicRequestRejection(normalized) ||
+        !!(input.final && isContextOverflow(input.final));
+    const decision = strictDecision.retryable || taskLevelTerminal
+        ? strictDecision
+        : { retryable: true, reason: 'network' };
     if (!decision.retryable) {
         return {
             kind: 'terminal',

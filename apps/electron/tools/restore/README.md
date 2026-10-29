@@ -63,8 +63,9 @@ and one prebuilt bundle is copied verbatim.
 
 The shipped client retries a failed model request with exponential backoff and a
 five-attempt / two-minute budget, and treats a dropped response body (`5xx`,
-`net::ERR_INCOMPLETE_CHUNKED_ENCODING`, empty response) as terminal. This product
-wants provider errors retried without a practical limit, on a fixed three-second
+`net::ERR_INCOMPLETE_CHUNKED_ENCODING`, `net::ERR_QUIC_PROTOCOL_ERROR`, empty
+response) as terminal. This product wants provider errors retried without a
+practical limit for every provider — BYOK or not — on a fixed three-second
 cadence, while a wrong credential or an exhausted quota stays terminal instead of
 hiding behind days of retries.
 
