@@ -15,4 +15,19 @@ export function pausesQueueOnAbort(reason) {
     const source = normalizeAbortSource(reason);
     return source === 'user_stop' || source === 'session_leave';
 }
+/** The abort reason a Goal pause or clear stops its own running Goal Turn with. */
+export const THREAD_GOAL_PAUSED_ABORT_REASON = 'thread-goal-paused';
+/**
+ * Abort reasons after which the Session queue drains as it does after a
+ * completed Turn. A Goal pause or clear stops only the Goal's own Turn: the user is
+ * still in the conversation, so ordinary messages queued behind that Turn run
+ * as normal conversation (spec §10) instead of waiting for an unrelated wake.
+ * Other non-pausing aborts keep their caller-owned follow-up.
+ */
+export function wakesQueueOnAbort(reason) {
+    // agent_interrupt stops only the running Turn (D11), so the messages already
+    // queued behind it run. It stays out of pausesQueueOnAbort, which is reserved
+    // for the user stepping away.
+    return (reason === THREAD_GOAL_PAUSED_ABORT_REASON || normalizeAbortSource(reason) === 'agent_interrupt');
+}
 //# sourceMappingURL=queue-pause-on-abort.js.map

@@ -1,3 +1,4 @@
+import { agentShellInstructions } from './agent-shell-context.js';
 import { isLegacyMemoryRecallEnabled, isMemoryV2Enabled } from '@mavis/config';
 import { isPromptSnapshotInvalidError, PromptSnapshotInvalidError, } from '@mavis/agent-runtime';
 import { DEFAULT_RETRY_CONTINUATION_PROMPT, DEFAULT_OUTPUT_REVISION_INSTRUCTION, OUTPUT_REVISION_PROMPT_KEY, RETRY_CONTINUATION_PROMPT_KEY, } from './prompt-templates.js';
@@ -6,14 +7,16 @@ import { isLegacyMinimaxProvider, modelConfigForRef, modelRefForModel, savedSess
 import { INSTRUCTIONS_CONTEXT_PREAMBLE } from '../prompt-blocks.js';
 import { createLocalStaticPromptReader, } from '../static-prompt-reader.js';
 import { resolveTurnModelSelection, turnModelParameters, } from './session-model-selection.js';
-import { readLocalAgentCustomConfig, } from './agent-custom-config.js';
-import { getLocalConversationBuildProfile, isLocalVelaBuild } from './build-profile.js';
 import { addRuntimeRules } from './runtime-prompt-rules.js';
 import { environmentContextBlock, } from './environment-prompt-composer.js';
 import { collectMemoryBlocks, toMemoryPromptSources, } from './memory-prompt-composer.js';
 /** Builds one AgentConfig solely from validated Agent/Session facts and narrow capabilities. */
 export class LocalAgentConfigBuilder {
     options;
+    resolveAgentShell;
+    bindAgentShellResolver(resolve) {
+        this.resolveAgentShell = resolve;
+    }
     staticPrompts;
     nowMs;
     sessionModelRepair;
@@ -40,35 +43,32 @@ export class LocalAgentConfigBuilder {
         return (await this.buildPrepared(input)).agentConfig;
     }
     async buildPrepared(input) {
+        const agentShell = await this.resolveAgentShell?.(input.session.sessionId);
         const source = this.options.promptSnapshots;
         const promptRead = input.promptRead ?? (source ? { source, snapshot: await source.capture() } : undefined);
         try {
-            const outputRevisionInstruction = await readOutputRevisionInstruction(promptRead);
-            const retryContinuationPrompt = await readRetryContinuationPrompt(promptRead, input);
-            await validateWorkflowPromptScope(promptRead);
-            return {
-                agentConfig: await this.buildForPromptScope(input, promptRead),
-                outputRevisionInstruction,
-                ...(retryContinuationPrompt ? { retryContinuationPrompt } : {}),
-                ...(promptRead ? { promptRead } : {}),
-            };
+            return await this.buildPreparedForPromptScope(input, promptRead, agentShell);
         }
         catch (error) {
             if (!source || !promptRead || !isPromptSnapshotInvalidError(error))
                 throw error;
             const builtinPromptRead = { source, snapshot: await source.captureBuiltin() };
-            const outputRevisionInstruction = await readOutputRevisionInstruction(builtinPromptRead);
-            const retryContinuationPrompt = await readRetryContinuationPrompt(builtinPromptRead, input);
-            await validateWorkflowPromptScope(builtinPromptRead);
-            return {
-                agentConfig: await this.buildForPromptScope(input, builtinPromptRead),
-                outputRevisionInstruction,
-                ...(retryContinuationPrompt ? { retryContinuationPrompt } : {}),
-                promptRead: builtinPromptRead,
-            };
+            return this.buildPreparedForPromptScope(input, builtinPromptRead, agentShell);
         }
     }
-    async buildForPromptScope(input, promptRead) {
+    async buildPreparedForPromptScope(input, promptRead, agentShell) {
+        const outputRevisionInstruction = await readOutputRevisionInstruction(promptRead);
+        const retryContinuationPrompt = await readRetryContinuationPrompt(promptRead, input);
+        await validateWorkflowPromptScope(promptRead);
+        return {
+            agentConfig: await this.buildForPromptScope(input, promptRead, agentShell),
+            ...(agentShell ? { agentShell } : {}),
+            outputRevisionInstruction,
+            ...(retryContinuationPrompt ? { retryContinuationPrompt } : {}),
+            ...(promptRead ? { promptRead } : {}),
+        };
+    }
+    async buildForPromptScope(input, promptRead, shell) {
         const config = this.options.config();
         const runtimeFacts = resolveAgentRuntimeFacts(input.agent, config);
         const profileAndBinding = await this.renderProfileForTurn({
@@ -96,7 +96,6 @@ export class LocalAgentConfigBuilder {
             profile,
         });
         const displayName = turnInput.agent.displayName?.trim() || turnInput.agent.agentName;
-        const customConfig = await loadCustomConfig(config, this.options);
         let isGitRepository;
         try {
             isGitRepository = await this.options.isGitRepository?.(turnInput.session.workspaceDir);
@@ -104,16 +103,30 @@ export class LocalAgentConfigBuilder {
         catch {
             isGitRepository = undefined;
         }
+        let environment = this.options.environment?.();
+        if (shell) {
+            environment = {
+                platform: 'win32',
+                osVersion: environment?.osVersion ?? 'Windows',
+                shell: `${shell.family} (${shell.executablePath})\n${agentShellInstructions(shell)}`,
+            };
+        }
+        else if (this.resolveAgentShell && environment?.platform === 'win32') {
+            environment = {
+                ...environment,
+                shell: 'pending background discovery. Continue conversation and use non-shell tools without waiting. Do not assume Bash or PowerShell syntax. The first bash call waits for discovery before permissions and returns shell instructions without executing a command. Rewrite the command for that resolved shell in a new tool-call batch before retrying. If discovery fails, non-shell tools remain available.',
+            };
+        }
         const systemPrompt = buildSystemPrompt({
             config,
-            environment: this.options.environment?.(),
+            environment,
             isGitRepository,
             modelId: model.model_id,
             agent: turnInput.agent,
             workspaceDir: turnInput.session.workspaceDir,
             sessionType: turnInput.session.sessionType,
             layers,
-            customConfig,
+            overrides: this.options.systemPromptOverrides,
             profile,
         });
         return createAgentConfig({
@@ -123,7 +136,6 @@ export class LocalAgentConfigBuilder {
             displayName,
             systemPrompt: systemPrompt.text,
             contextUsagePromptRanges: systemPrompt.ranges,
-            customConfig,
             runtimeFacts,
             profile,
         });
@@ -390,29 +402,21 @@ function loadMemoryBlocks(input) {
         },
     });
 }
-async function loadCustomConfig(config, options) {
-    const buildProfile = options.buildProfile ?? getLocalConversationBuildProfile();
-    if (!isLocalVelaBuild(buildProfile))
-        return undefined;
-    const reader = options.customConfigReader ?? readLocalAgentCustomConfig;
-    return reader({
-        dataDir: config.dataDir,
-        ...(options.logger ? { logger: options.logger } : {}),
-    });
-}
 function buildSystemPrompt(scope) {
-    const { agent, sessionType, layers, customConfig, profile } = scope;
+    const { agent, sessionType, layers, overrides, profile } = scope;
     const interactiveSurface = profile?.surface === undefined
         ? (sessionType ?? 'root') === 'root'
         : profile.surface !== 'task-child';
-    const customPrompt = customConfig?.systemPrompt;
-    const contentPrompt = customPrompt !== undefined
-        ? { text: addRuntimeRules(customPrompt, false) }
-        : buildIdentityPrompt({ agent, layers, profile, interactiveSurface });
     return composePromptParts([
-        contentPrompt,
+        buildIdentityPrompt({
+            agent,
+            layers,
+            profile,
+            interactiveSurface,
+            overrides: interactiveSurface ? overrides : undefined,
+        }),
         { text: environmentContextBlock(scope) },
-        ...(customPrompt === undefined && !interactiveSurface
+        ...(!interactiveSurface
             ? [
                 { text: '# Session Context' },
                 { text: profile?.surfacePrompt.trim() ?? '' },
@@ -424,7 +428,9 @@ function buildSystemPrompt(scope) {
     ]);
 }
 function buildIdentityPrompt(scope) {
-    const { agent, layers, profile, interactiveSurface } = scope;
+    const { agent, layers, profile, interactiveSurface, overrides } = scope;
+    const customPrompt = overrides?.customPrompt?.trim();
+    const appendPrompt = overrides?.appendSystemPrompt?.trim() ?? '';
     const persona = (profile?.persona ?? agent.persona)?.trim();
     const globalInstructions = layers.globalInstructions.trim();
     const projectInstructions = layers.projectInstructions.trim();
@@ -441,14 +447,23 @@ function buildIdentityPrompt(scope) {
         globalInstructions,
         projectInstructions,
     ].some((part) => part?.trim());
+    const rootSessionPrompt = [profile?.surfacePrompt, layers.sessionPrompt]
+        .filter(Boolean)
+        .join('\n\n');
+    const identity = customPrompt
+        ? [{ text: addRuntimeRules(customPrompt, interactiveSurface, rootSessionPrompt) }]
+        : [
+            { text: persona ?? '' },
+            {
+                text: addRuntimeRules(hasIdentity
+                    ? corePrompt
+                    : "You are a local coding assistant running in the user's workspace.", interactiveSurface, rootSessionPrompt),
+            },
+            { text: layers.basePrompt.trim() },
+        ];
     return composePromptParts([
-        { text: persona ?? '' },
-        {
-            text: addRuntimeRules(hasIdentity
-                ? corePrompt
-                : "You are a local coding assistant running in the user's workspace.", interactiveSurface, [profile?.surfacePrompt, layers.sessionPrompt].filter(Boolean).join('\n\n')),
-        },
-        { text: layers.basePrompt.trim() },
+        ...identity,
+        { text: appendPrompt },
         { text: instructionsPreamble },
         { text: globalInstructions, kind: 'OTHER' },
         { text: projectInstructions, kind: 'OTHER' },
@@ -487,7 +502,7 @@ function profilePromptMetadata(profile) {
     };
 }
 function createAgentConfig(scope) {
-    const { input, model, layers, displayName, systemPrompt, contextUsagePromptRanges, customConfig, runtimeFacts, profile, } = scope;
+    const { input, model, layers, displayName, systemPrompt, contextUsagePromptRanges, runtimeFacts, profile, } = scope;
     const agentConfig = {
         system_prompt: systemPrompt,
         ...profilePromptMetadata(profile),
@@ -532,12 +547,7 @@ function createAgentConfig(scope) {
             }
             : {}),
     };
-    attachCustomConfigEvidence(agentConfig, customConfig);
     return agentConfig;
-}
-function attachCustomConfigEvidence(agentConfig, customConfig) {
-    if (customConfig?.evidence.present)
-        agentConfig.customConfig = customConfig.evidence;
 }
 function resolveAgentRuntimeFacts(agent, config) {
     return {

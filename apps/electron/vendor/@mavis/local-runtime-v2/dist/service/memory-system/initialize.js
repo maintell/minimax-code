@@ -9,6 +9,7 @@ import { MemoryLegacyMigrationService } from './orchestration/legacy-migration-s
 import { MemoryRecallService } from './orchestration/recall-service.js';
 import { MemoryReconciler } from './orchestration/reconciler.js';
 import { MemoryScopeMutationCoordinator } from './scope-mutation.js';
+import { MemoryOnboardingStore } from './onboarding.js';
 import { MemoryAgentContributionAdapter } from './adapters/agent-contribution.js';
 import { MemoryFileStoreImpl } from './adapters/file-store.js';
 import { MemoryStateRepositoryImpl } from './adapters/state-repository.js';
@@ -28,7 +29,7 @@ export function initializeMemorySystem(options) {
     const fileStore = traceMemoryPort(diagnostics, 'files', new MemoryFileStoreImpl(options.dataDir));
     const source = traceMemoryPort(diagnostics, 'source', options.source);
     const model = traceMemoryPort(diagnostics, 'model', {
-        quotaRemainingPercent: () => options.model.quotaRemainingPercent(),
+        readQuota: options.model.readQuota.bind(options.model),
         resolveContract: options.model.resolveContract.bind(options.model),
         capture: (input) => options.model.capture(input),
         consolidateInPlace: (input) => options.model.consolidateInPlace(input),
@@ -56,8 +57,10 @@ export function initializeMemorySystem(options) {
     }));
     const recall = traceMemoryPort(diagnostics, 'recall', new MemoryRecallService(shared));
     const governance = traceMemoryPort(diagnostics, 'governance', new MemoryGovernanceService({ ...shared, nowMs }));
+    const onboardingStore = new MemoryOnboardingStore(options.db, repository, nowMs);
     const migrationService = traceMemoryPort(diagnostics, 'migration', new MemoryLegacyMigrationService({
         ...shared,
+        onboarding: onboardingStore,
         modelGateway: model,
         disableLegacyRecall: options.disableLegacyRecall,
         nowMs,
@@ -80,18 +83,14 @@ export function initializeMemorySystem(options) {
         }, () => consolidationService.rebuild(...args)),
     };
     const legacyMigration = {
-        prepare: (input) => execution.run({
+        listPending: migrationService.listPending.bind(migrationService),
+        abandon: migrationService.abandon.bind(migrationService),
+        migrate: (candidate) => execution.run({
             stage: 'migration',
-            operation: 'prepare',
-            sourceRef: input.agentName,
-        }, () => migrationService.prepare(input)),
-        accept: (input) => execution.run({
-            stage: 'migration',
-            operation: 'accept',
-            sourceRef: input.agentName,
-            previewId: input.previewId,
-        }, () => migrationService.accept(input)),
-        discard: migrationService.discard.bind(migrationService),
+            operation: 'migrate',
+            sourceRef: candidate.sourceFile,
+            sourceRevision: candidate.sourceRevision,
+        }, () => migrationService.migrate(candidate)),
     };
     // 4. Reconciler 最后构造：它依赖全部领域服务，被依赖方一个都不认识它。
     const reconciler = new MemoryReconciler({
@@ -101,6 +100,7 @@ export function initializeMemorySystem(options) {
         capture,
         consolidation,
         governance,
+        legacyMigration,
         model,
         scopeMutation,
         config,
@@ -108,6 +108,30 @@ export function initializeMemorySystem(options) {
         reportFailure: options.reportFailure,
         diagnostics,
     });
+    /**
+     * 选择迁移时立即固定迁移源与起始纪元：用户资料此刻复制成副本（为空也写空副本），之后在设置里
+     * 新写的资料不会被当作旧资料迁走；记下当前纪元，之后的 Reset 让剩余迁移停止（§8.3）。
+     */
+    const completeOnboarding = async (input) => {
+        const fresh = (await onboardingStore.inspect()).record === undefined;
+        if (!fresh || input.legacyChoice !== 'migrate')
+            return onboardingStore.complete(input);
+        try {
+            await fileStore.snapshotLegacyUserMemory();
+        }
+        catch {
+            // 首次 listPending 补做；资料迁移源仍只拍一次。
+        }
+        const scope = await repository.ensureScope(GLOBAL_SCOPE_KEY);
+        const result = await onboardingStore.complete({
+            ...input,
+            legacyMigrationResetEpoch: scope.resetEpoch,
+        });
+        // 选择迁移后立即申请一轮迁移；未迁完的文件在后续任务唤醒中继续。
+        if (result.status === 'completed')
+            reconciler.kick({ kind: 'legacy-migration' });
+        return result;
+    };
     // 5. 唯一的后置注入：把唤醒入口交回互斥区，构造期不成环。
     // 互斥区提交产生的是治理维护唤醒（§5.10）：只维护已有视图，不扫描抽取候选。
     scopeMutation.bindWakeSink(() => {
@@ -127,6 +151,13 @@ export function initializeMemorySystem(options) {
         recall,
         governance,
         legacyMigration,
+        onboarding: {
+            inspect: onboardingStore.inspect.bind(onboardingStore),
+            markLegacySessionMigrated: onboardingStore.markLegacySessionMigrated.bind(onboardingStore),
+            markLegacySessionAbandoned: onboardingStore.markLegacySessionAbandoned.bind(onboardingStore),
+            markLegacyRecallDisabled: onboardingStore.markLegacyRecallDisabled.bind(onboardingStore),
+            complete: (input) => completeOnboarding(input),
+        },
         reconciler,
         scopeMutation,
         agent,

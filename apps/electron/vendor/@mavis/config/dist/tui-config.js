@@ -17,11 +17,16 @@ export function parseTuiConfig(raw) {
     if (rawNotifications &&
         typeof rawNotifications === 'object' &&
         !Array.isArray(rawNotifications)) {
-        const { when, method } = rawNotifications;
+        const { when, method, events } = rawNotifications;
         notifications = {
             ...(when === 'unfocused' || when === 'always' || when === 'never' ? { when } : {}),
             ...(method === 'auto' || method === 'osc9' || method === 'osc777' || method === 'bel'
                 ? { method }
+                : {}),
+            ...(Array.isArray(events)
+                ? {
+                    events: events.filter((event) => typeof event === 'string'),
+                }
                 : {}),
         };
     }
@@ -34,7 +39,18 @@ export function parseTuiConfig(raw) {
         : undefined;
     const customStatusLine = parseTuiCustomStatusLineConfig(tui.customStatusLine);
     return {
+        ...(tui.terminalTitle === null
+            ? { terminalTitle: null }
+            : Array.isArray(tui.terminalTitle)
+                ? {
+                    terminalTitle: tui.terminalTitle
+                        .filter((item) => typeof item === 'string')
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                }
+                : {}),
         ...(typeof tui.showTips === 'boolean' ? { showTips: tui.showTips } : {}),
+        ...(typeof tui.programStatus === 'boolean' ? { programStatus: tui.programStatus } : {}),
         ...(notifications ? { notifications } : {}),
         ...(statusLine ? { statusLine } : {}),
         ...(customStatusLine ? { customStatusLine } : {}),

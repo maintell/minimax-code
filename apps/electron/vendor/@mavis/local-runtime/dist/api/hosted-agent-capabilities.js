@@ -3,7 +3,6 @@ import { isLegacyMemoryRecallEnabled, isMemoryV2Enabled } from '@mavis/config';
 import { join } from 'node:path';
 import { AuthStorage } from '@earendil-works/pi-coding-agent/auth-storage';
 import { resolveAgentCapabilities } from '@mavis/config';
-import { createChildBashLifecycle } from '../background-task/child-bash-lifecycle.js';
 import { isLocalChildWorkerSession } from '../sessions/session-policy.js';
 import { createHostedBackgroundReminderCapabilities } from '../background-task/hosted-reminder-capabilities.js';
 import { HttpRemoteTokenCounter } from '../context/remote-token-counter.js';
@@ -19,7 +18,6 @@ import { applyHostedCapabilityRestrictions } from './hosted-agent-capability-res
 import { createHostedAgentPermissionCapabilities } from './hosted-agent-permission-capabilities.js';
 import { HostedReviewCapability } from '../review/hosted-capability.js';
 import { resolveBuiltinReviewPromptDir } from '../review/preparation.js';
-import { classifyThreadGoalFailure } from '../thread-goal/failure-classification.js';
 import { createHostedSkillCapabilities } from './hosted-agent-skill-capabilities.js';
 export { toLocalSessionRecord } from './hosted-agent-session.js';
 /**
@@ -40,6 +38,7 @@ export function createHostedAgentCapabilities(host, restrictions = {}) {
         // 两个读取器在最小 host（单测夹具、精简装配）上可缺席；消费方本就接受 undefined。
         promptSnapshots: () => host.getPromptSnapshots?.(),
         internalTurnPromptReads: () => host.getInternalTurnPromptReads?.(),
+        subSessionRoundAttribution: () => host.subSessionRoundAttribution,
     });
     return {
         config: host.configGetter,
@@ -121,7 +120,7 @@ export function createHostedAgentCapabilities(host, restrictions = {}) {
             },
         },
         createChildBashLifecycle: (input) => isLocalChildWorkerSession(input.session)
-            ? createChildBashLifecycle(host.backgroundTaskService, {
+            ? host.backgroundTasks.createChildBashLifecycle({
                 sessionId: input.session.sessionId,
                 turnId: input.turnId,
                 signal: input.signal,
@@ -143,6 +142,7 @@ export function createHostedAgentCapabilities(host, restrictions = {}) {
                         writeEnabled: input.session.memoryPolicy?.writeEnabled !== false,
                     }),
                     environmentInSystemPrompt: true,
+                    ...(input.sessionIdInContext ? { sessionIdInContext: true } : {}),
                     memoryContextCharsUsed: memoryContextCharsUsed(input.contextUsagePromptRanges),
                 };
                 const reminderMessage = host.localDataCollector.toMessage(input.promptText, input.turnId, input.model);
@@ -192,13 +192,6 @@ export function createHostedAgentCapabilities(host, restrictions = {}) {
             }),
             markFailed: (input) => host.turnFileChanges.markPendingFailed(input.sessionId, input.turnId),
             takeToolProgress: (input) => host.turnFileChanges.takeToolArtifactProgress(input),
-        },
-        turnLifecycle: {
-            started: (input) => host.beginHostedTurn(input),
-            checkBudget: (input) => host.checkHostedTurnBudget(input),
-            classifyFailure: classifyThreadGoalFailure,
-            settled: (input) => host.settleHostedTurn(input),
-            abandoned: (input) => host.abandonHostedTurn(input),
         },
         terminalMemory: {
             record: (input) => {

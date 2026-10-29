@@ -13,6 +13,7 @@ import { resolveTuiThinkingChoice } from '../../features/model/thinking.js';
 import { resolveTuiEffortChoice } from '../../features/model/effort.js';
 import type { TuiPlanModeSnapshot } from '../interaction/plan-mode-flow.js';
 import type { TuiLlmRetryEvent } from '../../../types/runtime-events.js';
+import { formatRetryBudget } from '@mavis/shared/llm-retry-event';
 import {
   formatSideConversationLabel,
   type TuiSideConversationPresentation,
@@ -158,7 +159,7 @@ function resolveVisibleActivity(input: ResolveTuiVisiblePresentationInput): TuiA
       phase: 'retrying',
       runId,
       ...controls,
-      message: `Retrying model request · ${String(input.llmRetry.retryAttempt)}/${String(
+      message: `Retrying model request · ${String(input.llmRetry.retryAttempt)}/${formatRetryBudget(
         input.llmRetry.maxRetries,
       )}${retryDelay !== undefined ? ` · next in ${formatRetryDelay(retryDelay)}` : ''}${
         retryReason ? ` · ${retryReason}` : ''

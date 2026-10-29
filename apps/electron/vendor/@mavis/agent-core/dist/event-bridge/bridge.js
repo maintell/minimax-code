@@ -509,9 +509,9 @@ export class EventBridge {
         const typedErrorText = classified !== null && TYPED_TERMINAL_ERROR_CODES.has(classified.status_code)
             ? `${classified.status_code}:${classified.message}`
             : undefined;
-        const text = extractAssistantText(event.message) ||
-            typedErrorText ||
-            (errorMessage ? `[Error] ${errorMessage}` : '');
+        const assistantText = extractAssistantText(event.message);
+        const systemErrorContent = !assistantText && Boolean(errorMessage);
+        const text = assistantText || typedErrorText || (errorMessage ? `[Error] ${errorMessage}` : '');
         const thinking = extractAssistantThinking(event.message) || undefined;
         const toolCalls = extractAssistantToolCalls(event.message);
         const finishReason = isAssistantError(event.message) ? 'error' : stopReason;
@@ -563,6 +563,7 @@ export class EventBridge {
                 runtimeSeq: this.ctx.runtimeSeqGenerator(),
                 msgId: messageId,
                 text,
+                systemErrorContent,
                 ...(thinking !== undefined ? { thinking } : {}),
                 ...(thinkingDurationMs !== undefined ? { thinkingDurationMs } : {}),
                 ...(finishReason ? { finishReason } : {}),
@@ -585,6 +586,7 @@ export class EventBridge {
         this.pendingCompletedMessage = {
             msgId: messageId,
             text,
+            systemErrorContent,
             thinking,
             thinkingDurationMs,
             finishReason,
@@ -792,6 +794,7 @@ export class EventBridge {
             runtimeSeq: this.ctx.runtimeSeqGenerator(),
             msgId: pending.msgId,
             text: pending.text,
+            systemErrorContent: pending.systemErrorContent,
             ...(pending.thinking !== undefined ? { thinking: pending.thinking } : {}),
             ...(toolCalls.length ? { toolCalls } : {}),
             ...(pending.thinkingDurationMs !== undefined

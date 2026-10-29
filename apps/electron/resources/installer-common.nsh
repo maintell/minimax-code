@@ -4,6 +4,9 @@
 ; Reason: Windows upgrade process runs uninstall first, which would cause user project data loss
 ; User data directory: %USERPROFILE%\.minimax (with .mavis as junction/symlink)
 
+!include "file-associations.nsh"
+!include "installer-diagnostics.nsh"
+
 !macro customInstallMode
   StrCpy $isForceCurrentInstall "1"
 !macroend
@@ -71,6 +74,7 @@
 !macroend
 
 !macro customInstall
+  !insertmacro MCodeRegisterFileHandlers
   ; Ensure registry reflects the final (possibly user-chosen) install directory.
   ; Moved from preInit so that $INSTDIR is already resolved — either from the
   ; directory picker (fresh install) or the /S silent-mode default (auto-update).
@@ -121,6 +125,7 @@
 !macroend
 
 !macro customUnInstall
+  !insertmacro MCodeUnregisterFileTypes
   ; Remove sentinel files (current .minimax plus legacy compatibility path)
   Delete "$PROFILE\.minimax\.electron-installed"
   Delete "$PROFILE\.mavis\.electron-installed"

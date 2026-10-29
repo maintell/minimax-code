@@ -3,7 +3,9 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { isEn } from "../../config/env";
 import { getCategoryLogger } from "../../utils/logger";
-import { getComputerUsePermissionStatus } from "./permission";
+import { registerTransparentWindow } from "../../windows/utils";
+import { getVerifiedComputerUseAppBundle, getComputerUsePermissionStatus } from "../local-runtime/computer-use/component-permissions";
+import { getScreenPermissionStatus } from "./permission";
 /** execPath identifies the running bundle, including branded development launchers. */
 export function runningAppBundle(executable) {
     if (!path.isAbsolute(executable))
@@ -31,7 +33,8 @@ export function permissionGuideHtml(name, appIcon, title, instruction, close, pe
   </style></head><body><main><header><img src="${escape(permissionIcon)}" alt=""><h1>${escape(title)}</h1><button id="close" aria-label="${escape(close)}">×</button></header><p>${escape(instruction)}</p>${recoveryHint ? `<p class="recovery-hint">${escape(recoveryHint)}</p>` : ''}<div id="application" draggable="true" aria-label="${escape(name)}"><img src="${escape(appIcon)}" alt=""><span>${escape(name)}</span><b aria-hidden="true">↑</b></div></main></body></html>`;
 }
 export class ComputerUsePermissionGuide {
-    constructor() {
+    constructor(target = 'component') {
+        this.target = target;
         this.revision = 0;
         this.dragIcon = nativeImage.createEmpty();
         ipcMain.on('cu:permission:guide:drag', (event) => {
@@ -39,7 +42,8 @@ export class ComputerUsePermissionGuide {
                 event.sender !== this.window.webContents ||
                 event.senderFrame !== this.window.webContents.mainFrame)
                 return;
-            const bundle = runningAppBundle(process.execPath);
+            // Fixed by main when the window opened: the verified component or the running Desktop bundle.
+            const bundle = this.bundle;
             if (!bundle || !existsSync(bundle))
                 return;
             try {
@@ -61,6 +65,7 @@ export class ComputerUsePermissionGuide {
         this.timer = undefined;
         const window = this.window;
         this.window = undefined;
+        this.bundle = undefined;
         if (window && !window.isDestroyed())
             window.destroy();
     }
@@ -68,22 +73,31 @@ export class ComputerUsePermissionGuide {
         this.close();
         if (process.platform !== 'darwin')
             return;
-        const bundle = runningAppBundle(process.execPath);
-        if (!bundle || !existsSync(bundle))
+        const desktop = this.target === 'desktop';
+        if (desktop && kind !== 'screen-recording')
             return;
-        const granted = () => {
-            const status = getComputerUsePermissionStatus();
+        const revision = this.revision;
+        const bundle = desktop
+            ? runningAppBundle(process.execPath)
+            : await getVerifiedComputerUseAppBundle();
+        if (revision !== this.revision || !bundle || !existsSync(bundle))
+            return;
+        const granted = async () => {
+            const status = desktop
+                ? { screenRecording: getScreenPermissionStatus(), accessibility: 'granted' }
+                : await getComputerUsePermissionStatus();
             const value = kind === 'accessibility' ? status.accessibility : status.screenRecording;
             return value === 'granted' || value === 'not-required' || value === 'restricted';
         };
-        if (granted())
+        if ((await granted()) || revision !== this.revision)
             return;
-        const revision = this.revision;
-        // Use bundled product artwork: macOS may return a generic document icon for .app files.
-        const productIcon = nativeImage.createFromPath(path.join(app.getAppPath(), 'public', 'assets', 'logo', 'agentLogo.png'));
-        const fileIcon = productIcon.isEmpty()
+        // Use bundled artwork offline: macOS may return a generic document icon for .app files.
+        const artwork = nativeImage.createFromPath(desktop
+            ? path.join(app.getAppPath(), 'public', 'assets', 'logo', 'agentLogo.png')
+            : path.join(app.getAppPath(), 'public', 'assets', 'plugin', 'computer-use.png'));
+        const fileIcon = artwork.isEmpty()
             ? await app.getFileIcon(bundle, { size: 'normal' })
-            : productIcon;
+            : artwork;
         if (revision !== this.revision)
             return;
         const iconData = presentation?.permissionIconDataUrl;
@@ -111,7 +125,12 @@ export class ComputerUsePermissionGuide {
             y: Math.max(area.y, area.y + area.height - height - 24),
             show: false,
             frame: false,
+            ...(process.platform === 'darwin' ? { type: 'panel' } : {}),
             transparent: true,
+            backgroundColor: '#00000000',
+            hasShadow: false,
+            fullscreenable: false,
+            fullscreen: false,
             resizable: false,
             minimizable: false,
             maximizable: false,
@@ -124,8 +143,16 @@ export class ComputerUsePermissionGuide {
                 preload: path.join(__dirname, 'permission-guide-preload.js'),
             },
         });
+        registerTransparentWindow(window);
         this.window = window;
+        this.bundle = bundle;
         window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+        if (process.platform === 'darwin') {
+            window.setVisibleOnAllWorkspaces(true, {
+                visibleOnFullScreen: true,
+                skipTransformProcessType: true,
+            });
+        }
         window.webContents.on('will-navigate', (event) => event.preventDefault());
         window.on('closed', () => {
             if (this.window === window)
@@ -143,9 +170,22 @@ export class ComputerUsePermissionGuide {
             if (this.window !== window || window.isDestroyed())
                 return;
             window.showInactive();
+            let checking = false;
             this.timer = setInterval(() => {
-                if (granted())
-                    this.close();
+                if (checking)
+                    return;
+                checking = true;
+                void granted()
+                    .then((done) => {
+                    if (done && this.window === window)
+                        this.close();
+                })
+                    .catch((error) => {
+                    logger.warn('permission_guide_status_failed', { error: String(error) });
+                })
+                    .finally(() => {
+                    checking = false;
+                });
             }, 1000);
             this.timer.unref?.();
         }

@@ -1,6 +1,6 @@
 import { listInternalDefaultRootIds } from '../../shared/internal-default-roots.js';
 import { projectActivityExpression } from '../repo/activity.js';
-import { and, asc, desc, eq, exists as sqlExists, getTableColumns, gt, inArray, lte, sql, } from 'drizzle-orm';
+import { and, asc, desc, eq, exists as sqlExists, getTableColumns, gt, inArray, lte, or, sql, } from 'drizzle-orm';
 import { sessions as s } from '../../../../infra/db/schema/sessions.js';
 import { projects as p } from '../../../../infra/db/schema/projects.js';
 import { decodeSessionRow } from '../../sessions/repo/codec.js';
@@ -33,17 +33,22 @@ export class SidebarQueryService {
             const count = tx.$count(s, and(eq(s.projectId, p.projectId), sidebarPredicate(q)));
             // Project existence includes pinned sessions, but never internal sessions.
             // Preview/count still exclude pinned sessions through sidebarPredicate.
-            const hasEligibleSession = sqlExists(tx
+            const hasEligibleSession = (includeArchived) => sqlExists(tx
                 .select({ id: s.sessionId })
                 .from(s)
-                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds))));
+                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds, includeArchived)))
+                .limit(1));
+            // A workspace project stays listed after all of its conversations are
+            // archived; only an explicit removal (hidden) takes it out of the sidebar.
+            // The default "no project" bucket still needs an active conversation.
+            const isListedProject = or(hasEligibleSession(false), and(eq(p.projectKind, 'workspace'), hasEligibleSession(true)));
             const rows = tx
                 .select({
                 project: { ...getTableColumns(p), latestActivityAtMs: projectActivityExpression },
                 matchedCount: count,
             })
                 .from(p)
-                .where(and(sidebarProjectPredicate(q), hasFilters ? gt(count, 0) : hasEligibleSession, tupleAfter([
+                .where(and(sidebarProjectPredicate(q), hasFilters ? gt(count, 0) : isListedProject, tupleAfter([
                 sql `${p.pinned}`,
                 sql `${p.orderIndex}`,
                 projectActivityExpression,
@@ -53,7 +58,34 @@ export class SidebarQueryService {
                 .limit(limit + 1)
                 .all();
             const page = rows.slice(0, limit);
-            const ids = page.map((r) => r.project.projectId);
+            // Resolve selection by session ID, not by the current project page. Only the
+            // first page may carry an extra group; later pages retain ordinary boundaries.
+            const activeRow = input.activeSessionId
+                ? tx
+                    .select({ record: s, project: p, done: isDone })
+                    .from(s)
+                    .innerJoin(p, eq(s.projectId, p.projectId))
+                    .where(and(eq(s.sessionId, input.activeSessionId), sidebarPredicate(q)))
+                    .get()
+                : undefined;
+            const selectedProject = (() => {
+                if (last ||
+                    !activeRow ||
+                    page.some((row) => row.project.projectId === activeRow.project.projectId))
+                    return undefined;
+                return tx
+                    .select({
+                    project: { ...getTableColumns(p), latestActivityAtMs: projectActivityExpression },
+                    matchedCount: count,
+                })
+                    .from(p)
+                    .where(eq(p.projectId, activeRow.project.projectId))
+                    .get();
+            })();
+            const ids = [
+                ...page.map((r) => r.project.projectId),
+                ...(selectedProject ? [selectedProject.project.projectId] : []),
+            ];
             const previews = new Map();
             if (ids.length) {
                 const ranked = tx.$with('sidebar_ranked').as(tx
@@ -79,17 +111,10 @@ export class SidebarQueryService {
                     previews.set(row.project.projectId, list);
                 }
             }
-            // Selection is a separate projection: preserve normal page boundaries and
-            // apply exactly the same eligibility, filter and pin predicates as the list.
-            const activeRow = input.activeSessionId && ids.length
-                ? tx
-                    .select({ record: s, project: p, done: isDone })
-                    .from(s)
-                    .innerJoin(p, eq(s.projectId, p.projectId))
-                    .where(and(eq(s.sessionId, input.activeSessionId), inArray(s.projectId, ids), sidebarPredicate(q)))
-                    .get()
-                : undefined;
-            const groups = page.map((row) => {
+            const groups = [
+                ...page,
+                ...(selectedProject ? [selectedProject] : []),
+            ].map((row) => {
                 const entries = previews.get(row.project.projectId) ?? [];
                 const shown = entries.slice(0, sessionLimit);
                 return {
@@ -101,7 +126,7 @@ export class SidebarQueryService {
                     },
                     entries: shown,
                     ...(activeRow?.project.projectId === row.project.projectId &&
-                        !shown.some((value) => value.session.sessionId === activeRow.record.sessionId)
+                        (selectedProject || !shown.some((value) => value.session.sessionId === activeRow.record.sessionId))
                         ? { activeEntry: entry(activeRow, q) }
                         : {}),
                     matchedCount: Number(row.matchedCount),

@@ -5,7 +5,9 @@
  */
 import os from "os";
 import path from "path";
-import { app, globalShortcut, shell, ipcMain } from "electron";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { app, globalShortcut, BrowserWindow, shell, ipcMain } from "electron";
 import { createTray, getTray, destroyTray } from "../modules/tray";
 import { toggleArchonMiniChatWindow } from "../windows";
 import { windowManager } from "../windows/manager";
@@ -13,7 +15,7 @@ import { SHORTCUT_KEYS, IPC_CHANNELS } from "../config/constants";
 import logger from "../utils/logger";
 import { requestRendererRelaunch } from "../lifecycle/application-bootstrap";
 import { getDesktopConfig, setDesktopConfig } from "./storage.ipc";
-import { setKeepAwakeEnabled } from "../modules/power";
+import { startPowerSourceMonitoring, setKeepAwakeEnabled } from "../modules/power";
 import { ensureComputerUseUtilityStarted, stopLocalRuntime, prepareLocalRuntime } from "../modules/local-runtime";
 import { getLocalRuntimeDataDirInfo, relocateLocalRuntimeDataDir, LocalRuntimeDataDirRelocationError } from "../modules/local-runtime/data-dir-relocation";
 let localRuntimeDataDirRelocationInProgress = false;
@@ -35,7 +37,10 @@ function createTrayWithLifecycleQuit(options) {
  * 注意：调用前需要先调用 unregisterGlobalShortcuts() 取消旧的快捷键
  */
 export function registerGlobalShortcuts() {
-    const globalAccessShortcut = getDesktopConfig().globalAccessShortcut || {};
+    const config = getDesktopConfig();
+    if (config.shortcutsEnabled === false)
+        return true;
+    const globalAccessShortcut = config.globalAccessShortcut || {};
     const windowType = windowManager.getWindowType();
     let allSuccess = true;
     const miniChatShortcut = globalAccessShortcut[SHORTCUT_KEYS.MINI_CHAT_CREATE];
@@ -117,14 +122,17 @@ function firstOverrideBinding(value) {
     }
     return value || null;
 }
-export function applyShortcutOverrides(overrides) {
+export function applyShortcutOverrides(overrides, enabled) {
     const currentConfig = getDesktopConfig();
+    const nextEnabled = enabled ?? currentConfig.shortcutsEnabled !== false;
     const previousOverrides = currentConfig.shortcutOverrides || {};
     const previousGlobalAccess = currentConfig.globalAccessShortcut || {};
-    const previousMiniChat = previousGlobalAccess[SHORTCUT_KEYS.MINI_CHAT_CREATE] || null;
-    const nextMiniChat = Object.prototype.hasOwnProperty.call(overrides, SHORTCUT_KEYS.MINI_CHAT_TOGGLE)
+    const previousMiniChat = currentConfig.shortcutsEnabled === false
+        ? null
+        : previousGlobalAccess[SHORTCUT_KEYS.MINI_CHAT_CREATE] || null;
+    const nextMiniChat = nextEnabled
         ? firstOverrideBinding(overrides[SHORTCUT_KEYS.MINI_CHAT_TOGGLE])
-        : 'Alt+A';
+        : null;
     if (previousMiniChat !== nextMiniChat) {
         unregisterShortcut(previousMiniChat);
         if (!registerMiniChatShortcut(nextMiniChat)) {
@@ -145,8 +153,23 @@ export function applyShortcutOverrides(overrides) {
     }
     setDesktopConfig({
         shortcutOverrides: overrides,
+        shortcutsEnabled: nextEnabled,
         globalAccessShortcut: nextGlobalAccess,
     });
+    for (const window of BrowserWindow.getAllWindows()) {
+        try {
+            if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+                window.webContents.send(IPC_CHANNELS.DESKTOP_SHORTCUTS_CHANGED, {
+                    overrides,
+                    enabled: nextEnabled,
+                });
+            }
+        }
+        catch {
+            // A closing renderer must not turn a committed preference into a failed save.
+            logger.warn('[Desktop Settings] Could not notify a closing window of shortcut changes');
+        }
+    }
     return { success: true, overrides };
 }
 /**
@@ -170,19 +193,39 @@ function getLoginItemSettings() {
     const settings = app.getLoginItemSettings();
     return settings.openAtLogin;
 }
-export const openSystemNotificationSettings = () => {
+export const openSystemNotificationSettings = async () => {
     if (process.platform === 'darwin') {
         const release = os.release();
         const majorVersion = parseInt(release.split('.')[0]);
         if (majorVersion >= 22) {
-            shell.openExternal(`x-apple.systempreferences:com.apple.Notifications-Settings.extension`);
+            const settingsUrl = 'x-apple.systempreferences:com.apple.Notifications-Settings.extension';
+            let bundleId = '';
+            try {
+                // Read the running bundle identity, including worktree-specific development apps.
+                const { stdout } = await promisify(execFile)('/usr/bin/plutil', [
+                    '-extract',
+                    'CFBundleIdentifier',
+                    'raw',
+                    '-o',
+                    '-',
+                    path.resolve(process.execPath, '../../Info.plist'),
+                ], { encoding: 'utf8', timeout: 2000, maxBuffer: 4096 });
+                bundleId = stdout.trim();
+            }
+            catch {
+                logger.warn('[DesktopSettings] Could not read notification bundle identity; opening general settings');
+            }
+            await shell.openExternal(bundleId ? `${settingsUrl}?id=${encodeURIComponent(bundleId)}` : settingsUrl);
         }
         else {
-            shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
+            await shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
         }
     }
     else if (process.platform === 'win32') {
-        shell.openExternal('ms-settings:notifications');
+        await shell.openExternal('ms-settings:notifications');
+    }
+    else {
+        throw new Error('System notification settings are not supported on this platform');
     }
 };
 
@@ -210,8 +253,9 @@ export function initDesktopSettings(options = {}) {
         setLoginItemSettings(config.runOnStartup !== false);
         setDesktopConfig({ loginItemInitialized: true });
     }
-    // 初始化保持唤醒 — 通过 mode 状态机统一管理，false/true 都要显式传入
-    // 让 reconciler 计算正确的有效模式（CU 状态默认 false，此处不需要传）。
+    // 初始化保持唤醒：先读取并监听 AC/电池状态，再恢复用户偏好。
+    // 是否存在 RC producer binding 由 remote-control bridge 的状态订阅同步。
+    startPowerSourceMonitoring();
     setKeepAwakeEnabled(!!config.keepAwake);
     // 全局快捷键（MiniChat 等）延迟到 AppWindow 打开时注册，
     // 由 WindowManager 的 windowConfig.main.onSwitch 触发。
@@ -259,11 +303,10 @@ export function setupDesktopSettingsIPC(options = {}) {
     ipcMain.handle(IPC_CHANNELS.DESKTOP_GET_RUN_ON_STARTUP, () => {
         return getLoginItemSettings();
     });
-    // 保持唤醒（用户偏好）— mode 状态机会按 CU 状态选择正确的 Electron blocker type:
-    //   keepAwake=true & CU=off  → 'prevent-app-suspension'（仅阻止应用挂起，屏幕可休眠）
-    //   keepAwake=true & CU=on   → 'prevent-display-sleep'（CU 在驱动屏幕，必须保持唤醒）
-    //   keepAwake=false & CU=off → 'off'
-    //   keepAwake=false & CU=on  → 'prevent-display-sleep'（CU 优先级高于用户偏好）
+    // 保持唤醒（用户偏好）— mode 状态机会结合 RC、供电和 CU 状态选择 blocker type:
+    //   keepAwake=true & RC=on & AC=on & CU=off → 'prevent-app-suspension'（屏幕可休眠）
+    //   keepAwake=false / RC=off / AC=off & CU=off → 'off'
+    //   CU=on → 'prevent-display-sleep'（CU 优先级高于用户偏好、RC 和供电状态）
     ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_KEEP_AWAKE, (_, enabled) => {
         try {
             setKeepAwakeEnabled(enabled);
@@ -274,8 +317,8 @@ export function setupDesktopSettingsIPC(options = {}) {
             return { success: false, error: String(error) };
         }
     });
-    // 返回用户对 keepAwake 的偏好（不是当前持有的 assertion type），
-    // 因为调用方（如 SchedulePanel）需要的是用户意图，不是 OS 层细节。
+    // 返回用户对 keepAwake 的偏好（不是当前持有的 assertion type）；
+    // RC binding 和供电状态只决定偏好当前是否生效，不覆盖已保存的用户选择。
     ipcMain.handle(IPC_CHANNELS.DESKTOP_GET_KEEP_AWAKE, () => {
         return !!getDesktopConfig().keepAwake;
     });
@@ -310,9 +353,12 @@ export function setupDesktopSettingsIPC(options = {}) {
         const config = getDesktopConfig();
         return config.globalAccessShortcut;
     });
-    ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_SHORTCUT_OVERRIDES, (_, overrides) => {
+    ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_SHORTCUT_OVERRIDES, (_, overrides, enabled) => {
         try {
-            return applyShortcutOverrides(overrides);
+            if (enabled !== undefined && typeof enabled !== 'boolean') {
+                throw new Error('Invalid shortcuts enabled state');
+            }
+            return applyShortcutOverrides(overrides, enabled);
         }
         catch (error) {
             return {
@@ -323,9 +369,15 @@ export function setupDesktopSettingsIPC(options = {}) {
         }
     });
     // 打开系统通知设置
-    ipcMain.handle(IPC_CHANNELS.DESKTOP_OPEN_NOTIFICATION_SETTINGS, () => {
-        (0, openSystemNotificationSettings)();
-        return { success: true };
+    ipcMain.handle(IPC_CHANNELS.DESKTOP_OPEN_NOTIFICATION_SETTINGS, async () => {
+        try {
+            await (0, openSystemNotificationSettings)();
+            return { success: true };
+        }
+        catch (error) {
+            logger.error('[DesktopSettings] Failed to open system notification settings:', error);
+            return { success: false };
+        }
     });
     // 设置语言（需要重启生效）
     ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_LANGUAGE, (_, language) => {
@@ -347,7 +399,7 @@ export function setupDesktopSettingsIPC(options = {}) {
             ...getLocalRuntimeDataDirInfo(config),
         };
     });
-    ipcMain.handle(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, async (_, parentDir) => {
+    ipcMain.handle(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, async (_, parentDir, relocateOptions) => {
         if (process.platform !== 'win32') {
             return {
                 success: false,
@@ -370,6 +422,10 @@ export function setupDesktopSettingsIPC(options = {}) {
             const config = getDesktopConfig();
             const result = await relocateLocalRuntimeDataDir({
                 targetParentDir: parentDir,
+                cloudSyncRiskAcknowledged: typeof relocateOptions === 'object' &&
+                    relocateOptions !== null &&
+                    relocateOptions
+                        .cloudSyncRiskAcknowledged === true,
                 appInstallDir: process.platform === 'win32' ? path.dirname(app.getPath('exe')) : undefined,
                 previousParentDirs: Array.isArray(config.localRuntimePreviousDataParentDirs)
                     ? config.localRuntimePreviousDataParentDirs.filter((dir) => typeof dir === 'string')

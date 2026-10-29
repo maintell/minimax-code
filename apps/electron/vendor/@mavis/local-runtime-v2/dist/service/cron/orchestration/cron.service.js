@@ -6,6 +6,7 @@ import { assertCronContentSafe } from './content-safety.js';
 import { toCronSchedule } from './schedule.js';
 const DEFAULT_PAGE_LIMIT = 50;
 const MAX_PAGE_LIMIT = 200;
+const RECONCILIATION_DRAIN_TIMEOUT_MS = 5_000;
 async function settleBestEffort(operation) {
     try {
         await operation();
@@ -23,7 +24,9 @@ export function createCronService(deps) {
 }
 class SchedulerBackedCronService {
     deps;
-    detachedReconciliations = [];
+    detachedReconciliations = new Set();
+    closeController = new AbortController();
+    closePromise;
     selfReminders;
     constructor(deps) {
         this.deps = deps;
@@ -51,9 +54,11 @@ class SchedulerBackedCronService {
         return this.toDefinitionView(definition);
     }
     async createDefinition(command, context = { mutationSource: 'http_api' }) {
+        this.assertOpen();
         const nowMs = this.deps.nowMs();
         const model = resolveDefinitionModel(command.model, this.deps.modelSelection);
         await assertCronContentSafe(this.deps.reviewContent, command);
+        this.assertOpen();
         const created = this.deps.lifecycle.create({
             agentName: command.agentName,
             name: command.name,
@@ -66,16 +71,19 @@ class SchedulerBackedCronService {
             nowMs,
         });
         if (created.sessionTarget.mode === 'sessionId' && created.sessionTarget.sessionId) {
-            this.trackDetached(syncSingleSessionTitle(this.deps.sessionCreation, created));
+            this.trackDetached((signal) => syncSingleSessionTitle(this.deps.sessionCreation, created, signal));
         }
         const view = this.toDefinitionView(created);
         this.deps.metrics.taskCreated(view, context.mutationSource);
         return view;
     }
     async updateDefinition(command, context = { mutationSource: 'http_api' }) {
+        this.assertOpen();
         const nowMs = this.deps.nowMs();
         const model = resolveDefinitionModel(command.model, this.deps.modelSelection);
         await assertCronContentSafe(this.deps.reviewContent, command);
+        this.assertOpen();
+        const ownedBefore = this.ownedSessionId(this.deps.definitions.get(command.cronId));
         const updated = this.deps.lifecycle.update({
             cronId: command.cronId,
             ...(command.name === undefined ? {} : { name: command.name }),
@@ -87,16 +95,19 @@ class SchedulerBackedCronService {
             ...(command.project === undefined ? {} : { project: command.project }),
             nowMs,
         });
-        if (command.name !== undefined) {
-            this.trackDetached(syncSingleSessionTitle(this.deps.sessionCreation, updated));
+        if (command.name !== undefined || command.sessionTarget !== undefined) {
+            this.trackDetached((signal) => syncSingleSessionTitle(this.deps.sessionCreation, updated, signal));
         }
+        this.releaseOwner(ownedBefore, this.ownedSessionId(updated));
         const view = this.toDefinitionView(updated);
         this.deps.metrics.taskUpdated(view, context.mutationSource);
         return view;
     }
     deleteDefinition(command, context = { mutationSource: 'http_api' }) {
+        this.assertOpen();
         const definition = this.deps.definitions.get(command.cronId);
         const metricTask = definition ? this.toMetricTask(definition) : undefined;
+        const ownedBefore = this.ownedSessionId(definition);
         // Product deletion is retention-safe: tombstone the definition, cancel its
         // Scheduler job, and keep every Cron Run and conversation for history.
         this.deps.lifecycle.delete({
@@ -104,13 +115,15 @@ class SchedulerBackedCronService {
             nowMs: this.deps.nowMs(),
             deleteRuns: false,
         });
+        this.releaseOwner(ownedBefore, undefined);
         if (metricTask)
             this.deps.metrics.taskDeleted(metricTask, context.mutationSource);
-        return (this.deps.sessionCreation.detach?.(command.cronId, definition?.sessionTarget.mode === 'sessionId'
+        return this.trackReconciliation((signal) => this.deps.sessionCreation.detach?.(command.cronId, definition?.sessionTarget.mode === 'sessionId'
             ? definition.sessionTarget.sessionId
-            : undefined) ?? Promise.resolve());
+            : undefined, signal) ?? Promise.resolve());
     }
     deleteDefinitionsByAgent(agentName) {
+        this.assertOpen();
         const definitions = [];
         let before;
         do {
@@ -128,22 +141,32 @@ class SchedulerBackedCronService {
         } while (before);
         for (const definition of definitions) {
             const metricTask = this.toMetricTask(definition);
+            const ownedBefore = this.ownedSessionId(definition);
             this.deps.lifecycle.delete({
                 cronId: definition.cronId,
                 nowMs: this.deps.nowMs(),
                 deleteRuns: false,
             });
-            this.trackDetached(() => this.deps.sessionCreation.detach?.(definition.cronId, definition.sessionTarget.mode === 'sessionId'
+            this.releaseOwner(ownedBefore, undefined);
+            this.trackDetached((signal) => this.deps.sessionCreation.detach?.(definition.cronId, definition.sessionTarget.mode === 'sessionId'
                 ? definition.sessionTarget.sessionId
-                : undefined));
+                : undefined, signal));
             if (metricTask)
                 this.deps.metrics.taskDeleted(metricTask, 'system');
         }
     }
     async triggerManualRun(cronId, context = { triggerSource: 'http_api' }) {
+        this.assertOpen();
+        const requestId = context.requestId;
+        if (requestId !== undefined && !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestId)) {
+            throw new CronRepositoryError('CRON_INVALID', 'requestId must be 1-128 ASCII identifier characters');
+        }
         const definition = this.deps.definitions.get(cronId);
         if (!definition) {
             throw new CronRepositoryError('CRON_NOT_FOUND', 'Cron definition not found');
+        }
+        if (await this.deps.executor.isTargetArchived(definition)) {
+            throw new CronRepositoryError('CRON_SESSION_TARGET_ARCHIVED', 'Cron target session is archived');
         }
         const metricTask = this.toMetricTask(definition);
         const prepared = await this.deps.executor.prepareManual({
@@ -185,6 +208,31 @@ class SchedulerBackedCronService {
             ...(definition.deletedAtMs === undefined ? {} : { deletedAtMs: definition.deletedAtMs }),
         };
     }
+    /**
+     * The Session an enabled definition owns as its automation owner — the same
+     * rule as `hasActiveCronSessionOwner`, which gates Goal continuations.
+     */
+    ownedSessionId(definition) {
+        if (!definition || isSelfReminderId(definition.cronId))
+            return undefined;
+        if (definition.sessionTarget.mode !== 'sessionId')
+            return undefined;
+        try {
+            return this.deps.scheduler.inspect(definition.schedulerId)?.state === 'active'
+                ? definition.sessionTarget.sessionId
+                : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    /** A blocked Goal starts once its owner conflict clears (spec §6), not on the next unrelated wake. */
+    releaseOwner(before, after) {
+        if (!before || before === after)
+            return;
+        // Best-effort: the committed Cron mutation stands; a later wake re-checks.
+        this.trackDetached(() => this.deps.sessionCreation.ownerReleased?.(before));
+    }
     toMetricTask(definition) {
         try {
             const job = this.deps.scheduler.inspect(definition.schedulerId);
@@ -216,12 +264,62 @@ class SchedulerBackedCronService {
         });
     }
     trackDetached(operation) {
-        this.detachedReconciliations.push(typeof operation === 'function' ? settleBestEffort(operation) : operation);
+        if (this.closeController.signal.aborted)
+            return;
+        this.trackSettlement(this.startReconciliation(operation));
+    }
+    trackReconciliation(operation) {
+        const pending = this.startReconciliation(operation);
+        this.trackSettlement(pending);
+        return pending;
+    }
+    async startReconciliation(operation) {
+        await Promise.resolve();
+        this.closeController.signal.throwIfAborted();
+        return operation(this.closeController.signal);
+    }
+    trackSettlement(pending) {
+        // Observe failures for shutdown without hiding a required detach failure
+        // from its request caller. Only unsettled work stays retained by the owner.
+        const observe = async () => {
+            await settleBestEffort(() => pending);
+            this.detachedReconciliations.delete(observed);
+        };
+        const observed = observe();
+        this.detachedReconciliations.add(observed);
+    }
+    assertOpen() {
+        if (this.closeController.signal.aborted)
+            throw new CronRepositoryError('CRON_INVALID_STATE', 'Cron service is closed');
+    }
+    close() {
+        this.closeController.abort();
+        this.closePromise ??= this.drainReconciliations();
+        return this.closePromise;
+    }
+    async drainReconciliations() {
+        if (this.detachedReconciliations.size === 0)
+            return;
+        let timer;
+        try {
+            await Promise.race([
+                Promise.all([...this.detachedReconciliations]),
+                new Promise((_resolve, reject) => {
+                    timer = setTimeout(() => reject(new Error('Cron reconciliation drain timed out')), RECONCILIATION_DRAIN_TIMEOUT_MS);
+                }),
+            ]);
+        }
+        finally {
+            if (timer)
+                clearTimeout(timer);
+        }
     }
 }
 function resolveDefinitionModel(model, selection) {
     if (model === undefined || model === null)
         return model;
+    if (!model.trim())
+        return null;
     let decoded;
     try {
         decoded = decodeCronModel(model);
@@ -245,7 +343,7 @@ function resolveDefinitionModel(model, selection) {
     }
     throw new CronRepositoryError('CRON_INVALID', `Model ${JSON.stringify(model)} does not match an available model. Ask the user to choose one.`);
 }
-function syncSingleSessionTitle(sessionCreation, definition) {
+function syncSingleSessionTitle(sessionCreation, definition, signal) {
     if (isSelfReminderId(definition.cronId) || definition.sessionTarget.mode !== 'sessionId') {
         return Promise.resolve();
     }
@@ -255,7 +353,7 @@ function syncSingleSessionTitle(sessionCreation, definition) {
     // The task definition is already durable. Session metadata is a separate
     // boundary, so title convergence follows the same best-effort rule as
     // task-owned session cleanup.
-    return settleBestEffort(() => sessionCreation.rename?.(sessionId, definition.name));
+    return settleBestEffort(() => sessionCreation.rename?.(sessionId, definition.name, signal));
 }
 function paginate(rows, limit, toCursor) {
     const hasMore = rows.length > limit;

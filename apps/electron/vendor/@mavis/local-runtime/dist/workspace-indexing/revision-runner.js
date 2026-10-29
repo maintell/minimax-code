@@ -44,10 +44,12 @@ export class WorkspaceRevisionRunner {
                     await this.holdForPolicy(record, attempt);
                     return;
                 }
-                await this.recordFailure(record, error, attempt);
+                await this.recordFailure(record, error, attempt, signal);
             }
             catch (persistenceError) {
-                this.reportError(record, persistenceError);
+                if (!this.ctx.cancellations.isCancelled(record.sessionId, signal, persistenceError)) {
+                    this.reportError(record, persistenceError);
+                }
             }
         }
     }
@@ -105,7 +107,7 @@ export class WorkspaceRevisionRunner {
         });
     }
     /** Advances the retry ladder, or ends it when this fault is the last one. */
-    async recordFailure(record, error, attempt) {
+    async recordFailure(record, error, attempt, signal) {
         const stage = attempt.stage;
         let persistedRecord = record;
         try {
@@ -115,6 +117,7 @@ export class WorkspaceRevisionRunner {
             // Preserve weak-dependency containment when the state store itself is
             // unavailable; the subsequent patch remains the authoritative attempt.
         }
+        this.ctx.cancellations.assertActive(record.sessionId, signal);
         const code = normalizeWorkspaceRemoteErrorCode(error);
         const nextRetryCount = persistedRecord.retryCount + 1;
         const explicitlyTerminal = !!error && typeof error === 'object' && 'retryable' in error && error.retryable === false;

@@ -6,6 +6,11 @@ export const OUTPUT_SAFETY_CHUNK_THRESHOLD = 80;
 export const OUTPUT_SAFETY_LOCAL_ERROR_MAX_RETRIES = 3;
 export const OUTPUT_SAFETY_LOCAL_ERROR_RETRY_MAX_DELAY_MS = 5_000;
 /**
+ * 送审等到这么久，多半是本机后台进程太忙、没及时读到回包，而不是网络问题：失败时网络停止
+ * 提示改为引导用户检查电脑负荷；不管成功失败，都会通知界面在输入框上方提示。
+ */
+export const SAFETY_REVIEW_SLOW_READ_MS = 15_000;
+/**
  * V2-owned 先审后发 writer. It preserves producer order in one queue and releases
  * text only after threshold, phase-boundary, or final review. `finish` and the first
  * tool-call settle short text windows before their frames become releasable, so a
@@ -21,6 +26,8 @@ export class LocalOutputSafetyEventWriter {
     guidePrompt;
     networkStopped = false;
     reviewStopVariant = 'network';
+    /** 结束 `network` 软停止的那次送审等了 `SAFETY_REVIEW_SLOW_READ_MS` 以上。 */
+    slowNetworkRead = false;
     terminalFailed = false;
     pendingQueue = [];
     thinkingWindow = [];
@@ -140,11 +147,12 @@ export class LocalOutputSafetyEventWriter {
         this.clearPending();
         this.options.onBlocked?.();
     }
-    async softStopNetwork(variant = 'network') {
+    async softStopNetwork(variant = 'network', slowNetworkRead = false) {
         if (this.blocked || this.networkStopped)
             return;
         this.networkStopped = true;
         this.reviewStopVariant = variant;
+        this.slowNetworkRead = variant === 'network' && slowNetworkRead;
         try {
             await this.flushApprovedOnNetworkStop();
         }
@@ -154,10 +162,8 @@ export class LocalOutputSafetyEventWriter {
         }
     }
     async handleChunk(event, chunk) {
-        if (typeof chunk.msg_id === 'string' && chunk.msg_id) {
-            this.approvedMsgId = chunk.msg_id;
-            this.attemptMessageIds.add(chunk.msg_id);
-        }
+        if (!(await this.beginMessage(chunk.msg_id)))
+            return;
         if (chunk.thinking_content) {
             const pending = this.enqueuePending(event);
             this.thinkingWindow.push(pending);
@@ -185,10 +191,10 @@ export class LocalOutputSafetyEventWriter {
         this.enqueueReady(event);
     }
     async handleFinalMessage(event, message) {
-        if (typeof message.msg_id === 'string' && message.msg_id) {
-            this.approvedMsgId = message.msg_id;
-            this.attemptMessageIds.add(message.msg_id);
-        }
+        if (!(await this.beginMessage(message.msg_id)))
+            return;
+        // 系统错误只用于展示；模型正文及缓冲中的输出仍需审核。
+        const content = message.msg_content_source === 'system_error' ? undefined : message.msg_content;
         if (!(await this.reviewFinalWindow(message.thinking_content, this.thinkingText, SAFETY_SCENE.ThinkingContent))) {
             return;
         }
@@ -199,16 +205,28 @@ export class LocalOutputSafetyEventWriter {
         this.releaseWindow(this.thinkingWindow);
         this.thinkingText = '';
         this.flushReady();
-        if (!(await this.reviewFinalWindow(message.msg_content, this.contentText, SAFETY_SCENE.MessageOutput))) {
+        if (!(await this.reviewFinalWindow(content, this.contentText, SAFETY_SCENE.MessageOutput))) {
             return;
         }
         this.approvedContent =
-            message.msg_content && message.msg_content.length > 0
-                ? message.msg_content
-                : this.approvedContent + this.contentText;
+            content && content.length > 0 ? content : this.approvedContent + this.contentText;
         this.releaseWindow(this.contentWindow);
         this.contentText = '';
         this.enqueueReady(this.safetyReviewUnknown ? markSafetyReviewUnknown(event, message) : event);
+    }
+    /** Approved partials belong to one assistant message, not the entire tool loop. */
+    async beginMessage(messageId) {
+        if (typeof messageId !== 'string' || !messageId || messageId === this.approvedMsgId)
+            return true;
+        // Settle the old identity's pending window before switching. If review
+        // stops here, its approved prefix must still be attributed to that message.
+        if (!(await this.flushStreamingWindows()))
+            return false;
+        this.approvedMsgId = messageId;
+        this.approvedThinking = '';
+        this.approvedContent = '';
+        this.attemptMessageIds.add(messageId);
+        return true;
     }
     /** Settle all short streaming windows before a finish/tool-call frame can enter ready state. */
     async flushStreamingWindows() {
@@ -256,7 +274,9 @@ export class LocalOutputSafetyEventWriter {
                 return false;
             if (result.retryWithV2)
                 reviewScene = sceneForV2Retry(reviewScene);
-            metrics?.histogram('output_safety_check_duration_ms', Date.now() - startMs);
+            const elapsedMs = Date.now() - startMs;
+            metrics?.histogram('output_safety_check_duration_ms', elapsedMs);
+            this.noticeSlowReview(elapsedMs);
             if (this.isAuthSoftStop(result)) {
                 metrics?.counter('output_safety_error_total', 1, { errorKind: 'auth_error' });
                 metrics?.counter('output_safety_check_total', 1, { decision: 'soft_stop_auth' });
@@ -271,7 +291,7 @@ export class LocalOutputSafetyEventWriter {
                     continue;
                 }
                 metrics?.counter('output_safety_check_total', 1, { decision: 'soft_stop_network' });
-                await this.softStopNetwork();
+                await this.softStopNetwork('network', elapsedMs >= SAFETY_REVIEW_SLOW_READ_MS);
                 return false;
             }
             if (result.errorKind === 'api_error') {
@@ -285,6 +305,11 @@ export class LocalOutputSafetyEventWriter {
     }
     isStopped() {
         return this.blocked || this.networkStopped;
+    }
+    /** 这次送审等了 `SAFETY_REVIEW_SLOW_READ_MS` 以上就通知一次，不看送审结果。 */
+    noticeSlowReview(elapsedMs) {
+        if (elapsedMs >= SAFETY_REVIEW_SLOW_READ_MS)
+            this.options.onSlowReview?.();
     }
     isAuthSoftStop(result) {
         return result.errorKind === 'auth_error' && this.options.authErrorVariant === 'auth';

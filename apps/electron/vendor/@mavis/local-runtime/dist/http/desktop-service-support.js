@@ -4,7 +4,6 @@
  * local-runtime per-file line budget; these are stateless and shared across
  * the cron / goal / demo method groups.
  */
-import { ThreadGoalContractError } from '../thread-goal/contract.js';
 /** Build a JSON error Response body the generated router renders verbatim. */
 export function jsonError(status, message, code, errorCode) {
     return new Response(JSON.stringify({
@@ -20,17 +19,6 @@ export function jsonError(status, message, code, errorCode) {
         status,
         headers: { 'Content-Type': 'application/json' },
     });
-}
-/**
- * Guard the `session_id` path binder. The generated type makes it a required
- * string, but an empty segment can still arrive; treat that as a 400 so goal
- * methods never query the store with a blank key.
- */
-export function requireSessionId(sessionId) {
-    if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
-        throw new ThreadGoalContractError(400, 'session_id is required', 'VALIDATION_ERROR');
-    }
-    return sessionId;
 }
 /** Map an internal session status onto the cron session-history label. */
 export function toCronSessionStatusLabel(status) {

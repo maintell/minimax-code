@@ -9,6 +9,10 @@ export function buildLocalCronTools(deps) {
             try {
                 const command = cronCommand(def.name, input, 'cron_id');
                 const { view: _view, ...args } = input;
+                // Never use truthiness here: the string "false" must pause, not resume.
+                if (args.enabled === 'true' || args.enabled === 'false') {
+                    args.enabled = args.enabled === 'true';
+                }
                 if (def.name === 'cron_create' && typeof args.model === 'string') {
                     const resolution = await deps.cronAdapter.resolveModel?.({ model: args.model, sessionId: ctx.sessionId }, signal);
                     if (!resolution || resolution.kind !== 'resolved') {

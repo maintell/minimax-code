@@ -1,9 +1,9 @@
-import { MINIMAX_MODELS } from './minimax-model-catalog.js';
+import { MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID, MINIMAX_MODELS } from './minimax-model-catalog.js';
 import fs from 'node:fs';
 import { restrictConfigFileSync, writePrivateConfigFileSync } from './private-config-file.js';
 import { parseConfigText, serializeConfigPreservingComments, } from './comment-preserving-config-write.js';
 import { resolveRunawayGuardConfig } from './runaway-guard-config.js';
-import { MEMORY_V2_DEFAULTS, parseMemoryConfig } from './memory-config.js';
+import { MEMORY_V2_DEFAULTS, parseMemoryConfig, resolveMemoryDefaults, } from './memory-config.js';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -23,6 +23,7 @@ import { ASK_USER_CONFIG_DEFAULTS, parseAskUserConfig, } from './ask-user-config
 import { DATA_CONTRIBUTION_CONFIG_DEFAULTS, parseDataContributionConfig, } from './data-contribution-config.js';
 import { GOAL_CONFIG_DEFAULTS, parseGoalConfig } from './goal-config.js';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from './tool-result-compaction-config.js';
+import { REQUEST_MEDIA_DEFAULTS, parseRequestMediaConfig, } from './request-media-config.js';
 import { BROWSER_CONFIG_DEFAULTS, parseBrowserConfig, } from './browser-config.js';
 import { parseSandboxConfig, SANDBOX_CONFIG_DEFAULTS, } from './sandbox-config.js';
 import { parseSubagentConfig, SUBAGENT_CONFIG_DEFAULTS, } from './subagent-config.js';
@@ -615,7 +616,7 @@ function buildPresetEntry(key) {
     };
     return {
         provider: { minimax: provider },
-        defaultModel: 'minimax/MiniMax-M3.1-Flash-Preview',
+        defaultModel: `minimax/${MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID}`,
     };
 }
 export const DEFAULT_MODEL_PRESETS = {
@@ -632,6 +633,8 @@ const DEFAULTS = {
     logLevel: 'info',
     devPort: DEFAULT_UI_PORT,
     permissionMode: 'auto',
+    skipWindowsHardSafetyChecks: false,
+    skipParentDeathGuard: false,
     sseErrorPush: {
         history: true,
         stream: true,
@@ -688,6 +691,10 @@ const DEFAULTS = {
         // Default ON. See `SessionTitleConfig`.
         enabled: true,
     },
+    promptSuggestion: {
+        // Explicit opt-in because this performs one additional model request.
+        enabled: false,
+    },
     cli: {
         spawn: {
             enabled: false,
@@ -716,6 +723,7 @@ const DEFAULTS = {
     },
     runawayGuard: { enabled: true },
     toolResultCompaction: { ...TOOL_RESULT_COMPACTION_DEFAULTS },
+    requestMedia: { ...REQUEST_MEDIA_DEFAULTS },
     agentRuntime: {
         // Single source of truth lives in `./agent-runtime-config.ts` so the
         // default and the union type cannot drift.
@@ -772,6 +780,9 @@ function ensureConfigFile() {
         dataContribution: { enabled: DATA_CONTRIBUTION_CONFIG_DEFAULTS.enabled },
         // 仅新安装写入，避免改变已有用户缺省开启的选择。
         memory: { enabled: false },
+        // 首装写出可编辑的安全默认值；已有文件不补写、不覆盖用户选择。
+        skipWindowsHardSafetyChecks: DEFAULTS.skipWindowsHardSafetyChecks,
+        skipParentDeathGuard: DEFAULTS.skipParentDeathGuard,
     });
     writePrivateConfigFileSync(configPath, content, true);
 }
@@ -787,6 +798,15 @@ function readConfigFileText(configPath = getConfigPath()) {
     }
 }
 let _cached = null;
+function parseStartupRecoveryFault(raw) {
+    if (!raw || typeof raw !== 'object')
+        return {};
+    const step = Reflect.get(raw, 'step');
+    const mode = Reflect.get(raw, 'mode');
+    if (typeof step !== 'string' || (mode !== 'hang' && mode !== 'fail'))
+        return {};
+    return { startupRecoveryFault: { step, mode } };
+}
 function parseNotificationsConfig(raw) {
     if (raw == null || typeof raw !== 'object' || Array.isArray(raw))
         return undefined;
@@ -904,6 +924,9 @@ export function resolveConfigFromRaw(raw, dataDir) {
             })()
             : undefined,
         defaultLightModel: typeof raw.defaultLightModel === 'string' ? raw.defaultLightModel : undefined,
+        skipWindowsHardSafetyChecks: raw.skipWindowsHardSafetyChecks === true,
+        skipParentDeathGuard: raw.skipParentDeathGuard === true,
+        ...parseStartupRecoveryFault(raw.startupRecoveryFault),
         permissionMode: typeof raw.permissionMode === 'string' &&
             ['default', 'bypassPermissions', 'auto', 'off'].includes(raw.permissionMode)
             ? raw.permissionMode
@@ -931,7 +954,8 @@ export function resolveConfigFromRaw(raw, dataDir) {
         subAgentsDir: path.join(dataDir, 'subagents'),
         beta,
         agents: parseAgentsConfig(raw.agents),
-        memory: parseMemoryConfig(raw, DEFAULTS.memory),
+        // 构建变体在模块加载后注入，默认值随配置解析计算。
+        memory: parseMemoryConfig(raw, resolveMemoryDefaults(DEFAULTS.memory, isInternalBuild() || isInsideBuild())),
         subagent: parseSubagentConfig(raw.subagent),
         skillEvolve: parseSkillEvolveConfig(raw, beta),
         sessionRotate: parseSessionRotateConfig(raw),
@@ -941,6 +965,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         askUser: parseAskUserConfig(raw, DEFAULTS.askUser),
         dataContribution: parseDataContributionConfig(raw, DEFAULTS.dataContribution),
         sessionTitle: parseSessionTitleConfig(raw),
+        promptSuggestion: parsePromptSuggestionConfig(raw),
         cli: parseCliConfig(raw),
         browser: parseBrowserConfig(raw.browser),
         tui: parseTuiConfig(raw),
@@ -948,6 +973,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         contextManagement: parseContextManagementConfig(raw),
         runawayGuard: resolveRunawayGuardConfig(raw.runawayGuard),
         toolResultCompaction: parseToolResultCompactionConfig(raw.toolResultCompaction),
+        requestMedia: parseRequestMediaConfig(raw.requestMedia),
         agentRuntime: parseAgentRuntimeConfig(raw.agentRuntime),
         logRetentionDays: parseLogRetentionDays(raw),
         contentReview: parseContentReviewConfig(raw),
@@ -1193,6 +1219,19 @@ function parseSessionTitleConfig(raw) {
         enabled: typeof obj.enabled === 'boolean' ? obj.enabled : defaults.enabled,
     };
 }
+// ── prompt suggestion config parsing ────────────────────────────
+function parsePromptSuggestionConfig(raw) {
+    const value = raw.promptSuggestion;
+    const enabled = value != null && typeof value === 'object' && !Array.isArray(value)
+        ? value.enabled
+        : undefined;
+    // Internal builds dogfood the feature, so an unset value means on there; an
+    // explicit `false` still wins. Resolved at parse time, like `promptConfig`.
+    const defaultEnabled = DEFAULTS.promptSuggestion.enabled || isInternalBuild();
+    return typeof enabled === 'boolean'
+        ? { enabled, enabledSource: 'explicit' }
+        : { enabled: defaultEnabled, enabledSource: 'default' };
+}
 // ── CLI config parsing ──────────────────────────────────────────
 function parseCliConfig(raw) {
     const defaults = DEFAULTS.cli;
@@ -1230,7 +1269,14 @@ function parseContextManagementConfig(raw) {
     const cuMaxScreenshotsInContext = typeof rawCuMax === 'number' && Number.isFinite(rawCuMax) && rawCuMax >= 0
         ? Math.floor(rawCuMax)
         : defaults.cuMaxScreenshotsInContext;
-    return { disableSystemReminderModels, cuMaxScreenshotsInContext };
+    // Semantic validation (ratio vs. token count) lives with the trigger in
+    // @mavis/context-manager; keep numbers so the runtime can warn on bad ones.
+    const compactionTriggerAt = typeof obj.compactionTriggerAt === 'number' ? obj.compactionTriggerAt : undefined;
+    return {
+        disableSystemReminderModels,
+        cuMaxScreenshotsInContext,
+        ...(compactionTriggerAt === undefined ? {} : { compactionTriggerAt }),
+    };
 }
 // ── Agent Runtime config parsing — see ./agent-runtime-config.ts for the
 // canonical implementation. Re-exposed here so the public `getConfig()`

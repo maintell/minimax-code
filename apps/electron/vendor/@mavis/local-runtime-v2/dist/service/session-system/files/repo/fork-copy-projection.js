@@ -77,7 +77,7 @@ function rewriteForkDisplayAssetData(dataJson, replacements) {
         return dataJson;
     }
 }
-function rewriteForkAssetMarkup(content, replacements) {
+export function rewriteForkAssetMarkup(content, replacements) {
     const rewriteToken = (token, wrapItem = false) => {
         const parsed = collectMessageAssetItems(wrapItem ? `<deliver-assets>${token}</deliver-assets>` : token)[0];
         if (!parsed)

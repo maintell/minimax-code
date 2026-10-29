@@ -1,4 +1,3 @@
-import { reportThreadGoalEvalEvent } from '../thread-goal/eval-observability.js';
 export function createLocalRuntimeTelemetrySink(logger) {
     const runtimeLogger = logger.child({ component: 'local-runtime.session' });
     return (event) => {
@@ -20,33 +19,6 @@ export function createLocalRuntimeTelemetrySink(logger) {
         else {
             child.info(`runtime turn ${event.phase}`, fields);
         }
-    };
-}
-/** Records one safe local Goal event together with its best-effort Session Clio outcome. */
-export function createThreadGoalObservabilityEventSink(logger, reporterFactory) {
-    const goalLogger = logger.child({ component: 'local-runtime.thread-goal' });
-    return (event) => {
-        const deliveries = reporterFactory
-            ? reportThreadGoalEvalEvent(reporterFactory, event)
-            : [
-                {
-                    sessionId: event.payload.sessionId,
-                    trajectory: 'parent',
-                    outcome: 'not_configured',
-                },
-            ];
-        const payload = event.payload;
-        const child = goalLogger.child({
-            sessionId: event.payload.sessionId,
-            ...(typeof payload.turnId === 'string' ? { turnId: payload.turnId } : {}),
-        });
-        child.info('Thread Goal runtime decision', {
-            schema: 'mavis.goal_runtime_event.v1',
-            eventType: event.type,
-            eventAtMs: event.at,
-            payload,
-            clioDeliveries: deliveries,
-        });
     };
 }
 export function createMatrixToolLogger(logger) {

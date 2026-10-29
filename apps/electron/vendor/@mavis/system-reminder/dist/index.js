@@ -36,6 +36,7 @@ export { configureSystemReminderHost, getDefaultNudgeRegistry, _resetSystemRemin
 export { updateTodoState, getTodoState, clearTodoState, touchTodoStateTurn, shouldInjectTodoCompletionReminder, summarizeTodoStatuses, isTodoTerminal, _resetTodoStateForTests, } from './todo-state.js';
 export { boundMap, getEvolutionReminder } from './evolution.js';
 export { withMcodeToolsMasterReminder } from './mcode-tools-master-reminder.js';
+export { buildAskUserGuidanceBlock, buildAskUserPolicyBlock, decideAskUserReminders, findLatestAskUserPolicyDeclaration, hasAskUserGuidance, } from './ask-user-reminders.js';
 // Block builders — exported so cloud-runtime and adjacent surfaces can render
 // individual blocks outside the registry/service pipeline.
 export { formatPeersAggregated, buildAgentContextBlock, buildSlimAgentContextBlock, buildPeersUpdateBlock, buildActivePlanReminderBlock, buildPersonaMissingBlock, buildBootstrapBlock, buildWorktreeReminderBlock, buildTeamMemoryBlock, buildRelevantMemoryBlock, buildUserMemoryUpdateBlock, buildAgentMemoryUpdateBlock, buildMemorySummaryUpdateBlock, buildDailyMemoryUpdateBlock, buildIdentityUpdateBlock, buildConfigUpdateBlock, buildInboundMetaBlock, buildMemorySkillReminder, buildProactiveMemoryBlock, buildMemoryTopicsBlock, buildEvolutionReminderBlock, buildSkillEvolutionChannelsBlock, buildAsyncAuditBlock, buildMediaOutputReminderBlock, buildTaskCompletionReminderBlock, buildBoardNudgeBlock, buildSecretEnvBlock, } from './blocks.js';

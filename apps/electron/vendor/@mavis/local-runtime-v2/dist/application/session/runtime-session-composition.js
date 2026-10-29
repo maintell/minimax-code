@@ -1,9 +1,12 @@
 import { isLocalSourceProvenanceEnabled } from '@mavis/config';
 import { initializeModelSystem, freezeManagedQueueModel, resolveRequestedSessionModel, LocalModelProviderError, resolveBuiltinAgentModelGroup, previewAgentModelSelection, resolveEffectiveAgentModelSelection, AgentModelSelectionError, } from '../../service/model-system/index.js';
-import { createImportedSessionPinCallback, initializePinService, } from '../../service/pin/index.js';
+import { createSessionSystemPinBridge, initializePinService, } from '../../service/pin/index.js';
 import { createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, } from '../../service/session-system/index.js';
 import { createProductionAgentPreparation, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionModelRepair, agentHostModelFromQueue, } from '../../service/turn-system/index.js';
 import { createRuntimeAgentProduct } from '../agent/runtime-agent-product.js';
+import { withGoalAgentProduct } from './goal-agent-product.js';
+import { createRuntimeGoalPort } from './runtime-goal-port.js';
+import { initializeGoalService, isGoalVerifierChildSession, } from '../../service/goal/index.js';
 import { createApplicationFactPorts, createCommittedModelProviderSessionPort, } from './fact-ports.js';
 import { createPinnedAgentLookup } from './pin-agent-lookup.js';
 import { ModelProviderApplication } from './model-provider-application.js';
@@ -15,7 +18,7 @@ import { createQueueSubmissionRejectionDelivery, queryCollapseSteeringProjection
 export function createProductionSessionComposition(input) {
     const tuiProductPolicy = input.runtimeOwnerKind === 'tui';
     let executionSessionSystem;
-    const product = createRuntimeAgentProduct({
+    const baseProduct = createRuntimeAgentProduct({
         baseProduct: input.baseProduct,
         agentService: input.agentService,
         ensureSessionAgentDefinition: async (sessionId) => {
@@ -32,12 +35,15 @@ export function createProductionSessionComposition(input) {
         miniappAvailable: input.miniappAvailable,
         browserUse: input.browserUse,
         implicitCustomProviderThinking: tuiProductPolicy,
+        ...(input.systemPromptOverrides ? { systemPromptOverrides: input.systemPromptOverrides } : {}),
         agentReferenceProjection: input.agentReferenceProjection,
         ...(input.inspector ? { inspector: input.inspector } : {}),
         internalTurnPromptReads: input.internalTurnPromptReads,
         globalInstructions: input.globalInstructions,
         ...(input.promptSnapshots ? { promptSnapshots: input.promptSnapshots } : {}),
     });
+    const { goal, goalPort, bindGoalCronOwnerReader } = composeGoalOwner(input, baseProduct, () => executionSessionSystem?.queue.committed);
+    const product = withGoalAgentProduct(baseProduct, goal);
     const modelSystem = initializeModelSystem({
         config: input.modelConfig,
         resolverOptions: product.preparation.modelResolver,
@@ -58,9 +64,9 @@ export function createProductionSessionComposition(input) {
         configBuilder: product.preparation.configBuilder,
         modelResolver: modelSystem.resolver,
     });
-    const facts = createApplicationFactPorts({ publish: input.publishGlobalEvent });
+    const facts = createSessionFactPorts(input, goal);
     const archiveTitleModel = createProductionRootArchiveTitleModel({ agents: product.agents, preparation, safety: input.safety }, input.nowMs);
-    const importedSessionPin = createImportedSessionPinCallback();
+    const sessionPin = createSessionSystemPinBridge();
     const sessionSystem = initializeSessionSystem({
         db: input.db,
         sourceProjectionEnabled: isLocalSourceProvenanceEnabled(input.runtimeOwnerKind),
@@ -90,7 +96,8 @@ export function createProductionSessionComposition(input) {
             logger: input.logger,
         },
         steeringProjection: (queryKey) => ({ ...queryCollapseSteeringProjection(queryKey) }),
-        onPinnedSessionImported: importedSessionPin.onImported,
+        onPinnedSessionImported: sessionPin.onImported,
+        pinnedProjectIds: sessionPin.pinnedProjectIds,
         facts: facts.session,
         conversationFacts: facts.conversation,
         queueFacts: facts.queue,
@@ -111,14 +118,11 @@ export function createProductionSessionComposition(input) {
         runtimeOwnerIdentity: input.runtimeOwnerIdentity,
     });
     executionSessionSystem = sessionSystem;
-    const channelTurnAdmission = {
-        queueSubmissionRejections: createQueueSubmissionRejections(input, sessionSystem),
-        resolveChannelInputModel: createChannelInputModelResolver(input, sessionSystem),
-    };
+    const channelTurnAdmission = createChannelTurnAdmission(input, sessionSystem);
     const pinService = createRuntimePinService(input, sessionSystem);
-    importedSessionPin.bind(pinService);
+    sessionPin.bind(pinService);
     input.compatibility.bindSessionPinReader((sessionId) => pinService.isSessionPinned(sessionId));
-    preparation.bindSessionModelRepair(createSessionModelRepair(sessionSystem.sessions.records, input.logger));
+    preparation.bindSessionModelRepair(createSessionModelRepair(sessionSystem.sessions.records, input.logger, modelUpdatedFactSink(facts)));
     preparation.bindTaskSessionBindings(sessionSystem.sessions.records);
     const modelProviderApplication = new ModelProviderApplication({
         publish: input.publishGlobalEvent,
@@ -135,7 +139,7 @@ export function createProductionSessionComposition(input) {
                 return { ...session, frozenModel };
             },
             update: (sessionId, fields) => sessionSystem.sessions.records.mutateSession(sessionId, fields),
-            onCommittedUpdate: (session) => facts.session.handle({ kind: 'model-updated', session }),
+            onCommittedUpdate: modelUpdatedFactSink(facts),
         }),
         setDefaultModel: input.modelConfig.setDefaultModel,
         refreshOfficialModels: input.refreshOfficialModels,
@@ -176,6 +180,68 @@ export function createProductionSessionComposition(input) {
         archiveTitleModel,
         facts,
         channelTurnAdmission,
+        goal,
+        goalPort,
+        bindGoalCronOwnerReader,
+    };
+}
+/** 已提交事实的端口；撤回时经各自的服务重开问卷、删除目标。 */
+function createSessionFactPorts(input, goal) {
+    return createApplicationFactPorts({
+        publish: input.publishGlobalEvent,
+        questionnaires: input.compatibility.questionnaires,
+        goals: goal.service,
+        logger: input.logger,
+    });
+}
+/** Build the single Goal owner over the product it borrows turn infrastructure from. */
+function composeGoalOwner(input, baseProduct, committedQueue) {
+    let goalCronOwnerReader;
+    const goal = initializeGoalService({
+        db: input.db,
+        legacyQueueItems: committedQueue,
+        stoppedQueue: committedQueue,
+        nowMs: input.nowMs,
+        publishGlobalEvent: input.publishGlobalEvent,
+        configGetter: baseProduct.preparation.configBuilder.config,
+        reportFailure: (sessionId, message) => baseProduct.executor.reportFailure?.(sessionId, message),
+        formatError: describeError,
+        host: {
+            ...input.goalHost,
+            hasAutomationOwnerConflict: async (sessionId) => (await input.goalHost.hasActiveTeamOwner(sessionId)) ||
+                goalCronOwnerReader?.(sessionId) === true,
+            isGoalVerifierChildSession: async (sessionId) => isGoalVerifierChildSession(await input.goalHost.readSessionFacts(sessionId)),
+            sessionExists: async (sessionId) => (await input.goalHost.readSessionFacts(sessionId)) !== undefined,
+            promptSnapshots: () => input.promptSnapshots,
+            internalTurnPromptReads: () => input.internalTurnPromptReads,
+        },
+    });
+    const goalPort = createRuntimeGoalPort(goal);
+    input.goalHost.bindQuestionnaireWorkOwner(goal.questionnaireOwner);
+    input.goalHost.bindSubSessionRoundAttribution({
+        attributeRound: (round) => goal.service.attributeSubSessionRound(round),
+        forgetRound: (childTurnId) => goal.service.forgetSubSessionRound(childTurnId),
+    });
+    return {
+        goal,
+        goalPort,
+        bindGoalCronOwnerReader: (reader) => {
+            goalCronOwnerReader = reader;
+        },
+    };
+}
+/** Publishes a committed Session model write; `replacedFrom` marks a retired-model replacement. */
+function modelUpdatedFactSink(facts) {
+    return (session, replacedFrom) => facts.session.handle({
+        kind: 'model-updated',
+        session,
+        ...(replacedFrom ? { replacedFrom } : {}),
+    });
+}
+function createChannelTurnAdmission(input, sessionSystem) {
+    return {
+        queueSubmissionRejections: createQueueSubmissionRejections(input, sessionSystem),
+        resolveChannelInputModel: createChannelInputModelResolver(input, sessionSystem),
     };
 }
 function createQueueModelResolver(input, getSessionSystem) {
@@ -310,6 +376,9 @@ function createProjectHistoryRepairOptions(input) {
             logger: input.logger,
         }),
         legacyDefaultProjectHistoryRepairDiagnostics: createLegacyDefaultProjectHistoryRepairDiagnostics({ logger: input.logger }),
+        archivedProjectSidebarBaselineDiagnostics: createArchivedProjectSidebarBaselineDiagnostics({
+            logger: input.logger,
+        }),
         getAgentOwnerIdentity: createAgentOwnerIdentityReader(input.agentService),
     };
 }
@@ -361,6 +430,16 @@ function createLegacyDefaultProjectHistoryRepairDiagnostics(input) {
             ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
             ...(entry.agentName ? { agentName: entry.agentName } : {}),
         }, 'startup_legacy_default_project_history_repair_failed'),
+    };
+}
+function createArchivedProjectSidebarBaselineDiagnostics(input) {
+    return {
+        reportSummary: (summary) => {
+            if (!summary.applied)
+                return;
+            input.logger.info({ hiddenProjectIds: summary.hiddenProjectIds }, 'startup_archived_project_sidebar_baseline_applied');
+        },
+        reportFailure: (error) => input.logger.warn({ error }, 'startup_archived_project_sidebar_baseline_failed'),
     };
 }
 function createRuntimePinService(input, sessionSystem) {

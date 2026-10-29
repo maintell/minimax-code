@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { countTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { estimateCaptureTokens } from '../contracts/token-estimate.js';
 import { computeOutputDigest, renderSessionMirror, validateDocumentEnvelope, } from './session-doc.js';
 export class MemoryCaptureService {
     deps;
@@ -52,17 +53,14 @@ export class MemoryCaptureService {
      * 模型抽取 + 信封校验(§5.5)：字节上限与小节骨架；内部结构由 prompt 承担。
      * 遗忘规则注入 prompt，防止已删内容再生(§2.4/§5.8)。合法空结果返回 content undefined。
      */
-    async generateDocument(contractId, snapshot, forgetRules, maxDocBytes) {
+    async generateDocument(input) {
         const modelResult = await this.deps.model.capture({
-            contractId,
-            snapshot,
-            forgetRules,
-            maxDocBytes,
+            ...input,
             signal: new AbortController().signal,
         });
         if (modelResult.status !== 'ok')
             return mapModelFailure(modelResult);
-        const envelope = validateDocumentEnvelope(modelResult.output.document, maxDocBytes);
+        const envelope = validateDocumentEnvelope(modelResult.output.document, input.maxDocBytes);
         if (envelope.status === 'invalid') {
             return { status: 'deferred', reason: 'model-invalid-output' };
         }
@@ -85,9 +83,13 @@ export class MemoryCaptureService {
         if (existingState && existingState.sourceDigest === sourceDigest) {
             return { status: 'unchanged' };
         }
+        // 旧文档与遗忘规则随请求一并发送，先从合同的输入上限里扣除，剩余额度才分给历史。
+        const historyBudget = Math.max(0, contract.maxInputTokens -
+            estimateCaptureTokens(existingState?.content ?? '') -
+            estimateCaptureTokens(existingState?.forgetRules ?? ''));
         const historyResult = await this.deps.source.readHistory({
             sessionId: candidate.sessionId,
-            maxInputTokens: config.maxCaptureInputTokens,
+            maxInputTokens: historyBudget,
         });
         if (historyResult.status !== 'found')
             return mapHistoryFailure(historyResult.status);
@@ -124,7 +126,13 @@ export class MemoryCaptureService {
         if (prepared.status !== 'ready')
             return prepared;
         const { config, ctx, scopeKey, scope, existingState, contract, sourceDigest, snapshot } = prepared;
-        const generated = await this.generateDocument(contract.contractId, snapshot, existingState?.forgetRules, config.maxSessionDocBytes);
+        const generated = await this.generateDocument({
+            contractId: contract.contractId,
+            snapshot,
+            forgetRules: existingState?.forgetRules,
+            previousDocument: existingState?.content,
+            maxDocBytes: config.maxSessionDocBytes,
+        });
         if ('status' in generated)
             return generated;
         const content = generated.content;

@@ -1,4 +1,5 @@
 import { GLOBAL_SCOPE_KEY } from '../../service/memory-system/index.js';
+const LEGACY_MIGRATION_AUTOMATIC = 'legacy-migration-automatic';
 function err(code) {
     return { error: { code } };
 }
@@ -87,40 +88,43 @@ export class MemoryDesktopApplication {
         }
         return { resetEpoch: result.resetEpoch, filesDeleted: result.filesDeleted };
     }
-    async prepareLegacyMigration(req) {
-        const result = await this.deps.legacyMigration.prepare({ agentName: req.agentName });
-        if (result.status !== 'prepared') {
-            return err(result.status === 'unavailable' ? result.reason : result.status);
-        }
+    /*
+     * 旧记忆改为启用引导选择后由 Reconciler 静默迁移（§8），预览三件套没有调用方。
+     * 接口仍在跨仓 IDL 中，删除前返回固定错误码，避免旧客户端误以为迁移成功。
+     */
+    async prepareLegacyMigration(_req) {
+        return err(LEGACY_MIGRATION_AUTOMATIC);
+    }
+    async acceptLegacyMigration(_req) {
+        return err(LEGACY_MIGRATION_AUTOMATIC);
+    }
+    async discardLegacyMigration(_req) {
+        return err(LEGACY_MIGRATION_AUTOMATIC);
+    }
+    async getOnboarding(_req) {
+        const state = await this.deps.onboarding.inspect();
         return {
-            previewId: result.previewId,
-            sourceFileCount: result.sourceFileCount,
-            documents: result.documents.map((doc) => ({
-                sourceFile: doc.sourceFile,
-                markdown: doc.markdown,
-            })),
+            ...(state.record ? { record: wireOnboardingRecord(state.record) } : {}),
+            needsOnboarding: state.needsOnboarding,
         };
     }
-    async acceptLegacyMigration(req) {
-        const result = await this.deps.legacyMigration.accept({
-            agentName: req.agentName,
-            previewId: req.previewId,
+    async completeOnboarding(req) {
+        const result = await this.deps.onboarding.complete({
+            legacyChoice: req.legacyChoice,
+            backfillChoice: req.backfillChoice,
         });
-        if (result.status !== 'accepted') {
-            return err(result.status === 'unavailable' ? result.reason : result.status);
-        }
-        return { documentCount: result.documentCount };
+        if (result.status !== 'completed')
+            return err(result.status);
+        return { record: wireOnboardingRecord(result.record) };
     }
-    async discardLegacyMigration(req) {
-        const result = await this.deps.legacyMigration.discard({
-            agentName: req.agentName,
-            previewId: req.previewId,
-        });
-        if (result.status !== 'discarded') {
-            return err(result.status === 'unavailable' ? result.reason : result.status);
-        }
-        return { discarded: true };
-    }
+}
+/** 迁移进度与收尾状态是 runtime 内部状态，wire 只暴露 IDL 定义的三个字段。 */
+function wireOnboardingRecord(record) {
+    return {
+        completedAtMs: record.completedAtMs,
+        legacyChoice: record.legacyChoice,
+        backfillChoice: record.backfillChoice,
+    };
 }
 function mapForgetResult(result) {
     if (result.status === 'accepted-for-rebuild')
@@ -137,7 +141,7 @@ export function memoryDesktopApplicationFor(memory) {
         memoryV2: new MemoryDesktopApplication({
             recall: memory.recall,
             governance: memory.governance,
-            legacyMigration: memory.legacyMigration,
+            onboarding: memory.onboarding,
         }),
     };
 }

@@ -1,6 +1,4 @@
-import { RuntimeEventStatus, RuntimeEventType, } from '@mavis/agent-core/protocol';
 import { createHookExtension } from '@mavis/agent-runtime';
-import { summarizeCommittedPiGoalUsage } from '../../service/session-system/index.js';
 /** Exposes only durable local attachment registration to v2 ingress owners. */
 export function createV1AttachmentRegistration(source) {
     const attachments = source.createHostedAgentCapabilities().attachments;
@@ -32,8 +30,6 @@ function createV1ModelResolver(hosted) {
 export function createV1AgentHostProductCapabilities(source, evalReporterFactory, cloudHandoff) {
     const hosted = source.createHostedAgentCapabilities();
     const websiteDeploy = createV1WebsiteDeployProjectionAdapter(hosted.websiteDeploy);
-    const goalTurnLifecycle = createV1ThreadGoalTurnLifecycle(hosted.turnLifecycle);
-    const goalBudgetGuard = createV1GoalBudgetGuardExtension(hosted.turnLifecycle.checkBudget, goalTurnLifecycle.observedUsage);
     return {
         preparation: {
             configBuilder: {
@@ -51,7 +47,10 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
             snapshot: () => ({ computerUseGloballyEnabled: false }),
         },
         checkpointState: hosted.checkpointState,
-        toolSources: hosted.toolSources,
+        // Goal tools come from the local-runtime-v2 Goal owner (withGoalAgentProduct).
+        toolSources: {
+            resolve: async (input) => ({ ...(await hosted.toolSources.resolve(input)), threadGoalTools: [] }),
+        },
         inputPreparation: {
             assets: hosted.attachments,
             materializePrompt: hosted.websiteDeploy.materializeSources,
@@ -69,6 +68,7 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
                         availableSkillNames: (Array.isArray(input.agentConfig.skills)
                             ? input.agentConfig.skills
                             : []).flatMap((skill) => isRecord(skill) && typeof skill.name === 'string' ? [skill.name] : []),
+                        ...(input.sessionIdInContext ? { sessionIdInContext: true } : {}),
                         ...(model ? { model } : {}),
                     });
                 },
@@ -84,6 +84,7 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
             },
         },
         permission: hosted.permissions,
+        sessionAssets: { listSessionReadablePaths: hosted.attachments.listSessionReadablePaths },
         terminalMemory: hosted.terminalMemory,
         runner: {
             contextUsage: hosted.contextUsage,
@@ -116,11 +117,8 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
                     : undefined;
             },
         },
-        eventObserver: goalTurnLifecycle.observer,
-        turnSettlement: goalTurnLifecycle.settlement,
         normalExtensions: [
             websiteDeploy.extension,
-            goalBudgetGuard,
             createHookExtension({
                 id: 'local-builtin-tool-hooks',
                 description: 'Product-internal tool policies and result handlers.',
@@ -143,33 +141,6 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
             createHostedReviewExtension(hosted.review),
             ...(cloudHandoff ? [cloudHandoff.extension] : []),
         ],
-    };
-}
-function createV1GoalBudgetGuardExtension(checkBudget, observedUsage) {
-    return {
-        id: 'local-v1-goal-budget-guard',
-        description: 'Stop new tools when the admitted Goal execution budget is exhausted.',
-        init(pi) {
-            pi.on('before_tool_call', async (_input, _signal, turn) => {
-                let decision;
-                try {
-                    decision = await checkBudget({
-                        sessionId: turn.sessionId,
-                        turnId: turn.turnId,
-                        observedTokens: observedUsage(turn).tokens,
-                    });
-                }
-                catch {
-                    return {
-                        block: true,
-                        reason: 'GOAL_BUDGET_CHECK_UNAVAILABLE: Tool execution is disabled because the Goal budget check failed closed.',
-                    };
-                }
-                if (decision.decision === 'allow')
-                    return undefined;
-                return { block: true, reason: decision.message };
-            });
-        },
     };
 }
 function createV1WebsiteDeployProjectionAdapter(capability) {
@@ -224,192 +195,8 @@ function createHostedReviewExtension(review) {
         },
     };
 }
-function createV1ThreadGoalTurnLifecycle(lifecycle) {
-    const turns = new Map();
-    const state = (context) => {
-        const key = turnKey(context);
-        const existing = turns.get(key);
-        if (existing) {
-            const workerModelKey = context.executionModel
-                ? modelIdentity(context.executionModel)
-                : undefined;
-            if (workerModelKey)
-                existing.workerModelKey = workerModelKey;
-            return existing;
-        }
-        const created = {
-            tokens: 0,
-            retracted: false,
-            started: false,
-            usageIncomplete: false,
-            historyObserved: false,
-            toolCalls: 0,
-        };
-        const workerModelKey = context.executionModel
-            ? modelIdentity(context.executionModel)
-            : undefined;
-        if (workerModelKey)
-            Object.assign(created, { workerModelKey });
-        turns.set(key, created);
-        return created;
-    };
-    const ensureStarted = (context, observed) => {
-        if (observed.started)
-            return;
-        observed.started = true;
-        lifecycle.started({
-            sessionId: context.sessionId,
-            turnId: context.turnId,
-            ...(context.provenance?.source ? { source: context.provenance.source } : {}),
-        });
-    };
-    const observer = {
-        observeHistoryCommitted: ({ context, change }) => {
-            const observed = state(context);
-            if (change.reason === 'messageDelta') {
-                const usage = summarizeCommittedPiGoalUsage(change.messages);
-                observed.tokens += usage.tokens;
-                observed.usageIncomplete ||= usage.incomplete;
-                observed.historyObserved = true;
-                observed.toolCalls += countCommittedToolCalls(change.messages);
-                const finalAssistant = readLastAssistantText(change.messages);
-                if (finalAssistant.seen) {
-                    if (finalAssistant.text === undefined)
-                        delete observed.finalAssistantText;
-                    else
-                        observed.finalAssistantText = finalAssistant.text;
-                }
-            }
-            if (change.operation.kind === 'output-recall' ||
-                change.operation.kind === 'turn-retraction') {
-                observed.retracted = true;
-            }
-        },
-        observeRuntimeEvent: ({ context, event }) => {
-            const status = observedRuntimeStatus(event);
-            if (!status)
-                return;
-            const observed = state(context);
-            ensureStarted(context, observed);
-            if (status === 'failed') {
-                observed.failureClass = preferFailureClass(observed.failureClass, lifecycle.classifyFailure(event.payload.error));
-            }
-        },
-    };
-    return {
-        observer,
-        observedUsage: (input) => {
-            const observed = turns.get(turnKey(input));
-            return {
-                tokens: observed?.tokens ?? 0,
-                usageIncomplete: observed?.usageIncomplete ?? false,
-            };
-        },
-        settlement: {
-            settle: async (input) => {
-                const observed = state(input);
-                ensureStarted(input, observed);
-                await lifecycle.settled({
-                    ...input,
-                    tokens: observed.tokens,
-                    retracted: observed.retracted,
-                    ...(observed.usageIncomplete ? { usageIncomplete: true } : {}),
-                    ...(input.status === 'failed'
-                        ? { failureClass: observed.failureClass ?? 'unknown' }
-                        : {}),
-                    ...(observed.finalAssistantText !== undefined
-                        ? { finalAssistantText: observed.finalAssistantText }
-                        : {}),
-                    ...(observed.workerModelKey ? { workerModelKey: observed.workerModelKey } : {}),
-                    // Only report work signals backed by an actual history observation.
-                    // An omitted field means "unknown" downstream; a fabricated zero
-                    // would let the Goal no-tool breaker count an observation gap.
-                    ...(observed.historyObserved ? { workSignals: { toolCalls: observed.toolCalls } } : {}),
-                });
-                turns.delete(turnKey(input));
-            },
-            abandon: async (input) => {
-                // TurnSystem is out of settle retries, so the Goal decision for this
-                // Turn is never happening. Drop the observation and let the host
-                // release the Turn-scoped timing it froze for settlement.
-                turns.delete(turnKey(input));
-                lifecycle.abandoned(input);
-            },
-        },
-    };
-}
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-/**
- * Count committed tool calls produced by this Turn.
- *
- * Pi-agent assistant messages carry tool calls as `toolCall` content blocks
- * (`AssistantMessage['content'][number].type`), which is the same durable shape
- * the history projection and compaction paths read. Only committed assistant
- * messages are counted, so an in-flight or discarded call never inflates it.
- */
-function countCommittedToolCalls(messages) {
-    let count = 0;
-    for (const message of messages) {
-        if (!isRecord(message) || message.role !== 'assistant')
-            continue;
-        const content = message.content;
-        if (!Array.isArray(content))
-            continue;
-        for (const block of content) {
-            if (isRecord(block) && block.type === 'toolCall')
-                count += 1;
-        }
-    }
-    return count;
-}
-function readLastAssistantText(messages) {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const message = messages[index];
-        if (!message || typeof message !== 'object' || Array.isArray(message))
-            continue;
-        if (Reflect.get(message, 'role') !== 'assistant')
-            continue;
-        const content = Reflect.get(message, 'content');
-        if (!Array.isArray(content))
-            return { seen: true };
-        const text = content
-            .flatMap((block) => {
-            if (!block || typeof block !== 'object' || Array.isArray(block))
-                return [];
-            return Reflect.get(block, 'type') === 'text' &&
-                typeof Reflect.get(block, 'text') === 'string'
-                ? [Reflect.get(block, 'text')]
-                : [];
-        })
-            .join('');
-        return text.length > 0 ? { seen: true, text } : { seen: true };
-    }
-    return { seen: false };
-}
-function preferFailureClass(current, next) {
-    const rank = {
-        unknown: 0,
-        infra_retryable: 1,
-        rate_limit: 2,
-        provider_quota: 3,
-        safety: 4,
-    };
-    return current !== undefined && rank[current] >= rank[next] ? current : next;
-}
-function observedRuntimeStatus(event) {
-    if (event.type !== RuntimeEventType.SESSION_STATUS &&
-        event.type !== RuntimeEventType.TURN_TERMINAL) {
-        return undefined;
-    }
-    if (event.payload.status === RuntimeEventStatus.RUNNING)
-        return 'running';
-    if (event.payload.status === RuntimeEventStatus.COMPLETED)
-        return 'completed';
-    if (event.payload.status === RuntimeEventStatus.FAILED)
-        return 'failed';
-    return event.payload.status === RuntimeEventStatus.ABORTED ? 'aborted' : undefined;
 }
 function turnKey(context) {
     return `${context.sessionId}\0${context.turnId}`;
@@ -437,6 +224,135 @@ function systemReminderModel(agentConfig) {
         providerID,
         modelID,
         ...(typeof model.variant === 'string' && model.variant ? { variant: model.variant } : {}),
+    };
+}
+/**
+ * Validates a persisted Agent mention through the same trusted v1 resolver
+ * chain that Task uses. The primary family is intentionally excluded: a main
+ * session may nominate only a delegatable SubAgent, never itself.
+ */
+export async function resolveDelegatableAgentReference(resolver, requestRef, resolveTarget) {
+    try {
+        const scope = await resolver.resolveAgentReadScope(requestRef);
+        if (scope.canonicalName === scope.primaryName)
+            return 'unauthorized';
+        await resolveTarget(resolver, requestRef);
+        return 'authorized';
+    }
+    catch {
+        // Resolver failures must neither reveal roster details nor emit Task text.
+        return 'unknown';
+    }
+}
+/** Deferred, fail-open adapter for Agent facts emitted before v1 host binding. */
+export function createDeferredAgentRuntimeTelemetry(input) {
+    const { emitSubagentTelemetry, roleClass, events: SUBAGENT_TELEMETRY_EVENT } = input;
+    let sink;
+    let closed = false;
+    const facts = {
+        onNameCompatResolve: (fact) => {
+            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.nameCompatResolve, {
+                intent: fact.intent,
+                canonical_class: fact.canonicalClass,
+                source: fact.source,
+                success: fact.success,
+                ...(fact.memberCountBucket ? { member_count_bucket: fact.memberCountBucket } : {}),
+                ...(fact.errorCode ? { error_code: fact.errorCode } : {}),
+            });
+        },
+        onAgentRoleObservation: (fact) => {
+            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.agentRoleObservation, {
+                status: fact.status,
+                source: fact.source,
+                role_class: roleClass(fact.role),
+            });
+        },
+        // Emitted on EVERY overlay branch, including the skips. "My old display
+        // name did not carry over" must be answerable from one event, not from
+        // the absence of a repository write.
+        onPrimaryProfileOverlay: (fact) => {
+            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.primaryProfileOverlay, {
+                outcome: fact.outcome,
+                // Field names only: a displayName or workspace path is user content.
+                adopted_fields: fact.adoptedFields.join(','),
+                adopted_count: fact.adoptedFields.length,
+                display_name_locked: fact.displayNameLocked,
+            });
+        },
+    };
+    return {
+        facts,
+        bind: (binding) => {
+            if (closed)
+                return;
+            sink = createAgentTelemetryHost(binding);
+        },
+        close: () => {
+            closed = true;
+            sink = undefined;
+        },
+    };
+}
+function createAgentTelemetryHost(input) {
+    const client = input.metricsClient;
+    return {
+        metrics: {
+            incr: (name, labels) => client.counter(name, 1, labels),
+            gauge: (name, value, labels) => client.gauge(name, value, labels),
+            latency: (name, durationMs, labels) => client.histogram(name, durationMs, labels),
+        },
+        ...(input.emitBusEvent ? { emitBusEvent: input.emitBusEvent } : {}),
+    };
+}
+export function legacyCollisionMigrationId(error) {
+    const migrationId = error && typeof error === 'object' && 'migrationId' in error
+        ? error.migrationId
+        : undefined;
+    return typeof migrationId === 'string' && /^agent-name-conflicts-\d+$/u.test(migrationId)
+        ? migrationId
+        : undefined;
+}
+export function createV1CommerceCompatibility(options, createClient) {
+    return {
+        readAuthSnapshot: () => {
+            const { accessToken, loginEpoch } = options.authContextGetter?.() ?? {};
+            return { accessToken, loginEpoch };
+        },
+        async readMembershipFacts(signal) {
+            const client = createClient({
+                authContext: options.authContextGetter?.(),
+                routingContextGetter: options.routingContextGetter,
+                fetchImpl: options.fetchImpl,
+            });
+            return readMembershipFacts(await client.postGatewayJson('/matrix/api/v1/commerce/get_membership_info', {}, signal, 1_500));
+        },
+    };
+}
+function readMembershipFacts(response) {
+    const base = response.base_resp;
+    if (!base || typeof base !== 'object')
+        throw new Error('membership_base_resp_missing');
+    if (base.status_code !== 0)
+        throw new Error('membership_request_rejected');
+    return {
+        hasTokenPlan: response.has_token_plan === true,
+        subscriptionType: typeof response.subscription_type === 'string' ? response.subscription_type : 'unknown',
+    };
+}
+export function createV1MiniAppToolRules(routeContext) {
+    const config = () => routeContext().configGetter();
+    return {
+        listGlobalRules: () => routeContext().permissionRules.listRules({ source: 'global' }),
+        readPermissionMode: () => config().permissionMode,
+        readPolicyOwner: () => (config().permission?.policyOwner === 'engine' ? 'engine' : 'core'),
+        readDataDir: () => config().dataDir,
+        addGlobalAllowRule: (toolName) => routeContext().permissionRules.applyUpdate({
+            type: 'addRules',
+            source: 'global',
+            destination: 'global',
+            behavior: 'allow',
+            rules: [{ tool_name: toolName }],
+        }),
     };
 }
 //# sourceMappingURL=agent-host.js.map

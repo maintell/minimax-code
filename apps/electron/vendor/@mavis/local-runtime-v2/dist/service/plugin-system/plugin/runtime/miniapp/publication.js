@@ -1,9 +1,9 @@
-import { miniAppBusyReason, miniAppFailureReasonCode, } from '../../../../miniapp/index.js';
+import { MINIAPP_LOOPBACK_TOKEN_HEADER, miniAppBusyReason, miniAppFailureReasonCode, } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
 import { runAllFinally } from '../../../plugin-system-helpers.js';
 import { withPluginMcpRuntime, } from '../snapshot-builder.js';
 import { listAcceptedMiniApps, listEnabledMiniAppDefinitions, miniAppCandidateFromPackage, sameMiniAppCandidate, sameRunningGeneration, } from './candidate.js';
-import { buildSelectiveMiniAppInputs, miniAppManagedServerNames, ordinaryPackageContribution, retainRuntimeMiniAppContribution, withEnabledPluginRoster, } from './projection.js';
+import { acceptedFromTransition, buildSelectiveMiniAppInputs, changesOfficialMiniApp, divergentRosterOverrides, heldEntriesStillRunning, heldOfficialBuildContext, miniAppManagedServerNames, ordinaryPackageContribution, releaseOfficialRoots, releaseRetainedOfficialRoots, retainAcceptedOfficialRoots, retainRuntimeMiniAppContribution, withEnabledPluginRoster, } from './projection.js';
 /** Adapts accepted MiniApp contributions to the ordinary Plugin publication transaction. */
 export class SupervisedMiniAppPublicationParticipant {
     options;
@@ -11,6 +11,7 @@ export class SupervisedMiniAppPublicationParticipant {
     buildContexts = new WeakMap();
     closed = false;
     stopRequest;
+    retainedRoots = new Map();
     constructor(options) {
         this.options = options;
     }
@@ -26,13 +27,21 @@ export class SupervisedMiniAppPublicationParticipant {
             ? previous
             : current;
     }
-    async prepare(input) {
+    async prepare(rawInput) {
         if (this.closed)
             throw publicationError('MINIAPP_PUBLICATION_PARTICIPANT_CLOSED');
-        throwIfAborted(input.signal);
+        throwIfAborted(rawInput.signal);
+        const previous = this.active;
+        const held = heldOfficialBuildContext(rawInput, previous, this.options.supervisor);
+        const input = held
+            ? {
+                ...rawInput,
+                snapshot: this.buildRuntimeSnapshot(rawInput, held.context),
+                buildContext: held.context,
+            }
+            : rawInput;
         if (input.buildContext)
             this.recordBuildContext(input.snapshot, input.buildContext);
-        const previous = this.active;
         const stopRequest = this.stopRequest;
         if (stopRequest) {
             this.stopRequest = undefined;
@@ -51,8 +60,8 @@ export class SupervisedMiniAppPublicationParticipant {
                 preparedStart: input.preparedMiniAppStart,
                 disablePluginIds,
             });
-            const rewritten = this.rewriteAcceptedSnapshot(publicationSnapshot, state.next, input.rosterSource ?? input.snapshot);
-            return this.preparedPublication(state, rewritten, { failClosed });
+            const rewritten = this.rewriteAcceptedSnapshot(publicationSnapshot, state.next, input.rosterSource ?? input.snapshot, divergentRosterOverrides(input, state.next));
+            return this.preparedPublication(state, rewritten, { failClosed, held });
         }
         catch (error) {
             if (state)
@@ -245,6 +254,7 @@ export class SupervisedMiniAppPublicationParticipant {
         const active = this.active;
         this.active = new Map();
         await releaseLeases([...active.values()].flatMap(({ mcpLease }) => (mcpLease ? [mcpLease] : [])));
+        await releaseRetainedOfficialRoots(this.retainedRoots);
     }
     fallback(input, accepted) {
         const context = input.buildContext;
@@ -277,9 +287,9 @@ export class SupervisedMiniAppPublicationParticipant {
         this.recordBuildContext(snapshot, context);
         return snapshot;
     }
-    rewriteAcceptedSnapshot(snapshot, accepted, rosterSource = snapshot) {
+    rewriteAcceptedSnapshot(snapshot, accepted, rosterSource = snapshot, rosterOverrides) {
         const rewritten = rewriteManagedMcpServers(snapshot, accepted);
-        const rosteredSnapshot = withEnabledPluginRoster(rewritten, rosterSource);
+        const rosteredSnapshot = withEnabledPluginRoster(rewritten, rosterSource, rosterOverrides);
         const context = this.buildContexts.get(snapshot);
         if (context)
             this.recordBuildContext(rosteredSnapshot, context);
@@ -303,12 +313,7 @@ export class SupervisedMiniAppPublicationParticipant {
                     : await this.options.supervisor.prepare(item.candidate, preparationOptions);
                 transitions.push(transition);
                 throwIfAborted(signal);
-                next.set(item.candidate.pluginId, {
-                    ...item,
-                    candidate: transition.candidate,
-                    target: transition.target,
-                    transition,
-                });
+                next.set(item.candidate.pluginId, acceptedFromTransition(item, transition));
             }
             const acceptedIds = new Set(accepted.map(({ candidate }) => candidate.pluginId));
             for (const pluginId of new Set([...previous.keys(), ...options.disablePluginIds])) {
@@ -336,6 +341,7 @@ export class SupervisedMiniAppPublicationParticipant {
         let committed = false;
         let rolledBack = false;
         let retired = [];
+        let releasedRoots = [];
         return {
             snapshot,
             ...(options.failClosed ? { failClosed: true } : {}),
@@ -355,7 +361,11 @@ export class SupervisedMiniAppPublicationParticipant {
                     for (const stop of state.stops)
                         await stop.commit();
                     await acquireManagedMcpLeases(state.next, this.options.supervisor, acquired);
+                    if (!heldEntriesStillRunning(options.held, this.options.supervisor)) {
+                        throw publicationError('PUBLICATION_SUPERSEDED');
+                    }
                     retired = [...previous].flatMap(([pluginId, item]) => state.next.get(pluginId) === item ? [] : [item]);
+                    releasedRoots = retainAcceptedOfficialRoots(this.retainedRoots, state.next, this.options);
                     this.active = state.next;
                     committed = true;
                 }
@@ -396,6 +406,7 @@ export class SupervisedMiniAppPublicationParticipant {
                     ...state.disables.map((disable) => () => disable.finalize()),
                     ...state.stops.map((stop) => () => stop.finalize()),
                     () => releaseLeases(retired.flatMap(({ mcpLease }) => (mcpLease ? [mcpLease] : []))),
+                    () => releaseOfficialRoots(releasedRoots),
                 ]);
             },
         };
@@ -408,7 +419,8 @@ export function attachSupervisedMiniAppPublication(input) {
     if (input.current) {
         throw new PluginSystemError('PUBLICATION_PARTICIPANT_ALREADY_ATTACHED', 'Plugin publication participant is already attached');
     }
-    return new SupervisedMiniAppPublicationParticipant({ supervisor: input.supervisor });
+    const { supervisor, retainOfficialPackage } = input;
+    return new SupervisedMiniAppPublicationParticipant({ supervisor, retainOfficialPackage });
 }
 async function acquireManagedMcpLeases(next, supervisor, acquired) {
     for (const [pluginId, item] of next) {
@@ -542,24 +554,6 @@ function targetsMiniAppMutation(context) {
         (context.options.localEnabledOverrides?.has(plugin.rootPath) === true ||
             context.options.excludedLocalRoots?.has(plugin.rootPath) === true)) === true);
 }
-function changesOfficialMiniApp(current, next, disablePluginIds) {
-    const previousPackages = new Map(current.officialPackages.map((entry) => [entry.name, entry]));
-    const nextPackages = new Map(next.officialPackages.map((entry) => [entry.name, entry]));
-    return [...previousPackages.keys(), ...nextPackages.keys()].some((name) => {
-        const previous = previousPackages.get(name);
-        const candidate = nextPackages.get(name);
-        if (!previous?.plugin?.miniapp && !candidate?.plugin?.miniapp && !disablePluginIds.has(name)) {
-            return false;
-        }
-        return (!previous ||
-            !candidate ||
-            previous.rootPath !== candidate.rootPath ||
-            previous.contentDigest !== candidate.contentDigest ||
-            Boolean(previous.plugin?.miniapp &&
-                candidate.plugin?.miniapp &&
-                !sameMiniAppCandidate(miniAppCandidateFromPackage({ plugin: previous.plugin }), miniAppCandidateFromPackage({ plugin: candidate.plugin }))));
-    });
-}
 function inactivePublication(snapshot, assertCurrent = () => undefined) {
     return {
         snapshot,
@@ -582,9 +576,12 @@ function rewriteManagedMcpServers(snapshot, accepted) {
             return [];
         }
         used.add(key);
+        const url = new URL(replacement.path, replacement.origin).toString();
         const transport = {
             type: 'http',
-            url: new URL(replacement.path, replacement.origin).toString(),
+            url,
+            headers: { [MINIAPP_LOOPBACK_TOKEN_HEADER]: replacement.loopbackToken },
+            protectHeadersOnRedirect: true,
         };
         const rewritten = {
             ...entry,
@@ -596,8 +593,12 @@ function rewriteManagedMcpServers(snapshot, accepted) {
             },
             server: {
                 ...entry.server,
+                // `transport.headers` carries the loopback token; `resolvedServer` (this whole object) is
+                // JSON.stringify'd into `lifecycleKey` (mcp/runtime.ts) and `mcpDiscoveryKey`
+                // (plugin-system/publication.ts) as an in-memory Map key — never log or project either key.
                 resolvedServer: { ...entry.server.resolvedServer, transport },
-                configJson: JSON.stringify(transport),
+                // The per-generation credential lives only on the live transport, never in declared config.
+                configJson: JSON.stringify({ type: 'http', url }),
             },
         };
         return [rewritten];
@@ -613,7 +614,8 @@ function managedReplacements(accepted) {
             continue;
         const origin = item.target.origin;
         const processGeneration = item.target.processGeneration;
-        if (!origin || !processGeneration) {
+        const loopbackToken = item.loopbackToken;
+        if (!origin || !processGeneration || !loopbackToken) {
             if (item.runtimeStopped)
                 continue;
             throw publicationError('MINIAPP_MCP_RUNTIME_NOT_READY');
@@ -623,6 +625,7 @@ function managedReplacements(accepted) {
                 endpointId: declaration.id,
                 path: declaration.path,
                 origin,
+                loopbackToken,
                 miniAppGeneration: item.target.miniAppGeneration,
                 processGeneration,
             });

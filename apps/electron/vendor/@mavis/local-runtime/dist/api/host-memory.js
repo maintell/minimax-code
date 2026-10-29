@@ -4,6 +4,15 @@ import { logger } from '../common/logger.js';
 import { LocalDataCollector, } from '../memory/local-data-collector.js';
 import { LocalMemoryFacade } from '../memory/local-memory-facade.js';
 import { v1AutoMemoryWritesStopped, } from '../memory/local-memory-orchestration.js';
+/**
+ * Per-turn reminder clock: `Date#toString()` without seconds (e.g.
+ * `Fri Oct 09 2026 13:20 GMT+0800 (China Standard Time)`). Minute precision
+ * keeps the zone/offset the model relies on while avoiding a value that is
+ * unique to every second.
+ */
+export function formatReminderDate(nowMs) {
+    return new Date(nowMs).toString().replace(/(\d{2}:\d{2}):\d{2}/u, '$1');
+}
 export function createLocalMemorySubsystem(input) {
     const memoryFacade = new LocalMemoryFacade({
         config: () => ({
@@ -30,7 +39,7 @@ export function createLocalMemorySubsystem(input) {
                 !v1AutoMemoryWritesStopped(memory));
         },
         memoryAutoWriteEnabled: () => !v1AutoMemoryWritesStopped(input.configGetter().memory),
-        formatDate: () => new Date(input.nowMs()).toString(),
+        formatDate: () => formatReminderDate(input.nowMs()),
         emitBusEvent: input.emitBusEvent,
         nowMs: input.nowMs,
         ...(input.cliSunsetNotice ? { cliSunsetNotice: input.cliSunsetNotice } : {}),

@@ -1,6 +1,6 @@
 import { buildLocalToolRegistry, LocalTodoWriteToolDef, } from '@mavis/agent-tools/desktop';
 import { MatrixWebSearchToolDef } from '@mavis/agent-tools';
-import { resolveAgentCapabilities, } from '@mavis/config';
+import { getConfig, resolveAgentCapabilities, } from '@mavis/config';
 import { executeLocalMemoryTool } from '../memory/local-memory-tool.js';
 import { buildLocalHostTrashRuntime } from '../permissions/host-trash-runtime.js';
 import { resolveAgentBashEnvPolicy } from '../infra/ensure-rm-shim.js';
@@ -56,7 +56,8 @@ export function buildLocalNativeRuntimeTools(input) {
             bashAdapter: input.bashAdapter,
             sandboxOperationsFactory: input.sandboxOperationsFactory,
             hostTrashRuntime: buildLocalHostTrashRuntime(input),
-            bashEnvPolicy: resolveAgentBashEnvPolicy(input.dataDir),
+            bashEnvPolicy: (plan) => resolveAgentBashEnvPolicy(input.dataDir, process.platform, plan?.nativeDelete ??
+                (input.configGetter ?? getConfig)().permission?.nativeDelete === true),
             webFetchAdapter,
             webSearchAdapter,
             taskAdapter: input.taskAdapter,
@@ -103,7 +104,6 @@ export async function buildLocalTurnToolSources(input) {
         return {
             nativeTools: [],
             mcpEntries: [],
-            threadGoalTools: [],
             cuRuntimeAvailable: false,
         };
     }
@@ -116,6 +116,7 @@ export async function buildLocalTurnToolSources(input) {
     const nativeTools = buildLocalNativeRuntimeTools({
         skillRuntime: input.skillRuntime,
         dataDir: input.dataDir,
+        configGetter: input.configGetter,
         workspaceRoot: input.workspaceRoot,
         agentName: input.agentName,
         ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
@@ -180,11 +181,9 @@ export async function buildLocalTurnToolSources(input) {
         ? selectedBuiltinMcpEntries
         : selectedBuiltinMcpEntries.filter((entry) => !(entry.source === 'builtin-matrix' && entry.tool.def.name === MatrixWebSearchToolDef.name));
     const mcpEntries = selectedMcpEntries;
-    const threadGoalTools = (await input.threadGoal.runtimeToolsFor(false, input.sessionId));
     return {
         nativeTools: gatedNativeTools,
         mcpEntries,
-        threadGoalTools,
         cuRuntimeAvailable,
     };
 }

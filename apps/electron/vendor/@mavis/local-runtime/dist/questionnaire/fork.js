@@ -25,6 +25,10 @@ export async function copyPendingQuestionnaireForFork(store, input) {
                 ? { ...request.requester, sessionId: input.targetSessionId }
                 : childOwnedRequester(request, input.targetSessionId),
         },
+        // Keep the AskUser v2 column with the copy: request_json already carries
+        // responseMode, and a NULL column would turn the fork into a legacy row
+        // that gates the forked session's queue and Plan entry.
+        ...(source.responseMode ? { responseMode: source.responseMode } : {}),
         status: 'pending',
         createdAt: source.createdAt,
     });

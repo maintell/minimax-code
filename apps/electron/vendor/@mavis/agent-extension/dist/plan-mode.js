@@ -105,6 +105,75 @@ export function planModeExtension(options) {
                     }
                     : null,
             });
+            const reviewFallback = planReviewSubmissionFallback(options);
+            pi.on('after_tool_call', reviewFallback.afterToolCall);
+            pi.on('after_llm_call', reviewFallback.afterLlmCall);
+            pi.on('turn_end', reviewFallback.turnEnd);
+        },
+    };
+}
+/**
+ * Tools that can change the canonical Plan. The Plan tool guard rejects them
+ * for every other path, so a successful call in a Plan turn updated the Plan.
+ */
+const PLAN_DOCUMENT_TOOLS = new Set(['write', 'edit']);
+/**
+ * A Plan turn that updated the Plan should end in ExitPlanMode or a question.
+ * When it completes with a plain-text answer instead, the user would have no
+ * Review to approve, so the runtime submits the canonical Plan for Review on
+ * the Agent's behalf. The Agent's answer is delivered unchanged and the user
+ * keeps every Review choice: approve, feedback, or skip.
+ */
+function planReviewSubmissionFallback(options) {
+    const states = new Map();
+    const keyOf = (ctx) => `${ctx.sessionId}\u0000${ctx.turnId}`;
+    const stateFor = (ctx) => {
+        const key = keyOf(ctx);
+        let state = states.get(key);
+        if (!state) {
+            state = { planUpdated: false, closedInText: false };
+            states.set(key, state);
+        }
+        return state;
+    };
+    return {
+        afterToolCall: (input, _signal, ctx) => {
+            if (ctx.plan && !input.isError && PLAN_DOCUMENT_TOOLS.has(input.toolCall.name)) {
+                stateFor(ctx).planUpdated = true;
+            }
+            return undefined;
+        },
+        afterLlmCall: (event, ctx) => {
+            if (!ctx.plan)
+                return undefined;
+            // Only the last response of the turn matters; any tool call (including
+            // ExitPlanMode or a question) or a truncated/failed response clears it.
+            stateFor(ctx).closedInText =
+                event.message.stopReason === 'stop' &&
+                    !event.message.content.some((block) => block.type === 'toolCall');
+            return undefined;
+        },
+        // turn_end runs after every continuation has settled, so the closing
+        // response observed above is final. It must never throw: a turn_end
+        // failure would fail an otherwise completed turn.
+        turnEnd: async (event, ctx) => {
+            const state = states.get(keyOf(ctx));
+            states.delete(keyOf(ctx));
+            if (!ctx.plan || event.reason !== 'completed')
+                return;
+            if (!state?.planUpdated || !state.closedInText)
+                return;
+            try {
+                await options.actions.exit({ sessionId: ctx.sessionId, turnId: ctx.turnId });
+            }
+            catch (error) {
+                try {
+                    options.onReviewFallbackFailed?.(error);
+                }
+                catch {
+                    // Reporting must not change the completed turn.
+                }
+            }
         },
     };
 }
@@ -124,12 +193,22 @@ export function renderPlanModeReminder(canonicalPath) {
 Plan Mode is active. Your task is to investigate and produce an
 implementation-ready plan. Do not implement the plan.
 
-For investigation, you may use any available investigation tool, including
-repository inspection, read-only shell commands, external research, Browser
-tools, Skills, configured tools, and delegated tasks. For a tool that
-supports both reads and writes, select query, get, list, search, fetch,
-inspect, or preview operations. If its operation is unclear, choose the
-obviously read-only operation.
+The investigation capabilities below do not grant additional authorization.
+Respect any narrower scope or tool restrictions in the user's request and
+applicable repository instructions. If the user forbids shell commands,
+tests, network access, or delegation, do not use those capabilities even
+for read-only investigation or because a Skill suggests them. Use permitted
+inspection tools instead, or record the evidence you cannot obtain. Do not
+route a forbidden action through another tool or a delegated task.
+
+For investigation, use only capabilities permitted by the user's request
+and applicable instructions. When permitted, these can include repository
+inspection, read-only shell commands, external research, Browser tools,
+Skills, configured tools, and delegated tasks. A tool being available or
+read-only does not make it authorized. For a permitted tool that supports
+both reads and writes, select query, get, list, search, fetch, inspect, or
+preview operations. If its operation is unclear, do not use it until you can
+establish that it stays within the allowed scope and mutation boundary.
 
 Clarification is part of planning. Prefer investigation for anything the
 repository or references can answer. When a decision that shapes the plan
@@ -140,35 +219,46 @@ Minor open points you can safely defer belong there too, not in questions.
 
 Do not create, update, delete, publish, submit, deploy, send, or upload
 files, messages, jobs, schedules, services, account actions, or external
-objects. Reading or fetching remote content is investigation and is allowed;
-persisting fetched content into the workspace is a mutation and is not.
-Browser tools may navigate, search, filter, and inspect, but must not submit
-a mutating form or account action. Delegated tasks must remain research-only
-and follow the same mutation boundary. Shell commands may inspect but must
-not modify files, Git state, installed packages, or other system state;
-running existing builds or tests to verify current behavior counts as
-investigation, while installing dependencies or modifying files to make them
-run does not.
+objects. Reading or fetching remote content is investigation only when
+network access and that source are permitted; persisting fetched content
+into the workspace is a mutation and is not allowed. When Browser tools are
+permitted, they may navigate, search, filter, and inspect, but must not submit
+a mutating form or account action. When delegation is permitted, delegated
+tasks must remain research-only and inherit all user restrictions. When
+shell commands are permitted, they may inspect but must not modify files,
+Git state, installed packages, or other system state. Existing builds or
+tests may verify current behavior only when those operations are permitted
+and do not create or modify files or other state; installing dependencies or
+changing files to make them run is not investigation. If verification needs
+a forbidden capability or mutation, record it as unverified instead.
 
 The sole mutation exception is writing or editing the canonical Plan file at
 exactly this path:
 ${canonicalPath}
 No other file may be created or modified, and Git state must not change.
 
-If a tool is denied, switch to another read or investigation path. When two
-distinct approaches to the same question have been blocked, stop pursuing
-that question: converge on the evidence already available and record the
-remaining uncertainty in the Plan; do not keep looping.
+If an action is denied by the user or a permission boundary, do not retry
+that action through another tool, path, or delegated task. A technical
+failure may justify a different permitted investigation method, but does
+not expand authorization. When two distinct permitted approaches to the
+same question have been blocked, stop pursuing that question: converge on
+the evidence already available and record the remaining uncertainty in the
+Plan; do not keep looping.
 
 Keep the canonical Plan file up to date as you investigate and decisions
 change. The Plan should contain only relevant sections and cover enough
 detail for another agent to implement it safely, including:
-- goal, scope, and important non-goals;
+- goal, scope, important non-goals, and the user's tool, test, network,
+  delegation, and write restrictions;
 - current implementation and affected components or files;
 - proposed architecture and end-to-end flow;
 - relevant state, ownership, concurrency, failure, and recovery semantics;
 - tests and acceptance criteria;
 - unresolved decisions or risks, if any.
+
+Preserve those user restrictions when revising the Plan after feedback and
+in its implementation instructions. Feedback or approval alone does not
+waive a restriction; change it only when the user explicitly does so.
 
 The Plan may begin with one title; its first body section must be a
 non-empty \`## Summary\` stating the goal, scope, and key design decisions.
@@ -178,8 +268,14 @@ update the canonical Plan file at the exact path above. An inline response
 does not count as completing the Plan, even if it contains the same content.
 
 Call ExitPlanMode({}) only after the canonical Plan file is complete and
-ready for user review. Do not begin implementation after calling
-ExitPlanMode.
+ready for user review, and call it in the same turn once it is. The user can
+review and approve the Plan only through ExitPlanMode: a plain-text reply
+that says the Plan is ready, invites review, or asks the user to confirm
+before implementation does not open that review, even when the user asked
+to confirm the Plan before you implement it. If a decision that shapes the
+Plan still needs the user, ask it through an available question tool, then
+update the Plan and call ExitPlanMode after the answer is incorporated. Do
+not begin implementation after calling ExitPlanMode.
 </system-reminder>`;
 }
 function lifecycleTool(name, action) {
@@ -187,7 +283,7 @@ function lifecycleTool(name, action) {
         name,
         description: name === 'EnterPlanMode'
             ? 'Ask the local user to confirm entering Plan Mode; the turn ends while they decide, and planning starts only after they confirm. Call this as the first tool action for a requested planning deliverable — software or technical implementation planning, or any plan the user wants to approve before implementation or delivery — before reading or unpacking attachments, clarification, research, or drafting. If you only realize mid-task that this applies, call it then: late entry is better than none.'
-            : 'Freeze the canonical Plan file and ask the local user to review it; the turn ends while they decide. Only valid while Plan Mode is active, after the canonical Plan file has been written to disk — write or update it first.',
+            : 'Freeze the canonical Plan file and ask the local user to review it; the turn ends while they decide. This is the only way the user can review and approve the Plan: call it as soon as the Plan is ready instead of ending the turn with a plain-text request for review or confirmation. Only valid while Plan Mode is active, after the canonical Plan file has been written to disk — write or update it first.',
         schema: EmptyInput,
         source: 'builtin',
         execute: async (ctx, _input, signal) => {

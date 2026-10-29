@@ -4,7 +4,7 @@ import { isGitRepo } from '../../service/workspace/index.js';
 import { resolveAgentPromptSurface, createLocalStaticPromptReader, } from '../../service/turn-system/index.js';
 /** Decorates product-owned AgentHost capabilities with process-local runtime adapters. */
 export function createRuntimeAgentProduct(options) {
-    const { baseProduct, agentService, modelConfig, logger, nowMs, runtimeOwnerKind, capabilityProfile, miniappAvailable, implicitCustomProviderThinking, agentReferenceProjection, inspector, promptSnapshots, internalTurnPromptReads, browserUse, globalInstructions, } = options;
+    const { baseProduct, agentService, modelConfig, logger, nowMs, runtimeOwnerKind, capabilityProfile, miniappAvailable, implicitCustomProviderThinking, systemPromptOverrides, agentReferenceProjection, inspector, promptSnapshots, internalTurnPromptReads, browserUse, globalInstructions, } = options;
     const baseSkills = baseProduct.preparation.configBuilder.skills;
     return {
         ...baseProduct,
@@ -108,6 +108,7 @@ export function createRuntimeAgentProduct(options) {
                 tuiProductPolicy: runtimeOwnerKind === 'tui',
                 ...(promptSnapshots ? { promptSnapshots } : {}),
                 ...(implicitCustomProviderThinking ? { implicitCustomProviderThinking: true } : {}),
+                systemPromptOverrides,
                 profile: createV2AgentProfileSource(agentService, modelConfig.read, runtimeOwnerKind, capabilityProfile),
             },
             modelResolver: {

@@ -1,4 +1,5 @@
-import { createMiniAppControlExtension, createWordEditorExtension, createExcelEditorExtension, } from '@mavis/agent-extension';
+import { createMiniAppControlExtension } from '@mavis/agent-extension';
+import { prepareBackgroundTasks, } from './background-task-composition.js';
 import { createRuntimeCronSessionPorts, initializeCronService, } from '../../service/cron/index.js';
 import { composeTurnAdmissionPolicies, createDesktopSubagentConcurrency, } from '../../service/turn-system/index.js';
 import { composeLocalSandboxService, } from '../../service/sandbox/index.js';
@@ -9,17 +10,14 @@ import { CliSunsetNotice } from '../../service/turn-system/index.js';
 import { ComposerSendBehaviorPreference, } from '../../service/session-system/index.js';
 import { createLocalModelSystemConfigPort, resolveLocalRuntimeModelKey, } from '../../service/model-system/index.js';
 import { HostedCloudHandoffCapability, } from '../../service/session-handoff/index.js';
-import { initializeWorkspaceSystem, WorkspaceIndexingPolicy, } from '../../service/workspace/index.js';
+import { initializeRuntimeWorkspaceServices, WorkspaceIndexingPolicy, } from '../../service/workspace/index.js';
 import { createProductionSessionComposition, } from './runtime-session-composition.js';
 import { createHostSessionMiniAppLifecycle } from './miniapp-host.js';
 import { createMemoryRecallAdmissionPolicy } from './memory-recall-admission.js';
 export function createRuntimeNormalExtensions(input) {
     const miniAppLifecycle = createHostSessionMiniAppLifecycle(input.miniApp);
-    return [
-        ...(miniAppLifecycle ? [createMiniAppControlExtension(miniAppLifecycle)] : []),
-        ...(input.excelEditor ? [createExcelEditorExtension(input.excelEditor)] : []),
-        ...(input.wordEditor ? [createWordEditorExtension(input.wordEditor)] : []),
-    ];
+    // Office edits use source files; the workspace owns draft conflicts and refresh.
+    return miniAppLifecycle ? [createMiniAppControlExtension(miniAppLifecycle)] : [];
 }
 export function initializeRuntimeCron(input) {
     if (!input.options.scheduler) {
@@ -83,26 +81,25 @@ export function createRuntimeAgentReferenceProjection(compatibility, agentServic
         }, 'agent_reference'),
     };
 }
-export function createServiceWorkspace(prepared, compatibility, writeGlobalEvent) {
-    return initializeWorkspaceSystem({
-        git: {
-            publishChanged: (payload) => writeGlobalEvent({ type: 'workspace.git.changed', payload }),
-        },
-        indexingPolicy: prepared.workspaceIndexingPolicy,
-        indexingExecutor: compatibility.workspace,
-    });
+export function createRuntimeWorkspace(options, sessionSystem, writeGlobalEvent) {
+    return initializeRuntimeWorkspaceServices({
+        ...options,
+        getSession: (sessionId) => sessionSystem.repositories.sessions.get(sessionId),
+    }, (payload) => writeGlobalEvent({ type: 'workspace.git.changed', payload }));
 }
 /**
- * The shared admission chain stays unchanged for every runtime. Only the
- * trusted Electron composition adds durable Task-child concurrency policy.
+ * The shared admission chain stays unchanged for every runtime. Trusted local
+ * compositions (Desktop Electron, embedded CLI / TUI, app-server) add durable Task-child
+ * concurrency policy; cloud and other hosts keep the base chain.
  */
 export function createRuntimeTurnAdmissionOptions(input, planAdmission) {
-    const desktopSubagentConcurrency = isTrustedDesktopSubagentRuntime(input.options)
+    const desktopSubagentConcurrency = isTrustedLocalSubagentRuntime(input.options)
         ? createDesktopSubagentConcurrency({
             db: input.options.db,
             tasks: input.sessionSystem.sessions.taskExecutionAdmission,
-            maxConcurrentPerSession: input.options.compatibility.agentHost.preparation.configBuilder.config().subagent
+            readMaxConcurrentPerSession: () => input.options.compatibility.agentHost.preparation.configBuilder.config().subagent
                 ?.maxConcurrentPerSession,
+            ...(input.options.logger ? { logger: input.options.logger } : {}),
         })
         : undefined;
     return {
@@ -110,22 +107,31 @@ export function createRuntimeTurnAdmissionOptions(input, planAdmission) {
         ...(desktopSubagentConcurrency ? { subagentConcurrency: desktopSubagentConcurrency } : {}),
     };
 }
-function isTrustedDesktopSubagentRuntime(input) {
-    return input.runtimeOwnerKind === 'electron' && input.runtimeCapabilities?.electronHost === true;
+function isTrustedLocalSubagentRuntime(input) {
+    const capabilities = input.runtimeCapabilities;
+    if (input.runtimeOwnerKind === 'electron')
+        return capabilities?.electronHost === true;
+    return ((input.runtimeOwnerKind === 'cli' ||
+        input.runtimeOwnerKind === 'tui' ||
+        input.runtimeOwnerKind === 'app-server') &&
+        capabilities?.cliEmbedded === true);
 }
 export function prepareRuntimeServices(options) {
+    const backgroundTasks = prepareBackgroundTasks(options);
     const workspaceIndexingPolicy = new WorkspaceIndexingPolicy(options.db);
     const skillEnabledState = new SkillEnabledState(options.db);
     const legacyCredentialMigrationReceipt = new LegacyCredentialMigrationReceipt(options.db);
     const cliSunsetNotice = new CliSunsetNotice(options.db);
     const composerSendBehavior = new ComposerSendBehaviorPreference(options.db);
     return {
+        backgroundTasks,
         workspaceIndexingPolicy,
         skillEnabledState,
         legacyCredentialMigrationReceipt,
         cliSunsetNotice,
         composerSendBehavior,
         v1: {
+            createBackgroundTaskRuntime: backgroundTasks.createRuntime,
             workspaceIndexing: { isEnabled: () => workspaceIndexingPolicy.isEnabled() },
             skillEnabledState,
             runLegacyImCredentialMigration: (action) => legacyCredentialMigrationReceipt.run(action),
@@ -165,6 +171,7 @@ export function createRuntimeSessionComposition(input) {
     return createProductionSessionComposition({
         ...options,
         compatibility: options.compatibility.sessionV2,
+        goalHost: options.compatibility.goalHost,
         refreshOfficialModels: options.compatibility.modelProvider?.refreshOfficialModels,
         modelConfig: createLocalModelSystemConfigPort(options.compatibility.agentHost.preparation.configBuilder.config),
         ...dependencies,

@@ -2,7 +2,7 @@
 
 This package is the desktop client of MiniMax Code: the Electron application
 whose shell, main process, renderer bundle and runtime resources were restored
-from the publicly distributed Windows build (`MiniMax Code` 3.1.1, Electron
+from the publicly distributed Windows build (`MiniMax Code` 3.1.6, Electron
 42.8.0). See [RESTORATION.md](./RESTORATION.md) for exactly what was recovered,
 how, and which parts are shipped as prebuilt artifacts.
 
@@ -43,6 +43,12 @@ collide with an installed client's single-instance lock.
 Native modules are shipped prebuilt for Electron 42 (extracted from the
 installed client), therefore `npmRebuild` is disabled in
 `electron-builder.yml` and no local toolchain is required.
+
+`pnpm package` exists for local verification. **Releases are built by GitHub
+Actions**: run the `Desktop release` workflow (or push a `desktop-v<version>` tag
+matching `package.json`), which packages the client on `windows-latest` and
+publishes the installer, its blockmap and `latest.yml` to the release. Do not
+hand-publish a workstation build.
 
 ## Dependency policy
 

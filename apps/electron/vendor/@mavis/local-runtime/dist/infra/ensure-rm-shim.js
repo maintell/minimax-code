@@ -58,7 +58,7 @@ if [ ! -x "$trash_bin" ]; then
   echo "rm: refusing to fall back to an unrecoverable delete" >&2
   exit 1
 fi
-exec "$trash_bin" "$@"
+exec "$trash_bin" --rm-compatible "$@"
 `;
 /** Absolute path of the directory injected at the front of the agent's PATH. */
 export function resolveRmShimDir(dataDir) {
@@ -71,14 +71,19 @@ export function resolveRmShimDir(dataDir) {
  * missing or lost its execute bit (cache cleaner, restored backup, chmod), the
  * preflight first re-seeds it in place — `ensureRmShim` is idempotent — and
  * only refuses the spawn when that repair also fails (e.g. read-only dataDir).
- * A silent fall-through to `/bin/rm` is never possible. Without a dataDir
- * there is no shim to install, and Windows never uses the shim (see
- * `ensureRmShim`), so both return the shared resolver unchanged.
+ * Native deletion removes this profile's inherited shim path and skips the
+ * preflight entirely; the recoverable scripts on disk are left unchanged.
+ * Without a dataDir there is no shim to install, and Windows never injects
+ * the shim (see `ensureRmShim`).
  */
-export function resolveAgentBashEnvPolicy(dataDir, platform = process.platform) {
-    if (!dataDir || platform === 'win32')
+export function resolveAgentBashEnvPolicy(dataDir, platform = process.platform, nativeDelete = false) {
+    if (!dataDir)
         return resolveBashEnvPolicy({});
     const shimDir = resolveRmShimDir(dataDir);
+    if (nativeDelete)
+        return resolveBashEnvPolicy({ removePath: [shimDir] });
+    if (platform === 'win32')
+        return resolveBashEnvPolicy({});
     const shimPath = path.join(shimDir, 'rm');
     return resolveBashEnvPolicy({
         prependPath: [shimDir],

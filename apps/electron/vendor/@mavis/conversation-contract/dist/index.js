@@ -85,10 +85,14 @@ export class DeferredRuntimeConversation {
         cancelQueued: (sessionId, itemId) => this.use((conversation) => conversation.ingress.cancelQueued(sessionId, itemId)),
         reorderQueued: (sessionId, itemIds) => this.use((conversation) => conversation.ingress.reorderQueued(sessionId, itemIds)),
         abort: (sessionId, reason, turnId) => this.use((conversation) => conversation.ingress.abort(sessionId, reason, turnId)),
+        interruptTurn: (input) => this.use((conversation) => conversation.ingress.interruptTurn(input)),
         dispatchQueue: (sessionId) => this.use((conversation) => conversation.ingress.dispatchQueue(sessionId)),
     };
     maintenance = {
         compact: (input) => this.use((conversation) => conversation.maintenance.compact(input)),
+    };
+    taskConcurrency = {
+        occupancy: (parentSessionId) => this.use(async (conversation) => conversation.taskConcurrency?.occupancy(parentSessionId)),
     };
     constructor() {
         this.readiness = new Promise((resolve, reject) => {

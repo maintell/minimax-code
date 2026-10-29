@@ -1,4 +1,4 @@
-import { DEFAULT_MODEL_PRESETS, getRuntimePresetKey } from '@mavis/config';
+import { DEFAULT_MODEL_PRESETS, deliveredDefaultModelId, getRuntimePresetKey } from '@mavis/config';
 import { parseProviderId, parseSourceQualifiedModelKey } from '../resolution/model-key.js';
 import { cacheStatusView, minimaxApiModels, } from '../catalog/list-models.js';
 import { modelConfigFingerprint } from '../catalog/model-cache.js';
@@ -13,8 +13,12 @@ export function patchModelParameters(model, normalizedPatch) {
 export function removeLegacyCustomProviderNpm(provider) {
     delete provider.npm;
 }
-/** Keep the global default callable after a custom Provider/model mutation. */
-export function resetUnavailableCustomDefaultModel(draft) {
+/**
+ * Keep the global default callable after a custom Provider/model mutation.
+ * The replacement is the delivered default, the same rule used when an
+ * official snapshot retires the default.
+ */
+export function resetUnavailableCustomDefaultModel(draft, currentConfig) {
     const selected = parseSourceQualifiedModelKey(draft.defaultModel);
     if (selected?.source !== 'custom_provider')
         return false;
@@ -22,7 +26,10 @@ export function resetUnavailableCustomDefaultModel(draft) {
     const model = provider?.models?.[selected.modelId];
     if (provider?.enabled !== false && model && model.enabled !== false)
         return false;
-    draft.defaultModel = DEFAULT_MODEL_PRESETS[getRuntimePresetKey()].defaultModel;
+    const deliveredDefault = deliveredDefaultModelId(currentConfig?.provider?.minimax);
+    draft.defaultModel = deliveredDefault
+        ? `minimax/${deliveredDefault}`
+        : DEFAULT_MODEL_PRESETS[getRuntimePresetKey()].defaultModel;
     draft.defaultModelVariant = undefined;
     return true;
 }

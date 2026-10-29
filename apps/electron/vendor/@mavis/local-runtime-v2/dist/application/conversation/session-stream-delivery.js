@@ -1,6 +1,9 @@
+import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
+import { isSideChatSendOrigin } from '@mavis/shared/sidechat-send-origin';
 import { sanitizeDisplayAttachment, } from '../../service/session-system/index.js';
 import { turnAdmissionError } from './errors.js';
 import { queryCollapseSteeringProjection } from './query-collapse-identity.js';
+import { projectPeerMessageOrigin } from './peer-message-origin.js';
 export function mapV2TurnStreamResult(result) {
     if (!result.accepted) {
         const error = directSendAdmissionError(result.reason);
@@ -165,7 +168,7 @@ function frameMessages(data) {
     return messages.filter(isRecord);
 }
 function toSseMessage(message) {
-    const withSteering = toSseSteeringFields(toSseCronOrigin(message));
+    const withSteering = toSseSteeringFields(toSseSideChatOrigin(toSseMessageOrigin(message)));
     if (!Array.isArray(withSteering.attachments))
         return withSteering;
     return { ...withSteering, attachments: withSteering.attachments.map(toSseAttachment) };
@@ -174,10 +177,19 @@ function toSseSteeringFields(message) {
     const queryKey = typeof message.query_key === 'string' ? message.query_key : undefined;
     return { ...message, ...queryCollapseSteeringProjection(queryKey) };
 }
-function toSseCronOrigin(message) {
-    if (message.source !== 'cron' ||
-        message.origin !== undefined ||
-        !isRecord(message.sourceContext)) {
+function toSseMessageOrigin(message) {
+    if (message.origin !== undefined)
+        return message;
+    const questionnaireOrigin = projectQuestionnaireResponseOrigin(message);
+    if (questionnaireOrigin)
+        return questionnaireOrigin;
+    const backgroundOrigin = projectBackgroundTaskOrigin(message);
+    if (backgroundOrigin)
+        return backgroundOrigin;
+    const peerOrigin = projectPeerMessageOrigin(message);
+    if (peerOrigin)
+        return { ...message, origin: peerOrigin };
+    if (message.source !== 'cron' || !isRecord(message.sourceContext)) {
         return message;
     }
     const cronId = firstString([message.sourceContext.cronId]);
@@ -188,6 +200,25 @@ function toSseCronOrigin(message) {
         ...message,
         origin: { rawMeta: { cronId, ...(runId ? { runId } : {}) } },
     };
+}
+function projectQuestionnaireResponseOrigin(message) {
+    if (message.source !== 'questionnaire' || !isRecord(message.sourceContext))
+        return undefined;
+    const origin = message.sourceContext.origin;
+    return isOrdinaryQuestionnaireResponseOrigin(origin) ? { ...message, origin } : undefined;
+}
+function projectBackgroundTaskOrigin(message) {
+    if (message.source !== 'background-task' || !isRecord(message.sourceContext))
+        return undefined;
+    const origin = message.sourceContext.origin;
+    return isRecord(origin) ? { ...message, origin } : undefined;
+}
+/** Mirrors the history projection so a live SideChat hand-back gets its label too. */
+function toSseSideChatOrigin(message) {
+    if (message.origin !== undefined || !isRecord(message.sourceContext))
+        return message;
+    const origin = message.sourceContext.origin;
+    return isSideChatSendOrigin(origin) ? { ...message, origin } : message;
 }
 function toSseAttachment(value) {
     const sanitized = sanitizeDisplayAttachment(value);
@@ -341,6 +372,11 @@ const DIRECT_SEND_ADMISSION_ERRORS = {
         key: 'local_session_deleting',
         message: 'Session is being deleted',
     },
+    'computer-use-requires-new-turn': {
+        status: 409,
+        key: 'local_computer_use_requires_new_turn',
+        message: 'Computer Use requires a new Turn. Keep the message queued until the current Turn ends.',
+    },
     'compaction-active': {
         status: 409,
         key: 'local_session_compacting',
@@ -354,7 +390,7 @@ function directSendAdmissionError(reason) {
     if (isTurnContinuationAdmissionReason(reason)) {
         return turnContinuationAdmissionError(reason);
     }
-    const policyError = planAdmissionError(reason);
+    const policyError = runtimeAdmissionError(reason) ?? planAdmissionError(reason);
     if (policyError)
         return policyError;
     return (DIRECT_SEND_ADMISSION_ERRORS[reason] ?? {
@@ -379,6 +415,23 @@ function turnContinuationAdmissionError(reason) {
         key: 'local_turn_waiting_for_user',
         message: 'The current Turn is waiting for user input',
     };
+}
+function runtimeAdmissionError(reason) {
+    if (reason === 'policy:runtime:draining') {
+        return {
+            status: 503,
+            key: 'local_runtime_draining',
+            message: 'MCode is preparing to restart. Retry after reconnecting.',
+        };
+    }
+    if (reason === 'policy:runtime:auth-pending') {
+        return {
+            status: 503,
+            key: 'local_runtime_auth_pending',
+            message: 'MCode is waiting for Desktop authentication. Reconnect the development machine from Desktop.',
+        };
+    }
+    return undefined;
 }
 function planAdmissionError(reason) {
     if (reason === 'policy:plan:lifecycle-active') {

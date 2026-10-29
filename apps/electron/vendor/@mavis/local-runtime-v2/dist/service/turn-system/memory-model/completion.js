@@ -53,9 +53,13 @@ export function createGlobalMemoryModelCompletion(input) {
     return {
         async resolveModel(request) {
             const { resolved } = await resolve(request.reasoningEffort, request.modelName);
-            const maxOutputTokens = Math.min(request.kind === 'consolidation' ? 16_384 : 8_192, resolved.model.maxTokens);
+            // 整理在 INIT 时要一次写出整份 MEMORY.md（现约 70KB），迁移要把一份旧记忆文件
+            // （单文件可达数十 KB）一次改写成会话文档，上限都需容纳整份产物；输入预算等于上下文
+            // 窗口减去该值，取 32768 兼顾单次可写体量与可读输入。抽取产物是单会话文档，8192 足够。
+            const maxOutputTokens = Math.min(request.kind === 'capture' ? 8_192 : 32_768, resolved.model.maxTokens);
             return {
                 modelName: `${resolved.model.provider}/${resolved.model.id}`,
+                managedProvider: resolved.managedProvider === true,
                 parameters: { reasoning: resolved.thinkingLevel ?? 'off' },
                 maxInputTokens: Math.max(1, resolved.model.contextWindow - maxOutputTokens),
                 maxOutputTokens,
@@ -123,8 +127,6 @@ export function createGlobalMemoryModelCompletion(input) {
          * 以异常抛出，由 ModelGateway 统一分类；编辑效果以工作目录内容为准。
          */
         async runToolLoop(request) {
-            const { resolved } = await resolve(request.reasoningEffort, request.modelName);
-            const stream = resolved.streamFn ?? streamSimple;
             const tools = request.tools.map((tool) => ({
                 name: tool.name,
                 description: tool.description,
@@ -134,6 +136,9 @@ export function createGlobalMemoryModelCompletion(input) {
                 { role: 'user', content: request.briefing, timestamp: input.nowMs() },
             ];
             for (let turn = 0; turn < request.maxTurns; turn += 1) {
+                // 整轮可持续数十分钟，登录凭证会在期间轮换；每步重新解析，避免沿用过期 token 收到 401。
+                const { resolved } = await resolve(request.reasoningEffort, request.modelName);
+                const stream = resolved.streamFn ?? streamSimple;
                 const startedAtMs = input.nowMs();
                 input.diagnosticEvent?.('llm.request', {
                     kind: request.kind,
@@ -165,7 +170,11 @@ export function createGlobalMemoryModelCompletion(input) {
                 // 完成协议：模型不再调用工具即视为完成，最终文本不参与结果。
                 if (toolCalls.length === 0)
                     return { status: 'completed' };
-                messages.push(...(await executeMemoryLoopToolCalls(request.tools, toolCalls, input.nowMs, input.diagnosticEvent)));
+                messages.push(
+                // 输出撞上长度上限时，工具调用参数已被截断，执行它只会写入残缺内容。
+                ...(result.stopReason === 'length'
+                    ? rejectTruncatedToolCalls(toolCalls, input.nowMs)
+                    : await executeMemoryLoopToolCalls(request.tools, toolCalls, input.nowMs, input.diagnosticEvent)));
             }
             return { status: 'agent-limit-exceeded' };
         },
@@ -199,6 +208,19 @@ async function runMemoryLoopStep(step) {
         throw new Error(result.errorMessage ?? `Memory model ${result.stopReason}`);
     }
     return result;
+}
+const TRUNCATED_TOOL_CALL_MESSAGE = 'The response reached the output token limit, so this tool call was cut off and not executed. ' +
+    'Retry with smaller calls: split large content across several calls.';
+/** 响应被长度截断时不执行任何调用，统一回填可重试的错误，引导模型拆分输出。 */
+function rejectTruncatedToolCalls(toolCalls, nowMs) {
+    return toolCalls.map((call) => ({
+        role: 'toolResult',
+        toolCallId: call.id,
+        toolName: call.name,
+        content: [{ type: 'text', text: TRUNCATED_TOOL_CALL_MESSAGE }],
+        isError: true,
+        timestamp: nowMs(),
+    }));
 }
 /** 逐个执行工具调用并构造 toolResult 消息；未知工具与执行异常都以错误结果回填。 */
 async function executeMemoryLoopToolCalls(tools, toolCalls, nowMs, diagnosticEvent) {

@@ -1,14 +1,9 @@
 /**
  * v2 channel-subsystem composition (single production owner).
  *
- * Migration copy (MR2): v1 `api/host-channels.ts` (`wireChannelSubsystem` +
- * `createChannelApis` + the legacy IM Connection migration) with every
- * dependency remapped onto v2 channel-system modules. One deliberate
- * structural change: the runner is constructed directly (v1's
- * `createChannelRunner` wrapper existed only for retired pre-conversation
- * options). Everything else — construction order, family reconciliation,
- * §5.6 lazy registration, restore/startup orchestration — is kept verbatim
- * so v1 behaviour carries over unchanged.
+ * Per-platform stores and adapters preserve their existing routing and family
+ * reconciliation rules. The V2 composition owns startup admission and draining;
+ * the v1 shell borrows its facade and never constructs a second transport set.
  */
 import { LocalChannelBridgeInfra } from '../ingress/channel-bridge-infra.js';
 import { LocalChannelRunner } from '../ingress/runner.js';
@@ -34,6 +29,7 @@ import { migrateRootlessChannelState } from '../migration/rootless-startup-migra
 async function runChannelStartupSteps(scope) {
     const { input, channelApis, channelBridgeInfra } = scope;
     if (input.runLegacyImCredentialMigration) {
+        logChannelStartupStage('legacy_credential_migration');
         await input.runLegacyImCredentialMigration(() => migrateLegacyImCredentialsOnStartup({
             dataDir: input.dataDir,
             nowMs: input.nowMs,
@@ -45,7 +41,10 @@ async function runChannelStartupSteps(scope) {
             getSessionById: input.getSessionById,
         }));
     }
+    if (scope.isStopped())
+        return;
     if (input.rootlessV2) {
+        logChannelStartupStage('rootless_state_migration');
         await migrateRootlessChannelState({
             dataDir: input.dataDir(),
             defaultAgentName: input.agentName,
@@ -57,6 +56,9 @@ async function runChannelStartupSteps(scope) {
                 ? { resolveAgentReadScope: input.resolveAgentReadScope }
                 : {}),
         });
+        if (scope.isStopped())
+            return;
+        logChannelStartupStage('legacy_connection_migration');
         await migrateLegacyImConnectionState({
             dataDir: input.dataDir(),
             bindingStore: channelBridgeInfra.bindingStore,
@@ -82,9 +84,22 @@ async function runChannelStartupSteps(scope) {
                 : {}),
         });
     }
+    if (scope.isStopped())
+        return;
+    logChannelStartupStage('primary_family_convergence');
     scope.installPrimaryFamilyHooks();
     await runPrimaryFamilyConvergence(scope);
+    if (scope.isStopped())
+        return;
+    logChannelStartupStage('restore_inbound_loops');
     await channelApis.restartInboundLoops();
+}
+/**
+ * One fixed INFO per §5.3 step, so an uncoded startup rejection can be placed
+ * after the last stage entered. Observation only: no ordering or error effect.
+ */
+function logChannelStartupStage(stage) {
+    imLogger.info({ stage }, 'IM startup stage entered');
 }
 /**
  * Plan §5.5: startup reconcile converges persisted ownership only. Root /
@@ -98,16 +113,20 @@ async function runPrimaryFamilyConvergence(scope) {
     scope.setSuppressPrimaryFamilyTransportStart(true);
     try {
         await primaryFamilyReconciler.reconcileAll();
+        if (scope.isStopped())
+            return;
         if (input.conversation && !input.rootlessV2) {
             if (!primaryRootReconciler || !input.primaryFamilySessionModels || !input.configGetter) {
                 throw new Error('PRIMARY_AGENT_STARTUP_PORT_UNWIRED');
             }
             const { scopedSessionIds } = await primaryRootReconciler.reconcile();
+            if (scope.isStopped())
+                return;
             await repairPrimaryFamilySessionModels({ config: input.configGetter, sessions: input.primaryFamilySessionModels }, scopedSessionIds);
         }
     }
     finally {
-        scope.setSuppressPrimaryFamilyTransportStart(false);
+        scope.setSuppressPrimaryFamilyTransportStart(scope.isStopped());
     }
 }
 /** F4 arbiter: which clientId currently owns this agent's channel profile. */
@@ -129,6 +148,7 @@ async function resolveActiveChannelClient(channelApis, query) {
  * readiness without reading, migrating or restoring any Channel state.
  */
 function buildChannelStartup(scope) {
+    let stopped = false;
     let startup;
     let settleReady;
     const channelRestoreReady = new Promise((resolve, reject) => {
@@ -136,6 +156,8 @@ function buildChannelStartup(scope) {
     });
     markHandled(channelRestoreReady);
     const startChannelSubsystem = () => {
+        if (stopped)
+            return Promise.resolve();
         startup ??= (async () => {
             try {
                 if (scope.input.channelCapabilityPolicy === 'disabled') {
@@ -143,7 +165,7 @@ function buildChannelStartup(scope) {
                     settleReady();
                     return;
                 }
-                await runChannelStartupSteps(scope);
+                await runChannelStartupSteps({ ...scope, isStopped: () => stopped });
                 settleReady();
             }
             catch (err) {
@@ -153,7 +175,23 @@ function buildChannelStartup(scope) {
         })();
         return startup;
     };
-    return { startChannelSubsystem, channelRestoreReady };
+    const stopChannelStartup = async () => {
+        stopped = true;
+        scope.setSuppressPrimaryFamilyTransportStart(true);
+        // Already admitted migrations/restore must finish before the adapter sweep
+        // and before the runtime closes their stores. No later startup step enters.
+        if (startup) {
+            try {
+                await startup;
+            }
+            catch {
+                // The startup caller owns its error; teardown must still sweep adapters.
+            }
+        }
+        else
+            settleReady();
+    };
+    return { startChannelSubsystem, stopChannelStartup, channelRestoreReady };
 }
 /** Resolve the per-channel owner store, honouring an optional test override. */
 function resolveChannelOwnerStore(dataDir, nowMs, override) {
@@ -603,7 +641,7 @@ export function wireChannelSubsystem(input) {
         channelApis.wechatStore.setFamilyMutationHook(primaryFamilyReconciler.mutationHook('wechat'));
     };
     const primaryRootReconciler = buildPrimaryRootReconciler(input, primaryFamilyReconciler);
-    const { startChannelSubsystem, channelRestoreReady } = buildChannelStartup({
+    const { startChannelSubsystem, stopChannelStartup, channelRestoreReady } = buildChannelStartup({
         input,
         channelApis,
         channelBridgeInfra,
@@ -635,6 +673,7 @@ export function wireChannelSubsystem(input) {
         wechatChannelApi: channelApis.wechat,
         feishuCardActionHandler,
         startChannelSubsystem,
+        stopChannelStartup,
         channelRestoreReady,
     };
 }

@@ -140,4 +140,48 @@ function redactValue(value, seen, depth) {
 function normalizeKey(key) {
     return key.toLowerCase().replace(/[^a-z0-9]/gu, '');
 }
+// YAML / JSON parse errors quote raw config lines (`appSecret: …`,
+// `botToken: …`, `encryptKey: …`) that the fixed key set above does not name.
+const MESSAGE_KEY_VALUE = /(?<![\w.-])((["']?)([\w.-]+)\2\s*[:=]\s*["']?)[^\s"',;}]+/gu;
+const CREDENTIAL_KEY_PART = /secret|token|passw|credential|api[-_]?key|encrypt[-_]?key|aes[-_]?key/iu;
+const STACK_FRAME = /^\s*at (?:async )?(?:(.+?) \()?(.+?):(\d+)(?::\d+)?\)?$/u;
+/**
+ * Bounded name / message / top stack frames of an unknown throwable for one
+ * log line. Never spreads the error: only these three projections reach disk.
+ * The message additionally redacts quoted `key: value` lines whose key merely
+ * looks like a credential.
+ */
+export function redactErrorForLog(error, limits) {
+    if (!(error instanceof Error)) {
+        return {
+            errorName: 'NonError',
+            errorMessage: `non-Error throwable (${typeof error})`,
+            errorStackTop: [],
+        };
+    }
+    const message = redactSecretText(String(error.message)).replace(MESSAGE_KEY_VALUE, (match, prefix, _quote, key) => isSecretKey(key) || CREDENTIAL_KEY_PART.test(key) ? `${prefix}${REDACTED}` : match);
+    return {
+        errorName: error.name || 'Error',
+        errorMessage: message.length > limits.messageChars
+            ? `${message.slice(0, limits.messageChars)}…[truncated]`
+            : message,
+        errorStackTop: stackTopFrames(error.stack, limits.stackFrames),
+    };
+}
+/** `fn (file.js:line)` for the first frames; directories (user home) dropped. */
+function stackTopFrames(stack, limit) {
+    if (typeof stack !== 'string')
+        return [];
+    const frames = [];
+    for (const line of stack.split('\n')) {
+        const frame = STACK_FRAME.exec(line);
+        if (!frame)
+            continue;
+        const location = `${frame[2]?.split(/[\\/]/u).pop() ?? ''}:${frame[3] ?? ''}`;
+        frames.push(frame[1] ? `${frame[1]} (${location})` : location);
+        if (frames.length >= limit)
+            break;
+    }
+    return frames;
+}
 //# sourceMappingURL=redact-log-secret.js.map

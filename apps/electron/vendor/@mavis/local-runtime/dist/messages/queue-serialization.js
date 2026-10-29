@@ -1,5 +1,10 @@
+import { isThreadGoalKickoffQueueItem, readThreadGoalKickoffOriginRecord } from '@mavis/goal';
 import { isChannelQueueSource } from './queue.js';
-import { isThreadGoalKickoffQueueItem, readThreadGoalKickoffDisplayContent, } from '../thread-goal/kickoff.js';
+/** A Goal kickoff queue item carries its display text in `origin`; the Goal owner lives in local-runtime-v2. */
+function readThreadGoalKickoffDisplayContent(value) {
+    const record = readThreadGoalKickoffOriginRecord(value);
+    return typeof record?.displayContent === 'string' ? record.displayContent : undefined;
+}
 export function serializeQueuedMessage(item) {
     const kickoffDisplayContent = readThreadGoalKickoffDisplayContent(item.message.origin);
     const reviewRequest = item.message.source === 'code_review' ? { scope: 'local_changes' } : undefined;

@@ -24,6 +24,7 @@ export function createSessionForkDataCapability(input) {
                     agentName: session.agentName,
                     workspaceDir: session.workspaceDir,
                     title: session.title,
+                    titleSource: session.titleSource,
                     sessionType: 'branch',
                     sessionKind: session.sessionKind ?? 'conversation',
                     parentSessionId: session.parentSessionId ?? null,

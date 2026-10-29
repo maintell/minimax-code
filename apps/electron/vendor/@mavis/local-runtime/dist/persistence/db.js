@@ -397,31 +397,34 @@ const MIGRATIONS = [
     `,
     },
     {
+        // Versions 27, 29-31, 33 and 34 are Goal markers. Their columns used to be
+        // added by a guarded compatibility pass that left with the v1 Goal owner;
+        // local-runtime-v2 migration 46 now copies the table and defaults any
+        // missing column. The markers stay so databases that already recorded them
+        // do not skip a future migration that reuses the number.
+        //
         // Version 26 was already occupied by Session Assets when an unreleased
-        // Goal migration briefly reused it. Keep the published Goal marker at 27
-        // without replaying ALTER statements: the compatibility pass below adds
-        // missing columns/indexes conditionally. Workspace Indexing later reused
-        // 27; its append-only version-28 repair handles that second collision.
+        // Goal migration briefly reused it, so the Goal marker is 27. Workspace
+        // Indexing later reused 27; its append-only version-28 repair handles that
+        // second collision.
         version: 27,
         sql: `SELECT 1;`,
     },
     {
         // Workspace Indexing already owns the published version-28 collision
-        // repair. Goal policy columns therefore use the next append-only marker;
-        // the compatibility pass below performs guarded ALTERs for both fresh
-        // and partially migrated databases.
+        // repair. Goal policy columns therefore use the next append-only marker.
         version: 29,
         sql: `SELECT 1;`,
     },
     {
-        // Goal execution-wait columns are installed by the guarded compatibility
-        // pass below. Keep an append-only marker so schema history still records
-        // when that projection became part of the local database contract.
+        // Goal execution-wait columns. Keep an append-only marker so schema history
+        // still records when that projection became part of the local database
+        // contract.
         version: 30,
         sql: `SELECT 1;`,
     },
     {
-        // `execution_wait_epoch` joined the same guarded pass. A pre-existing row
+        // Goal `execution_wait_epoch`. A pre-existing row
         // gets a NULL epoch, which never matches `updated_at_ms`, so any wait
         // persisted before this column existed reads as "no wait" instead of
         // resurfacing against a newer admission epoch.
@@ -449,10 +452,20 @@ const MIGRATIONS = [
     `,
     },
     {
-        // Turn Diff retention took the published version-32 marker, so objective
-        // resources move to the next append-only slot. The column itself is
-        // installed by the guarded compatibility pass below.
+        // Turn Diff retention took the published version-32 marker, so Goal
+        // objective resources move to the next append-only slot.
         version: 33,
+        sql: `SELECT 1;`,
+    },
+    {
+        // Goal `usage_recovery_at_ms`, and Goal completion dismissal
+        // (`dismissed_at_ms`), which originally reused version 32 on the SSH
+        // branch. Pre-existing rows get NULL, so a Goal stopped by an account quota
+        // before this column existed stays manually resumable instead of being
+        // handed an invented recovery schedule. The Turn Diff retention table is
+        // recreated by its guarded compatibility pass for databases that saw that
+        // earlier version-32 marker first.
+        version: 34,
         sql: `SELECT 1;`,
     },
 ];
@@ -530,7 +543,6 @@ function ensureSchema(db) {
         runMigration(db, migration);
     }
     ensureLegacyMigrationTableCompatibility(db);
-    ensureThreadGoalTableCompatibility(db);
     ensureTurnDiffTableCompatibility(db);
     ensureCronTableCompatibility(db);
 }
@@ -592,67 +604,10 @@ function ensureLegacyMigrationTableCompatibility(db) {
       ON local_runtime_legacy_migrations(legacy_framework_session_id);
   `);
 }
-function ensureThreadGoalTableCompatibility(db) {
-    db.exec(`
-    CREATE TABLE IF NOT EXISTS local_runtime_thread_goals (
-      goal_id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL UNIQUE,
-      objective TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at_ms INTEGER NOT NULL,
-      updated_at_ms INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_local_runtime_thread_goals_session
-      ON local_runtime_thread_goals(session_id);
-  `);
-    const columns = new Set(db
-        .prepare('PRAGMA table_info(local_runtime_thread_goals)')
-        .all()
-        .map((row) => row.name)
-        .filter((name) => typeof name === 'string'));
-    const addColumn = (name, definition) => {
-        if (columns.has(name))
-            return;
-        db.exec(`ALTER TABLE local_runtime_thread_goals ADD COLUMN ${name} ${definition};`);
-        columns.add(name);
-    };
-    addColumn('tokens_used', 'INTEGER NOT NULL DEFAULT 0');
-    addColumn('time_used_seconds', 'INTEGER NOT NULL DEFAULT 0');
-    addColumn('token_budget', 'INTEGER');
-    addColumn('kickoff_attachments_json', "TEXT NOT NULL DEFAULT '[]'");
-    addColumn('objective_resources_json', "TEXT NOT NULL DEFAULT '[]'");
-    addColumn('kickoff_state', "TEXT NOT NULL DEFAULT 'consumed'");
-    addColumn('turns_used', 'INTEGER NOT NULL DEFAULT 0');
-    addColumn('reply_fingerprint', 'TEXT');
-    addColumn('no_progress_streak', 'INTEGER NOT NULL DEFAULT 0');
-    // Second, independent breaker counter: consecutive Goal-bound main turns that
-    // ended normally without any committed tool call. Existing rows start at 0,
-    // so the migration cannot resurrect a streak from history the host never
-    // observed.
-    addColumn('no_tool_streak', 'INTEGER NOT NULL DEFAULT 0');
-    addColumn('last_verification', 'TEXT');
-    addColumn('last_worker_proposal', 'TEXT');
-    addColumn('status_reason', 'TEXT');
-    // Execution wait projection. Deliberately separate from `status_reason`:
-    // these columns describe why an `active` Goal has not started its next Turn,
-    // and are written WITHOUT touching `updated_at_ms` (the admission epoch).
-    //
-    // `execution_wait_epoch` records the `updated_at_ms` the wait was decided
-    // against. The read path only surfaces a wait whose epoch still matches, so
-    // any writer that advances the epoch retires the wait for free — no writer
-    // has to remember to clear these columns.
-    addColumn('execution_wait_reason', 'TEXT');
-    addColumn('execution_wait_since_ms', 'INTEGER');
-    addColumn('execution_wait_epoch', 'INTEGER');
-    db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_local_runtime_thread_goals_kickoff_state
-      ON local_runtime_thread_goals(kickoff_state, session_id);
-  `);
-}
 /**
  * Cron unification Step 1 compatibility: guarantee `local_runtime_crons`
  * carries the `cron_id` column + UNIQUE index, then back-fill any NULL rows
- * with a minted UUID. Mirrors `ensureThreadGoalTableCompatibility` so dbs
+ * with a minted UUID, the same additive-compatibility pattern used for other tables so dbs
  * whose `schema_migrations` bookkeeping predates the v18 ALTER (e.g. created
  * fresh on an older binary, then upgraded) still converge. Idempotent: the
  * back-fill only touches rows where `cron_id IS NULL`, so re-opening never

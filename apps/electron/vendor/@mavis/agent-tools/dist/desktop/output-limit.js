@@ -3,6 +3,8 @@ export const DESKTOP_READ_TEXT_MAX_BYTES = 24 * 1024;
 export const DESKTOP_BASH_MAX_BYTES = 24 * 1024;
 // Leave room for exit/timing receipts and the readable output reference.
 export const DESKTOP_BASH_PREVIEW_BYTES = DESKTOP_BASH_MAX_BYTES - 2048;
+export const DESKTOP_BASH_MAX_OUTPUT_BYTES = 5 * 1024 * 1024 * 1024;
+export const DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
 export function limitDesktopPrefixLines(text, options) {
     const originalBytes = options.originalBytes ?? byteLength(text);
     const inputLines = splitBodyLines(text);
@@ -62,7 +64,7 @@ export function limitDesktopHeadTailLines(text, options) {
     return buildLimitedResult(limitedText, 'head_tail_lines', originalBytes, options.maxBytes, wholeHead.count + wholeTail.count + (oversizedHead ? 1 : 0) + (oversizedTail ? 1 : 0));
 }
 export function applyDesktopTextLimit(result, limited) {
-    if (!limited.truncation)
+    if (!limited.truncation && limited.text === result.text)
         return result;
     let replaced = false;
     const content = [];
@@ -78,7 +80,7 @@ export function applyDesktopTextLimit(result, limited) {
     }
     if (!replaced)
         content.unshift({ type: 'text', text: limited.text });
-    const continuation = limited.truncation.continuation_hint
+    const continuation = limited.truncation?.continuation_hint
         ? createDesktopOutputContinuation({
             ...(limited.truncation.next_offset === undefined
                 ? {}
@@ -95,7 +97,7 @@ export function applyDesktopTextLimit(result, limited) {
         content,
         details: {
             ...(result.details ?? {}),
-            desktop_output_truncation: limited.truncation,
+            ...(limited.truncation ? { desktop_output_truncation: limited.truncation } : {}),
             ...(continuation ? { desktop_output_continuation: continuation } : {}),
         },
     };

@@ -59,6 +59,10 @@ export class PluginPackageStorage {
             throw error;
         }
     }
+    /** Where an installed local plugin of this name lives; it may not exist. */
+    localPluginRoot(pluginName) {
+        return path.join(this.options.dataDir, 'plugins', pluginName);
+    }
     async readLocalMiniAppPackageRoot(packageRoot) {
         return this.workspaceMiniAppStorage.readPackageRoot(packageRoot);
     }

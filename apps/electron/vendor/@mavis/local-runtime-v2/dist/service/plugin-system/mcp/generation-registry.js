@@ -11,6 +11,16 @@ export class PluginCapabilityGenerationRegistry {
     get currentLeaseCount() {
         return this.current.leaseCount;
     }
+    /** Retired generations a turn still leases follow the new managed launches too. */
+    async adoptManagedServers(entries) {
+        const retired = [...this.generations.values()].filter((generation) => generation !== this.current &&
+            generation.retired &&
+            generation.leaseCount > 0 &&
+            !generation.cleanupTask);
+        if (retired.length === 0)
+            return;
+        await Promise.allSettled(retired.map((generation) => ignoreFailure(generation.runtime.adoptManagedServers?.(entries))));
+    }
     retain(revision) {
         const generation = this.generations.get(revision);
         if (!generation) {

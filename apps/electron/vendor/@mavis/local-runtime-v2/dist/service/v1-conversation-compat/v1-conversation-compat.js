@@ -3,11 +3,18 @@ import { isInlineDisplayDataUrl, toConversationCommittedMessage, } from '../sess
 /** v2 service implementation injected into hosted v1 compatibility consumers. */
 export class V1ConversationCompatibilityService {
     options;
+    taskConcurrency;
     constructor(options) {
         this.options = options;
+        const { taskOccupancy } = options;
+        if (taskOccupancy) {
+            this.taskConcurrency = {
+                occupancy: async (parentSessionId) => taskOccupancy(parentSessionId),
+            };
+        }
     }
     query = {
-        getSession: async (sessionId) => toConversationSession(await this.options.sessions.query.find(sessionId)),
+        getSession: async (sessionId) => this.withSideChatRelation(toConversationSession(await this.options.sessions.query.find(sessionId))),
         listSessions: async (options) => (await this.options.sessions.query.listExact(toSessionListOptions(options))).map(toRequiredConversationSession),
         listMessages: async (sessionId, options) => {
             const page = await this.options.sessions.messages.query.list({
@@ -131,6 +138,26 @@ export class V1ConversationCompatibilityService {
             });
             return result.status === 'aborted' || result.status === 'released';
         },
+        interruptTurn: async ({ sessionId, reason, turnId }) => {
+            const result = await this.options.turns.abort({
+                sessionId,
+                reason,
+                ...(turnId ? { turnId } : {}),
+            });
+            // `released` means the Turn was claimed but had not started executing;
+            // either way it is gone, which is what the caller asked for.
+            switch (result.status) {
+                case 'aborted':
+                case 'released':
+                    return { status: 'aborted', turnId: result.turnId };
+                case 'abort-timeout':
+                    return { status: 'abort-timeout', turnId: result.turnId };
+                case 'not-running':
+                    return { status: 'not-running' };
+                case 'turn-mismatch':
+                    return { status: 'turn-mismatch' };
+            }
+        },
         dispatchQueue: (sessionId) => this.wake(sessionId),
     };
     maintenance = {
@@ -150,6 +177,12 @@ export class V1ConversationCompatibilityService {
             return toCompactionOutcome(result, input.sessionId);
         },
     };
+    withSideChatRelation(session) {
+        if (!session)
+            return undefined;
+        const relation = this.options.sessions.sideChats?.relation(session.sessionId);
+        return relation ? { ...session, sideChat: { mainSessionId: relation.mainSessionId } } : session;
+    }
     async createSession(input) {
         const agentName = await this.options.resolveAgentWriteTarget(input.agentName);
         if (input.sessionType === 'root') {
@@ -204,6 +237,9 @@ export class V1ConversationCompatibilityService {
                         itemId: result.queue.itemId,
                         position: result.queue.position,
                         ahead: result.queue.ahead,
+                        ...(result.queue.dispatched !== undefined
+                            ? { dispatched: result.queue.dispatched }
+                            : {}),
                     },
                 }
                 : {}),
@@ -262,6 +298,7 @@ function sessionClassification(input) {
         ...(input.visibility ? { visibility: input.visibility } : {}),
         ...(input.purpose ? { purpose: input.purpose } : {}),
         ...(input.originCronId ? { originCronId: input.originCronId } : {}),
+        ...(input.createdBySessionId ? { createdBySessionId: input.createdBySessionId } : {}),
     };
 }
 function sessionPresentation(input) {
@@ -287,6 +324,7 @@ function sessionExecutionPreferences(input) {
             ? { isDefaultWorkspace: input.isDefaultWorkspace }
             : {}),
         ...(input.origin ? { origin: input.origin } : {}),
+        ...(input.pluginAgentDefinition ? { pluginAgentDefinition: input.pluginAgentDefinition } : {}),
     };
 }
 function toQueueMessage(message) {
@@ -374,11 +412,19 @@ function toQueuedItem(item) {
             ...(item.message.channelContext ? { channelContext: item.message.channelContext } : {}),
             ...(item.model ? { model: toConversationQueueModel(item.model) } : {}),
         },
+        ...queuedBatchOrigins(item),
         createdAt: item.createdAt,
         ...(item.clientRequestId ? { clientRequestId: item.clientRequestId } : {}),
         ...(item.dedupeKey ? { dedupeKey: item.dedupeKey } : {}),
         ...(item.expiresAt !== undefined ? { expiresAt: item.expiresAt } : {}),
     };
+}
+function queuedBatchOrigins(item) {
+    const batchOrigins = item.immediateSendBatch?.members.flatMap((member) => {
+        const origin = member.message.origin ?? member.provenance.sourceContext?.origin;
+        return origin === undefined ? [] : [origin];
+    });
+    return batchOrigins ? { batchOrigins } : {};
 }
 function toConversationAttachment(attachment) {
     if (!isInlineDisplayDataUrl(attachment.dataUrl))

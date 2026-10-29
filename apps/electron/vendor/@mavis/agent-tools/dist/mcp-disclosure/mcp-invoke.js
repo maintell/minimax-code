@@ -1,6 +1,5 @@
 import { Type } from '@sinclair/typebox';
-import { Value } from '@sinclair/typebox/value';
-import { defineRuntimeTool, } from '@mavis/agent-core/tools';
+import { defineRuntimeTool, validateRuntimeToolInput, } from '@mavis/agent-core/tools';
 const METADATA = new WeakMap();
 const MCP_INVOKE_METADATA = Symbol('mavis.mcp-invoke.metadata');
 const MAX_ARGUMENTS_JSON_BYTES = 256 * 1024;
@@ -143,6 +142,9 @@ function resolveTarget(input, registry, referenceRegistry) {
             message: `Arguments could not be prepared for "${selector}": ${boundedError(error)}`,
         };
     }
+    if (!isRecord(prepared)) {
+        return { kind: 'error', message: `Prepared arguments for "${selector}" must be an object.` };
+    }
     const inputSchema = reference?.inputSchema ?? target.def.schema;
     const mismatch = schemaMismatch(inputSchema, selector, prepared, selectorKind === 'tool_ref');
     if (mismatch)
@@ -152,7 +154,7 @@ function resolveTarget(input, registry, referenceRegistry) {
         selectorKind,
         selector,
         target,
-        arguments: isRecord(prepared) ? prepared : {},
+        arguments: prepared,
         inputSchema,
         ...(reference?.pluginName ? { pluginName: reference.pluginName } : {}),
     };
@@ -280,20 +282,15 @@ function validateDecodedJson(value, fieldName) {
     }
     return undefined;
 }
-function schemaMismatch(inputSchema, selector, prepared, failClosed) {
-    try {
-        if (Value.Check(inputSchema, prepared))
-            return undefined;
-        const issues = [...Value.Errors(inputSchema, prepared)]
-            .slice(0, 8)
-            .map((error) => `${error.path}: ${error.message}`);
-        const summary = `Arguments do not match the schema for "${selector}":\n${issues.join('\n')}`;
-        return failClosed ? summary : `${summary}\ninput_schema: ${JSON.stringify(inputSchema)}`;
+function schemaMismatch(inputSchema, selector, prepared, hostReference) {
+    const validation = validateRuntimeToolInput(inputSchema, prepared);
+    if (validation.valid)
+        return undefined;
+    if (validation.reason === 'unsupported') {
+        return `${hostReference ? 'Host schema' : 'Schema'} validation is unavailable for "${selector}".`;
     }
-    catch {
-        // Plain JSON Schema from an MCP server has no TypeBox internal symbols.
-        return failClosed ? `Host schema validation is unavailable for "${selector}".` : undefined;
-    }
+    const summary = `Arguments do not match the schema for "${selector}":\n${validation.issues.join('\n')}`;
+    return hostReference ? summary : `${summary}\ninput_schema: ${JSON.stringify(inputSchema)}`;
 }
 function readInput(value) {
     if (!isRecord(value))

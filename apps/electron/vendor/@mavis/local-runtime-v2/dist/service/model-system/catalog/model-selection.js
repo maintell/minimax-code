@@ -1,6 +1,6 @@
 import { ThinkingLevel } from '@mavis/protocol';
 import { modelRefForModel } from '../resolution/model-ref.js';
-import { DEFAULT_MODEL_PRESETS, getRuntimePresetKey, isLegacyManagedMinimaxProvider, resolveModelAvailability, } from '@mavis/config';
+import { DEFAULT_MODEL_PRESETS, deliveredDefaultModelId, getRuntimePresetKey, isLegacyManagedMinimaxProvider, listRouteModelIds, resolveModelReplacement, } from '@mavis/config';
 import { LocalModelProviderError } from '../contracts.js';
 import { parseProviderId, parseSourceQualifiedModelKey } from '../resolution/model-key.js';
 export const LEGACY_MINIMAX_PROVIDER_ID = 'custom_provider:minimax-legacy';
@@ -9,32 +9,30 @@ export function isLegacyMinimaxProvider(config, providerId) {
     const provider = key ? config.custom_provider?.[key] : undefined;
     return isLegacyManagedMinimaxProvider(providerId, provider?.options?.baseURL);
 }
-/** Resolves a retired managed alias without changing unrelated custom providers. */
+/**
+ * Resolves a retired managed alias without changing unrelated custom providers.
+ * The first candidate `minimax` lists wins: the same model, the configured
+ * default, then the delivered default and the first-run default. Never throws:
+ * with nothing listed the alias maps to the same model on `minimax` for the
+ * upstream to decide.
+ */
 export function resolveLegacyMinimaxModel(config, selection) {
     if (!isLegacyMinimaxProvider(config, selection.providerId))
         return undefined;
     const preset = getRuntimePresetKey();
     const configured = parseSourceQualifiedModelKey(config.defaultModel);
-    const officialDefault = parseSourceQualifiedModelKey(DEFAULT_MODEL_PRESETS[preset].defaultModel);
-    const candidates = [
-        { providerId: 'minimax', modelId: selection.modelId },
-        ...(configured &&
+    const firstRun = parseSourceQualifiedModelKey(DEFAULT_MODEL_PRESETS[preset].defaultModel);
+    const listed = listRouteModelIds(config, 'minimax', preset);
+    const modelId = [
+        selection.modelId,
+        configured &&
             (configured.providerId === 'minimax' || isLegacyMinimaxProvider(config, configured.providerId))
-            ? [{ providerId: 'minimax', modelId: configured.modelId }]
-            : []),
-        ...(officialDefault
-            ? [{ providerId: officialDefault.providerId, modelId: officialDefault.modelId }]
-            : []),
-    ];
-    const replacement = candidates.find((candidate) => resolveModelAvailability({
-        config,
-        ...candidate,
-        preset,
-        source: 'explicit_request',
-    }).available);
-    if (replacement)
-        return replacement;
-    throw new LocalModelProviderError(400, 'The legacy MiniMax model has no available official replacement. Select an available official model.', 'MODEL_NOT_AVAILABLE_FOR_ROUTE');
+            ? configured.modelId
+            : undefined,
+        deliveredDefaultModelId(config.provider?.minimax),
+        firstRun?.modelId,
+    ].find((candidate) => candidate !== undefined && listed.includes(candidate));
+    return { providerId: 'minimax', modelId: modelId ?? selection.modelId };
 }
 export const SELECTED_THINKING_EFFORT_CAPABILITY = 'selected_thinking_effort';
 function isRecord(value) {
@@ -152,21 +150,25 @@ function resolveCreateThinking(config, requested, providerId, modelId) {
     return inheritsGlobalEffort ? config.defaultModelThinking : requested.thinking;
 }
 /** Resolves explicit create input before any Session record is written. */
-export function resolveRequestedSessionModel(config, requested) {
+export function resolveRequestedSessionModel(config, input) {
     const fallback = parseSourceQualifiedModelKey(config.defaultModel);
-    const providerId = requested.providerId?.trim() || fallback?.providerId;
-    const modelId = requested.modelId?.trim() || fallback?.modelId;
-    if (!providerId || !modelId)
+    const requestedProviderId = input.providerId?.trim() || fallback?.providerId;
+    const requestedModelId = input.modelId?.trim() || fallback?.modelId;
+    if (!requestedProviderId || !requestedModelId)
         throw new LocalModelProviderError(400, 'Model selection is incomplete', 'VALIDATION_ERROR');
-    const availability = resolveModelAvailability({
+    // A retired official model is replaced (its parameters do not carry over);
+    // anything else is created as requested and the upstream decides.
+    const outcome = resolveModelReplacement({
         config,
-        providerId,
-        modelId,
+        providerId: requestedProviderId,
+        modelId: requestedModelId,
         preset: getRuntimePresetKey(),
-        source: 'explicit_request',
+        fallbacks: [fallback],
     });
-    if (!availability.available)
-        throw new LocalModelProviderError(400, availability.message, availability.code);
+    const replaced = outcome.kind === 'replaced';
+    const providerId = replaced ? outcome.model.providerId : requestedProviderId;
+    const modelId = replaced ? outcome.model.modelId : requestedModelId;
+    const requested = replaced ? { providerId, modelId } : input;
     const thinking = resolveCreateThinking(config, requested, providerId, modelId);
     const resolved = freezeManagedQueueModel(config, {}, {
         provider_id: providerId,
@@ -191,11 +193,15 @@ export function freezeManagedQueueModel(config, session, requested, frozenModel)
     const saved = queueSessionModel(session, frozenModel);
     const inherited = inheritedQueueSelection(config, session, saved);
     const selection = requested ?? inherited;
-    const provider = selection.provider_id ?? inherited.provider_id;
+    const requestedProvider = selection.provider_id ?? inherited.provider_id;
     const modelId = selection.model_id ?? inherited.model_id ?? '';
-    if (provider !== 'minimax' || config.minimaxModelSource === 'minimax_api_key')
+    // Only a listed managed model is frozen at admission. Anything else (another
+    // route, or a model the catalog no longer lists) is left to Turn preparation,
+    // which applies the replacement rule and repairs the Session.
+    const model = listedManagedQueueModel(config, requestedProvider, modelId);
+    if (!model)
         return requested;
-    const model = availableManagedQueueModel(config, modelId);
+    const provider = MANAGED_QUEUE_PROVIDER_ID;
     if (!requested && saved && !saved.parameterSnapshot) {
         return freezeLegacyQueueSelection(provider, modelId, model, selection);
     }
@@ -214,12 +220,12 @@ function queueSessionModel(session, frozenModel) {
         return frozenModel;
     return savedSessionModel(session, frozenModel);
 }
-function availableManagedQueueModel(config, modelId) {
+const MANAGED_QUEUE_PROVIDER_ID = 'minimax';
+function listedManagedQueueModel(config, provider, modelId) {
+    if (provider !== MANAGED_QUEUE_PROVIDER_ID || config.minimaxModelSource === 'minimax_api_key')
+        return undefined;
     const model = config.provider?.minimax?.models?.[modelId];
-    if (!modelId || !model || model.enabled === false) {
-        throw new LocalModelProviderError(400, 'Selected managed model is unavailable', 'VALIDATION_ERROR');
-    }
-    return model;
+    return modelId && model && model.enabled !== false ? model : undefined;
 }
 function freezeLegacyQueueSelection(provider, modelId, model, selection) {
     const resolved = modelRefForModel(provider, modelId, model, {

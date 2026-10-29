@@ -3,21 +3,26 @@ import { LocalQuestionnaireError } from './errors.js';
 import { QuestionnaireValidationError, sanitizeReplyAnswers, validateQuestionnaireReply, } from './normalize.js';
 import { isOwnedQuestionnaireRequest, QuestionnaireOwnedActionLifecycle, } from './owned-action-lifecycle.js';
 import { QuestionnaireGenericReplyLifecycle } from './generic-reply-lifecycle.js';
-import { canQueueReplyBehindActiveTurn, isStrandedAnsweredReply, queueReplyBehindActiveTurn, } from './reply-fallback.js';
-import { serializeQuestionnaireResponseMessage } from './serializer.js';
-import { recoverQuestionnairesOnStartup } from './startup-recovery.js';
+import { injectOrdinaryQuestionnaireReply, } from './ordinary-reply-injection.js';
+import { isStrandedAnsweredReply } from './reply-fallback.js';
+import { expireStaleQuestionnairesOnStartup, recoverQuestionnairesOnStartup, } from './startup-recovery.js';
+import { QuestionnaireV2Lifecycle } from './v2-lifecycle.js';
+import { isV2Questionnaire } from './v2-state.js';
 import { isQuestionnaireAgentAllowed, QuestionnaireRequestLifecycle } from './request-lifecycle.js';
-import { GoalQuestionnaireService } from './goal-questionnaire-service.js';
-export { GOAL_QUESTIONNAIRE_AUTO_REPLY_MS } from './contracts.js';
+import { QuestionnaireServiceSupport } from './service-support.js';
+import { projectQuestionnaireRecord } from './request-view.js';
+export { ASYNC_QUESTIONNAIRE_COUNTDOWN_SECONDS } from './contracts.js';
 export { QUESTIONNAIRE_TTL_MS };
 export { LocalQuestionnaireError };
-export class LocalQuestionnaireService extends GoalQuestionnaireService {
+export class LocalQuestionnaireService extends QuestionnaireServiceSupport {
     genericReplyLifecycle;
     ownedActionLifecycle;
     requestLifecycle;
+    v2Lifecycle;
     constructor(deps) {
         super(deps);
         this.requestLifecycle = new QuestionnaireRequestLifecycle(deps);
+        this.v2Lifecycle = new QuestionnaireV2Lifecycle(deps);
         this.ownedActionLifecycle = new QuestionnaireOwnedActionLifecycle(deps, (record, reply, continuationIdentity) => this.injectReply(record, reply, continuationIdentity));
         this.genericReplyLifecycle = new QuestionnaireGenericReplyLifecycle(deps, this.ownedActionLifecycle, (record) => this.wakeQueueAfterDuplicateResume(record));
     }
@@ -29,23 +34,33 @@ export class LocalQuestionnaireService extends GoalQuestionnaireService {
     }
     async reply(input) {
         const candidate = await this.deps.store.get(input.requestId);
+        // Route by the stored column: v2 rows have their own reply rules and are
+        // never Goal-owned; legacy rows keep the original Goal / generic paths.
+        if (candidate && isV2Questionnaire(candidate))
+            return this.v2Lifecycle.reply(input);
+        if (Array.isArray(input.reply.answers) &&
+            input.reply.answers.some((answer) => answer?.contextImages?.length)) {
+            throw new LocalQuestionnaireError(400, 'QUESTIONNAIRE_CONTEXT_IMAGES_UNSUPPORTED', 'Context images require a v2 questionnaire.');
+        }
         if (candidate?.request.purpose === 'goal')
-            return this.replyGoal(input);
+            return this.replyOwned(input);
         return this.genericReplyLifecycle.reply(input);
     }
-    async replyGoal(input) {
+    /** The operations the work owner (the v2 Goal owner) drives for its own requests. */
+    ownedOperations() {
+        return this.createOwnedOperations((input) => this.reply(input));
+    }
+    async replyOwned(input) {
         const record = await this.requireMutableRecord(input.requestId, input.agentName, 'reply');
         const session = await this.deps.getSessionById(record.sessionId);
         if (!session) {
             await this.deps.store.delete(record.requestId);
             throw new LocalQuestionnaireError(404, 'SESSION_NOT_FOUND', record.sessionId);
         }
-        const currentGoal = await this.deps.resolveGoal?.(record.sessionId);
-        if (!record.request.goalId ||
-            !currentGoal ||
-            currentGoal.goalId !== record.request.goalId ||
-            currentGoal.status === 'complete') {
-            await this.supersedeStaleGoalRequest(record, currentGoal?.goalId);
+        const workOwner = this.deps.workOwner;
+        const admission = workOwner ? await workOwner.admitReply(record) : { current: false };
+        if (!admission.current) {
+            await this.supersedeStaleOwnedRequest(record, admission.currentOwnerId);
             throw new LocalQuestionnaireError(410, 'QUESTIONNAIRE_GOAL_NO_LONGER_CURRENT', 'Questionnaire request no longer belongs to the current Goal');
         }
         let reply;
@@ -76,7 +91,12 @@ export class LocalQuestionnaireService extends GoalQuestionnaireService {
                 throw new LocalQuestionnaireError(410, 'QUESTIONNAIRE_AUTO_REPLY_CANCELLED', 'Questionnaire auto reply was cancelled by the runtime lifecycle');
             }
             const won = input.source === 'auto'
-                ? await this.deps.store.markAnsweredForActiveGoal(record.requestId, record.sessionId, record.request.goalId, answeredAt, reply)
+                ? await this.deps.store.markAnsweredIfLatestPendingWhen({
+                    requestId: record.requestId,
+                    sessionId: record.sessionId,
+                    answeredAt,
+                    replyPayload: reply,
+                }, () => workOwner?.acceptsAutomaticAnswer(record) === true)
                 : await this.deps.store.markAnswered(record.requestId, answeredAt, reply);
             if (!won)
                 await this.throwCurrentTerminalState(record.requestId);
@@ -103,6 +123,10 @@ export class LocalQuestionnaireService extends GoalQuestionnaireService {
         }
     }
     async dismiss(input) {
+        const candidate = await this.deps.store.get(input.requestId);
+        // v2 skip/close never marks the row dismissed; it only ends a sync wait.
+        if (candidate && isV2Questionnaire(candidate))
+            return this.v2Lifecycle.dismiss(input);
         const record = await this.requireDismissibleRecord(input.requestId, input.agentName);
         // Retract before the CAS: a queued degraded reply that the dispatcher
         // already claimed cannot be recalled, and reporting a successful dismiss
@@ -197,7 +221,16 @@ export class LocalQuestionnaireService extends GoalQuestionnaireService {
         }
     }
     async getPending(input) {
-        return this.requestLifecycle.getPending(input);
+        const record = await this.requestLifecycle.getPending(input);
+        return record ? projectQuestionnaireRecord(this.deps, record) : null;
+    }
+    /** getPending `includeUnanswered`: every unanswered v2 questionnaire, newest first. */
+    async listUnansweredV2(input) {
+        return (await this.v2Lifecycle.listUnanswered(input)).map((record) => projectQuestionnaireRecord(this.deps, record));
+    }
+    /** v2 Turn system hook: the answer reached the model (admission, consumption or teardown). */
+    async markAnswerAdmitted(input) {
+        return this.v2Lifecycle.markAnswerAdmitted(input);
     }
     async snapshotUnresolvedForRewind(sessionId) {
         const records = await this.deps.store.findUnresolvedForRewind(sessionId);
@@ -216,80 +249,31 @@ export class LocalQuestionnaireService extends GoalQuestionnaireService {
         }));
     }
     async get(input) {
-        return this.requestLifecycle.get(input);
+        const record = await this.requestLifecycle.get(input);
+        return record ? projectQuestionnaireRecord(this.deps, record) : null;
     }
     async getLatestPlanReview(input) {
         return this.requestLifecycle.getLatestPlanReview(input);
     }
+    /** Recover unowned requests; the work owner recovers its own (see `ownedOperations`). */
     async recoverOnStartup(options = {}) {
-        const goalStats = await super.recoverOnStartup(options);
-        const genericStats = await recoverQuestionnairesOnStartup({
+        return recoverQuestionnairesOnStartup({
             deps: this.deps,
             injectReply: (record, reply) => this.injectReply(record, reply),
+            recoverV2Answer: (record) => this.v2Lifecycle.recoverAnswer(record),
             wakeQueueAfterDuplicateResume: (record) => this.wakeQueueAfterDuplicateResume(record),
-            ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
+            ...options,
         });
-        return {
-            expired: genericStats.expired,
-            reinjected: goalStats.reinjected + genericStats.reinjected,
-            reemitted: genericStats.reemitted,
-        };
+    }
+    /** Expire stale unowned pending requests only; `recoverOnStartup` repeats it idempotently. */
+    async expireOnStartup(options = {}) {
+        return expireStaleQuestionnairesOnStartup({ deps: this.deps, ...options });
     }
     async reconcileOwnedActions(dispatch) {
         return this.ownedActionLifecycle.reconcile(dispatch);
     }
-    async injectReply(record, reply, continuationIdentityOrAutomatic) {
-        const message = {
-            content: serializeQuestionnaireResponseMessage(record.request, reply, this.deps.resolveLocale?.()),
-            attachments: [],
-            ...(record.request.mode === 'questionnaire' && record.request.purpose !== 'goal'
-                ? {
-                    origin: {
-                        kind: 'questionnaire-response',
-                        requestId: record.requestId,
-                        mode: 'questionnaire',
-                        purpose: 'ordinary',
-                    },
-                }
-                : {}),
-            ...(record.originChannelContext ? { channelContext: record.originChannelContext } : {}),
-        };
-        const conversation = this.deps.conversation;
-        if (!conversation) {
-            throw new LocalQuestionnaireError(503, 'CONVERSATION_UNAVAILABLE', 'Runtime Conversation is unavailable for questionnaire reply');
-        }
-        const resumeUserInput = conversation.ingress.resumeUserInput?.bind(conversation.ingress);
-        if (!resumeUserInput) {
-            await conversation.ingress.submit({
-                sessionId: record.sessionId,
-                source: 'questionnaire',
-                allowQueue: true,
-                clientRequestId: `questionnaire-reply:${record.requestId}`,
-                dedupeKey: `questionnaire-reply:${record.requestId}`,
-                message,
-            });
-            return { completed: true, admissionMode: 'started' };
-        }
-        const continuationIdentity = typeof continuationIdentityOrAutomatic === 'string'
-            ? continuationIdentityOrAutomatic
-            : continuationIdentityOrAutomatic
-                ? `questionnaire-reply:${record.requestId}`
-                : undefined;
-        try {
-            const admitted = await resumeUserInput({
-                sessionId: record.sessionId,
-                source: 'questionnaire',
-                requestId: record.requestId,
-                message,
-                ...(continuationIdentity ? { requestedTurnId: continuationIdentity } : {}),
-            });
-            return { completed: true, admissionMode: admitted.mode };
-        }
-        catch (err) {
-            if (!canQueueReplyBehindActiveTurn(record, err))
-                throw err;
-            return queueReplyBehindActiveTurn(conversation, record, message);
-        }
+    injectReply(record, reply, continuationIdentityOrAutomatic) {
+        return injectOrdinaryQuestionnaireReply(this.deps, record, reply, continuationIdentityOrAutomatic);
     }
     async wakeQueueAfterDuplicateResume(record) {
         try {

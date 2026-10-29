@@ -293,6 +293,34 @@ export function recordElectronStartupRuntimeReady() {
         // Clock and telemetry failures must not interrupt the Runtime ready callback.
     }
 }
+let firstContentVisibleSeen = false;
+const firstContentVisibleListeners = new Set();
+function notifyFirstContentVisible() {
+    if (firstContentVisibleSeen)
+        return;
+    firstContentVisibleSeen = true;
+    for (const listener of firstContentVisibleListeners) {
+        try {
+            listener();
+        }
+        catch {
+            // 监听方失败不影响启动埋点
+        }
+    }
+    firstContentVisibleListeners.clear();
+}
+/**
+ * 任一渲染进程首次上报 first_content_visible 时回调一次；已上报过则立即回调。
+ * 用于确认当前渲染资源可以正常出首屏（热更新健康确认）。
+ */
+export function onElectronFirstContentVisible(listener) {
+    if (firstContentVisibleSeen) {
+        listener();
+        return () => undefined;
+    }
+    firstContentVisibleListeners.add(listener);
+    return () => firstContentVisibleListeners.delete(listener);
+}
 export function setupElectronStartupPerformanceIPC(input) {
     enqueueStartupSummary = input.enqueue;
     input.ipcMain.on(input.channel, (event, payload) => {
@@ -301,6 +329,8 @@ export function setupElectronStartupPerformanceIPC(input) {
         const senderId = event.sender?.id;
         if (!Number.isInteger(senderId) || !isFiniteTimestamp(payload.timestampEpochMs))
             return;
+        if (payload.milestone === 'first_content_visible')
+            notifyFirstContentVisible();
         const surface = isStartupSurface(payload.surface) ? payload.surface : undefined;
         startupTracker.recordRendererMilestone(payload.milestone, payload.timestampEpochMs, senderId, surface);
     });

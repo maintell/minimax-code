@@ -3,6 +3,7 @@ import { deleteLegacyDaemonSessionMessages } from '../../infra/legacy-db/cleanup
 import { createLegacyOpencodeReadonlySource } from '../../infra/legacy-db/readonly-source.js';
 import { createSessionSystemAgentProjection, } from './agent-projection.js';
 import { SessionFilesService } from './files/service.js';
+import { createSideChatDataCapability } from './sessions/sidechat-data-capability.js';
 import { createSessionForkDataCapability } from './fork/index.js';
 import { createSessionAssetRepository } from './files/repo/assets.js';
 import { createHistoryPersistenceRepository, createLegacyHistorySourceReader, LegacyOpencodeImporter, } from './legacy-migration/index.js';
@@ -42,8 +43,10 @@ import { SessionUsageService } from './usage/service.js';
 import { createSessionUsageCommitSignal } from './usage/commit-signal.js';
 import { SessionLlmCallReportStore, SessionReportService } from '@mavis/session-report';
 import { createSessionStorageRetention } from './storage-retention.js';
+import { formatRuntimeModelIdentity } from '../model-system/index.js';
 import { repairRootProjectHistory, } from './_migration-root-project-history-repair.js';
 import { repairLegacyDefaultProjectHistory, } from './projects/legacy-default-project-history-repair.js';
+import { applyArchivedProjectSidebarBaseline, } from './projects/archived-project-sidebar-baseline.js';
 /** One production graph over the shared AppDb; repositories never own the connection. */
 export function initializeSessionSystem(options) {
     const nowMs = options.nowMs ?? Date.now;
@@ -73,7 +76,13 @@ export function initializeSessionSystem(options) {
         ...queueRuntimeOwnerOptions(options.runtimeOwnerIdentity),
     });
     const queueFacts = new QueueCommittedFactHub(options.queueFacts);
-    const stream = new SessionStreamService({ messages, nowMs });
+    const sideChats = createSideChatDataCapability({
+        db: options.db,
+        queue: queueRepository,
+        messages,
+        deletion: deletionGate.turnAdmission,
+        resolveModel: options.resolveQueueModel,
+    });
     const queryCollapseState = createQueryCollapseState({ db: options.db, nowMs });
     const { canonicalHistory, historyMutation, historyPersistence, llmCalls, reporting } = createSessionHistoryCapabilities(options, sessions, historyLocations, nowMs);
     const { legacy, onLegacyCleanupError } = createLegacySessionCapabilities({
@@ -84,10 +93,9 @@ export function initializeSessionSystem(options) {
         canonicalHistory,
         nowMs,
     });
-    const storageRetention = createSessionStorageRetention({
-        ...options.storageRetention,
-        nowMs,
-    });
+    const query = new MessageQueryService({ messages, sessions, sideChats, readiness: legacy });
+    const stream = new SessionStreamService({ messages: query, nowMs });
+    const storageRetention = createSessionStorageRetention({ ...options.storageRetention, nowMs });
     const records = createSessionRecordService({
         options,
         sessions,
@@ -120,7 +128,6 @@ export function initializeSessionSystem(options) {
         ...options.title,
     });
     const sessionDomain = initializeSessionDomain({ repository: sessions, discovery: legacy });
-    const recovery = new SessionRecoveryService({ sessions });
     const projectDomain = initializeProjectDomain({ repository: projects, sessions, nowMs });
     const queue = new CommittedQueueService({
         queue: new QueueService({
@@ -142,7 +149,7 @@ export function initializeSessionSystem(options) {
         onLegacyCleanupError,
         canonicalHistory,
         stream,
-        reports: createSessionReportsOwner(historyLocations, sessions),
+        ...createSessionDirectoryOwners(historyLocations, sessions),
     });
     const { agentProjection, conversationActions } = createAgentCapabilities({
         options,
@@ -156,7 +163,6 @@ export function initializeSessionSystem(options) {
         nowMs,
     });
     const usageProjector = createUsageProjector({ sessions, usage, usageCommits, nowMs });
-    const ready = createSessionSystemReadyHandler(options, queryCollapseState);
     let closePromise;
     return {
         repositories: {
@@ -176,7 +182,7 @@ export function initializeSessionSystem(options) {
             records,
             root: roots,
             activation,
-            recovery,
+            recovery: new SessionRecoveryService({ sessions }),
             state: createSessionStateWriter(sessions),
             execution: createSessionExecutionSource(sessions, legacy),
             interactionMode,
@@ -185,7 +191,7 @@ export function initializeSessionSystem(options) {
         },
         messages: {
             repository: messages,
-            query: new MessageQueryService({ messages, sessions, readiness: legacy }),
+            query,
             sources: createSessionSourceHistory(options, messages, sessions, legacy),
             conversationActions,
             userMessages: new UserMessageCommitService({ messages, nowMs }),
@@ -193,7 +199,11 @@ export function initializeSessionSystem(options) {
             rewind,
         },
         fork,
-        projects: { ...projectDomain, sidebar: new SidebarQueryService(options.db, nowMs, (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace')) },
+        sideChats,
+        projects: {
+            ...projectDomain,
+            sidebar: new SidebarQueryService(options.db, nowMs, (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace')),
+        },
         files,
         queue: {
             repository: queueRepository,
@@ -225,7 +235,7 @@ export function initializeSessionSystem(options) {
         llmCalls,
         agentProjection,
         queryCollapse: { state: queryCollapseState },
-        ready,
+        ready: createSessionSystemReadyHandler(options, queryCollapseState),
         runStorageMaintenance: () => storageRetention.run(),
         close: () => {
             closePromise ??= closeSessionSystem(titles, stream);
@@ -236,6 +246,7 @@ export function initializeSessionSystem(options) {
 function createSessionSystemReadyHandler(options, queryCollapseState) {
     let rootProjectHistoryRepair;
     let legacyDefaultProjectHistoryRepair;
+    let archivedProjectSidebarBaselineChecked = false;
     return async () => {
         rootProjectHistoryRepair ??= repairRootProjectHistory({
             db: options.db,
@@ -256,6 +267,18 @@ function createSessionSystemReadyHandler(options, queryCollapseState) {
             diagnostics: options.legacyDefaultProjectHistoryRepairDiagnostics,
         });
         await legacyDefaultProjectHistoryRepair;
+        // After both repairs: they move historical sessions between projects, and
+        // the baseline must judge each project by its final session set.
+        if (!archivedProjectSidebarBaselineChecked && options.pinnedProjectIds) {
+            archivedProjectSidebarBaselineChecked = true;
+            await applyArchivedProjectSidebarBaseline({
+                db: options.db,
+                nowMs: options.nowMs ?? Date.now,
+                agentInternalWorkspaceDir: (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace'),
+                pinnedProjectIds: options.pinnedProjectIds,
+                diagnostics: options.archivedProjectSidebarBaselineDiagnostics,
+            });
+        }
         await queryCollapseState.recoverUnfinished();
     };
 }
@@ -307,13 +330,21 @@ function createSessionMetadataCapabilities(options, nowMs) {
     });
     return { sessions, historyLocations, interactionMode, planDocuments };
 }
-function createSessionReportsOwner(historyLocations, sessions) {
+function createSessionDirectoryOwners(historyLocations, sessions) {
+    const locate = async (sessionId) => {
+        const session = await sessions.get(sessionId);
+        if (!session)
+            throw new Error(`Session not found: ${sessionId}`);
+        return historyLocations.ensure(session);
+    };
     return {
-        ensureDirectory: async (sessionId) => {
-            const session = await sessions.get(sessionId);
-            if (!session)
-                throw new Error(`Session not found: ${sessionId}`);
-            return (await historyLocations.ensure(session)).reports;
+        reports: {
+            ensureDirectory: async (sessionId) => (await locate(sessionId)).reports,
+            inspectDirectory: async (sessionId) => (await historyLocations.inspectSession(sessionId))?.paths.reports,
+        },
+        snapshots: {
+            resolveDirectory: async (sessionId) => (await locate(sessionId)).snapshots,
+            inspectDirectory: async (sessionId) => (await historyLocations.inspectSession(sessionId))?.paths.snapshots,
         },
     };
 }
@@ -364,17 +395,18 @@ function createSessionHistoryCapabilities(options, sessions, locations, nowMs) {
     const ioLane = createSessionHistoryIoLane();
     const activity = createSessionHistoryActivity();
     const historyPersistence = createHistoryPersistenceRepository({ db: options.db });
+    const legacyHistory = {
+        sources: createLegacyHistorySourceReader({
+            db: options.db,
+            readLedgerSnapshot: (sessionId) => releasedHistory.readLedgerSnapshot(sessionId),
+        }),
+        checkpoints: historyPersistence,
+    };
     const canonicalHistory = createSessionSystemCanonicalHistoryProvider({
         dataDir: options.dataDir,
         sessions,
         locations,
-        legacyHistory: {
-            sources: createLegacyHistorySourceReader({
-                db: options.db,
-                readLedgerSnapshot: (sessionId) => releasedHistory.readLedgerSnapshot(sessionId),
-            }),
-            checkpoints: historyPersistence,
-        },
+        legacyHistory,
         ioLane,
         activity,
         nowMs,
@@ -383,6 +415,7 @@ function createSessionHistoryCapabilities(options, sessions, locations, nowMs) {
         dataDir: options.dataDir,
         sessions,
         locations,
+        legacyHistory,
         ioLane,
         activity,
         onRewindCommitted: (input) => llmCalls.pruneAfterRewind({ sessionId: input.sessionId }),
@@ -482,7 +515,7 @@ function createUsageProjector(input) {
                 store: input.usage,
                 session,
                 turnId: record.turnId,
-                model: modelIdentity(record.model),
+                model: formatRuntimeModelIdentity(record.model) ?? null,
                 nowMs: input.nowMs,
                 messages: record.messages,
             });
@@ -555,17 +588,8 @@ async function closeSessionSystem(titles, stream) {
 }
 function createTitleCommitter(records, facts) {
     return async (sessionId, title, expectedTitle) => {
-        const updated = await records.mutateSession(sessionId, { title }, undefined, expectedTitle);
+        const updated = await records.mutateSession(sessionId, { title, titleSource: 'auto' }, undefined, { title: expectedTitle, source: 'default' });
         facts.handle({ kind: 'title-updated', session: updated, title });
     };
-}
-function modelIdentity(model) {
-    if (!model || typeof model !== 'object')
-        return null;
-    const provider = Reflect.get(model, 'provider');
-    const id = Reflect.get(model, 'id');
-    if (typeof provider === 'string' && typeof id === 'string')
-        return `${provider}/${id}`;
-    return typeof id === 'string' ? id : null;
 }
 //# sourceMappingURL=owner.js.map

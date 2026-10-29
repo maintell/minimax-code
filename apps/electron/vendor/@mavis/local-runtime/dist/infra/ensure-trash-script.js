@@ -23,7 +23,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { TRASH_SCRIPT_CONTENT } from './trash-script.js';
-import { TRASH_CMD_LAUNCHER_CONTENT, TRASH_SCRIPT_WIN_CONTENT } from './trash-script-win.js';
+import { TRASH_BASH_LAUNCHER_CONTENT, TRASH_CMD_LAUNCHER_CONTENT, TRASH_SCRIPT_WIN_CONTENT, } from './trash-script-win.js';
 export function ensureTrashScript(dataDir, platform = process.platform) {
     const binDir = path.join(dataDir, 'bin');
     mkdirSync(binDir, { recursive: true });
@@ -31,6 +31,7 @@ export function ensureTrashScript(dataDir, platform = process.platform) {
     if (isWin) {
         seedFileIfChanged(path.join(binDir, 'mavis-trash.js'), TRASH_SCRIPT_WIN_CONTENT);
         seedFileIfChanged(path.join(binDir, 'mavis-trash.cmd'), TRASH_CMD_LAUNCHER_CONTENT);
+        seedFileIfChanged(path.join(binDir, 'mavis-trash'), TRASH_BASH_LAUNCHER_CONTENT);
     }
     else {
         seedFileIfChanged(path.join(binDir, 'mavis-trash'), TRASH_SCRIPT_CONTENT, 0o755);
@@ -45,6 +46,15 @@ export function clearTrashRuntimeCache(dataDir, platform = process.platform) {
         trashRuntimeCache.clear();
     else
         trashRuntimeCache.delete(`${platform}:${dataDir}`);
+}
+/** Check exact bundled bytes on every Git Bash deletion; never trust PATH or mtime. */
+export function isGitBashTrashLauncherTrusted(dataDir) {
+    try {
+        return (readFileSync(path.join(dataDir, 'bin', 'mavis-trash'), 'utf8') === TRASH_BASH_LAUNCHER_CONTENT);
+    }
+    catch {
+        return false;
+    }
 }
 function sha256(value) {
     return createHash('sha256').update(value).digest('hex');

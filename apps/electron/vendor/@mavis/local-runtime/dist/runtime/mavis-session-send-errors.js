@@ -4,6 +4,8 @@ export class SessionSendRuntimeError extends Error {
     code;
     sessionId;
     turnId;
+    /** The admission reason behind a mapped rejection, when one exists. */
+    admissionReason;
     constructor(message, details) {
         super(message);
         this.name = 'SessionSendRuntimeError';
@@ -12,6 +14,8 @@ export class SessionSendRuntimeError extends Error {
         this.sessionId = details.sessionId;
         if (details.turnId)
             this.turnId = details.turnId;
+        if (details.reason)
+            this.admissionReason = details.reason;
     }
 }
 /**

@@ -30,6 +30,7 @@ import { MemoryCaptureService } from '../src/service/memory-system/orchestration
 import { MemoryConsolidationService } from '../src/service/memory-system/orchestration/consolidation-service.js';
 import { MemoryLegacyMigrationService } from '../src/service/memory-system/orchestration/legacy-migration-service.js';
 import { MemoryGovernanceService } from '../src/service/memory-system/orchestration/governance-service.js';
+import { MemoryOnboardingStore } from '../src/service/memory-system/onboarding.js';
 import type { SessionRecord } from '../src/service/session-system/index.js';
 
 const SOURCE_TEXT =
@@ -165,11 +166,13 @@ export async function createMemoryRealHarness(caseName: string) {
       'consolidation',
       new MemoryConsolidationService({ ...shared, model }),
     );
+    const onboarding = new MemoryOnboardingStore(client.db, repository, nowMs);
     const migration = traceMemoryPort(
       diagnostics,
       'migration',
       new MemoryLegacyMigrationService({
         ...shared,
+        onboarding,
         modelGateway: model,
         disableLegacyRecall: async (agentName) => {
           await writeFile(
@@ -208,6 +211,7 @@ export async function createMemoryRealHarness(caseName: string) {
       capture,
       consolidation,
       migration,
+      onboarding,
       governance,
       diagnostics,
       candidate: {

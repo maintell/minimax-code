@@ -14,11 +14,16 @@ export function initializeMiniAppSupervisor(options) {
         reservePort: (input) => ports.reserve(input),
         hostConnectorSessionFactory: createMiniAppHostConnectorSessionFactory({
             gateway: options.connectorGateway,
+            ...(options.agentGateway ? { agentGateway: options.agentGateway } : {}),
+            ...(options.permissionSwitches ? { permissionSwitches: options.permissionSwitches } : {}),
+            ...(options.toolGateway ? { toolGateway: options.toolGateway } : {}),
+            ...(options.logger ? { logger: options.logger } : {}),
         }),
     });
     const supervisor = new DefaultMiniAppSupervisor({
         stateStore: new DrizzleMiniAppStateStore(options.db),
         nodeRuntime,
+        ...(options.logger ? { logger: options.logger } : {}),
         verifyCandidate: options.verifyCandidate,
         ...(options.nowMs ? { nowMs: options.nowMs } : {}),
         ...(options.closeTimeoutMs ? { closeTimeoutMs: options.closeTimeoutMs } : {}),

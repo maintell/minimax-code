@@ -131,7 +131,7 @@ export function createControlledToolHooks(options) {
                 }
                 finally {
                     delegatedToolCalls.delete(authoritativeToolCallId);
-                    input.pluginHostApprovalTargets?.delete(authoritativeToolCallId);
+                    input.pluginToolApprovalTargets?.delete(authoritativeToolCallId);
                     if (!deliveryClosed)
                         input.control.closeAndClaimToolResultTail(authoritativeToolCallId);
                 }
@@ -140,17 +140,17 @@ export function createControlledToolHooks(options) {
     };
 }
 function prepareDelegatedToolCall(input, calls, context) {
-    if (context.toolCall.name !== 'mcp_invoke' || !hasHostToolReference(context.args)) {
+    if (context.toolCall.name !== 'mcp_invoke') {
         const binding = directBrowserHostBinding(input.assembly.tools, context.toolCall.name);
         if (binding)
-            input.pluginHostApprovalTargets?.set(context.toolCall.id, binding);
+            input.pluginToolApprovalTargets?.set(context.toolCall.id, binding);
         return { context };
     }
     const gateway = input.assembly.tools.find((tool) => tool.def.name === 'mcp_invoke');
     if (!gateway) {
         return {
             context,
-            decision: { block: true, reason: 'Host-bound gateway is unavailable for this turn.' },
+            decision: { block: true, reason: 'On-demand tool gateway is unavailable for this turn.' },
         };
     }
     const resolution = resolveDelegatedToolTarget(gateway, context.args);
@@ -159,13 +159,11 @@ function prepareDelegatedToolCall(input, calls, context) {
             context,
             decision: {
                 block: true,
-                reason: resolution?.message ?? 'Host-bound gateway could not resolve the requested tool_ref.',
+                reason: resolution?.message ?? 'On-demand tool gateway could not resolve the requested target.',
             },
         };
     }
-    if (resolution.selectorKind !== 'tool_ref')
-        return { context };
-    if (!resolution.pluginName) {
+    if (resolution.selectorKind === 'tool_ref' && !resolution.pluginName) {
         return {
             context,
             decision: { block: true, reason: 'Host-bound tool_ref has no trusted Plugin owner.' },
@@ -177,15 +175,12 @@ function prepareDelegatedToolCall(input, calls, context) {
         target: resolution,
     };
     calls.set(context.toolCall.id, delegated);
-    input.pluginHostApprovalTargets?.set(context.toolCall.id, {
+    input.pluginToolApprovalTargets?.set(context.toolCall.id, {
         tool: resolution.target,
         inputSchema: resolution.inputSchema,
-        pluginName: resolution.pluginName,
+        ...(resolution.selectorKind === 'tool_ref' ? { pluginName: resolution.pluginName } : {}),
     });
     return { context: effectiveBeforeToolContext(calls, context) };
-}
-function hasHostToolReference(value) {
-    return isRecord(value) && typeof value.tool_ref === 'string' && value.tool_ref.length > 0;
 }
 function effectiveBeforeToolContext(calls, context) {
     const delegated = calls.get(context.toolCall.id);
@@ -193,12 +188,7 @@ function effectiveBeforeToolContext(calls, context) {
         return context;
     return {
         ...context,
-        toolCall: {
-            ...context.toolCall,
-            name: delegated.target.target.def.name,
-            arguments: delegated.target.arguments,
-            ...(delegated.target.target.source ? { source: delegated.target.target.source } : {}),
-        },
+        toolCall: effectiveDelegatedToolIdentity(delegated, context.toolCall),
         args: delegated.target.arguments,
     };
 }
@@ -207,12 +197,7 @@ function effectiveAfterToolContext(delegated, context) {
         return context;
     return {
         ...context,
-        toolCall: {
-            ...context.toolCall,
-            name: delegated.target.target.def.name,
-            arguments: delegated.target.arguments,
-            ...(delegated.target.target.source ? { source: delegated.target.target.source } : {}),
-        },
+        toolCall: effectiveDelegatedToolIdentity(delegated, context.toolCall),
         args: delegated.target.arguments,
     };
 }
@@ -222,13 +207,16 @@ function effectiveToolExecutionStartContext(calls, context) {
         return context;
     return {
         ...context,
-        toolCall: {
-            ...context.toolCall,
-            name: delegated.target.target.def.name,
-            arguments: delegated.target.arguments,
-            ...(delegated.target.target.source ? { source: delegated.target.target.source } : {}),
-        },
+        toolCall: effectiveDelegatedToolIdentity(delegated, context.toolCall),
         args: delegated.target.arguments,
+    };
+}
+function effectiveDelegatedToolIdentity(delegated, toolCall) {
+    return {
+        ...toolCall,
+        name: delegated.target.target.def.name,
+        arguments: delegated.target.arguments,
+        source: delegated.target.target.source,
     };
 }
 function authorizeDelegatedToolCall(delegated) {
@@ -464,7 +452,7 @@ function buildPluginPostToolDecision(context, priorContext, pluginResult) {
     };
 }
 function pluginToolProvenance(input, toolName, delegated) {
-    const hostOwner = delegated?.target.pluginName ??
+    const hostOwner = (delegated?.target.selectorKind === 'tool_ref' ? delegated.target.pluginName : undefined) ??
         directBrowserHostBinding(input.assembly.tools, toolName)?.pluginName;
     if (hostOwner) {
         return {
@@ -485,9 +473,6 @@ function recordValue(value) {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value
         : {};
-}
-function isRecord(value) {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 function replaceRecord(target, value) {
     if (!target || typeof target !== 'object' || Array.isArray(target))

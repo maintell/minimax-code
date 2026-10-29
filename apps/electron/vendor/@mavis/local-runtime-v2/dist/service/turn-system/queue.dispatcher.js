@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createUserMessageId } from '../session-system/index.js';
-import { parseBackgroundTaskOriginMetadata } from './agent-host/contracts.js';
+import { parseBackgroundTaskDeliveryOrigin } from './agent-host/contracts.js';
 import { agentHostModelFromQueue } from './agent-host/index.js';
 export function createQueueDispatcher(options) {
     const states = new Map();
@@ -515,7 +515,7 @@ function toAgentInput(claim, item) {
     const channelContext = claim.message.channelContext ?? item.channelContext;
     const model = toModel(item.model);
     const origin = isTrustedBackgroundQueueClaim(claim)
-        ? parseBackgroundTaskOriginMetadata(claim.message.origin)
+        ? parseBackgroundTaskDeliveryOrigin(claim.message.origin)
         : undefined;
     return {
         text: item.immediateSendBatch?.members.map((member) => member.message.content).join('\n\n') ??
@@ -525,6 +525,7 @@ function toAgentInput(claim, item) {
             : claim.message.attachments).map(toAttachment),
         ...computerUseInput(claim, item),
         ...(origin ? { origin } : {}),
+        ...(claim.message.computerUse ? { computerUse: claim.message.computerUse } : {}),
         ...(channelContext ? { channelContext } : {}),
         ...(claim.message.quotedMessage ? { quotedMessage: claim.message.quotedMessage } : {}),
         ...(model ? { model } : {}),

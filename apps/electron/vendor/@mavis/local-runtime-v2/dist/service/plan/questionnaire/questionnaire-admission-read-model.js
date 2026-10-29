@@ -16,7 +16,10 @@ export function createPlanQuestionnaireAdmissionReadModel() {
     ELSE NULL
   END`;
     return {
-        hasAnyPendingInTransaction: (db, input) => hasRow(db, and(eq(questionnaireRequests.sessionId, input.sessionId), eq(questionnaireRequests.status, 'pending'), gte(questionnaireRequests.createdAt, input.createdAtCutoff))),
+        // Legacy rows only (response_mode IS NULL). An unanswered AskUser v2
+        // question stays pending for up to 24h and can be answered any time, so it
+        // must not block Plan entry or a Plan card (both call through here).
+        hasAnyPendingInTransaction: (db, input) => hasRow(db, and(eq(questionnaireRequests.sessionId, input.sessionId), eq(questionnaireRequests.status, 'pending'), gte(questionnaireRequests.createdAt, input.createdAtCutoff), isNull(questionnaireRequests.responseMode))),
         hasIncompletePlanLifecycleInTransaction: (db, input) => hasRow(db, and(eq(questionnaireRequests.sessionId, input.sessionId), eq(safeMode, 'plan'), input.excludeRequestId
             ? ne(questionnaireRequests.requestId, input.excludeRequestId)
             : undefined, isNull(questionnaireRequests.injectedAt), or(and(eq(questionnaireRequests.status, 'pending'), gte(questionnaireRequests.createdAt, input.createdAtCutoff)), inArray(questionnaireRequests.status, ['answered', 'dismissed'])))),

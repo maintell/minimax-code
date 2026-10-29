@@ -1,4 +1,4 @@
-export { McpConnectionPool, } from './runtime/connection-pool.js';
+export { McpConnectionPool, McpToolCallNotDispatchedError, McpToolCallTimeoutError, } from './runtime/connection-pool.js';
 export { MCP_DEFAULTS, NOOP_MCP_RUNTIME_LOGGER, } from './runtime/types.js';
 export { createTransport } from './runtime/transport/factory.js';
 export { createHttpTransport } from './runtime/transport/http.js';

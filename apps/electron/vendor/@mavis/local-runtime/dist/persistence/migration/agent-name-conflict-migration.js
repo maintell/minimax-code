@@ -1,5 +1,4 @@
 import path from 'node:path';
-import lockfile from 'proper-lockfile';
 import { openAgentDb } from '../../agent/db.js';
 import { openLocalRuntimeDb } from '../db.js';
 import { applyDirectoryAndPrimaryRename, ensureBackup, rewritePrimaryAgentDatabaseReferences, } from './agent-name-conflict-migration-backup.js';
@@ -11,14 +10,6 @@ import { resolveV2DirectoryContract, resolveV2MigrationBackupDir } from '../layo
 import { createV2BuiltinAgentNameConflictRepair, } from './v2-builtin-agent-name-conflict-migration.js';
 const MANIFEST_FILE = 'agent-name-conflicts.json';
 const EMPTY_REFERENCE_COUNTS = EMPTY_AGENT_NAME_CONFLICT_REFERENCE_COUNTS;
-// Synchronous backup/rewrite needs a long-lived dataDir lease.
-export const AGENT_NAME_CONFLICT_MIGRATION_LOCK_STALE_MS = 30 * 60_000;
-const AGENT_NAME_CONFLICT_MIGRATION_LOCK_RETRIES = {
-    retries: 120,
-    factor: 1.2,
-    minTimeout: 25,
-    maxTimeout: 500,
-};
 function rethrowMigrationFailure(failureStep, error, migrationId, secondaryError) {
     if (secondaryError === undefined &&
         typeof error === 'object' &&
@@ -41,77 +32,32 @@ function rethrowMigrationFailure(failureStep, error, migrationId, secondaryError
     throw migrationError;
 }
 /**
- * @deprecated Legacy explicit source-side repair adapter. V2 startup owns the
- * complete target-empty cutover; this remains an explicit repair/test adapter.
+ * Hands the legacy collision scan/apply and the V2 builtin-name repair to a
+ * V2 Agent cutover callback, and revokes them once the callback settles.
  *
- * Rename only custom rows that occupy a canonical built-in AgentName.
- *
- * The manifest fixes the chosen suffix so a crash cannot select another name
- * on retry.
+ * It takes no lock of its own: the runtime runs the cutover while it holds the
+ * dataDir startup migration lock, whose recorded holder pid lets the next
+ * startup reclaim it at once when the holder dies mid-cutover. A separate lock
+ * here is left behind whenever app.exit or a forced kill ends that startup,
+ * and then blocks every later startup until it expires.
  */
-export function ensureAgentNameConflictMigration(dataDir, nowMs = () => Date.now()) {
-    // Do not create a lock, backup, manifest, or other migration artifact when
-    // there is no actual conflict to repair. If work is required, inspect again
-    // after acquiring the lock because another process may have completed the
-    // migration while this caller was waiting to enter the critical section.
-    try {
-        const preflight = getAgentNameConflictMigrationState(dataDir);
-        const preflightResult = getPreflightMigrationResult(dataDir, preflight);
-        if (preflightResult)
-            return preflightResult;
-    }
-    catch (error) {
-        rethrowMigrationFailure('manifest_prepare', error);
-    }
-    let release;
-    try {
-        release = lockfile.lockSync(dataDir, { stale: AGENT_NAME_CONFLICT_MIGRATION_LOCK_STALE_MS });
-    }
-    catch (error) {
-        rethrowMigrationFailure('lock', error);
-    }
-    try {
-        return ensureAgentNameConflictMigrationLocked(dataDir, nowMs);
-    }
-    catch (error) {
-        return rethrowMigrationFailure('manifest_prepare', error);
-    }
-    finally {
-        release?.();
-    }
-}
-/**
- * Serialize a V2 Agent cutover with the same dataDir lock used by the legacy
- * collision migration. The async lock API waits for another host instead of
- * failing immediately, and keeps its heartbeat alive while builtin rows seed.
- */
-export async function withAgentNameConflictMigrationLock(dataDir, operation) {
-    let release;
-    try {
-        release = await lockfile.lock(dataDir, {
-            stale: AGENT_NAME_CONFLICT_MIGRATION_LOCK_STALE_MS,
-            retries: AGENT_NAME_CONFLICT_MIGRATION_LOCK_RETRIES,
-        });
-    }
-    catch (error) {
-        rethrowMigrationFailure('lock', error);
-    }
+export async function withAgentNameConflictMigrationScope(dataDir, operation) {
     let active = true;
+    const requireActive = () => {
+        if (!active)
+            throw new Error('Agent storage lock scope is no longer active');
+    };
+    const applyCollision = (nowMs = () => Date.now()) => {
+        requireActive();
+        try {
+            return ensureAgentNameConflictMigrationLocked(dataDir, nowMs);
+        }
+        catch (error) {
+            return rethrowMigrationFailure('manifest_prepare', error);
+        }
+    };
+    const repairBuiltinAgentNameConflicts = createV2BuiltinAgentNameConflictRepair(dataDir, requireActive);
     try {
-        const requireActive = () => {
-            if (!active)
-                throw new Error('Agent storage lock scope is no longer active');
-        };
-        const applyCollision = (nowMs = () => Date.now()) => {
-            requireActive();
-            try {
-                return ensureAgentNameConflictMigrationLocked(dataDir, nowMs);
-            }
-            catch (error) {
-                return rethrowMigrationFailure('manifest_prepare', error);
-            }
-        };
-        const repairBuiltinAgentNameConflicts = createV2BuiltinAgentNameConflictRepair(dataDir, requireActive);
         return await operation({
             inspectCollision: () => {
                 requireActive();
@@ -129,7 +75,6 @@ export async function withAgentNameConflictMigrationLock(dataDir, operation) {
     }
     finally {
         active = false;
-        await release?.();
     }
 }
 function ensureAgentNameConflictMigrationLocked(dataDir, nowMs) {
@@ -164,13 +109,6 @@ function getAgentNameConflictMigrationState(dataDir) {
         }
     }
     return { manifestPath, previous };
-}
-function getPreflightMigrationResult(dataDir, state) {
-    const completedResult = getCompletedMigrationResult(state);
-    if (completedResult)
-        return completedResult;
-    const inspection = inspectAgentNameConflictMigration(dataDir, state);
-    return inspection.status === 'skipped' ? migrationResultFromInspection(inspection) : undefined;
 }
 function inspectAgentNameConflictMigration(dataDir, state) {
     if (state.previous?.status === 'completed') {

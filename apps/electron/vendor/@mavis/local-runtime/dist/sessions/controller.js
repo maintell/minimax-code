@@ -1,7 +1,6 @@
 import { LocalRuntimeHost, } from '../runtime/host.js';
 import { DEFAULT_LOCAL_APP_MODE, resolveLocalAppMode, } from '../runtime/app-mode.js';
 import { LocalSessionRouter } from './router.js';
-import { LocalActiveTurnTimingRegistry, } from '../turns/active-turn-timing.js';
 import { applyLocalSessionListOptions } from './record-list-options.js';
 export { applyLocalSessionListOptions } from './record-list-options.js';
 /**
@@ -38,13 +37,11 @@ export class LocalSessionController {
     store;
     router;
     nowMs;
-    turnTimings;
     evalReporterFactory;
     assertTurnStartAllowed;
     assertSessionMutationAllowed;
     constructor(options = {}) {
         this.nowMs = options.nowMs ?? (() => Date.now());
-        this.turnTimings = options.turnTimings ?? new LocalActiveTurnTimingRegistry(this.nowMs);
         this.evalReporterFactory = options.evalReporterFactory;
         this.assertTurnStartAllowed = options.assertTurnStartAllowed ?? (() => undefined);
         this.assertSessionMutationAllowed = options.assertSessionMutationAllowed ?? (() => undefined);
@@ -172,27 +169,6 @@ export class LocalSessionController {
         await this.store.delete(sessionId);
         this.evalReporterFactory?.releaseReporter(sessionId);
     }
-    get activeTurnTimingReader() {
-        return this.turnTimings;
-    }
-    getActiveTurnTiming(sessionId) {
-        return this.turnTimings.getBySession(sessionId);
-    }
-    getTurnTiming(sessionId, turnId) {
-        return this.turnTimings.getByTurn(sessionId, turnId);
-    }
-    elapsedTurnSeconds(timing) {
-        return this.turnTimings.elapsedSeconds(timing);
-    }
-    beginTurnTiming(sessionId, turnId, source) {
-        this.turnTimings.begin(sessionId, turnId, source);
-    }
-    markTurnTimingSettling(sessionId, turnId) {
-        this.turnTimings.markSettling(sessionId, turnId);
-    }
-    finishTurnTiming(sessionId, turnId) {
-        this.turnTimings.finish(sessionId, turnId);
-    }
     async startTurn(input) {
         this.assertTurnStartAllowed();
         const session = await this.store.get(input.sessionId);
@@ -202,16 +178,7 @@ export class LocalSessionController {
         if (session.archived) {
             throw new LocalSessionResumeError(input.sessionId);
         }
-        this.turnTimings.begin(input.sessionId, input.turnId);
-        let output;
-        try {
-            output = await this.router.startTurn(session, input);
-        }
-        finally {
-            // Freeze immediately when the agent loop settles. Session projection and
-            // outer Goal accounting may still perform async work after this point.
-            this.turnTimings.markSettling(input.sessionId, input.turnId);
-        }
+        const output = await this.router.startTurn(session, input);
         const latest = await this.store.get(input.sessionId);
         if (latest) {
             await this.store.upsert({

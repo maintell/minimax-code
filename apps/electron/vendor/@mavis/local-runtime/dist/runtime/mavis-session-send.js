@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { ConversationTurnRejectedError, isRuntimeConversationShutdownError, isRuntimeConversationUnavailableError, } from '@mavis/conversation-contract';
 import { logger } from '../common/logger.js';
+import { peerSessionSendOrigin, resolveSessionSendOrigin } from './mavis-session-send-origin.js';
 import { awaitSessionSendTerminal, reclaimAdmittedSessionSend, } from './mavis-session-send-completion.js';
+import { attributeSessionSendRound } from './mavis-session-send-attribution.js';
 import { mapTurnRejection, sessionSendError, SessionSendRuntimeError, throwIfSessionSendAborted, } from './mavis-session-send-errors.js';
 /**
  * SessionSend admits one message into any reachable, unarchived local Session.
@@ -50,7 +52,9 @@ export async function sendToLocalSession(deps, req, signal) {
             });
         }
         throwIfSessionSendAborted(signal, req.sessionId, 'aborted-before-admission');
-        const admission = await admitSessionSend(deps, req, forceSteer, signal);
+        // An abort during this read is caught by the post-route check in admission.
+        const origin = await resolveSessionSendOrigin(deps, req);
+        const admission = await admitSessionSend(deps, req, target, forceSteer, origin, signal);
         logger.info({
             callerSessionId: req.callerSessionId,
             sessionId: req.sessionId,
@@ -195,8 +199,13 @@ function abortAdmittedSessionSend(deps, req, admission) {
  * produces in a target Session. `idempotencyKey` is new per call because two
  * SessionSend calls are two distinct messages; there is no replay to collapse.
  */
-async function admitSessionSend(deps, req, forceSteer, signal) {
+async function admitSessionSend(deps, req, target, forceSteer, origin, signal) {
     const decision = await resolveSessionSendRoute(deps, req, forceSteer);
+    const message = {
+        content: req.content,
+        attachments: [],
+        origin: origin ?? (await peerSessionSendOrigin(deps, req)),
+    };
     logger.info({
         callerSessionId: req.callerSessionId,
         sessionId: req.sessionId,
@@ -204,18 +213,40 @@ async function admitSessionSend(deps, req, forceSteer, signal) {
         route: decision.route,
         routeSource: decision.source,
         ...(decision.preference ? { composerSendBehavior: decision.preference } : {}),
+        ...(origin ? { origin: origin.kind } : {}),
     }, 'Session send resolved its ingress route');
     // The preference read is a DB round trip, so the caller can cancel between
     // the last check and the ingress call. Nothing has been delivered yet, which
     // makes this the last point where an abort costs nothing to honour.
     throwIfSessionSendAborted(signal, req.sessionId, 'aborted-after-route-resolution');
+    const attribution = await attributeSessionSendRound(deps, req, target);
+    let admission;
+    try {
+        admission = await deliverSessionSend(deps, req, decision, message, attribution?.requestedTurnId);
+    }
+    catch (error) {
+        attribution?.port.forgetRound(attribution.requestedTurnId);
+        throw error;
+    }
+    // Only a new round of its own carries the requested id; a message merged into
+    // a running round leaves that round's attribution to whoever started it.
+    if (attribution &&
+        (admission.mode === 'steered' ||
+            admission.mode === 'duplicate' ||
+            admission.turnId !== attribution.requestedTurnId)) {
+        attribution.port.forgetRound(attribution.requestedTurnId);
+    }
+    return admission;
+}
+async function deliverSessionSend(deps, req, decision, message, requestedTurnId) {
     if (decision.route === 'steer') {
         const steered = await deps.conversation.ingress.steer({
             sessionId: req.sessionId,
             source: 'communication',
             producerId: `session-send:${req.callerSessionId}`,
             idempotencyKey: `session-send:${randomUUID()}`,
-            message: { content: req.content, attachments: [] },
+            message,
+            ...(requestedTurnId ? { requestedTurnId } : {}),
         });
         return steered.mode === 'activated'
             ? {
@@ -232,14 +263,18 @@ async function admitSessionSend(deps, req, forceSteer, signal) {
         sessionId: req.sessionId,
         source: 'communication',
         allowQueue: true,
-        message: { content: req.content, attachments: [] },
+        message,
+        ...(requestedTurnId ? { requestedTurnId } : {}),
     });
+    // Queue admission answers `queued` even when it already started this item's
+    // own Turn on an idle target; `ahead: 0` alone can still be cap-blocked.
+    const started = accepted.mode === 'queued' && accepted.queue?.dispatched === true;
     return {
         route: 'submit',
         turnId: accepted.turnId,
-        mode: accepted.mode,
+        mode: started ? 'started' : accepted.mode,
         completion: accepted.completion,
-        ...(accepted.queue ? { queue: accepted.queue } : {}),
+        ...(accepted.queue && !started ? { queue: accepted.queue } : {}),
     };
 }
 /**

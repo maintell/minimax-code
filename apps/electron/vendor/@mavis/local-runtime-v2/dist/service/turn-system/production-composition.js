@@ -1,22 +1,25 @@
+import { mutableTitleContext } from './agent-host/preparation/config/title-context.js';
 import { createProductionRunawayGuardExtension } from './runaway-guard/extension.js';
 import { streamSimple } from '@earendil-works/pi-ai';
-import { sessionReportExtension, toolOutputBudgetExtension, } from '@mavis/agent-extension';
+import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExtension, toolOutputBudgetExtension, } from '@mavis/agent-extension';
 import { describeLocalBrowserToolInput } from '@mavis/agent-tools/desktop';
-import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from '@mavis/config';
-import { ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
+import { TOOL_RESULT_COMPACTION_DEFAULTS, parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
+import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
 import { isPeekSession } from '../session-system/sessions/repo/normalization.js';
 import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, LocalAgentHost, } from './agent-host/index.js';
 import { validateCanonicalHistoryMessages } from './agent-host/history/canonical-history-validation.js';
-import { readCompactionCommitMetadata } from './agent-host/compaction/context-compaction.js';
-import { LocalContextCompactor } from './compaction/local-context-compactor.js';
-import { AutomaticContextCompactor, createAutomaticContextRequestFilterHook, } from './compaction/automatic-context-compactor.js';
+import { readCompactionCommitMetadata } from './agent-host/compaction/compaction-commit-metadata.js';
+import { createContextCompactors } from './compaction/execution/production-context-compactors.js';
+import { createAutomaticContextRequestFilterHook, createRequestMediaGuardHook, } from './compaction/automatic-context-compactor.js';
 import { ContextUsageAnchorState } from './compaction/execution/usage-anchor.js';
 import { ToolResultArchiver } from './compaction/algorithm/tool-result-archiver.js';
 import { createFileApiUploadStoreSource } from './persistence/file-api-upload.repository.js';
 import { ToolOutputArtifactRepository } from './persistence/tool-output-artifact.repository.js';
+import { compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './agent-host/runner/policy/session-readable-grants.js';
 import { isProductionRuntimeErrorRetryable } from './runtime-error-retry-policy.js';
 import { createTodoCadenceReminderHook } from './execution/reminder/todo-cadence-reminder.js';
 import { createBackgroundCadenceReminder } from './execution/reminder/background-cadence-reminder.js';
+import { createSessionIdentityReminderHook } from './execution/reminder/session-identity-reminder.js';
 import { fitsReminderInFinalRequest } from './execution/reminder/reminder-admission.js';
 import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/session-agent-execution-snapshot.js';
 import { McpToolResultHistoryExternalizer } from './agent-host/execution/mcp-tool-result-history-externalizer.js';
@@ -95,8 +98,11 @@ export function createProductionRootArchiveTitleModel(product, nowMs) {
         ...(nowMs ? { nowMs } : {}),
     });
 }
-/** Desktop Peek adds mutation approval; BTW shares the ordinary runtime permission policy. */
-function createHostPermissionPolicy(options) {
+/**
+ * Desktop Peek adds mutation approval; BTW shares the ordinary runtime permission policy.
+ * A Mini App Agent session's ask waits only while its run has a listener to answer it.
+ */
+function createHostPermissionPolicy(options, toolOutputArtifacts) {
     return {
         ...options.product.permission,
         sideSessions: {
@@ -105,21 +111,45 @@ function createHostPermissionPolicy(options) {
                 return session ? session.purpose !== 'peek_btw_session' && isPeekSession(session) : false;
             },
         },
+        // Paths the runtime hands the Agent inside its private data directory are
+        // granted by the runtime, never derived by the permission engine. Every
+        // such feature registers one source here (see session-readable-grants.ts).
+        resolveSessionOwnedReadablePaths: createSessionReadableGrantResolver({
+            loadSession: (sessionId) => options.sessions.sessions.execution.getExecutionSnapshot(sessionId),
+            sources: [
+                toolOutputGrantSource(toolOutputArtifacts),
+                compactionSnapshotGrantSource({
+                    inspectSnapshotsDirectory: (sessionId) => options.sessions.artifacts.inspectSnapshotsDirectory(sessionId),
+                }),
+                runtimeWorkspaceGrantSource({
+                    dataDir: () => options.product.preparation.configBuilder.config().dataDir,
+                }),
+                ...(options.product.sessionAssets
+                    ? [sessionAttachmentGrantSource(options.product.sessionAssets)]
+                    : []),
+            ],
+            ...(options.product.permission.logger ? { logger: options.product.permission.logger } : {}),
+        }),
+        ...(options.miniAppApprovals ? { miniAppApprovals: options.miniAppApprovals } : {}),
     };
 }
 /** Connects the native v2 AgentHost only to injected product, owner and observer ports. */
 export async function createLocalAgentHost(options) {
+    const isSideChat = (sessionId) => options.sessions.sideChats.relation(sessionId) !== undefined;
     const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
     const contextUsageAnchor = new ContextUsageAnchorState();
     const toolOutputArtifacts = createToolOutputArtifactRepository(options);
     const getToolResultCompactionConfig = createToolResultCompactionConfigGetter(options);
+    const getRequestMediaConfig = createRequestMediaConfigGetter(options);
+    const getImageEncoding = () => requestImageEncoding(getRequestMediaConfig().image);
     const toolResultArchiver = new ToolResultArchiver({
         writeArtifact: (input) => toolOutputArtifacts.write(input),
+        writeImageArtifact: (input) => toolOutputArtifacts.writeImage(input),
         logger: options.product.runner.logger,
         getConfig: getToolResultCompactionConfig,
     });
     const mcpToolResultHistoryExternalizer = createMcpToolResultHistoryExternalizer(options, toolOutputArtifacts, getToolResultCompactionConfig);
-    const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig);
+    const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding);
     const dependencies = await createNativeAgentHostProductionDependencies({
         sessions: {
             get: (sessionId) => options.sessions.sessions.execution.getExecutionSnapshot(sessionId),
@@ -130,7 +160,7 @@ export async function createLocalAgentHost(options) {
         turnRuntimeFacts: options.product.turnRuntimeFacts,
         preparation: options.preparation,
         toolCatalog: {
-            ...optionalDesktopHostCapabilities(options.cliProductPolicy),
+            hostCapabilityRegistry: createHostCapabilityRegistry(options.cliProductPolicy),
             resolveSources: async (input) => {
                 const session = await requireExecutionSession(options.sessions, input);
                 return options.product.toolSources.resolve({
@@ -163,15 +193,18 @@ export async function createLocalAgentHost(options) {
             config: options.product.preparation.configBuilder.config().mcpToolSearch,
             env: process.env,
         },
-        inputPreparation: options.product.inputPreparation,
-        permission: createHostPermissionPolicy(options),
+        inputPreparation: { ...options.product.inputPreparation, getImageEncoding },
+        permission: createHostPermissionPolicy(options, toolOutputArtifacts),
         runner: {
             ...options.product.runner,
+            resolveComputerUseCapture: options.resolveComputerUseCapture,
             reviewContent: options.safety.review,
+            onSlowReview: options.onSlowReview,
         },
         ...optionalToolPolicyGuard(options.toolPolicyGuard),
         executor: {
             ...options.product.executor,
+            nativeDelete: () => options.product.preparation.configBuilder.config().permission?.nativeDelete === true,
             logger: options.product.runner.logger,
             backgroundCadenceReminder: createBackgroundCadenceReminder(contextUsageAnchor),
             canAppendExecutionBudgetReminder: (input, marker) => fitsReminderInFinalRequest(input, marker, contextUsageAnchor),
@@ -201,30 +234,40 @@ export async function createLocalAgentHost(options) {
             preparePluginHookSessionOwnership: options.pluginHookSessionOwnership.prepare,
             activatePluginHookSessionOwnership: options.pluginHookSessionOwnership.activate,
             afterCompactionBeforeLlmCallHooks: [
-                createAutomaticContextRequestFilterHook(),
+                createAutomaticContextRequestFilterHook((sessionId, messages) => isSideChat(sessionId)
+                    ? messages
+                    : messages.filter((message) => !isSideChatModeMessage(message))),
+                createRequestMediaGuardHook(),
+                createSessionIdentityReminderHook(contextUsageAnchor),
                 createTodoCadenceReminderHook(contextUsageAnchor),
             ],
             onSteeringConsumed: options.onSteeringConsumed,
             onInputReviewResolved: options.onInputReviewResolved,
             resolveLlmRetry: options.resolveLlmRetry,
+            ...optionalTurnAccounting(options.product),
             ...(options.outputTokenCap ? { outputTokenCap: options.outputTokenCap } : {}),
         },
         ...optionalNormalExtensions(normalExtensions),
         turnControl: options.turnControl,
-        ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
-        ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
+        ...optionalTurnHooks(options),
         canonicalHistory: adaptCanonicalHistory(options.sessions.canonicalHistory, options.sessions.sessions.historyMutation),
         compaction: {
             ...createContextCompactors({
+                checkpointRequestMessages: (messages) => messages.filter((message) => !isSideChatModeMessage(message)),
+                checkpointReminder: (sessionId, timestamp) => isSideChat(sessionId) ? createSideChatModeMessage(timestamp) : undefined,
                 contextUsageAnchor,
                 checkpointState: options.product.checkpointState,
                 logger: options.product.runner.logger,
                 toolResultArchiver,
                 promptSnapshots: options.product.promptSnapshots,
+                readConfig: () => options.product.preparation.configBuilder.config(),
+                resolveEarlierFiles: createEarlierFilesResolver(options, toolOutputArtifacts),
             }),
             control: options.turnControl,
             lifecycle: options.sessions.agentProjection.compactionLifecycle,
+            barrier: options.sessions.sessions.historyMutation.compactionBarrier,
             observer: options.sessions.agentProjection.compactionObserver,
+            checkpointSharedPrefixEnabled: createCheckpointSharedPrefixSwitch(options),
             ...(options.product.runner.metricsClient
                 ? { metricsClient: options.product.runner.metricsClient }
                 : {}),
@@ -253,13 +296,15 @@ export async function createLocalAgentHost(options) {
     });
     return { host: new LocalAgentHost(dependencies), lifecycle: dependencies.lifecycle };
 }
-function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig) {
+function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding) {
     return mergeNormalExtensions([
         sessionReportExtension({
             reports: options.sessions.llmCalls,
             reportFailure: options.product.executor.reportFailure,
         }),
         createHostRunawayGuardExtension(options),
+        createHostOutputLimitRecoveryExtension(options),
+        requestMediaExtension({ getImageEncoding }),
         toolOutputBudgetExtension({
             maxInlineBytes: TOOL_RESULT_COMPACTION_DEFAULTS.maxInlineKiB * 1_024,
             getMaxInlineBytes: () => getToolResultCompactionConfig().maxInlineBytes,
@@ -287,12 +332,72 @@ function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultC
     ], options.product.normalExtensions, options.normalExtensions);
 }
 function createHostRunawayGuardExtension(options) {
-    return createProductionRunawayGuardExtension({
+    const computerUseTurns = new Set();
+    const guard = createProductionRunawayGuardExtension({
         readLocalConfig: () => options.product.preparation.configBuilder.config().runawayGuard,
         readRemoteConfig: options.getRunawayGuardConfig,
         readVerifiedProgress: (input) => options.product.executor.fileChanges.takeToolProgress?.(input) ?? [],
         logger: options.product.runner.logger,
-        reportEvent: (sessionId, event) => options.product.runner.evalReporterFactory?.reportRuntimeEvent?.(sessionId, event),
+        reportEvent: (sessionId, event) => {
+            if (computerUseTurns.has(JSON.stringify([sessionId, event.payload.turn_id])))
+                return;
+            options.product.runner.evalReporterFactory?.reportRuntimeEvent?.(sessionId, event);
+        },
+    });
+    return {
+        ...guard,
+        async init(api) {
+            api.on('turn_start', (_event, ctx) => {
+                if (hasComputerUseHistory(ctx.history))
+                    computerUseTurns.add(computerUseTurnKey(ctx));
+            });
+            api.on('before_llm_call', (event, ctx) => {
+                if (event.tools?.some((tool) => tool.name.startsWith('computer_')) ||
+                    hasComputerUseHistory(event.messages) ||
+                    hasComputerUseHistory(ctx.history)) {
+                    computerUseTurns.add(computerUseTurnKey(ctx));
+                }
+            });
+            api.on('before_tool_call', (event, _signal, ctx) => {
+                if (event.toolCall.name.startsWith('computer_')) {
+                    computerUseTurns.add(computerUseTurnKey(ctx));
+                }
+                return undefined;
+            });
+            await guard.init(api);
+            // Registered after the guard: its turn_end summary must remain isolated too.
+            api.on('turn_end', (_event, ctx) => {
+                computerUseTurns.delete(computerUseTurnKey(ctx));
+            });
+        },
+    };
+}
+function computerUseTurnKey(ctx) {
+    return JSON.stringify([ctx.sessionId, ctx.turnId]);
+}
+function hasComputerUseHistory(messages) {
+    return messages.some((message) => (message.role === 'toolResult' && message.toolName.startsWith('computer_')) ||
+        (message.role === 'assistant' &&
+            message.content.some((part) => part.type === 'toolCall' && part.name.startsWith('computer_'))));
+}
+function createHostOutputLimitRecoveryExtension(options) {
+    const log = (outcome) => (observation) => {
+        options.product.runner.logger?.[outcome === 'exhausted' ? 'error' : 'info']?.({
+            event: 'output_limit_recovery',
+            outcome,
+            session_id: observation.sessionId,
+            turn_id: observation.turnId,
+            attempts: observation.attempts,
+            ...(observation.truncatedToolCall === undefined
+                ? {}
+                : { truncated_tool_call: observation.truncatedToolCall }),
+            ...(observation.model === undefined ? {} : { model: observation.model }),
+        }, '[local-runtime-v2] Output limit recovery');
+    };
+    return outputLimitRecoveryExtension({
+        onRetry: log('retry'),
+        onRecovered: log('recovered'),
+        onExhausted: log('exhausted'),
     });
 }
 function createMcpToolResultHistoryExternalizer(options, artifacts, getConfig) {
@@ -303,19 +408,44 @@ function createMcpToolResultHistoryExternalizer(options, artifacts, getConfig) {
         logger: options.product.runner.logger,
     });
 }
+function createEarlierFilesResolver(options, toolOutputArtifacts) {
+    return async (sessionId) => {
+        const [snapshots, toolOutputs] = await Promise.all([
+            options.sessions.artifacts.resolveSnapshotsDirectory(sessionId),
+            toolOutputArtifacts.directory(sessionId),
+        ]);
+        return { snapshots, toolOutputs };
+    };
+}
 function createToolOutputArtifactRepository(options) {
     return new ToolOutputArtifactRepository({
         resolveSessionReportsDirectory: (sessionId) => options.sessions.artifacts.ensureReportsDirectory(sessionId),
+        inspectSessionReportsDirectory: (sessionId) => options.sessions.artifacts.inspectReportsDirectory(sessionId),
     });
 }
-function createContextCompactors(input) {
-    return {
-        automatic: new AutomaticContextCompactor(input.contextUsageAnchor, input.checkpointState, input.logger, {
-            toolResultArchiver: input.toolResultArchiver,
-            promptSnapshots: input.promptSnapshots,
-        }),
-        manual: new LocalContextCompactor(input.checkpointState, input.logger, input.promptSnapshots),
+function createRequestMediaConfigGetter(options) {
+    return () => {
+        let raw;
+        try {
+            raw = options.product.preparation.configBuilder.config().requestMedia;
+        }
+        catch {
+            raw = undefined;
+        }
+        return parseRequestMediaConfig(raw);
     };
+}
+function requestImageEncoding(image) {
+    return {
+        maxWidth: image.max_width,
+        maxHeight: image.max_height,
+        maxBase64Bytes: image.max_base64_bytes,
+    };
+}
+/** Remote kill switch: only an explicit Apollo `false` restores the isolated checkpoint request. */
+function createCheckpointSharedPrefixSwitch(options) {
+    return () => readToolResultCompactionOverride(options.getToolResultCompactionConfig)
+        ?.checkpointSharedPrefix !== false;
 }
 function createToolResultCompactionConfigGetter(options) {
     const fileConfig = parseToolResultCompactionConfig(readToolResultCompactionFileConfig(options));
@@ -422,21 +552,37 @@ function mergeNormalExtensions(builtins, product, additional) {
     ];
     return merged.length > 0 ? merged : undefined;
 }
+function optionalTurnAccounting(product) {
+    return {
+        ...(product.turnRequestControl
+            ? { resolveTurnRequestControl: product.turnRequestControl }
+            : {}),
+        ...(product.turnUsageRecorder ? { resolveTurnUsageRecorder: product.turnUsageRecorder } : {}),
+    };
+}
 function optionalToolPolicyGuard(toolPolicyGuard) {
     return toolPolicyGuard ? { toolPolicyGuard } : {};
 }
-function optionalDesktopHostCapabilities(cliProductPolicy) {
-    return cliProductPolicy
-        ? {}
-        : {
-            hostCapabilityRegistry: new HostCapabilityRegistry([
-                createBrowserHostCapabilityAdapter(describeLocalBrowserToolInput),
-                createComputerUseHostCapabilityAdapter(),
-            ]),
-        };
+function createHostCapabilityRegistry(cliProductPolicy) {
+    return new HostCapabilityRegistry([
+        // CLI keeps its native Browser path; only CU uses the shared interactive Binding.
+        ...(cliProductPolicy
+            ? []
+            : [createBrowserHostCapabilityAdapter(describeLocalBrowserToolInput)]),
+        createComputerUseHostCapabilityAdapter(),
+    ], { reserveInlineGateway: !cliProductPolicy });
 }
 function optionalNormalExtensions(normalExtensions) {
     return normalExtensions ? { normalExtensions } : {};
+}
+/** Optional per-Turn seams; absent ones are omitted rather than set to undefined. */
+function optionalTurnHooks(options) {
+    return {
+        ...(options.askUserPolicy ? { askUserPolicy: options.askUserPolicy } : {}),
+        ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
+        ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
+        ...(options.promptSuggestion ? { promptSuggestion: options.promptSuggestion } : {}),
+    };
 }
 export function combineAgentEventObservers(...observers) {
     const active = observers.filter((observer) => observer !== undefined);
@@ -460,6 +606,10 @@ export function createSessionLLMRetryEventObserver(publish) {
             payload: { schemaVersion: 1, ...event },
         });
     };
+}
+/** 把运行器的慢送审通知投到产品事件流，界面据此在输入框上方提示检查电脑负荷。 */
+export function createContentReviewSlowEventObserver(publish) {
+    return ({ sessionId, turnId }) => publish({ type: 'content.review.slow', payload: { sessionId, turnId } });
 }
 async function observeAll(observers, observe) {
     const results = await Promise.allSettled(observers.map((observer) => observe(observer)));
@@ -524,7 +674,12 @@ function adaptCanonicalHistory(provider, mutation) {
                 summary: metadata.summary,
                 ...(metadata.currentUserSourceIndex === undefined
                     ? {}
-                    : { currentUserSourceIndex: metadata.currentUserSourceIndex }),
+                    : {
+                        currentUserSourceIndex: metadata.currentUserSourceIndex,
+                        ...(metadata.placedMarkerCount === undefined
+                            ? {}
+                            : { placedMarkerCount: metadata.placedMarkerCount }),
+                    }),
             };
             if (metadata.method !== 'llm_checkpoint') {
                 const committed = await provider.compact({
@@ -587,13 +742,6 @@ function requireHistoryOperation(change) {
     if (!change.operation)
         throw new TypeError('Canonical history operation is required.');
     return { ...change, operation: change.operation };
-}
-function mutableTitleContext(context) {
-    return {
-        systemPrompt: context.systemPrompt,
-        messages: context.messages.map((message) => ({ ...message })),
-        ...(context.tools ? { tools: [...context.tools] } : {}),
-    };
 }
 function describeError(error) {
     return error instanceof Error ? error.message : String(error);

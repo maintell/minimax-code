@@ -26,6 +26,7 @@ export class FileDiagnosticArtifactSource {
     uploadDefault;
     maxBytesPerFile;
     errorContext;
+    sinceMs;
     constructor(options) {
         this.id = options.id;
         this.label = options.label;
@@ -37,6 +38,7 @@ export class FileDiagnosticArtifactSource {
         this.uploadDefault = options.uploadDefault ?? 'consent-required';
         this.maxBytesPerFile = options.maxBytesPerFile;
         this.errorContext = options.errorContext;
+        this.sinceMs = options.sinceMs;
     }
     describe() {
         return {
@@ -72,7 +74,7 @@ export class FileDiagnosticArtifactSource {
             }
             if (stat.isSymbolicLink())
                 continue;
-            if (!stat.isFile() || stat.mtimeMs < input.sinceMs)
+            if (!stat.isFile() || stat.mtimeMs < (this.sinceMs ?? input.sinceMs))
                 continue;
             let realPath;
             try {

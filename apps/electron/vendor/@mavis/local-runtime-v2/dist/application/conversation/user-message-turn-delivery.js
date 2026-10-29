@@ -76,7 +76,8 @@ async function executeDelivery(options, input) {
             requestedTurnId: input.requestedTurnId,
             executionStart: start.promise,
             genuineUserQueryText,
-            requiresInputReview: visibleQuery,
+            // A completion summary is visible, but its input remains an internal continuation.
+            requiresInputReview: visibleQuery && input.provenance.source !== 'background-task',
         });
         if (!result.accepted) {
             if (result.reason !== 'duplicate') {
@@ -274,12 +275,12 @@ function commitMessage(options, input) {
         ...(context ? { sourceContext: context } : {}),
     }));
 }
-function shouldProjectMessage(input) {
+export function shouldProjectMessage(input) {
     if (!input)
         return true;
     return input.hideUserMessage !== true || hasDisplayContent(input);
 }
-function projectedMessageContent(input, fallback) {
+export function projectedMessageContent(input, fallback) {
     return hasDisplayContent(input) ? input.displayContent : fallback;
 }
 function hasDisplayContent(input) {

@@ -1,14 +1,15 @@
-import { constants } from "node:fs";
-import * as fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
+import { dataDirFs, dataDirFsConstants } from "./data-dir-fs.js";
 import { resolveLocalRuntimeDataDir, getDefaultLocalRuntimeDataParentDir, resolveLocalRuntimeDataDirFromParent, getConfiguredLocalRuntimeDataParentDir, setConfiguredLocalRuntimeDataParentDir } from "./data-dir";
 import { blockUtilityRuntimeStart } from "./runtime-start-guard";
-import { assertInternalDataDirStorage, DataDirStorageError, probeDataDirWrites } from "./data-dir-storage";
+import { assertInternalDataDirStorage, DataDirStorageError, probeDataDirWrites, looksLikeCloudSyncedPath } from "./data-dir-storage";
 export class LocalRuntimeDataDirRelocationError extends Error {
-    constructor(code, message) {
+    constructor(code, message, cause) {
         super(message);
         this.code = code;
+        this.cause = cause;
         this.name = 'LocalRuntimeDataDirRelocationError';
     }
 }
@@ -49,7 +50,7 @@ function uniqueDirs(dirs, platform) {
 async function statDirectory(dir, code) {
     let stat;
     try {
-        stat = await fs.stat(dir);
+        stat = await dataDirFs.stat(dir);
     }
     catch (error) {
         throw new LocalRuntimeDataDirRelocationError(code, `${dir} is not accessible: ${String(error)}`);
@@ -62,7 +63,7 @@ async function statDirectory(dir, code) {
 async function assertReadableWritableDirectory(dir, code) {
     await statDirectory(dir, code);
     try {
-        await fs.access(dir, constants.R_OK | constants.W_OK);
+        await dataDirFs.access(dir, dataDirFsConstants.R_OK | dataDirFsConstants.W_OK);
     }
     catch (error) {
         throw new LocalRuntimeDataDirRelocationError(code, `${dir} is not readable/writable: ${String(error)}`);
@@ -70,7 +71,7 @@ async function assertReadableWritableDirectory(dir, code) {
 }
 async function directoryExists(dir) {
     try {
-        await fs.access(dir, constants.F_OK);
+        await dataDirFs.access(dir, dataDirFsConstants.F_OK);
         return true;
     }
     catch {
@@ -79,7 +80,7 @@ async function directoryExists(dir) {
 }
 async function assertCurrentDataDir(dataDir) {
     try {
-        const stat = await fs.stat(dataDir);
+        const stat = await dataDirFs.stat(dataDir);
         if (!stat.isDirectory()) {
             throw new LocalRuntimeDataDirRelocationError('CURRENT_DATA_DIR_MISSING', `${dataDir} is not a directory`);
         }
@@ -92,12 +93,12 @@ async function assertCurrentDataDir(dataDir) {
 }
 async function inspectTargetDataDir(targetDataDir) {
     try {
-        const stat = await fs.stat(targetDataDir);
+        const stat = await dataDirFs.stat(targetDataDir);
         if (!stat.isDirectory()) {
             throw new LocalRuntimeDataDirRelocationError('TARGET_NOT_DIRECTORY', `${targetDataDir} exists but is not a directory`);
         }
-        await fs.access(targetDataDir, constants.R_OK | constants.W_OK);
-        const entries = await fs.readdir(targetDataDir);
+        await dataDirFs.access(targetDataDir, dataDirFsConstants.R_OK | dataDirFsConstants.W_OK);
+        const entries = await dataDirFs.readdir(targetDataDir);
         return entries.length === 0 ? 'empty' : 'non-empty';
     }
     catch (error) {
@@ -138,43 +139,92 @@ function isInternalSymlinkTarget(linkSourcePath, linkTarget, sourceRoot, platfor
         isSubPath(absoluteSourceTarget, sourceRoot, platform));
 }
 async function copyFileWithMetadata(sourcePath, targetPath) {
-    await fs.copyFile(sourcePath, targetPath);
-    const stat = await fs.stat(sourcePath);
-    await fs.chmod(targetPath, stat.mode).catch(() => { });
-    await fs.utimes(targetPath, stat.atime, stat.mtime).catch(() => { });
+    await dataDirFs.copyFile(sourcePath, targetPath);
+    const stat = await dataDirFs.stat(sourcePath);
+    await dataDirFs.chmod(targetPath, stat.mode).catch(() => { });
+    await dataDirFs.utimes(targetPath, stat.atime, stat.mtime).catch(() => { });
 }
-async function copyDataDirEntry(sourcePath, targetPath, pendingSymlinks) {
-    const stat = await fs.lstat(sourcePath);
-    if (stat.isSymbolicLink()) {
-        pendingSymlinks.push({
-            sourcePath,
-            targetPath,
-            linkTarget: await fs.readlink(sourcePath),
-        });
-        return;
+// Hash paths instead of logging user names, workspace names or raw fs messages.
+// The ASAR marker still makes virtual-filesystem regressions diagnosable.
+function describeMigrationPath(filePath) {
+    const id = createHash('sha256').update(filePath).digest('hex').slice(0, 12);
+    const asar = filePath.split(/[\\/]/).some((part) => part.endsWith('.asar'));
+    return `${id}(asar=${asar})`;
+}
+function describeMigrationError(error) {
+    if (error instanceof DataDirCopyError)
+        return error.message;
+    const nodeError = error;
+    const code = typeof nodeError?.code === 'string' && /^[A-Z_0-9]+$/.test(nodeError.code)
+        ? nodeError.code
+        : 'unknown';
+    const syscall = typeof nodeError?.syscall === 'string' && /^[a-zA-Z0-9_]+$/.test(nodeError.syscall)
+        ? nodeError.syscall
+        : 'unknown';
+    return `code=${code}; syscall=${syscall}`;
+}
+class DataDirCopyError extends Error {
+    constructor(operation, sourcePath, targetPath, cause) {
+        super(`operation=${operation}; source=${describeMigrationPath(sourcePath)}; target=${describeMigrationPath(targetPath)}; ${describeMigrationError(cause)}`);
+        this.cause = cause;
     }
-    if (stat.isDirectory()) {
-        await fs.mkdir(targetPath, { recursive: true, mode: stat.mode });
-        const entries = await fs.readdir(sourcePath);
-        for (const entry of entries) {
-            await copyDataDirEntry(path.join(sourcePath, entry), path.join(targetPath, entry), pendingSymlinks);
+}
+// Process-scoped Runtime state that is only valid for the Runtime that created it. The
+// Runtime has exited before copying, recreates these directories on start, and a sync client
+// or antivirus can keep the stale files locked, so copying them only risks failing migration.
+const RUNTIME_PROCESS_STATE_DIRS = [path.join('v2', 'runtime-owner-leases')];
+function isRuntimeProcessStateDir(sourceRoot, sourcePath) {
+    const relative = path.relative(sourceRoot, sourcePath);
+    return RUNTIME_PROCESS_STATE_DIRS.some((dir) => relative.toLowerCase() === dir.toLowerCase());
+}
+async function copyDataDirEntry(sourceRoot, sourcePath, targetPath, pendingSymlinks) {
+    let operation = 'lstat';
+    try {
+        const stat = await dataDirFs.lstat(sourcePath);
+        if (stat.isSymbolicLink()) {
+            operation = 'readlink';
+            pendingSymlinks.push({
+                sourcePath,
+                targetPath,
+                linkTarget: await dataDirFs.readlink(sourcePath),
+            });
+            return;
         }
-        await fs.utimes(targetPath, stat.atime, stat.mtime).catch(() => { });
-        return;
+        if (stat.isDirectory()) {
+            if (isRuntimeProcessStateDir(sourceRoot, sourcePath))
+                return;
+            operation = 'mkdir';
+            await dataDirFs.mkdir(targetPath, { recursive: true, mode: stat.mode });
+            operation = 'readdir';
+            const entries = await dataDirFs.readdir(sourcePath);
+            for (const entry of entries) {
+                await copyDataDirEntry(sourceRoot, path.join(sourcePath, entry), path.join(targetPath, entry), pendingSymlinks);
+            }
+            await dataDirFs.utimes(targetPath, stat.atime, stat.mtime).catch(() => { });
+            return;
+        }
+        if (stat.isFile()) {
+            operation = 'mkdir';
+            await dataDirFs.mkdir(path.dirname(targetPath), { recursive: true });
+            operation = 'copy-file';
+            await copyFileWithMetadata(sourcePath, targetPath);
+            return;
+        }
+        operation = 'unsupported-entry';
+        throw new Error('Unsupported data directory entry');
     }
-    if (stat.isFile()) {
-        await fs.mkdir(path.dirname(targetPath), { recursive: true });
-        await copyFileWithMetadata(sourcePath, targetPath);
-        return;
+    catch (error) {
+        if (error instanceof DataDirCopyError)
+            throw error;
+        throw new DataDirCopyError(operation, sourcePath, targetPath, error);
     }
-    throw new Error(`Unsupported data directory entry: ${sourcePath}`);
 }
 async function copyPendingSymlink(pending, sourceRoot, targetRoot, platform, targetPath = pending.targetPath) {
     const isInternal = isInternalSymlinkTarget(pending.sourcePath, pending.linkTarget, sourceRoot, platform);
-    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await dataDirFs.mkdir(path.dirname(targetPath), { recursive: true });
     let targetStat;
     try {
-        targetStat = await fs.stat(pending.sourcePath);
+        targetStat = await dataDirFs.stat(pending.sourcePath);
     }
     catch {
         targetStat = null;
@@ -187,7 +237,7 @@ async function copyPendingSymlink(pending, sourceRoot, targetRoot, platform, tar
             return;
         }
         if (targetStat?.isDirectory()) {
-            await fs.symlink(remappedTarget, targetPath, 'junction');
+            await dataDirFs.symlink(remappedTarget, targetPath, 'junction');
             return;
         }
         if (targetStat?.isFile()) {
@@ -195,11 +245,11 @@ async function copyPendingSymlink(pending, sourceRoot, targetRoot, platform, tar
             return;
         }
     }
-    await fs.symlink(remappedTarget, targetPath, targetStat?.isDirectory() ? 'dir' : 'file');
+    await dataDirFs.symlink(remappedTarget, targetPath, targetStat?.isDirectory() ? 'dir' : 'file');
 }
 async function copyLocalRuntimeDataDirEntries(sourceRoot, targetRoot) {
     const pendingSymlinks = [];
-    await copyDataDirEntry(sourceRoot, targetRoot, pendingSymlinks);
+    await copyDataDirEntry(sourceRoot, sourceRoot, targetRoot, pendingSymlinks);
     return pendingSymlinks;
 }
 function captureDataDirEnv() {
@@ -270,7 +320,7 @@ export async function relocateLocalRuntimeDataDir(options) {
     }
     const requestedTargetParentDir = normalizeDir(options.targetParentDir);
     await assertReadableWritableDirectory(requestedTargetParentDir, 'INVALID_PARENT');
-    const targetParentDir = await fs.realpath(requestedTargetParentDir);
+    const targetParentDir = await dataDirFs.realpath(requestedTargetParentDir);
     try {
         await assertInternalDataDirStorage(targetParentDir);
     }
@@ -286,7 +336,7 @@ export async function relocateLocalRuntimeDataDir(options) {
     const targetDataDir = resolveLocalRuntimeDataDirFromParent(targetParentDir, currentDataDirName);
     // Compare physical paths too: junctions can alias the source or the installation directory.
     // A missing source is allowed only when switching back to an existing historical directory.
-    const realCurrentDataDir = await fs
+    const realCurrentDataDir = await dataDirFs
         .realpath(currentDataDir)
         .catch((error) => {
         if (error.code === 'ENOENT')
@@ -304,11 +354,11 @@ export async function relocateLocalRuntimeDataDir(options) {
     }
     if (typeof options.appInstallDir === 'string' &&
         options.appInstallDir.trim() &&
-        isSameOrInsideDir(targetDataDir, await fs.realpath(options.appInstallDir), platform)) {
+        isSameOrInsideDir(targetDataDir, await dataDirFs.realpath(options.appInstallDir), platform)) {
         throw new LocalRuntimeDataDirRelocationError('TARGET_INSIDE_INSTALL_DIR', 'Target data directory cannot be inside the app install directory');
     }
     const targetState = await inspectTargetDataDir(targetDataDir);
-    if (targetState !== 'missing' && (await fs.lstat(targetDataDir)).isSymbolicLink()) {
+    if (targetState !== 'missing' && (await dataDirFs.lstat(targetDataDir)).isSymbolicLink()) {
         throw new LocalRuntimeDataDirRelocationError('TARGET_UNAVAILABLE', 'Target data directory cannot be a link');
     }
     const shouldSwitchToPrevious = targetIsPrevious && targetState === 'non-empty';
@@ -325,6 +375,12 @@ export async function relocateLocalRuntimeDataDir(options) {
     catch (error) {
         throw new LocalRuntimeDataDirRelocationError('TARGET_UNAVAILABLE', `Target write probe failed: ${String(error)}`);
     }
+    // Asked last so that a confirmed warning is not followed by another rejection.
+    if (!options.cloudSyncRiskAcknowledged &&
+        (looksLikeCloudSyncedPath(targetParentDir) ||
+            looksLikeCloudSyncedPath(requestedTargetParentDir))) {
+        throw new LocalRuntimeDataDirRelocationError('TARGET_CLOUD_SYNC_SUSPECTED', 'Target folder name looks like a cloud sync folder; user confirmation is required');
+    }
     const nextPreviousParentDirs = uniqueDirs([currentParentDir, ...previousParentDirs], platform);
     const tmpDataDir = path.join(targetParentDir, `${currentDataDirName}.tmp-${process.pid}-${Date.now().toString(36)}`);
     let createdTargetByCopy = false;
@@ -338,24 +394,31 @@ export async function relocateLocalRuntimeDataDir(options) {
         runtimeStartBlockReleased = true;
         releaseRuntimeStartBlock();
     };
+    let stage = 'stop-runtime';
     try {
         const stopResult = await options.stopLocalRuntime();
         if (stopResult.status === 'quarantined') {
             throw new LocalRuntimeDataDirRelocationError('RUNTIME_STOP_UNCONFIRMED', 'Local Runtime exit was not confirmed; data directory migration was cancelled');
         }
         if (!shouldSwitchToPrevious) {
-            await fs.rm(tmpDataDir, { recursive: true, force: true });
+            stage = 'clean-temp';
+            await dataDirFs.rm(tmpDataDir, { recursive: true, force: true });
+            stage = 'copy';
             const pendingSymlinks = await copyLocalRuntimeDataDirEntries(currentDataDir, tmpDataDir);
+            stage = 'remove-empty-target';
             if (targetState === 'empty' && (await directoryExists(targetDataDir))) {
-                await fs.rm(targetDataDir, { recursive: true, force: false });
+                await dataDirFs.rm(targetDataDir, { recursive: true, force: false });
             }
-            await fs.rename(tmpDataDir, targetDataDir);
+            stage = 'rename';
+            await dataDirFs.rename(tmpDataDir, targetDataDir);
             createdTargetByCopy = true;
+            stage = 'rebuild-links';
             for (const pending of pendingSymlinks) {
                 const finalTargetPath = path.join(targetDataDir, path.relative(tmpDataDir, pending.targetPath));
                 await copyPendingSymlink(pending, currentDataDir, targetDataDir, platform, finalTargetPath);
             }
         }
+        stage = 'save-config';
         await options.saveConfig({
             localRuntimeDataParentDir: targetParentDir,
             localRuntimePreviousDataParentDirs: nextPreviousParentDirs,
@@ -365,6 +428,7 @@ export async function relocateLocalRuntimeDataDir(options) {
         // app.relaunch() inherits process.env. Clear the old app-injected data
         // directory so the next process resolves from the saved desktop config.
         clearDataDirEnv();
+        stage = 'relaunch';
         await options.relaunch();
         return {
             success: true,
@@ -375,9 +439,16 @@ export async function relocateLocalRuntimeDataDir(options) {
         };
     }
     catch (error) {
-        await fs.rm(tmpDataDir, { recursive: true, force: true }).catch(() => { });
+        const cleanupFailures = [];
+        await dataDirFs.rm(tmpDataDir, { recursive: true, force: true }).catch((cleanupError) => {
+            cleanupFailures.push(`temp: ${describeMigrationError(cleanupError)}`);
+        });
         if (createdTargetByCopy) {
-            await fs.rm(targetDataDir, { recursive: true, force: true }).catch(() => { });
+            await dataDirFs
+                .rm(targetDataDir, { recursive: true, force: true })
+                .catch((cleanupError) => {
+                cleanupFailures.push(`target: ${describeMigrationError(cleanupError)}`);
+            });
         }
         releaseRuntimeStartBlockOnce();
         if (configCommitted) {
@@ -392,6 +463,6 @@ export async function relocateLocalRuntimeDataDir(options) {
         }
         if (error instanceof LocalRuntimeDataDirRelocationError)
             throw error;
-        throw new LocalRuntimeDataDirRelocationError('MIGRATION_FAILED', `Failed to relocate local runtime data directory: ${String(error)}`);
+        throw new LocalRuntimeDataDirRelocationError('MIGRATION_FAILED', `Failed to relocate local runtime data directory: stage=${stage}; ${describeMigrationError(error)}; cleanup=${cleanupFailures.length ? cleanupFailures.join(', ') : 'ok'}`, error);
     }
 }

@@ -18,37 +18,45 @@ function defaultEstimate(def) {
 }
 export function planMcpDisclosure(input) {
     const { entries, model, options } = input;
-    const allTools = entries.map((e) => e.tool);
-    const inlineAll = () => ({ deferred: false, inlineTools: allTools });
-    if (!options.enabled)
-        return inlineAll();
-    if (!modelInWhitelist(model.provider, model.id, options.modelWhitelist))
-        return inlineAll();
-    // The threshold (thresholdPct * contextWindow) is meaningless without a real
-    // context window. A non-positive/non-finite contextWindow would make
-    // thresholdTokens collapse to 0, deferring on any single tool. This guard also
-    // keeps the empty-identity NO_DISCLOSURE_MODEL sentinel inline regardless of the
-    // whitelist (including the '*' wildcard).
-    if (!(Number.isFinite(model.contextWindow) && model.contextWindow > 0))
-        return inlineAll();
-    const candidates = entries.filter((e) => e.source === 'configured');
-    const estimate = options.estimateTokens ?? defaultEstimate;
-    const estTokens = candidates.reduce((s, e) => s + estimate(e.tool.def), 0);
-    const thresholdTokens = options.thresholdPct * model.contextWindow;
-    if (candidates.length < options.minDeferCount || estTokens <= thresholdTokens)
-        return inlineAll();
-    const inlineTools = entries.filter((e) => e.source !== 'configured').map((e) => e.tool);
-    const index = buildOrReuseIndex(candidates, { maxSchemaTextLen: options.maxSchemaTextLen });
-    const deferredRegistry = new Map(candidates.map((e) => [e.tool.def.name, e.tool]));
+    const names = new Set();
+    for (const { tool } of entries) {
+        if (names.has(tool.def.name))
+            throw new Error(`Duplicate on-demand tool: ${tool.def.name}`);
+        names.add(tool.def.name);
+    }
+    const explicitlyDeferred = (tool) => tool.def.loading === 'on_demand' ||
+        (tool.def.loading !== 'default' && input.retainedDeferredTools?.has(tool) === true);
+    const candidates = entries.filter(({ tool, source }) => source === 'configured' && tool.def.loading !== 'default' && !explicitlyDeferred(tool));
+    const estimate = options?.estimateTokens ?? defaultEstimate;
+    const validContext = model !== undefined && Number.isFinite(model.contextWindow) && model.contextWindow > 0;
+    const thresholdTokens = options && validContext ? options.thresholdPct * model.contextWindow : 0;
+    const automaticallyDefer = Boolean(options?.enabled &&
+        model &&
+        validContext &&
+        modelInWhitelist(model.provider, model.id, options.modelWhitelist) &&
+        candidates.length >= options.minDeferCount &&
+        candidates.reduce((sum, { tool }) => sum + estimate(tool.def), 0) > thresholdTokens);
+    const deferredEntries = entries.filter(({ tool, source }) => explicitlyDeferred(tool) ||
+        (automaticallyDefer && source === 'configured' && tool.def.loading !== 'default'));
+    if (deferredEntries.length === 0) {
+        return { deferred: false, inlineTools: entries.map(({ tool }) => tool) };
+    }
+    const deferredRegistry = new Map(deferredEntries.map(({ tool }) => [tool.def.name, tool]));
+    const inlineTools = entries
+        .filter(({ tool }) => !deferredRegistry.has(tool.def.name))
+        .map(({ tool }) => tool);
+    const index = buildOrReuseIndex(deferredEntries, {
+        maxSchemaTextLen: options?.maxSchemaTextLen ?? 4096,
+    });
     return {
         deferred: true,
         inlineTools,
         deferredRegistry,
         index,
         stats: {
-            candidateCount: candidates.length,
+            candidateCount: deferredEntries.length,
             indexedCount: index.size,
-            estTokens,
+            estTokens: deferredEntries.reduce((sum, { tool }) => sum + estimate(tool.def), 0),
             thresholdTokens,
         },
     };

@@ -2,6 +2,8 @@ import { normalizeSessionType } from './normalization.js';
 export function recordFromCreate(input, nowMs) {
     const sessionType = normalizeSessionType(input.sessionType ?? 'branch');
     return {
+        ...(input.agentShell ? { agentShell: input.agentShell } : {}),
+        ...whenPresentAgentShellPreference(input.agentShellPreference),
         ...recordIdentityFields(input, sessionType),
         ...recordStateFields(input),
         ...recordErrorFields(input),
@@ -18,9 +20,11 @@ function recordIdentityFields(input, sessionType) {
         sessionType,
         sessionKind: input.sessionKind ?? 'conversation',
         title: input.title ?? null,
+        titleSource: input.titleSource ?? (input.title?.trim() ? 'manual' : 'default'),
         parentSessionId: input.parentSessionId ?? null,
         purpose: input.purpose,
         originCronId: input.originCronId,
+        miniAppOrigin: input.miniAppOrigin,
         isDefaultWorkspace: input.isDefaultWorkspace,
         runLocation: input.runLocation,
         ...appModeFields(sessionType, input.appMode),
@@ -55,8 +59,10 @@ function recordModelFields(input) {
 function recordProvenanceFields(input, nowMs) {
     return {
         origin: input.origin,
+        sideChatOrigin: input.sideChatOrigin,
         sessionOrigin: input.sessionOrigin,
         sessionDataVersion: input.sessionDataVersion,
+        ...(input.createdBySessionId ? { createdBySessionId: input.createdBySessionId } : {}),
         scratchpadPath: input.scratchpadPath,
         createdAtMs: input.createdAtMs ?? nowMs,
         updatedAtMs: input.updatedAtMs ?? nowMs,
@@ -66,5 +72,8 @@ function appModeFields(sessionType, appMode) {
     if (sessionType === 'root' || appMode === undefined)
         return {};
     return { appMode };
+}
+function whenPresentAgentShellPreference(preference) {
+    return preference ? { agentShellPreference: preference } : {};
 }
 //# sourceMappingURL=record-create.js.map

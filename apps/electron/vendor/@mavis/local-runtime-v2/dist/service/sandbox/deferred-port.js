@@ -1,4 +1,4 @@
-import { createLocalBashOperations } from '@earendil-works/pi-coding-agent/tools';
+import { createLocalBashOperations, } from '@earendil-works/pi-coding-agent/tools';
 import { nestedRuntimeGuardEnv } from '@mavis/shared/nested-runtime-guard';
 import { initializeLocalBackgroundBashExecutor } from '../background-bash/index.js';
 import { SandboxError } from './sandbox-errors.js';
@@ -9,11 +9,23 @@ import { sandboxErrorOutcome } from './observability/invocation-trace.js';
  */
 export function createDeferredLocalSandboxBashOperationsFactory(desiredEnabled, 
 /** Carries the runtime's PATH shims into background bash; see ensureRmShim. */
-envPolicy) {
+envPolicy, getSkipParentDeathGuard = () => false) {
     let current;
-    const fallback = createUnavailableSandboxBashOperationsFactory(desiredEnabled);
+    const fallback = createUnavailableSandboxBashOperationsFactory(desiredEnabled, (id) => port.resolveShell(id), getSkipParentDeathGuard);
     let executor;
+    let resolveShell;
     const port = {
+        bindShellResolver: (resolve) => {
+            resolveShell = resolve;
+        },
+        resolveShell: async (id) => {
+            if (process.platform !== 'win32')
+                return undefined;
+            const shell = await resolveShell?.(id);
+            if (!shell)
+                throw new Error('AGENT_SHELL_UNAVAILABLE: Session shell is not bound');
+            return shell;
+        },
         create: (input) => (current ?? fallback).create(input),
         execute: (input) => executor.execute(input),
         bind: (factory) => {
@@ -24,44 +36,60 @@ envPolicy) {
     return port;
 }
 /** Temporary owner adapter until the concrete operation factory is wired. */
-function createUnavailableSandboxBashOperationsFactory(effectiveEnabled) {
+function createUnavailableSandboxBashOperationsFactory(effectiveEnabled, resolveShell, getSkipParentDeathGuard) {
     return {
         create: (input) => {
             if (effectiveEnabled()) {
                 throw new SandboxError('SANDBOX_UNAVAILABLE', 'invocation', 'Sandbox Bash operations are unavailable');
             }
             const nativeOperations = createLocalBashOperations({
-                parentDeathGuard: input.identity.operationClass !== 'direct_foreground',
+                parentDeathGuard: input.identity.operationClass !== 'direct_foreground' && !getSkipParentDeathGuard(),
             });
             // Unbound and disabled still has to report admission, or a background
             // task started through this fallback would stay `queued` forever.
             return {
                 separatesOutputStreams: nativeOperations.separatesOutputStreams,
                 exec: async (command, cwd, options) => {
+                    const shell = await resolveShell(input.identity.sessionId);
+                    const operations = shell
+                        ? createLocalBashOperations({
+                            shellConfig: toShellConfig(shell),
+                            parentDeathGuard: input.identity.operationClass !== 'direct_foreground' &&
+                                !getSkipParentDeathGuard(),
+                        })
+                        : nativeOperations;
                     await input.onPreflightComplete?.();
-                    return nativeOperations.exec(command, cwd, options);
+                    return operations.exec(command, cwd, options);
                 },
             };
         },
     };
 }
 /** Build the single operations path shared by all local Bash operation classes. */
-export function createSandboxBashOperationsFactory(service) {
+export function createSandboxBashOperationsFactory(service, resolveShell = undefined, getSkipParentDeathGuard = () => false) {
     return {
         create: (input) => {
             const nativeOperations = createLocalBashOperations({
-                parentDeathGuard: input.identity.operationClass !== 'direct_foreground',
+                parentDeathGuard: input.identity.operationClass !== 'direct_foreground' && !getSkipParentDeathGuard(),
             });
             return {
                 separatesOutputStreams: nativeOperations.separatesOutputStreams,
                 exec: async (command, cwd, options) => {
+                    const shell = await resolveShell?.(input.identity.sessionId);
+                    const operations = shell
+                        ? createLocalBashOperations({
+                            shellConfig: toShellConfig(shell),
+                            parentDeathGuard: input.identity.operationClass !== 'direct_foreground' &&
+                                !getSkipParentDeathGuard(),
+                        })
+                        : nativeOperations;
                     const lease = await service.beginInvocation({
                         identity: input.identity,
                         workspaceRoot: input.workspaceRoot,
                         cwd,
                     });
                     return executeObserved({
-                        nativeOperations,
+                        nativeOperations: operations,
                         lease,
                         command,
                         cwd,
@@ -73,6 +101,15 @@ export function createSandboxBashOperationsFactory(service) {
                 },
             };
         },
+    };
+}
+/** Preserve the validated family instead of inferring it again from the executable name. */
+function toShellConfig(shell) {
+    const types = { 'git-bash': 'bash', 'windows-powershell': 'powershell', pwsh: 'pwsh' };
+    return {
+        shell: shell.executablePath,
+        type: types[shell.family],
+        args: shell.family === 'git-bash' ? ['-c'] : ['-NoProfile', '-NonInteractive', '-Command'],
     };
 }
 async function executeObserved(input) {

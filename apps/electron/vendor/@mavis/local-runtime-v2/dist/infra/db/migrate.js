@@ -8,22 +8,17 @@
  * 1. drizzle-kit 运行时需要 fs 读取 migration 目录，Electron asar 不友好。
  * 2. 我们需要与 v1 数据共存，部分 migration 是 data backfill，不是纯 DDL。
  * 3. 保持最小运行时依赖：只有 drizzle-orm + better-sqlite3。
+ *
+ * @public Strict fail-fast runner. Production startup goes through
+ * runMigrationsWithRecovery; this remains the dist API for the rehearsal
+ * scripts (`scripts/session-storage-real-data-rehearsal.mjs`), the schema
+ * snapshot generator, and focused tests that need exact-throw semantics.
  */
 export function runMigrations(rawDb, migrations) {
     validateMigrationEntries(migrations);
     // 确保 meta 表存在
-    rawDb.exec(`
-    CREATE TABLE IF NOT EXISTS local_runtime_v2_schema_migrations (
-      version INTEGER PRIMARY KEY,
-      applied_at_ms INTEGER NOT NULL
-    );
-  `);
-    const applied = new Set();
-    for (const row of rawDb.prepare('SELECT version FROM local_runtime_v2_schema_migrations').all()) {
-        if (!isVersionRow(row))
-            throw new Error('Invalid v2 schema migration history row');
-        applied.add(row.version);
-    }
+    ensureMigrationHistoryTable(rawDb);
+    const applied = readAppliedVersionSet(rawDb);
     for (const migration of migrations) {
         if (applied.has(migration.version))
             continue;
@@ -51,6 +46,89 @@ export function runMigrations(rawDb, migrations) {
             throw err;
         }
     }
+}
+/**
+ * Safe-mode migration runner: apply each pending entry, retry a failed entry
+ * once within the same boot (the cross-process migration lock is still held,
+ * so nothing wrote to the database between the attempts and a transient
+ * failure gets a second chance), and record a deterministic failure instead
+ * of throwing so the remaining pending entries still run. Entries listed in
+ * `skipVersions` (the persisted quarantine list) are never attempted and are
+ * never written into the version table.
+ * See `.harness/docs/adr/local-runtime-migration-fault-tolerance.md`.
+ */
+export function runMigrationsWithRecovery(rawDb, migrations, options = {}) {
+    validateMigrationEntries(migrations);
+    ensureMigrationHistoryTable(rawDb);
+    const applied = readAppliedVersionSet(rawDb);
+    const failures = [];
+    for (const migration of migrations) {
+        if (applied.has(migration.version))
+            continue;
+        if (options.skipVersions?.has(migration.version))
+            continue;
+        try {
+            applyMigrationOnce(rawDb, migration);
+        }
+        catch {
+            try {
+                applyMigrationOnce(rawDb, migration);
+            }
+            catch (retryError) {
+                failures.push({ version: migration.version, name: migration.name, error: retryError });
+                continue;
+            }
+        }
+        applied.add(migration.version);
+    }
+    return { failures };
+}
+/** One transactional attempt at a single migration entry. */
+function applyMigrationOnce(rawDb, migration) {
+    rawDb.exec('BEGIN IMMEDIATE');
+    try {
+        if (isMigrationApplied(rawDb, migration.version)) {
+            rawDb.exec('COMMIT');
+            return;
+        }
+        if (typeof migration.up === 'string') {
+            rawDb.exec(migration.up);
+        }
+        else {
+            migration.up(rawDb);
+        }
+        rawDb
+            .prepare('INSERT INTO local_runtime_v2_schema_migrations (version, applied_at_ms) VALUES (?, ?)')
+            .run(migration.version, Date.now());
+        rawDb.exec('COMMIT');
+    }
+    catch (err) {
+        try {
+            rawDb.exec('ROLLBACK');
+        }
+        catch {
+            // Some SQLite errors abort the transaction on their own; a rollback on
+            // an already-closed transaction must not mask the original failure.
+        }
+        throw err;
+    }
+}
+function ensureMigrationHistoryTable(rawDb) {
+    rawDb.exec(`
+    CREATE TABLE IF NOT EXISTS local_runtime_v2_schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at_ms INTEGER NOT NULL
+    );
+  `);
+}
+function readAppliedVersionSet(rawDb) {
+    const applied = new Set();
+    for (const row of rawDb.prepare('SELECT version FROM local_runtime_v2_schema_migrations').all()) {
+        if (!isVersionRow(row))
+            throw new Error('Invalid v2 schema migration history row');
+        applied.add(row.version);
+    }
+    return applied;
 }
 function isMigrationApplied(rawDb, version) {
     const rows = rawDb

@@ -68,15 +68,16 @@ function decodeFrozenDefinition(value) {
         throw new Error('Frozen Session Agent owner is invalid.');
     const model = decodeModel(value.model);
     const project = decodeProject(value.project);
-    const ownerInstanceId = optionalNonEmptyString(value.ownerInstanceId, 'ownerInstanceId');
-    return freezeDefinition({
+    const definition = {
         definitionVersion: 2,
         exactOwnerName,
-        ...(ownerInstanceId ? { ownerInstanceId } : {}),
+        ...frozenOwnerFields(optionalNonEmptyString(value.ownerInstanceId, 'ownerInstanceId'), value.pluginSource),
         model,
         project,
         ...base,
-    });
+    };
+    validatePluginSourceOwner(definition);
+    return freezeDefinition(definition);
 }
 function validateFrozenDefinition(definition) {
     if (typeof definition.systemPrompt !== 'string') {
@@ -100,6 +101,24 @@ function validateFrozenDefinition(definition) {
     if (definition.ownerInstanceId !== undefined && !definition.ownerInstanceId.trim()) {
         throw new Error('Frozen Session Agent owner instance is invalid.');
     }
+    validatePluginSourceOwner(definition);
+}
+/** A Plugin Agent has no Custom Agent incarnation and is owned by its scoped name. */
+function validatePluginSourceOwner(definition) {
+    if (definition.pluginSource === undefined)
+        return;
+    const source = decodePluginSource(definition.pluginSource);
+    if (definition.ownerInstanceId || source.scopedName !== definition.exactOwnerName) {
+        throw new Error('Frozen Session Agent Plugin source is invalid.');
+    }
+}
+function frozenOwnerFields(ownerInstanceId, pluginSource) {
+    return {
+        ...(ownerInstanceId ? { ownerInstanceId } : {}),
+        ...(pluginSource === undefined
+            ? {}
+            : { pluginSource: Object.freeze(decodePluginSource(pluginSource)) }),
+    };
 }
 function freezeDefinition(definition) {
     const base = {
@@ -123,7 +142,7 @@ function freezeDefinition(definition) {
     return Object.freeze({
         definitionVersion: 2,
         exactOwnerName: definition.exactOwnerName,
-        ...(definition.ownerInstanceId ? { ownerInstanceId: definition.ownerInstanceId } : {}),
+        ...frozenOwnerFields(definition.ownerInstanceId, definition.pluginSource),
         model: Object.freeze({
             providerId: definition.model.providerId,
             modelId: definition.model.modelId,
@@ -206,6 +225,22 @@ function validateModel(model) {
         optionalPositiveInteger(model.contextWindow, 'contextWindow');
     if (model.maxOutputTokens !== undefined)
         optionalPositiveInteger(model.maxOutputTokens, 'maxOutputTokens');
+}
+const PLUGIN_SOURCE_FORMATS = new Set(['minimax', '\u0063\u006c\u0061\u0075\u0064\u0065']);
+function decodePluginSource(value) {
+    if (!isRecord(value) ||
+        value.kind !== 'plugin' ||
+        !PLUGIN_SOURCE_FORMATS.has(String(value.format))) {
+        throw new Error('Frozen Session Agent Plugin source is invalid.');
+    }
+    return {
+        kind: 'plugin',
+        pluginName: requiredNonEmptyString(value.pluginName, 'pluginSource.pluginName'),
+        format: value.format,
+        agentName: requiredNonEmptyString(value.agentName, 'pluginSource.agentName'),
+        scopedName: requiredNonEmptyString(value.scopedName, 'pluginSource.scopedName'),
+        packageDigest: requiredNonEmptyString(value.packageDigest, 'pluginSource.packageDigest'),
+    };
 }
 function validateProject(project) {
     requiredNonEmptyString(project.workspaceDir, 'workspaceDir');

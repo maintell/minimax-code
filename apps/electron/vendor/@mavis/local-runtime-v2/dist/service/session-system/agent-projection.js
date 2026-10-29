@@ -1,5 +1,7 @@
 import { CONTEXT_USAGE_COMPONENT_KINDS, RuntimeEventStatus, RuntimeStopReasonType, RuntimeEventType, } from '@mavis/agent-core/protocol';
 import { RespDataType, Role } from '@mavis/agent-core/protocol/agent-message';
+import { projectCanonicalAssistantBoundaries, } from './messages/query/canonical-assistant-boundaries.js';
+import { describeRetractedInput } from './messages/retracted-input.js';
 export function createSessionSystemAgentProjection(options) {
     const compactionLane = createCompactionProjectionLane();
     const startedCompactions = new Map();
@@ -129,6 +131,17 @@ export function createSessionSystemAgentProjection(options) {
         },
         compactionObserver: {
             observe: (input) => compactionLane.run(input.attemptId, async () => {
+                // Manual compaction never settles Session state; mark it idle before its start is shown.
+                if (input.status === 'started' && input.reason === 'manual') {
+                    const { sessionId, turnId, turnSequence } = input.context;
+                    const eventId = `compaction:${input.attemptId}:started`;
+                    try {
+                        await options.state.markIdle({ sessionId, turnId, turnSequence, eventId });
+                    }
+                    catch {
+                        // Best-effort like this observation path (no logger here); never block the display.
+                    }
+                }
                 await projectCompactionObservation(options, startedCompactions, input);
             }),
         },
@@ -145,59 +158,6 @@ async function terminalConversationActions(options, context) {
         // Transient action projection must never suppress the durable terminal boundary.
         return [];
     }
-}
-async function projectCanonicalAssistantBoundaries(options, input) {
-    const canonicalMessageIds = canonicalAssistantMessageIds(input.change);
-    if (canonicalMessageIds.length === 0)
-        return;
-    try {
-        const displayMessages = await options.messages.listTurn(input.context.sessionId, input.context.turnId);
-        const assistants = displayMessages.filter(isCanonicalAssistantDisplayMessage);
-        if (assistants.length < canonicalMessageIds.length)
-            return;
-        const targets = assistants.slice(-canonicalMessageIds.length);
-        await Promise.all(targets.flatMap((message, index) => {
-            const canonicalMessageId = canonicalMessageIds[index];
-            return canonicalMessageId
-                ? [
-                    options.messages.upsert({
-                        sessionId: input.context.sessionId,
-                        turnId: input.context.turnId,
-                        message: {
-                            ...message,
-                            canonical_message_id: canonicalMessageId,
-                        },
-                    }),
-                ]
-                : [];
-        }));
-    }
-    catch {
-        // The canonical commit is authoritative. This Display-side Fork anchor is
-        // best-effort and old rows retain the next-User compatibility boundary.
-    }
-}
-function canonicalAssistantMessageIds(change) {
-    const messages = change.messages;
-    const identities = change.committedIdentityVector;
-    if (change.reason !== 'messageDelta' ||
-        !messages ||
-        !identities ||
-        identities.length < messages.length) {
-        return [];
-    }
-    const offset = identities.length - messages.length;
-    return messages.flatMap((message, index) => {
-        const identity = identities[offset + index];
-        return message.role === Role.Assistant && typeof identity === 'string' && identity.length > 0
-            ? [identity]
-            : [];
-    });
-}
-function isCanonicalAssistantDisplayMessage(message) {
-    return (message.role === Role.Assistant &&
-        !(typeof message.kind === 'string' && message.kind.length > 0) &&
-        !(typeof message.displayKind === 'string' && message.displayKind.length > 0));
 }
 async function recallAssistantAttempt(options, input) {
     const displayMessages = await options.messages.listTurn(input.sessionId, input.turnId);
@@ -233,11 +193,15 @@ async function recallAssistantAttempt(options, input) {
     });
 }
 async function projectCommittedConversation(options, input) {
+    const slowNetworkRead = input.change.operation.slowNetworkRead
+        ? { slowNetworkRead: true }
+        : {};
     if (input.change.operation.kind === 'network-reconcile') {
         await options.conversationFacts.handle({
             kind: 'network-stopped',
             sessionId: input.context.sessionId,
             turnId: input.context.turnId,
+            ...slowNetworkRead,
         });
         return;
     }
@@ -245,9 +209,11 @@ async function projectCommittedConversation(options, input) {
         return;
     const displayMessages = await options.messages.listTurn(input.context.sessionId, input.context.turnId);
     const messageIds = displayMessages.flatMap((message) => typeof message.msg_id === 'string' && message.msg_id.length > 0 ? [message.msg_id] : []);
-    const lastUserMsgId = displayMessages.reduce((latest, message) => message.role === Role.User && typeof message.msg_id === 'string' && message.msg_id.length > 0
-        ? message.msg_id
+    const lastUser = displayMessages.reduce((latest, message) => message.role === Role.User && typeof message.msg_id === 'string' && message.msg_id.length > 0
+        ? message
         : latest, undefined);
+    const lastUserMsgId = lastUser?.msg_id;
+    const retractedInput = describeRetractedInput(lastUser);
     await options.messages.rewind({
         sessionId: input.context.sessionId,
         messageIds,
@@ -265,6 +231,10 @@ async function projectCommittedConversation(options, input) {
         turnId: input.context.turnId,
         variant: input.change.operation.variant ?? 'content',
         ...(lastUserMsgId ? { lastUserMsgId } : {}),
+        // 界面收到撤回时这些消息行已经删了；还没加载这一轮的界面（比如从首页发起的目标）
+        // 只能用 `lastUserContent` 回填输入框。
+        ...retractedInput,
+        ...slowNetworkRead,
     });
 }
 async function projectCompactionObservation(options, startedCompactions, input) {

@@ -1,6 +1,7 @@
 import { CONTEXT_USAGE_COMPONENT_KINDS, } from '@mavis/agent-core/protocol';
 import { copyCanonicalHistoryForPiCompatibility, validateCanonicalHistoryMessages, } from '../history/canonical-history-validation.js';
 import { captureSemanticSnapshot } from '../history/semantic-identity.js';
+import { recordSharedPrefixFallbackBestEffort } from './checkpoint-request-shape.js';
 import { compactionTokenUsageMetadata, createCompactionTokenUsageAccumulator, readCompactionTokenUsage, } from './token-usage.js';
 export { createCompactionTokenUsageAccumulator, readCompactionTokenUsage } from './token-usage.js';
 // Mark fire-and-forget deliveries as consumed without retaining a pending
@@ -36,8 +37,9 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
         const attemptId = attempts.create(trustedContext, leaseId, input.phase);
         const attemptState = { started: false };
         const providerTokenUsage = createCompactionTokenUsageAccumulator();
+        let awaitingHistoryCommit = false;
         try {
-            const automaticInput = automaticContextCompactionInput(input, options.maxSerializedInputBytes);
+            const automaticInput = automaticContextCompactionInput(input, options.maxSerializedInputBytes, options.checkpointRequestShape);
             const probe = dependencies.automatic.probeBeforeLlm?.(automaticInput);
             if (probe?.shouldStart === false) {
                 return resolveAutomaticCompactionResult({
@@ -55,6 +57,9 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 messages,
             }, {
                 onStarted: async () => {
+                    if (dependencies.barrier) {
+                        await dependencies.barrier.begin(trustedContext.sessionId, attemptId, trustedContext.turnId);
+                    }
                     const admission = await options.beforeCompaction?.();
                     if (admission === false)
                         throw new AutomaticContextCompactionDeferredError();
@@ -85,10 +90,17 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                     thinkingLevel: input.thinkingLevel,
                     checkpoint: metadata,
                 }),
+                onCheckpointSharedPrefixFallback: (reason) => recordSharedPrefixFallbackBestEffort(options.logger, dependencies.metricsClient, {
+                    context: trustedContext,
+                    attemptId,
+                    phase: input.phase,
+                    api: input.model.api,
+                    reason,
+                }),
                 onProviderRequestSettled: providerTokenUsage.observe,
                 getProviderTokenUsage: providerTokenUsage.snapshot,
             }), messages.length);
-            return resolveAutomaticCompactionResult({
+            const decision = resolveAutomaticCompactionResult({
                 dependencies,
                 context: trustedContext,
                 attemptId,
@@ -96,6 +108,8 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 messages,
                 result,
             });
+            awaitingHistoryCommit = decision.type === 'replaceMessages';
+            return decision;
         }
         catch (error) {
             if (error instanceof AutomaticContextCompactionDeferredError) {
@@ -142,15 +156,24 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                     : 'context_compaction_failed',
             };
         }
+        finally {
+            endAutomaticCompactionBarrier(dependencies.barrier, trustedContext, attemptId, awaitingHistoryCommit);
+        }
     };
 }
-function automaticContextCompactionInput(input, maxSerializedInputBytes) {
+function endAutomaticCompactionBarrier(barrier, context, attemptId, awaitingHistoryCommit) {
+    if (!awaitingHistoryCommit)
+        barrier?.end(context.sessionId, attemptId);
+}
+function automaticContextCompactionInput(input, maxSerializedInputBytes, checkpointRequestShape) {
     return {
         sessionId: input.sessionId,
         phase: input.phase,
+        ...(input.recovery ? { recovery: input.recovery } : {}),
         messages: input.messages,
         model: input.model,
         ...(maxSerializedInputBytes === undefined ? {} : { maxSerializedInputBytes }),
+        ...(checkpointRequestShape === 'shared_prefix' ? { checkpointRequestShape } : {}),
         streamFn: input.streamFn,
         apiKey: input.apiKey,
         headers: input.headers,
@@ -212,6 +235,9 @@ function captureCheckpointGenerationMetadata(value) {
         responseContentKinds: Object.freeze(responseContentKinds),
         stopReason: value.stopReason,
         outputTokens: value.outputTokens,
+        ...(value.requestShape === 'shared_prefix' || value.requestShape === 'isolated'
+            ? { requestShape: value.requestShape }
+            : {}),
     });
 }
 export function logCheckpointGeneratedBestEffort(logger, input) {
@@ -231,6 +257,7 @@ export function logCheckpointGeneratedBestEffort(logger, input) {
             response_content_kinds: [...checkpoint.responseContentKinds],
             stop_reason: checkpoint.stopReason,
             output_tokens: checkpoint.outputTokens,
+            ...(checkpoint.requestShape ? { request_shape: checkpoint.requestShape } : {}),
         }, '[local-runtime-v2] context compaction checkpoint generated');
     }
     catch {
@@ -668,64 +695,6 @@ export function readPostCompactionContextUsage(value) {
         components,
     };
 }
-export function readCompactionCommitMetadata(value) {
-    const lifecycle = readCompactionLifecycleMetadata(value);
-    if (!lifecycle || !isRecord(value))
-        return undefined;
-    const summary = Reflect.get(value, 'summary');
-    if (typeof summary !== 'string')
-        return undefined;
-    const currentUserSourceIndex = readOptionalCurrentUserSourceIndex(value, lifecycle);
-    if (currentUserSourceIndex === null)
-        return undefined;
-    return lifecycle.method === 'llm_checkpoint'
-        ? readCheckpointCommitMetadata(lifecycle, summary, currentUserSourceIndex)
-        : readToolResultCommitMetadata(value, lifecycle, summary, currentUserSourceIndex);
-}
-function readCheckpointCommitMetadata(lifecycle, summary, currentUserSourceIndex) {
-    if (currentUserSourceIndex !== undefined && lifecycle.messagesAfter !== 3)
-        return undefined;
-    return Object.freeze({
-        compactionId: lifecycle.compactionId,
-        method: 'llm_checkpoint',
-        summary,
-        ...(currentUserSourceIndex === undefined ? {} : { currentUserSourceIndex }),
-    });
-}
-function readToolResultCommitMetadata(value, lifecycle, summary, currentUserSourceIndex) {
-    if (lifecycle.method === 'llm_checkpoint')
-        return undefined;
-    const replacementSourceIndexes = Reflect.get(value, 'replacementSourceIndexes');
-    const expectedSourceCount = currentUserSourceIndex === undefined ? lifecycle.messagesAfter : lifecycle.messagesAfter - 2;
-    if (!Array.isArray(replacementSourceIndexes) ||
-        expectedSourceCount < 0 ||
-        replacementSourceIndexes.length !== expectedSourceCount ||
-        !replacementSourceIndexes.every((index, position) => Number.isSafeInteger(index) &&
-            index >= 0 &&
-            index < lifecycle.messagesBefore &&
-            index !== currentUserSourceIndex &&
-            (position === 0 || index > replacementSourceIndexes[position - 1]))) {
-        return undefined;
-    }
-    return Object.freeze({
-        compactionId: lifecycle.compactionId,
-        method: lifecycle.method,
-        summary,
-        replacementSourceIndexes: Object.freeze([...replacementSourceIndexes]),
-        ...(currentUserSourceIndex === undefined ? {} : { currentUserSourceIndex }),
-    });
-}
-function readOptionalCurrentUserSourceIndex(value, lifecycle) {
-    if (!Object.hasOwn(value, 'currentUserSourceIndex'))
-        return undefined;
-    const index = Reflect.get(value, 'currentUserSourceIndex');
-    return typeof index === 'number' &&
-        Number.isSafeInteger(index) &&
-        index >= 0 &&
-        index < lifecycle.messagesBefore
-        ? index
-        : null;
-}
 export function readCompactionAttemptId(value) {
     return isRecord(value) ? readNonEmpty(value, 'compactionAttemptId') : undefined;
 }
@@ -836,7 +805,7 @@ function tokenEstimatesMatch(left, right) {
 function isCompactionPhase(value) {
     return value === 'initial' || value === 'iteration' || value === 'manual';
 }
-function isRecord(value) {
+export function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 //# sourceMappingURL=context-compaction.js.map

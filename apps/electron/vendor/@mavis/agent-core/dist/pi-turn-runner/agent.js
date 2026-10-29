@@ -1,5 +1,6 @@
 import { Agent } from '@earendil-works/pi-agent-core';
 import { projectAgentMessagesForModel } from './outbound-message-normalizer.js';
+import { resolveMaxImagesPerRequest } from './request-image-limit.js';
 import { failureReason } from './terminal.js';
 export function toPiUserMessage(input) {
     const message = {
@@ -55,6 +56,18 @@ export function newAgent(turn) {
                     undetermined_image_mime_types: outbound.undeterminedImageMimeTypes,
                 }, '[pi-turn-runner] kept provider-bound images whose dimensions could not be determined');
             }
+            if (outbound.omittedImageCount > 0) {
+                // History keeps every image; only this request copy drops the oldest
+                // ones so it stays within the model's per-request image limit (#425).
+                turn.logger.info({
+                    event: 'outbound_images_limited',
+                    session_id: turn.input.sessionId,
+                    turn_id: turn.input.turnId,
+                    provider: turn.llm.model.provider,
+                    omitted_image_count: outbound.omittedImageCount,
+                    max_images_per_request: resolveMaxImagesPerRequest(turn.llm.model),
+                }, '[pi-turn-runner] replaced older provider-bound images with placeholders');
+            }
             return outbound.messages;
         },
         streamFn: turn.streamFn,
@@ -67,9 +80,30 @@ export function newAgent(turn) {
         ...(turn.input.shouldStopAfterTurn
             ? { shouldStopAfterTurn: turn.input.shouldStopAfterTurn }
             : {}),
+        ...(turn.input.unexpectedToolCallFallback
+            ? { unexpectedToolCallFallback: turn.input.unexpectedToolCallFallback }
+            : {}),
         ...(turn.llm.payloadTransform ? { onPayload: turn.llm.payloadTransform } : {}),
         ...(turn.llm.responseObserver ? { onResponse: turn.llm.responseObserver } : {}),
     });
+}
+/**
+ * Pi ends its loop on a provider error, so a response an afterLlmCall hook
+ * recovered from (already removed from the transcript) is repeated here by
+ * continuing from the same transcript.
+ */
+async function repeatRecoveredRequest(agent, turn, convergeAtIdle) {
+    for (let recovery = turn.recovery.pending; recovery; recovery = turn.recovery.pending) {
+        delete turn.recovery.pending;
+        if (turn.input.signal?.aborted)
+            return;
+        turn.recovery.active = recovery;
+        turn.metrics.forgetLLMFailureObservation();
+        await agent.continue();
+        await agent.waitForIdle();
+        await convergeAtIdle?.();
+        await agent.waitForIdle();
+    }
 }
 export async function runAgent(agent, turn, convergeAtIdle) {
     const startMode = turn.input.startMode ?? 'prompt';
@@ -84,12 +118,14 @@ export async function runAgent(agent, turn, convergeAtIdle) {
             ]);
         }
         await agent.waitForIdle();
+        await repeatRecoveredRequest(agent, turn, convergeAtIdle);
         await convergeAtIdle?.();
         await agent.waitForIdle();
+        await repeatRecoveredRequest(agent, turn, convergeAtIdle);
         if (turn.input.signal?.aborted) {
             return { kind: 'aborted' };
         }
-        if (agent.state.errorMessage) {
+        if (agent.state.errorMessage && !turn.requestStoppedBeforeSend) {
             return failureReason(agent.state.errorMessage, turn.metrics.getLLMFailureObservation()?.normalized);
         }
         return undefined;

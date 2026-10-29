@@ -1,3 +1,4 @@
+import { settleInBackground as settleDetached } from '../../infra/async/settle.js';
 import { PluginSystemError } from './errors.js';
 export function deferred() {
     let resolve;
@@ -12,25 +13,18 @@ export async function runAfter(prior, operation) {
     await prior;
     return operation();
 }
-export async function preparePluginSystemTurnCapabilities(_connectorRuntime, _signal) {
-    // Apps are discovered on demand by mcode-tools. Never resolve their catalog
-    // during turn admission: even a failed discovery must not change the prefix.
-    return freeze({ runtimeTools: freeze([]), runtimeToolBindings: freeze([]) });
-}
-export function capturePluginSystemTurnCapabilities(snapshot, preparation) {
+/**
+ * Apps are discovered and called through mcode-tools. Turn admission never resolves a Connector
+ * catalog, so a slow or failed discovery cannot delay the turn or change its tool prefix.
+ */
+export function capturePluginSystemTurnCapabilities(snapshot) {
+    const toolNames = new Set();
+    const bindingNames = new Set();
     return freeze({
         ...snapshot,
-        runtimeTools: mergeRuntimeTools(preparation?.runtimeTools ?? [], snapshot.runtimeTools),
-        runtimeToolBindings: mergeRuntimeToolBindings(preparation?.runtimeToolBindings ?? [], snapshot.runtimeToolBindings),
+        runtimeTools: freeze(snapshot.runtimeTools.filter((tool) => keepFirstName(tool.def.name, toolNames))),
+        runtimeToolBindings: freeze(snapshot.runtimeToolBindings.filter((binding) => keepFirstName(binding.tool.def.name, bindingNames))),
     });
-}
-function mergeRuntimeToolBindings(primary, secondary) {
-    const names = new Set();
-    return freeze([...primary, ...secondary].filter((binding) => keepFirstName(binding.tool.def.name, names)));
-}
-function mergeRuntimeTools(primary, secondary) {
-    const names = new Set();
-    return freeze([...primary, ...secondary].filter((tool) => keepFirstName(tool.def.name, names)));
 }
 function keepFirstName(name, names) {
     const key = name.trim().normalize('NFKC').toLocaleLowerCase('en-US');
@@ -88,10 +82,13 @@ export function waitForScopedOperation(operation, currentScopeKey, timeoutMs = 2
     return waitUntilSettledOrDeadline(ignoreFailure(operation.operation), timeoutMs);
 }
 export function settleInBackground(promise) {
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises -- detached background work is fail-closed by ignoreFailure or its own error boundary
-    (async () => {
-        await ignoreFailure(promise);
-    })();
+    if (promise)
+        settleDetached(promise);
+}
+/** Lets accepted official Mini App roots outlive cache pruning when the reconciler retains them. */
+export function officialPackageRetentionOption(reconciler) {
+    const retain = reconciler?.retainPackageRoot?.bind(reconciler);
+    return retain ? { retainOfficialPackage: retain } : {};
 }
 export function findEnabledCachedPackage(installations, contentDigest) {
     for (const installation of installations.values()) {
@@ -118,13 +115,24 @@ export function findLocalPlugin(snapshot, pluginName) {
     const key = normalizedPluginName(pluginName);
     return snapshot.localPlugins.find((plugin) => normalizedPluginName(plugin.name) === key);
 }
+export function assertPluginNameAvailable(pluginName, officialInstallations, snapshot) {
+    const key = normalizedPluginName(pluginName);
+    if (officialInstallations.some((item) => item.installed && normalizedPluginName(item.name) === key) ||
+        snapshot.localPlugins.some((item) => normalizedPluginName(item.name) === key)) {
+        throw new PluginSystemError('PLUGIN_ALREADY_EXISTS', 'Plugin name is already installed');
+    }
+}
 function freeze(value) {
     return Object.freeze(value);
 }
 /** Explicit disable/uninstall revokes persisted selections before publishing the new snapshot. */
 export async function revokeOfficialPluginSelection(onRevoked, mutation, scope) {
     if (!mutation.installExists || !mutation.enabled) {
-        await onRevoked?.({ pluginName: mutation.pluginName, scope });
+        await onRevoked?.({
+            pluginName: mutation.pluginName,
+            scope,
+            reason: mutation.installExists ? 'disabled' : 'uninstalled',
+        });
     }
 }
 /** Fence explicit mutations against both the active publication and current identity. */

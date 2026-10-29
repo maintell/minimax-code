@@ -18,9 +18,14 @@
  *     — injected env wins so host-provided identity or policy data can
  *     override any stale value baked into config or leaking from the parent
  *     process env.
+ *   * `maxBufferSize: MCP_STDIO_MAX_MESSAGE_BYTES` — the SDK default (10 MiB)
+ *     closes the connection when one JSON-RPC message is larger, which a single
+ *     full-resolution image result easily exceeds. Oversized images are
+ *     re-encoded later, before they reach a model request.
  */
 import { homedir } from 'node:os';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+export const MCP_STDIO_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 export function createStdioTransport(config, options) {
     return new SafeStdioClientTransport({
         command: config.command,
@@ -28,6 +33,7 @@ export function createStdioTransport(config, options) {
         env: buildProcessEnv(config.env, options?.env),
         cwd: config.cwd ?? homedir(),
         stderr: 'pipe',
+        maxBufferSize: MCP_STDIO_MAX_MESSAGE_BYTES,
     });
 }
 class SafeStdioClientTransport extends StdioClientTransport {

@@ -10,6 +10,7 @@ export function normalizeAbortSource(value) {
     switch (value) {
         case 'user_stop':
         case 'session_leave':
+        case 'agent_interrupt':
         case 'immediate_send':
         case 'input_safety':
         case 'output_safety':

@@ -34,16 +34,7 @@
     }
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
-    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
     "@mavis/agent-core": "file:../agent-core",
-    "@mavis/plugin-hooks": "file:../plugin-hooks",
-    "@mavis/background-task": "file:../background-task",
-    "@mavis/context-manager": "file:../context-manager",
-    "@mavis/protocol": "file:../protocol",
-    "@mavis/shared": "file:../shared",
-    "@mavis/system-reminder": "file:../system-reminder",
-    "@mavis/team": "file:../team",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@sinclair/typebox": "^0.34.0",
     "@vscode/ripgrep": "file:../../@vscode/ripgrep",

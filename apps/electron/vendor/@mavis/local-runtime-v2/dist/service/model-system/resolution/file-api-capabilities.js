@@ -17,15 +17,68 @@ export function normalizeLocalFileApiCapabilities(capabilities) {
             : {}),
     };
 }
-/** Client protection budgets, not claims about a Provider's actual transport limits. */
+/**
+ * Client protection budgets, not claims about a Provider's actual transport limits.
+ *
+ * The request body default is generous (64 MiB) so the provider's own
+ * rejection decides what is too large; the local gate only stops requests no
+ * provider would take. A rejection, by the provider or by this gate, compacts
+ * the history once and repeats the request. A gateway with a lower limit
+ * (Bedrock accepts 20 MB) may declare `max_request_body_bytes` to stop earlier.
+ */
 const DEFAULT_LOCAL_MULTIMODAL_LIMITS = {
     max_image_bytes_inline: 10_485_760,
     max_video_bytes_inline: 52_428_800,
     max_request_body_bytes: 67_108_864,
     max_attachments_count: 4,
 };
+/** Marks a ModelRef whose `max_request_body_bytes` is the default, not declared. */
+const DEFAULT_REQUEST_BODY_CAPABILITY = 'default_request_body_bytes';
+const MIB = 1_024 * 1_024;
+const MESSAGES_API_HOST = new URL('https://api.anthropic.com').hostname;
+/**
+ * Documented request body limits of first-party API hosts, less headroom: the
+ * Messages API 32 MB direct and 30 MB on Google Cloud, OpenAI Responses 512 MB.
+ * Matched on the exact hostname, so gateways keep the default.
+ */
+const KNOWN_HOST_REQUEST_BODY_BYTES = [
+    { matches: (hostname) => hostname === MESSAGES_API_HOST, bytes: 28 * MIB },
+    {
+        matches: (hostname, api) => api === 'anthropic-messages' &&
+            (hostname === 'aiplatform.googleapis.com' || hostname.endsWith('-aiplatform.googleapis.com')),
+        bytes: 26 * MIB,
+    },
+    { matches: (hostname) => hostname === 'api.openai.com', bytes: 64 * MIB },
+];
 /** Shared by ModelRef construction and live resolution of legacy ModelRefs. */
 export function normalizeLocalMultimodalLimitCapabilities(capabilities) {
+    const limits = normalizedLimits(capabilities);
+    if (normalizePositiveByteLimit(capabilities?.max_request_body_bytes) === undefined) {
+        Reflect.set(limits, DEFAULT_REQUEST_BODY_CAPABILITY, true);
+    }
+    return limits;
+}
+/**
+ * Provider request body budget: the declared limit, else the documented limit
+ * of a known first-party host, else the default.
+ */
+export function resolveLocalRequestBodyBytes(capabilities, endpoint) {
+    const declared = Number(normalizedLimits(capabilities).max_request_body_bytes);
+    const isDefault = Reflect.get(capabilities ?? {}, DEFAULT_REQUEST_BODY_CAPABILITY) === true ||
+        normalizePositiveByteLimit(capabilities?.max_request_body_bytes) === undefined;
+    if (!isDefault)
+        return declared;
+    let hostname;
+    try {
+        hostname = new URL(endpoint.baseUrl).hostname.toLowerCase();
+    }
+    catch {
+        return declared;
+    }
+    return (KNOWN_HOST_REQUEST_BODY_BYTES.find(({ matches }) => matches(hostname, endpoint.api))?.bytes ??
+        declared);
+}
+function normalizedLimits(capabilities) {
     return {
         max_image_bytes_inline: normalizePositiveByteLimit(capabilities?.max_image_bytes_inline) ??
             DEFAULT_LOCAL_MULTIMODAL_LIMITS.max_image_bytes_inline,

@@ -237,7 +237,7 @@ export class PluginDesktopFacade {
         try {
             // Persist explicit withdrawal before dispatch: a committed response can be lost.
             if (action === 'disable' || action === 'uninstall') {
-                await this.options.system.revokeOfficialSelection(requestedName, scope);
+                await this.options.system.revokeOfficialSelection(requestedName, scope, action === 'uninstall' ? 'uninstalled' : 'disabled');
             }
             const response = await this.options.registryClient.mutate(requestedName, action);
             assertOfficialMutationResponse(response, requestedName);
@@ -248,6 +248,7 @@ export class PluginDesktopFacade {
                 installationPolicy: response.installationPolicy ?? PluginInstallationPolicy.USER_MANAGED,
                 ...(response.package ? { package: response.package } : {}),
             }, scope);
+            this.forgetMiniAppPermissions(action, response.installExists, requestedName, 'official');
             return response;
         }
         catch (error) {
@@ -258,6 +259,12 @@ export class PluginDesktopFacade {
             throw error;
         }
     }
+    /** A confirmed uninstall drops the Mini App switches; a reinstall starts fully enabled. */
+    forgetMiniAppPermissions(action, installExists, pluginName, source) {
+        if (action !== 'uninstall' || installExists)
+            return;
+        this.options.system.miniAppPublication.forgetPermissions(pluginName, source);
+    }
     async mutateLocal(req, action) {
         if (action === 'install') {
             throw new PluginDesktopFacadeError('LOCAL_PLUGIN_INSTALL_UNSUPPORTED');
@@ -265,6 +272,7 @@ export class PluginDesktopFacade {
         const result = action === 'uninstall'
             ? await this.options.system.uninstallLocalPlugin(req.pluginName)
             : await this.options.system.setLocalPluginEnabled(req.pluginName, action === 'enable');
+        this.forgetMiniAppPermissions(action, result.installExists, req.pluginName, 'local');
         return {
             source: InstalledPluginSource.LOCAL,
             installExists: result.installExists,
@@ -418,6 +426,7 @@ function officialInstalledCapabilities(plugin) {
         mcpServerCount: plugin?.mcpServers.length ?? 0,
         skillCount: plugin?.skills.length ?? 0,
         hookCount: plugin?.hooks?.length ?? 0,
+        agentCount: plugin?.agents?.length ?? 0,
     };
 }
 function overlayOfficialSummary(summary, installations) {
@@ -471,6 +480,7 @@ function localMarketplaceSummary(plugin) {
             mcpServerCount: plugin.plugin.mcpServers.length,
             skillCount: plugin.plugin.skills.length,
             hookCount: plugin.plugin.hooks?.length ?? 0,
+            agentCount: plugin.plugin.agents?.length ?? 0,
         },
         installExists: true,
         enabled: plugin.enabled,
@@ -501,6 +511,15 @@ function pluginPackageDetail(plugin, installExists, enabled) {
             content: skill.content,
         })),
         exampleQueries: [...plugin.exampleQueries],
+        ...(plugin.agents?.length
+            ? {
+                agents: plugin.agents.map((agent) => ({
+                    name: agent.scopedName,
+                    description: agent.description,
+                    content: agent.content,
+                })),
+            }
+            : {}),
     };
 }
 function pluginPackageSummary(plugin, installExists, enabled) {
@@ -516,6 +535,7 @@ function pluginPackageSummary(plugin, installExists, enabled) {
             mcpServerCount: plugin.mcpServers.length,
             skillCount: plugin.skills.length,
             hookCount: plugin.hooks?.length ?? 0,
+            agentCount: plugin.agents?.length ?? 0,
         },
         installExists,
         enabled,

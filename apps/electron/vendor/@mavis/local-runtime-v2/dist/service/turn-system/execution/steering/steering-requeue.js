@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { createUserMessageId, isQueueMessageSource } from '../../../session-system/index.js';
-import { isUserSteeringProducer } from '../../agent-host/contracts.js';
+import { isTeardownDurableSteeringProducer } from '../../agent-host/contracts.js';
 import { queueModelFromAgentHost } from '../../agent-host/index.js';
 import { pausesQueueOnAbort } from '../queue-pause-on-abort.js';
 // Wake publications may legitimately outlive `drain` — they await
@@ -14,7 +14,9 @@ const PRERELEASE_COMMIT_TIMEOUT_MS = 2_000;
  * Routes admitted-but-unconsumed user steering of an ended Turn (Decision v5):
  * exit-close batches return to the Session queue as queued items and wake the
  * dispatcher; abort/abnormal-seal batches fall into the conversation instead.
- * Non-user producers keep drop semantics on both lanes.
+ * Non-user producers keep drop semantics on both lanes, except the teardown-
+ * durable machine producers (AskUser v2 answers): the user already answered,
+ * so dropping the steer would lose the answer for good.
  */
 export function createSteeringRequeue(options) {
     const inflight = new Map();
@@ -92,7 +94,7 @@ export function createSteeringRequeue(options) {
         discard(batch) {
             const messages = batch.messages
                 .flatMap((message) => message.batchMembers ?? [message])
-                .filter((message) => isUserSteeringProducer(message.producerId))
+                .filter((message) => isTeardownDurableSteeringProducer(message.producerId, batch.workClosed === true))
                 .map((message) => ({ ...message, createdAt: message.createdAt ?? Date.now() }));
             if (messages.length === 0)
                 return;
@@ -365,6 +367,7 @@ function toBatchRequeueInput(batch, agentName, messages) {
     const model = [...members].reverse().find((member) => member.model)?.model;
     return {
         ...toRequeueInput(batch.sessionId, agentName, messages[0]),
+        source: requeueSource(messages),
         itemId: messages[0].queueClaim?.itemId ?? messages[0].sourceMessageId ?? id,
         clientRequestId: id,
         userMessageId: first.userMessageId,
@@ -374,12 +377,22 @@ function toBatchRequeueInput(batch, agentName, messages) {
         ...(model ? { model } : {}),
     };
 }
+/**
+ * Requeued user steering is the user's own composer input, except a batch of only Mini App text:
+ * it stays the Mini App's, which keeps it out of the user's editable queue.
+ */
+function requeueSource(messages) {
+    return messages.every((message) => message.provenance.source === 'miniapp') ? 'miniapp' : 'api';
+}
 function batchQueueMessage(members) {
     if (members.length === 1)
         return members[0].message;
     return {
         content: members.map((member) => member.message.content).join('\n\n'),
         attachments: members.flatMap((member) => member.message.attachments),
+        ...(members.some((member) => member.message.computerUse?.enable === true)
+            ? { computerUse: { enable: true } }
+            : {}),
         hideUserMessage: members.every((member) => member.message.hideUserMessage === true),
         ...(members.some((member) => member.message.displayContent !== undefined)
             ? {
@@ -423,6 +436,7 @@ function toRequeueInput(sessionId, agentName, message) {
         message: {
             content: input.text,
             attachments: (input.attachments ?? []).flatMap(toRequeueAttachment),
+            ...(input.computerUse ? { computerUse: { ...input.computerUse } } : {}),
             ...(delivery?.hideUserMessage !== undefined
                 ? { hideUserMessage: delivery.hideUserMessage }
                 : {}),

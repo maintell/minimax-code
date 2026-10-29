@@ -1,3 +1,4 @@
+import { addGitObservation, startGitCommandObservation, finishGitCommandObservation, } from '../git-read-observation.js';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -7,6 +8,7 @@ const GIT_MAX_BUFFER = 16 * 1024 * 1024;
 export async function git(args, workspace, options = {}) {
     if (options.signal?.aborted)
         throw abortError();
+    const started = startGitCommandObservation(options.trace);
     try {
         const pending = execFile('git', ['-c', 'core.quotePath=false', '--no-optional-locks', ...args], {
             cwd: resolve(workspace),
@@ -28,12 +30,16 @@ export async function git(args, workspace, options = {}) {
         if (isAbortFailure(error, options.signal)) {
             throw abortError();
         }
+        addGitObservation(options.trace, 'nonzero_exit_count');
         const err = error;
         return {
             code: typeof err.code === 'number' ? err.code : 1,
             stdout: bufferToString(err.stdout),
             stderr: bufferToString(err.stderr) || err.message,
         };
+    }
+    finally {
+        finishGitCommandObservation(options.trace, args, started);
     }
 }
 /**

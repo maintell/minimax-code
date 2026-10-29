@@ -27,8 +27,9 @@ export { HARD_BLOCKED_REGISTRY, SOFT_RISK_REGISTRY, SUBCOMMAND_DANGEROUS_PATTERN
 // ── Decision engine ──
 export { PermissionEngine } from './engine.js';
 export { registerDefaultCheckers } from './tools/index.js';
-export { unwrapCommandWrappers } from './tools/bash-wrapper-unwrap.js';
+export { unwrapCommandWrappers, unwrapBashCommandWrappers, readBashInlineScript, } from './tools/bash-wrapper-unwrap.js';
 export { isRmCommand, parseRmTargets, splitCommand } from './tools/bash-permission.js';
+export { splitShellSourceSegments } from './tools/bash-split.js';
 export { parseScriptPlainCommands, parseShellLcPlainCommands, parseShellLcSingleCommandPrefix, } from './tools/bash-ast.js';
 export { parseWindowsNativeDelete, } from './tools/windows-native-delete.js';
 export { readWindowsTrashExecution, withWindowsTrashExecution, } from './windows-trash-execution.js';
@@ -40,6 +41,10 @@ export { isSameResolvedPath } from './tools/path-identity.js';
 export { createToolPermissionContext } from './context.js';
 export { resolvePermissionPath } from './path-resolver.js';
 export { extractBashPathIntents } from './tools/path-capability.js';
+export { readBashCommand, gitBashCommandName } from './tools/bash-command.js';
+export { findHeredocBodies } from './tools/bash-split.js';
+export { isShellCommentStart, findShellCommentLineEnd, readBashExpansion, } from './tools/bash-expansion.js';
+export { commandHasExecutedHeredocBody } from './tools/bash-safety-scan.js';
 // ── Permission Core contract / reducer ──
 export { reducePermissionClassifierDecision, reducePermissionDecision, reducePermissionEvaluation, permissionModeToProfile, } from './permission-core.js';
 export { adaptLegacyPermissionResult, evaluateLegacyPermission, } from './legacy-permission-adapter.js';

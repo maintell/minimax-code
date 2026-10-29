@@ -6,6 +6,11 @@ function hasGetResponse(err) {
         'getResponse' in err &&
         typeof err.getResponse === 'function');
 }
+/** Keeps the original failure visible in logs when it was mapped to a stable status. */
+function describeError(err) {
+    const cause = err instanceof Error ? err.cause : undefined;
+    return cause === undefined ? String(err) : `${String(err)} (cause: ${String(cause)})`;
+}
 /** Start best-effort cancellation without delaying the replacement response. */
 export function cancelDiscardedBody(body) {
     if (!body)
@@ -65,7 +70,7 @@ export function errorBoundaryMiddleware() {
         else {
             const body = toErrorBody(err);
             if (body.code >= 500)
-                ctx.logger.ctxError(ctx, {}, `unhandled error: ${String(err)}`);
+                ctx.logger.ctxError(ctx, {}, `unhandled error: ${describeError(err)}`);
             replacement = new Response(JSON.stringify(body), {
                 status: body.code,
                 headers: responseHeadersFromHttpServiceContext(ctx, { 'Content-Type': 'application/json' }),

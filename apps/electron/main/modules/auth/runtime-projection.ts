@@ -38,7 +38,12 @@ function synchronizeProjection(session, observedLease) {
                     continue;
                 }
                 session.applyRuntimeIdentity?.(identity);
-                await setLocalRuntimeAuthContext({ accessToken: lease.accessToken, loginEpoch: lease.loginEpoch, ...identity }, { prepare: false, persistence: 'memory-only' });
+                await setLocalRuntimeAuthContext({
+                    accessToken: lease.accessToken,
+                    expiresAtMs: lease.expiresAtMs,
+                    loginEpoch: lease.loginEpoch,
+                    ...identity,
+                }, { prepare: false, persistence: 'memory-only' });
                 return { lease, identity };
             }
             throw new Error('Desktop account changed while resolving its identity. Please retry.');

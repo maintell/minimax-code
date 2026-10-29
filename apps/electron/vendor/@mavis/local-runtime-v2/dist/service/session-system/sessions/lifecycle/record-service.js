@@ -2,12 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { hasConversationTaskModelSelection, } from '@mavis/conversation-contract';
 import { isCurrentSessionAgentDefinition, withCurrentSessionAgentDefinitionProject, } from '../repo/agent-binding.js';
 import { isTaskSession } from '../repo/drizzle/normalization.js';
-import { AgentServiceError } from '../../../agent/errors.js';
+import { isAgentNotFoundError, reportDeletedAgentBackfillSkip, } from './backfill-diagnostics.js';
 import { SessionServiceError } from '../errors.js';
 import { isDefaultProjectWorkspace } from '../../shared/project-workspace.js';
-import { appModeFields, assertNativeMutation, assertTaskParent, createDefaultWorkspaceIdentity, errorMessage, internalDefaultWorkspaceIdentity, internalExplicitWorkspaceDir, modelKey, nonEmpty, normalizeAppMode, normalizeMemoryPolicyMutation, optionalModelVariant, sessionCaptureCandidate, sessionNotFound, taskMemoryPolicyFor, taskWorkspaceFor, visibilityForInternalKind, visibilityForKind, whenDefined, whenPresent, } from './record-service-fields.js';
+import { appModeFields, assertNativeMutation, assertTaskParent, createDefaultWorkspaceIdentity, errorMessage, internalDefaultWorkspaceIdentity, internalExplicitWorkspaceDir, metadataSessionKind, modelFieldsFromDefinition, modelKey, nonEmpty, normalizeAppMode, normalizeSessionMutation, optionalModelVariant, sessionCaptureCandidate, sessionNotFound, taskMemoryPolicyFor, taskWorkspaceFor, visibilityForInternalKind, visibilityForKind, whenDefined, whenPresent, } from './record-service-fields.js';
 export class SessionRecordService {
     deps;
+    captureAgentShell;
+    bindAgentShellCapture(capture) {
+        this.captureAgentShell = capture;
+    }
     makeSessionId;
     taskAgentBindingCapture;
     constructor(deps) {
@@ -85,36 +89,10 @@ export class SessionRecordService {
             // Startup backfill sweep tolerates a deleted historical Agent so one dead
             // reference does not stop the runtime from reaching `ready()`. Explicit
             // Session reopen still fails closed through ensureSessionAgentDefinition.
-            if (!this.isAgentNotFoundError(error))
+            if (!isAgentNotFoundError(error))
                 throw error;
-            this.reportDeletedAgentBackfillSkip(session);
+            reportDeletedAgentBackfillSkip(session, this.deps.backfillDiagnostics);
         }
-    }
-    reportDeletedAgentBackfillSkip(session) {
-        // Telemetry delivery MUST stay best-effort here. The capture layer has
-        // already decided this is a deleted-Agent skip and the sweep must continue.
-        try {
-            this.deps.backfillDiagnostics?.reportAgentDefinitionSkip({
-                code: 'AGENT_NOT_FOUND',
-                reason: 'startup-backfill-deleted-agent-skip',
-                sessionId: session.sessionId,
-                agentName: session.agentName,
-                status: session.status,
-                sessionKind: session.sessionKind,
-            });
-        }
-        catch (sinkError) {
-            // A failing logger or network sink cannot re-escalate the skipped row.
-            void sinkError;
-        }
-    }
-    /**
-     * True only when the error is an `AgentServiceError` carrying the stable
-     * `AGENT_NOT_FOUND` code. Other `AgentServiceError` codes, Session-level
-     * errors, plain Errors, and any wrapped error keep failing the sweep.
-     */
-    isAgentNotFoundError(error) {
-        return error instanceof AgentServiceError && error.code === 'AGENT_NOT_FOUND';
     }
     /** Backfills only the frozen definition of a historical Task, once. */
     async ensureTaskAgentBinding(sessionId) {
@@ -294,6 +272,7 @@ export class SessionRecordService {
                 ...(hasConversationTaskModelSelection(input.taskModelSelection)
                     ? { taskModelSelection: input.taskModelSelection }
                     : {}),
+                pluginAgent: input.input.pluginAgentDefinition,
             }),
         };
     }
@@ -333,6 +312,7 @@ export class SessionRecordService {
             sessionType: 'root',
             sessionKind: 'conversation',
             title: 'Main',
+            titleSource: 'auto',
             parentSessionId: null,
             origin: 'root-repair',
         });
@@ -372,6 +352,7 @@ export class SessionRecordService {
         });
     }
     async captureSessionAgentDefinition(input) {
+        assertPluginAgentTaskSession(input.session, input.pluginAgent);
         if (!isTaskSession(input.session))
             return undefined;
         const capture = this.taskAgentBindingCapture;
@@ -394,6 +375,7 @@ export class SessionRecordService {
             ...(hasConversationTaskModelSelection(input.taskModelSelection)
                 ? { taskModelSelection: input.taskModelSelection }
                 : {}),
+            pluginAgent: input.pluginAgent,
         });
     }
     async captureHistoricalTaskAgentBinding(input) {
@@ -434,14 +416,20 @@ export class SessionRecordService {
         throw new SessionServiceError('agent-not-found', `Agent not found: ${agentName}`);
     }
     async mutateSession(sessionId, fields, expectedModel, expectedTitle) {
+        const signal = expectedTitle?.signal;
+        signal?.throwIfAborted();
         const current = await this.requireSession(sessionId);
+        signal?.throwIfAborted();
         assertNativeMutation(current);
         if (fields.title !== undefined &&
             fields.title !== null &&
             (await this.deps.titlePolicy.blocks(fields.title, current))) {
             throw new SessionServiceError('content-policy-rejected', 'Content validation failed');
         }
-        const normalizedFields = normalizeMemoryPolicyMutation(current, fields);
+        const normalizedFields = normalizeSessionMutation(current, fields);
+        // Policy checks may involve remote I/O. Revocation must be checked at the
+        // durable write boundary, not only before starting that request.
+        signal?.throwIfAborted();
         if (Object.keys(normalizedFields).length === 0)
             return current;
         const updated = await this.deps.metadata.update(sessionId, normalizedFields, expectedModel, expectedTitle);
@@ -470,7 +458,14 @@ export class SessionRecordService {
         return session;
     }
     async createRecord(input) {
-        const created = await this.deps.metadata.create(input);
+        const capture = await this.captureAgentShell?.(input.parentSessionId);
+        const created = await this.deps.metadata.create({
+            ...input,
+            ...(capture?.agentShell ? { agentShell: capture.agentShell } : {}),
+            ...(capture?.agentShellPreference
+                ? { agentShellPreference: capture.agentShellPreference }
+                : {}),
+        });
         try {
             await this.deps.artifacts?.initialize(created.sessionId);
         }
@@ -547,17 +542,8 @@ function toInternalMetadataCreateInput(context) {
         ...internalModelFields(context.input, context.taskCapture, context.forkedAgentDefinition),
         ...internalBindingFields(context.taskCapture, context.forkedAgentDefinition),
         origin: context.input.origin ?? 'user',
+        ...whenPresent('createdBySessionId', context.input.createdBySessionId),
     };
-}
-function metadataSessionKind(input) {
-    const requestedKind = input.sessionKind ?? 'conversation';
-    if (requestedKind === 'unknown') {
-        throw new SessionServiceError('invalid-session-kind', `Unsupported Session kind: ${requestedKind}`);
-    }
-    if ((requestedKind === 'task' || requestedKind === 'peek') && !input.parentSessionId) {
-        throw new SessionServiceError('parent-required', `${requestedKind} Session requires a parent Session`);
-    }
-    return requestedKind;
 }
 function metadataIdentityFields(context, sessionKind) {
     const { input, taskWorkspace, runLocation } = context;
@@ -607,6 +593,7 @@ function internalIdentityFields(context) {
         workspaceDir: context.workspaceDir,
         isDefaultWorkspace: context.isDefaultWorkspace,
         title: input.title ?? null,
+        titleSource: input.titleSource ?? (input.title?.trim() ? 'auto' : 'default'),
         parentSessionId: input.parentSessionId ?? null,
     };
 }
@@ -617,6 +604,7 @@ function internalMetadataFields(context, sessionType) {
         ...whenPresent('visibility', visibility),
         ...whenPresent('purpose', input.purpose),
         ...whenPresent('originCronId', input.originCronId),
+        ...whenPresent('miniAppOrigin', input.miniAppOrigin),
         ...whenPresent('runLocation', input.runLocation),
         ...appModeFields(sessionType, input.appMode ?? parent?.appMode),
     };
@@ -637,18 +625,14 @@ function internalVariantField(input, taskCapture) {
         return whenDefined('effectiveModelVariant', taskCapture.effectiveModelVariant);
     return whenDefined('effectiveModelVariant', input.effectiveModelVariant);
 }
+function assertPluginAgentTaskSession(session, pluginAgent) {
+    if (pluginAgent && !isTaskSession(session)) {
+        throw new SessionServiceError('invalid-session-kind', 'Plugin Agent requires a Task Session');
+    }
+}
 function internalBindingFields(taskCapture, forkedAgentDefinition) {
     if (forkedAgentDefinition)
         return { agentDefinition: forkedAgentDefinition };
     return metadataBindingFields(taskCapture);
-}
-function modelFieldsFromDefinition(definition) {
-    return {
-        effectiveModel: `${definition.model.providerId}/${definition.model.modelId}`,
-        ...whenDefined('effectiveModelVariant', definition.model.variant),
-        ...whenDefined('effectiveModelThinking', definition.model.thinking),
-        ...whenDefined('effectiveModelContextWindow', definition.model.contextWindow),
-        ...whenDefined('effectiveModelMaxOutputTokens', definition.model.maxOutputTokens),
-    };
 }
 //# sourceMappingURL=record-service.js.map

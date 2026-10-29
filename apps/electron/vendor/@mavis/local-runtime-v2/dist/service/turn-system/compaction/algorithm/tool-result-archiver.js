@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { listRequestImages, replaceRequestImages, } from '@mavis/agent-core/pi-turn-runner';
+import { archivedImageText } from '@mavis/context-manager';
 import { parseToolRounds } from './history-reduction.js';
 // Defensive defaults for standalone algorithm callers. Production always injects
 // the config.yaml/Apollo-resolved settings from production-composition.
@@ -103,6 +105,71 @@ export class ToolResultArchiver {
             trimmedResultCount: replacements.length,
             actualSavingsBytes: materialized.actualSavingsBytes,
         };
+    }
+    /**
+     * Replaces every image in history, user attachments and tool results alike,
+     * with a receipt naming its file, so later requests carry text instead. An
+     * image whose history names no source file is written to the Session
+     * artifacts first. Video blocks stay: they have their own projection.
+     */
+    async archiveImages(input) {
+        const images = listRequestImages(input.messages).filter((image) => !image.mimeType?.toLowerCase().startsWith('video/'));
+        if (images.length === 0)
+            return undefined;
+        const receipts = new Map();
+        let savedBytes = 0;
+        for (const image of images) {
+            const receipt = archivedImageText(image.path ?? (await this.writeImageFile(input, image)));
+            receipts.set(image.key, receipt);
+            savedBytes += Math.max(0, image.base64Bytes - Buffer.byteLength(receipt));
+        }
+        logBestEffort(this.options.logger, 'info', {
+            event: 'context_image_archive',
+            session_id: input.sessionId,
+            archived_image_count: images.length,
+            saved_bytes: savedBytes,
+        });
+        return {
+            messages: replaceRequestImages(input.messages, (image) => receipts.get(image.key)),
+            archivedImageCount: images.length,
+            savedBytes,
+        };
+    }
+    /**
+     * Writes an image of a tool result or user message to the Session artifacts;
+     * `undefined` when it cannot. A user image is keyed by its message position,
+     * as user messages have no call id.
+     */
+    async writeImageFile(input, image) {
+        const message = input.messages[image.messageIndex];
+        if (!this.options.writeImageArtifact)
+            return undefined;
+        if (message?.role !== 'toolResult' && message?.role !== 'user')
+            return undefined;
+        const block = Array.isArray(message.content) ? message.content[image.blockIndex] : undefined;
+        if (block?.type !== 'image')
+            return undefined;
+        const owner = message.role === 'toolResult'
+            ? { toolCallId: message.toolCallId, toolName: message.toolName }
+            : { toolCallId: `user-${image.messageIndex}`, toolName: 'user' };
+        try {
+            const artifact = await this.options.writeImageArtifact({
+                sessionId: input.sessionId,
+                ...owner,
+                data: block.data,
+                mimeType: block.mimeType,
+            });
+            return nonEmptyString(artifact.reference);
+        }
+        catch (error) {
+            logBestEffort(this.options.logger, 'error', {
+                event: 'context_image_artifact_failed',
+                session_id: input.sessionId,
+                tool_name: owner.toolName,
+                reason: safeErrorReason(error),
+            });
+            return undefined;
+        }
     }
     finishMaterialization(input, replacements) {
         const actualSavingsBytes = calculateActualSavings(input.plan.candidates, replacements);

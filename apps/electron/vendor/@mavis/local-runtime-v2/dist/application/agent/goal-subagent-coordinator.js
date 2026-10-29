@@ -2,22 +2,16 @@ import { GOAL_VERIFIER_READONLY_PROFILE } from '@mavis/config';
 import { summarizeCommittedPiGoalUsage } from '../../service/session-system/index.js';
 import { renderGoalVerifierReminder } from './goal-verifier-reminder.js';
 /**
- * The only tools the builtin `verifier` role holds that a Goal verifier child
- * must not have. Everything else it could reach — write, edit, todowrite, the
- * whole `task*` family, memory, computer use — is already gone by the time a
- * call reaches this guard: the role asset grants five tools and the canonical
- * read-only ceiling subtracts the rest.
- */
-const GOAL_VERIFIER_DENIED_TOOLS = new Set(['web_fetch', 'web_search']);
-/**
  * Per-run counter for the Goal verifier child, and nothing more.
  *
  * The child runs on the ordinary delegation path under the builtin `verifier`
  * role, so this holds no authority: a Turn that claims a run id gains a
- * reminder, a two-tool denylist, and a hard turn/token ceiling — all of them
- * restrictions. There is nothing here worth forging.
+ * reminder, cumulative usage admission and output caps — all restrictions. There
+ * is nothing here worth forging. Its tools are the role's own, `web_fetch` and
+ * `web_search` included: the role asset and the canonical read-only ceiling
+ * already remove every write, Git, delegation and Goal capability.
  *
- * The ceiling still has to live somewhere: `pi-turn-runner` has no generic
+ * Admission still has to live somewhere: `pi-turn-runner` has no generic
  * iteration limit, so `beforeLlm` below is the only thing standing between a
  * looping child and the provider's context window.
  */
@@ -32,8 +26,8 @@ export class GoalVerifierChildCoordinator {
         });
     }
     reminder(runId) {
-        const hostContext = this.runs.get(runId)?.hostContext;
-        return hostContext ? renderGoalVerifierReminder(hostContext) : undefined;
+        const state = this.runs.get(runId);
+        return state ? renderGoalVerifierReminder(state.hostContext, state.objective) : undefined;
     }
     release(runId) {
         const state = this.runs.get(runId);
@@ -50,14 +44,15 @@ export class GoalVerifierChildCoordinator {
     /**
      * Host-clamped output cap for one provider request of this child run.
      *
-     * `beforeLlm` / `afterLlm` can only compare what the child has already spent,
-     * so a single response is free to blow past the run's cap before anything
-     * notices. Binding the same clamp to each request is what makes that
-     * impossible. An unknown run reports no cap; `beforeLlm` already aborts it
-     * before a request is ever made.
+     * Remaining reported total usage limits the controllable output of the next
+     * request. Input/reasoning and missing usage cannot be hard-capped by this
+     * output setting; afterLlm still accounts for their actual reported usage.
+     * Unknown runs report no cap and are rejected by beforeLlm. A host already
+     * bound to a budgeted run treats a disappearing cap as exhausted.
      */
     outputTokenCap(runId) {
-        return this.runs.get(runId)?.maxTokens;
+        const state = this.runs.get(runId);
+        return state?.maxTokens === undefined ? undefined : Math.max(0, state.maxTokens - state.tokens);
     }
     beforeLlm(runId, resolvedProvider) {
         const state = this.runs.get(runId);
@@ -98,22 +93,14 @@ export class GoalVerifierChildCoordinator {
         }
         return state.issue ? { type: 'fail', reason: state.issue.message } : undefined;
     }
-    beforeTool(runId, toolContext) {
-        const state = this.runs.get(runId);
-        if (!state) {
-            return {
-                block: true,
-                reason: 'GOAL_VERIFIER_CAPABILITY_VIOLATION: child run is no longer active.',
-            };
-        }
-        const toolName = toolContext.toolCall.name;
-        if (!GOAL_VERIFIER_DENIED_TOOLS.has(toolName))
+    beforeTool(runId) {
+        // Lifecycle guard only: a live run keeps every tool its role grants.
+        if (this.runs.has(runId))
             return undefined;
-        const reason = `GOAL_VERIFIER_CAPABILITY_VIOLATION: readonly Goal verification blocked tool "${toolName}".`;
-        // Latched, not aborted here: the blocked result goes back to the model and
-        // the next `beforeLlm` stops the run on the latched issue.
-        this.latchIssue(state, { code: 'capability_violation', message: reason });
-        return { block: true, reason };
+        return {
+            block: true,
+            reason: 'GOAL_VERIFIER_CAPABILITY_VIOLATION: child run is no longer active.',
+        };
     }
     latchIssue(state, issue) {
         state.issue ??= issue;
@@ -148,9 +135,9 @@ export function createGoalVerifierChildExtension(coordinator) {
                 const runId = goalVerifierRunId(turn.turnIntent);
                 return runId ? coordinator.afterLlm(runId, input.message) : undefined;
             });
-            pi.on('before_tool_call', (input, _signal, turn) => {
+            pi.on('before_tool_call', (_input, _signal, turn) => {
                 const runId = goalVerifierRunId(turn.turnIntent);
-                return runId ? coordinator.beforeTool(runId, input) : undefined;
+                return runId ? coordinator.beforeTool(runId) : undefined;
             });
         },
     };

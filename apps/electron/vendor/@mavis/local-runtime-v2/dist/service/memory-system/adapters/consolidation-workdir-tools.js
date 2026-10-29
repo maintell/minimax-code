@@ -60,6 +60,37 @@ async function listFiles(root, prefix = '') {
     }
     return names.sort();
 }
+/** 只有两份产物可写；其余输入文件只读。 */
+async function resolveArtifact(workDir, name) {
+    if (name !== 'MEMORY.md' && name !== 'memory_summary.md') {
+        return { error: { text: 'Only the two memory artifacts are writable.', isError: true } };
+    }
+    const full = await resolveSafePath(workDir, name, true);
+    if (!full)
+        return { error: { text: `Invalid file name: ${name}`, isError: true } };
+    return { full, name };
+}
+/** 读取产物现有正文；文件尚不存在时视为空，其余读取失败返回 undefined。 */
+async function readExisting(full) {
+    try {
+        return await readFile(full, 'utf8');
+    }
+    catch (error) {
+        return error.code === 'ENOENT' ? '' : undefined;
+    }
+}
+async function saveArtifact(full, name, content, verb) {
+    if (Buffer.byteLength(content, 'utf8') > MAX_WRITE_BYTES) {
+        return { text: 'Content exceeds the per-file write limit.', isError: true };
+    }
+    try {
+        await writeFile(full, content, 'utf8');
+        return { text: `${verb} ${name}.` };
+    }
+    catch {
+        return { text: `Failed to write ${name}.`, isError: true };
+    }
+}
 export function createConsolidationWorkdirTools(workDir) {
     return [
         {
@@ -104,25 +135,47 @@ export function createConsolidationWorkdirTools(workDir) {
                 content: Type.String(),
             }, { additionalProperties: false }),
             async execute(args) {
-                if (args.path !== 'MEMORY.md' && args.path !== 'memory_summary.md')
-                    return { text: 'Only the two memory artifacts are writable.', isError: true };
-                const full = await resolveSafePath(workDir, args.path, true);
-                if (!full)
-                    return { text: `Invalid file name: ${String(args.path)}`, isError: true };
-                const content = args.content;
-                if (typeof content !== 'string') {
+                const target = await resolveArtifact(workDir, args.path);
+                if ('error' in target)
+                    return target.error;
+                if (typeof args.content !== 'string') {
                     return { text: 'content must be a string.', isError: true };
                 }
-                if (Buffer.byteLength(content, 'utf8') > MAX_WRITE_BYTES) {
-                    return { text: 'Content exceeds the per-file write limit.', isError: true };
+                return saveArtifact(target.full, target.name, args.content, 'Wrote');
+            },
+        },
+        {
+            name: 'edit_file',
+            description: 'Replace one exact, unique snippet of MEMORY.md or memory_summary.md. ' +
+                'old_string must appear exactly once; new_string may be empty to delete it. ' +
+                'Prefer this over rewriting the whole file for incremental changes.',
+            parameters: Type.Object({
+                path: Type.String({ description: 'File name, e.g. MEMORY.md' }),
+                old_string: Type.String({ description: 'Exact text to replace, copied from the file.' }),
+                new_string: Type.String(),
+            }, { additionalProperties: false }),
+            async execute(args) {
+                const target = await resolveArtifact(workDir, args.path);
+                if ('error' in target)
+                    return target.error;
+                const { old_string: oldText, new_string: newText } = args;
+                if (typeof oldText !== 'string' || !oldText || typeof newText !== 'string') {
+                    return { text: 'old_string must be non-empty text and new_string text.', isError: true };
                 }
-                try {
-                    await writeFile(full, content, 'utf8');
-                    return { text: `Wrote ${String(args.path)}.` };
+                const current = await readExisting(target.full);
+                if (!current)
+                    return { text: `${target.name} is empty or missing.`, isError: true };
+                const first = current.indexOf(oldText);
+                if (first < 0)
+                    return { text: 'old_string was not found.', isError: true };
+                if (current.indexOf(oldText, first + oldText.length) >= 0) {
+                    return {
+                        text: 'old_string appears more than once; include more surrounding text.',
+                        isError: true,
+                    };
                 }
-                catch {
-                    return { text: `Failed to write ${String(args.path)}.`, isError: true };
-                }
+                const next = current.slice(0, first) + newText + current.slice(first + oldText.length);
+                return saveArtifact(target.full, target.name, next, 'Edited');
             },
         },
     ];

@@ -71,7 +71,35 @@ let DofldTool = (() => {
             this.deps = deps;
         }
         async execute(ctx, input, signal) {
-            if (input.command.trim().toLowerCase().replace(/\s+/g, ' ').startsWith('cron ')) {
+            const normalized = normalizeMavisCommand(input.command);
+            if (normalized === 'session list' ||
+                normalized === 'session get' ||
+                normalized === 'session update' ||
+                normalized === 'session messages') {
+                const text = JSON.stringify({
+                    ok: false,
+                    command: normalized,
+                    error: {
+                        kind: 'validation',
+                        code: 'SESSION_TOOL_MOVED',
+                        message: 'Search for session_* with tool_search, then call mcp_invoke.',
+                    },
+                });
+                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+            }
+            if (normalized === 'session delete') {
+                const text = JSON.stringify({
+                    ok: false,
+                    command: normalized,
+                    error: {
+                        kind: 'validation',
+                        code: 'SESSION_DELETE_NOT_ALLOWED',
+                        message: 'Deleting a session is reserved for the user. Ask the user to delete it in the app, or archive it with session update (archived: true).',
+                    },
+                });
+                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+            }
+            if (normalized.startsWith('cron ')) {
                 const text = JSON.stringify({
                     ok: false,
                     error: {

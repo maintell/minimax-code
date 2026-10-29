@@ -128,6 +128,7 @@ export class LocalDataCollector {
                 agentName,
                 agentRole,
                 sessionId: session.sessionId,
+                ...(session.sessionIdInContext ? { sessionIdInContext: true } : {}),
                 sessionType,
                 parentSessionId: session.parentSessionId ?? undefined,
                 taskResultDelivery: session.taskResultDelivery,

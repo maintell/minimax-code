@@ -212,6 +212,8 @@ export class LocalOutputSafetyEventWriter {
             // 会用完整 thinking/content 再各审一次。只有 final 审核通过，仍 held 的 chunk
             // 和 final event 才会按 pendingQueue 的原顺序释放给上游 SSE。
             const message = resp.agent_message;
+            // 系统错误只用于展示；模型正文及缓冲中的输出仍需审核。
+            const content = message.msg_content_source === 'system_error' ? undefined : message.msg_content;
             if (typeof message.msg_id === 'string' && message.msg_id)
                 this.approvedMsgId = message.msg_id;
             if (!(await this.reviewFinalWindow(message.thinking_content, this.thinkingText, SAFETY_SCENE.ThinkingContent))) {
@@ -227,13 +229,11 @@ export class LocalOutputSafetyEventWriter {
             this.releaseWindow(this.thinkingWindow);
             this.thinkingText = '';
             await this.flushReady();
-            if (!(await this.reviewFinalWindow(message.msg_content, this.contentText, SAFETY_SCENE.MessageOutput))) {
+            if (!(await this.reviewFinalWindow(content, this.contentText, SAFETY_SCENE.MessageOutput))) {
                 return;
             }
             this.approvedContent =
-                message.msg_content && message.msg_content.length > 0
-                    ? message.msg_content
-                    : this.approvedContent + this.contentText;
+                content && content.length > 0 ? content : this.approvedContent + this.contentText;
             this.releaseWindow(this.contentWindow);
             this.contentText = '';
             await this.enqueueReady(event);

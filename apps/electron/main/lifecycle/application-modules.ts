@@ -241,7 +241,10 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
         {
             name: 'hot-update-auto-check',
             phase: 'whenReady',
-            init: () => undefined,
+            init: () => {
+                if (!dependencies.isDev)
+                    dependencies.startHotUpdateAutoCheck();
+            },
             onInitError: 'continue',
             dispose: dependencies.stopHotUpdateAutoCheck,
             disposeStage: 'pre',

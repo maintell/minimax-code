@@ -53,4 +53,5 @@ export { parseMediaTags } from './outbound-media.js';
 export { placeholderMediaTags } from './im-text-sanitize.js';
 export { ASK_OTHER_PLACEHOLDER, ASK_USER_TOOL_NAME } from './questionnaire.js';
 export { withOpenCodeGoHeaders } from './opencode-go-headers.js';
+export { MINIMAX_CODE_USER_AGENT, withMiniMaxCodeUserAgent } from './minimax-code-user-agent.js';
 //# sourceMappingURL=index.js.map

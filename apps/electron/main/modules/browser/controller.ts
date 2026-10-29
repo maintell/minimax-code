@@ -4,13 +4,24 @@
  * 作为方法入口，调用 BrowserActions 子模块
  */
 import path from "node:path";
-import { forwardEmbeddedBrowserHostShortcut } from "./embedded-browser-host-shortcut";
+import { cloneBrowserDevicePreviewState } from "@mavis/shared/browser-device-preview";
+import { MINIAPP_SURFACE_ID_ARGUMENT_PREFIX } from "@mavis/shared/miniapp-surface";
+import { matchesEmbeddedBrowserShortcutAction, forwardEmbeddedBrowserHostShortcut } from "./embedded-browser-host-shortcut";
 import { WebContentsView } from "electron";
 import { BrowserActions } from "./browser-actions";
 import { DevicePreviewController } from "./device-preview-controller";
+import { DevicePreviewWindow } from "./device-preview-window";
 import { AgentCursorController } from "./agent-cursor-controller";
 import { AGENT_CURSOR_WORLD_ID, AGENT_CURSOR_BRIDGE_SCRIPT } from "./agent-cursor-bridge";
 export let EMBEDDED_BROWSER_PARTITION = 'persist:mavis-browser';
+/**
+ * Electron's own default for a `WebContentsView` created with no explicit
+ * background — opaque white. Exported so every call site that restores the
+ * view after a transparent pop-out shares this literal instead of duplicating it.
+ */
+export let DEFAULT_VIEW_BACKGROUND = '#ffffffff';
+/** Mini App pages get their own storage and the only webRequest hook that adds loopback auth. */
+export let MINIAPP_BROWSER_PARTITION = 'persist:mavis-miniapp';
 function boundsEqual(left, right) {
     return (left.x === right.x &&
         left.y === right.y &&
@@ -28,7 +39,21 @@ export class BrowserController {
     constructor(options = {}) {
         this.options = options;
         this.webContentsView = null;
+        this.previewWindow = null;
+        this.previewLayout = null;
         this.parentWindow = null;
+        /**
+         * File Panel host that owns shortcut routing. Unlike parentWindow it does not
+         * follow temporary reparenting into a background render or detached window.
+         */
+        this.shortcutHostWindow = null;
+        /**
+         * Wired by the manager while this Mini App page owns a detached window.
+         * Cmd/Ctrl+W in that state returns the page to the panel instead of
+         * forwarding to the File Panel host or falling through to the app menu's
+         * `role: 'close'`, which would otherwise close the main window.
+         */
+        this.onRequestCloseDetached = null;
         this.bounds = {
             x: 0,
             y: 0,
@@ -123,10 +148,12 @@ export class BrowserController {
             }
             this.devicePreviewController.reset();
             this.parentWindow = parentWindow;
+            this.shortcutHostWindow = parentWindow;
             this.bounds = bounds;
+            const partition = options.surfaceKind === 'miniapp' ? MINIAPP_BROWSER_PARTITION : EMBEDDED_BROWSER_PARTITION;
             this.webContentsView = new WebContentsView({
                 webPreferences: {
-                    partition: EMBEDDED_BROWSER_PARTITION,
+                    partition,
                     nodeIntegration: false,
                     nodeIntegrationInSubFrames: false,
                     contextIsolation: true,
@@ -139,6 +166,16 @@ export class BrowserController {
                     // 允许隐藏/后台页面被 Chromium 节流；自动化操作期间由 manager 临时关闭。
                     backgroundThrottling: true,
                     preload: path.join(__dirname, options.surfaceKind === 'miniapp' ? 'miniapp-preload.bundle.js' : 'preload.js'),
+                    // Fixed at WebContents creation; the page reads it synchronously as
+                    // `window.mcode.miniapp.window.id`. The WebContents is never rebuilt, so the
+                    // id survives pop-out and return.
+                    ...(options.surfaceKind === 'miniapp' && options.miniAppSurfaceId
+                        ? {
+                            additionalArguments: [
+                                `${MINIAPP_SURFACE_ID_ARGUMENT_PREFIX}${options.miniAppSurfaceId}`,
+                            ],
+                        }
+                        : {}),
                 },
             });
             // Normal creation loads a blank page for Windows initialization.
@@ -162,13 +199,19 @@ export class BrowserController {
             // 设置边界
             this.webContentsView.setBounds(bounds);
             // 设置事件监听
-            this.setupEventListeners(options.onOpenTab);
+            this.setupEventListeners(options.onOpenTab, partition);
+            const initialization = {
+                mode: options.devicePreviewMode ?? 'responsive',
+                ...(options.devicePreviewState
+                    ? { previewState: cloneBrowserDevicePreviewState(options.devicePreviewState) }
+                    : {}),
+            };
             if (options.skipInitialLoad === true) {
-                this.deferredInitialization = options.devicePreviewMode ?? 'responsive';
+                this.deferredInitialization = initialization;
             }
             else {
                 // 初始化子模块；诊断监听在后台自愈，不阻塞 Browser Tab 创建。
-                await this.initializeSubModules(options.devicePreviewMode ?? 'responsive');
+                await this.initializeSubModules(initialization.mode, initialization.previewState);
             }
             return { success: true };
         }
@@ -183,13 +226,13 @@ export class BrowserController {
     async completeDeferredInitialization() {
         if (!this.deferredInitialization)
             return;
-        await this.initializeSubModules(this.deferredInitialization);
+        await this.initializeSubModules(this.deferredInitialization.mode, this.deferredInitialization.previewState);
         this.deferredInitialization = null;
     }
     /**
      * 初始化子模块
      */
-    async initializeSubModules(devicePreviewMode) {
+    async initializeSubModules(devicePreviewMode, previewState) {
         const wc = this.webContents;
         if (!wc)
             return;
@@ -202,7 +245,10 @@ export class BrowserController {
         await this.devicePreviewController.setDisplayBounds(this.bounds);
         if (cdpHelper) {
             // Apply the initial viewport without reloading a restored history entry.
-            await this.devicePreviewController.setMode(devicePreviewMode);
+            if (!previewState?.enabled)
+                await this.devicePreviewController.setMode(devicePreviewMode);
+            if (previewState)
+                await this.devicePreviewController.restorePreviewState(previewState);
             this.syncDevicePreviewBorderRadius();
         }
         // DOM / Console / Network 属于可选诊断能力，不阻塞 Browser Tab 创建。
@@ -218,6 +264,8 @@ export class BrowserController {
             void this.agentCursorController.reset();
             this.devicePreviewController.reset();
             this.deferredInitialization = null;
+            this.releasePreviewWindow();
+            this.previewLayout = null;
             // 停止 DOM 监听
             this.browserActions.stopDOMListener();
             // 断开 CDP（通过 BrowserActions）
@@ -253,9 +301,25 @@ export class BrowserController {
     /**
      * 更新边界
      */
-    setBounds(bounds) {
+    setBounds(bounds, previewLayout) {
         if (!this.webContentsView || !this.contentView)
             return Promise.resolve();
+        if (previewLayout !== undefined)
+            this.previewLayout = previewLayout;
+        if (this.previewWindow || (this.previewLayout && this.getDevicePreviewState().enabled)) {
+            this.bounds = bounds;
+            this.browserActions.setBounds(bounds);
+            const hidden = bounds.x < 0 || bounds.y < 0;
+            if (hidden) {
+                this.previewWindow?.hide();
+                this.safeRemoveFromContentView(this.webContentsView);
+                return Promise.resolve();
+            }
+            this.syncPreviewPresentation();
+            return this.devicePreviewController
+                .setDisplayBounds(this.previewLayout?.available ?? bounds, this.previewLayout?.hostZoomFactor ?? 1)
+                .then(() => this.syncPreviewPresentation());
+        }
         const wasHidden = this.bounds.x < 0 || this.bounds.y < 0;
         const shouldHide = bounds.x < 0 || bounds.y < 0;
         const expectedBoundsMatch = boundsEqual(this.bounds, bounds);
@@ -293,7 +357,9 @@ export class BrowserController {
     }
     getNativeViewDiagnostics() {
         const view = this.webContentsView;
-        const contentView = this.contentView;
+        const previewHost = this.previewWindow?.window;
+        const livePreviewHost = previewHost && !previewHost.isDestroyed() ? previewHost : null;
+        const contentView = livePreviewHost?.contentView ?? this.contentView;
         if (!view) {
             return {
                 actualBounds: null,
@@ -308,10 +374,38 @@ export class BrowserController {
         catch {
             // The native view can disappear while Electron is tearing down its host.
         }
+        const previewBounds = livePreviewHost?.getContentBounds();
+        const hostBounds = previewBounds && this.parentWindow && !this.parentWindow.isDestroyed()
+            ? this.parentWindow.getContentBounds()
+            : null;
         return {
             actualBounds,
+            ...(actualBounds && previewBounds && hostBounds
+                ? {
+                    hostRelativeBounds: {
+                        ...actualBounds,
+                        x: previewBounds.x - hostBounds.x + actualBounds.x,
+                        y: previewBounds.y - hostBounds.y + actualBounds.y,
+                    },
+                }
+                : {}),
             parentWindowId: this.parentWindow?.id ?? null,
             attached: Array.isArray(contentView?.children) ? contentView.children.includes(view) : null,
+        };
+    }
+    /** Preserve native DIP rounding when a fixed preview is replaced by a DOM image. */
+    getDevicePreviewFrameBounds() {
+        if (!this.previewWindow || !this.previewLayout || this.parentWindow !== this.shortcutHostWindow)
+            return null;
+        const bounds = this.getNativeViewDiagnostics().hostRelativeBounds;
+        if (!bounds)
+            return null;
+        const zoom = this.previewLayout.hostZoomFactor;
+        return {
+            x: bounds.x / zoom,
+            y: bounds.y / zoom,
+            width: bounds.width / zoom,
+            height: bounds.height / zoom,
         };
     }
     /**
@@ -320,13 +414,23 @@ export class BrowserController {
     bringToFront() {
         if (!this.webContentsView || !this.contentView)
             return;
+        if (this.previewWindow) {
+            // The preview stays attached while hidden. Restore it without taking
+            // focus from the host toolbar or dismissing its newly opened picker.
+            this.syncPreviewPresentation();
+            return;
+        }
         this.safeRemoveFromContentView(this.webContentsView);
         this.safeAddToContentView(this.webContentsView);
         // macOS 会在原生 View 重新挂载时清掉页面焦点。若不恢复，落在跨域
         // iframe 内的第一次点击只会重新聚焦 WebContents，无法携带打开 OAuth
         // popup 所需的瞬时用户激活，表现为 Google 登录按钮无响应。
         try {
-            this.webContents?.focus();
+            // Selecting a tab from a native child menu must update the live page
+            // without stealing focus and dismissing that menu.
+            const childHasFocus = this.parentWindow?.getChildWindows().some((child) => child.isFocused());
+            if (!childHasFocus)
+                this.webContents?.focus();
         }
         catch {
             // Ignore races while the WebContents is being closed or reparented.
@@ -338,6 +442,7 @@ export class BrowserController {
     removeFromParent() {
         if (!this.webContentsView)
             return;
+        this.previewWindow?.hide();
         this.safeRemoveFromContentView(this.webContentsView);
     }
     /**
@@ -356,12 +461,22 @@ export class BrowserController {
         if (previousParentWindow && previousParentWindow !== parentWindow) {
             this.safeRemoveFromContentView(this.webContentsView, previousParentWindow);
         }
+        this.releasePreviewWindow();
         this.parentWindow = parentWindow;
-        this.bounds = bounds;
+        const preview = this.getDevicePreviewState();
+        const scale = this.devicePreviewController.getDisplayScale();
+        const pageBounds = preview.enabled && preview.viewport
+            ? {
+                ...bounds,
+                width: Math.max(1, Math.round(preview.viewport.width * scale)),
+                height: Math.max(1, Math.round(preview.viewport.height * scale)),
+            }
+            : bounds;
+        this.bounds = pageBounds;
         this.safeRemoveFromContentView(this.webContentsView, parentWindow);
         this.safeAddToContentView(this.webContentsView, parentWindow);
-        this.webContentsView.setBounds(bounds);
-        this.browserActions.setBounds(bounds);
+        this.webContentsView.setBounds(pageBounds);
+        this.browserActions.setBounds(pageBounds);
     }
     /**
      * 将 view 添加到父窗口中
@@ -375,9 +490,18 @@ export class BrowserController {
         }
         const previousParentWindow = this.parentWindow;
         if (previousParentWindow && previousParentWindow !== parentWindow) {
+            this.releasePreviewWindow();
             this.safeRemoveFromContentView(this.webContentsView, previousParentWindow);
         }
         this.parentWindow = parentWindow;
+        this.shortcutHostWindow = parentWindow;
+        if (this.previewLayout && this.getDevicePreviewState().enabled) {
+            // A background handoff carries compositor bounds. Wait for setBounds to
+            // supply the foreground clip before presenting it in the File Panel.
+            if (this.previewWindow)
+                this.syncPreviewPresentation();
+            return;
+        }
         this.safeRemoveFromContentView(this.webContentsView, parentWindow);
         if (this.bounds.x >= 0 && this.bounds.y >= 0) {
             this.safeAddToContentView(this.webContentsView, parentWindow);
@@ -447,6 +571,30 @@ export class BrowserController {
         }
     }
     /**
+     * Sets the native `WebContentsView`'s own background — separate from the
+     * page DOM background and from the owning `BaseWindow`'s. A `frame:false,
+     * transparent:true` Mini App window needs this cleared to an alpha-channel
+     * color, or the view paints an opaque rectangle regardless of the window's
+     * own transparency.
+     */
+    setBackgroundColor(color) {
+        if (!this.webContents || !this.webContentsView)
+            return;
+        try {
+            this.webContentsView.setBackgroundColor(color);
+        }
+        catch {
+            // Ignore races while the native view is being torn down.
+        }
+    }
+    /**
+     * Wired by the manager around a detach/attach round trip; see the field
+     * comment on `onRequestCloseDetached` above.
+     */
+    setOnRequestCloseDetached(callback) {
+        this.onRequestCloseDetached = callback;
+    }
+    /**
      * 获取当前状态
      */
     getState() {
@@ -482,6 +630,31 @@ export class BrowserController {
     }
     getDevicePreviewMode() {
         return this.devicePreviewController.getMode();
+    }
+    getDevicePreviewState() {
+        return this.devicePreviewController.getPreviewState();
+    }
+    async updateDevicePreview(request) {
+        try {
+            const result = await this.devicePreviewController.updatePreview(request);
+            this.syncDevicePreviewBorderRadius();
+            // Apply emulation in place so switching devices preserves the current document.
+            // Pages that detect identity only on load can still be refreshed explicitly.
+            return {
+                success: true,
+                changed: result.changed,
+                reloaded: false,
+                devicePreviewState: this.getDevicePreviewState(),
+            };
+        }
+        catch (error) {
+            this.syncDevicePreviewBorderRadius();
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+                devicePreviewState: this.getDevicePreviewState(),
+            };
+        }
     }
     getInputCoordinateScale() {
         return this.browserActions.getCurrentInputCoordinateScale();
@@ -644,16 +817,79 @@ export class BrowserController {
             mode: this.devicePreviewController.getMode(),
         };
     }
+    isDevicePreviewWindowFocused() {
+        return (this.parentWindow === this.shortcutHostWindow && (this.previewWindow?.isFocused() ?? false));
+    }
+    releasePreviewWindow() {
+        this.previewWindow?.destroy();
+        this.previewWindow = null;
+    }
+    syncPreviewPresentation() {
+        const view = this.webContentsView;
+        const parent = this.parentWindow;
+        if (!view || !parent || parent.isDestroyed())
+            return;
+        const state = this.getDevicePreviewState();
+        const layout = this.previewLayout;
+        if (!state.enabled || !state.viewport || !layout || parent !== this.shortcutHostWindow) {
+            const wasClipped = Boolean(this.previewWindow);
+            this.releasePreviewWindow();
+            if ((wasClipped || layout) && !this.isOffscreen()) {
+                if (parent !== this.shortcutHostWindow && state.enabled && state.viewport) {
+                    const scale = this.devicePreviewController.getDisplayScale();
+                    this.bounds = {
+                        ...this.bounds,
+                        width: Math.max(1, Math.round(state.viewport.width * scale)),
+                        height: Math.max(1, Math.round(state.viewport.height * scale)),
+                    };
+                    this.browserActions.setBounds(this.bounds);
+                }
+                this.safeAddToContentView(view);
+                if (!boundsEqual(view.getBounds(), this.bounds))
+                    view.setBounds(this.bounds);
+            }
+            return;
+        }
+        if (this.isOffscreen()) {
+            this.previewWindow?.hide();
+            return;
+        }
+        if (!this.previewWindow) {
+            this.safeRemoveFromContentView(view);
+            this.previewWindow = new DevicePreviewWindow(parent, view);
+        }
+        const scale = this.devicePreviewController.getDisplayScale();
+        this.previewWindow.update(this.bounds, {
+            x: Math.round(layout.offset.x),
+            y: Math.round(layout.offset.y),
+            width: Math.max(1, Math.round(state.viewport.width * scale)),
+            height: Math.max(1, Math.round(state.viewport.height * scale)),
+        });
+    }
     syncDevicePreviewBorderRadius() {
-        this.webContentsView?.setBorderRadius(this.devicePreviewController.getMode() === 'responsive'
-            ? 0
-            : BrowserController.DEVICE_PREVIEW_BORDER_RADIUS);
+        this.syncPreviewPresentation();
+        // Electron 42's rounded WebContentsView mask misroutes OOPIF input when
+        // emulation scale is below 1. The scrollable preview uses a rectangular
+        // native clip; retain the old mask only for the legacy five-preset surface.
+        const legacyDeviceFrame = !this.getDevicePreviewState().enabled && this.devicePreviewController.getPreset();
+        this.webContentsView?.setBorderRadius(legacyDeviceFrame ? BrowserController.DEVICE_PREVIEW_BORDER_RADIUS : 0);
     }
     /**
      * Expose the underlying WebContents for Electron-only host integrations.
      */
     getWebContents() {
         return this.webContents;
+    }
+    /**
+     * Gives the page real keyboard focus. A newly opened pop-out window does
+     * not otherwise pull it: without this, shortcuts like Cmd/Ctrl+W only
+     * work once the user clicks inside the page (Bug 2).
+     */
+    focusPage() {
+        const wc = this.webContents;
+        if (!wc || wc.isDestroyed())
+            return;
+        wc.focus();
     }
     async updateElementMapAfterAction(options) {
         return this.browserActions.updateElementMapAfterAction(options);
@@ -673,7 +909,7 @@ export class BrowserController {
     /**
      * 设置事件监听
      */
-    setupEventListeners(onOpenTab) {
+    setupEventListeners(onOpenTab, partition = EMBEDDED_BROWSER_PARTITION) {
         const wc = this.webContents;
         if (!wc || wc?.isDestroyed?.()) {
             return;
@@ -681,7 +917,22 @@ export class BrowserController {
         wc.on('before-input-event', (event, input) => {
             if (input.type !== 'keyDown' || !(input.meta || input.control || input.alt || input.shift))
                 return;
-            forwardEmbeddedBrowserHostShortcut(event, input, this.parentWindow, this.options.getShortcutOverrides?.() ?? {});
+            const overrides = this.options.getShortcutOverrides?.() ?? {};
+            const isDetached = this.parentWindow !== this.shortcutHostWindow;
+            if (isDetached &&
+                matchesEmbeddedBrowserShortcutAction(input, 'workspacePanel.closeCurrentTab', overrides)) {
+                // Detached: handle the close shortcut ourselves instead of forwarding
+                // it (nowhere useful to land) or leaving it to fall through to the
+                // app menu's `role: 'close'`, which resolves to the main window, not
+                // this Mini App's own pop-out.
+                event.preventDefault();
+                this.onRequestCloseDetached?.();
+                return;
+            }
+            forwardEmbeddedBrowserHostShortcut(event, input, this.shortcutHostWindow,
+            // Outside the File Panel host the close shortcut belongs to the page's
+            // own window, whose close handler returns the page to the panel.
+            isDetached ? { ...overrides, 'workspacePanel.closeCurrentTab': null } : overrides);
         });
         // 拦截新窗口打开请求
         wc.setWindowOpenHandler(({ url, features }) => {
@@ -704,7 +955,7 @@ export class BrowserController {
                         minimizable: false,
                         maximizable: false,
                         webPreferences: {
-                            partition: EMBEDDED_BROWSER_PARTITION,
+                            partition,
                             nodeIntegration: false,
                             nodeIntegrationInSubFrames: false,
                             contextIsolation: true,

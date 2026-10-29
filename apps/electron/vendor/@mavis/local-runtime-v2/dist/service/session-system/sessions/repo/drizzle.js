@@ -16,7 +16,7 @@ import { deleteSessionSearchDocument, searchSessionIds, writeSessionSearchDocume
 import { recordFromCreate } from './drizzle/record-create.js';
 import { projects } from '../../../../infra/db/schema/projects.js';
 import { eligible } from '../../projects/sidebar/predicate.js';
-import { recordProjectRemoval, sessionNotRemovedFromProject } from '../../shared/project-removal.js';
+import { recordProjectRemoval, sessionNotRemovedFromProject, } from '../../shared/project-removal.js';
 const DEFAULT_TREE_FILTER = {
     archived: false,
     includeHidden: false,
@@ -141,7 +141,9 @@ class DrizzleSessionRepository {
                         .run();
                 }
                 writeSessionSearchDocument(tx, record);
-                const project = tx.select({ project: projects }).from(projects)
+                const project = tx
+                    .select({ project: projects })
+                    .from(projects)
                     .innerJoin(sessions, eq(sessions.projectId, projects.projectId))
                     .where(and(eq(sessions.sessionId, record.sessionId), eq(projects.hidden, 1)))
                     .get()?.project;
@@ -151,12 +153,17 @@ class DrizzleSessionRepository {
                     if (!JSON.parse(project.extraDataJson).sidebarRemoval) {
                         recordProjectRemoval(tx, project, project.updatedAtMs, record.sessionId);
                     }
-                    const visible = tx.select({ id: sessions.sessionId }).from(sessions)
+                    const visible = tx
+                        .select({ id: sessions.sessionId })
+                        .from(sessions)
                         .innerJoin(projects, eq(sessions.projectId, projects.projectId))
-                        .where(and(eq(sessions.sessionId, record.sessionId), eligible(true))).get();
+                        .where(and(eq(sessions.sessionId, record.sessionId), eligible(true)))
+                        .get();
                     if (visible)
-                        tx.update(projects).set({ hidden: 0, updatedAtMs: nowMs })
-                            .where(eq(projects.projectId, project.projectId)).run();
+                        tx.update(projects)
+                            .set({ hidden: 0, updatedAtMs: nowMs })
+                            .where(eq(projects.projectId, project.projectId))
+                            .run();
                 }
             });
         }
@@ -261,7 +268,9 @@ class DrizzleSessionRepository {
             if (!row)
                 return undefined;
             const current = decodeSessionRow(row);
-            if (expectedTitle !== undefined && (current.title ?? null) !== expectedTitle) {
+            if (expectedTitle &&
+                ((current.title ?? null) !== expectedTitle.title ||
+                    (expectedTitle.source !== undefined && current.titleSource !== expectedTitle.source))) {
                 throw new SessionTitleConflictError();
             }
             assertSessionModelSnapshot(current, expectedModel);
@@ -376,12 +385,19 @@ class DrizzleSessionRepository {
                     sessionType: 'branch',
                     archived: true,
                     title: input.archivedRootTitle,
+                    titleSource: 'auto',
                     ...(input.linkPreviousRootsToNext
                         ? { parentSessionId: input.nextRootSessionId }
                         : {}),
                 }, nowMs));
             }
-            const nextRoot = withoutRootAppMode(applySessionUpdate(next, { sessionType: 'root', parentSessionId: null, archived: false, title: 'Main' }, nowMs));
+            const nextRoot = withoutRootAppMode(applySessionUpdate(next, {
+                sessionType: 'root',
+                parentSessionId: null,
+                archived: false,
+                title: 'Main',
+                titleSource: 'auto',
+            }, nowMs));
             writeRow(tx, nextRow, nextRoot);
             return { previousRoots, nextRoot };
         }, { behavior: 'immediate' });
@@ -680,6 +696,8 @@ class DrizzleSessionRepository {
                     sessionKind: current.sessionKind,
                     sessionOrigin: current.sessionOrigin,
                     originCronId: current.originCronId,
+                    miniAppOrigin: current.miniAppOrigin,
+                    createdBySessionId: current.createdBySessionId,
                     createdAtMs: current.createdAtMs,
                     historyRelativeDir: current.historyRelativeDir,
                 };

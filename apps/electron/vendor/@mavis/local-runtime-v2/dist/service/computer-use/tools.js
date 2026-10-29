@@ -140,7 +140,7 @@ const ACTIONS = [
     ],
     [
         'computer_drag',
-        'Drag within an exact application window using coordinates from its fresh screenshot. Official CUA 0.22.1 on macOS supports foreground drag only: tell the user which app will take mouse/keyboard control BEFORE the first call, then explicitly use delivery_mode:"foreground"; do not probe the known-unsupported background route. On Windows prefer supported background delivery. Respect an explicit background-only constraint and verify effects before retrying.',
+        'Drag within an exact application window using coordinates from its fresh screenshot. On macOS default to delivery_mode:"foreground" unless the active host explicitly reports background drag support. On Windows prefer supported background delivery. Before foreground input, tell the user which app will take mouse/keyboard control. Respect an explicit background-only constraint, do not repeat a refused delivery route, and verify effects before retrying.',
         'drag',
         {
             pid: { type: 'integer' },
@@ -569,7 +569,7 @@ function decimalArgument(value, integer) {
 }
 /** Registered names for Task capability ceilings; this does not enable or instantiate tools. */
 export const COMPUTER_USE_TOOL_NAMES = Object.freeze(ACTIONS.map(([name]) => name));
-export function buildComputerUseRuntimeTools(client) {
+export function buildComputerUseRuntimeTools(client, readSessionTitle) {
     if (!client)
         return [];
     return ACTIONS.map(([name, description, kind, properties]) => defineRuntimeTool({
@@ -603,8 +603,17 @@ export function buildComputerUseRuntimeTools(client) {
             const unregister = registerComputerUseAbortController(controller);
             const combined = combineAbortSignals(signal, controller.signal);
             try {
-                // Re-check the gate after registration to close the disable/dispatch
-                // race: a toggle may have changed while this tool was being queued.
+                // Read on every operation so renamed sessions keep the same native identity.
+                // Display lookup failures must not prevent an otherwise valid operation.
+                let sessionTitle;
+                try {
+                    sessionTitle = await readSessionTitle?.(ctx.sessionId);
+                }
+                catch {
+                    sessionTitle = undefined;
+                }
+                // Re-check the gate after registration and the asynchronous title lookup.
+                // A toggle may have changed while this tool was being queued.
                 if (!isComputerUseEnabled())
                     throw new Error('computer_disabled');
                 if (combined.signal.aborted)
@@ -612,6 +621,7 @@ export function buildComputerUseRuntimeTools(client) {
                 const value = await client.call({
                     kind,
                     sessionId: ctx.sessionId,
+                    ...(sessionTitle != null ? { sessionTitle } : {}),
                     turnId: ctx.turnId,
                     generation: 0,
                     payload: (input ?? {}),

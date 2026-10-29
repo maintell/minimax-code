@@ -1,31 +1,18 @@
+import { backgroundTaskNotificationReceiptId, } from '@mavis/agent-tools/desktop';
+import { createV1CommerceCompatibility, createV1AttachmentRegistration, createDeferredAgentRuntimeTelemetry as createAgentTelemetryAdapter, legacyCollisionMigrationId, resolveDelegatableAgentReference, createV1AgentHostProductCapabilities, createV1MiniAppToolRules, } from './agent-host.js';
 import { createDeferredPluginHookPermissionCapability, } from '@mavis/permission/plugin-hook-permission-port';
 import { createDeferredContentSafetyCapability } from '@mavis/shared/local-runtime-safety';
 import { createDeferredSkillRuntimeCapability } from '@mavis/shared/local-runtime-skills';
-import { buildCompressedModelImageFromBuffer, closeAgentDb, createUserStopCascade, createLocalWorkspaceGitFacade, emitSubagentTelemetry, listFileTree, ManagedWorktreeService, managedBackendRoutingHeaders, LocalQuestionnaireService, readLocalPermissionMode, replyLocalPermissionRequests, resolveTaskTarget, searchFiles, ThreadGoalContractError, withAgentNameConflictMigrationLock, roleClass, registerLocalAsset, SUBAGENT_TELEMETRY_EVENT, scanWorkspace, updateLocalConfigFile, } from '@mavis/local-runtime';
+import { closeAgentDb, emitSubagentTelemetry, roleClass, SUBAGENT_TELEMETRY_EVENT, resolveTaskTarget, createLocalWorkspaceGitFacade, listFileTree, ManagedWorktreeService, managedBackendRoutingHeaders, LocalQuestionnaireService, LocalMatrixClient, SqliteQuestionnaireRequestStore, discardLocalAssetRegistrations, loadUserImages, registerMessageAttachments, resolveSessionLocalAsset, readLocalPermissionMode, replyLocalPermissionRequests, searchFiles, withAgentNameConflictMigrationScope, registerLocalAsset, scanWorkspace, updateLocalConfigFile, } from '@mavis/local-runtime';
 import { createV1CronAgentCleanupBridge, createV1MavisCronAdapterBridge } from './cron.js';
-import { createV1AttachmentRegistration, createV1AgentHostProductCapabilities, } from './agent-host.js';
 import { createV1SessionCompatibility } from './session.js';
+import { createV1WorkspaceLocalActionsPort, createV1WorkspaceIndexingWorker, } from './workspace-local-actions.js';
 /**
- * Validates a persisted Agent mention through the same trusted v1 resolver
- * chain that Task uses. The primary family is intentionally excluded: a main
- * session may nominate only a delegatable SubAgent, never itself.
+ * Legacy Agent storage scope for the V2 cutover. Takes no lock: the caller
+ * must hold the dataDir startup migration lock for the whole operation.
  */
-async function resolveDelegatableAgentReference(resolver, requestRef) {
-    try {
-        const scope = await resolver.resolveAgentReadScope(requestRef);
-        if (scope.canonicalName === scope.primaryName)
-            return 'unauthorized';
-        await resolveTaskTarget(resolver, requestRef);
-        return 'authorized';
-    }
-    catch {
-        // Resolver failures must neither reveal roster details nor emit Task text.
-        return 'unknown';
-    }
-}
-/** Cross-process cutover lock shared with the legacy conflict migration. */
-export function withAgentStorageLock(dataDir, operation) {
-    return withAgentNameConflictMigrationLock(dataDir, async (legacyScope) => {
+export function withAgentStorageScope(dataDir, operation) {
+    return withAgentNameConflictMigrationScope(dataDir, async (legacyScope) => {
         let active = true;
         const applyCollision = (nowMs) => {
             if (!active)
@@ -84,73 +71,6 @@ export function withAgentStorageLock(dataDir, operation) {
         }
     });
 }
-function legacyCollisionMigrationId(error) {
-    const migrationId = error && typeof error === 'object' && 'migrationId' in error
-        ? error.migrationId
-        : undefined;
-    return typeof migrationId === 'string' && /^agent-name-conflicts-\d+$/u.test(migrationId)
-        ? migrationId
-        : undefined;
-}
-/** Deferred, fail-open adapter for Agent facts emitted before v1 host binding. */
-export function createDeferredAgentRuntimeTelemetry() {
-    let sink;
-    let closed = false;
-    const facts = {
-        onNameCompatResolve: (fact) => {
-            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.nameCompatResolve, {
-                intent: fact.intent,
-                canonical_class: fact.canonicalClass,
-                source: fact.source,
-                success: fact.success,
-                ...(fact.memberCountBucket ? { member_count_bucket: fact.memberCountBucket } : {}),
-                ...(fact.errorCode ? { error_code: fact.errorCode } : {}),
-            });
-        },
-        onAgentRoleObservation: (fact) => {
-            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.agentRoleObservation, {
-                status: fact.status,
-                source: fact.source,
-                role_class: roleClass(fact.role),
-            });
-        },
-        // Emitted on EVERY overlay branch, including the skips. "My old display
-        // name did not carry over" must be answerable from one event, not from
-        // the absence of a repository write.
-        onPrimaryProfileOverlay: (fact) => {
-            emitSubagentTelemetry(sink, SUBAGENT_TELEMETRY_EVENT.primaryProfileOverlay, {
-                outcome: fact.outcome,
-                // Field names only: a displayName or workspace path is user content.
-                adopted_fields: fact.adoptedFields.join(','),
-                adopted_count: fact.adoptedFields.length,
-                display_name_locked: fact.displayNameLocked,
-            });
-        },
-    };
-    return {
-        facts,
-        bind: (input) => {
-            if (closed)
-                return;
-            sink = createAgentTelemetryHost(input);
-        },
-        close: () => {
-            closed = true;
-            sink = undefined;
-        },
-    };
-}
-function createAgentTelemetryHost(input) {
-    const client = input.metricsClient;
-    return {
-        metrics: {
-            incr: (name, labels) => client.counter(name, 1, labels),
-            gauge: (name, value, labels) => client.gauge(name, value, labels),
-            latency: (name, durationMs, labels) => client.histogram(name, durationMs, labels),
-        },
-        ...(input.emitBusEvent ? { emitBusEvent: input.emitBusEvent } : {}),
-    };
-}
 /**
  * MR2: the v1 host exposes ONE authoritative capability bundle for channel
  * assembly; the v2 services own every store/adapter/runner. Only hosts with
@@ -159,25 +79,72 @@ function createAgentTelemetryHost(input) {
 function buildChannelWireCompatibility(api) {
     return api.runtimeConversation ? { channelWire: () => api.buildChannelWireInput() } : {};
 }
+const TERMINAL_BACKGROUND_TASK_STATUSES = new Set(['succeeded', 'failed', 'canceled', 'lost']);
 /**
- * V1-owned background task seam. Extracted from the composition function purely
- * to keep it readable; the user-stop cascade lives here because V1 holds the
- * task runners and their per-process admissions.
+ * Derives each terminal Task's notification state from durable facts only: the Task row and
+ * the Turn ingress receipt its delivery bound to the admitting Turn. User-stop suppression is
+ * the one process-local input, and it can only end a notification, never start one.
  */
-function buildBackgroundTaskCompatibility(api) {
+function createBackgroundTaskNotificationProjection(api) {
+    let receipts;
+    return {
+        bind: (next) => {
+            receipts = next;
+        },
+        annotate: async (ownerSessionId, tasks) => {
+            const terminal = tasks.filter((task) => TERMINAL_BACKGROUND_TASK_STATUSES.has(task.status));
+            if (!receipts || terminal.length === 0)
+                return tasks;
+            const receiptIds = terminal.map(({ taskId }) => backgroundTaskNotificationReceiptId(taskId));
+            let bindings;
+            try {
+                bindings = await receipts.findClientRequestBindings({
+                    sessionId: ownerSessionId,
+                    clientRequestIds: receiptIds,
+                });
+            }
+            catch (error) {
+                try {
+                    api.matrixLogger?.warn({ sessionId: ownerSessionId, turnId: 'background-task-notification' }, `Background Task notification receipts could not be read: ${String(error)}`);
+                }
+                catch {
+                    // Diagnostics are best-effort.
+                }
+                return tasks; // Unreadable ledger: state stays unknown (absent), read as settled.
+            }
+            const byReceiptId = new Map(bindings.map((binding) => [binding.clientRequestId, binding]));
+            return tasks.map((task) => {
+                if (!TERMINAL_BACKGROUND_TASK_STATUSES.has(task.status))
+                    return task;
+                const binding = byReceiptId.get(backgroundTaskNotificationReceiptId(task.taskId));
+                return { ...task, notification: backgroundTaskNotificationState(api, task, binding) };
+            });
+        },
+    };
+}
+function backgroundTaskNotificationState(api, task, binding) {
+    // Steered into a running Turn or admitted as a new one: the owner has it, however long it runs.
+    if (binding)
+        return { state: 'settled', turnId: binding.turnId };
+    // A result already read by a completed Turn, or a stop the user asked for, never wakes it.
+    if (task.deliveredAt !== undefined || api.backgroundTasks.isDeliverySuppressed(task.taskId)) {
+        return { state: 'settled' };
+    }
+    return { state: 'pending' };
+}
+/** Binds legacy Goal/session capabilities to the injected V2 background owner. */
+function buildBackgroundTaskCompatibility(api, notifications) {
     return {
         bindRuntimeOwner: (owner) => api.backgroundTaskService.bindRuntimeOwner(owner),
+        bindNotificationReceipts: (receipts) => notifications.bind(receipts),
         recover: async (recoveredTurnIds) => {
             await api.backgroundTaskService.reconcileStartupLostTasks({ recoveredTurnIds });
             return api.backgroundTaskService.hasPendingStartupRecovery();
         },
         pollRecovery: () => api.backgroundTaskService.pollStartupLostTasks(),
-        userStop: createUserStopCascade({
-            host: api,
-            // Pause before any task is stopped: a terminal task wakes the Session queue,
-            // and a live Goal would otherwise sail through its gate and start a Turn.
-            pauseActiveGoal: (sessionId) => api.threadGoal.pauseActiveGoalForAbort(sessionId),
-        }),
+        // Pause before any task is stopped: a terminal task wakes the Session queue,
+        // and a live Goal would otherwise sail through its gate and start a Turn.
+        createUserStop: ({ pauseActiveGoal }) => api.backgroundTasks.createUserStopCascade(pauseActiveGoal),
     };
 }
 function createQuestionnaireService(host) {
@@ -212,12 +179,23 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
             skillEnabledState: ports.skillEnabledState,
             runLegacyImCredentialMigration: ports.runLegacyImCredentialMigration,
             cliSunsetNotice: ports.cliSunsetNotice,
+            createBackgroundTaskRuntime: ports.createBackgroundTaskRuntime,
         }),
         createServiceCompatibility: (host, options, hostedCloudHandoff) => {
             const api = host.apiHost;
-            const processLocal = createV1ProcessLocalSupport(host);
+            const notifications = createBackgroundTaskNotificationProjection(api);
+            const processLocal = createV1ProcessLocalSupport(host, notifications);
+            const workspaceIndexing = createV1WorkspaceIndexingWorker(api);
+            const workspaceLocalActions = createV1WorkspaceLocalActionsPort(api);
+            const listRunningWorktreeDirs = async () => (await api.listAllSessions())
+                .filter((session) => session.status === 'started')
+                .map((session) => session.runLocation?.resolvedDir ?? session.workspaceDir);
             return {
                 ...processLocal,
+                bindQuestionnaireGoalProbe: (probe) => {
+                    host.apiHost.isQuestionnaireGoalActive = probe;
+                },
+                goalHost: createV1GoalHostCapabilities(host),
                 sandbox: {
                     eval: host.evalReporterFactory,
                     writeConfig: async (candidate) => {
@@ -227,10 +205,11 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                     },
                 },
                 managedWorktrees: new ManagedWorktreeService({
-                    listRunningWorktreeDirs: async () => (await api.listAllSessions())
-                        .filter((session) => session.status === 'started')
-                        .map((session) => session.runLocation?.resolvedDir ?? session.workspaceDir),
+                    listRunningWorktreeDirs,
                 }),
+                listRunningWorktreeDirs,
+                workspaceIndexing,
+                workspaceLocalActions,
                 cron: {
                     bindAgentCleanup: (service) => {
                         agentCleanup.bind(service);
@@ -243,20 +222,10 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                 },
                 memoryMigration: createV1MemoryMigrationCompatibility(api),
                 agentReferences: {
-                    resolveDelegatable: (requestRef) => resolveDelegatableAgentReference(api.agentResolver, requestRef),
+                    resolveDelegatable: (requestRef) => resolveDelegatableAgentReference(api.agentResolver, requestRef, resolveTaskTarget),
                 },
                 agentHost: createV1AgentHostProductCapabilities(host.apiHost, host.evalReporterFactory, hostedCloudHandoff),
                 generatedAssets: {
-                    compressModelImage: (input) => {
-                        const compressed = buildCompressedModelImageFromBuffer(Buffer.from(input.bytes), input.fileName, undefined, input.budget);
-                        return compressed
-                            ? {
-                                dataUrl: compressed.filePart.url,
-                                width: compressed.width,
-                                height: compressed.height,
-                            }
-                            : undefined;
-                    },
                     registerGeneratedAsset: async (input) => {
                         const record = await registerLocalAsset({
                             ...input,
@@ -280,10 +249,9 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                 },
                 attachmentRegistration: createV1AttachmentRegistration(host.apiHost),
                 ...buildChannelWireCompatibility(api),
-                backgroundTasks: buildBackgroundTaskCompatibility(api),
+                backgroundTasks: buildBackgroundTaskCompatibility(api, notifications),
                 conversation: {
                     bind: async (service) => {
-                        await api.recoverThreadGoalKickoffs(service);
                         conversation.bind(service);
                     },
                     fail: (error) => conversation.fail(error),
@@ -291,6 +259,7 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                 },
                 events: { bindPublisher: globalEvents.bindPublisher },
                 ...(options.miniAppSurface ? { miniAppSurface: options.miniAppSurface } : {}),
+                miniAppToolRules: createV1MiniAppToolRules(() => host.apiHost.permissionRouteContext()),
                 safety: {
                     bind: safety.bind,
                     apiVersion: 'v2',
@@ -311,6 +280,7 @@ export function createV1RuntimeCompatibility(conversation, factories = { createQ
                     bindRequestAdmission: (admission) => api.bindQuestionnaireRequestAdmission(admission),
                 },
                 sessionV2: createV1SessionCompatibility(host),
+                commerce: createV1CommerceCompatibility(api, (config) => new LocalMatrixClient(config)),
                 sessionHandoff: {
                     hosted: hostedCloudHandoff,
                     workspace: {
@@ -431,20 +401,61 @@ export async function cleanupFailedV1Startup(v1, closeV1, warn) {
         }
     }
 }
-function createV1ProcessLocalSupport(host) {
+function createV1ProcessLocalSupport(host, notifications) {
     return {
-        peripherals: createPeripheralApplication(host),
+        peripherals: createPeripheralApplication(host, notifications),
+        bindPermissionShellResolver: (resolve) => host.apiHost.bindPermissionShellResolver(resolve),
     };
 }
-function createPeripheralApplication(host) {
-    const questionnaires = new LocalQuestionnaireService(host.apiHost.questionnaireServiceDeps());
+function toQuestionnaireRecord(record) {
+    if (!record)
+        return undefined;
     return {
-        goals: createThreadGoalApplication(host.apiHost.threadGoal, (sessionId) => host.apiHost.isReadOnlyLegacySession(sessionId)),
+        request: record.request,
+        status: record.status,
+        sessionId: record.sessionId,
+        ...(record.agentName ? { agentName: record.agentName } : {}),
+        createdAt: record.createdAt,
+        ...(record.answeredAt !== undefined ? { answeredAt: record.answeredAt } : {}),
+        ...(record.dismissedAt !== undefined ? { dismissedAt: record.dismissedAt } : {}),
+    };
+}
+function createPeripheralApplication(host, notifications) {
+    const questionnaires = new LocalQuestionnaireService(host.apiHost.questionnaireServiceDeps());
+    const resolveQuestionnaireAgentName = async (name) => {
+        const requested = name.trim();
+        return requested.toLowerCase().startsWith('agent:')
+            ? host.apiHost.agentResolver.requireExactAgentKey(requested)
+            : requested;
+    };
+    return {
         questionnaires: {
-            getPending: async (input) => (await questionnaires.getPending(input))?.request ?? undefined,
-            getLatestPlanReview: async (input) => (await questionnaires.getLatestPlanReview(input))?.request ?? undefined,
+            begin: async (input) => {
+                const result = await questionnaires.begin(input);
+                return {
+                    requestId: result.requestId,
+                    schemaVersion: result.schemaVersion,
+                    stepCount: result.stepCount,
+                };
+            },
+            get: async (input) => toQuestionnaireRecord(await questionnaires.get({
+                ...input,
+                agentName: await resolveQuestionnaireAgentName(input.agentName),
+            })),
+            getPending: async (input) => (await questionnaires.getPending({
+                ...input,
+                agentName: await resolveQuestionnaireAgentName(input.agentName),
+            }))?.request ?? undefined,
+            listUnanswered: async (input) => (await questionnaires.listUnansweredV2({
+                ...input,
+                agentName: await resolveQuestionnaireAgentName(input.agentName),
+            })).map((record) => record.request),
+            getLatestPlanReview: async (input) => toQuestionnaireRecord(await questionnaires.getLatestPlanReview({
+                ...input,
+                agentName: await resolveQuestionnaireAgentName(input.agentName),
+            })),
             reply: async (input) => questionnaires.reply({
-                agentName: input.agentName,
+                agentName: await resolveQuestionnaireAgentName(input.agentName),
                 requestId: input.requestId,
                 reply: {
                     schemaVersion: 2,
@@ -453,7 +464,10 @@ function createPeripheralApplication(host) {
                     submittedAt: input.submittedAt,
                 },
             }),
-            dismiss: (input) => questionnaires.dismiss(input),
+            dismiss: async (input) => questionnaires.dismiss({
+                ...input,
+                agentName: await resolveQuestionnaireAgentName(input.agentName),
+            }),
         },
         workspace: {
             git: createLocalWorkspaceGitFacade(),
@@ -476,6 +490,7 @@ function createPeripheralApplication(host) {
                 return host.apiHost.permissionRouteContext().approvalService.listPending();
             },
             reply: ({ requestIds, decision }) => replyLocalPermissionRequests(host.apiHost.permissionRouteContext(), [...requestIds], decision),
+            dismiss: ({ requestId }) => host.apiHost.permissionRouteContext().approvalService.dismiss(requestId),
         },
         account: {
             getStatus: ({ sessionId } = {}) => host.apiHost.getProcessLocalAccountStatus(sessionId),
@@ -486,143 +501,29 @@ function createPeripheralApplication(host) {
         configuration: {
             getPermissionMode: async () => readLocalPermissionMode(host.apiHost.configGetter().permissionMode),
             setPermissionMode: ({ mode }) => host.apiHost.setProcessLocalPermissionMode(mode),
+            getPromptSuggestionEnabled: async () => host.apiHost.configGetter().promptSuggestion?.enabled === true,
+            setPromptSuggestionEnabled: async ({ enabled }) => {
+                // The same validated, lock-protected writer as the Desktop setting; an
+                // explicit value then wins over every surface's default.
+                await host.apiHost.updateConfig({ field: 'promptSuggestion.enabled', set: enabled });
+                return host.apiHost.configGetter().promptSuggestion?.enabled === true;
+            },
         },
         backgroundTasks: {
-            list: async ({ ownerSessionId, statuses, kinds, undeliveredOnly, limit }) => (await host.apiHost.backgroundTaskService.list({
-                ownerSessionId,
-                ...(statuses ? { statuses: [...statuses] } : {}),
-                ...(kinds ? { kinds: [...kinds] } : {}),
-                ...(undeliveredOnly !== undefined ? { undeliveredOnly } : {}),
-                limit: Math.min(Math.max(1, limit ?? 50), 100),
-                orderBy: 'updated_at',
-                order: 'desc',
-            })).items,
+            list: async ({ ownerSessionId, statuses, kinds, undeliveredOnly, limit, includeNotification, }) => {
+                const { items } = await host.apiHost.backgroundTaskService.list({
+                    ownerSessionId,
+                    ...(statuses ? { statuses: [...statuses] } : {}),
+                    ...(kinds ? { kinds: [...kinds] } : {}),
+                    ...(undeliveredOnly !== undefined ? { undeliveredOnly } : {}),
+                    limit: Math.min(Math.max(1, limit ?? 50), 100),
+                    orderBy: 'updated_at',
+                    order: 'desc',
+                });
+                return includeNotification ? notifications.annotate(ownerSessionId, items) : items;
+            },
         },
     };
-}
-/** Process-local facade over the authoritative v1 Thread Goal integration. */
-function createThreadGoalApplication(integration, isReadOnlyLegacySession) {
-    const requireEnabled = () => {
-        if (!integration.isEnabled())
-            throw new Error('Thread Goal is disabled.');
-    };
-    const assertMutable = async (sessionId) => {
-        if (await isReadOnlyLegacySession(sessionId)) {
-            throw new Error('Legacy opencode sessions are read-only in clean local-runtime mode.');
-        }
-    };
-    return {
-        isEnabled: () => integration.isEnabled(),
-        get: async (sessionId) => {
-            requireEnabled();
-            const state = await integration.getGoalForResponse(requireGoalSessionId(sessionId));
-            return state ? toGlobalThreadGoal(state) : undefined;
-        },
-        create: async ({ sessionId, objective: rawObjective, tokenBudget, kickoffAttachments }) => {
-            requireEnabled();
-            const normalizedSessionId = requireGoalSessionId(sessionId);
-            await assertMutable(normalizedSessionId);
-            const objective = requireGoalObjective(rawObjective);
-            const input = {
-                sessionId: normalizedSessionId,
-                objective,
-                ...(tokenBudget !== undefined ? { tokenBudget } : {}),
-                ...(kickoffAttachments?.length ? { kickoffAttachments } : {}),
-            };
-            const created = kickoffAttachments?.length
-                ? await integration.createGoal(input, { requireKickoffAdmission: true })
-                : await integration.createGoal(input);
-            return toGlobalThreadGoal(created);
-        },
-        patch: async (sessionId, patch) => {
-            requireEnabled();
-            const normalizedSessionId = requireGoalSessionId(sessionId);
-            await assertMutable(normalizedSessionId);
-            // Same intent split as the HTTP route: a bare `paused` is the user
-            // leaving the Goal and must take the atomic lifecycle transition, not
-            // the generic field patch.
-            const updated = isBareUserPause(patch)
-                ? await integration.pauseGoalByUser(normalizedSessionId)
-                : await integration.patchGoal(normalizedSessionId, normalizeProcessLocalGoalPatch(patch));
-            if (!updated)
-                throw goalNotFound(normalizedSessionId);
-            return toGlobalThreadGoal(updated);
-        },
-        clear: async (sessionId) => {
-            requireEnabled();
-            const normalizedSessionId = requireGoalSessionId(sessionId);
-            await assertMutable(normalizedSessionId);
-            if (!(await integration.deleteGoal(normalizedSessionId))) {
-                throw goalNotFound(normalizedSessionId);
-            }
-            return true;
-        },
-    };
-}
-function goalNotFound(sessionId) {
-    return new ThreadGoalContractError(404, `Goal not found for session: ${sessionId}`, 'GOAL_NOT_FOUND');
-}
-function normalizeGoalObjectivePatch(objective) {
-    return objective === undefined ? undefined : requireGoalObjective(objective);
-}
-/**
- * A bare `status: 'paused'` carries the user's intent to leave the Goal.
- * Anything paired with an objective or budget edit stays a field patch.
- */
-function isBareUserPause(patch) {
-    return (patch.status === 'paused' && patch.objective === undefined && patch.tokenBudget === undefined);
-}
-function normalizeProcessLocalGoalPatch(patch) {
-    const objective = normalizeGoalObjectivePatch(patch.objective);
-    if (patch.status === undefined && objective === undefined && patch.tokenBudget === undefined) {
-        throw new Error('Goal patch must include status, objective, or tokenBudget.');
-    }
-    return {
-        ...(patch.status ? { status: patch.status } : {}),
-        ...(objective !== undefined ? { objective } : {}),
-        ...(patch.tokenBudget !== undefined ? { tokenBudget: patch.tokenBudget } : {}),
-    };
-}
-function toGlobalThreadGoal(state) {
-    return {
-        goalId: state.goalId,
-        sessionId: state.sessionId,
-        objective: state.objective,
-        status: state.status,
-        createdAt: state.createdAt,
-        updatedAt: state.updatedAt,
-        tokensUsed: state.tokensUsed,
-        turnsUsed: state.turnsUsed,
-        timeUsedSeconds: state.timeUsedSeconds,
-        tokenBudget: state.tokenBudget,
-        statusReason: state.statusReason,
-        executionWait: state.executionWait,
-        ...(state.lastVerification !== undefined
-            ? {
-                lastVerification: {
-                    backend: state.lastVerification.backend,
-                    verdict: state.lastVerification.verdict,
-                    reason: state.lastVerification.reason,
-                    missing: [...state.lastVerification.missing],
-                    notMetStreak: state.lastVerification.notMetStreak,
-                    at: state.lastVerification.at,
-                },
-            }
-            : {}),
-        hasKickoffAttachments: state.kickoffAttachments.length > 0,
-    };
-}
-function requireGoalSessionId(value) {
-    const sessionId = value.trim();
-    if (!sessionId)
-        throw new Error('sessionId is required.');
-    return sessionId;
-}
-function requireGoalObjective(value) {
-    const objective = value.trim();
-    if (!objective)
-        throw new Error('goal objective must not be empty');
-    return objective;
 }
 /** Only forwards old consumers to the V2 instance; has no settings, pool or registry. */
 function createDeferredMcpRuntimeCapability() {
@@ -674,5 +575,71 @@ function createV1SkillRuntimeOptions(host, options, bindRuntime) {
         metricsClient: host.metricsClient,
         bindRuntime,
     };
+}
+/** Upper bound of one dependency scan; the task store caps a page at this size. */
+const UNFINISHED_BACKGROUND_TASK_SCAN_LIMIT = 500;
+function createV1GoalHostCapabilities(host) {
+    const api = host.apiHost;
+    const questionnaireStore = new SqliteQuestionnaireRequestStore(() => host.dataDir);
+    return {
+        questionnaires: () => new LocalQuestionnaireService(api.questionnaireServiceDeps()).ownedOperations(),
+        hasUnresolvedQuestionnaire: (sessionId) => questionnaireStore.hasUnresolvedBySession(sessionId),
+        hasPendingPermission: (sessionId) => api.hasPendingPermissionForSession(sessionId),
+        hasActiveTeamOwner: (sessionId) => api.hasActiveTeamOwner(sessionId),
+        listUnfinishedBackgroundTasks: async (sessionId, kinds) => (await api.backgroundTaskService.list({
+            ownerSessionId: sessionId,
+            kinds: [...kinds],
+            statuses: ['queued', 'running', 'stopping'],
+            limit: UNFINISHED_BACKGROUND_TASK_SCAN_LIMIT,
+        })).items.map((task) => {
+            // Every local task row records the Turn whose tool call started it.
+            const parentTurnId = task.metadata?.parentTurnId;
+            return {
+                kind: task.kind,
+                ...(typeof parentTurnId === 'string' && parentTurnId
+                    ? { startedByTurnId: parentTurnId }
+                    : {}),
+            };
+        }),
+        readSessionFacts: async (sessionId) => {
+            const session = await api.getSessionById(sessionId);
+            return session
+                ? {
+                    agentName: session.agentName,
+                    parentSessionId: session.parentSessionId,
+                    sessionType: session.sessionType,
+                    sessionKind: session.sessionKind,
+                    ...(session.purpose ? { purpose: session.purpose } : {}),
+                }
+                : undefined;
+        },
+        isReadOnlyLegacySession: (sessionId) => api.isReadOnlyLegacySession(sessionId),
+        bindQuestionnaireWorkOwner: (owner) => api.bindQuestionnaireWorkOwner(owner),
+        bindSubSessionRoundAttribution: (port) => api.bindSubSessionRoundAttribution(port),
+        objectiveAssets: {
+            resolve: ({ sessionId, assetId }) => resolveSessionLocalAsset({ dataDir: host.dataDir, sessionId, assetId }),
+            register: ({ sessionId, attachments }) => registerMessageAttachments({ dataDir: host.dataDir, sessionId, attachments }),
+            discard: async ({ sessionId, receipts }) => {
+                await discardLocalAssetRegistrations({ dataDir: host.dataDir, sessionId, receipts });
+            },
+        },
+        loadObjectiveImages: loadUserImages,
+        verifierTaskRunner: {
+            hasSession: async (sessionId) => Boolean(await api.getSessionById(sessionId)),
+            inheritSessionRestrictions: (input) => api.inheritSessionPermissionRestrictions(input),
+            runForeground: (input) => api.runForegroundDelegation(input),
+        },
+        observability: {
+            logger: host.observability,
+            ...(host.evalReporterFactory ? { evalReporterFactory: host.evalReporterFactory } : {}),
+        },
+    };
+}
+export function createDeferredAgentRuntimeTelemetry() {
+    return createAgentTelemetryAdapter({
+        emitSubagentTelemetry,
+        roleClass,
+        events: SUBAGENT_TELEMETRY_EVENT,
+    });
 }
 //# sourceMappingURL=runtime.js.map

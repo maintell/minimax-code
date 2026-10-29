@@ -1,11 +1,13 @@
-export function positionModelMenu(anchor, direction, align, measurement, area) {
+export function positionModelMenu(anchor, direction, align, measurement, area, horizontalPadding = 16) {
     const { menu, submenu } = measurement;
     const values = [
         ...Object.values(anchor),
         ...Object.values(menu),
         ...Object.values(submenu ?? {}),
+        horizontalPadding,
     ];
     if (!values.every(Number.isFinite) ||
+        horizontalPadding < 0 ||
         menu.width <= 0 ||
         menu.height <= 0 ||
         menu.width > 2000 ||
@@ -16,7 +18,7 @@ export function positionModelMenu(anchor, direction, align, measurement, area) {
     }
     const padding = 16;
     const clamp = (value, min, max) => Math.max(min, Math.min(value, Math.max(min, max)));
-    const x = clamp(align === 'start' ? anchor.x - 4 : anchor.x + anchor.width - menu.width, area.x + padding, area.x + area.width - menu.width - padding);
+    const x = clamp(align === 'start' ? anchor.x - 4 : anchor.x + anchor.width - menu.width, area.x + horizontalPadding, area.x + area.width - menu.width - horizontalPadding);
     const y = clamp(direction === 'up' ? anchor.y - menu.height - 4 : anchor.y + anchor.height + 4, area.y + padding, area.y + area.height - menu.height - padding);
     const subX = submenu && x + menu.width + submenu.width + padding > area.x + area.width
         ? x - submenu.width + 4
@@ -24,9 +26,12 @@ export function positionModelMenu(anchor, direction, align, measurement, area) {
     const subY = submenu
         ? clamp(y + submenu.top, area.y + padding, area.y + area.height - submenu.height - padding)
         : y;
-    const left = Math.min(x, submenu ? subX : x) - padding;
+    const menuLeft = Math.min(x, submenu ? subX : x);
+    const menuRight = Math.max(x + menu.width, submenu ? subX + submenu.width : x + menu.width);
+    // Preserve the full shadow wherever it fits, trimming only at a display edge.
+    const left = menuLeft - Math.min(padding, Math.max(horizontalPadding, menuLeft - area.x));
     const top = Math.min(y, subY) - padding;
-    const right = Math.max(x + menu.width, submenu ? subX + submenu.width : x + menu.width) + padding;
+    const right = menuRight + Math.min(padding, Math.max(horizontalPadding, area.x + area.width - menuRight));
     const bottom = Math.max(y + menu.height, submenu ? subY + submenu.height : y + menu.height) + padding;
     const originalLeft = Math.floor(left);
     const originalTop = Math.floor(top);
@@ -56,6 +61,8 @@ export function positionModelMenu(anchor, direction, align, measurement, area) {
 export function isModelMenuActionAllowed(data, action) {
     if (!action || typeof action !== 'object')
         return false;
+    if (action.type === 'tab-menu-hover')
+        return data.kind === 'panel-tabs' && typeof action.inside === 'boolean';
     if (action.type === 'auto')
         return Boolean(data.auto);
     if (action.type === 'source')
@@ -64,6 +71,12 @@ export function isModelMenuActionAllowed(data, action) {
     if (!row || row.disabled)
         return false;
     switch (action.type) {
+        case 'close-tab':
+            return data.kind === 'panel-tabs';
+        case 'reorder-tab':
+            return (data.kind === 'panel-tabs' &&
+                action.key !== action.overKey &&
+                data.rows.some((candidate) => candidate.key === action.overKey && !candidate.disabled));
         case 'select':
             return !row.zoom;
         case 'zoom':

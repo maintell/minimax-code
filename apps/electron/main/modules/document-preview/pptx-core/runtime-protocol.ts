@@ -9,6 +9,18 @@ const PREFIX = '/_mavis/pptx-core/';
 const MEMBER_SEGMENT = /^[A-Za-z0-9._-]+$/u;
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
 const MAX_RUNTIME_BYTES = 256 * 1024 * 1024;
+const PACKAGED_PHYSICAL_DIR = 'r';
+function resolvePhysicalDir(layout, hash) {
+    if (layout === 'packaged')
+        return PACKAGED_PHYSICAL_DIR;
+    if (layout === 'dev') {
+        if (!HASH.test(hash)) {
+            throw new Error('The PPTX runtime layout=dev requires a 64-character hash directory');
+        }
+        return hash;
+    }
+    throw new Error(`The PPTX runtime layout is invalid: ${String(layout)}`);
+}
 const runtimeCsp = [
     "default-src 'none'",
     "script-src 'self' 'wasm-unsafe-eval'",
@@ -38,8 +50,9 @@ async function readSelector(runtimeRoot) {
     }
     return selector;
 }
-async function readManifest(runtimeRoot, hash) {
-    const manifest = JSON.parse(await readFile(path.join(runtimeRoot, hash, 'manifest.json'), 'utf8'));
+async function readManifest(runtimeRoot, hash, layout) {
+    const physicalDir = resolvePhysicalDir(layout, hash);
+    const manifest = JSON.parse(await readFile(path.join(runtimeRoot, physicalDir, 'manifest.json'), 'utf8'));
     if (manifest.schema !== MANIFEST_SCHEMA ||
         manifest.runtimeHash !== `sha256:${hash}` ||
         JSON.stringify(Object.keys(manifest).sort()) !==
@@ -122,6 +135,14 @@ function isInside(candidate, root) {
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 async function readContainedAsset(root, member) {
+    // The physical dir itself must be a real directory: a symlinked `r/` or
+    // `<hash>/` would let an attacker redirect the asset tree outside the
+    // intended runtime root while still passing per-segment checks.
+    const rootDetails = await lstat(root);
+    if (rootDetails.isSymbolicLink())
+        throw new Error('The PPTX runtime physical directory cannot be a symbolic link');
+    if (!rootDetails.isDirectory())
+        throw new Error('The PPTX runtime physical directory is not a directory');
     let current = root;
     for (const segment of member.split('/')) {
         current = path.join(current, segment);
@@ -168,11 +189,12 @@ export function createPptxCoreRuntimeProtocolHandler(options) {
             const parsed = requestMember(url.pathname);
             if (!parsed || selector.runtimeHash !== `sha256:${parsed.hash}`)
                 return new Response(null, { status: 404 });
-            const manifest = await readManifest(options.runtimeRoot, parsed.hash);
+            const manifest = await readManifest(options.runtimeRoot, parsed.hash, options.layout);
             const asset = manifest.assets.find((candidate) => candidate.path === parsed.member);
             if (!asset || !Number.isSafeInteger(asset.sizeBytes) || asset.sizeBytes < 0)
                 return new Response(null, { status: 404 });
-            const bytes = await readContainedAsset(path.join(options.runtimeRoot, parsed.hash), parsed.member);
+            const physicalDir = resolvePhysicalDir(options.layout, parsed.hash);
+            const bytes = await readContainedAsset(path.join(options.runtimeRoot, physicalDir), parsed.member);
             const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
             if (bytes.byteLength !== asset.sizeBytes || digest !== asset.sha256)
                 return jsonResponse(pptxCoreRuntimeTerminalResponseV1('pptx_core_runtime_integrity_failure'), 500);

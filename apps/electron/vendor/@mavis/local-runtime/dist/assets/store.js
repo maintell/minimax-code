@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, } from 'node:fs';
-import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile, } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { PPTX_PREVIEW_LIMITS_V1 } from '@mavis/shared/pptx-rendering';
@@ -474,6 +474,128 @@ function listRegisteredV2Assets(dataDir) {
             return [];
         }
     });
+}
+const SESSION_ASSET_INDEX_REFRESH_MS = 1_000;
+/**
+ * Per-Session view of the shared v2 asset store, cheap enough for every
+ * permission check. The store is one dated tree shared by all Sessions, and
+ * each asset's sidecar names the Session that registered it.
+ *
+ * All file-system work is asynchronous, so even the cold first scan of a large
+ * store never blocks the runtime's event loop; concurrent callers share one
+ * in-flight scan. A directory is re-read only when its mtime changes (adding
+ * or removing an asset changes it), and the tree is re-walked at most once per
+ * refresh interval.
+ */
+export function createSessionAssetPathIndex(dataDir, options = {}) {
+    const nowMs = options.nowMs ?? Date.now;
+    const refreshIntervalMs = options.refreshIntervalMs ?? SESSION_ASSET_INDEX_REFRESH_MS;
+    let directories = new Map();
+    let refreshedAtMs;
+    let inFlight;
+    const scan = async () => {
+        const contract = resolveV2DirectoryContract(dataDir);
+        const assetsRoot = await realpath(contract.assets).catch(() => undefined);
+        const next = new Map();
+        if (assetsRoot) {
+            for (const { directory, mtimeMs } of await listAssetDirectories(contract.assets)) {
+                const previous = directories.get(directory);
+                next.set(directory, previous?.mtimeMs === mtimeMs
+                    ? previous
+                    : {
+                        mtimeMs,
+                        entries: await readAssetDirectoryEntries(contract.root, assetsRoot, directory),
+                    });
+            }
+        }
+        directories = next;
+    };
+    const refresh = () => {
+        if (inFlight)
+            return inFlight;
+        const now = nowMs();
+        if (refreshedAtMs !== undefined && now - refreshedAtMs < refreshIntervalMs) {
+            return Promise.resolve();
+        }
+        refreshedAtMs = now;
+        inFlight = scan().finally(() => {
+            inFlight = undefined;
+        });
+        return inFlight;
+    };
+    return {
+        async listSessionAssetPaths(sessionIds) {
+            const wanted = new Set(sessionIds.map((id) => id.trim()).filter(Boolean));
+            if (wanted.size === 0)
+                return [];
+            await refresh();
+            const paths = [];
+            for (const { entries } of directories.values()) {
+                for (const entry of entries) {
+                    if (wanted.has(entry.sessionId))
+                        paths.push(entry.filePath);
+                }
+            }
+            return paths;
+        },
+    };
+}
+/** Real (non-symlink) directories under the asset root, with their mtimes. */
+async function listAssetDirectories(root) {
+    const found = [];
+    const visit = async (directory) => {
+        const info = await lstat(directory).catch(() => undefined);
+        if (!info || info.isSymbolicLink() || !info.isDirectory())
+            return;
+        found.push({ directory, mtimeMs: info.mtimeMs });
+        const names = await readdir(directory).catch(() => []);
+        for (const name of names) {
+            // Asset files and sidecars carry an extension; dated directories do not.
+            if (!name.includes('.'))
+                await visit(path.join(directory, name));
+        }
+    };
+    await visit(root);
+    return found;
+}
+/**
+ * Valid Session-owned assets in one directory. Each sidecar is read once; the
+ * asset must sit next to it, be a regular file of the recorded size, and
+ * resolve inside the canonical asset root.
+ */
+async function readAssetDirectoryEntries(v2Root, assetsRoot, directory) {
+    const names = await readdir(directory).catch(() => []);
+    const entries = [];
+    for (const name of names) {
+        if (!name.endsWith('.asset.json'))
+            continue;
+        const entry = await readAssetDirectoryEntry(v2Root, assetsRoot, path.join(directory, name));
+        if (entry)
+            entries.push(entry);
+    }
+    return entries;
+}
+async function readAssetDirectoryEntry(v2Root, assetsRoot, sidecarPath) {
+    try {
+        const sidecarInfo = await lstat(sidecarPath);
+        if (sidecarInfo.isSymbolicLink() || !sidecarInfo.isFile())
+            return undefined;
+        const parsed = JSON.parse(await readFile(sidecarPath, 'utf-8'));
+        if (!isLocalRuntimeAssetRecord(parsed) || !parsed.sessionId)
+            return undefined;
+        const filePath = path.join(v2Root, parsed.relativePath);
+        if (`${filePath}.asset.json` !== sidecarPath)
+            return undefined;
+        const fileInfo = await stat(filePath);
+        if (!fileInfo.isFile() || fileInfo.size !== parsed.bytes)
+            return undefined;
+        if (!isPathInside(assetsRoot, await realpath(filePath)))
+            return undefined;
+        return { sessionId: parsed.sessionId, filePath };
+    }
+    catch {
+        return undefined;
+    }
 }
 function isSameAssetSource(record, canonicalSource) {
     if (record.absolutePath === canonicalSource)

@@ -1,5 +1,3 @@
-import { setupExcelEditorIPC } from "./excel-editor.ipc";
-import { setupWordEditorIPC } from "./word-editor.ipc";
 /**
  * File Tools IPC 处理器
  */
@@ -15,8 +13,6 @@ export function setupFileIPC() {
     ipcMain.handle(IPC_CHANNELS.FILE_STAGE_ATTACHMENT, async (_, fileName, bytes) => {
         return stageAttachment(app.getPath('userData'), fileName, bytes);
     });
-    setupWordEditorIPC();
-    setupExcelEditorIPC();
     ipcMain.handle(IPC_CHANNELS.FILE_SAVE_WORKBOOK, async (event, params) => {
         if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame)
             throw new Error('Workbook save requires the application frame');

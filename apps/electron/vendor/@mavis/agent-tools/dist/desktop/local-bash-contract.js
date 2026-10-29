@@ -35,9 +35,24 @@ function renderBashUsage(capabilities) {
             : ['- This Turn supports foreground execution only.']),
         "- Large output preserves the beginning and end. Follow the result's instructions to read omitted output.",
         ...shellRules(capabilities.shell),
+        ...deletionRules(capabilities.nativeDelete === true),
     ].join('\n');
 }
+function deletionRules(nativeDelete) {
+    if (nativeDelete)
+        return [];
+    return [
+        '- For recoverable file or directory deletion on macOS/Linux, read the exact `activeDataDir` from the current `<runtime-data-context>`; never guess it or invoke bare `mavis-trash`. Run `"<activeDataDir>/bin/mavis-trash" -- "<target1>" "<target2>"`.',
+        '- On Windows, use one top-level `rm -- "<target1>" "<target2>"`; the local runtime routes it through its trusted launcher.',
+        '- If recoverable deletion fails, report the failure instead of bypassing it with another deletion command or inline script. Never fall back to permanent deletion. Permission checks still apply.',
+    ];
+}
 function shellRules(shell) {
+    if (shell === 'pending')
+        return [
+            '- Shell discovery is pending in the background. Do not assume Bash or PowerShell syntax.',
+            '- The first bash call waits for discovery before permission checks and returns shell instructions without executing the command. Rewrite the command for the resolved shell in a new tool-call batch, then retry. Other tools do not wait for discovery.',
+        ];
     if (shell === 'unavailable')
         return [
             '- No local shell was resolved. Do not assume Bash or PowerShell syntax is executable.',

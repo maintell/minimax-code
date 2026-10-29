@@ -4,7 +4,7 @@
  *
  * Why a help tier: the tool description in `mavis-tool-def.ts` only shows
  * high-frequency commands inline so the static prompt stays small. Low-
- * frequency commands (`agent update`, `cron trigger`, `session delete`,
+ * frequency commands (`agent update`, `cron trigger`,
  * `drive nodes move/rename`, ...) live here — the LLM pays the token cost
  * only when it explicitly calls `mavis({ command: "<group> help" })`.
  *
@@ -422,124 +422,8 @@ const CRON_GROUP = {
 // ─── session ────────────────────────────────────────────────────────────
 const SESSION_GROUP = {
     group: 'session',
-    summary: 'Sessions are conversations. CRUD + message history for sessions you own or are linked to.',
-    commands: [
-        {
-            command: 'session list',
-            summary: 'List sessions for an agent (default mode) or list reachable peers (`mode: "peers"`).',
-            args: [
-                {
-                    name: 'mode',
-                    type: '"peers"|"sessions"',
-                    required: false,
-                    description: 'Default "sessions". Use "peers" to discover reachable peer sessions for `communicate`.',
-                },
-                {
-                    name: 'agent_name',
-                    type: 'string',
-                    required: false,
-                    description: '(sessions mode) Filter by owning agent. "me" supported.',
-                },
-                {
-                    name: 'parent_session_id',
-                    type: 'string',
-                    required: false,
-                    description: '(sessions mode) Filter by parent session. "me" supported.',
-                },
-                {
-                    name: 'archive_filter',
-                    type: '"Unarchived"|"Archived"',
-                    required: false,
-                    description: '(sessions mode) Defaults to Unarchived.',
-                },
-                {
-                    name: 'session_id',
-                    type: 'string',
-                    required: false,
-                    description: '(peers mode) Required; use "me" for the current session.',
-                },
-                {
-                    name: 'cursor',
-                    type: 'string',
-                    required: false,
-                    description: '(sessions mode) Pagination cursor.',
-                },
-                {
-                    name: 'limit',
-                    type: 'number',
-                    required: false,
-                    description: '(sessions mode) Page size.',
-                },
-            ],
-            examples: [
-                'mavis({ command: "session list", args: { agent_name: "me" } })',
-                'mavis({ command: "session list", args: { mode: "peers", session_id: "me" } })',
-            ],
-        },
-        {
-            command: 'session get',
-            summary: 'Fetch one session by id.',
-            args: [{ name: 'session_id', type: 'string', required: true, description: 'Session id.' }],
-            examples: ['mavis({ command: "session get", args: { session_id: "mvs_..." } })'],
-        },
-        {
-            command: 'session messages',
-            summary: "Read recent messages of a session (history snapshot). Use this to inspect a peer's progress or to read your own past turns.",
-            args: [
-                {
-                    name: 'session_id',
-                    type: 'string',
-                    required: true,
-                    description: 'Session id. "me" supported.',
-                },
-                { name: 'limit', type: 'number', required: false, description: 'Default 20.' },
-                {
-                    name: 'before',
-                    type: 'string',
-                    required: false,
-                    description: 'Opaque cursor — pass the value returned by the previous page.',
-                },
-            ],
-            examples: ['mavis({ command: "session messages", args: { session_id: "me", limit: 50 } })'],
-        },
-        {
-            command: 'session update',
-            summary: 'Patch session metadata (rename, archive, re-home to another agent).',
-            args: [
-                { name: 'session_id', type: 'string', required: true, description: 'Session id.' },
-                { name: 'title', type: 'string', required: false, description: 'New title.' },
-                {
-                    name: 'extra_data_json',
-                    type: 'string (JSON)',
-                    required: false,
-                    description: 'Replace the metadata blob.',
-                },
-                {
-                    name: 'agent_name',
-                    type: 'string',
-                    required: false,
-                    description: 'Re-home the session to another agent (display name).',
-                },
-                { name: 'archived', type: 'boolean', required: false, description: 'Archive / unarchive.' },
-            ],
-            examples: [
-                'mavis({ command: "session update", args: { session_id: "mvs_...", archived: true } })',
-            ],
-        },
-        {
-            command: 'session delete',
-            summary: 'Delete a session. Irreversible — messages and metadata are removed.',
-            args: [
-                {
-                    name: 'session_id',
-                    type: 'string',
-                    required: true,
-                    description: 'Session id. Cannot use "me".',
-                },
-            ],
-            examples: ['mavis({ command: "session delete", args: { session_id: "mvs_..." } })'],
-        },
-    ],
+    summary: 'Session list, get, update, and messages moved to on-demand tools session_list, session_get, session_update, and session_messages. Search for session_* with tool_search, then call mcp_invoke.',
+    commands: [],
 };
 // ─── drive ──────────────────────────────────────────────────────────────
 const DRIVE_GROUP = {

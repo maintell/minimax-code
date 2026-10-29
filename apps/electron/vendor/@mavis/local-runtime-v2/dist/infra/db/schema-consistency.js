@@ -1,5 +1,6 @@
-import { EXPECTED_TABLES, AGENT_COLUMN_DEFINITIONS, MEMORY_TABLE_NAMES, MEMORY_COLUMN_DEFINITIONS, MEMORY_CHECKS, } from './schema-consistency.contracts.js';
-import { canonicalizeSqlContract, canonicalizeSqlDefault, canonicalizeSqlDefinition, canonicalizeSqlExpression, extractSqlCheckContracts, } from './sql-contract.js';
+import { EXPECTED_TABLES, SESSION_QUERY_INDEX_NAMES, AGENT_COLUMN_DEFINITIONS, MEMORY_TABLE_NAMES, MEMORY_COLUMN_DEFINITIONS, MEMORY_CHECKS, } from './schema-consistency.contracts.js';
+import { readName, readNullableString, readNumber, readSql, readString, } from './schema-consistency.metadata-rows.js';
+import { canonicalizeSqlContract as compactSql, canonicalizeSqlDefault, canonicalizeSqlDefinition as normalizeDefinition, canonicalizeSqlExpression, extractSqlCheckContracts, } from './sql-contract.js';
 import { SESSION_STORAGE_RAW_OBJECTS, SESSION_STORAGE_SCHEMA, SESSION_STORAGE_TABLE_METADATA, SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA, SESSION_STORAGE_TRIGGER_METADATA, SESSION_STORAGE_VIRTUAL_TABLE_METADATA, } from './schema/session-storage.js';
 import { MINIAPP_STATE_TABLE_METADATA } from './schema/miniapp.js';
 import { SESSION_CLIO_INDEX_NAMES, SESSION_CLIO_TABLE_NAMES } from './schema/session-clio.js';
@@ -8,16 +9,6 @@ import { LEGACY_HISTORY_NOTICE_REPAIR_CUTOFF_TABLE } from './legacy-history-noti
 const SESSION_TABLE_CONFIGS = SESSION_STORAGE_TABLE_METADATA.required;
 const OPTIONAL_DIAGNOSTIC_TABLE_CONFIGS = SESSION_STORAGE_TABLE_METADATA.optionalDiagnostic;
 const CONDITIONAL_LEGACY_TABLE_CONFIGS = SESSION_STORAGE_TABLE_METADATA.conditionalLegacyInput;
-const SESSION_QUERY_INDEX_NAMES = new Set([
-    'idx_local_runtime_queue_items_session_status_id',
-    'idx_local_runtime_queue_items_session_client_request',
-    'idx_local_runtime_queue_items_session_dedupe',
-    'idx_local_runtime_queue_items_session_claim_id',
-    'idx_local_runtime_queue_items_session_routing_id',
-    'idx_local_runtime_token_usage_model_ts',
-    'idx_local_runtime_token_usage_day_ts',
-    'idx_local_runtime_session_assets_session_key_time',
-]);
 const QUEUE_CONVERGENCE_INDEX_NAMES = new Set([
     'idx_local_runtime_queue_items_session_status_expiry_id',
     'local_runtime_queue_migration_quarantine_source',
@@ -146,11 +137,11 @@ function assertSessionMetadataComplete() {
     const inventoryCount = classifiedCount +
         SESSION_STORAGE_RAW_OBJECTS.externalTables.length +
         SESSION_STORAGE_VIRTUAL_TABLE_METADATA.length;
-    const complete = ownerCount === 33 &&
+    const complete = ownerCount === 34 &&
         CONDITIONAL_LEGACY_TABLE_CONFIGS.length === 2 &&
         SESSION_STORAGE_RAW_OBJECTS.externalTables.length === 5 &&
         SESSION_STORAGE_VIRTUAL_TABLE_METADATA.length === 1 &&
-        inventoryCount === 41;
+        inventoryCount === 42;
     if (!complete)
         throw new Error('Session storage schema metadata is incomplete');
 }
@@ -168,24 +159,31 @@ function assertRequiredTableColumns(db) {
         if (shouldSkipRequiredTableCheck(db, table))
             continue;
         const actual = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(readName));
-        let expectedColumns = expected;
-        if (table === 'local_runtime_v2_cron_runs' && !cronExecutionFieldsApplied(db)) {
-            expectedColumns = expectedColumns.filter((column) => !CRON_EXECUTION_FIELD_COLUMNS.has(column));
-        }
-        if (table === 'local_runtime_v2_cron_definitions' && !cronSessionTargetModeApplied(db)) {
-            expectedColumns = expectedColumns.filter((column) => !CRON_SESSION_TARGET_MODE_COLUMNS.has(column));
-        }
-        expectedColumns = expectedAgentColumnsForDatabase(db, table, expectedColumns);
+        const expectedColumns = expectedTableColumnsForDatabase(db, table, expected);
         const missingColumns = expectedColumns.filter((column) => !actual.has(column));
         if (actual.size === 0 || missingColumns.length > 0) {
             throw new Error(`Database schema columns missing: ${table}.${missingColumns.join(`,${table}.`)}`);
         }
     }
 }
+/** Goal tables, each checked only once the migration that creates it has run. */
+const GOAL_TABLE_MIGRATIONS = new Map([
+    ['local_runtime_v2_goals', 46],
+    ['local_runtime_v2_goal_requests', 47],
+    ['local_runtime_v2_goal_token_charges', 48],
+]);
+/** Tables checked only once the migration that creates them has run. */
+const TABLE_MIGRATIONS = new Map([
+    ...GOAL_TABLE_MIGRATIONS,
+    ['local_runtime_plugin_miniapp_permission', 50],
+]);
 function shouldSkipRequiredTableCheck(db, table) {
+    const tableMigration = TABLE_MIGRATIONS.get(table);
     return ((table === 'agents' && !agentMigrationApplied(db)) ||
+        (table === 'local_runtime_background_tasks' && !migrationApplied(db, 45)) ||
         (table.startsWith('local_runtime_v2_memory_') && !memoryMigrationApplied(db)) ||
-        (table === MINIAPP_STATE_TABLE_METADATA.name && !miniAppStateContractApplied(db)));
+        (table === MINIAPP_STATE_TABLE_METADATA.name && !miniAppStateContractApplied(db)) ||
+        (tableMigration !== undefined && !migrationVersionApplied(db, tableMigration)));
 }
 function assertMiniAppStateTable(db) {
     if (!miniAppStateContractApplied(db))
@@ -372,6 +370,10 @@ function assertSessionIndexDefinitions(db) {
 }
 function indexMigrationGates(db) {
     return [
+        {
+            applied: sessionSideChatsSchemaActive(db),
+            names: new Set(['idx_local_runtime_session_sidechats_main_created']),
+        },
         { applied: sharedProjectSchemaCompatibilityApplied(db), names: CHANNEL_PROJECT_INDEX_NAMES },
         { applied: queryIndexesApplied(db), names: SESSION_QUERY_INDEX_NAMES },
         { applied: queueConvergenceApplied(db), names: QUEUE_CONVERGENCE_INDEX_NAMES },
@@ -680,6 +682,8 @@ function baseSessionTableActive(db, tableName) {
         (taskSessionBindingsApplied(db) || !TASK_SESSION_BINDING_TABLE_NAMES.has(tableName)));
 }
 function lateSessionTableActive(db, tableName) {
+    if (tableName === 'local_runtime_session_sidechats')
+        return sessionSideChatsSchemaActive(db);
     if (QUEUE_PAUSE_TABLE_NAMES.has(tableName))
         return queuePauseApplied(db);
     if (SOURCE_RESOURCE_TABLE_NAMES.has(tableName))
@@ -689,6 +693,9 @@ function lateSessionTableActive(db, tableName) {
     if (SESSION_CLIO_TABLE_NAMES.has(tableName))
         return migrationApplied(db, 41);
     return true;
+}
+function sessionSideChatsSchemaActive(db) {
+    return migrationApplied(db, 42) || tableExists(db, 'local_runtime_session_sidechats');
 }
 function tableExists(db, name) {
     return db.prepare(`PRAGMA table_info(${name})`).all().length > 0;
@@ -792,22 +799,22 @@ function currentColumnDefinitions(db, table) {
     return compatibleDefinitions;
 }
 function queryIndexesApplied(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(9));
+    return migrationVersionApplied(db, 9);
 }
 function queueConvergenceApplied(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(10));
+    return migrationVersionApplied(db, 10);
 }
 function fileApiCacheApplied(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(11));
+    return migrationVersionApplied(db, 11);
 }
 function agentMigrationApplied(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(14));
+    return migrationVersionApplied(db, 14);
 }
 function queryCollapseApplied(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(16));
+    return migrationVersionApplied(db, 16);
 }
 function projectV5TriggerCompatibilityRestored(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(18));
+    return migrationVersionApplied(db, 18);
 }
 // Version 33 reapplies the published Channel schema; versions 34–35 restore its old contract.
 function intermediateChannelProjectSchemaApplied(db) {
@@ -881,66 +888,53 @@ function tableHasColumn(db, tableName, columnName) {
     return (db.prepare(`SELECT name FROM pragma_table_info('${tableName}') WHERE name = ?`).all(columnName)
         .length > 0);
 }
-function readName(value) {
-    if (typeof value !== 'object' || value === null || !('name' in value)) {
-        throw new Error('Database schema metadata row is invalid');
-    }
-    const name = value.name;
-    if (typeof name !== 'string')
-        throw new Error('Database schema metadata name is invalid');
-    return name;
-}
-function readSql(value) {
-    if (typeof value !== 'object' || value === null || !('sql' in value)) {
-        throw new Error('Database schema metadata row is invalid');
-    }
-    const sql = value.sql;
-    if (typeof sql !== 'string')
-        throw new Error('Database schema metadata sql is invalid');
-    return sql;
-}
-function readString(value, key) {
-    if (typeof value !== 'object' || value === null || !(key in value)) {
-        throw new Error('Database schema metadata row is invalid');
-    }
-    const result = value[key];
-    if (typeof result !== 'string')
-        throw new Error(`Database schema metadata ${key} is invalid`);
-    return result;
-}
-function readNumber(value, key) {
-    if (typeof value !== 'object' || value === null || !(key in value)) {
-        throw new Error('Database schema metadata row is invalid');
-    }
-    const result = value[key];
-    if (typeof result !== 'number')
-        throw new Error(`Database schema metadata ${key} is invalid`);
-    return result;
-}
-function readNullableString(value, key) {
-    if (typeof value !== 'object' || value === null || !(key in value)) {
-        throw new Error('Database schema metadata row is invalid');
-    }
-    const result = value[key];
-    if (result !== null && typeof result !== 'string') {
-        throw new Error(`Database schema metadata ${key} is invalid`);
-    }
-    return result;
-}
 function normalizeSql(value) {
     return value.replaceAll('"', '').replace(/\s+/gu, ' ').trim().replace(/;$/u, '').toLowerCase();
 }
-function compactSql(value) {
-    return canonicalizeSqlContract(value);
+function expectedTableColumnsForDatabase(db, table, expected) {
+    let expectedColumns = expected;
+    if (table === 'local_runtime_v2_cron_definitions' && !migration35ConvergenceApplied(db)) {
+        expectedColumns = expectedColumns.filter((column) => column !== 'project' && column !== 'model');
+    }
+    if (table === 'local_runtime_v2_cron_runs' && !cronExecutionFieldsApplied(db)) {
+        expectedColumns = expectedColumns.filter((column) => !CRON_EXECUTION_FIELD_COLUMNS.has(column));
+    }
+    if (table === 'local_runtime_v2_cron_definitions' && !cronSessionTargetModeApplied(db)) {
+        expectedColumns = expectedColumns.filter((column) => !CRON_SESSION_TARGET_MODE_COLUMNS.has(column));
+    }
+    if (table === 'local_runtime_v2_goals') {
+        const pending = pendingGoalColumns(db);
+        expectedColumns = expectedColumns.filter((column) => !pending.has(column));
+    }
+    expectedColumns = expectedAgentColumnsForDatabase(db, table, expectedColumns);
+    return expectedColumns;
 }
-function normalizeDefinition(value) {
-    return canonicalizeSqlDefinition(value);
+/** Goal columns added by migration 48 (full-usage token accounting). */
+const GOAL_TOKEN_USAGE_COLUMNS = new Set([
+    'token_accounting_version',
+    'input_tokens',
+    'cache_write_tokens',
+    'cache_read_tokens',
+    'output_tokens',
+]);
+/** Goal columns whose migration (48 token usage, 51 cache write unreported) has not run yet. */
+function pendingGoalColumns(db) {
+    const pending = new Set();
+    if (!migrationVersionApplied(db, 48))
+        for (const column of GOAL_TOKEN_USAGE_COLUMNS)
+            pending.add(column);
+    if (!migrationVersionApplied(db, 51))
+        pending.add('cache_write_unreported');
+    return pending;
+}
+function migrationVersionApplied(db, version) {
+    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(version));
 }
 function memoryMigrationApplied(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(38));
+    return migrationVersionApplied(db, 38);
 }
 function memoryExecutionsApplied(db) {
-    return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(40));
+    return migrationVersionApplied(db, 40);
 }
 function memoryTableNames(db) {
     return MEMORY_TABLE_NAMES.filter((name) => memoryExecutionsApplied(db) || !name.includes('_execution_'));

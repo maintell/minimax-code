@@ -2,8 +2,9 @@ import { LocalMemoryError } from './types.js';
 import { emitResourceAmbiguityTelemetry, } from '../agent/subagent-telemetry.js';
 export function selectMainMemoryResource(candidates, canonicalName, telemetryHost) {
     const canonical = candidates.find(({ sourceAgent }) => sourceAgent === canonicalName);
-    const canonicalHasContent = canonical?.value.content.trim().length;
-    if (canonical && canonicalHasContent)
+    // An existing canonical file is authoritative, including an explicitly saved
+    // empty value. Only a missing file may fall back to a compatible source.
+    if (canonical?.value.updatedAt !== undefined)
         return canonical;
     const compatibleWithContent = candidates.filter(({ sourceAgent, value }) => sourceAgent !== canonicalName && value.content.trim().length > 0);
     const soleCompatibleWithContent = compatibleWithContent[0];
@@ -13,8 +14,6 @@ export function selectMainMemoryResource(candidates, canonicalName, telemetryHos
     if (compatibleWithContent.length > 1) {
         throwAmbiguousMemory('main', compatibleWithContent.map(({ sourceAgent }) => sourceAgent), telemetryHost);
     }
-    if (canonical?.value.updatedAt !== undefined)
-        return canonical;
     const existing = candidates.find(({ value }) => value.updatedAt !== undefined);
     if (existing)
         return existing;

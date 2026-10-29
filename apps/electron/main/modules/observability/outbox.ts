@@ -200,6 +200,32 @@ function sanitizeUtilityRuntimePayload(payload) {
     }
     return sanitized;
 }
+const HOT_UPDATE_CHANNELS = new Set(['prod', 'internal', 'inside', 'staging', 'test', 'none']);
+const HOT_UPDATE_RESULTS = new Set(['success', 'error', 'rejected', 'available', 'up_to_date']);
+const HOT_UPDATE_VERSION_PATTERN = /^(bundled|\d+\.\d+\.\d+-renderer\.\d+)$/;
+/** hot_update.* 只保留通道、版本、结果等有限字段；reason 走路径脱敏与长度上限 */
+function sanitizeHotUpdatePayload(payload) {
+    const sanitized = {
+        ...safeCommonMetadata(payload),
+        domain: 'hot_update',
+        channel: boundedValue(payload.channel, HOT_UPDATE_CHANNELS),
+    };
+    if (typeof payload.version === 'string' && HOT_UPDATE_VERSION_PATTERN.test(payload.version)) {
+        sanitized.version = payload.version;
+    }
+    if (payload.result !== undefined) {
+        sanitized.result = boundedValue(payload.result, HOT_UPDATE_RESULTS);
+    }
+    if (typeof payload.reason === 'string') {
+        sanitized.reason = boundFailureDetail(payload.reason);
+    }
+    if (typeof payload.duration_ms === 'number' && Number.isFinite(payload.duration_ms)) {
+        sanitized.duration_ms = payload.duration_ms;
+    }
+    if (typeof payload.promoted === 'boolean')
+        sanitized.promoted = payload.promoted;
+    return sanitized;
+}
 function sanitizeGenericProbePayload(eventName, payload) {
     if (eventName === 'workspace_indexing.state') {
         return { ...safeCommonMetadata(payload), ...sanitizeWorkspaceIndexingPayload(payload) };
@@ -255,6 +281,9 @@ function sanitizeGenericProbePayload(eventName, payload) {
     // sibling event with a different shape starts flowing through the outbox.
     if (eventName.startsWith('utility_runtime.')) {
         return sanitizeUtilityRuntimePayload(payload);
+    }
+    if (eventName.startsWith('hot_update.')) {
+        return sanitizeHotUpdatePayload(payload);
     }
     if (eventName === 'desktop.abnormal_page') {
         return {

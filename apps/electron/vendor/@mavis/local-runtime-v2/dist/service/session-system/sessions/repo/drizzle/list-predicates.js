@@ -34,9 +34,11 @@ function listParentPredicate(options) {
         : eq(sessions.parentSessionId, options.parentSessionId);
 }
 function listOriginPredicate(options) {
-    return 'originCronId' in options && options.originCronId
-        ? eq(sessions.originCronId, options.originCronId)
-        : undefined;
+    if (!('originCronId' in options) || options.originCronId === undefined)
+        return undefined;
+    if (options.originCronId === null)
+        return isNull(sessions.originCronId);
+    return options.originCronId ? eq(sessions.originCronId, options.originCronId) : undefined;
 }
 function archivedPredicate(archived) {
     return archived === undefined ? undefined : eq(sessions.archived, archived ? 1 : 0);

@@ -53,8 +53,8 @@ export const TURN_END_STATUS = { OK: 1, ERROR: 2, ABORTED: 3 };
 const RESP_DATA_TYPE = { AgentMessage: 2, AgentMessageChunk: 6, Heartbeat: 10 };
 const DONE_SENTINEL = '[DONE]';
 const STREAM_SCOPE_SEPARATOR = '\u0000';
-function pumpKey(sessionId, streamScope) {
-    return streamScope ? `${streamScope}${STREAM_SCOPE_SEPARATOR}${sessionId}` : sessionId;
+function pumpKey(sessionId, cmdId, streamScope) {
+    return `${streamScope ?? ''}${STREAM_SCOPE_SEPARATOR}${sessionId}${STREAM_SCOPE_SEPARATOR}${cmdId}`;
 }
 export class StreamPump {
     deps;
@@ -63,15 +63,27 @@ export class StreamPump {
         this.deps = deps;
     }
     getActiveCmdId(sessionId, streamScope) {
-        return this.pumps.get(pumpKey(sessionId, streamScope))?.cmdId;
+        let resumeCmdId;
+        for (const pump of this.pumps.values()) {
+            if (pump.sessionId !== sessionId || pump.streamScope !== streamScope)
+                continue;
+            if (pump.cmdType === 'cmd.session.send')
+                return pump.cmdId;
+            resumeCmdId = pump.cmdId;
+        }
+        return resumeCmdId;
     }
     start(input) {
-        // One active turn per session within one gateway connection. Independent
-        // connections may stream the same session without superseding each other.
-        const registryKey = pumpKey(input.sessionId, input.streamScope);
+        if (input.signal?.aborted) {
+            void input.response.body?.cancel().catch(() => undefined);
+            return;
+        }
+        // One gateway connection carries requests from multiple consumers. Their
+        // send/resume streams for the same session must remain independent.
+        const registryKey = pumpKey(input.sessionId, input.cmdId, input.streamScope);
         const stale = this.pumps.get(registryKey);
         if (stale) {
-            this.deps.logger.warn(`[rc.pump] superseding stale pump scope=${input.streamScope ?? ''} session=${input.sessionId} cmd=${stale.cmdId}`);
+            this.deps.logger.warn(`[rc.pump] superseding duplicate command scope=${input.streamScope ?? ''} session=${input.sessionId} cmd=${stale.cmdId}`);
             this.terminate(stale, { emitTurnEnd: false });
         }
         const pump = {
@@ -92,6 +104,12 @@ export class StreamPump {
         };
         this.deps.logger.info(`[rc.pump] event=stream_start trace_id=${pump.traceId ?? ''} rc_cmd_id=${pump.cmdId} session_id=${pump.sessionId} cmd_type=${pump.cmdType}`);
         this.pumps.set(registryKey, pump);
+        if (input.signal) {
+            const signal = input.signal;
+            const abort = () => this.terminate(pump, { emitTurnEnd: false });
+            signal.addEventListener('abort', abort, { once: true });
+            pump.removeAbortListener = () => signal.removeEventListener('abort', abort);
+        }
         void this.run(pump, input.response).catch((err) => {
             this.deps.logger.error(`[rc.pump] pump crashed session=${pump.sessionId}: ${err instanceof Error ? err.message : String(err)}`);
             if (pump.aborted || pump.turnEndSent)
@@ -101,12 +119,13 @@ export class StreamPump {
         });
     }
     abortSession(sessionId, cause, streamScope) {
-        const pump = this.pumps.get(pumpKey(sessionId, streamScope));
-        if (!pump)
+        const active = [...this.pumps.values()].filter((pump) => pump.sessionId === sessionId && pump.streamScope === streamScope);
+        if (active.length === 0)
             return;
-        this.deps.logger.info(`[rc.pump] abort scope=${streamScope ?? ''} session=${sessionId} cause=${cause}`);
-        // Deterministic ABORTED turn_end for the phone, then kill the reader.
-        this.terminate(pump, { emitTurnEnd: true });
+        this.deps.logger.info(`[rc.pump] abort scope=${streamScope ?? ''} session=${sessionId} streams=${active.length} cause=${cause}`);
+        // Every consumer of this session needs its own terminal reply.
+        for (const pump of active)
+            this.terminate(pump, { emitTurnEnd: true });
     }
     abortAll(cause, streamScope) {
         const active = [...this.pumps.values()].filter((pump) => streamScope === undefined || pump.streamScope === streamScope);
@@ -119,6 +138,7 @@ export class StreamPump {
         }
     }
     terminate(pump, opts) {
+        pump.removeAbortListener?.();
         pump.aborted = true;
         if (opts.emitTurnEnd)
             this.emitTurnEnd(pump, TURN_END_STATUS.ABORTED);
@@ -172,6 +192,7 @@ export class StreamPump {
             this.finish(pump, {});
         }
         finally {
+            pump.removeAbortListener?.();
             pump.reader = null;
             if (this.pumps.get(pump.registryKey) === pump)
                 this.pumps.delete(pump.registryKey);
@@ -216,7 +237,7 @@ export class StreamPump {
         const text = `{"v":1,"id":${JSON.stringify(`ev-${randomUUID()}`)},"ts":${(this.deps.nowMs ?? Date.now)()},` +
             `"type":"${frameType}","in_reply_to":${JSON.stringify(pump.cmdId)},${traceField}"source":"desktop",` +
             `"payload":{"session_id":${JSON.stringify(pump.sessionId)},"${payloadKey}":${dataJson}}}`;
-        const result = this.deps.sender.sendFrameText(text, frameType);
+        const result = this.deps.sender.sendFrameText(text, frameType, pump.streamScope);
         if (result.ok) {
             pump.frameCount += 1;
             return;
@@ -230,7 +251,7 @@ export class StreamPump {
                     code: 'FRAME_TOO_LARGE',
                     message: 'a stream frame exceeded max_message_bytes and was dropped',
                     retryable: false,
-                }, { inReplyTo: pump.cmdId, traceId: pump.traceId }));
+                }, { inReplyTo: pump.cmdId, traceId: pump.traceId }), pump.streamScope);
             }
             return; // keep pumping the rest of the turn
         }
@@ -246,7 +267,7 @@ export class StreamPump {
             message: error.message,
             retryable: false,
             ...(error.errorCode !== undefined ? { errorCode: error.errorCode } : {}),
-        }, { inReplyTo: pump.cmdId, traceId: pump.traceId }));
+        }, { inReplyTo: pump.cmdId, traceId: pump.traceId }), pump.streamScope);
         if (!sent)
             pump.sendFailedCount += 1;
     }
@@ -255,7 +276,7 @@ export class StreamPump {
             code: 'DAEMON_UNAVAILABLE',
             message: 'local runtime stream became unavailable',
             retryable: true,
-        }, { inReplyTo: pump.cmdId, traceId: pump.traceId }));
+        }, { inReplyTo: pump.cmdId, traceId: pump.traceId }), pump.streamScope);
         if (!sent)
             pump.sendFailedCount += 1;
     }
@@ -289,7 +310,7 @@ export class StreamPump {
             msg_id: msgId,
             status,
             ...(fields.errorCode ? { error_code: fields.errorCode } : {}),
-        }, { inReplyTo: pump.cmdId, traceId: pump.traceId }));
+        }, { inReplyTo: pump.cmdId, traceId: pump.traceId }), pump.streamScope);
     }
 }
 function readStreamError(peek) {

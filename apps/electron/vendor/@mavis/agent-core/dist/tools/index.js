@@ -19,7 +19,7 @@
 export { defineRuntimeTool } from './define.js';
 export { bindTool, toRuntimeTool } from './bind.js';
 export { prepareEditArguments } from './edit-prepare-arguments.js';
-export { isRuntimeToolInputValid } from './input-validation.js';
+export { isRuntimeToolInputValid, validateRuntimeToolInput, } from './input-validation.js';
 export { TURN_TERMINATING_TOOL_RESULT_DETAIL, isTurnTerminatingToolResultDetails, } from './turn-termination.js';
 export { ReadToolDef, WriteToolDef, EditToolDef, BashToolDef, GrepToolDef, GlobToolDef, TodoWriteToolDef, TaskToolDef, } from './builtin-defs.js';
 //# sourceMappingURL=index.js.map

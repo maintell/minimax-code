@@ -40,7 +40,7 @@ export class CronContractError extends Error {
         this.name = 'CronContractError';
     }
 }
-/** Map the internal runtime task state onto the generated flat CronTask. */
+/** Keep the emitted legacy shape narrow while checking the generated HTTP contract. */
 export function cronStateToCronTask(state) {
     return {
         ...(state.cronId ? { cronId: state.cronId } : {}),

@@ -5,11 +5,29 @@ import path from 'node:path';
  * a POSIX daemon inspects a Windows shell command.
  */
 export function resolvePermissionPath(raw, context = {}, shell = 'unknown') {
-    if (raw.includes('$') || raw.includes('`')) {
+    if (context.pathSyntax?.dynamic ?? (raw.includes('$') || raw.includes('`'))) {
         return { raw, dynamic: true, resolution: 'environment' };
     }
-    if (raw.includes('?') || raw.includes('*') || raw.includes('[')) {
+    if (context.pathSyntax?.glob ?? (raw.includes('?') || raw.includes('*') || raw.includes('['))) {
         return { raw, dynamic: true, resolution: 'glob' };
+    }
+    // MSYS drive mounts are absolute Windows paths only for a trusted POSIX
+    // shell on Windows. Preserve raw for execution and normalize the identity.
+    if (context.platform === 'win32' && shell === 'posix') {
+        const msys = /^\/(?:proc\/cygdrive\/)?([A-Za-z])(?:\/(.*))?$/.exec(raw);
+        if (msys) {
+            return {
+                raw,
+                resolved: path.win32.normalize(`${msys[1]}:/${msys[2] ?? ''}`),
+                dynamic: false,
+                resolution: 'absolute',
+            };
+        }
+        // /usr, /etc, /tmp, and other MSYS mounts depend on the selected Git
+        // installation. Do not invent a Windows drive-root mapping for them.
+        if (raw.startsWith('/') && !raw.startsWith('//')) {
+            return { raw, dynamic: true, resolution: 'unknown' };
+        }
     }
     const windowsAbsolute = /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith('\\\\');
     if (windowsAbsolute) {
@@ -20,12 +38,12 @@ export function resolvePermissionPath(raw, context = {}, shell = 'unknown') {
             resolution: 'absolute',
         };
     }
-    if (raw === '~' || raw.startsWith('~/')) {
+    if ((raw === '~' || raw.startsWith('~/')) && context.pathSyntax?.expandHome !== false) {
         if (!context.homeDir)
             return { raw, dynamic: true, resolution: 'home' };
         return {
             raw,
-            resolved: path.resolve(context.homeDir, raw === '~' ? '.' : raw.slice(2)),
+            resolved: (context.platform === 'win32' ? path.win32 : path).resolve(context.homeDir, raw === '~' ? '.' : raw.slice(2)),
             dynamic: false,
             resolution: 'home',
         };

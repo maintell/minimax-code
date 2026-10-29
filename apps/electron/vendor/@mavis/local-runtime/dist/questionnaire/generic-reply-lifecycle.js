@@ -68,8 +68,9 @@ export class QuestionnaireGenericReplyLifecycle {
                 sessionId: record.sessionId,
                 error: err instanceof Error ? err.message : String(err),
             });
-            if (ownedAction) {
-                this.deps.onOwnedActionFailure?.(record.requestId);
+            const recoverOwnedAction = this.ownedActionRecovery(ownedAction);
+            if (recoverOwnedAction) {
+                recoverOwnedAction(record.requestId);
             }
             else {
                 throw new LocalQuestionnaireError(503, 'QUESTIONNAIRE_CONTINUATION_NOT_STARTED', `Questionnaire answer was saved, but the continuation could not start: ${err instanceof Error ? err.message : String(err)}`);
@@ -82,8 +83,9 @@ export class QuestionnaireGenericReplyLifecycle {
                 ...(completed.status !== undefined ? { status: completed.status } : {}),
                 ...(completed.error ? { error: completed.error } : {}),
             });
-            if (ownedAction) {
-                this.deps.onOwnedActionFailure?.(record.requestId);
+            const recoverOwnedAction = this.ownedActionRecovery(ownedAction);
+            if (recoverOwnedAction) {
+                recoverOwnedAction(record.requestId);
             }
             else {
                 throw new LocalQuestionnaireError(completed.status ?? 503, 'QUESTIONNAIRE_CONTINUATION_NOT_STARTED', `Questionnaire answer was saved, but the continuation could not start${completed.status === undefined ? '.' : ` (HTTP ${completed.status}).`}`);
@@ -120,6 +122,14 @@ export class QuestionnaireGenericReplyLifecycle {
             injected: completed?.completed === true,
         };
     }
+    /**
+     * An owned action's saved answer is resumed by its owner's recovery hook.
+     * Without one nothing retries it before the next startup reconciliation, so
+     * the caller must see the failure instead of an accepted reply.
+     */
+    ownedActionRecovery(ownedAction) {
+        return ownedAction ? this.deps.onOwnedActionFailure : undefined;
+    }
     async requireReplyRecord(requestId, agentName) {
         const record = await this.deps.store.get(requestId);
         if (!record) {
@@ -140,7 +150,7 @@ export class QuestionnaireGenericReplyLifecycle {
         return record;
     }
 }
-function haveSameAnswers(left, right) {
+export function haveSameAnswers(left, right) {
     return JSON.stringify(canonicalAnswers(left)) === JSON.stringify(canonicalAnswers(right));
 }
 function canonicalAnswers(reply) {
@@ -151,6 +161,15 @@ function canonicalAnswers(reply) {
         selectedOther: answer.selectedOther === true,
         ...(answer.otherText ? { otherText: answer.otherText } : {}),
         skipped: answer.skipped === true,
+        ...(answer.contextImages?.length
+            ? {
+                contextImages: answer.contextImages.map((image) => ({
+                    contextId: image.contextId,
+                    annotationId: image.annotationId,
+                    sha256: image.sha256,
+                })),
+            }
+            : {}),
     }))
         .sort((left, right) => left.stepId.localeCompare(right.stepId));
 }

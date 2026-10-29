@@ -14,7 +14,7 @@ export class WorkspaceIndexingController extends WorkspaceIndexingControllerBase
         if (!workspaceDir) {
             throw new AppError(400, 'INVALID_WORKSPACE_DIR', 'workspace_dir must not be empty');
         }
-        this.indexing.prewarm(workspaceDir);
+        await this.indexing.prewarm(workspaceDir);
         return { scheduled: true };
     }
 }

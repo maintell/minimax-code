@@ -129,7 +129,7 @@ export class ForkService {
             ...(source.isDefaultWorkspace !== undefined
                 ? { isDefaultWorkspace: source.isDefaultWorkspace }
                 : {}),
-            title: resolveChildTitle(request, suggestedTitle),
+            ...resolveChildTitle(request, suggestedTitle),
             ...(source.appMode ? { appMode: source.appMode } : {}),
             ...(runLocation ? { runLocation } : {}),
             ...(source.effectiveModel !== undefined ? { effectiveModel: source.effectiveModel } : {}),
@@ -347,6 +347,32 @@ export class ForkService {
             return this.resumePending(input, pending);
         return this.startForkOwned(input);
     }
+    /**
+     * Fork options and a fresh Fork share this preflight so a boundary that `history.fork` would
+     * reject (e.g. inside an unfinished tool call) is refused before any child Session exists.
+     */
+    async isHistoryBoundarySettled(sourceSessionId, boundary) {
+        const inspect = this.deps.history.inspectBoundary;
+        if (!inspect || !hasCanonicalForkBoundary(boundary))
+            return true;
+        const inspection = await inspect({
+            sourceSessionId,
+            ...canonicalHistoryBoundaryInput(boundary),
+        });
+        return inspection.settled;
+    }
+    /** Refuses before any owned resource exists; read failures keep the shape `fork()` reported. */
+    async assertHistoryBoundarySettled(sourceSessionId, boundary) {
+        let settled;
+        try {
+            settled = await this.isHistoryBoundarySettled(sourceSessionId, boundary);
+        }
+        catch (error) {
+            throw normalizeStartError(error);
+        }
+        if (!settled)
+            throw unsettledHistoryBoundary();
+    }
     async resumePending(input, pending) {
         const stage = asRecoverableForkStage(pending.stage);
         if (pending.status !== 'running' || !stage || !pending.intent) {
@@ -375,6 +401,7 @@ export class ForkService {
         const boundary = await this.readBoundary(source.sessionId, input.assistantDisplayMessageId, input.sidePresentation ? {} : undefined);
         const resolvedRequest = resolveForkRequest(input, boundary);
         this.assertForkBoundary(source, boundary, resolvedRequest);
+        await this.assertHistoryBoundarySettled(source.sessionId, boundary);
         const progress = createStartProgress(this.deps.operations, resolvedRequest);
         await progress.advance('running', 'validated');
         try {
@@ -534,6 +561,9 @@ function requireResumeChild(child) {
         return child;
     throw new ForkServiceError('fork-failed', 'Fork recovery child session is missing');
 }
+function unsettledHistoryBoundary() {
+    return new ForkServiceError('invalid-boundary', 'Fork boundary would end inside an unfinished tool call');
+}
 function missingWorktreeProof() {
     return new ForkServiceError('fork-failed', 'Fork recovery requires persisted worktree ownership proof');
 }
@@ -607,7 +637,10 @@ function displayCopyInput(context) {
     };
 }
 function resolveChildTitle(request, suggestedTitle) {
-    return request.useSuggestedTitle === true ? suggestedTitle : (request.title ?? suggestedTitle);
+    const customTitle = request.useSuggestedTitle === true ? undefined : (request.title ?? undefined);
+    return customTitle !== undefined
+        ? { title: customTitle, titleSource: 'manual' }
+        : { title: suggestedTitle, titleSource: 'auto' };
 }
 export async function suggestForkTitle(source, sessions) {
     const sourceTitle = source.title ?? source.sessionId;

@@ -17,6 +17,8 @@
  * native binding (which is also unavailable in vitest's sandbox).
  */
 import { v4 } from "uuid";
+import { homedir } from "node:os";
+import { LOCAL_DESKTOP_RUNTIME_ID } from "@mavis/shared/desktop-runtime";
 import { nativeTheme } from "electron";
 import { logger } from "../../utils";
 import { IPC_CHANNELS } from "../../config/constants";
@@ -46,6 +48,7 @@ const TITLE_BROADCAST_DEBOUNCE_MS = 80;
 export class TerminalManager {
     constructor(options = {}) {
         this.terminals = new Map();
+        this.runtimeSuspensions = new Map();
         this.pendingCreations = new Set();
         this.dataObservers = new Set();
         this.options = {
@@ -77,7 +80,8 @@ export class TerminalManager {
         if (!requestedCwd) {
             throw new Error('TerminalManager.create: cwd is required');
         }
-        const pending = { sessionId, cancelled: false };
+        const runtimeId = params.runtimeId ?? LOCAL_DESKTOP_RUNTIME_ID;
+        const pending = { sessionId, runtimeId, cancelled: false };
         this.pendingCreations.add(pending);
         let resolved;
         try {
@@ -92,16 +96,37 @@ export class TerminalManager {
         const shellInfo = detectShell();
         const shellPath = shellOverride && shellOverride.length > 0 ? shellOverride : shellInfo.path;
         const shellType = shellOverride ? shellInfo.type : shellInfo.type;
-        const spawner = this.options.spawner ?? loadDefaultSpawner();
         // Use login + interactive flags on Unix so user dotfiles run; on Windows
         // PowerShell we suppress the profile to keep startup deterministic.
         const args = computeShellArgs(shellInfo.isWindows, shellType);
-        const env = buildTerminalEnv(process.env);
+        const result = await this.createProgram(params.sessionId, {
+            command: shellPath,
+            args,
+            cwd,
+            shellType,
+            title: shellType,
+            runtimeId,
+        });
+        return { ...result, ...(cwdFallbackFrom ? { cwdFallbackFrom } : {}) };
+    }
+    /** Spawn a Main-authorized program, used by SSH terminals after project resolution. */
+    async createProgram(sessionId, spec) {
+        if (!sessionId)
+            throw new Error('TerminalManager.createProgram: sessionId is required');
+        if (!spec.command)
+            throw new Error('TerminalManager.createProgram: command is required');
+        if (this.runtimeSuspensions.has(spec.runtimeId)) {
+            throw new Error('Terminal runtime is unavailable');
+        }
+        const spawnCwd = spec.cwd || homedir();
+        const shellInfo = detectShell();
+        const spawner = this.options.spawner ?? loadDefaultSpawner();
+        const env = buildTerminalEnv(spec.env ?? process.env);
         let ptyHandle;
         try {
-            ptyHandle = spawner(shellPath, args, {
+            ptyHandle = spawner(spec.command, [...spec.args], {
                 name: 'xterm-256color',
-                cwd,
+                cwd: spawnCwd,
                 env,
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
@@ -110,17 +135,18 @@ export class TerminalManager {
             });
         }
         catch (err) {
-            logger.error(`[TerminalManager] failed to spawn pty: shell=${shellPath} cwd=${cwd} err=${String(err)}`);
+            logger.error(`[TerminalManager] failed to spawn pty: command=${spec.command} cwd=${spawnCwd} err=${String(err)}`);
             throw err instanceof Error ? err : new Error(String(err));
         }
         const id = v4();
         const record = {
             id,
             sessionId,
-            cwd,
-            shell: shellPath,
-            shellType,
-            title: shellType,
+            runtimeId: spec.runtimeId,
+            cwd: spawnCwd,
+            shell: spec.command,
+            shellType: spec.shellType,
+            title: spec.title,
             createdAt: Date.now(),
             pty: ptyHandle,
             subscribers: new Map(),
@@ -129,7 +155,7 @@ export class TerminalManager {
             oscParser: new OscTitleParser(),
             exited: false,
             exitCode: null,
-            disposers: [],
+            disposers: spec.onDispose ? [spec.onDispose] : [],
             pendingTitle: null,
             titleBroadcastTimer: null,
         };
@@ -142,20 +168,31 @@ export class TerminalManager {
         record.disposers.push(() => safeDispose(dataDisp));
         record.disposers.push(() => safeDispose(exitDisp));
         this.terminals.set(id, record);
-        logger.info(`[TerminalManager] created terminal id=${id} session=${sessionId} shell=${shellPath} cwd=${cwd}`);
+        if (spec.initialInput) {
+            try {
+                ptyHandle.write(spec.initialInput);
+            }
+            catch (error) {
+                this.terminals.delete(id);
+                for (const dispose of record.disposers)
+                    dispose();
+                ptyHandle.kill();
+                throw error;
+            }
+        }
+        logger.info(`[TerminalManager] created terminal id=${id} session=${sessionId} runtime=${spec.runtimeId} command=${spec.command} cwd=${spawnCwd}`);
         return {
             terminalId: id,
             title: record.title,
             shellType: record.shellType,
-            ...(cwdFallbackFrom ? { cwdFallbackFrom } : {}),
         };
     }
     /** Return metadata for every terminal owned by `sessionId`. */
     list(params) {
-        const { sessionId } = params;
+        const { sessionId, runtimeId = LOCAL_DESKTOP_RUNTIME_ID } = params;
         const out = [];
         for (const t of this.terminals.values()) {
-            if (t.sessionId === sessionId) {
+            if (t.sessionId === sessionId && t.runtimeId === runtimeId) {
                 out.push({
                     id: t.id,
                     title: t.title,
@@ -171,13 +208,15 @@ export class TerminalManager {
      * the scrollback snapshot, and resizes the PTY to the renderer's
      * viewport so output wraps correctly.
      */
-    async attach(terminalId, subscriber, cols, rows) {
-        const record = this.requireTerminal(terminalId);
+    async attach(terminalId, subscriber, cols, rows, runtimeId = LOCAL_DESKTOP_RUNTIME_ID) {
+        const record = this.requireTerminalForRuntime(terminalId, runtimeId);
         if (subscriber.isDestroyed()) {
             logger.warn(`[TerminalManager] attach skipped — subscriber destroyed (terminal=${terminalId})`);
             return { scrollback: record.scrollback.snapshot() };
         }
-        if (!record.exited && !record.directoryRecoveryCompleted) {
+        if (record.runtimeId === LOCAL_DESKTOP_RUNTIME_ID &&
+            !record.exited &&
+            !record.directoryRecoveryCompleted) {
             const resolved = await resolveTerminalCwd(record.cwd);
             if (this.terminals.get(terminalId) !== record)
                 throw new Error(`Terminal not found: ${terminalId}`);
@@ -199,13 +238,14 @@ export class TerminalManager {
                     return { scrollback: record.scrollback.snapshot() };
                 record.recovery ?? (record.recovery = this.create({
                     sessionId: record.sessionId,
+                    runtimeId: record.runtimeId,
                     cwd: resolved.cwd,
                     shellOverride: record.shell,
                 }));
                 try {
                     const replacementTerminal = await record.recovery;
                     if (this.terminals.get(terminalId) !== record) {
-                        this.dispose(replacementTerminal.terminalId);
+                        this.dispose(replacementTerminal.terminalId, record.runtimeId);
                         throw new Error(`Terminal not found: ${terminalId}`);
                     }
                     // The renderer may discard this reply after switching away. Only an
@@ -252,8 +292,8 @@ export class TerminalManager {
         this.removeSubscriber(record, subscriber.id);
     }
     /** Forward stdin from the renderer into the PTY. */
-    write(terminalId, data) {
-        const record = this.terminals.get(terminalId);
+    write(terminalId, data, runtimeId = LOCAL_DESKTOP_RUNTIME_ID) {
+        const record = this.getTerminalForRuntime(terminalId, runtimeId);
         if (!record || record.exited)
             return;
         try {
@@ -264,8 +304,8 @@ export class TerminalManager {
         }
     }
     /** Resize the PTY (rows/cols must be >= 1). */
-    resize(terminalId, cols, rows) {
-        const record = this.terminals.get(terminalId);
+    resize(terminalId, cols, rows, runtimeId = LOCAL_DESKTOP_RUNTIME_ID) {
+        const record = this.getTerminalForRuntime(terminalId, runtimeId);
         if (!record || record.exited)
             return;
         if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols < 1 || rows < 1) {
@@ -280,13 +320,41 @@ export class TerminalManager {
     }
     /**
      * Kill the PTY and remove the record. Subsequent calls are no-ops.
-     * Subscribers receive a final `TERMINAL_EXIT` event.
+     * Explicit disposal removes listeners before killing the PTY. Runtime
+     * revocation uses disposeByRuntime to notify subscribers of the forced exit.
      */
-    dispose(terminalId) {
-        const record = this.terminals.get(terminalId);
+    dispose(terminalId, runtimeId = LOCAL_DESKTOP_RUNTIME_ID) {
+        const record = this.getTerminalForRuntime(terminalId, runtimeId);
         if (!record)
             return;
         this.killAndCleanup(record);
+    }
+    /** Revoke interactive PTYs only; Runtime daemon tasks have a separate owner. */
+    disposeByRuntime(runtimeId) {
+        for (const pending of this.pendingCreations) {
+            if (pending.runtimeId === runtimeId)
+                pending.cancelled = true;
+        }
+        for (const record of Array.from(this.terminals.values())) {
+            if (record.runtimeId === runtimeId)
+                this.killAndCleanup(record, true);
+        }
+    }
+    /** Prevent replacement PTYs while project removal awaits transport cleanup. */
+    suspendRuntime(runtimeId) {
+        this.runtimeSuspensions.set(runtimeId, (this.runtimeSuspensions.get(runtimeId) ?? 0) + 1);
+        this.disposeByRuntime(runtimeId);
+        let released = false;
+        return () => {
+            if (released)
+                return;
+            released = true;
+            const remaining = (this.runtimeSuspensions.get(runtimeId) ?? 1) - 1;
+            if (remaining === 0)
+                this.runtimeSuspensions.delete(runtimeId);
+            else
+                this.runtimeSuspensions.set(runtimeId, remaining);
+        };
     }
     /** Dispose every PTY belonging to `sessionId`. */
     disposeBySession(sessionId) {
@@ -332,6 +400,17 @@ export class TerminalManager {
         }
         return record;
     }
+    requireTerminalForRuntime(id, runtimeId) {
+        const record = this.requireTerminal(id);
+        if (record.runtimeId !== runtimeId) {
+            throw new Error(`Terminal runtime mismatch: ${id}`);
+        }
+        return record;
+    }
+    getTerminalForRuntime(id, runtimeId) {
+        const record = this.terminals.get(id);
+        return record?.runtimeId === runtimeId ? record : undefined;
+    }
     handleData(record, data) {
         if (this.terminals.get(record.id) !== record || record.exited)
             return;
@@ -348,10 +427,16 @@ export class TerminalManager {
         this.broadcast(record, IPC_CHANNELS.TERMINAL_OUTPUT, {
             terminalId: record.id,
             data,
+            runtimeId: record.runtimeId,
         });
         for (const observer of this.dataObservers) {
             try {
-                observer({ sessionId: record.sessionId, terminalId: record.id, data });
+                observer({
+                    sessionId: record.sessionId,
+                    terminalId: record.id,
+                    runtimeId: record.runtimeId,
+                    data,
+                });
             }
             catch (err) {
                 logger.warn(`[TerminalManager] data observer failed: ${String(err)}`);
@@ -366,6 +451,7 @@ export class TerminalManager {
         this.broadcast(record, IPC_CHANNELS.TERMINAL_EXIT, {
             terminalId: record.id,
             exitCode,
+            runtimeId: record.runtimeId,
         });
         this.clearPendingTitleBroadcast(record);
         // Drop the listener disposers — keep the record so a renderer can still
@@ -412,6 +498,7 @@ export class TerminalManager {
             this.broadcast(record, IPC_CHANNELS.TERMINAL_TITLE, {
                 terminalId: record.id,
                 title: pendingTitle,
+                runtimeId: record.runtimeId,
             });
         }, this.options.titleBroadcastDebounceMs);
     }
@@ -422,7 +509,7 @@ export class TerminalManager {
         }
         record.pendingTitle = null;
     }
-    killAndCleanup(record) {
+    killAndCleanup(record, notifyRevocation = false) {
         this.terminals.delete(record.id);
         this.clearPendingTitleBroadcast(record);
         // Dispose listeners BEFORE kill to prevent ThreadSafeFunction callbacks
@@ -431,6 +518,13 @@ export class TerminalManager {
             fn();
         record.disposers = [];
         if (!record.exited) {
+            if (notifyRevocation) {
+                this.broadcast(record, IPC_CHANNELS.TERMINAL_EXIT, {
+                    terminalId: record.id,
+                    runtimeId: record.runtimeId,
+                    exitCode: null,
+                });
+            }
             try {
                 record.pty.kill();
             }

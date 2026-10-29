@@ -1,6 +1,6 @@
 import { browserPrintableKeyDescriptor } from './browser-keyboard.js';
 import { CDPPageScanner } from './cdp-page-scanner.js';
-import { isRecord } from './browser-state.js';
+import { describeCdpException, isRecord } from './browser-state.js';
 import { browserInputDiagnosticLogger, formatConsoleStack, MAX_CONSOLE_DIAGNOSTIC_ENTRIES, MAX_CONSOLE_DIAGNOSTIC_PAGE_BYTES, MAX_NETWORK_DIAGNOSTIC_ENTRIES, MAX_NETWORK_DIAGNOSTIC_PAGE_BYTES, networkStatusMatches, normalizeNetworkResourceType, sanitizeNetworkDiagnosticUrl, sanitizeNetworkText, summarizeRemoteObject, } from './cdp-diagnostic-helpers.js';
 import { uploadFilesByBackendNodeId as runFileUpload } from './cdp-file-upload.js';
 import { abortReason, abortableDelay, BROWSER_TIMEOUTS, isBrowserOperationInterruption, throwIfAborted, withTimeout, } from './operation-timeout.js';
@@ -1711,7 +1711,7 @@ export class CDPHelper {
                 userGesture: true,
             }, timeoutMs, signal, commandSessionId));
             if (response.exceptionDetails) {
-                throw new Error(response.exceptionDetails.text ?? response.result?.description ?? 'Element action failed');
+                throw new Error(describeCdpException(response.exceptionDetails, response.result?.description ?? 'Element action failed'));
             }
             return response.result?.value;
         }

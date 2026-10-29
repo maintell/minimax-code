@@ -19,10 +19,6 @@ export class LocalApiAgentRoutes {
     constructor(ctx) {
         this.ctx = ctx;
     }
-    clearRootSessionIf(sessionId) {
-        if (this.rootSessionId === sessionId)
-            this.rootSessionId = undefined;
-    }
     get controller() {
         return this.ctx.controller;
     }

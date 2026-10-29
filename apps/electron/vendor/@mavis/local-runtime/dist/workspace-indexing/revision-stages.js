@@ -96,6 +96,7 @@ async function uploadCapture(record, signal, ctx, progress) {
             updatedAtMs: ctx.nowMs(),
         });
     }
+    ctx.cancellations.assertActive(record.sessionId, signal);
     const uploaded = {
         ...record,
         archiveOssKey,
@@ -149,6 +150,7 @@ async function materializeIndex(record, signal, ctx, progress) {
     progress.stage = 'remote_wait';
     if (!(await ctx.isEnabled()))
         return;
+    ctx.cancellations.assertActive(record.sessionId, signal);
     const status = await ctx.remote.getRevisionStatus({
         workspaceId: record.workspaceId,
         sessionId: record.sessionId,
@@ -193,6 +195,7 @@ async function materializeIndex(record, signal, ctx, progress) {
     }
     if (!(await ctx.isEnabled()))
         return;
+    ctx.cancellations.assertActive(record.sessionId, signal);
     await ctx.store.patchRevision(record.revisionId, {
         remoteState: 'pending_download',
         embeddingModel: status.embeddingModel,
@@ -204,12 +207,14 @@ async function materializeIndex(record, signal, ctx, progress) {
     });
     if (!(await ctx.isEnabled()))
         return;
+    ctx.cancellations.assertActive(record.sessionId, signal);
     const targetPath = await ctx.semanticIndexStore.createDownloadTarget({
         workspaceId: record.workspaceId,
         revisionId: record.revisionId,
     });
     let installed;
     try {
+        ctx.cancellations.assertActive(record.sessionId, signal);
         progress.stage = 'download';
         const downloadStartedMs = ctx.nowMs();
         const downloaded = await ctx.remote.downloadIndex({
@@ -248,6 +253,7 @@ async function materializeIndex(record, signal, ctx, progress) {
             dimensions: status.dimensions,
             normalization: status.normalization,
         }), signal);
+        ctx.cancellations.assertActive(record.sessionId, signal);
         ctx.metrics.attempt({
             stage: 'install',
             outcome: 'success',
@@ -286,6 +292,7 @@ async function uploadTracked(record, payload, ctx, input) {
         .catch(() => undefined);
     if (sizeBytes !== undefined)
         ctx.metrics.payloadBytes(payload, sizeBytes, record.kind);
+    input.signal?.throwIfAborted();
     return ctx.remote.uploadFile(input);
 }
 //# sourceMappingURL=revision-stages.js.map

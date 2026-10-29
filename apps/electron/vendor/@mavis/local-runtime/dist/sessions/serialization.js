@@ -33,6 +33,7 @@ export function toDaemonSession(session) {
         parentSessionId: session.parentSessionId ?? null,
         visibility: session.visibility ?? 'visible',
         ...(session.purpose ? { purpose: session.purpose } : {}),
+        ...(session.createdBySessionId ? { createdBySessionId: session.createdBySessionId } : {}),
         ...(session.effectiveModel !== undefined ? { effective_model: session.effectiveModel } : {}),
         ...(session.effectiveModelVariant !== undefined
             ? { effective_model_variant: session.effectiveModelVariant }

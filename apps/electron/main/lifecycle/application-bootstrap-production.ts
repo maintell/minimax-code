@@ -5,7 +5,7 @@ import { screen, powerMonitor, net, app, crashReporter, ipcMain, BrowserWindow, 
 import { autoUpdater } from "electron-updater";
 import { buildEnv, LOCALE, isDev, isTest, isStaging, isInternalBuild, isInsideBuild } from "../config";
 import { DOMAIN_URL, IPC_CHANNELS } from "../config/constants";
-import { setupAllIPC, initDesktopSettings, cleanupDesktopSettings, stopHotUpdateAutoCheck } from "../ipc";
+import { setupAllIPC, initDesktopSettings, cleanupDesktopSettings, startHotUpdateAutoCheck, stopHotUpdateAutoCheck } from "../ipc";
 import { cleanupPPTPreviewCache } from "../ipc/pptPreview.ipc";
 import { handleCloudProtocolJsonRequest } from "../ipc/proxy.ipc";
 import { getTokens, clearTokens, getDesktopConfig, replaceSharedUserInfo } from "../ipc/storage.ipc";
@@ -239,6 +239,17 @@ function createProductionComposition(options = {}) {
                     if (window && !window.isDestroyed())
                         window.close();
                 },
+                destroyAll: () => {
+                    for (const window of BrowserWindow.getAllWindows()) {
+                        try {
+                            if (!window.isDestroyed())
+                                window.destroy();
+                        }
+                        catch (error) {
+                            logLifecycleError('Failed to destroy a window during update shutdown', error);
+                        }
+                    }
+                },
             },
             beforeQuit: clearGpuSentinel,
             confirmNormalQuit: () => confirmQuitWithRunningTasks(windowManager.getWindowByType('archon')),
@@ -353,6 +364,7 @@ function createProductionComposition(options = {}) {
                 setupAllIPC: () => setupAllIPC({
                     requestQuit: (intent) => quitCoordinator.requestQuit(intent),
                     runtimeTransportMode,
+                    appVersion: app.getVersion(),
                     resolveTrustedWorkspace: documentPreviewWorkspaceAuthority.resolveTrustedWorkspace,
                     resolveTrustedWorkspaceCapability: documentPreviewWorkspaceAuthority.resolveTrustedWorkspaceCapability,
                     onDocumentPreviewSenderDestroyed: documentPreviewWorkspaceAuthority.releaseSender,
@@ -391,6 +403,7 @@ function createProductionComposition(options = {}) {
                 registerActivateHandler,
                 initDesktopSettings: () => initDesktopSettings({ requestQuit: (intent) => quitCoordinator.requestQuit(intent) }),
                 cleanupDesktopSettings: cleanupDesktopSettings,
+                startHotUpdateAutoCheck: startHotUpdateAutoCheck,
                 stopHotUpdateAutoCheck: stopHotUpdateAutoCheck,
                 disposeTerminalSessions: () => getTerminalManager().disposeAll(),
             };

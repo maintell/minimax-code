@@ -1,7 +1,30 @@
+/**
+ * Shell tokenisation primitive used by the bash permission gate and the
+ * classifier. Extracted to a dedicated module so both consumers
+ * import from the same source — required because the classifier
+ * already imports the SAFE first-word set + destructive-kill helper from
+ * `bash-permission.ts` would create a circular reference if `shellTokenize`
+ * were re-imported in the other direction.
+ *
+ * Splits an input shell command string into individual arguments,
+ * correctly handling single quotes, double quotes, and backslash escaping.
+ * Returns unquoted values (e.g. `"my file"` → `my file`).
+ *
+ * Notes for callers:
+ *   - This tokeniser does NOT evaluate command substitution (`$(...)`,
+ *     backticks), parameter expansion (`$VAR`), or glob expansion. The
+ *     literal text of those constructs is preserved as a token.
+ *   - Unquoted backslash escapes the following character. Inside double
+ *     quotes it only escapes $, backtick, double quote, backslash or newline.
+ *   - Single quotes preserve everything inside literally, including
+ *     backslashes and double quotes (no escape processing).
+ *   - Double quotes preserve backslashes before other characters literally.
+ */
+import { readBashExpansion, isShellCommentStart, findShellCommentLineEnd, } from './bash-expansion.js';
 export function shellTokenize(input) {
     return shellTokenizeWithMetadata(input).map((token) => token.value);
 }
-export function shellTokenizeWithMetadata(input) {
+export function shellTokenizeWithMetadata(input, includePathSyntax = false) {
     const tokens = [];
     let current = '';
     let currentStart;
@@ -9,6 +32,9 @@ export function shellTokenizeWithMetadata(input) {
     let inSingleQuote = false;
     let inDoubleQuote = false;
     let escaped = false;
+    let previousExpansionEnd = -1;
+    let dynamic = false;
+    let glob = false;
     const startCurrent = (index) => {
         currentStart ??= index;
     };
@@ -19,14 +45,33 @@ export function shellTokenizeWithMetadata(input) {
                 start: currentStart ?? end,
                 end,
                 quoted: currentQuoted,
+                ...(includePathSyntax
+                    ? {
+                        pathSyntax: {
+                            dynamic,
+                            glob,
+                            expandHome: input[currentStart ?? end] === '~' &&
+                                (input[(currentStart ?? end) + 1] === '/' || (currentStart ?? end) + 1 === end),
+                        },
+                    }
+                    : {}),
             });
         }
         current = '';
         currentStart = undefined;
         currentQuoted = false;
+        dynamic = false;
+        glob = false;
     };
     for (let i = 0; i < input.length; i++) {
         const ch = input[i];
+        // Comments cannot leak quote state into following commands.
+        if (!escaped &&
+            isShellCommentStart(input, i, inSingleQuote, inDoubleQuote, previousExpansionEnd)) {
+            flushCurrent(i);
+            i = findShellCommentLineEnd(input, i);
+            continue;
+        }
         if (escaped) {
             startCurrent(i - 1);
             current += ch;
@@ -44,9 +89,23 @@ export function shellTokenizeWithMetadata(input) {
                 i += 2;
                 continue;
             }
+            if (inDoubleQuote && next !== undefined && !['$', '`', '"', '\\'].includes(next)) {
+                startCurrent(i);
+                current += ch;
+                continue;
+            }
             startCurrent(i);
             currentQuoted = true;
             escaped = true;
+            continue;
+        }
+        const expansion = !inSingleQuote && readBashExpansion(input, i, !inDoubleQuote);
+        if (expansion) {
+            startCurrent(i);
+            current += input.slice(i, expansion.end);
+            dynamic = true;
+            previousExpansionEnd = expansion.end;
+            i = expansion.end - 1;
             continue;
         }
         if (ch === "'" && !inDoubleQuote) {
@@ -66,6 +125,10 @@ export function shellTokenizeWithMetadata(input) {
             continue;
         }
         startCurrent(i);
+        if (!inSingleQuote && (ch === '$' || ch === '`'))
+            dynamic = true;
+        if (!inSingleQuote && !inDoubleQuote && /[*?[]/.test(ch))
+            glob = true;
         current += ch;
     }
     flushCurrent(input.length);

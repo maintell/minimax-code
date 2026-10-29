@@ -29,6 +29,7 @@
     "mavis/skills/minimax-code-product/references/account-models.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/skills/minimax-code-product/references/agents.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/skills/minimax-code-product/references/extensions.md": "Built-in Skill reference, outside Prompt injection.",
+    "mavis/skills/minimax-code-product/references/hooks.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/skills/minimax-code-product/references/workflows.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/system-prompt.md.hbs": "Legacy Agent-level fallback superseded by managed mode assets.",
     "verifier/agent.md": "Agent capability configuration, outside Prompt injection.",

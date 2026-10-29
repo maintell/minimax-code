@@ -5,6 +5,21 @@ import { invokeHttpSse, } from '../../runtime/sse.js';
 import { DESKTOP_SERVICE_ROUTES, DESKTOP_SERVICE_SSE_CONTRACTS } from './routes.js';
 export function createDesktopServiceClient(options) {
     return {
+        listBackgroundTasks(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listBackgroundTasks, req, callOptions);
+        },
+        getBackgroundTask(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getBackgroundTask, req, callOptions);
+        },
+        readBackgroundTaskOutput(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput, req, callOptions);
+        },
+        stopBackgroundTask(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.stopBackgroundTask, req, callOptions);
+        },
+        deleteBackgroundTask(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deleteBackgroundTask, req, callOptions);
+        },
         ping(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ping, req, callOptions);
         },
@@ -106,6 +121,24 @@ export function createDesktopServiceClient(options) {
         },
         testLocalMcpServer(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.testLocalMcpServer, req, callOptions);
+        },
+        listLocalHooks(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listLocalHooks, req, callOptions);
+        },
+        createLocalHook(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.createLocalHook, req, callOptions);
+        },
+        updateLocalHook(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.updateLocalHook, req, callOptions);
+        },
+        deleteLocalHook(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deleteLocalHook, req, callOptions);
+        },
+        setLocalHookEnabled(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setLocalHookEnabled, req, callOptions);
+        },
+        setLocalHookScopeEnabled(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setLocalHookScopeEnabled, req, callOptions);
         },
         listLocalMcpRuntimeServers(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listLocalMcpRuntimeServers, req, callOptions);
@@ -266,6 +299,12 @@ export function createDesktopServiceClient(options) {
         putWorkspaceIndexingPreference(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.putWorkspaceIndexingPreference, req, callOptions);
         },
+        getComputerUseDefaultPreference(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getComputerUseDefaultPreference, req, callOptions);
+        },
+        putComputerUseDefaultPreference(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.putComputerUseDefaultPreference, req, callOptions);
+        },
         getComposerSendBehavior(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getComposerSendBehavior, req, callOptions);
         },
@@ -328,6 +367,9 @@ export function createDesktopServiceClient(options) {
         },
         patchGoal(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.patchGoal, req, callOptions);
+        },
+        dismissGoal(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.dismissGoal, req, callOptions);
         },
         deleteGoal(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deleteGoal, req, callOptions);
@@ -557,6 +599,15 @@ export function createDesktopServiceClient(options) {
         compressSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.compressSession, req, callOptions);
         },
+        createSideChat(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.createSideChat, req, callOptions);
+        },
+        createSideChatFromQueue(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.createSideChatFromQueue, req, callOptions);
+        },
+        promoteSideChat(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.promoteSideChat, req, callOptions);
+        },
         getMessages(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMessages, req, callOptions);
         },
@@ -587,8 +638,17 @@ export function createDesktopServiceClient(options) {
         inspectTurnContinuation(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.inspectTurnContinuation, req, callOptions);
         },
+        getSessionActivity(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSessionActivity, req, callOptions);
+        },
         abortSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.abortSession, req, callOptions);
+        },
+        cancelPromptSuggestion(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion, req, callOptions);
+        },
+        getPromptSuggestion(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getPromptSuggestion, req, callOptions);
         },
         steerSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.steerSession, req, callOptions);
@@ -740,6 +800,12 @@ export function createDesktopServiceClient(options) {
         discardLegacyMemoryMigration(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.discardLegacyMemoryMigration, req, callOptions);
         },
+        getMemoryV2Onboarding(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMemoryV2Onboarding, req, callOptions);
+        },
+        completeMemoryV2Onboarding(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.completeMemoryV2Onboarding, req, callOptions);
+        },
         replyPermission(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.replyPermission, req, callOptions);
         },
@@ -748,6 +814,12 @@ export function createDesktopServiceClient(options) {
         },
         rejectQuestion(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.rejectQuestion, req, callOptions);
+        },
+        getPermissionMode(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getPermissionMode, req, callOptions);
+        },
+        setPermissionMode(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setPermissionMode, req, callOptions);
         },
         listPendingPermissions(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listPendingPermissions, req, callOptions);
@@ -760,6 +832,9 @@ export function createDesktopServiceClient(options) {
         },
         listWorkspaceFileTree(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listWorkspaceFileTree, req, callOptions);
+        },
+        getWorkspaceFileMetadata(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getWorkspaceFileMetadata, req, callOptions);
         },
         readWorkspaceFile(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.readWorkspaceFile, req, callOptions);

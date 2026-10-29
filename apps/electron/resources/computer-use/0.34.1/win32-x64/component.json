@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "version": "0.34.1",
+  "brandRevision": 1,
+  "platform": "win32",
+  "arch": "x64",
+  "bundleId": "com.minimax.computer-use",
+  "executablePath": "minimax-computer-use.exe",
+  "sha256": "be49b89916dea667de3dbab7bdca8c98ef2f87ba78a07327c6ba547965194e1c",
+  "files": {
+    "LICENSE": "c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9",
+    "THIRD_PARTY_NOTICES.md": "859e2c3e753a2d9477a52b169dd0d421e9746371a97af1033a9d16968d2a2634",
+    "build-provenance.json": "84105c9edd24d44afbbdd07c01ba8ce3dc3b92439d3bbaf0bb58f77d6a496392",
+    "candidate.json": "eb9883a1cc52909f63400aa565a5cf25a8f3c2a6ca139d4c8679e63ba143708b",
+    "cua-cursor-theme.exe": "88e6ad88e96630977a3a12e47e83bf0ec45553ee0cb7f7e9c031897a80309479",
+    "cua_driver_abi.h": "e952620e41ac81b2d900886c7b0a24ebc6268a4edb8df88cc9971ae34af4ba0d",
+    "cua_driver_node_runtime.node": "3f6d41702b3f080c000591e0cde314c3bcafbd5a1105fa41f62b43420c672c8d",
+    "cua_driver_sdk.dll": "64b0632410d9baf7a843c17ac994780b5dcc7a19403613a1ae253598dfb2667c",
+    "minimax-computer-use-uia.exe": "a6c5ee5675cc5d27faee7719eae66d91559b42127c5089133b833031d4368408",
+    "minimax-computer-use.exe": "be49b89916dea667de3dbab7bdca8c98ef2f87ba78a07327c6ba547965194e1c"
+  },
+  "updateSource": "minimax-managed",
+  "sourceCommit": "0c69d9a2c8abbb5051a2df4a23f0fa166d5385dc"
+}

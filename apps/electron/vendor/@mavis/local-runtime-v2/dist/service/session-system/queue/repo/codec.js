@@ -187,6 +187,7 @@ const SOURCES = new Set([
     'channel:wechat',
     'channel:feishu',
     'channel:telegram',
+    'miniapp',
 ]);
 function record(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);

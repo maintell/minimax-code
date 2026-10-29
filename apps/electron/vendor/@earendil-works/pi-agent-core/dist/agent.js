@@ -115,6 +115,8 @@ export class Agent {
     maxRetryDelayMs;
     /** Tool execution strategy for assistant messages that contain multiple tool calls. */
     toolExecution;
+    /** Optional text fallback used instead of executing provider-emitted unoffered tools. */
+    unexpectedToolCallFallback;
     constructor(options = {}) {
         this._state = createMutableAgentState(options.initialState);
         this.convertToLlm = options.convertToLlm ?? defaultConvertToLlm;
@@ -136,6 +138,7 @@ export class Agent {
         this.transport = options.transport ?? "auto";
         this.maxRetryDelayMs = options.maxRetryDelayMs;
         this.toolExecution = options.toolExecution ?? "parallel";
+        this.unexpectedToolCallFallback = options.unexpectedToolCallFallback;
     }
     /**
      * Subscribe to agent lifecycle events.
@@ -301,6 +304,7 @@ export class Agent {
             thinkingBudgets: this.thinkingBudgets,
             maxRetryDelayMs: this.maxRetryDelayMs,
             toolExecution: this.toolExecution,
+            unexpectedToolCallFallback: this.unexpectedToolCallFallback,
             beforeToolCall: this.beforeToolCall,
             onToolExecutionStart: this.onToolExecutionStart,
             afterToolCall: this.afterToolCall,

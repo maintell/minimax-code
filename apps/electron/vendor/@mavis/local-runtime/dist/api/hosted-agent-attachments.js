@@ -1,8 +1,14 @@
 import { basename, extname } from 'node:path';
-import { discardLocalAssetRegistrations, registerMessageAttachments, resolveSessionLocalAssetSource, } from '../assets/store.js';
-import { loadUserMediaCandidatesForMessages, maxModelImageBytesForBatch, } from '../messages/input.js';
+import { createSessionAssetPathIndex, discardLocalAssetRegistrations, registerMessageAttachments, resolveSessionLocalAssetSource, } from '../assets/store.js';
+import { loadUserMediaCandidatesForMessages, } from '../messages/input.js';
 export function createHostedAttachmentCapabilities(host) {
+    const sessionAssets = createSessionAssetPathIndex(() => host.configGetter().dataDir);
     return {
+        /**
+         * Asset files the given Sessions registered (attachments, generated media).
+         * The runtime hands the Agent these paths, so they become its read grant.
+         */
+        listSessionReadablePaths: async (sessionIds) => sessionAssets.listSessionAssetPaths(sessionIds),
         register: (input) => registerAttachments(host, input),
         discard: (input) => discardLocalAssetRegistrations({
             dataDir: host.configGetter().dataDir,
@@ -17,6 +23,11 @@ export function createHostedAttachmentCapabilities(host) {
         materialize: (input) => materializeAttachment(host, input),
     };
 }
+/**
+ * Registers one attachment and reports its stored bytes as the inline media
+ * source. Images are not resized here: the turn encodes them once, to
+ * `requestMedia.image`, like every other image entering the conversation.
+ */
 async function materializeAttachment(host, input) {
     const raw = normalizeAttachment(input.attachment, input.attachmentIndex);
     const [registered] = await registerAttachments(host, {
@@ -26,10 +37,7 @@ async function materializeAttachment(host, input) {
     }, input.attachmentIndex);
     if (!registered)
         throw new Error('Attachment registration returned no result.');
-    const media = await loadUserMediaCandidatesForMessages([{ content: '', attachments: [raw] }], [{ content: '', attachments: [registered] }], {
-        maxBytesPerImage: maxModelImageBytesForBatch(input.imageAttachmentCount),
-        ...(input.modelCapabilities ? { capabilities: input.modelCapabilities } : {}),
-    });
+    const media = await loadUserMediaCandidatesForMessages([{ content: '', attachments: [raw] }], [{ content: '', attachments: [registered] }], { preprocessImages: false });
     const candidate = media?.[0];
     return {
         // Read the immutable upload snapshot. Original-path metadata is resolved
@@ -44,8 +52,6 @@ async function materializeAttachment(host, input) {
                     id: candidate.id,
                     sizeBytes: candidate.sizeBytes,
                     ...(candidate.data ? { data: candidate.data } : {}),
-                    // Preprocessing may transcode (e.g. PNG → JPEG) to fit the inline
-                    // budget; the stored asset keeps `mimeType` above.
                     ...(candidate.mime ? { mime: candidate.mime } : {}),
                 },
             }

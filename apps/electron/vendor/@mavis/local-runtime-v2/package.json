@@ -82,9 +82,6 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
-    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
-    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
     "@mavis/agent-core": "file:../agent-core",
     "@mavis/agent-extension": "file:../agent-extension",
     "@mavis/agent-runtime": "file:../agent-runtime",
@@ -94,15 +91,6 @@
     "@mavis/conversation-contract": "file:../conversation-contract",
     "@mavis/goal": "file:../goal",
     "@mavis/local-runtime": "file:../local-runtime",
-    "@mavis/mcp": "file:../mcp",
-    "@mavis/permission": "file:../permission",
-    "@mavis/plugin-hooks": "file:../plugin-hooks",
-    "@mavis/protocol": "file:../protocol",
-    "@mavis/session-report": "file:../session-report",
-    "@mavis/shared": "file:../shared",
-    "@mavis/skills": "file:../skills",
-    "@mavis/system-reminder": "file:../system-reminder",
-    "@mavis/thrift-gen": "file:../thrift-gen",
     "@minimax/mcode-sandbox-runtime": "file:../../@minimax/mcode-sandbox-runtime",
     "@sinclair/typebox": "^0.34.0",
     "better-sqlite3": "file:../../better-sqlite3",
@@ -118,6 +106,7 @@
     "proper-lockfile": "^4",
     "smol-toml": "1.7.0",
     "typebox": "1.1.38",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "@mavis/background-task": "file:../background-task"
   }
 }

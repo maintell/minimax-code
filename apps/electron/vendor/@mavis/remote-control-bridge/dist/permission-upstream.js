@@ -45,12 +45,18 @@
  * local desktop turn) goes out WITHOUT in_reply_to as a broadcast frame.
  *
  * Delivery semantics: most frames are only sent while the WS is connected.
- * The three notification-trigger events (permission.ask, questionnaire.ask,
- * session.finish) use a bounded, deduped in-memory buffer across transient WS
- * reconnects. stop() clears that buffer, so deliberate disconnect, unbind,
- * account switch, and process shutdown cannot replay an old account's events.
- * Terminal permission/questionnaire events invalidate their matching buffered
- * ask before delivery, so reconnect cannot resurrect an already-settled UI.
+ * Notification-trigger events (permission.ask, questionnaire.ask,
+ * session.finish, and a thread_goal.updated that completes a Goal or needs
+ * the user) use a bounded in-memory buffer across transient WS reconnects that
+ * keeps only the newest pending event per session. A Goal Turn's
+ * session.finish (it carries `goalId`) is never buffered: the Goal notifies
+ * through its own state instead. stop() clears that buffer, so deliberate
+ * disconnect, unbind, account switch, and process shutdown cannot replay an
+ * old account's events. Terminal permission/questionnaire events invalidate
+ * their matching buffered ask before delivery, and a later state of the same
+ * Goal that needs no notification (resumed, user-paused, cleared) invalidates
+ * its buffered Goal notification, so reconnect cannot resurrect an
+ * already-settled UI or a stale Goal state. Online forwarding is unchanged.
  * The bus subscription itself stays open from start() to stop() and reconnects
  * with a fixed delay if the runtime restarts.
  *
@@ -65,7 +71,11 @@ const NOTIFICATION_TRIGGER_EVENT_TYPES = new Set([
     'permission.ask',
     'questionnaire.ask',
     'session.finish',
+    'thread_goal.updated',
 ]);
+/** Goal states the user is told about: completion, or needing the user. */
+const GOAL_ATTENTION_STATUSES = new Set(['complete', 'blocked', 'usage_limited', 'budget_limited']);
+const GOAL_USER_PAUSE_REASON = 'paused(user_requested)';
 const SESSION_MUTATION_EVENT_TYPES = new Set([
     'session.title_updated',
     'session.model_updated',
@@ -153,6 +163,7 @@ export class PermissionUpstream {
         const { type, timestamp } = event;
         const { payload } = event;
         this.cancelBufferedAskForTerminalEvent(event);
+        this.cancelBufferedGoalStateForNewerState(event);
         if (type === 'permission.ask' || type === 'permission.resolved') {
             this.handlePermissionEvent(type, payload, timestamp);
             return;
@@ -241,8 +252,11 @@ export class PermissionUpstream {
     bufferNotificationEvent(event, reason) {
         if (!NOTIFICATION_TRIGGER_EVENT_TYPES.has(event.type))
             return false;
-        const key = notificationEventKey(event);
-        const sessionId = readString(event.payload.sessionId);
+        if (event.type === 'thread_goal.updated' && !isGoalNotificationState(event.payload)) {
+            return false;
+        }
+        const key = notificationEventSessionId(event);
+        const sessionId = key;
         const turnId = readString(event.payload.turnId);
         const requestId = readString(event.payload.requestId);
         const identity = `${sessionId ? ` session_id=${sessionId}` : ''}${turnId ? ` turn_id=${turnId}` : ''}${requestId ? ` request_id=${requestId}` : ''}`;
@@ -250,7 +264,11 @@ export class PermissionUpstream {
             this.deps.logger.warn(`component=rc_event_upstream event=notification_buffer event_type=${event.type}${identity} status=dropped_missing_identity`);
             return true;
         }
-        // Replace a duplicate in place with the newest payload/timestamp.
+        if (event.type === 'session.finish' && readString(event.payload.goalId)) {
+            this.deps.logger.info(`component=rc_event_upstream event=notification_buffer event_type=${event.type}${identity} status=dropped_goal_turn_end`);
+            return true;
+        }
+        // One pending notification per session: the newest replaces the older one.
         this.pendingNotificationEvents.delete(key);
         const limit = Math.max(1, this.deps.pendingNotificationLimit ?? NOTIFICATION_EVENT_BUFFER_LIMIT);
         if (this.pendingNotificationEvents.size >= limit) {
@@ -268,12 +286,40 @@ export class PermissionUpstream {
         return true;
     }
     cancelBufferedAskForTerminalEvent(event) {
-        const key = terminalNotificationAskKey(event);
-        if (!key || !this.pendingNotificationEvents.delete(key))
-            return;
+        const askType = terminalNotificationAskType(event);
         const sessionId = readString(event.payload.sessionId);
         const requestId = readString(event.payload.requestId);
+        if (!askType || !sessionId || !requestId)
+            return;
+        const pending = this.pendingNotificationEvents.get(sessionId);
+        if (pending?.type !== askType || readString(pending.payload.requestId) !== requestId)
+            return;
+        this.pendingNotificationEvents.delete(sessionId);
         this.deps.logger.info(`component=rc_event_upstream event=notification_buffer event_type=${event.type}${sessionId ? ` session_id=${sessionId}` : ''}${requestId ? ` request_id=${requestId}` : ''} status=cancelled_terminal pending=${this.pendingNotificationEvents.size}`);
+    }
+    /**
+     * A buffered Goal notification is stale once the same Goal moves on without
+     * needing the user (resumed, user-paused) or is cleared, and once another
+     * Goal updates in that Session: creating a Goal replaces a finished one
+     * without a cleared event, and the client applies a replayed update as the
+     * Session's current Goal. Drop it so reconnect cannot replay an old
+     * completion/attention state; a buffered ask stays.
+     */
+    cancelBufferedGoalStateForNewerState(event) {
+        const succession = goalStateSuccession(event);
+        if (!succession)
+            return;
+        const pending = this.pendingNotificationEvents.get(succession.sessionId);
+        if (pending?.type !== 'thread_goal.updated')
+            return;
+        const pendingGoal = pending.payload.goal;
+        const pendingGoalId = pendingGoal && typeof pendingGoal === 'object'
+            ? readString(Reflect.get(pendingGoal, 'goalId'))
+            : undefined;
+        if (pendingGoalId === succession.goalId && !succession.supersedesSameGoal)
+            return;
+        this.pendingNotificationEvents.delete(succession.sessionId);
+        this.deps.logger.info(`component=rc_event_upstream event=notification_buffer event_type=${event.type} session_id=${succession.sessionId} status=cancelled_superseded_goal pending=${this.pendingNotificationEvents.size}`);
     }
     clearPendingNotifications(reason) {
         const count = this.pendingNotificationEvents.size;
@@ -283,34 +329,62 @@ export class PermissionUpstream {
         }
     }
 }
-function notificationEventKey(event) {
+/** Session a notification-trigger event belongs to; the buffer keeps one per session. */
+function notificationEventSessionId(event) {
+    if (event.type === 'thread_goal.updated') {
+        const goal = event.payload.goal;
+        return goal && typeof goal === 'object'
+            ? readString(Reflect.get(goal, 'sessionId'))
+            : undefined;
+    }
     const sessionId = readString(event.payload.sessionId);
     if (!sessionId)
         return undefined;
-    if (event.type === 'permission.ask') {
-        const requestId = readString(event.payload.requestId);
-        return requestId ? `permission:${sessionId}:${requestId}` : undefined;
-    }
-    if (event.type === 'questionnaire.ask') {
-        const requestId = readString(event.payload.requestId);
-        return requestId ? `questionnaire:${sessionId}:${requestId}` : undefined;
-    }
-    if (event.type === 'session.finish') {
-        const turnId = readString(event.payload.turnId);
-        return turnId ? `${event.type}:${sessionId}:${turnId}` : undefined;
-    }
-    return undefined;
+    // An ask is only replayable with its request identity; a Turn end with its Turn.
+    const identity = event.type === 'session.finish'
+        ? readString(event.payload.turnId)
+        : readString(event.payload.requestId);
+    return identity ? sessionId : undefined;
 }
-function terminalNotificationAskKey(event) {
-    const sessionId = readString(event.payload.sessionId);
-    const requestId = readString(event.payload.requestId);
-    if (!sessionId || !requestId)
-        return undefined;
-    if (event.type === 'permission.resolved') {
-        return `permission:${sessionId}:${requestId}`;
+function isGoalNotificationState(payload) {
+    const goal = payload.goal;
+    if (!goal || typeof goal !== 'object')
+        return false;
+    const status = readString(Reflect.get(goal, 'status'));
+    if (status && GOAL_ATTENTION_STATUSES.has(status))
+        return true;
+    if (status !== 'paused')
+        return false;
+    const reason = readString(Reflect.get(goal, 'statusReason'));
+    return reason !== undefined && reason !== GOAL_USER_PAUSE_REASON;
+}
+/**
+ * The Session Goal a Goal event reports. It supersedes a buffered state of
+ * another Goal in any case; of the same Goal only as a clear or an update that
+ * no longer needs the user.
+ */
+function goalStateSuccession(event) {
+    if (event.type === 'thread_goal.cleared') {
+        const sessionId = readString(event.payload.sessionId);
+        const goalId = readString(event.payload.goalId);
+        return sessionId && goalId ? { sessionId, goalId, supersedesSameGoal: true } : undefined;
     }
+    if (event.type !== 'thread_goal.updated')
+        return undefined;
+    const goal = event.payload.goal;
+    if (!goal || typeof goal !== 'object')
+        return undefined;
+    const sessionId = readString(Reflect.get(goal, 'sessionId'));
+    const goalId = readString(Reflect.get(goal, 'goalId'));
+    if (!sessionId || !goalId)
+        return undefined;
+    return { sessionId, goalId, supersedesSameGoal: !isGoalNotificationState(event.payload) };
+}
+function terminalNotificationAskType(event) {
+    if (event.type === 'permission.resolved')
+        return 'permission.ask';
     if (event.type === 'questionnaire.dismiss' || event.type === 'questionnaire.superseded') {
-        return `questionnaire:${sessionId}:${requestId}`;
+        return 'questionnaire.ask';
     }
     return undefined;
 }

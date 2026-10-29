@@ -9,6 +9,7 @@
  */
 import { ToolCallStatus } from '@mavis/agent-core/protocol/agent-message';
 import { parseMediaTags } from '@mavis/shared';
+import { isTurnLifecycleMessageKind } from '@mavis/shared/turn-message-kind';
 import { extractToolDetail, formatToolResultFallback, formatToolSummary, sanitizeChannelReplyText, } from './message-format.js';
 /**
  * Default filter when none is supplied — equals legacy behavior (concise
@@ -43,7 +44,9 @@ class CommittedMessageCollector {
         this.filter = filter;
     }
     take(message) {
-        if (message.role === 'user' || message.role === 'system' || message.kind === 'compaction') {
+        if (message.role === 'user' ||
+            message.role === 'system' ||
+            isTurnLifecycleMessageKind(message.kind)) {
             return;
         }
         this.finalMessages += 1;

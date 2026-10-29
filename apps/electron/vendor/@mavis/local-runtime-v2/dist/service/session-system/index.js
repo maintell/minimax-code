@@ -17,6 +17,8 @@ export * from './sessions/repo/codec.js';
 export * from './sessions/repo/normalization.js';
 export * from './sessions/representation/serialization.js';
 export * from './shared/user-message-id.js';
+export * from './shared/sidechat-mode.js';
+export { canonicalProjectWorkspaceDir } from './shared/workspace.js';
 export * from './fork/index.js';
 export { initializeSessionSystem } from './owner.js';
 export { createSessionOperationIntentRepository } from './mutation/index.js';
@@ -24,4 +26,6 @@ export * from './legacy-migration/index.js';
 export * from './legacy-migration/repo/history-checkpoint.js';
 export * from './legacy-migration/repo/pi-history-source.js';
 export { createLegacyOpencodeReadonlySource } from '../../infra/legacy-db/readonly-source.js';
+export { normalizeAbsolutePath } from './shared/path-normalization.js';
+export * from './sessions/sidechat-data-capability.js';
 //# sourceMappingURL=index.js.map

@@ -1,20 +1,62 @@
 import { createHash } from 'node:crypto';
 import { MsgType, RespDataType, Role, ToolCallStatus, } from '@mavis/agent-core/protocol/agent-message';
 import { RuntimeEventType } from '@mavis/agent-core/protocol';
+import { ComputerUseCaptureReporter, isComputerUseTool } from './computer-use-capture/reporter.js';
 /** Keeps eval capture fail-open around the native V2 runner. */
 export async function runWithLocalEvalReporter(factory, input, execute, logger) {
-    const reporter = beginTurn(factory, input, logger);
-    const reportedInput = reporter ? withReporter(input, reporter, logger) : input;
+    const localCapture = input.computerUseCapture?.enabled === true
+        ? await beginComputerUseCapture(input, logger)
+        : undefined;
+    // CU evidence has separate storage consent; never send it to the ordinary network outbox.
+    const reporter = localCapture ?? (isComputerUseTurn(input) ? undefined : beginTurn(factory, input, logger));
+    let reportedInput = reporter ? withReporter(input, reporter, logger) : input;
+    if (localCapture) {
+        localCapture.beginTurn({
+            turnId: input.turnId,
+            userMessage: input.userMessage.text,
+            model: input.llm.model,
+        });
+        reportedInput = {
+            ...reportedInput,
+            hooks: localCapture.withCheckpointHooks(reportedInput.hooks ?? {}),
+        };
+    }
     try {
         const result = await execute(reportedInput);
         finishTurn(reporter, result.retracted || result.networkStopped
             ? { ...result.outcome, status: 'aborted' }
             : result.outcome, logger);
+        await localCapture?.seal();
         return result;
     }
     catch (error) {
         failTurn(reporter, error, Boolean(input.signal?.aborted), logger);
+        await localCapture?.seal();
         throw error;
+    }
+}
+function isComputerUseTurn(input) {
+    return (input.computerUseCapture !== undefined ||
+        Boolean(input.tools?.some((tool) => isComputerUseTool(tool.def.name))) ||
+        Boolean(input.history?.some((message) => (message.role === 'toolResult' && isComputerUseTool(message.toolName)) ||
+            (message.role === 'assistant' &&
+                message.content.some((part) => part.type === 'toolCall' && isComputerUseTool(part.name))))));
+}
+async function beginComputerUseCapture(input, logger) {
+    const config = input.computerUseCapture;
+    if (config?.enabled !== true || config.localStorageConsent !== true)
+        return undefined;
+    try {
+        return await ComputerUseCaptureReporter.create(config, {
+            sessionId: input.sessionId,
+            turnId: input.turnId,
+        }, logger);
+    }
+    catch (error) {
+        if (config.strict)
+            throw new Error('computer_use_capture_initialization_failed', { cause: error });
+        logFailure(logger, 'computer_use_capture_initialize', error);
+        return undefined;
     }
 }
 function beginTurn(factory, input, logger) {

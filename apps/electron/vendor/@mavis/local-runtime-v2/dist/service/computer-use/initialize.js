@@ -1,6 +1,7 @@
 import { isComputerUseEnabled, setComputerUseEnabled, } from './state.js';
 import { resolveComputerUseSelection, createComputerUsePluginRevocationHandler, } from './session-selection.js';
 import { buildComputerUseRuntimeTools } from './tools.js';
+import { readComputerUseDefault } from './default-preference.js';
 /** Bind plugin publication and explicit revocation to the same Computer Use owner. */
 export function createComputerUsePluginCallbacks(client, preferences) {
     const revoke = createComputerUsePluginRevocationHandler(preferences);
@@ -50,11 +51,44 @@ export function initializeComputerUseProductCapabilities(input) {
             // Preflight checks the trusted enabled plugin before resolving session selection.
             ...(input.client && preferences
                 ? {
+                    resolveComputerUseDefault: async () => {
+                        const scope = input.selectionScope?.();
+                        if (!scope ||
+                            !isComputerUseEnabled() ||
+                            input.client?.selectionPolicy === 'explicit-interactive')
+                            return 'disabled';
+                        try {
+                            if (!(await readComputerUseDefault(preferences, scope)))
+                                return 'disabled';
+                            await input.client?.ensureReady?.();
+                            const current = input.selectionScope?.();
+                            return current?.principalId === scope.principalId &&
+                                current.deployment === scope.deployment &&
+                                isComputerUseEnabled()
+                                ? 'enabled'
+                                : 'disabled';
+                        }
+                        catch {
+                            return 'unavailable';
+                        }
+                    },
+                    persistComputerUseSelection: async ({ sessionId }) => {
+                        const scope = input.selectionScope?.();
+                        if (!scope)
+                            return false;
+                        const selected = await resolveComputerUseSelection(preferences, { sessionId, selection: true }, scope);
+                        const current = input.selectionScope?.();
+                        return (selected &&
+                            current?.principalId === scope.principalId &&
+                            current?.deployment === scope.deployment);
+                    },
                     resolveComputerUseSelection: async (selection) => {
                         const scope = input.selectionScope?.();
                         if (!scope)
                             return false;
                         const selected = await resolveComputerUseSelection(preferences, selection, scope);
+                        if (selected)
+                            await input.client?.ensureReady?.();
                         const current = input.selectionScope?.();
                         return (selected &&
                             current?.principalId === scope.principalId &&
@@ -62,16 +96,19 @@ export function initializeComputerUseProductCapabilities(input) {
                     },
                 }
                 : {}),
-            snapshot: () => ({ computerUseGloballyEnabled: isComputerUseEnabled() }),
+            snapshot: () => ({
+                computerUseGloballyEnabled: isComputerUseEnabled(),
+                computerUseRequiresInteractiveTurn: input.client?.selectionPolicy === 'explicit-interactive',
+            }),
         },
         toolSources: {
             resolve: async (toolInput) => {
                 const sources = await input.baseToolSources.resolve(toolInput);
                 const nativeTools = sources.nativeTools.filter((tool) => !tool.def.name.startsWith('computer_'));
-                if (input.client && toolInput.computerUseActive)
-                    await input.client.ensureReady?.();
+                // Driver admission is resolved once in preflight for explicit and default selections.
+                // Re-probing here would turn a best-effort default into a fatal chat setup failure.
                 const computerTools = input.client && toolInput.computerUseActive
-                    ? buildComputerUseRuntimeTools(input.client)
+                    ? buildComputerUseRuntimeTools(input.client, input.readSessionTitle)
                     : [];
                 return {
                     ...sources,

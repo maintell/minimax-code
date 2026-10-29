@@ -2,7 +2,7 @@ import { createAgentRuntime } from '@mavis/agent-runtime';
 import { getLocalBashEnvironment } from '@mavis/agent-tools';
 import { buildLocalTurnToolCatalog, } from './assembly/local-turn-tool-catalog.js';
 import { createLocalTurnToolCatalogInput, } from './assembly/local-turn-tool-catalog-source.js';
-import { NativeLocalTurnExecutionPreparationSource } from './assembly/local-turn-execution-preparation.js';
+import { NativeLocalTurnExecutionPreparationSource, } from './assembly/local-turn-execution-preparation.js';
 import { LocalTurnInputPreparer, } from './assembly/local-turn-input-preparation.js';
 import {} from './execution/executor.js';
 import { LocalAgentConfigBuilder, LocalAgentPreparationService, } from './preparation/index.js';
@@ -30,7 +30,10 @@ export async function createNativeAgentHostProductionDependencies(options) {
         },
     };
     const runtime = new LocalAgentTurnRunner(options.runner);
-    const executionPreparation = new NativeLocalTurnExecutionPreparationSource(new LocalTurnInputPreparer(options.inputPreparation), new LocalTurnPermissionGate(createPermissionGateOptions(options)));
+    const executionPreparation = new NativeLocalTurnExecutionPreparationSource(new LocalTurnInputPreparer({
+        ...options.inputPreparation,
+        persistComputerUseSelection: options.turnRuntimeFacts?.persistComputerUseSelection,
+    }), new LocalTurnPermissionGate(createPermissionGateOptions(options)), options.askUserPolicy, options.runner.logger);
     const dependencies = createNativeAgentHostDependencies(options, normal, runtime, executionPreparation);
     return {
         ...dependencies,
@@ -57,6 +60,7 @@ function createNativeAgentHostDependencies(options, normal, runtime, executionPr
         turnControl: options.turnControl,
         ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
         ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
+        promptSuggestion: options.promptSuggestion,
         canonicalHistory: options.canonicalHistory,
         ...(options.runner.logger ? { logger: options.runner.logger } : {}),
         ...(options.usage ? { usage: options.usage } : {}),

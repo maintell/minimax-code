@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { ASK_OTHER_PLACEHOLDER, } from '@mavis/shared/questionnaire';
+import { ASK_OTHER_PLACEHOLDER, QUESTIONNAIRE_CONTEXT_IMAGE_LIMITS, } from '@mavis/shared/questionnaire';
 export class QuestionnaireNormalizationError extends Error {
     constructor(message) {
         super(message);
@@ -59,9 +59,11 @@ export function normalizeAskUserInput(input, opts) {
     if (!Array.isArray(input.steps)) {
         throw new QuestionnaireNormalizationError('ask_user input must include a non-empty `steps` array');
     }
-    const includeRecommendations = opts.purpose === 'goal';
+    const recommendations = opts.purpose === 'goal' || opts.recommendations === 'explicit-or-first'
+        ? 'goal'
+        : (opts.recommendations ?? 'none');
     const steps = input.steps
-        .map((step, idx) => normalizeStep(step, idx, includeRecommendations))
+        .map((step, idx) => normalizeStep(step, idx, recommendations))
         .filter((step) => step !== null);
     if (steps.length === 0) {
         throw new QuestionnaireNormalizationError('ask_user input must include at least one step with non-empty question text');
@@ -160,6 +162,7 @@ export function validateQuestionnaireReply(request, payload) {
         throw new QuestionnaireValidationError('answers must be an array');
     }
     const stepById = new Map(request.steps.map((step) => [step.id, step]));
+    let imageCount = 0;
     const answeredStepIds = new Set();
     for (const answer of payload.answers) {
         if (!answer || typeof answer.stepId !== 'string') {
@@ -177,6 +180,33 @@ export function validateQuestionnaireReply(request, payload) {
         const selectedIds = Array.isArray(answer.selectedOptionIds) ? answer.selectedOptionIds : [];
         const selectedOther = answer.selectedOther === true;
         const otherText = typeof answer.otherText === 'string' ? answer.otherText : '';
+        if (answer.contextImages !== undefined) {
+            if (!Array.isArray(answer.contextImages) ||
+                (answer.contextImages.length > 0 && (skipped || !selectedOther))) {
+                throw new QuestionnaireValidationError('Context images require an unskipped Others answer.');
+            }
+            const ids = new Set();
+            for (const image of answer.contextImages) {
+                if (!image ||
+                    typeof image.contextId !== 'string' ||
+                    !image.contextId.trim() ||
+                    image.contextId.length > 2048 ||
+                    typeof image.annotationId !== 'string' ||
+                    !image.annotationId.trim() ||
+                    image.annotationId.length > 128 ||
+                    !image.attachment) {
+                    throw new QuestionnaireValidationError('Invalid context image identity.');
+                }
+                const id = JSON.stringify([image.contextId, image.annotationId]);
+                if (ids.has(id))
+                    throw new QuestionnaireValidationError('Duplicate context image.');
+                ids.add(id);
+                imageCount += 1;
+            }
+            if (imageCount > QUESTIONNAIRE_CONTEXT_IMAGE_LIMITS.count) {
+                throw new QuestionnaireValidationError('Too many context images.');
+            }
+        }
         if (skipped) {
             if (selectedIds.length > 0 || selectedOther || otherText.trim() !== '') {
                 throw new QuestionnaireValidationError(`step ${step.id}: skipped answer cannot carry selectedOptions / selectedOther / otherText`);
@@ -223,10 +253,17 @@ export function sanitizeReplyAnswers(payload) {
         if (sanitized.selectedOther && typeof answer.otherText === 'string') {
             sanitized.otherText = answer.otherText.trim();
         }
+        if (sanitized.selectedOther && answer.contextImages?.length) {
+            sanitized.contextImages = answer.contextImages.map(({ contextId, annotationId, attachment }) => ({
+                contextId,
+                annotationId,
+                attachment: structuredClone(attachment),
+            }));
+        }
         return sanitized;
     });
 }
-function normalizeStep(raw, index, includeRecommendations) {
+function normalizeStep(raw, index, recommendations) {
     if (!raw || typeof raw.question !== 'string')
         return null;
     const question = raw.question.trim();
@@ -237,7 +274,7 @@ function normalizeStep(raw, index, includeRecommendations) {
         id,
         question,
         selectionMode: raw.selectionMode === 'multiple' ? 'multiple' : 'single',
-        options: normalizeOptions(raw.options, id, includeRecommendations),
+        options: normalizeOptions(raw.options, id, recommendations),
         allowOther: true,
         otherPlaceholder: ASK_OTHER_PLACEHOLDER,
         required: true,
@@ -253,7 +290,7 @@ function normalizeStep(raw, index, includeRecommendations) {
         step.image = image;
     return step;
 }
-function normalizeOptions(raw, stepId, includeRecommendations) {
+function normalizeOptions(raw, stepId, recommendations) {
     if (!Array.isArray(raw))
         return [];
     const out = [];
@@ -276,13 +313,16 @@ function normalizeOptions(raw, stepId, includeRecommendations) {
             normalized.description = description;
         if (image)
             normalized.image = image;
-        if (includeRecommendations && !hasRecommendation && option.recommended === true) {
+        if (recommendations !== 'none' && !hasRecommendation && option.recommended === true) {
             normalized.recommended = true;
             hasRecommendation = true;
         }
         out.push(normalized);
     });
-    if (includeRecommendations && out.length > 0 && !hasRecommendation) {
+    // Fill one in only where an option can be adopted without the user: legacy
+    // Goal questionnaires and v2 Goal questions (Goal + skip) both select it when
+    // their deadline passes, so the highlighted option is the one selected.
+    if (recommendations === 'goal' && out.length > 0 && !hasRecommendation) {
         out[0].recommended = true;
     }
     return out;

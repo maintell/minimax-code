@@ -6,9 +6,8 @@ import * as path from "path";
 import * as fs from "fs";
 import * as crypto from "crypto";
 import { app, net } from "electron";
-import { compareVersions } from "../../utils";
 import { getCategoryLogger } from "../../utils/logger";
-import { HOT_UPDATE_DIR } from "./config";
+import { HOT_UPDATE_DIR, SHELL_FINGERPRINT_FILENAME } from "./config";
 const logger = getCategoryLogger('update');
 // ==================== 路径相关 ====================
 /**
@@ -18,10 +17,18 @@ export function getHotUpdateDir() {
     return path.join(app.getPath('userData'), HOT_UPDATE_DIR);
 }
 /**
- * 获取热更新资源目录路径（解压后的资源）
+ * 读取打包时写入 dist/ 的壳指纹；缺失或格式错误返回 null（该包不接收热更新）
  */
-export function getHotUpdateResourceDir() {
-    return path.join(getHotUpdateDir(), 'resources');
+export function readShellFingerprint(appPath = app.getAppPath()) {
+    try {
+        const raw = JSON.parse(fs.readFileSync(path.join(appPath, 'dist', SHELL_FINGERPRINT_FILENAME), 'utf8'));
+        return typeof raw.shellFingerprint === 'string' && /^[0-9a-f]{64}$/.test(raw.shellFingerprint)
+            ? raw.shellFingerprint
+            : null;
+    }
+    catch {
+        return null;
+    }
 }
 /**
  * 确保目录存在
@@ -33,7 +40,7 @@ export function ensureDir(dirPath) {
 }
 // ==================== 网络请求 ====================
 /**
- * 使用 Electron net.fetch 发起 GET 请求
+ * 使用 Electron net.fetch 发起 GET 请求；404 返回 null（该通道/版本尚未发布热更新）
  */
 export async function fetchText(url) {
     const response = await net.fetch(url, {
@@ -42,6 +49,9 @@ export async function fetchText(url) {
             Pragma: 'no-cache',
         },
     });
+    if (response.status === 404 || response.status === 403) {
+        return null;
+    }
     if (!response.ok) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
@@ -64,7 +74,7 @@ export async function calculateFileSha256(filePath) {
  */
 export async function downloadFile(url, destPath, options) {
     ensureDir(path.dirname(destPath));
-    const { expectedSha256, onProgress } = options || {};
+    const { expectedSha256, expectedSize, onProgress } = options || {};
     const response = await net.fetch(url);
     if (!response.ok) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -82,8 +92,13 @@ export async function downloadFile(url, destPath, options) {
             const result = await reader.read();
             done = result.done;
             if (result.value) {
-                fileStream.write(Buffer.from(result.value));
                 downloadedSize += result.value.length;
+                if (expectedSize !== undefined && downloadedSize > expectedSize) {
+                    throw new Error(`Download exceeds expected size ${expectedSize}`);
+                }
+                if (!fileStream.write(Buffer.from(result.value))) {
+                    await new Promise((resolve) => fileStream.once('drain', () => resolve()));
+                }
                 if (onProgress && totalSize > 0) {
                     onProgress(downloadedSize, totalSize);
                 }
@@ -97,13 +112,14 @@ export async function downloadFile(url, destPath, options) {
                     resolve();
             });
         });
+        if (expectedSize !== undefined && downloadedSize !== expectedSize) {
+            throw new Error(`Size mismatch: expected ${expectedSize}, got ${downloadedSize}`);
+        }
         // 验证 SHA256
         if (expectedSha256) {
             logger.info('[HotUpdate] Verifying file integrity...');
             const actualSha256 = await calculateFileSha256(destPath);
             if (actualSha256 !== expectedSha256) {
-                // 删除损坏的文件
-                fs.unlinkSync(destPath);
                 throw new Error(`SHA256 mismatch: expected ${expectedSha256}, got ${actualSha256}`);
             }
             logger.info('[HotUpdate] File integrity verified');
@@ -123,51 +139,6 @@ export async function downloadFile(url, destPath, options) {
     }
 }
 // ==================== 版本相关 ====================
-/**
- * 解析热更新版本号
- * 格式：{appVersion}-renderer.{n}
- * 例如：3.0.3-renderer.1
- */
-export function parseRendererVersion(version) {
-    const match = version.match(/^(.+)-renderer\.(\d+)$/);
-    if (!match) {
-        return null;
-    }
-    return {
-        appVersion: match[1],
-        rendererNum: parseInt(match[2], 10),
-    };
-}
-/**
- * 比较热更新版本号
- * @returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal
- */
-export function compareRendererVersions(v1, v2) {
-    // null 表示打包版本，任何热更新版本都 > null
-    if (v1 === null && v2 === null)
-        return 0;
-    if (v1 === null)
-        return -1;
-    if (v2 === null)
-        return 1;
-    const parsed1 = parseRendererVersion(v1);
-    const parsed2 = parseRendererVersion(v2);
-    // 如果解析失败，按字符串比较
-    if (!parsed1 || !parsed2) {
-        return v1.localeCompare(v2);
-    }
-    // 先比较应用版本
-    const appCompare = compareVersions(parsed1.appVersion, parsed2.appVersion);
-    if (appCompare !== 0) {
-        return appCompare;
-    }
-    // 应用版本相同，比较渲染版本号
-    if (parsed1.rendererNum > parsed2.rendererNum)
-        return 1;
-    if (parsed1.rendererNum < parsed2.rendererNum)
-        return -1;
-    return 0;
-}
 /**
  * 获取当前应用版本
  */

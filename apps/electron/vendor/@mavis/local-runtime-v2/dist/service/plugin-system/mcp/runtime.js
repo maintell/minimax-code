@@ -150,6 +150,25 @@ export class PluginMcpRuntime {
     async disconnectServers(serverNames) {
         await Promise.allSettled([...new Set(serverNames)].map((serverName) => this.disconnectBounded(serverName)));
     }
+    async adoptManagedServers(entries) {
+        if (this.closed)
+            return;
+        const changed = [];
+        for (const entry of entries) {
+            if (entry.managedIdentity?.kind !== 'miniapp')
+                continue;
+            const name = poolName(entry);
+            if (this.servers.get(name)?.managedIdentity?.kind !== 'miniapp')
+                continue;
+            const key = lifecycleKey(entry);
+            if (this.lifecycleKeys.get(name) === key)
+                continue;
+            this.servers.set(name, entry);
+            this.lifecycleKeys.set(name, key);
+            changed.push(name);
+        }
+        await this.disconnectServers(changed);
+    }
     async disconnectBounded(serverName) {
         await ignoreFailure(withTimeout(this.pool.disconnect(serverName), this.disconnectTimeoutMs, `Plugin MCP disconnect timed out for ${serverName}`));
     }

@@ -1,13 +1,27 @@
+/** Remaining-budget fractions that each emit one reminder when first crossed. */
+const BUDGET_FRACTION_THRESHOLDS = [0.5, 0.25, 0.1];
+/** Inside this window every request carries a (coarse) reminder. */
+const FINAL_WINDOW_MS = 120_000;
+const FINAL_WINDOW_LEVEL = BUDGET_FRACTION_THRESHOLDS.length + 1;
 /**
  * Request-only context; the caller's existing cancellation timer remains
  * authoritative. `replaceRequestMessages` keeps the marker out of durable
- * history, so it must be registered before any hook that returns
- * `appendMessage` — `runBeforeLLM` ends the pipeline on a successful append.
+ * history. `runBeforeLLM` accumulates appends, so later hooks keep running;
+ * it is still registered before the appending background reminder.
+ *
+ * To avoid spending tokens on every model request, the reminder is emitted
+ * only on the first request (announces the budget), when the remaining budget
+ * first drops to ≤50%, ≤25% and ≤10% of the total, and on every request inside
+ * the final two minutes. The total budget is measured from hook creation
+ * (turn preparation), since requests carry no start time. Precision is whole
+ * minutes outside the final window and 10-second steps inside it, so the text
+ * does not churn between otherwise identical requests.
  */
 export function createExecutionBudgetReminder(executionDeadlineAtMs, nowMs = Date.now, canAppend, logger) {
     if (executionDeadlineAtMs === undefined || !canAppend)
         return undefined;
-    let previousSampleAtMs;
+    const totalMs = Math.max(0, executionDeadlineAtMs - nowMs());
+    let emittedLevel;
     return (input) => {
         try {
             if (input.signal?.aborted)
@@ -16,27 +30,26 @@ export function createExecutionBudgetReminder(executionDeadlineAtMs, nowMs = Dat
             const remainingMs = executionDeadlineAtMs - now;
             if (remainingMs <= 0)
                 return undefined;
-            const elapsedMs = previousSampleAtMs !== undefined && now >= previousSampleAtMs
-                ? now - previousSampleAtMs
-                : undefined;
-            previousSampleAtMs = now;
-            const elapsed = elapsedMs !== undefined
-                ? ` Since the previous model request was prepared: ${Math.floor(elapsedMs / 1_000)} seconds (model generation, tools, and waiting).`
-                : ' This budget includes model generation, tools, and waiting.';
+            const level = budgetLevel(remainingMs, totalMs);
+            const first = emittedLevel === undefined;
+            if (!first && level !== FINAL_WINDOW_LEVEL && level <= emittedLevel)
+                return undefined;
             const marker = {
                 role: 'user',
-                content: `<system-reminder>Execution time remaining at request preparation: ${Math.ceil(remainingMs / 1_000)} seconds.${elapsed}</system-reminder>`,
+                content: formatBudgetReminder(remainingMs, totalMs, first),
                 timestamp: now,
             };
             if (!canAppend(input, marker))
                 return undefined;
+            emittedLevel = level;
             try {
                 logger?.info?.({
                     session_id: input.sessionId,
                     turn_id: input.turnId,
                     sampled_at_ms: now,
                     remaining_ms: remainingMs,
-                    elapsed_since_previous_request_ms: elapsedMs ?? null,
+                    total_ms: totalMs,
+                    budget_level: level,
                 }, 'execution budget context sampled');
             }
             catch {
@@ -52,5 +65,31 @@ export function createExecutionBudgetReminder(executionDeadlineAtMs, nowMs = Dat
             return undefined;
         }
     };
+}
+/** 0 = above 50%; 1..3 = crossed 50/25/10%; FINAL_WINDOW_LEVEL = final two minutes. */
+function budgetLevel(remainingMs, totalMs) {
+    if (remainingMs <= FINAL_WINDOW_MS)
+        return FINAL_WINDOW_LEVEL;
+    let level = 0;
+    BUDGET_FRACTION_THRESHOLDS.forEach((fraction, index) => {
+        if (remainingMs <= totalMs * fraction)
+            level = index + 1;
+    });
+    return level;
+}
+function formatRemainingBudget(remainingMs) {
+    if (remainingMs > FINAL_WINDOW_MS)
+        return `about ${Math.floor(remainingMs / 60_000)} minutes`;
+    if (remainingMs >= 10_000)
+        return `about ${Math.floor(remainingMs / 10_000) * 10} seconds`;
+    return 'under 10 seconds';
+}
+function formatBudgetReminder(remainingMs, totalMs, first) {
+    const remaining = formatRemainingBudget(remainingMs);
+    const total = totalMs > FINAL_WINDOW_MS
+        ? `${Math.round(totalMs / 60_000)} minutes`
+        : `${Math.max(10, Math.round(totalMs / 10_000) * 10)} seconds`;
+    const scope = first ? ' Model generation, tools, and waiting all count against it.' : '';
+    return `<system-reminder>Execution time remaining: ${remaining} of ${total} total.${scope}</system-reminder>`;
 }
 //# sourceMappingURL=execution-budget-reminder.js.map

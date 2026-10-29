@@ -58,8 +58,12 @@ export function createV1CompatibleTurnSubmission(options) {
                 provenance: turnProvenance(input),
                 producerId: input.producerId,
                 idempotencyKey: input.idempotencyKey,
+                ...(input.activationDisplayContent !== undefined
+                    ? { activationDisplayContent: input.activationDisplayContent }
+                    : {}),
                 ...(input.requestedTurnId ? { requestedTurnId: input.requestedTurnId } : {}),
                 preDelivery: input.preDelivery,
+                ...(input.receiptAliases?.length ? { receiptAliases: input.receiptAliases } : {}),
                 delivery: toDeliveryOptions(message),
             }), (result) => result.delivered, materialized.discardCreated);
         },

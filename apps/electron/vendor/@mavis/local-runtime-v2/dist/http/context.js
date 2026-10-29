@@ -10,6 +10,7 @@ export function buildRequestContext(request, deps) {
         requestId,
         startedAtMs: deps.nowMs(),
         requestHeaders: new Headers(request.headers),
+        observationHeaders: new Headers(),
     };
 }
 //# sourceMappingURL=context.js.map

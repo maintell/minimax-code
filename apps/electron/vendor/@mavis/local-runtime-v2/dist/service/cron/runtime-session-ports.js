@@ -2,6 +2,7 @@ import { decodeCronModel } from '@mavis/shared/cron-model';
 import { createCronSessionPurpose, formatCronRunTitle } from '@mavis/shared/cron-purpose';
 import { createHostCronSessionCreation } from './adapters/session-creation.adapter.js';
 import { deliverRuntimeCron } from './runtime-delivery.js';
+import { CronDeliveryDeferredError } from './errors.js';
 /** Binds Cron's session ports to the V2 Agent, Session, and Turn capabilities. */
 export function createRuntimeCronSessionPorts(options) {
     const { agentSessionPorts, sessions, turns, reportFailure, lifecycle, deletion } = options;
@@ -20,7 +21,12 @@ export function createRuntimeCronSessionPorts(options) {
         getSession: async (sessionId) => {
             const session = await sessions.sessions.repository.get(sessionId);
             return session
-                ? { sessionId, agentName: session.agentName, archived: session.archived }
+                ? {
+                    sessionId,
+                    agentName: session.agentName,
+                    archived: session.archived,
+                    workspaceDir: session.workspaceDir,
+                }
                 : undefined;
         },
         resolveAgentWriteTarget: agentSessionPorts.resolveWriteTarget,
@@ -38,16 +44,19 @@ export function createRuntimeCronSessionPorts(options) {
             });
             return { sessionId: session.sessionId, agentName: session.agentName };
         },
-        renameSession: async (sessionId, title) => {
+        renameSession: async (sessionId, title, signal) => {
+            signal?.throwIfAborted();
             const session = await sessions.sessions.repository.get(sessionId);
+            signal?.throwIfAborted();
             if (!session || session.title?.trim())
                 return;
-            await lifecycle.renameSession(sessionId, title, session.title ?? null);
+            await lifecycle.renameSession(sessionId, title, session.title ?? null, signal);
         },
         discardSession: async (sessionId) => {
             await deletion.deleteTaskOwnedSessionById(sessionId);
         },
-        detachCronSessions: async (cronId, targetSessionId) => {
+        detachCronSessions: async (cronId, targetSessionId, signal) => {
+            signal?.throwIfAborted();
             await sessions.sessions.repository.detachCronSessions(cronId, targetSessionId);
         },
         resolveDefaultWorkspaceDir: options.resolveDefaultWorkspaceDir,
@@ -69,9 +78,19 @@ export function createRuntimeCronSessionPorts(options) {
                 }
                 return result;
             },
+            // Level-triggered: the Queue re-checks every gate on this wake.
+            ownerReleased: (sessionId) => turns.dispatchQueue(sessionId),
         },
         delivery: {
-            deliver: (request) => deliverRuntimeCron(turns, request, reportFailure),
+            deliver: (request) => deliverRuntimeCron(turns, {
+                ...request,
+                beforeDelivery: async () => {
+                    await request.beforeDelivery?.();
+                    const snapshot = await sessions.queue.committed.snapshot(request.sessionId);
+                    if (snapshot.pause)
+                        throw new CronDeliveryDeferredError('CRON_DELIVERY_QUEUE_PAUSED');
+                },
+            }, reportFailure),
         },
     };
 }

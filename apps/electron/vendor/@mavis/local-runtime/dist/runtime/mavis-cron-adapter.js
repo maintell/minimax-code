@@ -288,7 +288,7 @@ function normalizeOnceSession(session) {
 }
 function toMavisCronTask(state) {
     const task = cronStateToCronTask(state);
-    const { session: legacySession, model: modelSelection, ...rest } = task;
+    const { session: legacySession, ...rest } = task;
     const session = legacySession?.mode === 'sessionId' && legacySession.sessionId
         ? { mode: 'sessionId', sessionId: legacySession.sessionId }
         : legacySession?.mode === 'new'
@@ -296,7 +296,6 @@ function toMavisCronTask(state) {
             : undefined;
     return {
         ...rest,
-        ...(modelSelection?.modelId === undefined ? {} : { model: modelSelection.modelId }),
         ...(session ? { session } : {}),
     };
 }

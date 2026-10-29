@@ -2,7 +2,8 @@ export const SUBAGENT_CONFIG_DEFAULTS = {
     maxConcurrentPerSession: 4,
 };
 /**
- * Parses the startup-only Desktop Task-child concurrency setting.
+ * Parses the Desktop Task-child concurrency setting. Admission re-reads it
+ * from the current config on every check.
  *
  * Invalid values fall back to the safe default so config mistakes never
  * remove the execution bound.

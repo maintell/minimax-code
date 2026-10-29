@@ -30,6 +30,7 @@ export function createRuntimeConversationApplication(options) {
         queue: options.sessionSystem.queue.committed,
         stream: options.sessionSystem.stream,
         sessionReader: options.sessionSystem.sessions.query,
+        sideChats: options.sessionSystem.sideChats,
         attachmentRegistration: options.attachmentRegistration,
         threadGoal: { pauseActiveForAbort: options.pauseActiveForAbort },
         steer: (input) => options.runtimeConversation.ingress.steer(input),

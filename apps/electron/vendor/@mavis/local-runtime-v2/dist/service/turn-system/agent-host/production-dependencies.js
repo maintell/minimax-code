@@ -15,7 +15,12 @@ export function createAgentHostProductionDependencies(options) {
     assertAgentHostCapabilityAvailable('history-failure-projector', typeof options.events?.historyFailures?.projectHistoryFailure === 'function');
     const events = new RequiredAgentEventDelivery(options.events);
     validateUsageProjection(options.usage);
-    return createDependencyRecord(options, history, events, new LocalRuntimeTurnExecutor(options.executor));
+    return createDependencyRecord(options, history, events, 
+    // The suggestion port is host-owned; the executor only forwards the
+    // short-lived capture after a successful commit.
+    new LocalRuntimeTurnExecutor(options.promptSuggestion
+        ? { ...options.executor, promptSuggestion: options.promptSuggestion }
+        : options.executor));
 }
 function validateUsageProjection(usage) {
     if (usage) {
@@ -40,6 +45,7 @@ function createDependencyRecord(options, history, events, executor) {
             : {}),
         ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
         ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
+        promptSuggestion: options.promptSuggestion,
         history,
         events,
         ...(options.logger ? { logger: options.logger } : {}),

@@ -92,6 +92,32 @@ export function consumeShellWrapperPrefix(tokens, startIdx) {
     }
     return i;
 }
+/** Execution identity for Bash safety checks, not the generic fast-allow gate. */
+export function consumeBashExecutionPrefix(tokens) {
+    let start = 0;
+    for (let depth = 0; depth < 8; depth++) {
+        const next = consumeShellWrapperPrefix(tokens, consumeEnvVarPrefix(tokens, start));
+        if (next !== start) {
+            start = next;
+            continue;
+        }
+        if (tokens[start] === 'builtin') {
+            start++;
+            continue;
+        }
+        if (tokens[start] !== 'exec')
+            return start;
+        start++;
+        while (tokens[start]?.startsWith('-')) {
+            const flag = tokens[start++];
+            if (flag === '--')
+                break;
+            if (/^-[cl]*a$/u.test(flag))
+                start++;
+        }
+    }
+    return start;
+}
 // Per-wrapper valued-short flag tables. Members are short flags whose
 // VALUE lives in the next token (e.g. `-n 5` → consume both). Long-form
 // (`--max-args=N`) is always single-token and falls through the generic
@@ -345,6 +371,13 @@ export function stripTransparentWrappersForRuleMatch(command) {
  * Reference: agent-server rules.py `_unwrap_command_wrappers()`
  */
 export function unwrapCommandWrappers(command) {
+    return unwrapShellCommandWrappers(command, false);
+}
+/** Preserve native interpreter boundaries for callers that only understand Bash. */
+export function unwrapBashCommandWrappers(command) {
+    return unwrapShellCommandWrappers(command, true);
+}
+function unwrapShellCommandWrappers(command, stopAtWindowsShell) {
     const cmd = command.trim();
     const candidates = [cmd];
     // Bounded-depth worklist so nested wrappers get exposed too:
@@ -368,7 +401,7 @@ export function unwrapCommandWrappers(command) {
         if (item.depth >= MAX_UNWRAP_DEPTH)
             continue;
         const before = candidates.length;
-        unwrapOneLevel(item.cmd, candidates);
+        unwrapOneLevel(item.cmd, candidates, stopAtWindowsShell);
         for (let idx = before; idx < candidates.length; idx += 1) {
             const next = candidates[idx];
             if (next)
@@ -385,15 +418,16 @@ export function unwrapCommandWrappers(command) {
  * Called by `unwrapCommandWrappers`'s worklist so nested wrappers get
  * further unwrapped by re-running this on the exposed inner payload.
  */
-function unwrapOneLevel(cmd, candidates) {
+function unwrapOneLevel(cmd, candidates, stopAtWindowsShell = false) {
     // First try the command verbatim against `[sudo] bash|sh|zsh|... -c`
     // and Windows-shell wrappers (`cmd /c "..."`, `powershell -Command "..."`,
     // etc.). These expose the inner payload so the HARD safety scan applies
     // to the actual delete/dangerous command instead of the outer wrapper —
     // otherwise `cmd /c "rmdir /s /q ..."` slips past the row-anchored
     // windows-delete regexes in HARD_BLOCKED_BASH_PATTERNS.
-    pushBashCInner(cmd, candidates);
-    pushWindowsShellInner(cmd, candidates);
+    pushBashCInner(cmd, candidates, stopAtWindowsShell);
+    if (!stopAtWindowsShell)
+        pushWindowsShellInner(cmd, candidates);
     // Then strip leading transparent wrappers (nohup / setsid / timeout / ...)
     // and try the same matchers on the stripped form. Without this the
     // SOFT pre-scan + HARD safety scan miss `nohup bash -c "<payload>"` and
@@ -403,7 +437,7 @@ function unwrapOneLevel(cmd, candidates) {
     const shellTokens = shellTokenizeWithMetadata(cmd);
     const tokens = shellTokens.map((t) => t.value);
     if (tokens.length > 0) {
-        const innerIdx = consumeShellWrapperPrefix(tokens, 0);
+        const innerIdx = consumeShellWrapperPrefix(tokens, consumeEnvVarPrefix(tokens, 0));
         if (innerIdx > 0 && innerIdx < tokens.length) {
             // Slice the RAW source substring from the first non-stripped
             // token to the end of the command so quoted payloads
@@ -416,8 +450,9 @@ function unwrapOneLevel(cmd, candidates) {
             const stripped = innerStartMeta ? cmd.slice(innerStartMeta.start).trim() : '';
             if (stripped && !candidates.includes(stripped)) {
                 candidates.push(stripped);
-                pushBashCInner(stripped, candidates);
-                pushWindowsShellInner(stripped, candidates);
+                pushBashCInner(stripped, candidates, stopAtWindowsShell);
+                if (!stopAtWindowsShell)
+                    pushWindowsShellInner(stripped, candidates);
             }
         }
     }
@@ -450,35 +485,41 @@ const POSIX_SHELL_NAMES = new Set([
  * C:\..."` from a WSL cross-shell nest) survives the POSIX tokenizer's
  * escape-strip.
  */
-function pushBashCInner(cmd, candidates) {
-    const shellTokens = shellTokenizeWithMetadata(cmd);
+function pushBashCInner(cmd, candidates, posixPayload = false) {
+    const payload = readBashInlineScript(cmd, posixPayload);
+    if (!payload || (posixPayload && payload.dynamic))
+        return;
+    const script = posixPayload ? payload.script : payload.rawScript;
+    if (script && !candidates.includes(script))
+        candidates.push(script);
+}
+/** Shared inline-script parsing for Bash wrapper inspection and hard safety. */
+export function readBashInlineScript(cmd, posixPayload = true) {
+    const shellTokens = shellTokenizeWithMetadata(cmd, true);
     const tokens = shellTokens.map((t) => t.value);
-    if (tokens.length < 3)
+    if (tokens.length < 2)
         return;
     // Optional `sudo` prefix consumes 1 token. `sudo` itself carries flags
     // (`-u`, `-i`, `-H`, etc.) but callers usually invoke as bare `sudo
     // bash -c ...` — extended `sudo -u user bash -c` is uncommon and not
     // handled here (falls through to no-op if the shape doesn't match).
-    let head = 0;
-    if ((tokens[0] ?? '').toLowerCase() === 'sudo')
-        head = 1;
+    let head = posixPayload ? consumeBashExecutionPrefix(tokens) : 0;
+    if ((tokens[head] ?? '').toLowerCase() === 'sudo')
+        head++;
     if (head >= tokens.length)
         return;
-    const headMeta = shellTokens[head];
-    const headRaw = headMeta ? cmd.slice(headMeta.start, headMeta.end) : (tokens[head] ?? '');
-    // Peel outer quotes for the shell path — supports `"/bin/bash" -c`.
-    const headForBasename = (() => {
-        if (headRaw.length >= 2) {
-            const first = headRaw[0];
-            const last = headRaw[headRaw.length - 1];
-            if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-                return headRaw.slice(1, -1);
-            }
-        }
-        return headRaw;
-    })();
-    // Basename normalise: `/bin/bash` → `bash`; `C:\wsl\bin\bash` → `bash`.
-    const headBasename = (headForBasename.split(/[\\/]/).pop() ?? headForBasename).toLowerCase();
+    if (posixPayload && tokens[head] === 'eval') {
+        const args = shellTokens.slice(head + (tokens[head + 1] === '--' ? 2 : 1));
+        const script = args.map((token) => token.value).join(' ');
+        return {
+            script,
+            rawScript: script,
+            dynamic: args.some((token) => token.pathSyntax?.dynamic === true),
+        };
+    }
+    const headBasename = (tokens[head]?.split(/[\\/]/).pop() ?? '')
+        .replace(/\.exe$/i, '')
+        .toLowerCase();
     // Two shapes are supported:
     //   1. Direct shell:      <shell> -c <payload>          → -c at head+1
     //   2. busybox indirect:  busybox <shell> -c <payload>  → -c at head+2
@@ -501,9 +542,18 @@ function pushBashCInner(cmd, candidates) {
     }
     if (cFlagIdx >= tokens.length - 1)
         return;
-    // The `-c` flag itself, or an equivalent short/long form. POSIX shells
-    // accept just `-c`; `dash` and `busybox sh` also accept it.
-    if ((tokens[cFlagIdx] ?? '') !== '-c')
+    // Shell startup flags precede the inline command: -lc, -e -c,
+    // --noprofile --norc -c, or -o errexit -c. Do not scan past a script
+    // filename or the -- option terminator and mistake script args for flags.
+    while (cFlagIdx < tokens.length - 1) {
+        const flag = tokens[cFlagIdx] ?? '';
+        if (flag === '--' || !flag.startsWith('-'))
+            return;
+        if (/^-[^-]*c/u.test(flag))
+            break;
+        cFlagIdx += /^(?:-[^-]*[oO]|--rcfile|--init-file)$/u.test(flag) ? 2 : 1;
+    }
+    if (cFlagIdx >= tokens.length - 1)
         return;
     // Payload is the single next token (all POSIX `-c` shells take one
     // string argument). Raw substring preserves any Windows-shape content
@@ -522,9 +572,11 @@ function pushBashCInner(cmd, candidates) {
         }
     }
     rest = rest.trim();
-    if (rest && !candidates.includes(rest)) {
-        candidates.push(rest);
-    }
+    return {
+        script: payloadMeta.value.trim(),
+        rawScript: rest,
+        dynamic: payloadMeta.pathSyntax?.dynamic === true,
+    };
 }
 /**
  * PowerShell boolean (switch) flags that take NO value argument.

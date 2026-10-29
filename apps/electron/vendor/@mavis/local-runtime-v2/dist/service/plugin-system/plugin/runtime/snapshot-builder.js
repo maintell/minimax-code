@@ -1,15 +1,22 @@
 import path from 'node:path';
 import { McpNameRegistry, configuredMcpNameKey, pluginMcpNameKey } from '@mavis/mcp';
 import { buildPluginSkillRuntimeName } from '@mavis/shared';
+import { hostWithholdsMiniApp } from '../package/miniapp/engines.js';
 export class PluginSnapshotBuilder {
     names;
-    constructor(names = new McpNameRegistry()) {
+    options;
+    constructor(names = new McpNameRegistry(), options = {}) {
         this.names = names;
+        this.options = options;
+    }
+    /** The version the engines gate compares against; undefined means the gate is off. */
+    get miniAppHostVersion() {
+        return this.options.hostVersion;
     }
     build(input) {
         const state = createSnapshotBuildState(input.reservations);
-        appendOfficialPackages(input.officialPackages, state);
-        appendLocalPackages(input, state);
+        appendOfficialPackages(input.officialPackages, state, this.options);
+        appendLocalPackages(input, state, this.options);
         const allocated = this.names.assignServers([
             ...input.reservations.mcpServerNames.map((name) => ({
                 key: configuredMcpNameKey(name),
@@ -61,6 +68,7 @@ export class PluginSnapshotBuilder {
             runtimeToolBindings: freeze([]),
             hostBindings: freeze(state.hostBindings),
             hooks: freeze([...state.hooks]),
+            agents: freeze([...state.agents].sort((left, right) => left.scopedName.localeCompare(right.scopedName))),
         });
         return freeze({
             revision: input.revision,
@@ -110,16 +118,35 @@ function createSnapshotBuildState(reservations) {
         mcpServers: [],
         hooks: [],
         hostBindings: [],
+        agents: [],
         pluginNames: new Set(),
         skillNames: new Set(reservations.skillNames.map(normalizedSkillKey)),
     };
 }
-function appendOfficialPackages(packages, state) {
+/** True when the Host is a parsable release older than the package's `engines.mcode`. */
+export function withholdsMiniAppForHost(plugin, hostVersion) {
+    return hostWithholdsMiniApp(hostVersion, plugin.miniapp?.engines?.mcode);
+}
+/**
+ * Withholds the Mini App and the MCP servers it would have served when the Host is too old.
+ * The package stays installed and listed; the diagnostic is the only trace.
+ */
+function gateMiniAppEngines(plugin, options, diagnostics) {
+    if (!withholdsMiniAppForHost(plugin, options.hostVersion))
+        return plugin;
+    diagnostics.push(freeze({ code: 'MINIAPP_HOST_TOO_OLD', pluginName: plugin.name }));
+    const managed = new Set(plugin.miniapp?.mcpEndpoints.map(({ server }) => server));
+    const { miniapp, ...rest } = plugin;
+    void miniapp;
+    return { ...rest, mcpServers: rest.mcpServers.filter(({ name }) => !managed.has(name)) };
+}
+function appendOfficialPackages(packages, state, options) {
     const sorted = [...packages].sort((left, right) => collisionKey(left.plugin.name).localeCompare(collisionKey(right.plugin.name)) ||
         left.contentDigest.localeCompare(right.contentDigest));
     for (const entry of sorted) {
+        const plugin = gateMiniAppEngines(entry.plugin, options, state.diagnostics);
         const accepted = acceptPackageCapabilities({
-            plugin: entry.plugin,
+            plugin,
             packageContentDigest: entry.contentDigest,
             sourceKind: 'official',
             includeRuntimeCapabilities: true,
@@ -128,28 +155,28 @@ function appendOfficialPackages(packages, state) {
         if (!accepted)
             continue;
         state.officialPackages.push(freeze({
-            name: entry.plugin.name,
-            ...(entry.plugin.version ? { version: entry.plugin.version } : {}),
-            rootPath: entry.plugin.rootPath,
+            name: plugin.name,
+            ...(plugin.version ? { version: plugin.version } : {}),
+            rootPath: plugin.rootPath,
             contentDigest: entry.contentDigest,
-            ...(entry.plugin.miniapp ? { plugin: entry.plugin } : {}),
+            ...(plugin.miniapp ? { plugin } : {}),
         }));
-        state.enabledPlugins.push(enabledProjection(entry.plugin));
+        state.enabledPlugins.push(enabledProjection(plugin));
         state.skills.push(...accepted.skills);
         for (const skill of accepted.skills)
-            state.skillOwners.set(skill, entry.plugin.name);
+            state.skillOwners.set(skill, plugin.name);
         state.mcpServers.push(...accepted.mcpServers);
         state.hooks.push(...accepted.hooks);
         state.hostBindings.push(...accepted.hostBindings);
     }
 }
-function appendLocalPackages(input, state) {
+function appendLocalPackages(input, state, options) {
     const sorted = [...input.localPackages].sort((left, right) => normalizedPath(left.plugin.rootPath).localeCompare(normalizedPath(right.plugin.rootPath)));
     for (const entry of sorted)
-        appendLocalPlugin(entry, input.isLocalEnabled, state);
+        appendLocalPlugin(entry, input.isLocalEnabled, state, options);
 }
-function appendLocalPlugin(entry, isLocalEnabled, state) {
-    const { plugin } = entry;
+function appendLocalPlugin(entry, isLocalEnabled, state, options) {
+    const plugin = gateMiniAppEngines(entry.plugin, options, state.diagnostics);
     const enabled = isLocalEnabled(plugin.rootPath);
     if (state.pluginNames.has(collisionKey(plugin.name))) {
         state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NAME_CONFLICT', pluginName: plugin.name }));
@@ -164,14 +191,12 @@ function appendLocalPlugin(entry, isLocalEnabled, state) {
     });
     if (!accepted)
         return;
-    if (plugin.skills.length === 0 &&
-        plugin.mcpServers.length === 0 &&
-        (plugin.hooks?.length ?? 0) === 0 &&
-        !plugin.miniapp) {
+    // A package whose only capability is a withheld Mini App stays visible and uninstallable.
+    if (!hasSupportedLocalCapability(entry.plugin)) {
         state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NO_SUPPORTED_CAPABILITY', pluginName: plugin.name }));
         return;
     }
-    state.localPlugins.push(localProjection(plugin, entry.contentDigest, enabled));
+    state.localPlugins.push(localProjection(entry.plugin, plugin, entry.contentDigest, enabled));
     if (!enabled)
         return;
     state.enabledPlugins.push(enabledProjection(plugin));
@@ -181,8 +206,16 @@ function appendLocalPlugin(entry, isLocalEnabled, state) {
     state.mcpServers.push(...accepted.mcpServers);
     state.hooks.push(...accepted.hooks);
     state.hostBindings.push(...accepted.hostBindings);
+    state.agents.push(...accepted.agents);
 }
-function localProjection(plugin, contentDigest, enabled) {
+function hasSupportedLocalCapability(plugin) {
+    return (plugin.skills.length > 0 ||
+        plugin.mcpServers.length > 0 ||
+        (plugin.hooks?.length ?? 0) > 0 ||
+        (plugin.agents?.length ?? 0) > 0 ||
+        Boolean(plugin.miniapp));
+}
+function localProjection(authoredPlugin, plugin, contentDigest, enabled) {
     return freeze({
         name: plugin.name,
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
@@ -196,6 +229,7 @@ function localProjection(plugin, contentDigest, enabled) {
         source: plugin.source,
         enabled,
         plugin,
+        ...(authoredPlugin === plugin ? {} : { authoredPlugin }),
     });
 }
 function capabilityCollisionState(state) {
@@ -219,7 +253,7 @@ function acceptPackageCapabilities(input) {
     const pluginKey = collisionKey(plugin.name);
     input.pluginNames.add(pluginKey);
     if (!input.includeRuntimeCapabilities) {
-        return { skills: [], mcpServers: [], hooks: [], hostBindings: [] };
+        return { skills: [], mcpServers: [], hooks: [], hostBindings: [], agents: [] };
     }
     const skills = acceptPackageSkills(input);
     return {
@@ -227,6 +261,38 @@ function acceptPackageCapabilities(input) {
         mcpServers: acceptPackageServers(input),
         hooks: [...(plugin.hooks ?? [])],
         hostBindings: acceptHostBindings(input, skills),
+        agents: input.sourceKind === 'local' ? acceptPackageAgents(input) : [],
+    };
+}
+function acceptPackageAgents(input) {
+    return (input.plugin.agents ?? []).map((agent) => turnPluginAgent(input.plugin, input.packageContentDigest, agent));
+}
+function turnPluginAgent(plugin, packageDigest, agent) {
+    return freeze({
+        scopedName: agent.scopedName,
+        pluginName: plugin.name,
+        agentName: agent.name,
+        sourceFormat: agent.sourceFormat === 'MINIMAX' ? 'minimax' : '\u0063\u006c\u0061\u0075\u0064\u0065',
+        packageDigest,
+        pluginRoot: plugin.rootPath,
+        description: agent.description,
+        ...(agent.displayName ? { displayName: agent.displayName } : {}),
+        systemPrompt: agent.systemPrompt,
+        ...(agent.model ? { model: agent.model } : {}),
+        ...(agent.effort ? { effort: agent.effort } : {}),
+        ...(agent.contextWindow === undefined ? {} : { contextWindow: agent.contextWindow }),
+        ...(agent.maxOutputTokens === undefined ? {} : { maxOutputTokens: agent.maxOutputTokens }),
+        ...turnPluginAgentSelectors(agent),
+        declaredMcpServers: freeze(plugin.mcpServers.map((server) => server.name)),
+    });
+}
+function turnPluginAgentSelectors(agent) {
+    return {
+        ...(agent.tools === undefined ? {} : { tools: agent.tools }),
+        ...(agent.disallowedTools === undefined ? {} : { disallowedTools: agent.disallowedTools }),
+        ...(agent.mcpServers === undefined ? {} : { mcpServers: agent.mcpServers }),
+        ...(agent.skills === undefined ? {} : { skills: agent.skills }),
+        ...(agent.extensionSkills === undefined ? {} : { extensionSkills: agent.extensionSkills }),
     };
 }
 function acceptHostBindings(input, acceptedSkills) {

@@ -7,7 +7,7 @@ import fs from "fs";
 import { app, BrowserWindow, session, ipcMain } from "electron";
 import electronStore from "electron-store";
 import { isProd, isStaging, isTest, isDev, isZh, LOCALE, isEn } from "../config/env";
-import { SHORTCUT_KEYS, DEFAULT_SHORTCUT, IPC_CHANNELS } from "../config/constants";
+import { IPC_CHANNELS, SHORTCUT_KEYS } from "../config/constants";
 import { setLocalRuntimeAuthContext, setLocalRuntimeContextWindowUsageEnabled, syncLocalRuntimeAuthContext } from "../modules/local-runtime";
 import { logger } from "../utils";
 import { scheduleMcodeToolsAuthorization, clearMcodeToolsAuthorization } from "../modules/mcode-tools";
@@ -65,10 +65,9 @@ function getDefaultLanguage() {
     // 其他情况使用构建时的语言环境
     return LOCALE;
 }
+const LEGACY_MINI_CHAT_SHORTCUT = 'Alt+A';
 export function getDefaultShortcut() {
-    return {
-        [SHORTCUT_KEYS.MINI_CHAT_CREATE]: DEFAULT_SHORTCUT.MINI_CHAT_CREATE,
-    };
+    return {};
 }
 const defaultConfig = {
     language: getDefaultLanguage(),
@@ -86,8 +85,10 @@ const defaultConfig = {
     codeFontSize: DEFAULT_DESKTOP_TYPOGRAPHY.codeFontSize,
     appearance: DEFAULT_DESKTOP_APPEARANCE_STATE,
     plainTextEditorEnabled: true,
+    activityGroupsExpandedByDefault: false,
     globalAccessShortcut: getDefaultShortcut(),
     shortcutOverrides: {},
+    shortcutsEnabled: true,
     developerOptions: {
         enabled: true,
         autoOpenNativeDevTools: false,
@@ -118,6 +119,7 @@ const store = new electronStore({
         localStorageConfig: defaultLocalStorageConfig,
         tokens: {},
         mainWindowState: null,
+        miniAppWindowBounds: {},
     },
 });
 let appearanceSyncRevision = 0;
@@ -141,6 +143,22 @@ export function getStoredMainWindowState() {
  */
 export function setStoredMainWindowState(state) {
     store.set('mainWindowState', state);
+}
+/**
+ * 读取某个 pluginId 上次弹出窗口的屏幕 bounds（未记录时为 null）。
+ * 返回原始值，由调用方负责校验与"是否落在可见屏幕内"的兜底。
+ */
+export function getStoredMiniAppWindowBounds(pluginId) {
+    const all = store.get('miniAppWindowBounds') || {};
+    return all[pluginId] ?? null;
+}
+/**
+ * 记录某个 pluginId 上次弹出窗口的屏幕 bounds。按 pluginId 覆盖写入，
+ * 不影响其它 pluginId 的记忆。
+ */
+export function setStoredMiniAppWindowBounds(pluginId, bounds) {
+    const all = store.get('miniAppWindowBounds') || {};
+    store.set('miniAppWindowBounds', { ...all, [pluginId]: bounds });
 }
 /**
  * 获取 tokens
@@ -352,7 +370,7 @@ export function getDesktopConfig() {
                 [SHORTCUT_KEYS.MINI_CHAT_TOGGLE]: null,
             };
         }
-        else if (legacyMiniChat === DEFAULT_SHORTCUT.MINI_CHAT_CREATE) {
+        else if (legacyMiniChat === LEGACY_MINI_CHAT_SHORTCUT) {
             config.shortcutOverrides = {};
         }
         else {
@@ -360,6 +378,12 @@ export function getDesktopConfig() {
                 [SHORTCUT_KEYS.MINI_CHAT_TOGGLE]: legacyMiniChat,
             };
         }
+        changed = true;
+    }
+    // Retire the old default while retaining explicitly customized bindings.
+    if (!Object.prototype.hasOwnProperty.call(config.shortcutOverrides, SHORTCUT_KEYS.MINI_CHAT_TOGGLE) &&
+        config.globalAccessShortcut[SHORTCUT_KEYS.MINI_CHAT_CREATE] === LEGACY_MINI_CHAT_SHORTCUT) {
+        delete config.globalAccessShortcut[SHORTCUT_KEYS.MINI_CHAT_CREATE];
         changed = true;
     }
     /** 确保 scheduleNotification 有默认值，或者目录不存在时重新创建 */
@@ -386,6 +410,10 @@ export function getDesktopConfig() {
     }
     if (typeof config.plainTextEditorEnabled !== 'boolean') {
         config.plainTextEditorEnabled = true;
+    }
+    if (typeof config.activityGroupsExpandedByDefault !== 'boolean') {
+        config.activityGroupsExpandedByDefault = defaultConfig.activityGroupsExpandedByDefault;
+        changed = true;
     }
     if (typeof config.fileLineWrapEnabled !== 'boolean') {
         config.fileLineWrapEnabled = defaultConfig.fileLineWrapEnabled;
@@ -471,9 +499,11 @@ export function clearDesktopConfig() {
         codeFontSize: current.codeFontSize ?? defaultConfig.codeFontSize,
         appearance: current.appearance ?? defaultConfig.appearance,
         plainTextEditorEnabled: current.plainTextEditorEnabled ?? true,
+        activityGroupsExpandedByDefault: current.activityGroupsExpandedByDefault ?? defaultConfig.activityGroupsExpandedByDefault,
         fileOpenInNewTabEnabled: current.fileOpenInNewTabEnabled ?? defaultConfig.fileOpenInNewTabEnabled,
         globalAccessShortcut: current.globalAccessShortcut ?? defaultConfig.globalAccessShortcut,
         shortcutOverrides: current.shortcutOverrides ?? defaultConfig.shortcutOverrides,
+        shortcutsEnabled: current.shortcutsEnabled ?? defaultConfig.shortcutsEnabled,
         loginItemInitialized: current.loginItemInitialized,
         workingDirectory: current.workingDirectory ?? defaultConfig.workingDirectory,
         swimLaneName: current.swimLaneName ?? defaultConfig.swimLaneName,

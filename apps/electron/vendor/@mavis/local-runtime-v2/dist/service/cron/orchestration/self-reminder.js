@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { formatSelfReminderName } from '@mavis/shared/cron-purpose';
 import { CronRepositoryError } from '../errors.js';
 import { assertCronContentSafe } from './content-safety.js';
 export function createSelfReminderService(deps) {
@@ -31,7 +32,7 @@ export function createSelfReminderService(deps) {
             const definition = deps.lifecycle.create({
                 cronId,
                 agentName: command.agentName,
-                name: `Task follow-up (${cronId.slice(-8)})`,
+                name: formatSelfReminderName(cronId),
                 prompt: `${command.prompt.trim()}\n\nOnly report meaningful progress, completion, failure or required user action.`,
                 schedule: { kind: 'once', runAtMs },
                 sessionTarget: { mode: 'sessionId', sessionId: command.sessionId },

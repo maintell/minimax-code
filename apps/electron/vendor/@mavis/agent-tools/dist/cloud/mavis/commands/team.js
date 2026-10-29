@@ -314,9 +314,10 @@ export const handleTeamPlanDecision = async (ctx, args) => {
     const ownerErr = checkOwner(ctx, args.plan_id, rt.runtime, session.sessionId);
     if (ownerErr)
         return ownerErr;
-    const validated = DecisionSchema.safeParse(args.decision);
+    const decision = normalizeTeamDecision(args.decision);
+    const validated = DecisionSchema.safeParse(decision);
     if (!validated.success) {
-        const hint = buildDecisionValidationHint(args.plan_id, args.decision);
+        const hint = buildDecisionValidationHint(args.plan_id, decision);
         return failure(ctx.command, 'validation', `invalid decision: ${validated.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')}\n\n${hint}`, { issues: validated.error.issues, hint });
     }
     try {
@@ -329,6 +330,115 @@ export const handleTeamPlanDecision = async (ctx, args) => {
         });
     }
 };
+/**
+ * Repairs the shapes some model tool-call decoders produce for the nested
+ * decision payload: the whole body as a JSON string, arrays wrapped as
+ * `{"item": [...]}` / `{"item": {...}}`, collapsed into index-keyed objects
+ * (`{"0": {...}}`) or a lone item object, and booleans / numbers as strings. Anything it cannot repair is returned unchanged so
+ * `DecisionSchema` still reports the real problem.
+ */
+export function normalizeTeamDecision(value) {
+    const decision = parseJsonText(value);
+    if (!isPlainObject(decision))
+        return decision;
+    const out = { ...decision };
+    if ('last_cycle' in out) {
+        out.last_cycle = mapArray(normalizeArray(out.last_cycle), parseJsonText);
+    }
+    if ('next_cycle' in out) {
+        out.next_cycle = mapArray(normalizeArray(out.next_cycle), normalizeNextCycleTask);
+    }
+    if ('plan_complete' in out)
+        out.plan_complete = normalizeBoolean(out.plan_complete);
+    return out;
+}
+function normalizeNextCycleTask(value) {
+    const task = parseJsonText(value);
+    if (!isPlainObject(task))
+        return task;
+    const out = { ...task };
+    if (typeof out.verified_by === 'string' && out.verified_by.trim().startsWith('[')) {
+        out.verified_by = parseJsonText(out.verified_by);
+    }
+    else if (isIndexKeyedObject(out.verified_by)) {
+        out.verified_by = normalizeArray(out.verified_by);
+    }
+    else if (isPlainObject(out.verified_by) && Object.keys(out.verified_by).length === 1) {
+        const inner = Object.values(out.verified_by)[0];
+        if (Array.isArray(inner))
+            out.verified_by = inner;
+        else if (typeof inner === 'string')
+            out.verified_by = [inner];
+    }
+    if (typeof out.verify_prompt === 'string') {
+        const parsed = parseJsonText(out.verify_prompt);
+        if (isPlainObject(parsed) && Object.values(parsed).every((v) => typeof v === 'string')) {
+            out.verify_prompt = parsed;
+        }
+    }
+    if (typeof out.timeout_ms === 'string' && out.timeout_ms.trim() !== '') {
+        const parsed = Number(out.timeout_ms.trim());
+        if (Number.isInteger(parsed))
+            out.timeout_ms = parsed;
+    }
+    return out;
+}
+function normalizeArray(value) {
+    const parsed = parseJsonText(value);
+    if (Array.isArray(parsed) || !isPlainObject(parsed))
+        return parsed;
+    if (Object.keys(parsed).length === 0)
+        return [];
+    if (isIndexKeyedObject(parsed)) {
+        return Object.keys(parsed)
+            .sort((a, b) => Number(a) - Number(b))
+            .map((key) => parsed[key]);
+    }
+    if ('task_id' in parsed)
+        return [parsed];
+    const entries = Object.values(parsed);
+    if (entries.length === 1 && Array.isArray(entries[0]))
+        return entries[0];
+    if (entries.length === 1 && isPlainObject(entries[0]) && 'task_id' in entries[0]) {
+        return [entries[0]];
+    }
+    return parsed;
+}
+function mapArray(value, fn) {
+    return Array.isArray(value) ? value.map(fn) : value;
+}
+function normalizeBoolean(value) {
+    if (typeof value !== 'string')
+        return value;
+    const text = value.trim().toLowerCase();
+    if (text === 'true')
+        return true;
+    if (text === 'false')
+        return false;
+    return value;
+}
+function parseJsonText(value) {
+    if (typeof value !== 'string')
+        return value;
+    const text = value.trim();
+    if (!text.startsWith('{') && !text.startsWith('['))
+        return value;
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return value;
+    }
+}
+function isPlainObject(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function isIndexKeyedObject(value) {
+    if (!isPlainObject(value))
+        return false;
+    const keys = Object.keys(value);
+    return keys.length > 0 && keys.every((key) => /^\d+$/.test(key));
+}
 function buildDecisionValidationHint(planId, decision) {
     const problems = [];
     const d = decision;

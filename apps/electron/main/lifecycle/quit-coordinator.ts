@@ -1,4 +1,5 @@
 const RENDERER_ACK_TIMEOUT_MS = 12000;
+const UPDATE_WINDOW_CLOSE_TIMEOUT_MS = 12000;
 const CLEANUP_CUTOFF_MS = 16000;
 export let INSTALLER_HANDOFF_TIMEOUT_MS = 30000;
 // Best-effort budget for flushing buffered logs before a terminal exit. Kept
@@ -138,6 +139,7 @@ export class QuitCoordinator {
             this.logError('Lifecycle beforeQuit hooks failed', error);
         }
         this.armRendererAckTimer();
+        this.armUpdateWindowCloseTimer();
     }
     confirmRendererQuit() {
         this.completeRendererAck('confirmed');
@@ -330,9 +332,58 @@ export class QuitCoordinator {
             this.logWarn('Failed to clear the renderer quit acknowledgement timer', error);
         }
     }
+    armUpdateWindowCloseTimer() {
+        // Only an explicitly requested update may force windows closed. A normal
+        // quit can also resolve to an install plan (silent update on exit).
+        if (this.owned?.intent !== 'install-update' || this.owned.plan.kind !== 'install')
+            return;
+        if (this.cleanupPromise || this.terminalStarted)
+            return;
+        try {
+            this.updateWindowCloseTimer = this.dependencies.timers.setTimeout(() => this.forceCloseUpdateWindows(), UPDATE_WINDOW_CLOSE_TIMEOUT_MS);
+        }
+        catch (error) {
+            this.logError('Failed to arm the update window close timeout', error);
+            this.forceCloseUpdateWindows();
+        }
+    }
+    forceCloseUpdateWindows() {
+        if (this.cleanupPromise || this.terminalStarted)
+            return;
+        this.updateWindowCloseTimer = undefined;
+        this.logWarn(`Update windows did not close within ${UPDATE_WINDOW_CLOSE_TIMEOUT_MS}ms; forcing close`);
+        if (this.rendererAckPending) {
+            this.rendererAckOutcome = 'timed-out';
+            this.rendererAckPending = false;
+            this.recordRendererAckDuration();
+            this.clearRendererAckTimer();
+        }
+        try {
+            this.dependencies.window.destroyAll();
+        }
+        catch (error) {
+            this.logError('Failed to force update windows closed', error);
+        }
+        // A cancelled BrowserWindow.close() may have already aborted app.quit().
+        // Destroying the window need not emit will-quit, so advance explicitly.
+        this.startCleanup();
+    }
+    clearUpdateWindowCloseTimer() {
+        if (this.updateWindowCloseTimer === undefined)
+            return;
+        const timer = this.updateWindowCloseTimer;
+        this.updateWindowCloseTimer = undefined;
+        try {
+            this.dependencies.timers.clearTimeout(timer);
+        }
+        catch (error) {
+            this.logWarn('Failed to clear the update window close timeout', error);
+        }
+    }
     startCleanup() {
         if (this.cleanupPromise)
             return;
+        this.clearUpdateWindowCloseTimer();
         const completion = deferred();
         this.cleanupPromise = completion.promise;
         void this.executeCleanup().then(() => completion.resolve(), (error) => {
@@ -453,6 +504,21 @@ export class QuitCoordinator {
         }
     }
     startInstallerHandoff(plan) {
+        this.logInstallerDiagnostic('Installer handoff starting', {
+            installer_path: plan.installerPath,
+            is_silent: plan.isSilent,
+            force_run_after: plan.isForceRunAfter,
+            cleanup_outcome: this.cleanupOutcome,
+            cleanup_aborted: this.cleanupSummary?.aborted,
+            unfinished_init_owners: this.cleanupSummary?.unfinishedInitOwners,
+            unfinished_dispose_owners: this.cleanupSummary?.unfinishedDisposeOwners,
+            cleanup_results: this.cleanupSummary?.results.map(({ name, status, durationMs }) => ({
+                name,
+                status,
+                duration_ms: durationMs,
+            })),
+            renderer_ack: this.rendererAckOutcome,
+        });
         this.installerHandoffStartedAtMs = this.now();
         try {
             this.installerHandoffTimer = this.dependencies.timers.setTimeout(() => this.failInstallerHandoff(plan, 'timeout'), INSTALLER_HANDOFF_TIMEOUT_MS);
@@ -534,6 +600,10 @@ export class QuitCoordinator {
     }
     observeInstallerHandoff(outcome) {
         const startedAtMs = this.installerHandoffStartedAtMs ?? this.now();
+        this.logInstallerDiagnostic('Installer handoff result (not installation result)', {
+            outcome,
+            duration_ms: Math.max(0, this.now() - startedAtMs),
+        });
         try {
             this.dependencies.observeInstallerHandoff?.({
                 outcome,
@@ -546,6 +616,19 @@ export class QuitCoordinator {
     }
     now() {
         return this.dependencies.now?.() ?? Date.now();
+    }
+    logInstallerDiagnostic(message, fields) {
+        try {
+            this.dependencies.logger.info?.({
+                app_instance_id: this.dependencies.appInstanceId,
+                ts_ms: this.now(),
+                pid: process.pid,
+                ...fields,
+            }, `[QuitCoordinator] ${message}`);
+        }
+        catch {
+            // Diagnostic failures must not change the installer handoff.
+        }
     }
     settleOwned(terminalOutcome) {
         if (!this.owned || this.owned.settled)

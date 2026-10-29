@@ -1,15 +1,13 @@
 import { HTTPException } from 'hono/http-exception';
-import { DesktopWorkspaceFileServiceBase } from './desktop-workspace-file-service.js';
+import { DesktopHookServiceBase } from './desktop-hook-service-base.js';
 import { getSessionFilesService } from '../session-assets/session-files-service.js';
 import { getSessionInputSummaryService, SessionInputSummaryNotFoundError, SessionInputSummaryValidationError, } from '../session-navigation/service.js';
-import { getConfig } from '@mavis/config';
 import { CronContractError, assertCronName, assertSchedulable, createCronReqToConfig, cronStateToCronTask, toCronContractError, updateCronReqToConfigUpdate, } from '../cron/contract.js'; // desktop-service-boundary-skip: anchor=server-cron-contract owner=cron reason=legacy-cron-rpc-glue-before-facade; followup=desktop-service-domain-facades
 import { createStoredCronTask, deleteStoredCronTask, getStoredCronTask, listStoredCronTasks, updateStoredCronTask, } from '../cron/index.js';
-import { ThreadGoalContractError, createGoalReqToCreateInput, goalStateToGoalState, patchGoalReqToPatchInput, toThreadGoalContractError, } from '../thread-goal/contract.js'; // desktop-service-boundary-skip: anchor=server-goal-contract owner=thread-goal reason=legacy-goal-rpc-glue-before-facade; followup=desktop-service-domain-facades
 import { LocalAgentContractError } from '../agent/contract.js';
 import { LocalProjectContractError } from '../project/index.js';
 import { cronReviewBlocks } from '../content-safety/cron-fields.js';
-import { jsonError, requireSessionId, toCronSessionStatusLabel, } from './desktop-service-support.js';
+import { jsonError, toCronSessionStatusLabel, } from './desktop-service-support.js';
 import { DesktopEchoService } from './desktop-echo-service.js';
 import { DesktopPinService } from './desktop-pin-service.js';
 import { DesktopModelProviderService, } from './desktop-model-provider-service.js';
@@ -24,7 +22,10 @@ import { DesktopGlobalEventsService, } from './desktop-global-events-service.js'
  * Cron 写入端。
  */
 function cronV2Unsupported(method) {
-    return new CronContractError(501, `Cron v2 method ${method} is served by the local-runtime-v2 front door`, 'CRON_V2_UNSUPPORTED_ON_LEGACY_HOST');
+    return new HTTPException(501, {
+        res: jsonError(501, `Cron v2 method ${method} is not supported on this runtime host. ` +
+            'Use a Desktop host with the Cron scheduler. Do not retry on this host.', 'CRON_V2_UNSUPPORTED_ON_LEGACY_HOST'),
+    });
 }
 /**
  * v1 宿主不持有 LLM Context Inspector。capture、Session 文件历史与全局设置都属于
@@ -58,14 +59,23 @@ function pageCronSessions(items, cursor, limit) {
 function safeSessionMutationError(error) {
     return { name: error instanceof Error ? error.name : 'UnknownError' };
 }
-export class DesktopService extends DesktopWorkspaceFileServiceBase {
-    cron;
-    goal;
-    skills;
-    agents;
-    project;
-    metricsClient;
-    sessionMutationEvents;
+export class DesktopService extends DesktopHookServiceBase {
+    dependencies;
+    async listBackgroundTasks() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async getBackgroundTask() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async readBackgroundTaskOutput() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async stopBackgroundTask() {
+        throw new Error('Background task API requires Runtime V2');
+    }
+    async deleteBackgroundTask() {
+        throw new Error('Background task API requires Runtime V2');
+    }
     echoService = new DesktopEchoService();
     sessionService;
     permissionService;
@@ -73,20 +83,13 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
     modelProviderService;
     reviewService;
     globalEventsService;
-    constructor(cron, goal, skills, memory, agents, permission, pin, project, questionnaire, modelProvider, metricsClient, sessionMutationEvents, review, _reservedV2GlobalInstructionsSlot, globalEvents, _retiredMcp, _reservedV2WorkspaceIndexingSlot) {
-        void _reservedV2GlobalInstructionsSlot;
-        void _reservedV2WorkspaceIndexingSlot;
+    constructor(dependencies = {}) {
+        const { memory, questionnaire, agents, permission, pin, modelProvider, metricsClient, review, globalEvents, } = dependencies;
         // Desktop transport stays a consumer of the explicitly injected V2 agent
         // port.  Channel, memory, and questionnaire adapters only need the
         // resolver slice; they must never reconstruct a legacy AgentService.
         super(memory, questionnaire, agents?.service);
-        this.cron = cron;
-        this.goal = goal;
-        this.skills = skills;
-        this.agents = agents;
-        this.project = project;
-        this.metricsClient = metricsClient;
-        this.sessionMutationEvents = sessionMutationEvents;
+        this.dependencies = dependencies;
         this.sessionService = new DesktopSessionService(this.localApiJson.bind(this), this.localApiResponse.bind(this), metricsClient);
         this.permissionService = permission ? new DesktopPermissionService(permission) : undefined;
         this.pinService = new DesktopPinService(pin);
@@ -378,7 +381,7 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
         const operation = req.pinned ? 'pin' : 'unpin';
         return this.runSessionMutation(operation, req.sessionId, 'session.pinned_updated', async (startedAt) => {
             const resp = await this.pinService.pinSession(...args);
-            this.publishSessionMutationEvent(operation, req.sessionId, 'session.pinned_updated', startedAt, () => this.sessionMutationEvents?.pinnedUpdated({
+            this.publishSessionMutationEvent(operation, req.sessionId, 'session.pinned_updated', startedAt, () => this.dependencies.sessionMutationEvents?.pinnedUpdated({
                 sessionId: req.sessionId,
                 ...(resp.item?.session?.agentName ? { agentName: resp.item.session.agentName } : {}),
                 pinned: req.pinned,
@@ -410,6 +413,12 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
         void ctx;
         void req;
         return this.unimplementedGeneratedMethod('putWorkspaceIndexingPreference');
+    }
+    getComputerUseDefaultPreference(..._args) {
+        return this.unimplementedGeneratedMethod('getComputerUseDefaultPreference');
+    }
+    putComputerUseDefaultPreference(..._args) {
+        return this.unimplementedGeneratedMethod('putComputerUseDefaultPreference');
     }
     prewarmWorkspaceIndexing(ctx, req) {
         void ctx;
@@ -509,7 +518,7 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
     async updateSession(...args) {
         const req = args[1];
         const title = req.title;
-        const publishTitleUpdated = this.sessionMutationEvents?.titleUpdated;
+        const publishTitleUpdated = this.dependencies.sessionMutationEvents?.titleUpdated;
         if (!publishTitleUpdated)
             return this.sessionService.updateSession(...args);
         return this.runSessionMutation('rename', req.id, title !== undefined ? 'session.title_updated' : undefined, async (startedAt) => {
@@ -554,7 +563,7 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
     }
     async deleteSession(...args) {
         const sessionId = args[1].id;
-        const publishDeleted = this.sessionMutationEvents?.deleted;
+        const publishDeleted = this.dependencies.sessionMutationEvents?.deleted;
         if (!publishDeleted) {
             const resp = await this.sessionService.deleteSession(...args);
             await this.pinService.removePinnedSession(sessionId);
@@ -583,6 +592,16 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
     }
     getMessages(...args) {
         return this.sessionService.getMessages(...args);
+    }
+    // SideChat 仅由 Local Runtime v2 实现；旧 host 保持 fail closed。
+    createSideChat(..._args) {
+        return this.unimplementedGeneratedMethod('CreateSideChat');
+    }
+    createSideChatFromQueue(..._args) {
+        return this.unimplementedGeneratedMethod('CreateSideChatFromQueue');
+    }
+    promoteSideChat(..._args) {
+        return this.unimplementedGeneratedMethod('PromoteSideChat');
     }
     // Session fork, rewind, and message editing are owned by Local Runtime v2.
     // Legacy-only hosts expose the generated routes and fail closed here rather
@@ -660,9 +679,16 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
             res: jsonError(501, 'Turn continuation requires local-runtime-v2.', 'TURN_CONTINUATION_UNSUPPORTED'),
         });
     }
+    async getSessionActivity() {
+        throw new HTTPException(501, {
+            res: jsonError(501, 'Session activity requires local-runtime-v2.', 'SESSION_ACTIVITY_UNSUPPORTED'),
+        });
+    }
     abortSession(...args) {
         return this.sessionService.abortSession(...args);
     }
+    cancelPromptSuggestion = () => this.unimplementedGeneratedMethod('CancelPromptSuggestion');
+    getPromptSuggestion = () => this.unimplementedGeneratedMethod('GetPromptSuggestion');
     listQueueMessages(...args) {
         return this.sessionService.listQueueMessages(...args);
     }
@@ -697,6 +723,12 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
         return this.sessionService.reapplyTurnDiff(...args);
     }
     // ─── permission (local ask-UI bus; thin adapter over the legacy routes) ──
+    getPermissionMode(_ctx, _req) {
+        return this.unimplementedGeneratedMethod('getPermissionMode');
+    }
+    setPermissionMode(_ctx, _req) {
+        return this.unimplementedGeneratedMethod('setPermissionMode');
+    }
     replyPermission(ctx, req) {
         return this.requirePermission().replyPermission(ctx, req);
     }
@@ -948,6 +980,12 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
     discardLegacyMemoryMigration(_ctx, _req) {
         return this.unimplementedGeneratedMethod('DiscardLegacyMemoryMigration');
     }
+    getMemoryV2Onboarding(_ctx, _req) {
+        return this.unimplementedGeneratedMethod('GetMemoryV2Onboarding');
+    }
+    completeMemoryV2Onboarding(_ctx, _req) {
+        return this.unimplementedGeneratedMethod('CompleteMemoryV2Onboarding');
+    }
     getSandboxStatus = sandboxUnsupported('getSandboxStatus');
     putSandboxConfig = sandboxUnsupported('putSandboxConfig');
     getSandboxViolations = sandboxUnsupported('getSandboxViolations');
@@ -961,78 +999,18 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
             error: 'Cron delivery is served by the local-runtime-v2 front door',
         };
     }
-    async createGoal(ctx, req) {
-        void ctx;
-        return this.mapGoalErrors(async () => {
-            const goal = this.requireGoal();
-            await this.assertGoalSessionMutable(req.sessionId);
-            const goalConfig = getConfig().goal;
-            const input = createGoalReqToCreateInput(req, goalConfig.objectiveMaxChars === undefined
-                ? {}
-                : { objectiveMaxChars: goalConfig.objectiveMaxChars });
-            const created = await goal.createGoal(input);
-            return { goal: goalStateToGoalState(created) };
-        });
-    }
-    async getGoal(ctx, req) {
-        void ctx;
-        const goal = this.requireGoal();
-        return this.mapGoalErrors(async () => {
-            const sessionId = requireSessionId(req.sessionId);
-            // Keep HTTP glue free of timing arithmetic: Thread Goal owns how a
-            // persisted row is projected while the local-runtime turn is live.
-            const state = goal.getBySessionForResponse
-                ? await goal.getBySessionForResponse(sessionId)
-                : await goal.store.getBySession(sessionId);
-            return state ? { goal: goalStateToGoalState(state) } : {};
-        });
-    }
-    async patchGoal(ctx, req) {
-        void ctx;
-        const goal = this.requireGoal();
-        return this.mapGoalErrors(async () => {
-            const sessionId = requireSessionId(req.sessionId);
-            const existing = await goal.store.getBySession(sessionId);
-            if (!existing)
-                throw this.goalNotFound(sessionId);
-            await this.assertGoalSessionMutable(sessionId);
-            const goalConfig = getConfig().goal;
-            const { patch, hasChange, isUserPause } = patchGoalReqToPatchInput(req, goalConfig.objectiveMaxChars === undefined
-                ? {}
-                : { objectiveMaxChars: goalConfig.objectiveMaxChars });
-            if (!hasChange) {
-                throw new ThreadGoalContractError(400, 'PATCH body must include status, objective, or token_budget.', 'VALIDATION_ERROR');
-            }
-            // Route on the caller's intent, not on the patch's field shape: an
-            // explicit user pause is an atomic lifecycle transition, not a field
-            // update that happens to set `status`.
-            const goalForResponse = isUserPause
-                ? await goal.pauseGoalByUser(sessionId)
-                : await goal.patchGoal(sessionId, patch);
-            if (!goalForResponse)
-                throw this.goalNotFound(sessionId);
-            return { goal: goalStateToGoalState(goalForResponse) };
-        });
-    }
-    async deleteGoal(ctx, req) {
-        void ctx;
-        const goal = this.requireGoal();
-        return this.mapGoalErrors(async () => {
-            const sessionId = requireSessionId(req.sessionId);
-            const existing = await goal.store.getBySession(sessionId);
-            if (!existing)
-                return { success: true };
-            await this.assertGoalSessionMutable(sessionId);
-            await goal.deleteGoal(sessionId);
-            return { success: true };
-        });
-    }
+    // Goal is owned by the local-runtime-v2 Goal service and served by its front door.
+    createGoal = () => this.unimplementedGeneratedMethod('createGoal');
+    getGoal = () => this.unimplementedGeneratedMethod('getGoal');
+    patchGoal = () => this.unimplementedGeneratedMethod('patchGoal');
+    deleteGoal = () => this.unimplementedGeneratedMethod('deleteGoal');
+    dismissGoal = () => this.unimplementedGeneratedMethod('dismissGoal');
     // ─── channel (desktop/local-runtime only) ────────────────────────────────
     // The channel handlers + their local-API dispatch helpers live in
     // DesktopChannelServiceBase (./desktop-channel-service.js). This concrete
     // service only supplies the host's local-API route.
     getLocalApiRoute() {
-        return this.cron?.routeLocalApiRequest;
+        return this.dependencies.cron?.routeLocalApiRequest;
     }
     listSkills = () => this.unimplementedGeneratedMethod('listSkills');
     listSkillHub = () => this.unimplementedGeneratedMethod('listSkillHub');
@@ -1058,52 +1036,13 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
     requestSkillEvolveScan = () => this.unimplementedGeneratedMethod('requestSkillEvolveScan');
     revertSkillEvolve = () => this.unimplementedGeneratedMethod('revertSkillEvolve');
     mutateSkillEvolveLifecycle = () => this.unimplementedGeneratedMethod('mutateSkillEvolveLifecycle');
-    requireGoal() {
-        if (!this.goal) {
-            throw new HTTPException(503, {
-                res: jsonError(503, 'Thread goal store is not available', 'GOAL_UNAVAILABLE'),
-            });
-        }
-        if (this.goal.isEnabled?.() === false) {
-            throw new HTTPException(403, {
-                res: jsonError(403, 'Thread Goal is disabled', 'GOAL_DISABLED'),
-            });
-        }
-        return this.goal;
-    }
-    async assertGoalSessionMutable(sessionId) {
-        const hook = this.goal?.isReadOnlyLegacySession;
-        if (hook && (await hook(sessionId))) {
-            throw new HTTPException(409, {
-                res: jsonError(409, 'Legacy opencode sessions are read-only in clean local-runtime mode.', 'read_only_legacy_session'),
-            });
-        }
-    }
-    goalNotFound(sessionId) {
-        return new HTTPException(404, {
-            res: jsonError(404, `Goal not found for session: ${sessionId}`, 'GOAL_NOT_FOUND'),
-        });
-    }
-    async mapGoalErrors(fn) {
-        try {
-            return await fn();
-        }
-        catch (err) {
-            if (err instanceof HTTPException)
-                throw err;
-            const mapped = toThreadGoalContractError(err);
-            throw new HTTPException(mapped.status, {
-                res: jsonError(mapped.status, mapped.message, mapped.code),
-            });
-        }
-    }
     requireCron() {
-        if (!this.cron) {
+        if (!this.dependencies.cron) {
             throw new HTTPException(503, {
                 res: jsonError(503, 'Cron runtime is not available', 'CRON_UNAVAILABLE'),
             });
         }
-        return this.cron;
+        return this.dependencies.cron;
     }
     isCronConsumerEnabled(cron) {
         // Older unit-test/runtime mocks predate `cronConsumerEnabled`; preserve the
@@ -1115,12 +1054,12 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
         return (_ctx, _req) => this.rejectChannel();
     }
     requireAgents() {
-        if (!this.agents) {
+        if (!this.dependencies.agents) {
             throw new HTTPException(503, {
                 res: jsonError(503, 'Desktop agent service is not configured', 'AGENT_UNAVAILABLE'),
             });
         }
-        return this.agents;
+        return this.dependencies.agents;
     }
     requirePermission() {
         if (!this.permissionService) {
@@ -1146,12 +1085,12 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
         }
     }
     requireProject() {
-        if (!this.project) {
+        if (!this.dependencies.project) {
             throw new HTTPException(503, {
                 res: jsonError(503, 'Desktop project service is not configured', 'PROJECT_UNAVAILABLE'),
             });
         }
-        return this.project;
+        return this.dependencies.project;
     }
     async mapProjectErrors(fn) {
         try {
@@ -1172,7 +1111,7 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
         const startedAt = Date.now();
         try {
             const result = await run(startedAt);
-            if (eventType === undefined && this.sessionMutationEvents) {
+            if (eventType === undefined && this.dependencies.sessionMutationEvents) {
                 logger.info({
                     component: 'desktop_session_mutation',
                     operation,
@@ -1183,7 +1122,7 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
                     duration_ms: Date.now() - startedAt,
                     reason: 'no_title',
                 }, 'desktop session mutation committed without an event');
-                this.metricsClient?.counter('session_mutation_event_total', 1, {
+                this.dependencies.metricsClient?.counter('session_mutation_event_total', 1, {
                     operation,
                     status: 'skipped',
                 });
@@ -1202,7 +1141,7 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
                 error_code: 'SESSION_MUTATION_FAILED',
                 err: safeSessionMutationError(error),
             }, 'desktop session mutation failed before event publication');
-            this.metricsClient?.counter('session_mutation_event_total', 1, {
+            this.dependencies.metricsClient?.counter('session_mutation_event_total', 1, {
                 operation,
                 status: 'mutation_failed',
             });
@@ -1210,11 +1149,11 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
         }
     }
     publishSessionMutationEvent(operation, sessionId, eventType, mutationStartedAt, publish) {
-        if (!this.sessionMutationEvents)
+        if (!this.dependencies.sessionMutationEvents)
             return;
         try {
             publish();
-            this.metricsClient?.counter('session_mutation_event_total', 1, {
+            this.dependencies.metricsClient?.counter('session_mutation_event_total', 1, {
                 operation,
                 status: 'emitted',
             });
@@ -1229,7 +1168,7 @@ export class DesktopService extends DesktopWorkspaceFileServiceBase {
             }, 'desktop session mutation event emitted');
         }
         catch (error) {
-            this.metricsClient?.counter('session_mutation_event_total', 1, {
+            this.dependencies.metricsClient?.counter('session_mutation_event_total', 1, {
                 operation,
                 status: 'emit_failed',
             });

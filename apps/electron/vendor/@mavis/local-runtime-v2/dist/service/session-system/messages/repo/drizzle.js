@@ -3,7 +3,7 @@ import { runWithWriteLock, WriteLockWaitAbortedError, } from '../../../../infra/
 import { legacyMessages, messageRowMigrations, messageRows, sessionAssetIndexState, sessionAssets, } from '../../../../infra/db/schema/messages.js';
 import { replaceMessageAssets } from '../asset-index.js';
 import { decodeDisplayMessage, decodeMessageSource, normalizeDisplayMessage } from './codec.js';
-import { MessageWriteWaitAbortedError, UserMessageCommitAdmissionError, UserMessageCommitConflictError, } from './contract.js';
+import { MessageDataCorruptionError, MessageWriteWaitAbortedError, UserMessageCommitAdmissionError, UserMessageCommitConflictError, } from './contract.js';
 import { ensureMessageRowsReadyInTransaction } from './readiness.js';
 import { syncMessageSourceProjection } from './source-projection.js';
 const INPUT_REJECTED_DISPLAY_KIND = 'input_rejected';
@@ -48,11 +48,12 @@ class DrizzleMessageRepository {
     async list(sessionId, options = {}) {
         this.ensureReady(sessionId);
         const anchorId = options.before ? this.messageRowId(sessionId, options.before) : undefined;
+        const afterId = this.visibleBoundaryId(sessionId, options.afterMessageId);
         const limit = normalizeLimit(options.limit, 0);
         const query = this.options.db
             .select()
             .from(messageRows)
-            .where(and(eq(messageRows.sessionId, sessionId), anchorId === undefined ? undefined : lt(messageRows.id, anchorId)))
+            .where(and(eq(messageRows.sessionId, sessionId), anchorId === undefined ? undefined : lt(messageRows.id, anchorId), afterId === undefined ? undefined : gt(messageRows.id, afterId)))
             .orderBy(desc(messageRows.id));
         const rows = limit > 0 ? query.limit(limit + 1).all() : query.all();
         const hasMore = limit > 0 && rows.length > limit;
@@ -63,15 +64,16 @@ class DrizzleMessageRepository {
             ...(hasMore && selected[0] ? { nextCursor: selected[0].messageId } : {}),
         };
     }
-    async listAfter(sessionId, afterMsgId) {
+    async listAfter(sessionId, afterMsgId, visibleAfterMessageId) {
         this.ensureReady(sessionId);
         const anchorId = afterMsgId ? this.messageRowId(sessionId, afterMsgId) : undefined;
         if (afterMsgId && anchorId === undefined)
             return { status: 'missing-anchor', messages: [] };
+        const visibleAfterId = this.visibleBoundaryId(sessionId, visibleAfterMessageId);
         const rows = this.options.db
             .select()
             .from(messageRows)
-            .where(and(eq(messageRows.sessionId, sessionId), anchorId === undefined ? undefined : gt(messageRows.id, anchorId)))
+            .where(and(eq(messageRows.sessionId, sessionId), anchorId === undefined ? undefined : gt(messageRows.id, anchorId), visibleAfterId === undefined ? undefined : gt(messageRows.id, visibleAfterId)))
             .orderBy(asc(messageRows.id))
             .all();
         return { status: 'ok', messages: rows.map(decodeDisplayMessage) };
@@ -208,6 +210,17 @@ class DrizzleMessageRepository {
         return result;
     }
     async upsertMany(inputs, options) {
+        try {
+            return await runWithWriteLock(this.options.db, (db) => this.upsertManyInTransaction(db, inputs), options);
+        }
+        catch (error) {
+            if (error instanceof WriteLockWaitAbortedError) {
+                throw new MessageWriteWaitAbortedError(error.signal);
+            }
+            throw error;
+        }
+    }
+    upsertManyInTransaction(db, inputs) {
         const sessionId = inputs[0]?.sessionId;
         if (!sessionId)
             return [];
@@ -224,18 +237,8 @@ class DrizzleMessageRepository {
             }),
             replaceProvenance: hasMessageProvenance(input),
         }));
-        try {
-            await runWithWriteLock(this.options.db, (tx) => {
-                this.ensureReadyInTransaction(tx, sessionId);
-                normalized.forEach(({ message, replaceProvenance }) => this.write(tx, sessionId, message, replaceProvenance));
-            }, options);
-        }
-        catch (error) {
-            if (error instanceof WriteLockWaitAbortedError) {
-                throw new MessageWriteWaitAbortedError(error.signal);
-            }
-            throw error;
-        }
+        this.ensureReadyInTransaction(db, sessionId);
+        normalized.forEach(({ message, replaceProvenance }) => this.write(db, sessionId, message, replaceProvenance));
         return normalized.map(({ message }) => message);
     }
     async replace(input) {
@@ -550,6 +553,14 @@ class DrizzleMessageRepository {
             .values(state)
             .onConflictDoUpdate({ target: sessionAssetIndexState.sessionId, set: state })
             .run();
+    }
+    visibleBoundaryId(sessionId, messageId) {
+        if (!messageId)
+            return undefined;
+        const id = this.messageRowId(sessionId, messageId);
+        if (id === undefined)
+            throw new MessageDataCorruptionError(sessionId, messageId);
+        return id;
     }
     messageRowId(sessionId, messageId, db = this.options.db) {
         return db

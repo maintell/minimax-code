@@ -3,6 +3,7 @@ import { hasAcceptedLeaseIdentity, isAbortSignalLike } from './accepted-lease.js
 import { captureAgentHostExecutionRequest } from './canonical-user-input.js';
 import { AgentHostCompactionExecutor, AgentHostCompactionLeaseError, AgentCompactionCloseError, AgentCompactionAssociationError, AgentCompactionSnapshotError, captureAcceptedCompactionInput, } from './compaction/agent-host-compaction-executor.js';
 import { ContextCompactionAttemptFactory, createAutomaticContextCompactionHook, } from './compaction/context-compaction.js';
+import { resolveCheckpointRequestShape } from './compaction/checkpoint-request-shape.js';
 import { assertAgentHostCapabilityAvailable, assertAgentHostCompactionDependenciesReady, assertAgentHostDependenciesReady, } from './empty-dependencies.js';
 import { buildHostFailedEvent } from './events/host-failed-event.js';
 import { AgentHostCommittedHistoryWriter } from './history/committed-history-writer.js';
@@ -11,7 +12,8 @@ import { AgentHistoryOperationIdentityError } from './history/history-operation-
 import { AgentTerminalConfirmationError, TurnCommitPipeline, commitHostFailedTerminal, } from './events/turn-commit-pipeline.js';
 import { AgentHostSessionReadError } from './preparation/session-read.js';
 import { AgentEventAssociationError, AgentExecutionSnapshotNotFoundError, TurnPreflight, observeAgentTurnSetupStage, } from './preparation/turn-preflight.js';
-import { localPluginHookCoordinator } from './assembly/local-turn-plugin-hooks.js';
+import { exactPluginMcpToolOwners } from './assembly/local-turn-plugin-capabilities.js';
+import { loadLocalConfigHooks, localPluginHookCoordinator, } from './assembly/local-turn-plugin-hooks.js';
 export class AgentEventIdentityError extends Error {
     name = 'AgentEventIdentityError';
     constructor(kind) {
@@ -68,6 +70,15 @@ export class LocalAgentHost {
         }, this.committedHistory, this.compactionAttempts);
         this.preflight = new TurnPreflight(dependencies);
     }
+    notifyTurnStarted(context) {
+        try {
+            // A new Turn supersedes any suggestion still generating for this Session.
+            this.dependencies.promptSuggestion?.turnStarted(context.sessionId);
+        }
+        catch {
+            /* An optional suggestion can never fail a Turn. */
+        }
+    }
     async run(input) {
         const lease = captureAcceptedTurnLease(readUnknownProperty(input, 'lease'));
         const control = scopeTurnControl(this.dependencies, lease);
@@ -79,6 +90,7 @@ export class LocalAgentHost {
             executionMode: 'activate',
         };
         let capabilityLease;
+        let configHooks = [];
         try {
             let preflight;
             try {
@@ -91,13 +103,13 @@ export class LocalAgentHost {
                 });
                 context = createAgentEventContext(acceptedInput);
                 assertAgentHostDependenciesReady(this.dependencies);
+                this.notifyTurnStarted(context);
                 setupLogContext.executionMode = acceptedInput.request.executionMode ?? 'activate';
                 const turnCapabilities = this.dependencies.turnCapabilities;
                 capabilityLease = turnCapabilities
                     ? await observeAgentTurnSetupStage(this.dependencies.logger, setupLogContext, 'capability_acquisition', () => turnCapabilities.acquire({
                         sessionId: acceptedInput.lease.sessionId,
                         turnId: acceptedInput.lease.turnId,
-                        signal: acceptedInput.lease.signal,
                         ...(acceptedInput.beforeCapabilityCapture
                             ? { beforeCapabilityCapture: acceptedInput.beforeCapabilityCapture }
                             : {}),
@@ -117,6 +129,7 @@ export class LocalAgentHost {
                     }));
                 }
                 preflight = { ...prepared, assembly };
+                configHooks = await loadLocalConfigHooks(prepared.session);
             }
             catch (error) {
                 return this.fail({
@@ -150,10 +163,12 @@ export class LocalAgentHost {
                 context: executionContext,
                 preflight,
                 control,
+                configHooks,
                 ...(capabilityLease?.capabilities ? { capabilities: capabilityLease.capabilities } : {}),
             });
         }
         finally {
+            this.dependencies.compaction?.barrier?.endTurn(context.sessionId, context.turnId);
             capabilityLease?.release();
         }
     }
@@ -202,13 +217,16 @@ export class LocalAgentHost {
     }
     createExecutionInput(input, scope, pipeline) {
         const { context, preflight, control } = scope;
-        const effectivePluginHooks = this.resolvePluginHooksForTurn(input.lease.sessionId, scope.capabilities?.hooks ?? []);
+        const effectivePluginHooks = this.resolvePluginHooksForTurn(input.lease.sessionId, [
+            ...scope.configHooks,
+            ...(scope.capabilities?.hooks ?? []),
+        ]);
         const pluginHookRuntimeContext = effectivePluginHooks.length
             ? this.resolvePluginHookRuntimeContext(input, preflight)
             : undefined;
         const pluginApprovalRequests = new Map();
-        const pluginHostApprovalTargets = new Map();
-        const pluginMcpToolOwners = exactPluginMcpToolOwners(scope.capabilities?.runtimeToolBindings ?? []);
+        const pluginToolApprovalTargets = new Map();
+        const pluginMcpToolOwners = exactPluginMcpToolOwners(scope.capabilities?.runtimeToolBindings ?? [], preflight.assembly.tools);
         const contextCompactionHook = this.createContextCompactionHook(input, {
             context,
             preflight,
@@ -232,7 +250,7 @@ export class LocalAgentHost {
                     pluginHooks: effectivePluginHooks,
                     ...(pluginHookRuntimeContext ? { pluginHookRuntimeContext } : {}),
                     pluginApprovalRequests,
-                    pluginHostApprovalTargets,
+                    pluginToolApprovalTargets,
                     ...(pluginMcpToolOwners.size > 0 ? { pluginMcpToolOwners } : {}),
                 }
                 : {}),
@@ -309,7 +327,18 @@ export class LocalAgentHost {
             });
         }
         await this.commitBackgroundTaskReads(context, outcome);
+        // Only now is the Turn durable: fire optional post-commit work without
+        // awaiting it, so a suggestion can never delay or fail this Turn.
+        this.afterSuccessfulCommit(outcome);
         return outcome;
+    }
+    afterSuccessfulCommit(outcome) {
+        try {
+            this.dependencies.executor.afterSuccessfulCommit?.(outcome);
+        }
+        catch {
+            /* An optional post-commit observer can never fail a committed Turn. */
+        }
     }
     async commitBackgroundTaskReads(context, outcome) {
         if (outcome.status !== 'completed')
@@ -384,6 +413,7 @@ export class LocalAgentHost {
         const { context, preflight, pluginHooks, pluginHookRuntimeContext } = options;
         return createAutomaticContextCompactionHook(this.dependencies.compaction, context, input.lease.leaseId, {
             maxSerializedInputBytes: preflight.preparation.llm.maxRequestBodyBytes,
+            checkpointRequestShape: resolveCheckpointRequestShape(preflight.preparation.llm, this.dependencies.compaction.checkpointSharedPrefixEnabled),
             attempts: this.compactionAttempts,
             logger: this.dependencies.logger,
             ...(pluginHooks.length
@@ -624,6 +654,7 @@ function scopeTurnControl(dependencies, lease) {
     assertAgentHostCapabilityAvailable('turn-control', [
         control?.drainSteering,
         control?.tryBeginClose,
+        control?.cancelClose,
         control?.sealAbnormalTerminal,
         control?.openToolResultTail,
         control?.closeAndClaimToolResultTail,
@@ -637,24 +668,6 @@ function createBaseAgentEventContext(input) {
         turnId: input.lease.turnId,
         turnSequence: input.lease.acceptedSequence,
     };
-}
-function exactPluginMcpToolOwners(bindings) {
-    const owners = new Map();
-    const ambiguous = new Set();
-    for (const binding of bindings) {
-        if (binding.kind !== 'mcp' || !binding.pluginName?.trim())
-            continue;
-        const toolName = binding.tool.def.name;
-        const existing = owners.get(toolName);
-        if (existing && existing !== binding.pluginName) {
-            owners.delete(toolName);
-            ambiguous.add(toolName);
-            continue;
-        }
-        if (!ambiguous.has(toolName))
-            owners.set(toolName, binding.pluginName);
-    }
-    return owners;
 }
 function createAgentEventContext(input) {
     const base = createBaseAgentEventContext(input);

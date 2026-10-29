@@ -136,7 +136,7 @@ async function submitQueued(options, input, makeTurnId) {
     options.completions.bind(turnId, committed.item.itemId);
     await admitQueuedSessionClioQuery(options, input, committed.item);
     await dispatchBestEffort(options, input.sessionId);
-    const ahead = await queuedWorkAhead(options, {
+    const { ahead, dispatched } = await queuedWorkAhead(options, {
         sessionId: input.sessionId,
         itemId: committed.item.itemId,
         turnId,
@@ -152,6 +152,7 @@ async function submitQueued(options, input, makeTurnId) {
             itemId: committed.item.itemId,
             position: committed.position,
             ahead,
+            dispatched,
         },
     };
 }
@@ -199,7 +200,7 @@ async function admitQueuedSessionClioQuery(options, input, item) {
         occurredAtMs: item.createdAt,
     });
 }
-function toQueueInput(input, values) {
+export function toQueueInput(input, values) {
     return {
         session: { sessionId: input.sessionId, agentName: values.agentName },
         requestedTurnId: values.requestedTurnId,
@@ -217,6 +218,7 @@ function toQueueMessage(input) {
     const channelContext = toQueueChannelContext(input);
     return {
         content: input.input.text,
+        ...(input.input.computerUse ? { computerUse: input.input.computerUse } : {}),
         attachments: (input.input.attachments ?? []).flatMap(toQueueAttachment),
         ...(input.input.computerUse ? { computerUse: { enable: input.input.computerUse.enable } } : {}),
         ...(input.inputSafetyDecision ? { inputSafetyDecision: input.inputSafetyDecision } : {}),
@@ -250,16 +252,24 @@ async function queuedWorkAhead(options, input) {
         ]);
         const activeTurnId = options.activeTurnId(input.sessionId);
         const pendingIndex = pending.findIndex((item) => item.itemId === input.itemId);
-        if (pendingIndex >= 0)
-            return pendingIndex + (activeTurnId ? 1 : 0);
-        if (exact?.status === 'claimed') {
-            return activeTurnId && activeTurnId !== input.turnId ? 1 : 0;
+        if (pendingIndex >= 0) {
+            return { ahead: pendingIndex + (activeTurnId ? 1 : 0), dispatched: false };
         }
-        return 0;
+        if (exact?.status === 'claimed') {
+            const otherTurnActive = Boolean(activeTurnId && activeTurnId !== input.turnId);
+            return { ahead: otherTurnActive ? 1 : 0, dispatched: !otherTurnActive };
+        }
+        // A successful dispatch acknowledges (removes) the item, but cancelled and
+        // rejected items disappear too. Only this item's own Turn being the active
+        // one proves it is running.
+        return { ahead: 0, dispatched: activeTurnId === input.turnId };
     }
     catch {
-        return (Math.max(0, input.admittedPosition - 1) +
-            (input.activeTurnIdAtAdmission && input.activeTurnIdAtAdmission !== input.turnId ? 1 : 0));
+        return {
+            ahead: Math.max(0, input.admittedPosition - 1) +
+                (input.activeTurnIdAtAdmission && input.activeTurnIdAtAdmission !== input.turnId ? 1 : 0),
+            dispatched: false,
+        };
     }
 }
 function toQueueCanonicalMetadata(input) {
@@ -367,5 +377,6 @@ const QUEUE_SOURCES = new Set([
     'channel:wechat',
     'channel:feishu',
     'channel:telegram',
+    'miniapp',
 ]);
 //# sourceMappingURL=turn-submission.service.js.map

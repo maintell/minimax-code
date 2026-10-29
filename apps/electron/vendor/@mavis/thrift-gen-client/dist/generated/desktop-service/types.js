@@ -13,6 +13,25 @@ export const TurnContinuationState = {
     Running: 2,
     WaitingForUser: 3,
 };
+export const SessionActivityState = {
+    Idle: 0,
+    Running: 1,
+    WaitingForUser: 2,
+    Scheduled: 3,
+};
+export const SessionActivityKind = {
+    Turn: 1,
+    QueuedMessages: 2,
+    BackgroundTask: 3,
+    TaskNotification: 4,
+    ThreadGoal: 5,
+    TeamPlan: 6,
+    CronRun: 7,
+    CronSchedule: 8,
+    Questionnaire: 9,
+    Permission: 10,
+    PausedQueue: 11,
+};
 export const SessionTypeView = {
     Branch: 0,
     Root: 1,
@@ -38,6 +57,10 @@ export const SessionKind = {
 };
 export const SessionCollaborationKind = {
     LocalCloudHandoff: 1,
+};
+export const SideChatMutationState = {
+    Pending: 0,
+    Committed: 1,
 };
 export const AppId = {
     Glow: 1,
@@ -95,6 +118,10 @@ export const PluginInstallationPolicy = {
 export const PluginShowcaseMediaType = {
     IMAGE: 1,
     VIDEO: 2,
+    PPT: 3,
+    WORD: 4,
+    EXCEL: 5,
+    PDF: 6,
 };
 export const InstalledPluginSource = {
     OFFICIAL: 1,
@@ -176,6 +203,15 @@ export const CronTriggerSource = {
     Manual: 0,
     Scheduled: 1,
 };
+export const DesktopBackgroundTaskStatus = {
+    Queued: 0,
+    Running: 1,
+    Stopping: 2,
+    Succeeded: 3,
+    Failed: 4,
+    Canceled: 5,
+    Lost: 6,
+};
 export const PinnedItemType = {
     Session: 1,
     Agent: 2,
@@ -206,11 +242,23 @@ export const QuestionnaireStatus = {
     Superseded: 3,
     Dismissed: 4,
 };
+export const QuestionnaireReopenReason = {
+    ContentRecall: 1,
+};
 export const LocalMcpTransport = {
     Stdio: 1,
     Http: 2,
     StreamableHttp: 3,
     Sse: 4,
+};
+export const LocalHookScope = {
+    USER: 1,
+    PROJECT: 2,
+};
+export const LocalHookSource = {
+    USER: 1,
+    PROJECT: 2,
+    PLUGIN: 3,
 };
 export const FeedbackStatus = {
     FEEDBACK_STATUS_UNSPECIFIED: 0,
@@ -221,6 +269,12 @@ export const FeedbackClientType = {
     FEEDBACK_CLIENT_UNSPECIFIED: 0,
     DESKTOP: 1,
     WEB: 2,
+};
+export const FeedbackCategory = {
+    FEEDBACK_CATEGORY_UNSPECIFIED: 0,
+    MODEL_QUALITY: 1,
+    APP_BUG: 2,
+    OTHER: 3,
 };
 export const WebsiteManagementCode = {
     OK: 0,

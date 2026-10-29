@@ -2,7 +2,7 @@ export * from './builtin-defs.js';
 export * from './runtime-types.js';
 export * from './cloud-bash.js';
 export * from './cloud-communicate.js';
-export * from './cloud-connector.js';
+export * from './cloud-tool-target-hooks.js';
 export * from './cloud-plugin-hook-result.js';
 export * from './cloud-plugin-hook-response.js';
 export * from './cloud-edit.js';
@@ -41,4 +41,5 @@ export * from './secret-env-inject.js';
 export * from './tool-result-truncation.js';
 export * from './types.js';
 export { buildCloudCronTools } from './cloud-cron-tools.js';
+export { buildCloudSessionTools, CLOUD_SESSION_TOOL_NAMES } from './cloud-session-tools.js';
 //# sourceMappingURL=index.js.map

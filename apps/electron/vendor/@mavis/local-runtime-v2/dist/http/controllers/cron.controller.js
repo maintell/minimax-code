@@ -16,6 +16,7 @@ const DOMAIN_ERROR_STATUS = {
     CRON_NOT_FOUND: 404,
     CRON_DEFINITION_NOT_FOUND: 404,
     CRON_CONFLICT: 409,
+    CRON_RUN_ID_CONFLICT: 409,
     SELF_REMINDER_EXISTS: 409,
     CRON_INVALID_STATE: 409,
     SCHEDULER_INVALID: 400,
@@ -24,6 +25,7 @@ const DOMAIN_ERROR_STATUS = {
     // 领域层暴露的 targetSession 校验错误。
     CRON_TARGET_SESSION_NOT_FOUND: 404,
     CRON_TARGET_SESSION_AGENT_MISMATCH: 409,
+    CRON_SESSION_TARGET_ARCHIVED: 409,
 };
 function toAppError(err) {
     if (err instanceof AppError)
@@ -95,24 +97,8 @@ function toContractSchedule(schedule) {
     }
     return { kind: CronScheduleKind.Once, runAtMs: schedule.runAtMs };
 }
-function toDomainSessionTarget(target) {
-    if (!target)
-        throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget is required');
-    if (target.mode === CronSessionTargetMode.New) {
-        if (target.sessionId !== undefined) {
-            throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget.sessionId is not allowed for New mode');
-        }
-        return { mode: 'new' };
-    }
-    if (target.mode === CronSessionTargetMode.SessionId) {
-        return {
-            mode: 'sessionId',
-            sessionId: requireText(target.sessionId, 'sessionTarget.sessionId'),
-        };
-    }
-    throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget.mode is invalid');
-}
-function toDomainCreateSessionTarget(target) {
+/** A fixed target without `sessionId` is minted on the next run, on create and on rebind alike. */
+function toDomainSessionTargetInput(target) {
     if (!target)
         throw new AppError(400, 'VALIDATION_ERROR', 'sessionTarget is required');
     if (target.mode === CronSessionTargetMode.New) {
@@ -230,7 +216,7 @@ class CronController extends CronControllerBase {
         const agentName = requireText(req.agentName, 'agentName');
         const prompt = requireText(req.prompt, 'prompt');
         const schedule = toDomainSchedule(req.schedule);
-        const sessionTarget = toDomainCreateSessionTarget(req.sessionTarget);
+        const sessionTarget = toDomainSessionTargetInput(req.sessionTarget);
         return mapDomainErrors(async () => {
             const view = await this.service.createDefinition({
                 name,
@@ -249,7 +235,7 @@ class CronController extends CronControllerBase {
     }
     async updateCronDefinition(ctx, req) {
         const cronId = requireText(req.cronId, 'cronId');
-        const sessionTarget = req.sessionTarget === undefined ? undefined : toDomainSessionTarget(req.sessionTarget);
+        const sessionTarget = req.sessionTarget === undefined ? undefined : toDomainSessionTargetInput(req.sessionTarget);
         const schedule = req.schedule === undefined ? undefined : toDomainSchedule(req.schedule);
         return mapDomainErrors(async () => {
             const view = await this.service.updateDefinition({
@@ -298,7 +284,7 @@ class CronController extends CronControllerBase {
     // 旧版 v1 形态的 Cron 接口。
     // v1 CronTask/ActiveHours/keepSessions 结构包含 v2 领域按 §9 移除的能力。
     // 这些路由继续保留在生成契约中，并返回稳定的不支持错误，避免有损映射到新领域。
-    // Local Mavis Tool 按 §8 调用 v2 方法。
+    // Agent 通过 v2 cron 工具调用新领域；Local Mavis Tool 的旧 cron 分支返回 CRON_TOOL_MOVED。
     async listCrons(_ctx, _req) {
         throw legacyUnsupported('listCrons');
     }

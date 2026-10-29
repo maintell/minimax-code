@@ -13,9 +13,6 @@
     }
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
-    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
-    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
     "@mavis/agent-core": "file:../agent-core",
     "@mavis/agent-tools": "file:../agent-tools",
     "@mavis/config": "file:../config",
@@ -23,14 +20,6 @@
     "@mavis/context-manager": "file:../context-manager",
     "@mavis/cron": "file:../cron",
     "@mavis/goal": "file:../goal",
-    "@mavis/mcp": "file:../mcp",
-    "@mavis/permission": "file:../permission",
-    "@mavis/protocol": "file:../protocol",
-    "@mavis/shared": "file:../shared",
-    "@mavis/skills": "file:../skills",
-    "@mavis/system-reminder": "file:../system-reminder",
-    "@mavis/thrift-gen": "file:../thrift-gen",
-    "@mavis/thrift-gen-client": "file:../thrift-gen-client",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "file:../../better-sqlite3",
     "croner": "^9",
@@ -44,7 +33,8 @@
     "pngjs": "6.0.0",
     "proper-lockfile": "^4",
     "saxes": "6.0.0",
-    "zod": "^3"
+    "zod": "^3",
+    "@mavis/background-task": "file:../background-task"
   },
   "optionalDependencies": {
     "@larksuiteoapi/node-sdk": "^1.60.0"

@@ -1,10 +1,13 @@
 import { isCloudSessionRead, readCloudSession } from './session-read-source.js';
 import { deriveMediaKind, inferAssetMimeType } from '@mavis/shared';
 import { getCloudDriveNodeId, isCommitIdTransportId } from '@mavis/shared/asset-markup';
+import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
+import { isSideChatSendOrigin } from '@mavis/shared/sidechat-send-origin';
 import { DriveNodeSource, DriveNodeType, InstalledPluginSource, PluginCapabilityType, } from '@mavis/thrift-gen/generated/desktop-service/types';
 import { MessageQueryServiceError, PeekContextServiceError, SessionInputSummaryServiceError, SessionUsageServiceError, SessionSourceQueryServiceError, isInlineDisplayDataUrl, } from '../../service/session-system/index.js';
 import { AppError } from '../errors.js';
 import { queryCollapseSteeringProjection } from '../conversation/query-collapse-identity.js';
+import { projectPeerMessageOrigin } from '../conversation/peer-message-origin.js';
 /** Owns generated Session content mapping and the message repair-fence workflow. */
 export class SessionContentApplication {
     options;
@@ -163,14 +166,21 @@ export class SessionContentApplication {
         }
     }
     async readMessages(input) {
-        const repaired = await this.options.maintenance.tryRunExclusive(input.sessionId, async () => {
-            const page = await this.options.messages.list(input);
-            return {
-                ...page,
-                messages: await this.options.staleCompactionRepair.repair(input.sessionId, page.messages),
-            };
-        });
-        const page = repaired.acquired ? repaired.value : await this.options.messages.list(input);
+        let page = await this.options.messages.list(input);
+        // Normal history reads must not take the admission lock: concurrent sends
+        // otherwise fail as "active Turn" even though no Turn exists. Mutating stale
+        // compaction repair still re-reads and writes under the exclusive fence.
+        if (this.options.staleCompactionRepair.needsRepair(page.messages)) {
+            const repaired = await this.options.maintenance.tryRunExclusive(input.sessionId, async () => {
+                const current = await this.options.messages.list(input);
+                return {
+                    ...current,
+                    messages: await this.options.staleCompactionRepair.repair(input.sessionId, current.messages),
+                };
+            });
+            if (repaired.acquired)
+                page = repaired.value;
+        }
         return {
             ...page,
             messages: await this.options.conversationActions.project({
@@ -355,14 +365,22 @@ function toQueryCollapseView(state) {
             : {}),
     };
 }
-/** Adapts v2 Cron provenance to the legacy UI origin contract without exposing routing context. */
+/**
+ * Adapts persisted Cron, background task, SideChat hand-back and peer Session provenance to the
+ * legacy UI origin contract without exposing routing context.
+ */
 function toSessionMessageOriginJson(message) {
     const explicitOrigin = firstDefined([message.originJson, message.origin_json, message.origin]);
     if (explicitOrigin !== undefined)
         return jsonStringOrString(explicitOrigin);
+    const sourceContext = firstDefined([message.sourceContext, message.source_context]);
+    if (carriesSourceContextOrigin(message, sourceContext))
+        return jsonStringOrString(sourceContext.origin);
+    const peerOrigin = projectPeerMessageOrigin(message);
+    if (peerOrigin)
+        return jsonStringOrString(peerOrigin);
     if (maybeString(message.source) !== 'cron')
         return undefined;
-    const sourceContext = firstDefined([message.sourceContext, message.source_context]);
     if (!isRecord(sourceContext))
         return undefined;
     const cronId = nonEmptyString(firstDefined([sourceContext.cronId, sourceContext.cron_id]));
@@ -375,6 +393,15 @@ function toSessionMessageOriginJson(message) {
             ...(runId ? { runId } : {}),
         },
     });
+}
+/** Approved machine-owned message sources may carry their UI origin in sourceContext. */
+function carriesSourceContextOrigin(message, sourceContext) {
+    if (!isRecord(sourceContext))
+        return false;
+    return (maybeString(message.source) === 'background-task' ||
+        isSideChatSendOrigin(sourceContext.origin) ||
+        (message.source === 'questionnaire' &&
+            isOrdinaryQuestionnaireResponseOrigin(sourceContext.origin)));
 }
 function messageApplicationError(error) {
     switch (error.reason) {

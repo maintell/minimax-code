@@ -17,6 +17,7 @@ function createCore(options) {
         credentialStore: createCredentialStore({ authHome: namespace.namespaceHome }),
         oauthClient: new HttpOAuthClient({ ...options.endpoints, fetchImpl: options.fetchImpl }),
         initialize: () => migrateLegacyAuthNamespace(namespace),
+        onDiagnostic: options.onDiagnostic,
     });
 }
 //# sourceMappingURL=factory.js.map

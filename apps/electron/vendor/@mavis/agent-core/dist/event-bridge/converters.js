@@ -444,6 +444,10 @@ export async function buildCompletedAssistantMessage(input, respDataTransform) {
         ...(input.usage ? { usage: input.usage } : {}),
         nowMs: input.nowMs,
     }), { sessionId: input.sessionId, turnId: input.turnId }, input.logger);
+    // 只标记未被 transform 改写的系统错误，不能让替换后的正文跳过审核。
+    if (input.systemErrorContent && respData.agent_message?.msg_content === input.text) {
+        respData.agent_message.msg_content_source = 'system_error';
+    }
     return buildStreamRespEvent({
         sessionId: input.sessionId,
         turnId: input.turnId,
