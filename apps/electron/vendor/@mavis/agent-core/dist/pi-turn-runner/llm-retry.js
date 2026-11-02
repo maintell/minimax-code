@@ -1099,12 +1099,16 @@ function throwingReplayStream(buffered, thrown) {
     };
 }
 function commitsOutput(event) {
-    if (event.type === 'text_delta' ||
-        event.type === 'thinking_delta' ||
-        event.type === 'toolcall_delta') {
+    // Local patch: reasoning deltas are NOT a commit boundary. They are discarded
+    // by the caller on a retry anyway, so treating them as committed forced a
+    // failed request out of the retry loop and into the resume path with an empty
+    // prefix — measured as resume_start chars=0 followed by the model answering
+    // with a tool call. Only answer text and tool-call arguments are visible
+    // enough to make a silent replay unsafe.
+    if (event.type === 'text_delta' || event.type === 'toolcall_delta') {
         return event.delta.length > 0;
     }
-    if (event.type === 'text_end' || event.type === 'thinking_end')
+    if (event.type === 'text_end')
         return event.content.length > 0;
     if (event.type === 'toolcall_end')
         return true;
@@ -1114,8 +1118,6 @@ function hasCommittedContent(message) {
     return message.content.some((block) => {
         if (block.type === 'text')
             return block.text.length > 0;
-        if (block.type === 'thinking')
-            return block.thinking.length > 0;
         return block.type === 'toolCall';
     });
 }

@@ -114,6 +114,57 @@ patchFile("@mavis/agent-core/dist/pi-turn-runner/llm-retry.js", [
     replace: `        if (commitsOutput(next.value)) {`,
   },
   {
+    // Reasoning deltas are dropped by the caller when an attempt is discarded, so
+    // they must not end the retry window. Treating them as committed pushed a
+    // failed request into the resume path with an empty prefix (measured as
+    // `resume_start chars=0`, after which the model answered with a tool call).
+    label: "commit boundary ignores reasoning deltas",
+    find: `function commitsOutput(event) {
+    if (event.type === 'text_delta' ||
+        event.type === 'thinking_delta' ||
+        event.type === 'toolcall_delta') {
+        return event.delta.length > 0;
+    }
+    if (event.type === 'text_end' || event.type === 'thinking_end')
+        return event.content.length > 0;
+    if (event.type === 'toolcall_end')
+        return true;
+    return 'partial' in event && hasCommittedContent(event.partial);
+}
+function hasCommittedContent(message) {
+    return message.content.some((block) => {
+        if (block.type === 'text')
+            return block.text.length > 0;
+        if (block.type === 'thinking')
+            return block.thinking.length > 0;
+        return block.type === 'toolCall';
+    });
+}`,
+    replace: `function commitsOutput(event) {
+    // Local patch: reasoning deltas are NOT a commit boundary. They are discarded
+    // by the caller on a retry anyway, so treating them as committed forced a
+    // failed request out of the retry loop and into the resume path with an empty
+    // prefix — measured as resume_start chars=0 followed by the model answering
+    // with a tool call. Only answer text and tool-call arguments are visible
+    // enough to make a silent replay unsafe.
+    if (event.type === 'text_delta' || event.type === 'toolcall_delta') {
+        return event.delta.length > 0;
+    }
+    if (event.type === 'text_end')
+        return event.content.length > 0;
+    if (event.type === 'toolcall_end')
+        return true;
+    return 'partial' in event && hasCommittedContent(event.partial);
+}
+function hasCommittedContent(message) {
+    return message.content.some((block) => {
+        if (block.type === 'text')
+            return block.text.length > 0;
+        return block.type === 'toolCall';
+    });
+}`,
+  },
+  {
     label: "retry trace: call start",
     find: `        const callId = input.generateCallId?.() ?? defaultCallId();
         const callIdentity = {};`,
