@@ -186,16 +186,21 @@ function __mavisResumeStream(input) {
             signal.addEventListener('abort', onAbort, { once: true });
     });
     const note = (event) => __mavisRetryTrace(event);
-    async function resumeOnce() {
+    async function resumeOnce(continueFromText) {
         const messages = Array.isArray(context && context.messages) ? context.messages : [];
-        const resumeContext = {
-            ...(context || {}),
-            messages: [
-                ...messages,
-                { role: 'assistant', content: [{ type: 'text', text }] },
-                { role: 'user', content: [{ type: 'text', text: directive }] },
-            ],
-        };
+        const resumeContext = continueFromText
+            ? {
+                ...(context || {}),
+                messages: [
+                    ...messages,
+                    { role: 'assistant', content: [{ type: 'text', text }] },
+                    { role: 'user', content: [{ type: 'text', text: directive }] },
+                ],
+            }
+            // Nothing visible was committed, so there is no break point to
+            // continue from: re-issue the original request unchanged (a plain
+            // retry, which is what the pre-output path would have done).
+            : { ...(context || {}) };
         const attempt = await inner(model, resumeContext, { ...(options || {}), maxRetries: 0 });
         let tail = '';
         const iterable = attempt && typeof attempt[Symbol.asyncIterator] === 'function' ? attempt : undefined;
@@ -280,15 +285,18 @@ function __mavisResumeStream(input) {
                 try {
                     if (signal && signal.aborted)
                         throw abortReason();
-                    await resumeOnce();
+                    await resumeOnce(text.length > 0);
                     note({ event: 'resume_ok', round, chars: text.length });
                     break;
                 }
                 catch (error) {
                     if ((signal && signal.aborted) || sawToolcall) {
-                        note({ event: 'resume_stop', round, reason: signal && signal.aborted ? 'aborted' : 'toolcall' });
-                        rejectSettled(error);
-                        throw error;
+                        // Surface the provider's original failure, not this
+                        // wrapper's internal reason: the caller decides what the
+                        // user sees, and "resume produced a tool call" is noise.
+                        note({ event: 'resume_stop', round, reason: signal && signal.aborted ? 'aborted' : 'toolcall', detail: String(error && error.message ? error.message : error).slice(0, 200) });
+                        rejectSettled(failure);
+                        throw failure;
                     }
                     text = snapshot;
                     note({ event: 'resume_retry', round, message: String(error && error.message ? error.message : error).slice(0, 200) });
