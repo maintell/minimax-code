@@ -67,7 +67,10 @@ five-attempt / two-minute budget, and treats a dropped response body (`5xx`,
 response) as terminal. This product wants provider errors retried without a
 practical limit for every provider — BYOK or not — on a fixed three-second
 cadence, while a wrong credential or an exhausted quota stays terminal instead of
-hiding behind days of retries.
+hiding behind days of retries. A response that breaks *after* output has already
+been streamed cannot be re-sent (that would duplicate it), so it is resumed: the
+call is re-issued with the truncated text plus a continue directive, and the
+continuation is appended in one delta.
 
 That is a behavioural change, not a recovery artefact, so it is applied by
 [`apply-local-patches.mjs`](./apply-local-patches.mjs) after vendoring:

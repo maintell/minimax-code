@@ -52,6 +52,209 @@ const PUBLIC_ERROR_MESSAGES = {
     unknown: 'LLM request failed',
     length: 'LLM response reached the length limit',
 };
+function __mavisRetryTrace(event) {
+    try {
+        const proc = globalThis.process;
+        const fs = proc?.getBuiltinModule?.('node:fs');
+        if (!fs) return;
+        const home = proc?.env?.USERPROFILE || proc?.env?.HOME;
+        if (!home) return;
+        const dir = home + '/.minimax/v2/observability';
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(dir + '/llm-retry-trace.jsonl', JSON.stringify({ at: new Date().toISOString(), pid: proc?.pid, ...event }) + '\n');
+    }
+    catch {
+        // Observability must never change provider behaviour.
+    }
+}
+/**
+ * Local patch: resume a response that died after part of it had already been
+ * handed to the caller. Re-sending the request would duplicate the visible
+ * output, so the normal retry path cannot be reused; the only correct
+ * continuation is a fresh call told to pick up where the truncated text
+ * stopped. Its events are NOT streamed as they arrive (a second start/textStart
+ * would collide with the open content block): its text is appended in one delta
+ * once it completes, and a tool call aborts the resume because a second tool
+ * block cannot be merged into the committed message.
+ */
+function __mavisResumeStream(input) {
+    const { inner, model, context, options, source } = input;
+    const signal = options?.signal;
+    const delayMs = Number(globalThis.process?.env?.MAVIS_RESUME_DELAY_MS ?? 3000);
+    const directive = '（上一段输出因链路中断被截断：请从断点继续，不要重复已经输出的内容，也不要重新解释。）';
+    let text = '';
+    let sawToolcall = false;
+    let finalMessage;
+    let started = false;
+    let resolveSettled;
+    let rejectSettled;
+    const settledPromise = new Promise((resolve, reject) => {
+        resolveSettled = resolve;
+        rejectSettled = reject;
+    });
+    const abortReason = () => (signal && signal.reason instanceof Error ? signal.reason : new Error('LLM retry cancelled'));
+    const wait = (ms) => new Promise((resolve, reject) => {
+        if (signal && signal.aborted) {
+            reject(abortReason());
+            return;
+        }
+        const onAbort = () => {
+            clearTimeout(timer);
+            if (signal)
+                signal.removeEventListener('abort', onAbort);
+            reject(abortReason());
+        };
+        const timer = setTimeout(() => {
+            if (signal)
+                signal.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        if (signal)
+            signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const note = (event) => __mavisRetryTrace(event);
+    async function resumeOnce() {
+        const messages = Array.isArray(context && context.messages) ? context.messages : [];
+        const resumeContext = {
+            ...(context || {}),
+            messages: [
+                ...messages,
+                { role: 'assistant', content: [{ type: 'text', text }] },
+                { role: 'user', content: [{ type: 'text', text: directive }] },
+            ],
+        };
+        const attempt = await inner(model, resumeContext, { ...(options || {}), maxRetries: 0 });
+        let tail = '';
+        const iterable = attempt && typeof attempt[Symbol.asyncIterator] === 'function' ? attempt : undefined;
+        if (iterable) for await (const event of iterable) {
+            if (!event)
+                continue;
+            if (event.type === 'text_delta') {
+                tail += event.delta || '';
+                continue;
+            }
+            if (event.type === 'text_end')
+                continue;
+            if (event.type === 'start' || event.type === 'text_start' || event.type === 'done')
+                continue;
+            if (event.type === 'error')
+                throw new Error('resume attempt failed');
+            if (typeof event.type === 'string' && event.type.indexOf('toolcall') === 0) {
+                sawToolcall = true;
+                throw new Error('resume produced a tool call');
+            }
+        }
+        const final = await (attempt && typeof attempt.result === 'function' ? attempt.result() : undefined);
+        if (!final || final.stopReason === 'error')
+            throw new Error('resume attempt ended in failure');
+        if (final.stopReason === 'aborted')
+            throw abortReason();
+        text = text + tail;
+        finalMessage = final;
+    }
+    const stream = {
+        async *[Symbol.asyncIterator]() {
+            started = true;
+            const iterator = source[Symbol.asyncIterator]();
+            let failure;
+            for (;;) {
+                let next;
+                try {
+                    next = await iterator.next();
+                }
+                catch (thrown) {
+                    failure = thrown;
+                    break;
+                }
+                if (next.done)
+                    break;
+                const event = next.value;
+                if (event.type === 'text_delta')
+                    text += event.delta || '';
+                else if (event.type === 'text_end')
+                    text = text || String(event.content || '');
+                else if (typeof event.type === 'string' && event.type.indexOf('toolcall') === 0)
+                    sawToolcall = true;
+                yield event;
+            }
+            if (failure === undefined) {
+                let settled;
+                try {
+                    settled = await source.result();
+                }
+                catch (thrown) {
+                    failure = thrown;
+                }
+                if (failure === undefined) {
+                    if (settled && settled.stopReason === 'error') {
+                        failure = new Error(String(settled.errorMessage || 'stream ended in error'));
+                    }
+                    else {
+                        finalMessage = settled;
+                        resolveSettled(settled);
+                        return;
+                    }
+                }
+            }
+            if (sawToolcall) {
+                rejectSettled(failure);
+                throw failure;
+            }
+            const baseText = text;
+            note({ event: 'resume_start', chars: baseText.length });
+            for (let round = 1;; round += 1) {
+                const snapshot = text;
+                try {
+                    if (signal && signal.aborted)
+                        throw abortReason();
+                    await resumeOnce();
+                    note({ event: 'resume_ok', round, chars: text.length });
+                    break;
+                }
+                catch (error) {
+                    if ((signal && signal.aborted) || sawToolcall) {
+                        note({ event: 'resume_stop', round, reason: signal && signal.aborted ? 'aborted' : 'toolcall' });
+                        rejectSettled(error);
+                        throw error;
+                    }
+                    text = snapshot;
+                    note({ event: 'resume_retry', round, message: String(error && error.message ? error.message : error).slice(0, 200) });
+                    await wait(delayMs);
+                }
+            }
+            const merged = {
+                role: 'assistant',
+                timestamp: Date.now(),
+                ...(finalMessage || {}),
+                stopReason: 'stop',
+                content: [{ type: 'text', text }],
+            };
+            const tail = text.slice(baseText.length);
+            if (tail.length > 0)
+                yield { type: 'text_delta', contentIndex: 0, delta: tail, partial: merged };
+            yield { type: 'text_end', contentIndex: 0, content: text, partial: merged };
+            yield { type: 'done', reason: 'stop', message: merged };
+            resolveSettled(merged);
+        },
+        result() {
+            if (!started) {
+                started = true;
+                void (async () => {
+                    try {
+                        for await (const ignored of stream) {
+                            void ignored;
+                        }
+                    }
+                    catch (error) {
+                        rejectSettled(error);
+                    }
+                })();
+            }
+            return settledPromise;
+        },
+    };
+    return stream;
+}
 /** Add framework-owned transport retry to a provider StreamFn. Hosts opt in explicitly. */
 export function withLLMRetry(inner, input) {
     const policy = resolvePolicy(input.policy);
@@ -65,6 +268,7 @@ export function withLLMRetry(inner, input) {
             : undefined;
     return (async (model, originalContext, options) => {
         const callId = input.generateCallId?.() ?? defaultCallId();
+        __mavisRetryTrace({ event: 'call_start', scope: input.scope, provider: String(model.provider), model: String(model.id), callId });
         const callIdentity = {};
         const callState = { retryTriggered: false, requestAttempts: 0 };
         const request = await admitRequest(lifecycle, callId, originalContext);
@@ -92,6 +296,17 @@ export function withLLMRetry(inner, input) {
             }
             const preflight = await preflightAttempt(inner, model, context, options, nowMs, callIdentity, isByokProvider(model.provider), requestAttempt, request.observeAttempt(requestSettledObserver(options)));
             callState.requestAttempts = requestAttempt;
+            __mavisRetryTrace({
+                event: 'attempt_result',
+                scope: input.scope,
+                provider: String(model.provider),
+                callId,
+                attempt: requestAttempt,
+                kind: preflight.kind,
+                reason: preflight.kind === 'committed' ? undefined : preflight.failure?.error?.reason,
+                buffered: preflight.kind === 'committed' ? 0 : (preflight.failure?.buffered?.length ?? 0),
+                message: String((preflight.kind === 'committed' ? '' : preflight.failure?.error?.message) ?? '').slice(0, 200),
+            });
             if (preflight.kind === 'committed') {
                 if (requestAttempt > 1) {
                     await notify(input.observer, {
@@ -504,7 +719,13 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
         if (commitsOutput(next.value)) {
             return {
                 kind: 'committed',
-                stream: observeRequestSettlement(replayStream(stream, iterator, buffered), requestAttempt, onRequestSettled, options?.signal),
+                stream: __mavisResumeStream({
+                    inner,
+                    model,
+                    context,
+                    options,
+                    source: observeRequestSettlement(replayStream(stream, iterator, buffered), requestAttempt, onRequestSettled, options?.signal),
+                }),
             };
         }
     }
@@ -898,7 +1119,10 @@ function resolvePolicy(policy) {
 }
 function retryDelayMs(retryAfterMs, retryAttempt, policy, random) {
     if (retryAfterMs !== undefined)
-        return Math.min(policy.maxDelayMs, Math.max(0, retryAfterMs));
+        // Local patch: never wait less than the fixed cadence. A gateway that
+        // answers 'Retry-After: 0' would otherwise turn the retry loop into a
+        // busy spin (measured: 291k attempts in 27h at 0-1ms intervals).
+        return Math.max(policy.baseDelayMs, Math.min(policy.maxDelayMs, Math.max(0, retryAfterMs)));
     // Local patch: unstable upstreams retry on the fixed `baseDelayMs` cadence
     // (no exponential growth, no jitter); a server-directed Retry-After still
     // wins above.
