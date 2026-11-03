@@ -49,6 +49,16 @@ Native modules are shipped prebuilt for Electron 42 (extracted from the
 installed client), therefore `npmRebuild` is disabled in
 `electron-builder.yml` and no local toolchain is required.
 
+A local packaging run can fail with `makensis.exe timed out after 4 minutes`:
+electron-builder writes the NSIS script to `makensis` stdin and kills the
+process after a hard-coded four minutes (`builder-util/out/util.js`), which the
+maximum-compressed ~260 MB payload can exceed on a slow disk — the app payload
+is compressed before that step, so the failure is not a configuration error.
+For a workstation build either raise that timeout in `node_modules` (not a
+tracked file) or package with `compression: store`, which skips payload
+compression and yields a larger installer. The `Desktop release` runner has
+enough headroom and keeps the shipped settings.
+
 `pnpm package` exists for local verification. **Releases are built by GitHub
 Actions**: run the `Desktop release` workflow (or push a `desktop-v<version>` tag
 matching `package.json`), which packages the client on `windows-latest` and
