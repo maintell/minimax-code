@@ -37,6 +37,7 @@ function readToolCall(entry) {
             ...optionalToolCallArgs(Reflect.get(entry, 'tool_call_args')),
             ...optionalToolCallResult(Reflect.get(entry, 'tool_call_result_data')),
             ...optionalDuration(Reflect.get(entry, 'tool_call_duration_ms')),
+            ...optionalParentToolCallId(Reflect.get(entry, 'parent_tool_call_id')),
         },
     ];
 }
@@ -53,6 +54,9 @@ function optionalDuration(value) {
     return typeof value === 'number' && Number.isFinite(value)
         ? { tool_call_duration_ms: value }
         : {};
+}
+function optionalParentToolCallId(value) {
+    return typeof value === 'string' && value.length > 0 ? { parent_tool_call_id: value } : {};
 }
 function readString(value, key) {
     const field = value[key];

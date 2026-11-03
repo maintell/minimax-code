@@ -169,10 +169,14 @@ export function isMiniAppAgentAccess(value) {
 }
 const MINIAPP_CONNECTOR_PROVIDER = /^[a-z0-9_-]{1,64}$/u;
 /**
- * `deviceAccess` entries: each is one Chromium device permission the page may hold, named as
+ * `deviceAccess` entries: each is one Chromium permission the page may hold, named as
  * `navigator.permissions.query` names it. The same list bounds the manifest reader.
  */
-export const MINIAPP_DEVICE_ACCESS_ITEMS = Object.freeze(['microphone']);
+export const MINIAPP_DEVICE_ACCESS_ITEMS = Object.freeze([
+    'microphone',
+    'camera',
+    'notifications',
+]);
 export function isMiniAppDeviceAccessItem(value) {
     return MINIAPP_DEVICE_ACCESS_ITEMS.includes(value);
 }
@@ -1152,12 +1156,13 @@ function parseMiniAppWindowOptions(value) {
 export function parseMiniAppWindowState(value) {
     if (!isPlainRecord(value))
         return null;
+    const behavior = value.modeChangeReloadsPage === true ? { modeChangeReloadsPage: true } : {};
     if (value.mode === 'inline')
-        return { mode: 'inline' };
+        return { mode: 'inline', ...behavior };
     if (value.mode !== 'window')
         return null;
     const window = parseMiniAppWindowOptions(value.window);
-    return window ? { mode: 'window', window } : null;
+    return window ? { mode: 'window', window, ...behavior } : null;
 }
 /** Page-facing allowlist: `not_found` and unknown codes are not representable here. */
 export function parseMiniAppWindowResult(value) {

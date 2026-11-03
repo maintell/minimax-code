@@ -1,7 +1,7 @@
 import { THREAD_GOAL_AUTO_RECOVERABLE_USAGE_REASON, ThreadGoalBudgetLimitedError, ThreadGoalEpochConflictError, ThreadGoalObjectiveConflictError, ThreadGoalStatusConflictError, ThreadGoalTokenBudgetExhaustedError, } from '@mavis/goal';
 import { and, eq, ne } from 'drizzle-orm';
 import { localRuntimeV2Goals as goals } from '../../../infra/db/schema/goal.js';
-import { isKnownThreadGoalStatus, positiveOrNull, readRawGoalRow, rowToThreadGoalState, withGoalAccounting, } from './store-row.js';
+import { isKnownThreadGoalStatus, ownLimitFields, positiveOrNull, readRawGoalRow, rowToThreadGoalState, withGoalAccounting, } from './store-row.js';
 /** Apply a user-authored Goal mutation and advance the admission epoch. */
 export function patchThreadGoal(db, nowMs, goalId, input) {
     const existing = readRawGoalRow(db, eq(goals.goalId, goalId));
@@ -10,18 +10,22 @@ export function patchThreadGoal(db, nowMs, goalId, input) {
         throw new Error(`Thread goal not found: ${goalId}`);
     }
     assertPatchGuards(state, input);
-    const resumesTokenLimited = assertStatusTransition(state, existing?.status, input);
+    const reopensBudgetLimited = assertStatusTransition(state, existing?.status, input);
     // `updated_at_ms` is also the Goal decision epoch. A user-authored
     // mutation must invalidate an in-flight settlement even when both
     // writes happen inside the same wall-clock millisecond.
     const now = Math.max(nowMs(), state.updatedAt + 1);
-    const next = planPatchedFields(state, input, resumesTokenLimited);
+    const next = planPatchedFields(state, input, reopensBudgetLimited);
+    const requestLimit = nextOwnLimit(state.requestLimit, input.requestLimit);
+    const activeSecondsLimit = nextOwnLimit(state.activeSecondsLimit, input.activeSecondsLimit);
     const result = db
         .update(goals)
         .set({
         status: next.status,
         objective: next.objective,
         tokenBudget: next.tokenBudget,
+        requestLimit,
+        activeSecondsLimit,
         replyFingerprint: next.replyFingerprint,
         noProgressStreak: next.noProgressStreak,
         noToolStreak: next.noToolStreak,
@@ -38,8 +42,9 @@ export function patchThreadGoal(db, nowMs, goalId, input) {
         throw explainGuardedPatchMiss(db, goalId, input);
     }
     return withGoalAccounting(db, {
-        ...state,
+        ...withoutOwnLimits(state),
         ...next,
+        ...ownLimitFields(requestLimit, activeSecondsLimit),
         updatedAt: now,
         executionWait: null,
     });
@@ -63,13 +68,13 @@ function assertPatchGuards(state, input) {
 }
 /**
  * Refuse transitions the patch surface never allows and report whether this
- * patch reopens a token-limited Goal by raising or clearing its budget.
+ * patch reopens a budget-limited Goal by lifting the limit it used up.
  */
 function assertStatusTransition(state, persistedStatus, input) {
     if (input.status !== 'active')
         return false;
-    const resumesTokenLimited = reopensTokenLimitedGoal(state, input);
-    if (state.status === 'budget_limited' && !resumesTokenLimited) {
+    const reopensBudgetLimited = reopensBudgetLimitedGoal(state, input);
+    if (state.status === 'budget_limited' && !reopensBudgetLimited) {
         throw new ThreadGoalBudgetLimitedError(state.goalId);
     }
     if (!isKnownThreadGoalStatus(persistedStatus)) {
@@ -78,17 +83,33 @@ function assertStatusTransition(state, persistedStatus, input) {
     if (state.status === 'complete') {
         throw new ThreadGoalStatusConflictError(state.goalId, state.status);
     }
-    return resumesTokenLimited;
+    return reopensBudgetLimited;
 }
-function reopensTokenLimitedGoal(state, input) {
-    return (state.status === 'budget_limited' &&
-        state.statusReason === 'budget_limited(token)' &&
-        input.tokenBudget !== undefined &&
-        (input.tokenBudget === null || input.tokenBudget > state.tokensUsed));
+/**
+ * The same patch lifts the limit the Goal used up: the token budget cleared or
+ * raised above the tokens used, or the request or time limit cleared (an
+ * objective edit clears every limit it does not set itself).
+ */
+function reopensBudgetLimitedGoal(state, input) {
+    if (state.status !== 'budget_limited')
+        return false;
+    switch (state.statusReason) {
+        case 'budget_limited(token)':
+            return (input.tokenBudget !== undefined &&
+                (input.tokenBudget === null || input.tokenBudget > state.tokensUsed));
+        case 'budget_limited(main_turn)':
+            return input.requestLimit === null;
+        case 'budget_limited(active_time)':
+            return input.activeSecondsLimit === null;
+        default:
+            return (input.tokenBudget === null &&
+                input.requestLimit === null &&
+                input.activeSecondsLimit === null);
+    }
 }
-function planPatchedFields(state, input, resumesTokenLimited) {
+function planPatchedFields(state, input, reopensBudgetLimited) {
     const objective = planObjective(state, input);
-    const resumed = input.status === 'active' && (isResumableStop(state) || resumesTokenLimited);
+    const resumed = input.status === 'active' && (isResumableStop(state) || reopensBudgetLimited);
     const status = input.status ?? state.status;
     const statusReason = nextStatusReason(state, input);
     return {
@@ -117,6 +138,21 @@ function planObjective(state, input) {
  */
 function nextTokenBudget(state, input) {
     return input.tokenBudget === undefined ? state.tokenBudget : positiveOrNull(input.tokenBudget);
+}
+/** The state without its own caps, so a cleared cap does not survive the spread. */
+function withoutOwnLimits(state) {
+    const base = { ...state };
+    delete base.requestLimit;
+    delete base.activeSecondsLimit;
+    return base;
+}
+/**
+ * The same tri-state for the Goal's own request and time caps: `undefined`
+ * keeps the stored value, `null` clears it (back to the global default), a
+ * positive integer sets it.
+ */
+function nextOwnLimit(current, requested) {
+    return requested === undefined ? (current ?? null) : positiveOrNull(requested);
 }
 /**
  * The no-tool streak is a separate column with its own explicit clear list:

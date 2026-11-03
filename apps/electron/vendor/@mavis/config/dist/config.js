@@ -168,6 +168,14 @@ export const BETA_FEATURE_DEFS = {
     browserAgentCursor: { defaultVisibility: 'online', configurableVisibility: 'online' },
     desktopPlanMode: { defaultVisibility: 'online', configurableVisibility: 'online' },
     desktopPlanModeAgentEntry: { defaultVisibility: 'none', configurableVisibility: 'online' },
+    // On by default everywhere except the public production build: dev/test/staging through the
+    // test channel, Internal and inside packages through their build variant. An explicit `false`
+    // always wins, and explicit `true` still opts a production install in.
+    ptc: {
+        defaultVisibility: 'test',
+        defaultBuildVariants: ['internal', 'inside'],
+        configurableVisibility: 'online',
+    },
     peek: { defaultVisibility: 'test', configurableVisibility: 'test' },
     keepAlive: { defaultVisibility: 'test', configurableVisibility: 'test' },
     promptOverride: { defaultVisibility: 'test', configurableVisibility: 'test' },
@@ -184,6 +192,7 @@ export const BETA_FEATURE_DEFS = {
         defaultVisibility: 'online',
         configurableVisibility: 'online',
     },
+    pluginMarketplaces: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
 };
 assertBetaFeatureDefinitions(BETA_FEATURE_DEFS);
 function getBetaFeatureChannel(context) {
@@ -692,8 +701,7 @@ const DEFAULTS = {
         enabled: true,
     },
     promptSuggestion: {
-        // Explicit opt-in because this performs one additional model request.
-        enabled: false,
+    // Unset: the effective default is resolved with the remote policy.
     },
     cli: {
         spawn: {
@@ -926,6 +934,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         defaultLightModel: typeof raw.defaultLightModel === 'string' ? raw.defaultLightModel : undefined,
         skipWindowsHardSafetyChecks: raw.skipWindowsHardSafetyChecks === true,
         skipParentDeathGuard: raw.skipParentDeathGuard === true,
+        diagnostics: parseDiagnosticsConfig(raw.diagnostics),
         ...parseStartupRecoveryFault(raw.startupRecoveryFault),
         permissionMode: typeof raw.permissionMode === 'string' &&
             ['default', 'bypassPermissions', 'auto', 'off'].includes(raw.permissionMode)
@@ -986,23 +995,40 @@ export function resolveConfigFromRaw(raw, dataDir) {
         sandbox: parseSandboxConfig(raw.sandbox),
     };
 }
+/** Only an absolute, non-empty `steerFaultFile` string enables the tree. */
+export function parseDiagnosticsConfig(raw) {
+    if (raw == null || typeof raw !== 'object' || Array.isArray(raw))
+        return undefined;
+    const steerFaultFile = Reflect.get(raw, 'steerFaultFile');
+    if (typeof steerFaultFile !== 'string' || !path.isAbsolute(steerFaultFile))
+        return undefined;
+    return { steerFaultFile };
+}
 // ── Beta features config parsing ────────────────────────────────
 function parseBetaConfig(raw) {
     const obj = raw.beta != null && typeof raw.beta === 'object' && !Array.isArray(raw.beta)
         ? raw.beta
         : {};
-    const context = {
+    const context = currentBetaResolutionContext();
+    const result = {};
+    for (const key of Object.keys(BETA_FEATURE_DEFS)) {
+        result[key] = resolveBetaFeature(key, obj[key], context);
+    }
+    return result;
+}
+/**
+ * The build facts `parseBetaConfig` resolves every flag with. Exported so a caller holding a
+ * raw (unparsed) config can resolve one flag exactly as `getConfig()` would for this process,
+ * instead of rebuilding the context and drifting from it.
+ */
+export function currentBetaResolutionContext() {
+    return {
         buildEnv: getRuntimeBuildEnv(),
         defaultBuildEnvironment: getBetaDefaultBuildEnvironment(),
         internalBuild: isInternalBuild(),
         insideBuild: isInsideBuild(),
         mcodeToolsDevMode: process.env.MAVIS_DEV_MCODE_TOOLS_MODE === 'published' ? 'published' : undefined,
     };
-    const result = {};
-    for (const key of Object.keys(BETA_FEATURE_DEFS)) {
-        result[key] = resolveBetaFeature(key, obj[key], context);
-    }
-    return result;
 }
 // ── Skill Evolve config parsing ─────────────────────────────────
 /**
@@ -1225,12 +1251,9 @@ function parsePromptSuggestionConfig(raw) {
     const enabled = value != null && typeof value === 'object' && !Array.isArray(value)
         ? value.enabled
         : undefined;
-    // Internal builds dogfood the feature, so an unset value means on there; an
-    // explicit `false` still wins. Resolved at parse time, like `promptConfig`.
-    const defaultEnabled = DEFAULTS.promptSuggestion.enabled || isInternalBuild();
-    return typeof enabled === 'boolean'
-        ? { enabled, enabledSource: 'explicit' }
-        : { enabled: defaultEnabled, enabledSource: 'default' };
+    // Keep "never chose" distinct from an explicit `false`: the effective default
+    // depends on the remote policy, which parsing cannot see.
+    return typeof enabled === 'boolean' ? { enabled } : {};
 }
 // ── CLI config parsing ──────────────────────────────────────────
 function parseCliConfig(raw) {

@@ -4,12 +4,16 @@ import * as path from "node:path";
 import { dataDirFs, dataDirFsConstants } from "./data-dir-fs.js";
 import { resolveLocalRuntimeDataDir, getDefaultLocalRuntimeDataParentDir, resolveLocalRuntimeDataDirFromParent, getConfiguredLocalRuntimeDataParentDir, setConfiguredLocalRuntimeDataParentDir } from "./data-dir";
 import { blockUtilityRuntimeStart } from "./runtime-start-guard";
+import { createPendingVerification } from "./data-dir-relocation-guard";
 import { assertInternalDataDirStorage, DataDirStorageError, probeDataDirWrites, looksLikeCloudSyncedPath } from "./data-dir-storage";
 export class LocalRuntimeDataDirRelocationError extends Error {
-    constructor(code, message, cause) {
+    constructor(code, message, cause,
+    /** Which internal-disk rule rejected the target, with the detected enum values. */
+    diskCheck) {
         super(message);
         this.code = code;
         this.cause = cause;
+        this.diskCheck = diskCheck;
         this.name = 'LocalRuntimeDataDirRelocationError';
     }
 }
@@ -278,7 +282,11 @@ function restoreDataDirEnv(snapshot) {
     else
         process.env.__MAVIS_RUNTIME_PROFILE = snapshot.legacyProfile;
 }
-function clearDataDirEnv() {
+/**
+ * app.relaunch() inherits process.env, and an inherited data-dir env wins over the
+ * desktop config. Clear it before any relaunch that changes the configured directory.
+ */
+export function clearDataDirEnv() {
     delete process.env.MINIMAX_DATA_DIR;
     delete process.env.MAVIS_DATA_DIR;
     delete process.env.__MAVIS_RUNTIME_DATA_DIR;
@@ -326,7 +334,7 @@ export async function relocateLocalRuntimeDataDir(options) {
     }
     catch (error) {
         if (error instanceof DataDirStorageError) {
-            throw new LocalRuntimeDataDirRelocationError(error.code, error.message);
+            throw new LocalRuntimeDataDirRelocationError(error.code, error.message, undefined, error.diskCheck);
         }
         throw error;
     }
@@ -422,6 +430,7 @@ export async function relocateLocalRuntimeDataDir(options) {
         await options.saveConfig({
             localRuntimeDataParentDir: targetParentDir,
             localRuntimePreviousDataParentDirs: nextPreviousParentDirs,
+            localRuntimeDataDirPendingVerification: createPendingVerification(targetParentDir, options.previousConfig),
         });
         configCommitted = true;
         setConfiguredLocalRuntimeDataParentDir(targetParentDir);
@@ -452,7 +461,10 @@ export async function relocateLocalRuntimeDataDir(options) {
         }
         releaseRuntimeStartBlockOnce();
         if (configCommitted) {
-            await options.saveConfig(options.previousConfig);
+            await options.saveConfig({
+                ...options.previousConfig,
+                localRuntimeDataDirPendingVerification: undefined,
+            });
             setConfiguredLocalRuntimeDataParentDir(previousConfiguredLocalRuntimeDataParentDir);
             restoreDataDirEnv(previousDataDirEnv);
         }

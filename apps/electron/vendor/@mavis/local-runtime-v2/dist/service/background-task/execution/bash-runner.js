@@ -326,6 +326,7 @@ function executeBash(input, output, timing) {
             ...(input.toolCtx.forceReadOnlyFilesystem ? { forceReadOnlyFilesystem: true } : {}),
         },
         workspaceRoot: input.parentSession.workspaceDir || input.host.resolveDefaultWorkspaceDir(),
+        ...(input.toolCtx.workspaceRoots ? { workspaceRoots: input.toolCtx.workspaceRoots } : {}),
         command: input.command,
         ...(input.permissionExecutionPlan
             ? { permissionExecutionPlan: input.permissionExecutionPlan }

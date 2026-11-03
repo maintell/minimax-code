@@ -4,6 +4,8 @@ import {} from '@mavis/agent-core/tools';
 import { prepareBashTurnTools } from '../assembly/local-turn-tool-catalog.js';
 import { createPluginAgentRoster } from '../assembly/turn-capability-lifecycle.js';
 import { buildCompletedTerminalStatusEvent, buildRuntimeWarningEvent, } from '@mavis/agent-core/event-bridge';
+import { withPtcCompactionReminder } from './ptc/compaction-reminder.js';
+import { createPtcTurnCompactionReminder, observePtcTurnAdmission, preparePtcExecution, } from './ptc/turn-preparation.js';
 import { beginLocalPluginHookTurn, createLocalPluginHookEventReporter, emitLocalPluginHookWarnings, localPluginHookCoordinator as pluginHookCoordinator, } from '../assembly/local-turn-plugin-hooks.js';
 import { copyCanonicalHistoryForPiCompatibility } from '../history/canonical-history-validation.js';
 import { assertLocalOutputFormatCapability, buildTurnPayloadTransforms, } from '../assembly/local-turn-payload-transform.js';
@@ -19,7 +21,7 @@ import { createControlledToolHooks } from './plugin-hook-tool-lifecycle.js';
 import { createExecutionBudgetReminder } from '../runner/execution-budget-reminder.js';
 import { createTurnPromptSuggestionCapture, PromptSuggestionCommitRelay, readPromptSuggestionScope, withPromptSuggestionHooks, } from '../runner/prompt-suggestion/capture.js';
 import { withExecutionObservability } from './execution-observability.js';
-import { ackCommittedToolResultTailClaims, attachCommittedFacts, attachWaitingForUser, continuationRunMode, contentReviewOptions, hostOutputTokenCap, providerHistory, requestControlledRunOptions, } from './turn-execution-policy.js';
+import { ackCommittedToolResultTailClaims, attachCommittedFacts, attachWaitingForUser, continuationRunMode, contentReviewOptions, hostOutputTokenCap, providerHistory, reconcileIntent, requestControlledRunOptions, } from './turn-execution-policy.js';
 async function emitComputerUseDefaultWarning(input, reporter) {
     if (input.preparation.agentConfig.computerUseDefaultUnavailable !== true)
         return;
@@ -248,6 +250,7 @@ export class LocalRuntimeTurnExecutor {
                 history: prepared.history,
                 signal: input.lease.signal,
                 tools: prepared.tools,
+                ...(prepared.ptcTools ? { ptcTools: prepared.ptcTools } : {}),
                 disableBuiltinToolFallback: prepared.toolResolution.disableBuiltinToolFallback,
                 toolContext: prepared.toolContext,
                 hooks: withExecutionObservability(withPromptSuggestionHooks(mergeHooks({
@@ -261,6 +264,7 @@ export class LocalRuntimeTurnExecutor {
                     toolSafetyGuard,
                     toolPolicyGuard: this.options.toolPolicyGuard,
                     finalizeToolResultForHistory: this.options.finalizeToolResultForHistory,
+                    ptcFactCollector: prepared.ptcFactCollector,
                 }), promptSuggestion?.capture), input.request.provenance.sourceContext?.executionDiagnostics === true),
                 caller: prepared.caller,
                 ...(prepared.unexpectedToolCallFallback
@@ -321,7 +325,7 @@ export class LocalRuntimeTurnExecutor {
             prepared,
             readTaskOutputTaskIds,
             runnerResult,
-            promptSuggestion: readPromptSuggestionScope(input, prepared, promptSuggestion?.capture),
+            promptSuggestion: readPromptSuggestionScope(input, prepared, promptSuggestion?.capture, runnerResult?.outcome?.replyMessageId),
         };
     }
     /** Fires the optional next-message suggestion once the Host durably committed the Turn. */
@@ -363,7 +367,8 @@ export class LocalRuntimeTurnExecutor {
         const readTaskOutputTaskIds = new Set();
         const toolResolution = preparedExecution.toolResolution;
         const admittedTools = applyProcessLocalToolResultPolicy(validateRoutedTurnTools(input.assembly.tools), this.options.cliProductPolicy === true);
-        const canConsumeNativeTaskOutput = admittedTools.some((tool) => tool.def.name === 'task_output' && (tool.source === undefined || tool.source === 'builtin'));
+        const ptc = preparePtcExecution(input.assembly.tools, admittedTools, this.options, input);
+        const canConsumeNativeTaskOutput = ptc.canConsumeNativeTaskOutput;
         const standardTools = prepareBashTurnTools(admittedTools, canConsumeNativeTaskOutput, this.options.nativeDelete?.() === true, input.preparation.agentShell);
         const toolContext = {
             ...toolResolution.context,
@@ -373,6 +378,7 @@ export class LocalRuntimeTurnExecutor {
             allowBashAutoPromotion: canConsumeNativeTaskOutput,
             canConsumeBackgroundBashOutput: canConsumeNativeTaskOutput,
             canConsumeBackgroundTaskOutput: canConsumeNativeTaskOutput,
+            ...ptc.context,
         };
         const caller = preparedExecution.caller;
         const standardSystemPrompt = joinPrompt(input.assembly.systemPromptPrefix, baseSystemPrompt);
@@ -385,6 +391,7 @@ export class LocalRuntimeTurnExecutor {
                 : { contextUsagePromptRanges: standardContextUsagePromptRanges }),
         });
         const { systemPrompt, tools, contextUsagePromptRanges } = providerContext;
+        observePtcTurnAdmission(input, ptc, this.options, { systemPrompt, tools });
         input.onContextUsagePromptRangesResolved?.(contextUsagePromptRanges);
         const userPromptPrefix = joinUserPrompt(input.assembly.userPromptPrefix, renderAgentRuntimeReminders(input.assembly.reminders), joinPrompt(preparedExecution.reminderBlocks.join('\n\n'), input.pluginHookContext
             ? `<plugin-hook-context>\n${input.pluginHookContext}\n</plugin-hook-context>`
@@ -411,12 +418,13 @@ export class LocalRuntimeTurnExecutor {
             tools,
             eventWriter,
         });
+        const memorySummary = await prepareMemorySummary(this.options.memorySummaryReminder, initialHookInput, lightweightMode);
         const backgroundReminder = await this.options.backgroundCadenceReminder?.prepare({
             hookInput: initialHookInput,
             loadFacts: preparedExecution.loadBackgroundReminder,
             hasSuccessfulTaskOutputRead: () => readTaskOutputTaskIds.size > 0,
         });
-        const beforeLlmCallHooks = await this.resolveBeforeLlmCallHooks(input, afterCompactionReminderHooks(createExecutionBudgetReminder(input.request.executionDeadlineAtMs, this.options.nowMs, this.options.canAppendExecutionBudgetReminder, this.options.logger), backgroundReminder?.hook));
+        const beforeLlmCallHooks = await this.resolveBeforeLlmCallHooks(input, withPtcCompactionReminder(createPtcTurnCompactionReminder(input, this.options), afterCompactionReminderHooks(memorySummary.hooks, createExecutionBudgetReminder(input.request.executionDeadlineAtMs, this.options.nowMs, this.options.canAppendExecutionBudgetReminder, this.options.logger), backgroundReminder?.hook)));
         validateResolvedInput({
             input,
             llm,
@@ -432,10 +440,12 @@ export class LocalRuntimeTurnExecutor {
             userMessage,
             history,
             beforeUserMessages: [
+                ...memorySummary.beforeUserMessages,
                 ...(backgroundReminder?.beforeUserMessages ?? []),
                 ...beforeBatchMessages,
             ],
             tools,
+            ...(ptc.ptcTools ? { ptcTools: ptc.ptcTools } : {}),
             toolResolution,
             toolContext,
             beforeLlmCallHooks,
@@ -452,6 +462,7 @@ export class LocalRuntimeTurnExecutor {
                 }
                 : {}),
             readTaskOutputTaskIds,
+            ptcFactCollector: ptc.ptcFactCollector,
             prepareSteering: preparedExecution.prepareSteering ?? preparePlainSteering,
         };
     }
@@ -594,49 +605,29 @@ async function cleanupPluginHookTranscriptBestEffort(cleanup) {
 function pluginHookTranscriptCleanup(writer) {
     return writer ? () => writer.cleanup() : undefined;
 }
+/** Lightweight mode drops memory from the provider context entirely. */
+async function prepareMemorySummary(reminder, hookInput, lightweightMode) {
+    if (lightweightMode || !reminder)
+        return { beforeUserMessages: [], hooks: [] };
+    return reminder.prepare({ hookInput });
+}
 /**
- * `runBeforeLLM` accumulates `appendMessage` decisions, so later hooks still
- * run. The budget reminder stays before the background cadence reminder so
- * its request-only marker precedes the durable background marker and the
- * reminder admission sees the request before that marker is registered.
+ * All reminders append durable hidden markers and `runBeforeLLM` accumulates
+ * them, so none can starve another. The order fixes where the markers sit
+ * relative to each other, identically in the request and in history: the
+ * restored Memory summary comes first because it is context for everything
+ * after it, and the budget admission measures the request before the
+ * background marker is registered.
  */
-function afterCompactionReminderHooks(budgetReminder, backgroundReminder) {
+function afterCompactionReminderHooks(memorySummaryHooks, budgetReminder, backgroundReminder) {
     return [
+        ...memorySummaryHooks,
         ...(budgetReminder ? [budgetReminder] : []),
         ...(backgroundReminder ? [backgroundReminder] : []),
     ];
 }
-/**
- * Maps the neutral runner's optional reconcile signal onto a host reconcile
- * intent. The concrete detection lives in the v2 native runner adapter; the
- * host only normalizes the approved partial content to a string.
- */
-function reconcileIntent(result) {
-    const signal = result?.reconcile;
-    if (!signal)
-        return undefined;
-    switch (signal.kind) {
-        case 'output-recall':
-            return {
-                kind: 'output-recall',
-                source: signal.source,
-                variant: signal.variant,
-                ...(signal.slowNetworkRead ? { slowNetworkRead: true } : {}),
-            };
-        case 'network-reconcile':
-            return {
-                kind: 'network-reconcile',
-                approvedContent: signal.approvedContent ?? '',
-                ...(signal.slowNetworkRead ? { slowNetworkRead: true } : {}),
-            };
-        case 'abort-reconcile':
-            return { kind: 'abort-reconcile', approvedContent: signal.approvedContent ?? '' };
-        default:
-            return undefined;
-    }
-}
 function mergeHooks(options) {
-    const { input, toolResolution, pendingToolResultTailClaims, hostBeforeLlmCallHooks, readTaskOutputTaskIds, terminalTaskOutputReadIds, toolsDisabled, toolSafetyGuard, toolPolicyGuard, finalizeToolResultForHistory, } = options;
+    const { input, toolResolution, pendingToolResultTailClaims, hostBeforeLlmCallHooks, readTaskOutputTaskIds, terminalTaskOutputReadIds, toolsDisabled, toolSafetyGuard, toolPolicyGuard, finalizeToolResultForHistory, ptcFactCollector, } = options;
     const toolHooks = createControlledToolHooks({
         input,
         permissionGuard: toolResolution.permissionGuard,
@@ -647,6 +638,7 @@ function mergeHooks(options) {
         toolSafetyGuard,
         toolPolicyGuard,
         finalizeToolResultForHistory,
+        ...(ptcFactCollector ? { ptcFactCollector } : {}),
     });
     return {
         ...input.assembly.hooks,

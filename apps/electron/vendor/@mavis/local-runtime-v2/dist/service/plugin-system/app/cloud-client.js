@@ -1,8 +1,10 @@
-import { readConnectedToolsResponse, readToolCallResponse, } from './cloud-client-response.js';
+import { readConnectedToolsResponse, readConnectorListResponse, readToolCallResponse, } from './cloud-client-response.js';
 const CONNECTOR_BASE = '/minimax-cloud/api/v1/connectors';
 // Host-process callers list tools before an interactive Mini App action, so
 // keep discovery short enough that a slow Cloud dependency fails visibly.
 const CONNECTOR_TOOL_LIST_TIMEOUT_MS = 5_000;
+// Plugin detail stays usable without Cloud, so catalog enrichment gives up quickly.
+const CONNECTOR_CATALOG_TIMEOUT_MS = 5_000;
 const CONNECTOR_TOOL_CALL_TIMEOUT_MS = 10 * 60 * 1000;
 /** Existing CloudConnectorService client used by the Host-process Connector Gateway. */
 export class ConnectorCloudClient {
@@ -16,6 +18,17 @@ export class ConnectorCloudClient {
             listConnectedTools: (input) => this.requestConnectedTools(input.credential, input.signal),
             callTool: (input) => this.requestToolCall(input, input.credential, input.onDispatch),
         };
+    }
+    /** Enabled Connector catalog with the signed-in user's connection state. */
+    async listConnectors() {
+        const payload = await this.transport.request({
+            method: 'GET',
+            path: CONNECTOR_BASE,
+            query: { include_status: true },
+            auth: 'required',
+            timeoutMs: CONNECTOR_CATALOG_TIMEOUT_MS,
+        });
+        return readConnectorListResponse(payload);
     }
     async requestConnectedTools(credential, signal) {
         const payload = await this.transport.request({

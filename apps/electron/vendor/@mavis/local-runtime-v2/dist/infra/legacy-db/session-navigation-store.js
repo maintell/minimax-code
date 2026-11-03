@@ -1,0 +1,252 @@
+import { withLocalRuntimeDb } from './db.js';
+import {} from './database-contracts.js';
+import { isNavigableUserInput, projectNavigationText, takeUnicodeCodePoints, } from './session-navigation-text.js';
+const CONTENT_HEAD_CODE_POINTS = 200;
+export class SqliteSessionInputSummaryStore {
+    dataDir;
+    constructor(dataDir) {
+        this.dataDir = dataDir;
+    }
+    async list(sessionId, options) {
+        return this.withDb((db) => runReadTransaction(db, () => readSessionInputSummaryPage(db, sessionId, options)));
+    }
+    withDb(fn) {
+        return withLocalRuntimeDb(this.dataDir, fn);
+    }
+}
+function readSessionInputSummaryPage(db, sessionId, options) {
+    if (!sessionExists(db, sessionId))
+        return undefined;
+    const rows = db
+        .prepare(`
+      SELECT id, msg_id, role, created_at_ms, data_json
+      FROM local_runtime_message_rows
+      WHERE session_id = ?
+      ORDER BY id ASC
+    `)
+        .all(sessionId);
+    const assets = db
+        .prepare(`
+      SELECT messages.id AS message_row_id,
+             assets.msg_id,
+             assets.message_created_at_ms,
+             assets.asset_index,
+             assets.asset_key,
+             assets.source_tag,
+             assets.path,
+             assets.name,
+             assets.asset_type,
+             assets.artifact_id,
+             assets.drive_node_id
+      FROM local_runtime_session_assets AS assets
+      JOIN local_runtime_message_rows AS messages
+        ON messages.session_id = assets.session_id
+       AND messages.msg_id = assets.msg_id
+      WHERE assets.session_id = ?
+      ORDER BY messages.id ASC, assets.asset_index ASC, assets.id ASC
+    `)
+        .all(sessionId);
+    const turnDiffs = db
+        .prepare(`
+      SELECT messages.id AS message_row_id,
+             diffs.file_changes_json
+      FROM local_runtime_turn_diffs AS diffs
+      JOIN local_runtime_message_rows AS messages
+        ON messages.session_id = diffs.session_id
+       AND messages.msg_id = diffs.assistant_message_id
+      WHERE diffs.session_id = ?
+      ORDER BY messages.id ASC, diffs.captured_at_ms ASC, diffs.change_set_id ASC
+    `)
+        .all(sessionId);
+    const summaries = buildSummaries(rows, assets, turnDiffs);
+    const page = paginateSummaries(summaries, options);
+    return {
+        ...page,
+        total: summaries.length,
+        scannedRows: rows.length,
+        dataJsonBytes: rows.reduce((total, row) => total + Buffer.byteLength(row.data_json), 0),
+    };
+}
+function sessionExists(db, sessionId) {
+    const session = db
+        .prepare('SELECT 1 AS found FROM local_runtime_sessions WHERE session_id = ?')
+        .get(sessionId);
+    return session?.found === 1;
+}
+function buildSummaries(rows, assets, turnDiffs) {
+    const assetsByRowId = groupAssetsByMessageRow(assets);
+    const fileChangesByRowId = groupFileChangesByMessageRow(turnDiffs);
+    const summaries = [];
+    let current;
+    for (const row of rows) {
+        const message = parseMessage(row);
+        if (!message)
+            continue;
+        if (isNavigableUserInput(message)) {
+            current = takeUserInput({ current, summaries }, row, message);
+        }
+        if (!current)
+            continue;
+        updateAssistantResponse(current, row, message);
+        addSummaryArtifacts(current, assetsByRowId.get(row.id), fileChangesByRowId.get(row.id));
+    }
+    if (current)
+        summaries.push(...finishSummary(current));
+    return summaries;
+}
+/**
+ * A `steered_user` input joins the open Turn's summary with its own anchor;
+ * any other navigable input closes that summary and opens the next one.
+ */
+function takeUserInput(state, row, message) {
+    const { current, summaries } = state;
+    if (message.kind === 'steered_user' && current) {
+        current.steeredInputs.push(messageHead(row, message));
+        return current;
+    }
+    if (current)
+        summaries.push(...finishSummary(current));
+    return {
+        userInput: messageHead(row, message),
+        steeredInputs: [],
+        artifactsByKey: new Map(),
+        fileChangePaths: new Set(),
+    };
+}
+function addSummaryArtifacts(summary, assets = [], files = []) {
+    for (const asset of assets)
+        summary.artifactsByKey.set(asset.assetKey, asset);
+    for (const file of files)
+        summary.fileChangePaths.add(file);
+}
+function updateAssistantResponse(summary, row, message) {
+    if (message.role !== 'assistant')
+        return;
+    const head = messageHead(row, message);
+    if (head.contentHead)
+        summary.assistantResponse = head;
+}
+function groupAssetsByMessageRow(rows) {
+    const grouped = new Map();
+    for (const row of rows) {
+        const artifact = toArtifact(row);
+        const existing = grouped.get(row.message_row_id);
+        if (existing)
+            existing.push(artifact);
+        else
+            grouped.set(row.message_row_id, [artifact]);
+    }
+    return grouped;
+}
+function groupFileChangesByMessageRow(rows) {
+    const grouped = new Map();
+    for (const row of rows) {
+        const files = parseChangedFiles(row.file_changes_json);
+        if (files.length === 0)
+            continue;
+        const existing = grouped.get(row.message_row_id);
+        if (existing)
+            existing.push(...files);
+        else
+            grouped.set(row.message_row_id, files);
+    }
+    return grouped;
+}
+function parseChangedFiles(value) {
+    try {
+        const parsed = JSON.parse(value);
+        if (!Array.isArray(parsed))
+            return [];
+        return parsed.flatMap((item) => {
+            if (item === null || typeof item !== 'object' || !('file' in item))
+                return [];
+            const file = item.file;
+            if (typeof file !== 'string' || file.trim().length === 0)
+                return [];
+            return [file.trim()];
+        });
+    }
+    catch {
+        return [];
+    }
+}
+function parseMessage(row) {
+    try {
+        const parsed = JSON.parse(row.data_json);
+        return {
+            ...parsed,
+            msg_id: row.msg_id,
+            ...(row.role ? { role: row.role } : {}),
+        };
+    }
+    catch {
+        return undefined;
+    }
+}
+function messageHead(row, message) {
+    const contentHead = takeUnicodeCodePoints(projectNavigationText(message.msg_content), CONTENT_HEAD_CODE_POINTS);
+    return {
+        messageRowId: row.id,
+        msgId: message.msg_id,
+        timestamp: row.created_at_ms,
+        ...(contentHead ? { contentHead } : {}),
+    };
+}
+function finishSummary(summary) {
+    const result = {
+        ...(summary.assistantResponse ? { assistantResponse: summary.assistantResponse } : {}),
+        artifacts: [...summary.artifactsByKey.values()].sort((left, right) => left.messageRowId - right.messageRowId || left.assetIndex - right.assetIndex),
+        fileChangeCount: summary.fileChangePaths.size,
+    };
+    return [summary.userInput, ...summary.steeredInputs].map((userInput) => ({
+        userInput,
+        ...result,
+    }));
+}
+function paginateSummaries(summaries, options) {
+    const end = options.beforeRowId === undefined
+        ? summaries.length
+        : findExclusiveEndIndex(summaries, options.beforeRowId);
+    const start = Math.max(0, end - options.limit);
+    const page = summaries.slice(start, end);
+    const hasMore = start > 0;
+    return {
+        summaries: page,
+        hasMore,
+        ...(hasMore && page[0] ? { nextBeforeRowId: page[0].userInput.messageRowId } : {}),
+    };
+}
+function findExclusiveEndIndex(summaries, beforeRowId) {
+    let low = 0;
+    let high = summaries.length;
+    while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        const summary = summaries[middle];
+        if (summary && summary.userInput.messageRowId < beforeRowId)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    return low;
+}
+function toArtifact(row) {
+    return {
+        messageRowId: row.message_row_id,
+        msgId: row.msg_id,
+        messageCreatedAtMs: row.message_created_at_ms,
+        assetIndex: row.asset_index,
+        assetKey: row.asset_key,
+        sourceTag: row.source_tag,
+        path: row.path,
+        ...(row.name ? { name: row.name } : {}),
+        ...(row.asset_type ? { assetType: row.asset_type } : {}),
+        ...(row.artifact_id ? { artifactId: row.artifact_id } : {}),
+        ...(row.drive_node_id ? { driveNodeId: row.drive_node_id } : {}),
+    };
+}
+function runReadTransaction(db, fn) {
+    if (!db.transaction)
+        return fn();
+    return db.transaction(fn)();
+}
+//# sourceMappingURL=session-navigation-store.js.map

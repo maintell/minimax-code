@@ -29,18 +29,7 @@ export class LocalTurnInputPreparer {
         });
         const capabilities = modelCapabilities(input.preparation.agentConfig);
         const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities, this.options.getImageEncoding?.());
-        const systemValue = await this.options.reminders.buildSystem({
-            session: input.session,
-            agent: input.agent,
-            agentConfig: input.preparation.agentConfig,
-            promptText,
-            turnId: input.lease.turnId,
-            ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
-            ...(input.history && messagesCarrySessionId(input.history, input.session.sessionId)
-                ? { sessionIdInContext: true }
-                : {}),
-        });
-        const system = validateSystemReminder(systemValue);
+        const system = validateSystemReminder(await this.options.reminders.buildSystem(systemReminderInput(input, promptText)));
         const systemBlock = optionalReminderBlock('system', system.content);
         system.finalizeTelemetry?.({
             content: systemBlock,
@@ -371,6 +360,20 @@ function backgroundTaskOrigin(messages) {
         }),
     };
 }
+/** Turn facts the system reminder owner needs; optional facts are omitted, not undefined. */
+function systemReminderInput(input, promptText) {
+    return {
+        session: input.session,
+        agent: input.agent,
+        agentConfig: input.preparation.agentConfig,
+        promptText,
+        turnId: input.lease.turnId,
+        ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
+        ...(input.history && messagesCarrySessionId(input.history, input.session.sessionId)
+            ? { sessionIdInContext: true }
+            : {}),
+    };
+}
 function validateSystemReminder(value) {
     if (!value || typeof value.content !== 'string') {
         throw new TypeError('System reminder owner returned invalid v2 facts.');
@@ -558,19 +561,19 @@ function modelCapabilities(agentConfig) {
     return readRecord(readRecord(agentConfig.model)?.capabilities);
 }
 function buildSlashSkillReminder(canonical, agentConfig) {
-    const requested = canonical.messages.reduce((found, message) => {
-        if (found)
-            return found;
-        return /^\/([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?)(?:\s|$)/u.exec(message.text.trimStart())?.[1];
-    }, undefined);
-    if (!requested)
-        return '';
     const skills = Array.isArray(agentConfig.skills) ? agentConfig.skills : [];
-    const match = skills.find((skill) => {
-        const name = readString(readRecord(skill), 'name');
-        return name?.toLowerCase() === requested.toLowerCase();
-    });
-    const name = readString(readRecord(match), 'name');
+    const names = skills
+        .map((skill) => readString(readRecord(skill), 'name'))
+        .filter((name) => name !== undefined);
+    let name;
+    for (const message of canonical.messages) {
+        const requested = /^\/([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?)(?:\s|$)/u.exec(message.text.trimStart())?.[1];
+        if (!requested)
+            continue;
+        name = names.find((candidate) => candidate.toLowerCase() === requested.toLowerCase());
+        if (name)
+            break;
+    }
     return name
         ? [
             '<system-reminder>',

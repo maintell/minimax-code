@@ -1,7 +1,8 @@
 import { defineRuntimeTool, } from '@mavis/agent-core/tools';
 import { Type } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
-import { LOCAL_BROWSER_ACTION_INPUT_CONTRACTS, LOCAL_BROWSER_ACTION_NAMES, LocalBrowserClickToolDef, LocalBrowserGetDomToolDef, LocalBrowserHoverToolDef, LocalBrowserInspectEditableTargetsToolDef, LocalBrowserInspectToolDef, LocalBrowserNavigateToolDef, LocalBrowserPasteToolDef, LocalBrowserPressKeyToolDef, LocalBrowserScreenshotToolDef, LocalBrowserScrollToolDef, LocalBrowserToolDef, LocalBrowserTypeToolDef, LocalBrowserVerifyTextToolDef, LocalBrowserWaitForToolDef, } from './builtin-browser-defs.js';
+import { BROWSER_OBSERVABLE_ACTIONS, LOCAL_BROWSER_ACTION_INPUT_CONTRACTS, LOCAL_BROWSER_ACTION_NAMES, LocalBrowserClickToolDef, LocalBrowserGetDomToolDef, LocalBrowserHoverToolDef, LocalBrowserInspectEditableTargetsToolDef, LocalBrowserInspectToolDef, LocalBrowserObserveInput, LocalBrowserNavigateToolDef, LocalBrowserPasteToolDef, LocalBrowserPressKeyToolDef, LocalBrowserScreenshotToolDef, LocalBrowserScrollToolDef, LocalBrowserToolDef, LocalBrowserTypeToolDef, LocalBrowserVerifyTextToolDef, LocalBrowserWaitForToolDef, } from './builtin-browser-defs.js';
+import { observationReadFailure, observePage, } from './local-browser-observe.js';
 export const CONTROL_IN_APP_BROWSER_SKILL_NAME = 'control-in-app-browser';
 const SCREENSHOT_DELIVERY_INSTRUCTION = 'This screenshot is model-visible inspection evidence and is not shown to the user by default. Do not proactively claim it was sent, shared, shown, or attached, and do not emit its delivery markup unless the user explicitly asks to see or receive this screenshot. When explicitly requested, emit userDelivery.mediaMarkup exactly once if userDelivery.available is true. Never expose Base64 or a data URL, and never fabricate a path or markup when delivery is unavailable.';
 const COMPACT_HOVER_SEMANTIC_SOURCES = new Set([
@@ -36,6 +37,9 @@ const pendingPostActionVisuals = new WeakMap();
 // runtime executes them concurrently. Queue them per session in arrival order
 // so the second call observes the first call's result instead of failing.
 const browserSessionQueues = new WeakMap();
+const OBSERVABLE_ACTIONS = new Set(BROWSER_OBSERVABLE_ACTIONS);
+/** Appended to the run_code Browser variant's description; the top-level definition never says it. */
+const OBSERVE_DESCRIPTION_SENTENCE = 'Page-changing actions accept observe to return the page after the action in the same call.';
 const COMPACT_INSPECT_CONTINUATION_INSTRUCTION = 'For truncated inspect results, continue with the returned continuation input; do not invent snapshot IDs or offsets.';
 class BrowserOperationTimeoutError extends Error {
     code = 'BROWSER_OPERATION_TIMEOUT';
@@ -125,7 +129,14 @@ export function buildLocalBrowserRuntimeTools(adapter, options = {}) {
     }
     return tools;
 }
-/** Builds the exact compact Browser input contract disclosed by a Host Binding. */
+/**
+ * Builds the exact compact Browser input contract disclosed by a Host Binding.
+ * The Host uses it only to validate a Plugin PreToolUse rewrite of the admitted
+ * `mcp_browser` call; it never reaches a model request. Page-changing actions
+ * accept `observe` here so a rewrite of a run_code child that carries it stays
+ * valid; the model can send `observe` only where the definition declares it
+ * (the PTC variant, `withLocalBrowserObserve`).
+ */
 export function describeLocalBrowserToolInput(target) {
     const actions = target.def.schema.properties?.action?.enum;
     const allowed = new Set(Array.isArray(actions) ? actions : []);
@@ -134,7 +145,45 @@ export function describeLocalBrowserToolInput(target) {
         .map(([action, contract]) => Type.Object({
         action: Type.Literal(action),
         input: contract.optional ? Type.Optional(contract.schema) : contract.schema,
+        ...(OBSERVABLE_ACTIONS.has(action)
+            ? { observe: Type.Optional(LocalBrowserObserveInput) }
+            : {}),
     }, { additionalProperties: false })));
+}
+/**
+ * The compact Browser definition a PTC Turn lists inside run_code: the same
+ * tool plus a declared `observe`, so a program acts and reads the result in
+ * one call. Only run_code's child catalog uses it (and a direct call of that
+ * hidden child); a Turn that lists Browser as a top-level tool keeps its
+ * definition byte for byte. The compact argument repair moves unknown
+ * top-level keys into `input`, so `observe` is set aside around it. Returns
+ * undefined for any definition that is not the compact Browser shape.
+ */
+export function withLocalBrowserObserve(def) {
+    const properties = def.schema.properties;
+    if (def.schema.type !== 'object' ||
+        !isRecord(properties) ||
+        !('action' in properties) ||
+        !('input' in properties) ||
+        'observe' in properties) {
+        return undefined;
+    }
+    const prepare = def.prepareArguments;
+    return {
+        ...def,
+        description: `${def.description} ${OBSERVE_DESCRIPTION_SENTENCE}`,
+        schema: {
+            ...def.schema,
+            properties: { ...properties, observe: Type.Optional(LocalBrowserObserveInput) },
+        },
+        prepareArguments: (args) => {
+            if (!isRecord(args) || !('observe' in args))
+                return prepare ? prepare(args) : args;
+            const { observe, ...rest } = args;
+            const prepared = prepare ? prepare(rest) : rest;
+            return isRecord(prepared) ? { ...prepared, observe } : prepared;
+        },
+    };
 }
 function buildDetailedBrowserRuntimeTools(adapter, options, availableActions) {
     const tools = [
@@ -227,6 +276,18 @@ function createBrowserCompactRuntimeTool(adapter, options, availableActions) {
                 // Eval 777827: `{"action":"press_key\">"}` arrived with its fields lost.
                 `Missing input for browser action "${action}". Put the action's fields inside "input", for example {"action": "${action}", "input": {...}}.`, 'invalid_input');
             }
+            // Declared only by the run_code variant (withLocalBrowserObserve); the
+            // top-level schema rejects it before execute, so a direct Turn never
+            // gets here with it.
+            const observe = input.observe;
+            if (observe !== undefined) {
+                if (!OBSERVABLE_ACTIONS.has(action)) {
+                    return browserToolError(LocalBrowserToolDef.name, action, `observe is accepted only by page-changing actions (${[...OBSERVABLE_ACTIONS].join(', ')}).`, 'invalid_input');
+                }
+                if (!Value.Check(LocalBrowserObserveInput, observe)) {
+                    return browserToolError(LocalBrowserToolDef.name, action, 'observe must be { kind: "inspect" | "text", selector?, waitForText?, timeout?, maxChars? }.', 'invalid_input');
+                }
+            }
             const rawInput = normalizeBrowserActionInput(action, input.input ?? {});
             if (!Value.Check(contract.schema, rawInput)) {
                 return browserToolError(LocalBrowserToolDef.name, action, describeBrowserContractMismatch(action, contract.schema, rawInput), 'invalid_input');
@@ -236,7 +297,7 @@ function createBrowserCompactRuntimeTool(adapter, options, availableActions) {
             if (semanticError) {
                 return browserToolError(LocalBrowserToolDef.name, action, semanticError, 'invalid_input');
             }
-            return executeBrowserAction(LocalBrowserToolDef.name, action, adapter, ctx, validatedInput, signal, 'compact', options.preprocessScreenshot, options.browserSkillSessionStore, options.postActionVisualCountByTurn, options.interactiveTakeover);
+            return executeBrowserAction(LocalBrowserToolDef.name, action, adapter, ctx, validatedInput, signal, 'compact', options.preprocessScreenshot, options.browserSkillSessionStore, options.postActionVisualCountByTurn, options.interactiveTakeover, observe);
         },
     });
 }
@@ -260,7 +321,7 @@ function browserProviderNavigationGuidance(provider) {
     }
     return 'Follow the active Browser provider navigation policy when choosing between navigate and open_tab.';
 }
-async function executeBrowserAction(toolName, action, adapter, ctx, input, signal, exposure = 'full', preprocessScreenshot, browserSkillSessionStore, postActionVisualCountByTurn, interactiveTakeover = true) {
+async function executeBrowserAction(toolName, action, adapter, ctx, input, signal, exposure = 'full', preprocessScreenshot, browserSkillSessionStore, postActionVisualCountByTurn, interactiveTakeover = true, observe) {
     let releaseSession;
     try {
         releaseSession = await acquireBrowserSessionTurn(adapter, ctx.sessionId, signal);
@@ -285,7 +346,34 @@ async function executeBrowserAction(toolName, action, adapter, ctx, input, signa
             const postActionVisual = action === 'screenshot' || action === 'run_script'
                 ? undefined
                 : await capturePostActionVisual(action, rawInput, rawResult, adapter, ctx, operationSignal, preprocessScreenshot, postActionVisualCountByTurn);
-            return browserToolResult(toolName, action, result, exposure, postActionVisual, interactiveTakeover);
+            const actionResult = browserToolResult(toolName, action, result, exposure, postActionVisual, interactiveTakeover);
+            // An ordinary click that navigated reports UNEXPECTED_NAVIGATION: the
+            // input did run and the page moved, which is exactly when the model
+            // must read the new page. Observe it instead of spending a round trip.
+            const navigated = readResultCode(actionResult) === 'UNEXPECTED_NAVIGATION';
+            if (!observe ||
+                (actionResult.isError && !navigated) ||
+                readRequiredNextToolMarker(actionResult)) {
+                return actionResult;
+            }
+            // Read only after the post-action screenshot has settled: the provider
+            // admits one action per session and refuses a read sent alongside it.
+            await waitForPendingPostActionVisual(adapter, ctx.sessionId, operationSignal);
+            let observed;
+            let waitTimedOut = false;
+            try {
+                const observation = await observePage(observe, adapter, ctx, operationSignal, MAX_PENDING_VISUAL_SETTLE_MS);
+                waitTimedOut = observation.waitTimedOut;
+                observed = browserToolResult(toolName, observation.kind === 'inspect' ? 'inspect' : 'query', observation.result, exposure, undefined, interactiveTakeover);
+            }
+            catch (error) {
+                // Cancellation keeps its existing path; any other read failure is
+                // observation evidence and must not turn the finished action into an error.
+                if (operationSignal.aborted)
+                    throw error;
+                observed = observationReadFailure(toolName, observe, error);
+            }
+            return withObservation(actionResult, observed, waitTimedOut);
         }, LOCAL_BROWSER_TOOL_TIMEOUT_MS, 'Local Browser tool', signal);
     }
     catch (error) {
@@ -428,6 +516,11 @@ function browserToolResult(toolName, action, result, exposure, postActionVisual,
             action,
             result: sanitized,
         },
+        // A run_code program reads refs, effects and URLs from data instead of
+        // re-parsing the text; it carries exactly the bounded result the text
+        // shows. Agent Core drops `programmatic` from model-visible results, so a
+        // direct call is unchanged.
+        programmatic: { data: { action, result: sanitized } },
         ...(isError ? { isError: true } : {}),
     };
 }
@@ -501,6 +594,69 @@ function summarizeScriptResult(result, imagesOmitted = false) {
         }));
     }
     return summary;
+}
+function readResultCode(result) {
+    const details = isRecord(result.details) ? result.details : undefined;
+    const inner = details && isRecord(details.result) ? details.result : undefined;
+    return typeof inner?.code === 'string' ? inner.code : undefined;
+}
+/**
+ * Nests the read under `observation` of the action result. The action keeps its
+ * own effect fields; the observation is evidence the model judges. An
+ * observation that itself requires user takeover keeps that marker, so the
+ * model is still told to call ask_user next.
+ *
+ * A click that navigated (UNEXPECTED_NAVIGATION) fails only because it asks
+ * the caller to read the new page before continuing. Once the observation has
+ * read that page the request is met, so the result is no longer an error:
+ * `success` becomes true, `navigation.detected` and `code` stay so the model
+ * still sees that the URL changed. Without this a program checking r.isError
+ * returns before it can use the observation, costing the round trip back.
+ */
+function withObservation(actionResult, observed, waitTimedOut) {
+    const actionDetails = isRecord(actionResult.details) ? actionResult.details : {};
+    const observedDetails = isRecord(observed.details) ? observed.details : {};
+    const observedResult = isRecord(observedDetails.result) ? observedDetails.result : {};
+    const observation = {
+        ...observedResult,
+        ...(waitTimedOut ? { waitTimedOut: true } : {}),
+        ...(observed.isError ? { observationFailed: true } : {}),
+    };
+    const safety = isRecord(observedResult.safety) ? observedResult.safety : undefined;
+    const actionFields = isRecord(actionDetails.result) ? actionDetails.result : {};
+    const navigationRead = actionFields.code === 'UNEXPECTED_NAVIGATION' && !observed.isError;
+    const result = {
+        ...actionFields,
+        ...(navigationRead
+            ? {
+                success: true,
+                error: undefined,
+                recovery: 'The click navigated; observation is the new page. Use its refs.',
+            }
+            : {}),
+        observation,
+        ...(safety ? { safety } : {}),
+    };
+    const action = actionDetails.action;
+    const text = JSON.stringify({ action, result });
+    return {
+        tool_name: actionResult.tool_name,
+        text,
+        content: [
+            { type: 'text', text },
+            ...actionResult.content.filter((block) => block.type !== 'text'),
+            ...observed.content.filter((block) => block.type !== 'text'),
+        ],
+        details: { ...actionDetails, result },
+        programmatic: { data: { action, result } },
+        ...(actionResult.isError && !navigationRead ? { isError: true } : {}),
+    };
+}
+function readRequiredNextToolMarker(result) {
+    const details = isRecord(result.details) ? result.details : undefined;
+    const inner = details && isRecord(details.result) ? details.result : undefined;
+    const safety = inner && isRecord(inner.safety) ? inner.safety : undefined;
+    return typeof safety?.requiredNextTool === 'string' ? safety.requiredNextTool : undefined;
 }
 const POST_ACTION_VISUAL_PADDING_PX = 48;
 const POST_ACTION_VISUAL_MAX_CLIP_EDGE_PX = 4_096;
@@ -998,12 +1154,12 @@ const AUTHENTICATION_TAKEOVER_SAFETY = {
     classification: 'authentication_user_takeover',
     mutationAllowed: false,
     requiredNextTool: 'ask_user',
-    instruction: 'Call the actual ask_user tool call now so the user can take over this same Browser tab. Do not write <ask_user>, ask_user(...), or a prose placeholder; text does not pause the turn.',
+    instruction: "If you have not already asked about this sign-in, call the actual ask_user tool now as a question that waits for the user's answer, so the user can sign in on this same Browser tab. Do not write <ask_user>, ask_user(...), or a prose placeholder; text does not pause the turn. Inspect this tab again only after the user answers that they signed in.",
 };
 const CREDENTIAL_SIGN_IN_SAFETY = {
     classification: 'authentication_credential_prompt',
     mutationAllowed: true,
-    instruction: "No takeover surface: sign in yourself with credentials the user or task supplied, or an account this sign-in page publishes for that user or task. If values are missing, request them with ask_user when available; otherwise report what is missing and continue the rest of the task. Never guess credentials or echo secrets.",
+    instruction: 'No takeover surface: sign in yourself with credentials the user or task supplied, or an account this sign-in page publishes for that user or task. If values are missing, request them with ask_user when available; otherwise report what is missing and continue the rest of the task. Never guess credentials or echo secrets.',
 };
 function appendBrowserSafetyGuidance(action, result, interactiveTakeover) {
     if (!isRecord(result))

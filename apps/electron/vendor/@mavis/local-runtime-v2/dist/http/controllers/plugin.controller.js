@@ -2,7 +2,7 @@
 // Regeneration never overwrites an existing controller file.
 import {} from '@mavis/thrift-gen/generated/desktop-service/types';
 import { PluginControllerBase } from '../generated/plugin-controller-base.gen.js';
-import { AppError, NotImplementedError } from '../errors.js';
+import { AppError, NotImplementedError, toErrorBody } from '../errors.js';
 import { PluginDesktopFacadeError, PluginSystemCloudTransportError, PluginSystemError, } from '../../service/plugin-system/index.js';
 export class PluginController extends PluginControllerBase {
     pluginSystem;
@@ -55,6 +55,30 @@ export class PluginController extends PluginControllerBase {
         void ctx;
         return mapPluginFacadeError(() => this.pluginSystem.importGithubPlugin(req));
     }
+    async updatePlugin(ctx, req) {
+        void ctx;
+        return mapPluginFacadeError(() => this.pluginSystem.updatePlugin(req));
+    }
+    async listPluginMarketplaces(ctx, req) {
+        void ctx;
+        return mapPluginFacadeError(() => this.pluginSystem.listPluginMarketplaces(req));
+    }
+    async addPluginMarketplace(ctx, req) {
+        void ctx;
+        return mapPluginFacadeError(() => this.pluginSystem.addPluginMarketplace(req));
+    }
+    async refreshPluginMarketplaces(ctx, req) {
+        void ctx;
+        return mapPluginFacadeError(() => this.pluginSystem.refreshPluginMarketplaces(req));
+    }
+    async setPluginMarketplaceAutoUpdate(ctx, req) {
+        void ctx;
+        return mapPluginFacadeError(() => this.pluginSystem.setPluginMarketplaceAutoUpdate(req));
+    }
+    async removePluginMarketplace(ctx, req) {
+        void ctx;
+        return mapPluginFacadeError(() => this.pluginSystem.removePluginMarketplace(req));
+    }
 }
 const unimplementedPluginSystem = {
     listMarketplacePlugins: () => Promise.reject(new NotImplementedError('listMarketplacePlugins')),
@@ -68,6 +92,12 @@ const unimplementedPluginSystem = {
     refresh: () => Promise.reject(new NotImplementedError('refreshPlugins')),
     previewGithubPlugin: () => Promise.reject(new NotImplementedError('previewGithubPlugin')),
     importGithubPlugin: () => Promise.reject(new NotImplementedError('importGithubPlugin')),
+    updatePlugin: () => Promise.reject(new NotImplementedError('updatePlugin')),
+    listPluginMarketplaces: () => Promise.reject(new NotImplementedError('listPluginMarketplaces')),
+    addPluginMarketplace: () => Promise.reject(new NotImplementedError('addPluginMarketplace')),
+    refreshPluginMarketplaces: () => Promise.reject(new NotImplementedError('refreshPluginMarketplaces')),
+    setPluginMarketplaceAutoUpdate: () => Promise.reject(new NotImplementedError('setPluginMarketplaceAutoUpdate')),
+    removePluginMarketplace: () => Promise.reject(new NotImplementedError('removePluginMarketplace')),
 };
 export const pluginController = new PluginController();
 async function mapPluginFacadeError(operation) {
@@ -76,16 +106,8 @@ async function mapPluginFacadeError(operation) {
     }
     catch (error) {
         if (error instanceof PluginDesktopFacadeError) {
-            if (error.code === 'PLUGIN_NOT_FOUND') {
-                throw new AppError(404, error.code, 'Plugin not found');
-            }
-            if (error.code === 'PLUGIN_AUTH_REQUIRED') {
-                throw new AppError(401, error.code, 'Login is required');
-            }
-            if (error.code === 'PLUGIN_AUTH_SYNC_TIMEOUT') {
-                throw new AppError(503, error.code, 'Login state is still synchronizing');
-            }
-            throw new AppError(400, error.code, 'Invalid Plugin request');
+            const mapped = FACADE_ERRORS.get(error.code);
+            throw new AppError(mapped?.status ?? 400, error.code, mapped?.message ?? 'Invalid Plugin request');
         }
         if (error instanceof PluginSystemCloudTransportError) {
             if (error.code === 'AUTH_REQUIRED') {
@@ -101,11 +123,38 @@ async function mapPluginFacadeError(operation) {
         throwPluginSystemError(error);
     }
 }
+const FACADE_ERRORS = new Map([
+    ['PLUGIN_NOT_FOUND', { status: 404, message: 'Plugin not found' }],
+    ['PLUGIN_AUTH_REQUIRED', { status: 401, message: 'Login is required' }],
+    ['PLUGIN_AUTH_SYNC_TIMEOUT', { status: 503, message: 'Login state is still synchronizing' }],
+    [
+        'PLUGIN_MARKETPLACE_UNAVAILABLE',
+        { status: 503, message: 'Plugin marketplaces are unavailable' },
+    ],
+    ['PLUGIN_UPDATE_UNSUPPORTED', { status: 409, message: 'Plugin cannot be updated' }],
+]);
+/**
+ * Keeps the standard error body and adds the domain `reasonCode` (for example
+ * the Git failure class `AUTH_REQUIRED` or `TIMEOUT`) for UI hints.
+ */
+class PluginReasonError extends AppError {
+    reasonCode;
+    constructor(mapped, reasonCode) {
+        super(mapped.status, mapped.key, mapped.message, mapped.retryable);
+        this.reasonCode = reasonCode;
+    }
+    getResponse() {
+        return new Response(JSON.stringify({ ...toErrorBody(this), reasonCode: this.reasonCode }), {
+            status: this.status,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+}
 function throwPluginSystemError(error) {
     const mapped = mapPluginSystemAppError(error.code);
-    if (mapped)
-        throw mapped;
-    throw error;
+    if (!mapped)
+        throw error;
+    throw error.reasonCode ? new PluginReasonError(mapped, error.reasonCode) : mapped;
 }
 function mapPluginSystemAppError(code) {
     if (code === 'DISPOSED') {
@@ -122,12 +171,53 @@ function mapPluginSystemAppError(code) {
     if (code === 'PLUGIN_IMPORT_UNAVAILABLE') {
         return new AppError(503, code, 'Git repository import is unavailable');
     }
+    const mapped = PLUGIN_IDENTITY_ERRORS.get(code) ?? marketplaceError(code);
+    if (mapped)
+        return new AppError(mapped.status, code, mapped.message);
     if (GITHUB_UPSTREAM_CODES.has(code))
         return new AppError(502, code, 'GitHub is unavailable');
     if (isGithubImportValidationCode(code)) {
         return new AppError(422, code, 'GitHub Plugin cannot be imported');
     }
     return undefined;
+}
+const PLUGIN_IDENTITY_ERRORS = new Map([
+    ['PLUGIN_ID_AMBIGUOUS', { status: 409, message: 'Plugin name matches several Plugins' }],
+    ['PLUGIN_ID_INVALID', { status: 400, message: 'Invalid Plugin id' }],
+    ['PLUGIN_UPDATE_UNSUPPORTED', { status: 409, message: 'Plugin cannot be updated' }],
+    ['PLUGIN_NOT_ENABLED', { status: 409, message: 'Plugin is disabled' }],
+    ['PLUGIN_SOURCE_MISSING', { status: 422, message: 'Plugin folder is missing' }],
+    ['PLUGIN_LINK_INVALID', { status: 422, message: 'Plugin folder cannot be linked' }],
+]);
+const MARKETPLACE_CONFLICT_CODES = new Set([
+    'PLUGIN_MARKETPLACE_NAME_RESERVED',
+    'PLUGIN_MARKETPLACE_NAME_TAKEN',
+    'PLUGIN_MARKETPLACE_ENTRY_UNAVAILABLE',
+    'PLUGIN_MARKETPLACE_UPDATE_UNSUPPORTED',
+    'PLUGIN_MARKETPLACE_UNINSTALL_FAILED',
+]);
+/**
+ * Marketplace failures: an unreachable Git remote is 502, a missing
+ * marketplace 404, a build without the feature 403, a reserved or taken name
+ * and an entry or Plugin state that forbids the action 409, and a source or
+ * catalog that cannot be used 422.
+ */
+function marketplaceError(code) {
+    if (!code.startsWith('PLUGIN_MARKETPLACE_'))
+        return undefined;
+    if (code === 'PLUGIN_MARKETPLACE_UNREACHABLE') {
+        return { status: 502, message: 'Plugin marketplace is unreachable' };
+    }
+    if (code === 'PLUGIN_MARKETPLACE_NOT_FOUND') {
+        return { status: 404, message: 'Plugin marketplace not found' };
+    }
+    if (code === 'PLUGIN_MARKETPLACE_DISABLED') {
+        return { status: 403, message: 'Plugin marketplaces are not available in this build' };
+    }
+    if (MARKETPLACE_CONFLICT_CODES.has(code)) {
+        return { status: 409, message: 'Plugin marketplace action conflicts with its state' };
+    }
+    return { status: 422, message: 'Plugin marketplace cannot be used' };
 }
 const GITHUB_UPSTREAM_CODES = new Set([
     'GITHUB_UNAVAILABLE',

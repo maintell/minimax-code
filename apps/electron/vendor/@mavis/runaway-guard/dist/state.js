@@ -20,6 +20,7 @@ export function snapshotTurnSummary(ctx, state) {
         agentName: ctx.agentName,
         stepCount: state.stepIndex,
         projectionSkippedCount: state.fingerprintSkippedCount,
+        childStepsProjected: state.childStepsProjected,
         reminderInjected: state.reminderInjected,
         signals: snapshotSignalStats(state.signalStats),
     };
@@ -48,6 +49,7 @@ export function newShadowState() {
         secret: randomBytes(32),
         stepIndex: 0,
         fingerprintSkippedCount: 0,
+        childStepsProjected: 0,
         reminderAttempted: false,
         reminderInjected: false,
         signalStats: createSignalStats(),

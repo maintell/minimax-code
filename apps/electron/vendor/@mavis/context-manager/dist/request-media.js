@@ -1,6 +1,7 @@
 import { isContextOverflow, } from '@earendil-works/pi-ai';
 import { formatDimensionNote, ImageProcessorUnavailableError, resizeImage, } from '@earendil-works/pi-coding-agent/image-resize';
 import { isLLMImageLimitMessage, isLLMRequestTooLargeMessage, listRequestImages, replaceRequestImages, resolveMaxImagesPerRequest, } from '@mavis/agent-core/pi-turn-runner';
+import { recordImageEncodedContent } from '@mavis/agent-core/tools';
 /** Strictest known per-image provider limit, in base64 bytes. */
 export const PROVIDER_IMAGE_MAX_BASE64_BYTES = 5 * 1024 * 1024;
 // Request body budget assumed when the host declares none; matches the
@@ -150,38 +151,63 @@ const IMAGE_PROCESSOR_UNAVAILABLE_NOTE = '[Image omitted: image processing runti
  * image over the limits is replaced with `IMAGE_PROCESSOR_UNAVAILABLE_NOTE`
  * when the image processor cannot load, as the Read tool did, and an image it
  * cannot decode is replaced with a note, so its bytes never enter history.
+ *
+ * The returned array is marked with what happened to each changed image
+ * (recordImageEncodedContent), so PTC can report a native read's image as
+ * resized or omitted instead of as rewritten by an unknown hook. Output with
+ * an undecodable image is not marked: there is no image state to report.
  */
 export async function encodeRequestImageBlocks(blocks, encoding = DEFAULT_REQUEST_IMAGE_ENCODING) {
-    let changed = false;
-    const encoded = await Promise.all(blocks.map(async (block) => {
-        const { data, mimeType } = block;
-        if (block.type !== 'image' || typeof data !== 'string' || typeof mimeType !== 'string') {
-            return [block];
-        }
-        const bytes = Buffer.from(data, 'base64');
-        const encodedImage = await encodeImageOrUnavailable(bytes, mimeType, encoding);
-        if (encodedImage === PROCESSOR_UNAVAILABLE) {
-            changed = true;
-            return [{ type: 'text', text: IMAGE_PROCESSOR_UNAVAILABLE_NOTE }];
-        }
-        if (encodedImage === 'undecodable') {
-            changed = true;
-            const text = `[Image omitted: the ${mimeType} data (${bytes.length} bytes) could not be decoded; it may be corrupt, truncated, or in an unsupported format.]`;
-            return [{ type: 'text', text }];
-        }
-        if (!encodedImage)
-            return [block];
-        changed = true;
-        const image = { ...block, ...encodedImage.image };
-        return encodedImage.dimensionNote
-            ? [image, { type: 'text', text: encodedImage.dimensionNote }]
-            : [image];
-    }));
-    return changed ? encoded.flat() : undefined;
+    const encoded = await Promise.all(blocks.map((block) => encodeImageBlock(block, encoding)));
+    if (!encoded.some(({ fact }) => fact !== undefined))
+        return undefined;
+    const output = encoded.flatMap(({ blocks: next }) => next);
+    const facts = encoded.flatMap(({ fact }) => (fact ? [fact] : []));
+    if (!facts.includes('undecodable')) {
+        recordImageEncodedContent(blocks, output, facts);
+    }
+    return output;
+}
+/** One block's replacement and what changed; no fact when it is kept as it was. */
+async function encodeImageBlock(block, encoding) {
+    const { data, mimeType } = block;
+    if (block.type !== 'image' || typeof data !== 'string' || typeof mimeType !== 'string') {
+        return { blocks: [block] };
+    }
+    const bytes = Buffer.from(data, 'base64');
+    const encodedImage = await encodeImageOrUnavailable(bytes, mimeType, encoding);
+    if (encodedImage === PROCESSOR_UNAVAILABLE) {
+        return {
+            blocks: [{ type: 'text', text: IMAGE_PROCESSOR_UNAVAILABLE_NOTE }],
+            fact: { mimeType, omittedReason: 'processor_unavailable' },
+        };
+    }
+    if (encodedImage === 'undecodable') {
+        const text = `[Image omitted: the ${mimeType} data (${bytes.length} bytes) could not be decoded; it may be corrupt, truncated, or in an unsupported format.]`;
+        return { blocks: [{ type: 'text', text }], fact: 'undecodable' };
+    }
+    if (!encodedImage)
+        return { blocks: [block] };
+    const image = { ...block, ...encodedImage.image };
+    const fact = {
+        mimeType: encodedImage.image.mimeType,
+        width: encodedImage.width,
+        height: encodedImage.height,
+        originalWidth: encodedImage.originalWidth,
+        originalHeight: encodedImage.originalHeight,
+    };
+    return encodedImage.dimensionNote
+        ? { blocks: [image, { type: 'text', text: encodedImage.dimensionNote }], fact }
+        : { blocks: [image], fact };
 }
 async function encodeImage(bytes, mimeType, encoding) {
     const encoded = await encodeImageOrUnavailable(bytes, mimeType, encoding);
-    return encoded === PROCESSOR_UNAVAILABLE ? undefined : encoded;
+    if (encoded === PROCESSOR_UNAVAILABLE || encoded === undefined)
+        return undefined;
+    if (encoded === 'undecodable')
+        return encoded;
+    const { image, width, height, dimensionNote } = encoded;
+    return { image, width, height, ...(dimensionNote ? { dimensionNote } : {}) };
 }
 const PROCESSOR_UNAVAILABLE = Symbol('image processor unavailable');
 async function encodeImageOrUnavailable(bytes, mimeType, encoding) {
@@ -203,6 +229,8 @@ async function encodeImageOrUnavailable(bytes, mimeType, encoding) {
             image: { data: resized.data, mimeType: resized.mimeType },
             width: resized.width,
             height: resized.height,
+            originalWidth: resized.originalWidth,
+            originalHeight: resized.originalHeight,
         };
         const shrunk = resized.width !== resized.originalWidth || resized.height !== resized.originalHeight;
         const dimensionNote = shrunk ? formatDimensionNote(resized) : undefined;

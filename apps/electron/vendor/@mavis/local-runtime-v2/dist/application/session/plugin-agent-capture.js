@@ -1,4 +1,5 @@
 import { resolvePluginDataDirectory } from '@mavis/plugin-hooks';
+import { isAgentSelectorMcpToolName } from '../../service/turn-system/index.js';
 const PLUGIN_ROOT_PLACEHOLDERS = new Set([
     'MINIMAX_PLUGIN_ROOT',
     '\u0043LAUDE_PLUGIN_ROOT',
@@ -35,6 +36,7 @@ export function pluginAgentSource(agent) {
         agentName: agent.agentName,
         scopedName: agent.scopedName,
         packageDigest: agent.packageDigest,
+        ...(agent.origin ? { origin: agent.origin } : {}),
     };
 }
 /** @internal Exported only for focused placeholder tests. */
@@ -112,7 +114,7 @@ export function bindPluginAgentMcpSelectors(profile, agent, bindings, inventoryT
 /** Returns this Plugin's aliases for `name`, or `undefined` when another owner may own it. */
 function rebindMcpSelector(name, ownServers, own) {
     const key = selectorKey(name);
-    if (!key.startsWith(MCP_PREFIX))
+    if (!isAgentSelectorMcpToolName(key))
         return undefined;
     const aliases = own
         .filter((binding) => binding.mcpToolName !== undefined &&

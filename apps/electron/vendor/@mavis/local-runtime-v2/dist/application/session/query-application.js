@@ -34,11 +34,18 @@ export class SessionQueryApplication {
             agentName: req.agentName,
             limit: req.limit,
             cursor: req.cursor,
+            // projectIds 是云端的项目筛选，本地和 SSH 按项目 key（旧调用方按工作目录）筛选，不读它。
+            workspaceDirs: req.workspaceDirs,
+            projectKeys: req.projectKeys,
+            includeArchived: req.includeArchived,
         }));
+        const sessionProjects = Object.entries(page.projectKeys ?? {}).map(([sessionId, projectKey]) => ({ sessionId, projectKey }));
         return {
             sessions: page.sessions.map((session) => toSessionInfoView(session, this.options.sideChats.relation(session.sessionId))),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+            ...(page.messageMatches?.length ? { messageMatches: [...page.messageMatches] } : {}),
+            ...(sessionProjects.length ? { sessionProjects } : {}),
         };
     }
     async getSessionTree(_context, req) {

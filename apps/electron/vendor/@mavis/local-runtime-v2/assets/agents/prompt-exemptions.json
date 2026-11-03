@@ -30,10 +30,12 @@
     "mavis/skills/minimax-code-product/references/agents.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/skills/minimax-code-product/references/extensions.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/skills/minimax-code-product/references/hooks.md": "Built-in Skill reference, outside Prompt injection.",
+    "mavis/skills/minimax-code-product/references/miniapps.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/skills/minimax-code-product/references/workflows.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/system-prompt.md.hbs": "Legacy Agent-level fallback superseded by managed mode assets.",
     "verifier/agent.md": "Agent capability configuration, outside Prompt injection.",
     "worker/agent.md": "Agent capability configuration, outside Prompt injection.",
-    "_v2/tui/SYSTEM.md.hbs": "V2 本地模式 Prompt，合并身份、规则与功能条件；不参与 desktop_agent 动态下发。"
+    "_v2/tui/SYSTEM.md.hbs": "V2 本地模式 Prompt，合并身份、规则与功能条件；不参与 desktop_agent 动态下发。",
+    "_v2/PTC_TOOL_CALLS.md.hbs": "V2 本地 PTC 段落，只在 PTC 真正生效的回合由运行时渲染后插入主模板；不参与 desktop_agent 动态下发，远端版本和旧客户端都不需要它。"
   }
 }

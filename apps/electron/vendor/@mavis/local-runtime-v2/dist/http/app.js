@@ -15,6 +15,8 @@ import { mountWorkspaceHtmlPreviewRoutes } from './routing/workspace-html-previe
 import { mountBrowserTurnContextRoutes } from './routing/browser-turn-context.js';
 import { mountChannelCompatRoutes } from './routing/channel-compat.js';
 export { createV2AgentRuntimeManagementPort } from './controllers/agent-runtime-port.js';
+export { createLocalRuntimeHost } from './host/initialize.js';
+export { cleanupFailedV1Startup, createV1RuntimeCompatibility, withAgentStorageScope, } from './host/composition.js';
 const CRON_UNAVAILABLE_ERROR = {
     code: 'CRON_UNAVAILABLE',
     message: 'Cron is not available on this runtime host',
@@ -107,6 +109,7 @@ export function ownerCapabilitiesForServices(services) {
         // 其余宿主回落 v1 的 memory-v2-disabled 降级实现。
         memoryV2: Boolean(services?.memoryV2),
         goal: Boolean(services?.goal),
+        sessionActivity: Boolean(services?.sessionActivity),
     };
 }
 function inferOwnerCapabilities(services) {

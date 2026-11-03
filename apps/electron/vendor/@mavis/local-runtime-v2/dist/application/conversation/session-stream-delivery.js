@@ -1,15 +1,82 @@
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
 import { isSideChatSendOrigin } from '@mavis/shared/sidechat-send-origin';
 import { sanitizeDisplayAttachment, } from '../../service/session-system/index.js';
+import { isUndeliveredRetryCopy } from './undelivered-side-messages.js';
 import { turnAdmissionError } from './errors.js';
 import { queryCollapseSteeringProjection } from './query-collapse-identity.js';
 import { projectPeerMessageOrigin } from './peer-message-origin.js';
 export function mapV2TurnStreamResult(result) {
     if (!result.accepted) {
+        if (result.reason === 'side-message-undelivered') {
+            return streamError(undeliveredSideMessageError(result));
+        }
         const error = directSendAdmissionError(result.reason);
         return streamError(error);
     }
+    if ('outcome' in result)
+        return { ok: true, source: sideMessageOutcomeFrames(result) };
     return { ok: true, source: mapV2SessionFrames(result.frames) };
+}
+/**
+ * A composer side message settled without a stream of its own: a successful
+ * SSE with one outcome frame, then `[DONE]`. A queued fallback carries the
+ * Queue item so the client shows it without enqueueing again; it is the first
+ * frame (no open marker) so a client can tell it apart before any acceptance.
+ */
+function sideMessageOutcomeFrames(result) {
+    const frame = result.outcome === 'queued'
+        ? {
+            type: 'queue_fallback',
+            queue_fallback: {
+                session_id: result.sessionId,
+                item_id: result.queue.itemId,
+                item_ids: [result.queue.itemId],
+                position: result.queue.position,
+                ahead: result.queue.ahead,
+                turn_id: result.turnId,
+                reason: result.race,
+            },
+        }
+        : {
+            type: 'steer_duplicate',
+            steer_duplicate: { session_id: result.sessionId, turn_id: result.turnId },
+        };
+    const frames = [
+        ...(result.outcome === 'duplicate' ? [{ dataJson: '{"type":10}' }] : []),
+        jsonFrame(frame),
+        { dataJson: '[DONE]' },
+    ];
+    return staticFrames(frames);
+}
+/**
+ * A side message the runtime received but could neither steer nor queue. The
+ * Queue fallback already ran, so neither key is one a client should fall back
+ * on again. `detail` is JSON: recorded `{ message_id, goal_id?, reason }`, plain
+ * `{ reason }`.
+ */
+export function undeliveredSideMessageError(result) {
+    const record = result.undelivered;
+    if (!record) {
+        return {
+            status: 409,
+            key: 'local_side_message_delivery_failed',
+            message: 'The message could not be delivered to the running Turn or the Queue.',
+            detail: JSON.stringify({ reason: result.race }),
+        };
+    }
+    return {
+        status: 409,
+        key: 'local_side_message_undelivered',
+        message: 'The message could not be delivered; it was kept in the conversation and the Goal paused.',
+        detail: JSON.stringify({
+            message_id: record.messageId,
+            ...(record.goalId ? { goal_id: record.goalId } : {}),
+            reason: result.race,
+        }),
+    };
+}
+export async function* staticFrames(frames) {
+    yield* frames;
 }
 export function openV2SessionStream(frames) {
     return { ok: true, source: mapV2SessionFrames(frames) };
@@ -95,7 +162,11 @@ function mapStandardV2Frame(frame) {
     if (frame.kind === 'resync-required')
         return [{ type: 'resume_overflow' }];
     if (frame.kind === 'message-committed' || frame.kind === 'durable-message') {
-        return frameMessages(frame.data).map((message) => ({
+        // A retried undelivered message stays visible as its own row; the copy the
+        // retry delivered is never shown a second time.
+        return frameMessages(frame.data)
+            .filter((message) => !isUndeliveredRetryCopy(message))
+            .map((message) => ({
             type: 2,
             agent_message: toSseMessage(message),
         }));
@@ -400,10 +471,12 @@ function directSendAdmissionError(reason) {
     });
 }
 function isTurnContinuationAdmissionReason(reason) {
-    return reason === 'unavailable' || reason === 'waiting-for-user';
+    return (reason === 'unavailable' ||
+        reason === 'waiting-for-user' ||
+        reason === 'continuation-unavailable');
 }
 function turnContinuationAdmissionError(reason) {
-    if (reason === 'unavailable') {
+    if (reason === 'unavailable' || reason === 'continuation-unavailable') {
         return {
             status: 409,
             key: 'local_turn_continuation_unavailable',

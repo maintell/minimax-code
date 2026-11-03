@@ -86,6 +86,7 @@ export function createSandboxBashOperationsFactory(service, resolveShell = undef
                     const lease = await service.beginInvocation({
                         identity: input.identity,
                         workspaceRoot: input.workspaceRoot,
+                        ...(input.workspaceRoots ? { workspaceRoots: input.workspaceRoots } : {}),
                         cwd,
                     });
                     return executeObserved({

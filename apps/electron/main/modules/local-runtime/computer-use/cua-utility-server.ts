@@ -3,9 +3,10 @@ import { createComputerUseClient, ComputerUseError } from "@mavis/computer-use";
 import { prepareDesktopComputerUseComponent } from "./packaged-component";
 import { createPreviewTargetPublisher } from "./cua-preview-target";
 import { createCuaDisplayReader } from "./cua-displays";
+import { createCuaOverlayTargetTracker } from "./cua-overlay-target";
 import { createCuaStructuredLogger } from "./cua-logging";
 // Existing callers and mapping tests use this entry; execution is shared with TUI.
-export { mapRequestToCuaTool, validateClickAction, shouldAvoidNativeBackgroundClick, foregroundShortcutRefusal } from "@mavis/computer-use/mapping";
+export { mapRequestToCuaTool, validateClickAction } from "@mavis/computer-use/mapping";
 
 /** Desktop presentation/MessagePort adapter. Native ownership belongs to the shared client. */
 export async function startCuaUtilityServer(input) {
@@ -14,6 +15,7 @@ export async function startCuaUtilityServer(input) {
     let previewOwner;
     let requestPort;
     let stopped = false;
+    const overlayTargets = createCuaOverlayTargetTracker();
     const active = new Map();
     input.parentPort.start?.();
     const client = createComputerUseClient({
@@ -24,7 +26,7 @@ export async function startCuaUtilityServer(input) {
         logger,
         readDisplays: createCuaDisplayReader(input.parentPort, input.generation),
         onActivityChange: input.onActivityChange,
-        onOperation: input.onOperation,
+        onOperation: (request) => input.onOperation?.(request, overlayTargets.targetFor(request.requestId)),
         onOperationFinished: input.onOperationFinished,
         onRelease(sessionId, turnId) {
             if ((!sessionId || previewOwner?.sessionId === sessionId) &&
@@ -34,8 +36,15 @@ export async function startCuaUtilityServer(input) {
             }
             input.onRelease?.(sessionId, turnId);
         },
+        async onResult({ request, payload, result }) {
+            if (!stopped)
+                overlayTargets.noteResult(request, payload, result);
+        },
         async onMapped({ runtime, request, payload, signal }) {
-            if (stopped || signal.aborted || !input.onPreviewTarget || process.platform !== 'darwin')
+            if (stopped || signal.aborted)
+                return;
+            overlayTargets.noteMapped(request, payload);
+            if (!input.onPreviewTarget || process.platform !== 'darwin')
                 return;
             if (!preview ||
                 previewOwner?.generation !== runtime.generation ||
@@ -142,6 +151,7 @@ export async function startCuaUtilityServer(input) {
         })
             .finally(() => {
             active.delete(request.requestId);
+            overlayTargets.forget(request.requestId);
         });
     };
     input.parentPort.on('message', ({ data, ports }) => {

@@ -3,6 +3,11 @@ export const LOCAL_DESKTOP_RUNTIME_ID = 'local';
 /** Namespace for runtimes owned by persisted SSH projects. */
 export const SSH_PROJECT_RUNTIME_ID_PREFIX = 'ssh-project:';
 const PROJECT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+/**
+ * Remote Runtime business feature declared in the SSH app-server initialize
+ * result. A transport handshake alone never implies this feature.
+ */
+export const RUNTIME_FEATURE_PROJECT_ICON_UPDATE = 'project.icon.update';
 export function sshProjectRuntimeId(projectId) {
     if (!PROJECT_ID_PATTERN.test(projectId)) {
         throw new Error('invalid_ssh_project_id');

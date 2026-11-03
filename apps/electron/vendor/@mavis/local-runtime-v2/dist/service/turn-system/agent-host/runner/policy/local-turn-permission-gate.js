@@ -1,5 +1,6 @@
 import { withPermissionExecutionPlan } from '@mavis/agent-tools';
 import { assertAgentHostCapabilityAvailable } from '../../empty-dependencies.js';
+import { observePtcChildPermission } from '../ptc/ptc-observability.js';
 import { SIDE_SESSION_APPROVAL_REASON, sideSessionRequiresApproval, } from './side-session-approval.js';
 import { readPermissionToolRequest, } from './permission-tool-request.js';
 import { createShellReadinessGuard } from './shell-readiness-guard.js';
@@ -120,7 +121,9 @@ export class LocalTurnPermissionGate {
                 rewrite_applied: false,
                 side_session: true,
             });
-            return permissionBlock(request.toolName, SIDE_SESSION_APPROVAL_REASON, 'user');
+            return input.toolContext.parentToolCallId
+                ? userDeniedBlock(request.toolName, SIDE_SESSION_APPROVAL_REASON)
+                : permissionBlock(request.toolName, SIDE_SESSION_APPROVAL_REASON, 'user');
         }
         this.logEnforcement(input, request, {
             policy_behavior: 'ask',
@@ -291,7 +294,9 @@ export class LocalTurnPermissionGate {
                 approval_decision: approval,
                 rewrite_applied: false,
             });
-            return permissionBlock(request.toolName, decision.reason, 'user');
+            return input.toolContext.parentToolCallId
+                ? userDeniedBlock(request.toolName, decision.reason)
+                : permissionBlock(request.toolName, decision.reason, 'user');
         }
         applyExecutionPlan(input.toolContext, executionPlan);
         this.logEnforcement(input, request, {
@@ -353,6 +358,8 @@ export class LocalTurnPermissionGate {
             tool_name: request.toolName,
             ...fields,
         }, 'permission.enforcement');
+        // Every final decision passes here; a run_code child also gets its PTC line.
+        observePtcChildPermission(this.options, input, request, fields);
     }
     requestApproval(input, request, decision) {
         const approval = this.options.approval;
@@ -373,6 +380,7 @@ export class LocalTurnPermissionGate {
             ...(decision.ruleMatchers ? { ruleMatchers: decision.ruleMatchers } : {}),
             ...(input.signal ? { signal: input.signal } : {}),
             ...(input.channelContext ? { channelContext: input.channelContext } : {}),
+            ...ptcApprovalContext(input.toolContext),
         });
     }
     /** Windows-only, per-Turn handshake; no command or permission check runs in its batch. */
@@ -382,6 +390,17 @@ export class LocalTurnPermissionGate {
             resolveAgentShell: this.options.resolveAgentShell,
         });
     }
+}
+function ptcApprovalContext(context) {
+    if (!context.parentToolCallId)
+        return {};
+    // A denied child fails only that call and the program keeps running, as a
+    // native denial does, so the ask no longer sets `stopPtcOnDeny` (it only
+    // relabelled the deny button as "deny and stop").
+    return {
+        parentToolCallId: context.parentToolCallId,
+        ...(context.parentDescription ? { parentToolDescription: context.parentDescription } : {}),
+    };
 }
 function preToolHookAllowsWithoutApproval(input, decision) {
     return (input.preToolPermission?.behavior === 'allow' && decision.hookAutoApprovalEligible === true);
@@ -474,6 +493,9 @@ function permissionBlock(toolName, reason, source) {
             ? `Permission denied by user for ${toolName}: ${reason}`
             : `Permission denied for ${toolName}: ${reason}`,
     };
+}
+function userDeniedBlock(toolName, reason) {
+    return { ...permissionBlock(toolName, reason, 'user'), approvalStatus: 'denied' };
 }
 async function requestApproval(owner, input) {
     return validateApprovalDecision(await owner.request(input));

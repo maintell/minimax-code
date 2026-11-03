@@ -4,7 +4,7 @@ const EMBEDDED_BROWSER_SHORTCUT_ACTIONS = [
     'browser.open',
     'files.open',
 ];
-function toKeyboardEvent(input) {
+export function toKeyboardEvent(input) {
     // Electron's before-input-event Input has no getModifierState. Some
     // Electron versions surface an 'altgr' entry in Input.modifiers — honor it
     // so AltGr typing on Windows layouts is never treated as a shortcut (the

@@ -16,9 +16,9 @@ import { createFeishuCardActionHandler } from '../interaction/feishu-card-action
 import { isUsableTelegramBinding, } from '../transport/telegram/telegram-store.js';
 import { isUsableWeChatBinding, } from '../transport/wechat/wechat-store.js';
 import { migrateLegacyImCredentialsOnStartup } from '../migration/legacy-im-migration-startup.js';
-import { PrimaryAgentFamilyReconciler } from '../migration/primary-agent-family-reconciler.js';
-import { PrimaryAgentRootReconciler, } from '../migration/primary-agent-root-reconciler.js';
-import { repairPrimaryFamilySessionModels, } from '../migration/primary-agent-session-model-repair.js';
+import { PrimaryAgentFamilyReconciler } from '../migration/primary-family/primary-agent-family-reconciler.js';
+import { PrimaryAgentRootReconciler, } from '../migration/primary-family/primary-agent-root-reconciler.js';
+import { repairPrimaryFamilySessionModels, } from '../migration/primary-family/primary-agent-session-model-repair.js';
 import { createChannelApis, agentNameFromClientName, markHandled, } from './channel-apis.js';
 import { detach } from '../settle.js';
 import { migrateLegacyImConnectionState, } from './legacy-connection-migration.js';

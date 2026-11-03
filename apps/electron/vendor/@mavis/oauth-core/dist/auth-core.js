@@ -5,12 +5,15 @@ import { join } from 'node:path';
 import { MCODE_OAUTH_AUDIENCE, MCODE_OAUTH_CLIENT_ID, MCODE_OAUTH_SCOPES, } from './contracts.js';
 import { CrossProcessAuthLock } from './cross-process-lock.js';
 import { FileStore } from './credential-store/file-store.js';
-import { persistAuth, reportAuthDiagnostic, } from './diagnostics.js';
+import { AuthCredentialSaveError, persistAuth, reportAuthDiagnostic, } from './diagnostics.js';
+import { AuthRefreshTrace, runWithAuthRefreshTrace, } from './refresh-diagnostics.js';
 import { currentRefreshOwner, isRefreshOwnerAlive } from './refresh-owner.js';
 import { OAuthProtocolError, } from './oauth-client.js';
 import { AUTH_STATE_SCHEMA_VERSION, AuthStateStore, } from './state-store.js';
 const DEFAULT_AUTHORIZATION_LEASE_MS = 10 * 60 * 1_000;
 const DEFAULT_STATE_POLL_INTERVAL_MS = 250;
+// Refreshes are serialized by auth.lock; the cap only bounds diagnostic memory.
+const MAX_ACTIVE_REFRESH_TRACES = 8;
 /** Storage/recovery failure, never evidence that Account rejected the login. */
 export class AuthRefreshCommitPendingError extends Error {
     code = 'AUTH_REFRESH_COMMIT_PENDING';
@@ -93,6 +96,22 @@ export class MCodeOAuthCore {
     pendingRefresh;
     pendingRefreshRollback;
     pendingRefreshInvalidation;
+    refreshTraces = new Map();
+    /** Tee existing diagnostics into the matching refresh trace, then forward unchanged. */
+    diagnosticObserver = (event) => {
+        try {
+            this.refreshTraces.get(event.correlationId)?.observeDiagnostic(event);
+        }
+        catch {
+            /* Diagnostics must never affect the refresh. */
+        }
+        try {
+            this.options.onDiagnostic?.(event);
+        }
+        catch {
+            /* Logging must not change credential commits. */
+        }
+    };
     constructor(options) {
         this.options = options;
         this.stateStore = new AuthStateStore(options.namespace.statePath);
@@ -601,6 +620,19 @@ export class MCodeOAuthCore {
     }
     async refreshCredential(current, options = {}) {
         const transactionId = randomUUID();
+        // Observation only: the transaction below runs identically with or without a trace.
+        const trace = this.startRefreshTrace(transactionId, current, options);
+        try {
+            const lease = await this.refreshCredentialTransaction(transactionId, current, options, trace);
+            this.finishRefreshTrace(trace, 'success');
+            return lease;
+        }
+        catch (error) {
+            this.finishRefreshTrace(trace, 'failure', error);
+            throw error;
+        }
+    }
+    async refreshCredentialTransaction(transactionId, current, options, trace) {
         const refreshing = {
             ...current.state,
             status: 'refreshing',
@@ -612,14 +644,14 @@ export class MCodeOAuthCore {
         await this.persistRefresh(refreshing, 'prepare_refresh', 'auth-state.json', null, () => this.stateStore.write(refreshing));
         let grant;
         try {
-            grant = await this.options.oauthClient.refreshToken(current.credential.refreshToken);
+            grant = await runWithAuthRefreshTrace(trace, () => this.options.oauthClient.refreshToken(current.credential.refreshToken));
             reportAuthDiagnostic({
                 phase: 'refresh_response',
                 file: 'oauth',
                 correlationId: transactionId,
                 generation: refreshing.generation,
                 refreshResponseSucceeded: true,
-            }, this.options.onDiagnostic, 'success');
+            }, this.diagnosticObserver, 'success');
         }
         catch (error) {
             reportAuthDiagnostic({
@@ -628,8 +660,9 @@ export class MCodeOAuthCore {
                 correlationId: transactionId,
                 generation: refreshing.generation,
                 refreshResponseSucceeded: false,
-            }, this.options.onDiagnostic, 'failure', error);
+            }, this.diagnosticObserver, 'failure', error);
             if (isInvalidRefreshGrant(error)) {
+                trace?.recordDecision('invalid_grant_400');
                 // Account already rejected this login. Storage failure must not turn it
                 // back into an apparently recoverable refresh or lose the cleanup task.
                 this.pendingRefreshInvalidation = { state: refreshing, refreshResponseSucceeded: false };
@@ -640,6 +673,7 @@ export class MCodeOAuthCore {
                 const preserveSession = !options.rejected &&
                     current.state.status === 'authenticated' &&
                     current.credential.expiresAtMs > this.now();
+                trace?.recordDecision('refresh_exception_non_invalid_grant', preserveSession ? 'authenticated' : 'expired');
                 // Keep the unsaved rollback in the original owner. A failed state write
                 // must not strand this known failed request behind the refresh fence.
                 // This is never set for a successful grant or invalid_grant.
@@ -774,7 +808,57 @@ export class MCodeOAuthCore {
             correlationId: state.refresh?.id ?? randomUUID(),
             generation: state.generation,
             refreshResponseSucceeded,
-        }, this.options.onDiagnostic, operation);
+        }, this.diagnosticObserver, operation);
+    }
+    startRefreshTrace(correlationId, current, options) {
+        try {
+            const trace = new AuthRefreshTrace({
+                correlationId,
+                trigger: options.rejected ? 'unauthorized_response' : 'min_validity',
+                stateBefore: current.state.status,
+                generationBefore: current.state.generation,
+                credentialGenerationBefore: current.credential.generation,
+                generationAttempted: Math.max(current.state.generation, current.credential.generation) + 1,
+                // Wall clock on purpose: diagnostics must not consume the injected clock.
+                credentialRemainingMs: current.credential.expiresAtMs - Date.now(),
+            });
+            if (this.refreshTraces.size >= MAX_ACTIVE_REFRESH_TRACES) {
+                const oldest = this.refreshTraces.keys().next().value;
+                if (oldest !== undefined)
+                    this.refreshTraces.delete(oldest);
+            }
+            this.refreshTraces.set(correlationId, trace);
+            this.emitRefreshDiagnostic(trace.startEvent());
+            return trace;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    finishRefreshTrace(trace, outcome, error) {
+        if (!trace)
+            return;
+        try {
+            this.refreshTraces.delete(trace.correlationId);
+            const summary = trace.finish(outcome, {
+                thrownError: error,
+                fallbackDecision: refreshFailureFallbackDecision(error),
+                pendingCommitPresent: Boolean(this.pendingRefresh || this.pendingRefreshRollback || this.pendingRefreshInvalidation),
+            });
+            if (summary)
+                this.emitRefreshDiagnostic(summary);
+        }
+        catch {
+            /* Diagnostics must never affect the refresh. */
+        }
+    }
+    emitRefreshDiagnostic(event) {
+        try {
+            this.options.onRefreshDiagnostic?.(event);
+        }
+        catch {
+            /* Logging must not change the refresh outcome. */
+        }
     }
     async assertRefreshCurrent(expected) {
         const state = await this.stateStore.read();
@@ -801,6 +885,16 @@ function isInvalidRefreshGrant(error) {
     return (error instanceof OAuthProtocolError &&
         error.code === 'invalid_grant' &&
         error.httpStatus === 400);
+}
+/** Diagnostic label for failures that did not pass the refresh-response decision. */
+function refreshFailureFallbackDecision(error) {
+    if (error instanceof AuthCredentialSaveError)
+        return 'credential_write_failed';
+    if (error instanceof AuthSessionChangedError)
+        return 'session_changed';
+    if (error instanceof AuthRefreshCommitPendingError)
+        return 'commit_pending';
+    return undefined;
 }
 async function sleepWithSignal(sleep, durationMs, signal) {
     if (!signal) {

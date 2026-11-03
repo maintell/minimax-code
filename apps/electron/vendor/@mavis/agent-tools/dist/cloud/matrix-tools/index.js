@@ -155,7 +155,7 @@ export { MATRIX_TOOL_PATHS };
  * real effective surface instead of keeping stale fallback tools around.
  *
  * Shared by both cloud-runtime (`packages/cloud-runtime/src/tools/index.ts`)
- * and local-runtime (`packages/local-runtime/src/api/local-native-tools.ts`)
+ * and local-runtime (`packages/local-runtime-v2/src/service/turn-system/agent-host/assembly/local-turn-tool-catalog.ts`)
  * so the two runtimes apply the same gate against the same `IModelCapabilities`
  * shape.
  */

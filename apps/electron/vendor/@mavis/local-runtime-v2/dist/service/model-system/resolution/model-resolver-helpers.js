@@ -10,11 +10,12 @@ export function buildLocalProviderHeaders(input) {
         'X-Mavis-Agent-Id': input.agentId,
         'X-Mavis-Timezone-Offset': String(new Date().getTimezoneOffset() * -60),
     };
+    for (const key of Object.keys(headers)) {
+        const normalizedKey = key.toLowerCase();
+        if (normalizedKey === 'bedrock-lane' || normalizedKey === 'bedrock_lane')
+            delete headers[key];
+    }
     if (input.managedProvider) {
-        for (const key of Object.keys(headers)) {
-            if (key.toLowerCase() === 'bedrock-lane')
-                delete headers[key];
-        }
         headers['User-Agent'] = MANAGED_PROVIDER_USER_AGENT;
         Object.assign(headers, managedBackendRoutingHeaders(input.routingContext, currentBuildEnv()));
     }

@@ -5,6 +5,7 @@ export class GoalTurnContextRegistry {
     signals = new Map();
     breakerDecisions = new Map();
     detachedTurns = new Map();
+    drainTokens = 0;
     getBinding(turnId) {
         return this.bindings.get(turnId);
     }
@@ -76,6 +77,51 @@ export class GoalTurnContextRegistry {
         return bound?.kind === 'main' && bound.sessionId === sessionId
             ? bound.binding.goalId
             : undefined;
+    }
+    /**
+     * Before the Goal is paused for an undelivered side message, mark its Goal
+     * Turns that are current at `fromEpoch` so they keep running to their end
+     * (spec 4.4: the running Turn is not interrupted). The mark only ever covers
+     * Turns admitted before the pause; no new Goal Turn is admitted while paused.
+     */
+    beginUndeliveredMessageDrain(sessionId, goalId, fromEpoch) {
+        const token = ++this.drainTokens;
+        const marked = [];
+        for (const bound of this.bindings.values()) {
+            if (bound.sessionId === sessionId &&
+                bound.kind === 'main' &&
+                bound.binding.goalId === goalId &&
+                bound.binding.admittedGoalUpdatedAt === fromEpoch) {
+                // Another failure at the same epoch already marked this Turn (pending
+                // or committed): join its mark instead of replacing it, so whichever
+                // attempt wins the pause CAS, the losing one cannot revoke the permit.
+                const shared = bound.undeliveredMessageDrain?.fromEpoch === fromEpoch
+                    ? bound.undeliveredMessageDrain
+                    : undefined;
+                const drain = shared ?? { fromEpoch, pending: new Set() };
+                drain.pending.add(token);
+                bound.undeliveredMessageDrain = drain;
+                marked.push({ bound, drain });
+            }
+        }
+        return {
+            commit: (pausedEpoch) => {
+                for (const { drain } of marked) {
+                    drain.pending.delete(token);
+                    drain.pausedEpoch ??= pausedEpoch;
+                }
+            },
+            cancel: () => {
+                for (const { bound, drain } of marked) {
+                    drain.pending.delete(token);
+                    if (drain.pending.size === 0 &&
+                        drain.pausedEpoch === undefined &&
+                        bound.undeliveredMessageDrain === drain) {
+                        delete bound.undeliveredMessageDrain;
+                    }
+                }
+            },
+        };
     }
     /** A Goal Turn of this session is bound and not finished, running or not yet. */
     hasBindingInSession(sessionId) {

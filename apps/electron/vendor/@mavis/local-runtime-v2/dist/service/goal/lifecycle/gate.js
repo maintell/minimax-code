@@ -91,12 +91,20 @@ export async function finalRecheck(deps, input, configGetter) {
         },
     };
 }
+/**
+ * The limits in force for a Goal (spec 6.2): the Goal's own value whenever it
+ * has one, even when the global config says otherwise; else the global
+ * default; else unlimited (`null`).
+ */
 export function resolveThreadGoalBudgetLimits(goal, configGetter) {
     const budget = configGetter?.().goal?.budget;
     return {
-        tokens: goal.tokenBudget ?? positiveIntegerOrNull(budget?.defaultTokens),
-        mainTurns: positiveIntegerOrNull(budget?.defaultMainTurns),
-        activeSeconds: positiveIntegerOrNull(budget?.defaultActiveSeconds),
+        tokens: positiveIntegerOrNull(goal.tokenBudget ?? undefined) ??
+            positiveIntegerOrNull(budget?.defaultTokens),
+        mainTurns: positiveIntegerOrNull(goal.requestLimit ?? undefined) ??
+            positiveIntegerOrNull(budget?.defaultMainTurns),
+        activeSeconds: positiveIntegerOrNull(goal.activeSecondsLimit ?? undefined) ??
+            positiveIntegerOrNull(budget?.defaultActiveSeconds),
     };
 }
 export function firstExhaustedThreadGoalBudget(usage, limits) {

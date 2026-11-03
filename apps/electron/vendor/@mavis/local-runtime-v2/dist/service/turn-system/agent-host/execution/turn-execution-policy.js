@@ -12,16 +12,19 @@ export function hostOutputTokenCap(resolver, input) {
         };
 }
 export function contentReviewOptions(input, options) {
+    const managedProvider = input.preparation.llm.managedProvider === true;
     if (options.tuiProductPolicy === true) {
-        const contentReviewRequired = options.contentReviewEnabled !== false && input.preparation.llm.managedProvider === true;
+        const contentReviewRequired = options.contentReviewEnabled !== false && managedProvider;
         return {
             contentReviewRequired,
             ...(contentReviewRequired ? {} : { streamUnreviewedOutput: true }),
         };
     }
-    return options.cliProductPolicy === true
-        ? { contentReviewRequired: input.preparation.llm.managedProvider === true }
-        : {};
+    if (options.cliProductPolicy === true)
+        return { contentReviewRequired: managedProvider };
+    // Desktop：BYOK（含自定义 Provider、Codex OAuth）不送 MiniMax 内容审核，输出直接流式下发；
+    // 托管模型保持原有审核归属。
+    return managedProvider ? {} : { contentReviewRequired: false, streamUnreviewedOutput: true };
 }
 /**
  * Retry options, plus the request barrier and step stop of a Turn its owner
@@ -63,6 +66,37 @@ export function attachWaitingForUser(outcome, waitingForUser) {
     return waitingForUser && outcome.status === 'completed'
         ? { ...outcome, waitingForUser: true }
         : outcome;
+}
+/**
+ * Maps the neutral runner's optional reconcile signal onto a host reconcile
+ * intent. The concrete detection lives in the v2 native runner adapter; the
+ * host only normalizes the approved partial content to a string.
+ */
+export function reconcileIntent(result) {
+    const signal = result?.reconcile;
+    if (!signal)
+        return undefined;
+    switch (signal.kind) {
+        case 'output-recall':
+            return {
+                kind: 'output-recall',
+                source: signal.source,
+                variant: signal.variant,
+                ...(signal.slowNetworkRead ? { slowNetworkRead: true } : {}),
+            };
+        case 'network-reconcile':
+            return {
+                kind: 'network-reconcile',
+                approvedContent: signal.approvedContent ?? '',
+                ...(signal.slowNetworkRead ? { slowNetworkRead: true } : {}),
+            };
+        case 'safety-reconcile':
+            return { kind: 'safety-reconcile', approvedContent: signal.approvedContent };
+        case 'abort-reconcile':
+            return { kind: 'abort-reconcile', approvedContent: signal.approvedContent ?? '' };
+        default:
+            return undefined;
+    }
 }
 export function continuationRunMode(input) {
     return input.request.executionMode === 'continuation' ? { startMode: 'continue' } : {};

@@ -1,14 +1,14 @@
 import { agentShellInstructions } from './agent-shell-context.js';
 import { isLegacyMemoryRecallEnabled, isMemoryV2Enabled } from '@mavis/config';
 import { isPromptSnapshotInvalidError, PromptSnapshotInvalidError, } from '@mavis/agent-runtime';
-import { DEFAULT_RETRY_CONTINUATION_PROMPT, DEFAULT_OUTPUT_REVISION_INSTRUCTION, OUTPUT_REVISION_PROMPT_KEY, RETRY_CONTINUATION_PROMPT_KEY, } from './prompt-templates.js';
+import { DEFAULT_RETRY_CONTINUATION_PROMPT, readOutputRevisionInstruction, RETRY_CONTINUATION_PROMPT_KEY, } from './prompt-templates.js';
 import { resolveAgentCapabilities } from '@mavis/config';
 import { isLegacyMinimaxProvider, modelConfigForRef, modelRefForModel, savedSessionModel, } from '../../../../model-system/index.js';
 import { INSTRUCTIONS_CONTEXT_PREAMBLE } from '../prompt-blocks.js';
 import { createLocalStaticPromptReader, } from '../static-prompt-reader.js';
 import { resolveTurnModelSelection, turnModelParameters, } from './session-model-selection.js';
 import { addRuntimeRules } from './runtime-prompt-rules.js';
-import { environmentContextBlock, } from './environment-prompt-composer.js';
+import { AdditionalWorkspaceRootsBinding, environmentContextBlock, } from './environment-prompt-composer.js';
 import { collectMemoryBlocks, toMemoryPromptSources, } from './memory-prompt-composer.js';
 /** Builds one AgentConfig solely from validated Agent/Session facts and narrow capabilities. */
 export class LocalAgentConfigBuilder {
@@ -21,6 +21,7 @@ export class LocalAgentConfigBuilder {
     nowMs;
     sessionModelRepair;
     taskSessionBindings;
+    workspaceRoots = new AdditionalWorkspaceRootsBinding();
     constructor(options) {
         this.options = options;
         this.staticPrompts =
@@ -39,21 +40,23 @@ export class LocalAgentConfigBuilder {
     bindTaskSessionBindings(bindings) {
         this.taskSessionBindings = bindings;
     }
+    bindAdditionalWorkspaceRoots = this.workspaceRoots.bind;
     async build(input) {
         return (await this.buildPrepared(input)).agentConfig;
     }
     async buildPrepared(input) {
         const agentShell = await this.resolveAgentShell?.(input.session.sessionId);
+        const scoped = await this.workspaceRoots.scope(input);
         const source = this.options.promptSnapshots;
         const promptRead = input.promptRead ?? (source ? { source, snapshot: await source.capture() } : undefined);
         try {
-            return await this.buildPreparedForPromptScope(input, promptRead, agentShell);
+            return await this.buildPreparedForPromptScope(scoped, promptRead, agentShell);
         }
         catch (error) {
             if (!source || !promptRead || !isPromptSnapshotInvalidError(error))
                 throw error;
             const builtinPromptRead = { source, snapshot: await source.captureBuiltin() };
-            return this.buildPreparedForPromptScope(input, builtinPromptRead, agentShell);
+            return this.buildPreparedForPromptScope(scoped, builtinPromptRead, agentShell);
         }
     }
     async buildPreparedForPromptScope(input, promptRead, agentShell) {
@@ -66,14 +69,18 @@ export class LocalAgentConfigBuilder {
             outputRevisionInstruction,
             ...(retryContinuationPrompt ? { retryContinuationPrompt } : {}),
             ...(promptRead ? { promptRead } : {}),
+            ...(input.additionalWorkspaceRoots
+                ? { additionalWorkspaceRoots: input.additionalWorkspaceRoots }
+                : {}),
         };
     }
     async buildForPromptScope(input, promptRead, shell) {
         const config = this.options.config();
-        const runtimeFacts = resolveAgentRuntimeFacts(input.agent, config);
+        const runtimeFacts = resolveAgentRuntimeFacts(input.agent, config, input.session);
         const profileAndBinding = await this.renderProfileForTurn({
             ...input,
             ...(promptRead ? { promptRead } : {}),
+            ...ptcRequestedField(runtimeFacts),
         });
         const profile = profileAndBinding.profile;
         const turnInput = input;
@@ -124,6 +131,9 @@ export class LocalAgentConfigBuilder {
             modelId: model.model_id,
             agent: turnInput.agent,
             workspaceDir: turnInput.session.workspaceDir,
+            ...(input.additionalWorkspaceRoots
+                ? { additionalWorkspaceRoots: input.additionalWorkspaceRoots }
+                : {}),
             sessionType: turnInput.session.sessionType,
             layers,
             overrides: this.options.systemPromptOverrides,
@@ -204,16 +214,6 @@ async function validateWorkflowPromptScope(scope) {
         }
     }
 }
-async function readOutputRevisionInstruction(scope) {
-    if (!scope)
-        return DEFAULT_OUTPUT_REVISION_INSTRUCTION;
-    const result = await scope.source.read(scope.snapshot, OUTPUT_REVISION_PROMPT_KEY);
-    if (result.kind === 'found')
-        return result.content;
-    if (result.kind === 'missing')
-        return DEFAULT_OUTPUT_REVISION_INSTRUCTION;
-    throw new PromptSnapshotInvalidError(`Workflow prompt cannot be read: ${OUTPUT_REVISION_PROMPT_KEY}`);
-}
 async function readRetryContinuationPrompt(scope, input) {
     if (input.clientIntent !== 'retry-continuation')
         return undefined;
@@ -225,6 +225,15 @@ async function readRetryContinuationPrompt(scope, input) {
     if (result.kind === 'missing')
         return DEFAULT_RETRY_CONTINUATION_PROMPT;
     throw new PromptSnapshotInvalidError(`Desktop task prompt cannot be read: ${RETRY_CONTINUATION_PROMPT_KEY}`);
+}
+/**
+ * The same Session mode that becomes agentConfig.ptc_enabled, which the tool
+ * catalog reads, so the prompt's PTC section and the PTC catalog are decided
+ * from one fact on every build of this Session (Turns, compaction, title,
+ * Context Debug) and the prompt prefix does not depend on what started the Turn.
+ */
+function ptcRequestedField(runtimeFacts) {
+    return runtimeFacts.ptcEnabled ? { ptcRequested: true } : {};
 }
 async function loadPromptLayers(parameters) {
     const { input, config, runtimeFacts, options, staticPrompts, nowMs, modelContextWindow, profile, } = parameters;
@@ -520,42 +529,49 @@ function createAgentConfig(scope) {
         computerUseActive: runtimeFacts.computerUseActive,
         desktopPluginSkills: layers.desktopPluginSkills,
         ...(typeof input.agent.metadata?.id === 'string' ? { agent_id: input.agent.metadata.id } : {}),
-        ...(profile
-            ? {
-                capability_ceiling: profile.capabilityCeiling,
-                agent_profile: {
-                    ...(profile.excludeAgentResources ? { exclude_agent_resources: true } : {}),
-                    ...(profile.skipAgentResolution ? { skip_agent_resolution: true } : {}),
-                    ...(profile.expectedAgentInstanceId
-                        ? { expected_agent_instance_id: profile.expectedAgentInstanceId }
-                        : {}),
-                    exact_owner_name: profile.exactOwnerName,
-                    canonical_view_name: profile.canonicalViewName,
-                    agent_role: profile.agentRole,
-                    creation_source: profile.creationSource,
-                    surface: profile.surface,
-                    ...(profile.taskExecutionMode
-                        ? { task_execution_mode: profile.taskExecutionMode }
-                        : {}),
-                    provenance_source: profile.provenance.source,
-                    ...(profile.provenance.appMode ? { app_mode: profile.provenance.appMode } : {}),
-                    trusted_builtin: profile.creationSource === 'builtin',
-                    memory_agent_scope_enabled: profile.memoryReadAgentNames.length > 0,
-                    memory_read_agent_names: profile.memoryReadAgentNames,
-                    ...(profile.configSelection ? { config_selection: profile.configSelection } : {}),
-                },
-            }
-            : {}),
+        ...profileAgentConfig(profile),
     };
+    if (runtimeFacts.ptcEnabled)
+        agentConfig.ptc_enabled = true;
     return agentConfig;
 }
-function resolveAgentRuntimeFacts(agent, config) {
+function profileAgentConfig(profile) {
+    if (!profile)
+        return {};
+    return {
+        capability_ceiling: profile.capabilityCeiling,
+        agent_profile: {
+            ...(profile.excludeAgentResources ? { exclude_agent_resources: true } : {}),
+            ...(profile.skipAgentResolution ? { skip_agent_resolution: true } : {}),
+            ...(profile.expectedAgentInstanceId
+                ? { expected_agent_instance_id: profile.expectedAgentInstanceId }
+                : {}),
+            exact_owner_name: profile.exactOwnerName,
+            canonical_view_name: profile.canonicalViewName,
+            agent_role: profile.agentRole,
+            creation_source: profile.creationSource,
+            surface: profile.surface,
+            ...(profile.taskExecutionMode ? { task_execution_mode: profile.taskExecutionMode } : {}),
+            provenance_source: profile.provenance.source,
+            ...(profile.provenance.appMode ? { app_mode: profile.provenance.appMode } : {}),
+            trusted_builtin: profile.creationSource === 'builtin',
+            memory_agent_scope_enabled: profile.memoryReadAgentNames.length > 0,
+            memory_read_agent_names: profile.memoryReadAgentNames,
+            ...(profile.configSelection ? { config_selection: profile.configSelection } : {}),
+        },
+    };
+}
+function resolveAgentRuntimeFacts(agent, config, session) {
     return {
         resourceAgentName: agent.resourceAgentName?.trim() || agent.agentName,
         builtinCapabilities: agent.builtinCapabilities ?? resolveAgentCapabilities(config.agents?.default),
         ...(agent.builtinSkillNames ? { builtinSkillNames: agent.builtinSkillNames } : {}),
         computerUseActive: agent.computerUseActive === true,
         exposeComputerUseActive: agent.computerUseActive !== undefined,
+        // Fixed at Session creation and refreshed only after a summary compaction (beta.ptc resolved
+        // for the build then), so toggling beta.ptc never changes an ongoing conversation's prompt
+        // prefix.
+        ptcEnabled: session.toolCallMode === 'ptc',
     };
 }
 export function modelRefFromConfig(config, override, options = {}) {

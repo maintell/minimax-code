@@ -1,7 +1,7 @@
 /**
  * 应用菜单模块
  */
-import { BaseWindow, shell, dialog, Menu } from "electron";
+import { BaseWindow, BrowserWindow, shell, dialog, Menu } from "electron";
 import { hideWindowsMenuBar } from "../../windows/windows-titlebar";
 import { isDev, isTest, isStaging, isInternalBuild } from "../../config";
 import { IPC_CHANNELS, DOMAIN_URL, DISPLAY_NAME } from "../../config/constants";
@@ -51,6 +51,18 @@ function closeArchonWindow() {
     const win = BaseWindow.getFocusedWindow() ?? getMainWindow();
     if (win && !win.isDestroyed())
         win.close();
+}
+/**
+ * `role: 'reload'` reloads the focused WebContents, which is an embedded
+ * Browser `<webview>` guest whenever one holds focus in the host's view tree
+ * (Chromium keeps reporting it focused after the user returns to the app UI).
+ * Reload the focused window's own document instead, never a guest page.
+ */
+function reloadFocusedWindow() {
+    const focused = BaseWindow.getFocusedWindow();
+    const win = focused instanceof BrowserWindow && !focused.isDestroyed() ? focused : getMainWindow();
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed())
+        win.webContents.reload();
 }
 function closeNativeDevTools() {
     const win = getMainWindow();
@@ -330,7 +342,11 @@ export function setupArchonMenu() {
                 { role: 'minimize', label: isEn ? 'Minimize' : '最小化' },
                 { role: 'togglefullscreen', label: isEn ? 'Toggle Fullscreen' : '切换全屏' },
                 { type: 'separator' },
-                { role: 'reload', label: isEn ? 'Reload' : '重新加载' },
+                {
+                    label: isEn ? 'Reload' : '重新加载',
+                    accelerator: 'CmdOrCtrl+R',
+                    click: reloadFocusedWindow,
+                },
                 { type: 'separator' },
                 isMac
                     ? { label: isEn ? 'Close' : '关闭', click: closeArchonWindow }

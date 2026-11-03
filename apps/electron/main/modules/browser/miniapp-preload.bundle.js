@@ -180,7 +180,11 @@ var MINIAPP_HOST_CAPABILITIES = Object.freeze([
 function hasMiniAppHostCapability(name) {
   return MINIAPP_HOST_CAPABILITIES.includes(name);
 }
-var MINIAPP_DEVICE_ACCESS_ITEMS = Object.freeze(["microphone"]);
+var MINIAPP_DEVICE_ACCESS_ITEMS = Object.freeze([
+  "microphone",
+  "camera",
+  "notifications"
+]);
 var MINIAPP_AGENT_FAILURE_CODES = [
   "invalid_request",
   "not_permitted",
@@ -850,12 +854,13 @@ function parseMiniAppWindowOptions(value) {
 function parseMiniAppWindowState(value) {
   if (!isPlainRecord(value))
     return null;
+  const behavior = value.modeChangeReloadsPage === true ? { modeChangeReloadsPage: true } : {};
   if (value.mode === "inline")
-    return { mode: "inline" };
+    return { mode: "inline", ...behavior };
   if (value.mode !== "window")
     return null;
   const window = parseMiniAppWindowOptions(value.window);
-  return window ? { mode: "window", window } : null;
+  return window ? { mode: "window", window, ...behavior } : null;
 }
 function parseMiniAppWindowResult(value) {
   if (!isPlainRecord(value))

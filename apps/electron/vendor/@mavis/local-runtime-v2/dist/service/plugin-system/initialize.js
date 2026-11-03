@@ -6,6 +6,7 @@ import { PluginSystemCloudTransport } from './cloud-transport.js';
 import { createMiniAppPluginMcpTools } from './mcp/miniapp-plugin-mcp-tools.js';
 import { PluginMcpRuntime } from './mcp/runtime.js';
 import { GithubPluginImporter } from './plugin/import/github-plugin-importer.js';
+import { createPluginMarketplaceService } from './plugin/marketplace/marketplace-service.js';
 import { PluginDesktopFacade } from './plugin/runtime/desktop-facade.js';
 import { OfficialPluginAuthBarrier, resolveOfficialPluginAuthState, } from './plugin/runtime/official-operations.js';
 import { OfficialPluginReconciler } from './plugin/runtime/official-reconciler.js';
@@ -88,6 +89,16 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
     const unsubscribeSkillChanges = dependencies.skill.onDidChangeRuntimeSkills?.(() => system.markReservationsDirty()) ??
         (() => undefined);
     system.attachPublicationPort(turnCapabilities.attach(system));
+    const marketplaces = createPluginMarketplaceService({
+        dataDir: dependencies.dataDir,
+        installer: system.localInstaller,
+        isEnabled: () => dependencies.configGetter().beta?.pluginMarketplaces === true,
+        logger: {
+            info: (message, fields) => dependencies.logger.info(fields ?? {}, message),
+            warn: (message, fields) => dependencies.logger.warn(fields ?? {}, message),
+        },
+        metrics: { incr: metricTags.incr, latency: metricTags.latency },
+    });
     const plugin = new PluginDesktopFacade({
         system,
         registryClient,
@@ -95,6 +106,8 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         standaloneSkillIdentities: dependencies.standaloneSkillIdentities,
         waitForOfficialAuth: () => officialAuthBarrier.waitUntilReady(),
         githubImporter,
+        marketplaces,
+        connectorCatalog: connectorClient,
         metrics: metricTags,
     });
     let readyPromise;
@@ -131,7 +144,11 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         },
         enabledHookPluginNames: () => new Set((system.currentSnapshot.turnCapabilities.hooks ?? []).map((handler) => handler.pluginName)),
         ready: () => {
-            readyPromise ??= system.initialize();
+            readyPromise ??= (async () => {
+                await system.initialize();
+                // Background marketplace sync installs through the initialized PluginSystem.
+                marketplaces.start();
+            })();
             return readyPromise;
         },
         close: () => {
@@ -140,7 +157,12 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
                 unsubscribeMcpChanges();
                 unsubscribeSkillChanges();
                 try {
-                    await system.dispose();
+                    try {
+                        await marketplaces.dispose();
+                    }
+                    finally {
+                        await system.dispose();
+                    }
                 }
                 finally {
                     await hostConnectorSystem.close();

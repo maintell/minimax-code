@@ -24,10 +24,16 @@ export function detectPluginReferencesForMessages(messages, fallbackText, plugin
     }
     return selected;
 }
+const PTC_RUN_CODE_CALL = 'inside run_code like any other tool: `await tools.<name>(args)`, or `await tools["<name>"](args)` when the name contains characters such as `-`.';
+/** The `via ...` marker of a capability discovered through Tool Search. */
+function toolSearchAccess(ptc) {
+    return ptc ? 'via `tool_search` + `run_code`' : 'via `tool_search` + `mcp_invoke`';
+}
 /** Render one self-contained reminder for every Plugin selected in this turn. */
-export function buildPluginReferenceReminder(plugins, unavailablePluginIds = []) {
+export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [], options = {}) {
     if (plugins.length === 0 && unavailablePluginIds.length === 0)
         return undefined;
+    const ptc = options.ptc === true;
     const blocks = plugins.slice(0, 8).map((plugin) => {
         const name = inlineCode(plugin.name);
         const displayName = pluginDisplayName(plugin);
@@ -55,18 +61,18 @@ export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [])
                 ]
                 : [
                     '<connected-app-tools>',
-                    formatToolGroups(plugin.appTools, 'app'),
+                    formatToolGroups(plugin.appTools, 'app', ptc),
                     '</connected-app-tools>',
                 ]),
             '',
             '<plugin-mcp-tools>',
-            formatToolGroups(plugin.mcpTools, 'server'),
+            formatToolGroups(plugin.mcpTools, 'server', ptc),
             '</plugin-mcp-tools>',
             '',
             ...(plugin.hostTools
                 ? [
                     '<plugin-host-tools>',
-                    formatToolGroups(plugin.hostTools, 'host'),
+                    formatToolGroups(plugin.hostTools, 'host', ptc),
                     '</plugin-host-tools>',
                     '',
                 ]
@@ -114,7 +120,9 @@ export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [])
             : []),
         ...(plugins.some((plugin) => [...plugin.appTools, ...plugin.mcpTools, ...(plugin.hostTools ?? [])].some((group) => group.access === 'tool_search'))
             ? [
-                'For capabilities marked `via tool_search + mcp_invoke`, discover the exact tool with `tool_search`, read its complete parameter schema, then call it through `mcp_invoke`.',
+                ptc
+                    ? `For capabilities marked \`via tool_search + run_code\`, discover the exact tool with \`tool_search\`, read its complete parameter schema, then call it ${PTC_RUN_CODE_CALL}`
+                    : 'For capabilities marked `via tool_search + mcp_invoke`, discover the exact tool with `tool_search`, read its complete parameter schema, then call it through `mcp_invoke`.',
             ]
             : []),
         'Before following a listed Skill, call the `skill` tool with its exact name.',
@@ -152,7 +160,7 @@ function detectReferencesInText(text, plugins) {
     matches.sort((left, right) => left.index - right.index);
     return matches.map((match) => match.plugin);
 }
-function formatToolGroups(groups, label) {
+function formatToolGroups(groups, label, ptc) {
     if (groups.length === 0)
         return 'none';
     return [...groups]
@@ -165,7 +173,7 @@ function formatToolGroups(groups, label) {
     })
         .map((group) => {
         const tools = formatToolNames(group.tools);
-        const access = group.access === 'tool_search' ? ' via `tool_search` + `mcp_invoke`' : '';
+        const access = group.access === 'tool_search' ? ` ${toolSearchAccess(ptc)}` : '';
         return `- ${label} \`${inlineCode(group.source)}\`${access}: ${tools || 'none'}`;
     })
         .join('\n');

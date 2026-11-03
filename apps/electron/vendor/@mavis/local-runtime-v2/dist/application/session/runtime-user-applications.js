@@ -2,9 +2,24 @@ import { ModelFavoritesPreference } from '../../service/model-system/index.js';
 import { composeProcessLocalApplication } from './process-local-composition.js';
 import { readLocalInstructionSources } from '../../service/turn-system/index.js';
 import { createRuntimeConversationApplication } from '../conversation/runtime-conversation-application.js';
+import { UndeliveredSideMessages, } from '../conversation/undelivered-side-messages.js';
+/** Undelivered side messages over the Session's message rows, stream and Goal owner. */
+export function createRuntimeUndeliveredSideMessages(input) {
+    return new UndeliveredSideMessages({
+        messages: input.sessionSystem.messages.repository,
+        stream: input.sessionSystem.stream,
+        goals: input.goalPort,
+        ...(input.reportFailure ? { reportFailure: input.reportFailure } : {}),
+    });
+}
 export function createRuntimeUserApplications(input) {
+    const undeliveredMessages = createRuntimeUndeliveredSideMessages(input);
+    // Replacing the objective keeps the Goal id: its undelivered rows stay but
+    // stop pausing or resuming it (spec 4.6).
+    input.goalPort.observeObjectiveReplaced((goal) => undeliveredMessages.detachGoal(goal.sessionId, goal.goalId));
     return {
         conversation: createRuntimeConversationApplication({
+            undeliveredMessages,
             sessionSystem: input.sessionSystem,
             turnSystem: input.owners.turnSystem,
             runtimeConversation: input.owners.runtimeConversation,

@@ -2,9 +2,10 @@ import { isMemoryV2Enabled, getRuntimePresetKey, resolveModelAvailability } from
 import { hasConversationTaskModelSelection, } from '@mavis/conversation-contract';
 import { COMPUTER_USE_TOOL_NAMES } from '../../service/computer-use/index.js';
 import { bindPluginAgentMcpSelectors, pluginAgentSource, renderPluginAgentProfile, } from './plugin-agent-capture.js';
+import { FROZEN_MCP_SERVERS_NONE, FROZEN_SELECTOR_VERSION, FROZEN_TOOLS_ALL_SCOPE_MARKER, } from '../../service/agent/index.js';
 import { AgentModelSelectionError, canonicalSelectionModelKey, LocalModelProviderError, resolveEffectiveAgentModelSelection, modelConfigForRef, modelRefForModel, savedSessionModel, parseSourceQualifiedModelKey, } from '../../service/model-system/index.js';
 import { toLegacyTaskSessionBinding } from '../../service/session-system/index.js';
-import { filterLocalTurnCapabilityInventory, resolveAgentPromptSurface, } from '../../service/turn-system/index.js';
+import { filterLocalTurnCapabilityInventory, isAgentSelectorMcpToolName, resolveToolsAllowlistScope, resolveAgentPromptSurface, } from '../../service/turn-system/index.js';
 /** Captures an immutable V2 Agent definition before the Session row is inserted. */
 export function createTaskAgentBindingCaptureCoordinator(options) {
     return {
@@ -78,7 +79,10 @@ async function freezeCapturedCapabilities(options, session, profile, pluginAgent
         ...ready.sources.threadGoalTools,
         ...(ready.desktopCapabilities?.runtimeTools ?? []),
     ].map((tool) => tool.def.name);
-    return freezeSelectorCapabilities(bindPluginAgentMcpSelectors(profile, pluginAgent, bindings, inventoryToolNames), ready);
+    return freezeSelectorCapabilities(bindPluginAgentMcpSelectors(profile, pluginAgent, bindings, inventoryToolNames), ready, 
+    // Decided from the list the author wrote: rebinding may replace a Plugin's
+    // `mcp__*` selectors with nothing, which must not turn it into a native list.
+    resolveToolsAllowlistScope(profile.configSelection?.tools));
 }
 async function renderCaptureProfile(input) {
     const { options, config, session } = input;
@@ -580,29 +584,20 @@ function baseThinkingSelection(input) {
 function taskTargetModelSelection(profile) {
     return profile.configSelection?.model ? profile.configSelection : undefined;
 }
-function freezeSelectorCapabilities(profile, ready) {
+function freezeSelectorCapabilities(profile, ready, authorToolsAllowlistScope) {
+    const facts = toTurnProfileFacts(profile);
+    const toolsAllowlistScope = authorToolsAllowlistScope ?? resolveToolsAllowlistScope(profile.configSelection?.tools);
     const filtered = filterLocalTurnCapabilityInventory({
         sources: ready.sources,
-        agentProfile: toTurnProfileFacts(profile),
+        agentProfile: { ...facts, toolsAllowlistScope },
         ...(ready.desktopCapabilities ? { desktopCapabilities: ready.desktopCapabilities } : {}),
     });
     // Capture the possible native Computer Use ceiling before the first @ admission.
     // Apply the original selectors here; final Turn gates still require activation.
-    const facts = toTurnProfileFacts(profile);
     const deferredComputerTools = facts.trustedBuiltin && facts.canonicalRole === 'mavis' && facts.surface === 'interactive'
         ? COMPUTER_USE_TOOL_NAMES.filter((name) => filtered.selector.allowsTool(name))
         : [];
-    const tools = uniqueNames([
-        ...deferredComputerTools,
-        ...filtered.nativeTools.map((tool) => tool.def.name),
-        ...filtered.mcpEntries.map(({ tool }) => tool.def.name),
-        ...filtered.threadGoalTools.map((tool) => tool.def.name),
-        ...(filtered.desktopCapabilities?.runtimeTools.map((tool) => tool.def.name) ?? []),
-    ]);
-    const mcpServers = uniqueNames([
-        ...filtered.mcpEntries.flatMap((entry) => (entry.serverName ? [entry.serverName] : [])),
-        ...(filtered.desktopCapabilities?.runtimeToolBindings.flatMap((binding) => binding.kind === 'mcp' ? [binding.source] : []) ?? []),
-    ]);
+    const tools = frozenToolNames(filtered, deferredComputerTools, toolsAllowlistScope, profile.configSelection?.tools);
     // The Skill reader checks both allowlists for Desktop Plugin Skills, so a
     // frozen Plugin Skill must be named in `skills` as well as `extensionSkills`.
     const desktopSkills = (filtered.desktopCapabilities?.skills ?? [])
@@ -627,16 +622,58 @@ function freezeSelectorCapabilities(profile, ready) {
     ]);
     const disallowedTools = profile.configSelection?.disallowedTools ?? [];
     return {
-        // Undefined canonical selectors resolve to the current ready inventory at
-        // Task creation, plus the explicitly allowed deferred Computer Use names above.
-        // Persisting every bucket turns the snapshot into a true
-        // upper bound: later installs can only be removed by current runtime gates.
+        // The snapshot is an upper bound for internal tools and Skills only:
+        // undefined selectors resolve to the ready inventory at Task creation (plus
+        // the allowed deferred Computer Use names), and later installs can only be
+        // removed by current runtime gates. MCP and Plugin tools are not bounded by
+        // it; they follow the Agent's `mcpServers` and `disallowedTools` on every
+        // Turn (README "Desktop Local Agent 定义").
         tools,
         disallowedTools: [...disallowedTools],
-        mcpServers,
+        // The Agent's own selector, not the servers ready now, so a server configured
+        // or recovered after capture stays reachable by the running Task.
+        mcpServers: frozenMcpServerSelector(profile.configSelection?.mcpServers),
         skills,
         extensionSkills,
+        selectorVersion: FROZEN_SELECTOR_VERSION,
     };
+}
+/**
+ * Version 2 encoding of the Agent's `mcpServers` in a field releases up to
+ * v3.1.4 require: unset → `[]` (unrestricted), `[]` → `[":none"]` (no MCP),
+ * server names as written.
+ */
+function frozenMcpServerSelector(selection) {
+    if (selection === undefined)
+        return [];
+    const names = uniqueNames(selection);
+    return names.length > 0 ? names : [FROZEN_MCP_SERVERS_NONE];
+}
+/**
+ * A `native` list bounds internal tools only, so the snapshot names no MCP or
+ * Plugin tool. An `all` list (one that names `mcp__*` tools) keeps every
+ * admitted name plus the `mcp__*` selectors themselves, even for tools not
+ * ready at capture, so later Turns still read it as `all` from its content.
+ * `selected` is the list after Plugin alias rebinding. When rebinding left no
+ * `mcp__*` name, those tools are unavailable: the author's names could match a
+ * same-named configured server, so only `FROZEN_TOOLS_ALL_SCOPE_MARKER` is
+ * added, which matches no tool and keeps the list read as `all`.
+ */
+function frozenToolNames(filtered, deferredComputerTools, scope, selected) {
+    const all = scope === 'all';
+    const admitted = uniqueNames([
+        ...deferredComputerTools,
+        ...filtered.nativeTools.map((tool) => tool.def.name),
+        ...filtered.mcpEntries
+            .map(({ tool }) => tool.def.name)
+            .filter((name) => all || !isAgentSelectorMcpToolName(name)),
+        ...filtered.threadGoalTools.map((tool) => tool.def.name),
+        ...(all ? (filtered.desktopCapabilities?.runtimeTools.map((tool) => tool.def.name) ?? []) : []),
+    ]);
+    if (!all)
+        return admitted;
+    const named = uniqueNames([...admitted, ...(selected ?? []).filter(isAgentSelectorMcpToolName)]);
+    return named.some(isAgentSelectorMcpToolName) ? named : [...named, FROZEN_TOOLS_ALL_SCOPE_MARKER];
 }
 function isBuiltinRuntimeSkill(skill) {
     return skill.sourceType === 1;

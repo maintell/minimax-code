@@ -1,3 +1,4 @@
+import { CHANNEL_STEER_PRODUCER_ID } from '@mavis/shared';
 import { QUESTIONNAIRE_ANSWER_STEERING_PRODUCER } from '@mavis/shared/questionnaire';
 /** Producers whose steering is user-visible work rather than machine delivery. */
 const USER_STEERING_PRODUCERS = new Set([
@@ -22,20 +23,26 @@ export function isUserSteeringProducer(producerId) {
     return USER_STEERING_PRODUCERS.has(producerId);
 }
 /**
- * Machine producers whose steering carries a decision the user already made
- * (an AskUser v2 answer). They keep machine semantics while the Turn runs
- * (still injected at a normal exit boundary while work remains open), but
- * teardown must persist them like user steering instead of dropping them, or the
- * answer would be lost after Stop / shutdown / lease loss.
+ * Machine producers whose steering carries input the user already gave and
+ * was already acknowledged for: an AskUser v2 answer, and an IM follow-up
+ * merged into the running IM Turn (`channel-steer`, receipted to IM as
+ * received). They keep machine semantics while the Turn runs (still injected
+ * at a normal exit boundary while work remains open), but teardown must
+ * persist them like user steering instead of dropping them, or the input would
+ * be lost after Stop / shutdown / lease loss.
  */
 const TEARDOWN_DURABLE_MACHINE_PRODUCERS = new Set([
     QUESTIONNAIRE_ANSWER_STEERING_PRODUCER,
+    CHANNEL_STEER_PRODUCER_ID,
 ]);
 export function isTeardownDurableSteeringProducer(producerId, workClosed = false) {
     return (isHandedBackOnClose(producerId, workClosed) ||
         TEARDOWN_DURABLE_MACHINE_PRODUCERS.has(producerId));
 }
-/** A normal exit defers user input; closed work also defers pending answers. */
+/**
+ * A normal exit defers user input; closed work also defers terminal input,
+ * pending answers and merged IM follow-ups (requeued with their IM origin).
+ */
 export function isHandedBackOnClose(producerId, workClosed) {
     return (isUserSteeringProducer(producerId) ||
         (workClosed &&

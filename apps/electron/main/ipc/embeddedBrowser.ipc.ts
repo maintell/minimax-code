@@ -9,6 +9,7 @@ import { isBrowserPreviewScope, isBrowserPreviewLayout, isBrowserDevicePreviewRe
 import { getEmbeddedBrowserManager, openEmbeddedBrowserExternally } from "../modules/browser/embedded-browser-manager";
 import { normalizeCommentKeys, normalizeCommentRevisions, validateCommentKey } from "../modules/browser/embedded-browser-manager-helpers";
 import { createNewEmbeddedBrowserTab } from "../modules/browser/embedded-browser-new-tab";
+import { normalizeFindInPageRequest, normalizeFindInPageStopAction } from "../modules/browser/embedded-browser-find";
 import { getLocalServerRegistry } from "../modules/local-servers/registry";
 import { getTerminalManager } from "../modules/terminal";
 import { getCategoryLogger } from "../utils/logger";
@@ -311,7 +312,10 @@ export function setupEmbeddedBrowserIPC() {
         const layoutCommandId = issueLayoutCommandId();
         manager.setHostWindow(BrowserWindow.fromWebContents(event.sender), event.sender.id, getHostZoomFactor(event));
         const normalizedBounds = normalizeBounds(bounds);
-        const target = normalizeBrowserTarget(params);
+        const target = {
+            ...normalizeBrowserTarget(params),
+            ...(params?.selectForAgent === true ? { selectForAgent: true } : {}),
+        };
         const viewport = normalizeRendererViewport(params?.viewport);
         logIpcReceipt('show', event, {
             sessionId: target.sessionId ?? null,
@@ -384,7 +388,11 @@ export function setupEmbeddedBrowserIPC() {
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_HIDE, async (_event, params) => {
         const layoutCommandId = issueLayoutCommandId();
-        return manager.hide({ ...normalizeDestroyParams(params), ...(params?.select === true ? { select: true } : {}) }, layoutCommandId);
+        return manager.hide({
+            ...normalizeDestroyParams(params),
+            ...(params?.select === true ? { select: true } : {}),
+            ...(params?.selectIfAgentTarget === true ? { selectIfAgentTarget: true } : {}),
+        }, layoutCommandId);
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_DESTROY, async (_event, params) => manager.destroy(normalizeDestroyParams(params)));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_GET_STATE, async (_event, params) => manager.getState({
@@ -448,6 +456,13 @@ export function setupEmbeddedBrowserIPC() {
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_FORCE_RELOAD, async (_event, params) => manager.forceReload(normalizeBrowserTarget(params)));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SET_ZOOM, async (_event, params) => manager.setZoom(typeof params?.factor === 'number' ? params.factor : 1, normalizeBrowserTarget(params)));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_IN_PAGE, async (_event, params) => {
+        const request = normalizeFindInPageRequest(params);
+        if (!request)
+            return { success: false, error: 'text is required' };
+        return manager.findInPage(request, normalizeBrowserTarget(params));
+    });
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_STOP_FIND_IN_PAGE, async (_event, params) => manager.stopFindInPage(normalizeFindInPageStopAction(params?.action), normalizeBrowserTarget(params)));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_COOKIES, async (_event, params) => manager.clearCookies(normalizeBrowserTarget(params)));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_CACHE, async (_event, params) => manager.clearCache(normalizeBrowserTarget(params)));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SET_COMMENT_MODE, async (_event, params) => {

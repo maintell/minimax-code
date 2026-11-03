@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import { sessionLocks, isDeletionOwnerKind, turnIngress, turnIngressClientRequests, turnIngressSequences, } from '../../../infra/db/schema/turn.js';
-import { COMPACTION_DELETING_OWNER_KIND, createRecoveredTerminalFact, DELETION_FENCE_EXPIRES_AT_MS, MAINTENANCE_DELETING_OWNER_KIND, MAINTENANCE_OWNER_KIND, recoverDeadLegacyOwnerInTransaction, recoverExpiredInTransaction, recoverProcessRestartInTransaction, shouldRecoverStalledLegacyTurnLease, SESSION_DELETION_OWNER_KIND, TURN_DELETING_OWNER_KIND, } from './turn-lease-recovery.js';
+import { COMPACTION_DELETING_OWNER_KIND, DELETION_FENCE_EXPIRES_AT_MS, MAINTENANCE_DELETING_OWNER_KIND, MAINTENANCE_OWNER_KIND, recoverDeadLegacyOwnerInTransaction, recoverExpiredInTransaction, recoverProcessRestartInTransaction, shouldRecoverStalledLegacyTurnLease, SESSION_DELETION_OWNER_KIND, TURN_DELETING_OWNER_KIND, } from './turn-lease-recovery.js';
+import { pendingSettlementOf, recoverAdmissionPendingSettlementInTransaction, recoverPendingSettlementInTransaction, releaseOrPromoteDeletionFence, samePendingSettlement, } from './pending-settlement-recovery.js';
 import { createPluginHookSessionPersistence } from './plugin-hook-session.repository.js';
 import { findClientRequestBindings, insertReceiptAliases, persistedTurnConsumesQueuePause, publishQueueFacts, } from './turn-ingress-persistence.js';
 const DEFAULT_LEASE_MS = 30 * 60 * 1_000;
@@ -69,11 +70,7 @@ export function createTurnRepository(options) {
             return updated.changes === 1;
         },
         settle: async (input) => {
-            const pending = {
-                sessionId: input.sessionId,
-                turnId: input.turnId,
-                leaseId: input.leaseId,
-            };
+            const pending = pendingSettlementOf(input);
             try {
                 const committed = options.db.transaction((tx) => {
                     const completedAtMs = nowMs();
@@ -133,7 +130,7 @@ export function createTurnRepository(options) {
         deleteSessionData: (sessionId) => deleteTurnSessionData(options, pendingSettlements, sessionId),
         completeSessionDeletion: (sessionId) => completeTurnSessionDeletion(options, sessionId, isLeaseOwnerCurrent),
         findReceipt: (turnId) => findTurnReceipt(options, turnId),
-        findActiveTurn: async (sessionId) => findActiveTurn(options.db, sessionId, nowMs()),
+        findActiveTurn: async (sessionId) => findActiveTurn(options.db, sessionId, nowMs(), (ownerId) => isOwnedByOtherLiveRuntime(ownerId, { isLeaseOwnerAlive, isLeaseOwnerCurrent })),
         findLatestTurnActivity: async (sessionId) => findLatestTurnActivity(options.db, sessionId),
         ...pluginHookSessionPersistence,
         findSteeringReceipt: (input) => findSteeringReceipt(options, input),
@@ -157,14 +154,17 @@ export function createTurnRepository(options) {
 async function admitRepositoryTurn(options, input, dependencies) {
     const pending = dependencies.pendingSettlements.get(input.sessionId);
     const committed = options.db.transaction((tx) => {
+        // Recovery runs even when this candidate is rejected; its facts still commit.
+        const recoveryQueueFacts = [];
         const result = admitTurnInTransaction(tx, options, input, {
             pending,
             nowMs: dependencies.nowMs(),
             makeLeaseId: dependencies.makeLeaseId,
             leaseMs: dependencies.leaseMs,
+            recoveryQueueFacts,
         });
         if (result.status !== 'accepted')
-            return { result, facts: [] };
+            return { result, facts: recoveryQueueFacts };
         const effect = options.priorityFence.acceptedInTransaction(tx, {
             sessionId: input.sessionId,
             consumeQueuePause: input.consumeQueuePause === true,
@@ -177,7 +177,7 @@ async function admitRepositoryTurn(options, input, dependencies) {
                     ...(effect.revokeToken ? { queuePauseRevokeToken: effect.revokeToken } : {}),
                 }
                 : result,
-            facts: effect.facts,
+            facts: [...recoveryQueueFacts, ...effect.facts],
         };
     }, { behavior: 'immediate' });
     if (dependencies.pendingSettlements.get(input.sessionId) === pending) {
@@ -348,9 +348,17 @@ async function findTurnReceipt(options, turnId) {
         acceptedSequence: receipt.acceptedSequence,
     };
 }
-function findActiveTurn(db, sessionId, nowMs) {
+/**
+ * True only for a lock positively owned by another live Runtime. Unknown or
+ * dead owners stay false so recovery and the current-process admission window
+ * keep their existing behavior.
+ */
+function isOwnedByOtherLiveRuntime(ownerId, liveness) {
+    return !liveness.isLeaseOwnerCurrent(ownerId) && liveness.isLeaseOwnerAlive(ownerId) === true;
+}
+function findActiveTurn(db, sessionId, nowMs, isOwnedByOtherRuntime) {
     const lock = db
-        .select({ ownerKind: sessionLocks.ownerKind })
+        .select({ ownerId: sessionLocks.ownerId, ownerKind: sessionLocks.ownerKind })
         .from(sessionLocks)
         .where(and(eq(sessionLocks.sessionId, sessionId), inArray(sessionLocks.ownerKind, [
         'turn',
@@ -368,7 +376,13 @@ function findActiveTurn(db, sessionId, nowMs) {
         .orderBy(desc(turnIngress.acceptedSequence))
         .get();
     const busyReason = accepted ? storedBusyReason(accepted.busyReason) : undefined;
-    return accepted && busyReason ? { turnId: accepted.turnId, busyReason } : undefined;
+    if (!accepted || !busyReason)
+        return undefined;
+    return {
+        turnId: accepted.turnId,
+        busyReason,
+        ...(isOwnedByOtherRuntime(lock.ownerId) ? { ownedByOtherRuntime: true } : {}),
+    };
 }
 async function findSteeringReceipt(options, input) {
     const mapping = options.db
@@ -452,14 +466,17 @@ function storedBusyReason(value) {
         return 'turn';
     return value === 'compaction' ? 'compaction' : undefined;
 }
-function recoverAdmissionTerminalFacts(tx, input, pending, nowMs) {
+function recoverAdmissionTerminalFacts(tx, options, input, context) {
+    const { pending, nowMs } = context;
     const pendingRecovery = pending
-        ? recoverPendingSettlementInTransaction(tx, pending, nowMs)
+        ? recoverAdmissionPendingSettlementInTransaction(tx, options.priorityFence, pending, nowMs)
         : undefined;
+    if (pendingRecovery)
+        context.recoveryQueueFacts.push(...pendingRecovery.queueFacts);
     const expiredRecovery = recoverExpiredInTransaction(tx, input.sessionId, nowMs);
     const legacyRecovery = recoverDeadLegacyOwnerInTransaction(tx, input.sessionId, nowMs);
     return [
-        ...(pendingRecovery ? [pendingRecovery] : []),
+        ...(pendingRecovery?.terminalFact ? [pendingRecovery.terminalFact] : []),
         ...expiredRecovery.terminalFacts,
         ...legacyRecovery.terminalFacts,
     ];
@@ -471,7 +488,7 @@ function admitTurnInTransaction(tx, options, input, context) {
     if (blocksAdmission(sessionRejection, input.bypassSessionMutation)) {
         return { status: 'rejected', reason: sessionRejection };
     }
-    const terminalFacts = recoverAdmissionTerminalFacts(tx, input, context.pending, context.nowMs);
+    const terminalFacts = recoverAdmissionTerminalFacts(tx, options, input, context);
     const lock = findSessionLock(tx, input.sessionId);
     if (lock && isDeletionOwnerKind(lock.ownerKind)) {
         return withRecoveredTerminalFacts({ status: 'rejected', reason: 'session-deleting' }, terminalFacts);
@@ -657,11 +674,6 @@ function parseStringArray(value) {
 function sameStrings(left, right) {
     return left.length === right.length && left.every((value, index) => value === right[index]);
 }
-function samePendingSettlement(left, right) {
-    return (left?.sessionId === right.sessionId &&
-        left.turnId === right.turnId &&
-        left.leaseId === right.leaseId);
-}
 function withRecoveredTerminalFacts(result, terminalFacts) {
     return terminalFacts.length > 0 ? { ...result, recoveredTerminalFacts: terminalFacts } : result;
 }
@@ -695,47 +707,6 @@ function settleInTransaction(tx, input, completedAtMs) {
         throw new Error(`Turn settlement lost ownership: ${input.sessionId}/${input.turnId}`);
     }
     return { status: 'settled', completedAtMs, outcome: input.outcome };
-}
-function recoverPendingSettlementInTransaction(tx, pending, completedAtMs) {
-    const lock = tx
-        .select({ ownerId: sessionLocks.ownerId, ownerKind: sessionLocks.ownerKind })
-        .from(sessionLocks)
-        .where(eq(sessionLocks.sessionId, pending.sessionId))
-        .get();
-    const receipt = tx
-        .select({ status: turnIngress.status })
-        .from(turnIngress)
-        .where(and(eq(turnIngress.sessionId, pending.sessionId), eq(turnIngress.turnId, pending.turnId)))
-        .get();
-    if (lock?.ownerId !== pending.leaseId || receipt?.status !== 'accepted')
-        return undefined;
-    tx.update(turnIngress)
-        .set({ status: 'failed', completedAtMs })
-        .where(and(eq(turnIngress.sessionId, pending.sessionId), eq(turnIngress.turnId, pending.turnId), eq(turnIngress.status, 'accepted')))
-        .run();
-    releaseOrPromoteDeletionFence(tx, {
-        sessionId: pending.sessionId,
-        leaseId: pending.leaseId,
-        ownerKind: lock.ownerKind,
-        completedAtMs,
-    });
-    return createRecoveredTerminalFact(pending.sessionId, pending.turnId, completedAtMs, 'settlement-retry');
-}
-function releaseOrPromoteDeletionFence(tx, input) {
-    const ownership = and(eq(sessionLocks.sessionId, input.sessionId), eq(sessionLocks.ownerId, input.leaseId));
-    if (input.ownerKind === TURN_DELETING_OWNER_KIND ||
-        input.ownerKind === COMPACTION_DELETING_OWNER_KIND) {
-        return tx
-            .update(sessionLocks)
-            .set({
-            ownerKind: SESSION_DELETION_OWNER_KIND,
-            acquiredAtMs: input.completedAtMs,
-            expiresAtMs: DELETION_FENCE_EXPIRES_AT_MS,
-        })
-            .where(ownership)
-            .run();
-    }
-    return tx.delete(sessionLocks).where(ownership).run();
 }
 function findDuplicate(tx, input) {
     const byTurn = tx.select().from(turnIngress).where(eq(turnIngress.turnId, input.turnId)).get();

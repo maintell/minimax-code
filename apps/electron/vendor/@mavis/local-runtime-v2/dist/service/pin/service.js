@@ -42,7 +42,10 @@ export class PinService {
             const session = await this.options.sessions.get(id);
             if (!session)
                 throw new PinServiceError('session-not-found', `Session ${id} was not found`);
-            const refs = updateRefs(await this.readRefsInWriteLane(), { type: 'session', id }, pinned, insertIndex);
+            const previous = await this.readRefsInWriteLane();
+            const refs = updateRefs(previous, { type: 'session', id }, pinned, insertIndex);
+            // Restore first: a failed restore must leave the session pinned and retryable.
+            await this.restoreUnpinnedSessions(previous, refs);
             await this.writeRefs(refs);
             return {
                 item: pinned ? { ref: { type: 'session', id }, session } : undefined,
@@ -98,7 +101,8 @@ export class PinService {
         return this.serializeWrite(async () => {
             const existingKeys = new Set((await this.readRefsForValidation()).map(pinRefKey));
             await this.validateEntities(refs, existingKeys);
-            await this.readRefsInWriteLane();
+            const previous = await this.readRefsInWriteLane();
+            await this.restoreUnpinnedSessions(previous, refs);
             await this.writeRefs(refs);
             await this.syncProjects(refs);
             return this.hydrate(refs, true);
@@ -296,6 +300,19 @@ export class PinService {
             return [ref];
         });
         return [...base, ...appendedCurrent, ...appendedAgents];
+    }
+    /**
+     * The pinned list shows a session even when its project was removed from the
+     * sidebar. Unpinning must not make such a session unreachable, so it is listed
+     * in its project again; other tasks of that removed project stay hidden.
+     */
+    async restoreUnpinnedSessions(previous, next) {
+        const kept = new Set(next.filter((ref) => ref.type === 'session').map((ref) => ref.id));
+        for (const ref of previous) {
+            if (ref.type !== 'session' || kept.has(ref.id))
+                continue;
+            await this.options.projectRepository.restoreSessionAfterRemoval(ref.id, this.nowMs());
+        }
     }
     async writeRefs(refs) {
         upsertPreferenceValue(this.options.db, PINNED_ITEMS_ORDER_PREFERENCE_KEY, refs);

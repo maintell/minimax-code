@@ -53,6 +53,7 @@ export class SshAppServerClient {
         this.ready = false;
         this.awaitingDiscovery = false;
         this.accountMethods = new Set();
+        this.runtimeFeatures = [];
         this.stopping = false;
         this.lostNotified = false;
         this.accountListeners = new Set();
@@ -66,6 +67,14 @@ export class SshAppServerClient {
     getDaemonInstanceId() {
         const instanceId = this.ready ? this.bootstrapIdentity?.instanceId : undefined;
         return typeof instanceId === 'string' && instanceId.length > 0 ? instanceId : null;
+    }
+    /** Business features declared by the ready Runtime; older servers declare none. */
+    getRuntimeFeatures() {
+        return this.ready ? this.runtimeFeatures : [];
+    }
+    /** Remote home and Runtime data directories; older servers do not report them. */
+    getRemoteEnvironmentPaths() {
+        return this.ready ? this.remoteEnvironmentPaths : undefined;
     }
     getHostProbe() {
         if (!this.ready)
@@ -800,6 +809,8 @@ export class SshAppServerClient {
         if (generation !== this.generation)
             return;
         this.accountMethods = new Set(result.capabilities.methods);
+        this.runtimeFeatures = readRuntimeFeatures(result.capabilities.features);
+        this.remoteEnvironmentPaths = readRemoteEnvironmentPaths(result.environment);
         // Only trust an encoding the server named for this connection, and only
         // one this build can actually decode.
         this.binaryPayloadEncoding = protocol.negotiateAppServerBinaryPayloadEncoding([
@@ -994,6 +1005,23 @@ function validateInitializeResult(value, protocol, identity) {
         throw new SshRuntimeError('app_server_protocol_mismatch', 'Remote MCode app-server uses an incompatible transport protocol.');
     }
     return value;
+}
+/** Optional and additive: a malformed list means no features, never a lost connection. */
+function readRuntimeFeatures(value) {
+    if (!Array.isArray(value) || !value.every((feature) => typeof feature === 'string'))
+        return [];
+    return Object.freeze([...new Set(value)]);
+}
+/** Optional and additive: unusable paths disable the extra scope, never the connection. */
+function readRemoteEnvironmentPaths(value) {
+    if (!isRecord(value) || value.platformFamily !== 'unix')
+        return undefined;
+    const { homeDir, dataDir } = value;
+    if (typeof homeDir !== 'string' || !isSafeAbsoluteRemotePath(homeDir))
+        return undefined;
+    if (typeof dataDir !== 'string' || !isSafeAbsoluteRemotePath(dataDir))
+        return undefined;
+    return Object.freeze({ homeDir, dataDir });
 }
 function isNodeError(value) {
     return value instanceof Error && 'code' in value;

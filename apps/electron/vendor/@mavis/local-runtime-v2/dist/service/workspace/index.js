@@ -6,4 +6,18 @@ export * from './errors.js';
 export { WorkspaceFileError } from './operations/filesystem/files.js';
 export { WorkspaceGitService } from './orchestration/workspace-git.service.js';
 export { isGitRepo } from './operations/changes.js';
+export { createLocalWorkspaceGitFacade } from './files/api.js';
+export { listFileTree } from './files/api.js';
+export { searchFiles } from './files/api.js';
+export { ManagedWorktreeService } from './git/managed-worktrees.js';
+export { scanWorkspace } from './indexing/scan/scanner.js';
+export { createLocalFileApiGitChangesCoordinator } from './files/api.js';
+export { routeLocalFileApi } from './files/api.js';
+export { createWorkspaceIndexingHostSubsystem } from './indexing/scan/index.js';
+export { hostCaptureWorkspaceRevisionAfterTurn } from './indexing/scan/index.js';
+export { hostLogWorkspaceSemanticSearchUnavailable } from './indexing/scan/index.js';
+export { hostPrewarmWorkspaceIndexingForWorkspace } from './indexing/scan/index.js';
+export { hostPrepareWorkspaceIndexingForSessionStart } from './indexing/scan/index.js';
+export { git } from './operations/git-process.js';
+export { generateDefaultWorktreeBranch } from './worktree-branch.js';
 //# sourceMappingURL=index.js.map

@@ -5,10 +5,11 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { ipcMain, nativeTheme, shell } from "electron";
+import { app, ipcMain, nativeTheme, shell } from "electron";
 import { logger, isLogFile, getLogFilePath, getCategoryLogger, flushLogs, getLogDir } from "../utils";
 import { getExtraLogSources, resolveRuntimeLogsDir } from "../utils/extra-log-source";
 import { getDesktopAppInstallDir } from "../utils/install-dir";
+import { ensureDefaultProjectDir } from "../utils/default-project-dir";
 import { importEsm } from "../utils/import-esm";
 import { IPC_CHANNELS } from "../config/constants";
 import { uploadToOSS } from "../modules/oss";
@@ -21,6 +22,22 @@ import { createRequiredUploadArtifact } from "../modules/diagnostics/required-up
 import { writeDiagnosticArchive } from "../modules/diagnostics/diagnostic-archive";
 import { collectDesktopEnvironment } from "../modules/diagnostics/desktop-environment";
 configureUtilityRuntimeDiagnosticsLogger(logger);
+const BROWSER_FEEDBACK_DIAGNOSTICS_FILE = 'browser-diagnostics.json';
+/** Loaded on demand so feedback upload does not pull the Browser module graph into system IPC. */
+async function collectBrowserDiagnosticsForUpload() {
+    const [{ collectBrowserFeedbackDiagnostics }, { getEmbeddedBrowserFeedbackDiagnostics }, ipc] = await Promise.all([
+        import('../modules/browser/browser-feedback-diagnostics'),
+        import('../modules/browser/embedded-browser-manager'),
+        import('./browserTelemetry.ipc'),
+    ]);
+    return collectBrowserFeedbackDiagnostics({
+        pages: getEmbeddedBrowserFeedbackDiagnostics,
+        renderer: () => getMainWindow()?.webContents,
+        requestRenderer: ipc.requestBrowserRendererDiagnostics,
+        appVersion: app.getVersion(),
+        platform: process.platform,
+    });
+}
 const UPLOAD_LOG_MAX_FILES = 256;
 const UPLOAD_LOG_MAX_BYTES = 512 * 1024 * 1024;
 /**
@@ -59,7 +76,7 @@ function toSharedFileSource(runtime, source) {
     });
 }
 async function collectUploadDiagnosticBundle(input) {
-    const runtime = await importEsm('@mavis/local-runtime');
+    const runtime = await importEsm('@mavis/local-runtime-v2/diagnostics');
     const goalDiagnostics = await importEsm('@mavis/local-runtime-v2');
     const runtimeDataDir = resolveLocalRuntimeDataDir();
     const requiredArtifacts = [];
@@ -73,6 +90,15 @@ async function collectUploadDiagnosticBundle(input) {
                 skippedArtifacts.push({ name: ef.name, reason: 'stat_failed' });
             }
         }
+    }
+    try {
+        requiredArtifacts.push(await createRequiredUploadArtifact({
+            name: BROWSER_FEEDBACK_DIAGNOSTICS_FILE,
+            content: JSON.stringify(await collectBrowserDiagnosticsForUpload(), null, 2),
+        }));
+    }
+    catch {
+        skippedArtifacts.push({ name: BROWSER_FEEDBACK_DIAGNOSTICS_FILE, reason: 'collection_failed' });
     }
     try {
         requiredArtifacts.push(await createRequiredUploadArtifact({
@@ -197,6 +223,10 @@ export function setupSystemIPC(options = {}) {
             return { success: false, error: String(error) };
         }
     });
+    // 未选择文件夹时新建项目使用的 Documents/MiniMax/<项目名>
+    ipcMain.handle(IPC_CHANNELS.SYSTEM_ENSURE_DEFAULT_PROJECT_DIR, (_, projectName) => typeof projectName === 'string'
+        ? ensureDefaultProjectDir(app.getPath('documents'), projectName)
+        : { success: false, error: 'invalid-name' });
     // 打开指定文件夹
     ipcMain.handle(IPC_CHANNELS.SYSTEM_OPEN_DIR, async (_, dirPath) => {
         try {
@@ -228,6 +258,10 @@ export function setupSystemIPC(options = {}) {
     });
     ipcMain.handle(IPC_CHANNELS.SYSTEM_GET_APP_INSTALL_DIR, () => {
         return getDesktopAppInstallDir();
+    });
+    // 安装包版本（同步，用于 preload 初始化 platformInfo.appVersion）
+    ipcMain.on(IPC_CHANNELS.SYSTEM_GET_APP_VERSION_SYNC, (event) => {
+        event.returnValue = app.getVersion();
     });
     // ============================================
     // 渲染进程日志上报
@@ -398,13 +432,47 @@ export async function uploadLog(extraFiles, sessionId) {
         return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
 }
+const FEEDBACK_CATEGORIES = new Set(['general', 'browser', 'plugin']);
+const BROWSER_CONTEXT_BACKENDS = new Set(['web-contents-view', 'webview']);
+const BROWSER_CONTEXT_SURFACES = new Set(['browser', 'miniapp']);
+/** Renderer-supplied feedback metadata is untrusted: keep bounded enum/number fields only. */
+export function sanitizeFeedbackMetadata(data) {
+    const result = {};
+    if (typeof data.feedback_category === 'string' && FEEDBACK_CATEGORIES.has(data.feedback_category))
+        result.feedback_category = data.feedback_category;
+    const raw = data.browser_context;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const input = raw;
+        const context = {};
+        if (typeof input.rendererBackend === 'string' &&
+            BROWSER_CONTEXT_BACKENDS.has(input.rendererBackend))
+            context.rendererBackend = input.rendererBackend;
+        if (typeof input.surfaceKind === 'string' && BROWSER_CONTEXT_SURFACES.has(input.surfaceKind))
+            context.surfaceKind = input.surfaceKind;
+        if (typeof input.urlScheme === 'string' && /^[a-z]{1,16}$/.test(input.urlScheme))
+            context.urlScheme = input.urlScheme;
+        if (Number.isSafeInteger(input.tabId))
+            context.tabId = input.tabId;
+        if (Object.keys(context).length)
+            result.browser_context = context;
+    }
+    return result;
+}
 /**
  * Upload feedback log: write a JSON metadata file to the log directory,
  * then call the standard uploadLog() to bundle everything and upload.
  */
 async function uploadFeedbackLog(data) {
     try {
-        const sessionReport = await collectSessionReportBestEffort(data.session_id);
+        const metadata = sanitizeFeedbackMetadata(data);
+        data = { ...data, ...metadata };
+        if (!metadata.feedback_category)
+            delete data.feedback_category;
+        if (!metadata.browser_context)
+            delete data.browser_context;
+        const sessionReport = data.session_id
+            ? await collectSessionReportBestEffort(data.session_id)
+            : [];
         const logDir = getLogDir();
         await fs.promises.mkdir(logDir, { recursive: true });
         // Format timestamp for filename: YYYY-MM-DD-HH-mm
@@ -422,7 +490,7 @@ async function uploadFeedbackLog(data) {
         await fs.promises.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
         logger.info(`[UploadFeedbackLog] Wrote feedback metadata: ${fileName}`);
         // Now run the standard upload flow, injecting the metadata file
-        const result = await uploadLog([{ name: fileName, path: filePath }, ...sessionReport], data.session_id);
+        const result = await uploadLog([{ name: fileName, path: filePath }, ...sessionReport], data.session_id || undefined);
         // Clean up the metadata file after upload (success or failure)
         try {
             await fs.promises.unlink(filePath).catch(() => { });

@@ -14,7 +14,9 @@ export function bindAgentShellService(service, ports) {
             return undefined;
         return shell.family === 'git-bash' ? 'posix' : 'powershell';
     });
-    service.warmup();
+    // No discovery before the Runtime is ready: a probe that takes the process down would
+    // otherwise fail startup. Session creation, chat preparation and Bash still start the
+    // background discovery on demand.
 }
 export function initializeAgentShellService(options) {
     return new AgentShellService({

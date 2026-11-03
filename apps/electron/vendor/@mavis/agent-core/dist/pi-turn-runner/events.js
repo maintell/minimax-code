@@ -288,6 +288,9 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         }
     };
     const writeAgentEvent = async (event, observedAtMs) => {
+        if (requiresPtcLifecycleDelivery(event, turn) && !turn.bridge.getActiveAssistantMessageId()) {
+            throw new Error('PTC lifecycle delivery requires an active assistant message id.');
+        }
         let out;
         try {
             out = await turn.bridge.processEvent(event, observedAtMs);
@@ -349,6 +352,8 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                 event_type: event.type,
                 error: err instanceof Error ? err.message : String(err),
             }, '[pi-turn-runner] event handler threw');
+            if (requiresPtcLifecycleDelivery(event, turn))
+                throw err;
         }
         if ((!discardMessage && event.type === 'message_end') || event.type === 'tool_execution_end') {
             await history.flushTail();
@@ -384,7 +389,7 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         if (event.type === 'turn_end')
             await pollExternalContinuations(event);
     };
-    const unsubscribe = agent.subscribe((event) => {
+    const dispatch = (event) => {
         // Capture before queueing or awaiting response hooks so decode timing only
         // spans model events, not caller-side control or delivery work.
         const observedAtMs = nowMs();
@@ -394,13 +399,25 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         const queued = queue.then(() => onAgentEvent(event, observedAtMs));
         queue = queued.catch(() => undefined);
         return queued;
-    });
+    };
+    const unsubscribe = agent.subscribe((event) => dispatch(event));
     return {
         unsubscribe,
         drain: () => queue,
+        dispatch,
         convergeAtIdle,
         forcedTermination: () => forcedTermination,
     };
+}
+function requiresPtcLifecycleDelivery(event, turn) {
+    if (turn.input.toolConfig.ptcTools === undefined ||
+        (event.type !== 'tool_execution_start' && event.type !== 'tool_execution_end')) {
+        return false;
+    }
+    if (event.parentToolCallId)
+        return true;
+    return (event.toolName === 'run_code' &&
+        (turn.input.toolConfig.tools ?? []).some((tool) => tool.def.name === 'run_code' && tool.source === 'builtin'));
 }
 function enqueueSteering(agent, messages) {
     if (messages.some((message) => immediateSendBatchId(message) !== undefined)) {

@@ -23,10 +23,12 @@
 import { getConfig } from "@mavis/config";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
 import logger from "../../../utils/logger";
+import { recordAuthRefreshExecutionGap } from "../../auth/refresh-environment";
 import { destroyAllManagedMiniAppTabs } from "../../browser/embedded-browser-manager";
 import { enqueueElectronObservabilityEvent, isElectronObservabilityShuttingDown, getElectronObservabilityAppInstanceId } from "../../observability/outbox";
 import { recordElectronStartupRuntimeReady } from "../../observability/startup-performance";
 import { resolveLocalRuntimeDataDir } from "../data-dir";
+import { notifyDataDirRuntimeReady, notifyDataDirRuntimeTerminalFailure, notifyDataDirRuntimeStartAttempt } from "../data-dir-relocation-guard";
 import { prepareLocalRuntimeNativeSqliteEnv } from "../native-sqlite-env";
 import { resolveLocalRuntimeLaunchPlan } from "../test-data-isolation";
 import { resetUtilityRuntimeStartBlockForTests, isUtilityRuntimeStartBlocked } from "../runtime-start-guard";
@@ -185,7 +187,12 @@ function getManager() {
         emit: enqueueElectronObservabilityEvent,
         isQuitInProgress: isElectronObservabilityShuttingDown,
     });
-    executionContinuityController ?? (executionContinuityController = createExecutionContinuity());
+    if (!executionContinuityController) {
+        executionContinuityController = createExecutionContinuity();
+        // Read-only breadcrumb for OAuth refresh summaries; listener errors are
+        // already isolated by the continuity controller.
+        executionContinuityController.continuity.onGap((observation) => recordAuthRefreshExecutionGap(observation.executionGapMs));
+    }
     manager = new LocalRuntimeUtilityProcessManager({
         bootstrapTimeoutMs: launchPlan.utilityBootstrapTimeoutMs,
         ...(isUtilityRuntimeHealthRecoveryDisabled() ? { runtimeHealthTimeoutMs: false } : {}),
@@ -251,6 +258,7 @@ function getManager() {
         },
         onRuntimeReady: () => {
             runtimeFailReason = null;
+            notifyDataDirRuntimeReady();
             // CUA may finish first while local-runtime is still starting. Reconcile
             // the pending transferred port as soon as the runtime publishes ready;
             // otherwise the CUA activation would report success but leave v2 on the
@@ -271,6 +279,7 @@ function getManager() {
             // A terminal verdict must reach windows that are already open; the
             // once-per-window startup push cannot see a mid-session latch.
             if (terminal) {
+                notifyDataDirRuntimeTerminalFailure(reasonCode);
                 broadcastRuntimeFailed({
                     type: failureTypeForReasonCode(reasonCode),
                     message,
@@ -295,6 +304,7 @@ export function isUtilityRuntimeHealthRecoveryDisabled(env = process.env) {
 export async function ensureUtilityRuntimeStarted(options = {}) {
     if (isUtilityRuntimeStartBlocked())
         return false;
+    notifyDataDirRuntimeStartAttempt();
     return getManager().ensureStarted(options);
 }
 /** Lazily starts the sibling CUA utility after a conversation explicitly opts
@@ -497,7 +507,7 @@ export async function collectUtilityRuntimeSessionReport(sessionId) {
 }
 export async function stopUtilityRuntime() {
     if (!manager) {
-        stopComputerUseUtility();
+        await stopComputerUseUtility();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
         return { status: 'exited' };
@@ -506,7 +516,7 @@ export async function stopUtilityRuntime() {
         return await manager.stop();
     }
     finally {
-        stopComputerUseUtility();
+        await stopComputerUseUtility();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
     }

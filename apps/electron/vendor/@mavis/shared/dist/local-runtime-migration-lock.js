@@ -8,7 +8,7 @@ import { resolveV2DirectoryContract } from './local-runtime-paths.js';
  * `process.kill(pid, 0)` liveness probing and an mtime heartbeat are portable
  * Node primitives (Windows/macOS), the same pattern as the sqlite snapshot
  * publish lock in `v2-migration.ts`. The primitive lives in `@mavis/shared`
- * (zero runtime dependencies) and `@mavis/local-runtime` re-exports it. See
+ * (zero runtime dependencies); `@mavis/local-runtime-v2` imports it directly. See
  * `.harness/docs/adr/local-runtime-migration-fault-tolerance.md`.
  */
 const MIGRATION_LOCK_FILE = 'migration.lock';

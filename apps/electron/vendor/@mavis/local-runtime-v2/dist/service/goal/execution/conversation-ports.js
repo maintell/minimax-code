@@ -42,7 +42,7 @@ export function createGoalConversationPorts(input) {
                 throw error;
             }
         },
-        steerContinuationTurn: async ({ sessionId, message, idempotencyKey, internalPromptRead, onAccepted, }) => {
+        steerContinuationTurn: async ({ sessionId, message, idempotencyKey, displayContent, internalPromptRead, onAccepted, }) => {
             try {
                 const result = await conversation().ingress.steer({
                     sessionId,
@@ -55,6 +55,7 @@ export function createGoalConversationPorts(input) {
                         attachments: message.attachments.map((attachment) => ({ ...attachment })),
                         origin: message.origin,
                         hideUserMessage: true,
+                        ...(displayContent ? { displayContent } : {}),
                     },
                     preDelivery: {
                         accept: async (accepted) => {
@@ -70,6 +71,10 @@ export function createGoalConversationPorts(input) {
                         },
                     },
                 });
+                if (result.mode === 'queued') {
+                    // Only a user side message (raceFallback) is ever queued; Goal steers never ask for it.
+                    throw new Error(`Goal continuation steer was queued unexpectedly: ${result.turnId}`);
+                }
                 if (result.mode === 'activated')
                     detach(observeActivatedSteer(sessionId, result));
                 return result;

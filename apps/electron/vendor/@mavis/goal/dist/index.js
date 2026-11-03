@@ -36,7 +36,7 @@ export { createEvaluatorVerifierAdapter, evaluatorVerdictJsonSchema, EvaluatorMo
 export { createSubagentVerifierAdapter } from './verification/subagent.js';
 export { verificationModeForRoute } from './verification/verification-policy.js';
 export { INTERNAL_CONTEXT_OPEN_PREFIX, INTERNAL_CONTEXT_CLOSE_TAG, wrapInternalContext, isInternalContextMessage, } from './internal-context-fragment.js';
-export { CreateGoalToolDef, UpdateGoalToolDef, GetGoalToolDef, hasUpdateGoalTokenBudgetIntent, resolveUpdateGoalMode, } from './tool-defs.js';
+export { CreateGoalToolDef, UpdateGoalToolDef, GetGoalToolDef, hasUpdateGoalTokenBudgetIntent, resolveUpdateGoalMode, UPDATE_GOAL_LIMIT_FIELDS, } from './tool-defs.js';
 export { CreateGoalTool, UpdateGoalTool, GetGoalTool } from './tool-impls.js';
 export { GOAL_BUDGET_WRAP_UP_INSTRUCTION, GOAL_TOKEN_BUDGET_WRAP_UP_INSTRUCTION, GOAL_COMPLETION_TOOL_REFUSAL, GOAL_FINAL_REPLY_INSTRUCTION, GOAL_FINAL_REPLY_RETRY_PROMPT, GOAL_FINAL_REPLY_RETRY_REASON, createGoalFinalReplyGate, isAcceptedGoalCompletionResult, } from './final-reply.js';
 export { isVerificationInterruptedReason, renderVerificationInterruptedNotice, } from './verification-interrupted.js';

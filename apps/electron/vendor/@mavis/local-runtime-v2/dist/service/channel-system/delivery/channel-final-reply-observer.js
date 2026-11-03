@@ -45,7 +45,15 @@ export class ChannelFinalReplyObserver {
         const admitted = resolveChannelRoute(context.provenance);
         if (admitted)
             return admitted;
-        const persisted = await this.options.messages.resolveTurnSource(context.sessionId, context.turnId);
+        return this.resolvePersistedTurnChannel(context.sessionId, context.turnId);
+    }
+    /**
+     * Routing from the Turn's first persisted user message. It stays readable
+     * for the whole Turn, so IM ingress uses the same answer to decide whether
+     * a follow-up may join the running Turn.
+     */
+    async resolvePersistedTurnChannel(sessionId, turnId) {
+        const persisted = await this.options.messages.resolveTurnSource(sessionId, turnId);
         return resolveChannelRoute(persisted);
     }
 }

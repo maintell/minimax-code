@@ -8,9 +8,6 @@ export function createTurnPromptSuggestionCapture(input, prepared, options) {
     const port = options.promptSuggestion;
     if (!port ||
         !port.enabled() ||
-        // Beta: offered only on the platform-billed (subscription) model path,
-        // unless the port opts every model in (internal builds).
-        (input.preparation.llm.managedProvider !== true && port.allowUnmanagedModels !== true) ||
         prepared.caller !== 'chat' ||
         input.session.parentSessionId ||
         (input.session.interactionMode ?? 'default') !== 'default' ||
@@ -22,11 +19,13 @@ export function createTurnPromptSuggestionCapture(input, prepared, options) {
             llm: { ...input.preparation.llm, ...prepared.llm },
             sessionId: input.lease.sessionId,
             signal,
-        }, options)),
+        }, options), 
+        // 建议用的是本轮同一个模型，审不审和本轮正文一致：BYOK 模型不送 MiniMax 审核。
+        input.preparation.llm.managedProvider === true),
     };
 }
 /** Narrows one accepted Turn to the composer-facing cases only. */
-export function readPromptSuggestionScope(input, prepared, capture) {
+export function readPromptSuggestionScope(input, prepared, capture, replyMessageId) {
     if (!capture ||
         prepared.caller !== 'chat' ||
         input.session.parentSessionId ||
@@ -41,6 +40,7 @@ export function readPromptSuggestionScope(input, prepared, capture) {
             interactionMode: input.session.interactionMode,
         },
         capture: capture.read(),
+        ...(replyMessageId ? { messageId: replyMessageId } : {}),
     };
 }
 /** Appends the capture Hooks without replacing any existing Hook. */
@@ -100,6 +100,7 @@ export class PromptSuggestionCommitRelay {
                 turnId: scope.turnId,
                 caller: scope.caller,
                 session: scope.session,
+                ...(scope.messageId ? { messageId: scope.messageId } : {}),
             }, scope.capture);
         }
         catch {

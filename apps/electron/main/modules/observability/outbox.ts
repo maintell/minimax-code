@@ -1,10 +1,12 @@
 import { readFileSync, existsSync, renameSync, unlinkSync, statSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
+import { sanitizeBrowserTelemetryPayload } from "./browser-telemetry-sanitizer";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { app, ipcMain } from "electron";
 import { IPC_CHANNELS } from "../../config/constants";
 import { boundFailureDetail } from "./failure-detail";
 import { sanitizeWorkspaceIndexingPayload } from "./workspace-indexing";
+import { AUTH_REFRESH_SUMMARY_EVENT, sanitizeAuthRefreshSummaryPayload } from "./auth-refresh-summary";
 import logger from "../../utils/logger";
 import { setupElectronStartupPerformanceIPC } from "./startup-performance";
 import { readSystemSessionEndEvidence } from "./system-session-end";
@@ -230,6 +232,9 @@ function sanitizeGenericProbePayload(eventName, payload) {
     if (eventName === 'workspace_indexing.state') {
         return { ...safeCommonMetadata(payload), ...sanitizeWorkspaceIndexingPayload(payload) };
     }
+    if (eventName === AUTH_REFRESH_SUMMARY_EVENT) {
+        return { ...safeCommonMetadata(payload), ...sanitizeAuthRefreshSummaryPayload(payload) };
+    }
     if (eventName === 'app.crash') {
         // `source` collides with the RUM SDK's built-in source dimension and is
         // masked in analytics queries; `crash_source` is the queryable mirror.
@@ -266,6 +271,10 @@ function sanitizeGenericProbePayload(eventName, payload) {
                 payload.crashed_app_instance_id.length <= MAX_CRASHED_APP_INSTANCE_ID_LENGTH
                 ? { crashed_app_instance_id: payload.crashed_app_instance_id }
                 : {}),
+            ...(payload.crashed_browser_backend === 'webview' ||
+                payload.crashed_browser_backend === 'web-contents-view'
+                ? { crashed_browser_backend: payload.crashed_browser_backend }
+                : {}),
         };
     }
     if (eventName === 'app.system_session_end') {
@@ -284,6 +293,9 @@ function sanitizeGenericProbePayload(eventName, payload) {
     }
     if (eventName.startsWith('hot_update.')) {
         return sanitizeHotUpdatePayload(payload);
+    }
+    if (eventName.startsWith('browser.')) {
+        return sanitizeBrowserTelemetryPayload(eventName, payload, safeCommonMetadata(payload));
     }
     if (eventName === 'desktop.abnormal_page') {
         return {

@@ -163,6 +163,7 @@ export var HarnessControlMode;
     HarnessControlMode[HarnessControlMode["EXECUTION_STATUS"] = 9] = "EXECUTION_STATUS";
     HarnessControlMode[HarnessControlMode["EXECUTION_SNAPSHOT"] = 10] = "EXECUTION_SNAPSHOT";
     HarnessControlMode[HarnessControlMode["EXECUTION_READ_SNAPSHOT"] = 11] = "EXECUTION_READ_SNAPSHOT";
+    HarnessControlMode[HarnessControlMode["INJECT_USER_MESSAGE"] = 1006] = "INJECT_USER_MESSAGE";
 })(HarnessControlMode || (HarnessControlMode = {}));
 export var SessionExecutionAdmissionKind;
 (function (SessionExecutionAdmissionKind) {

@@ -46,6 +46,12 @@ export const localRuntimeV2Goals = sqliteTable('local_runtime_v2_goals', {
     cacheWriteUnreported: integer('cache_write_unreported', { mode: 'boolean' })
         .notNull()
         .default(false),
+    /**
+     * This Goal's own work-request cap and active-time cap in seconds
+     * (migration 52). NULL means the Goal has none and uses the global default.
+     */
+    requestLimit: integer('request_limit'),
+    activeSecondsLimit: integer('active_seconds_limit'),
 }, (table) => [
     uniqueIndex('idx_local_runtime_v2_goals_session').on(table.sessionId),
     index('idx_local_runtime_v2_goals_kickoff_state').on(table.kickoffState, table.sessionId),

@@ -50,6 +50,7 @@ import { buildReplaceAllEdit, ReplaceAllError, withReplaceAllCount, } from '../s
 import { executeEditWithLineNumberRetry, normalizeEditsForLineNumberRetry, } from '../shared/edit-line-number-retry.js';
 import { createCapturingEditOperations } from '../shared/edit-capture.js';
 import { withCompatibleEditToolResponse } from '../plugin-hooks/vendor-tool-response.js';
+import { fileStorageFailure } from './storage-failure.js';
 let CloudEditTool = (() => {
     let _classDecorators = [bindTool(EditToolDef)];
     let _classDescriptor;
@@ -108,7 +109,16 @@ let CloudEditTool = (() => {
             // recovers (CR !4027 P1).
             const capture = createCapturingEditOperations();
             const tool = createEditTool(this.workspaceRoot, { operations: capture.operations });
-            const piResult = await executeEditWithLineNumberRetry(tool, { path: abs, edits: piEdits }, signal);
+            let piResult;
+            try {
+                piResult = await executeEditWithLineNumberRetry(tool, { path: abs, edits: piEdits }, signal);
+            }
+            catch (error) {
+                const failure = signal?.aborted ? undefined : fileStorageFailure(EditToolDef.name, error);
+                if (!failure)
+                    throw error;
+                return failure;
+            }
             const res = replacedCount === undefined ? piResult : withReplaceAllCount(piResult, abs, replacedCount);
             const textContent = res.content.filter((c) => c.type === 'text');
             const text = textContent.map((c) => c.text).join('\n');

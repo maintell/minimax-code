@@ -64,6 +64,7 @@
  * | 46  | create_goal_owner_table                           | no     | CREATE + INSERT-only copy; legacy source rows retained |
  * | 47  | create_goal_request_ledger                        | no     | CREATE IF NOT EXISTS |
  * | 48  | add_goal_token_usage                              | no     | ADD COLUMN (with defaults); CREATE IF NOT EXISTS |
+ * | 52  | add_goal_request_and_time_limits                  | no     | ADD COLUMN (nullable)                            |
  *
  * The Memory version-collision adoption (`memory-migration-recovery.ts`) is
  * not a catalog entry but replays m33, so initialize treats a pending

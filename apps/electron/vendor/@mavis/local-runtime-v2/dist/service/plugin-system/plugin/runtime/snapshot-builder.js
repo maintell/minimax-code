@@ -1,7 +1,8 @@
 import path from 'node:path';
 import { McpNameRegistry, configuredMcpNameKey, pluginMcpNameKey } from '@mavis/mcp';
-import { buildPluginSkillRuntimeName } from '@mavis/shared';
+import { buildPluginSkillRuntimeName, LOCAL_PLUGIN_MARKETPLACE, OFFICIAL_PLUGIN_MARKETPLACE, pluginIdKey, samePluginId, } from '@mavis/shared';
 import { hostWithholdsMiniApp } from '../package/miniapp/engines.js';
+import { hasSupportedCapability } from '../package/package-readers.js';
 export class PluginSnapshotBuilder {
     names;
     options;
@@ -47,6 +48,7 @@ export class PluginSnapshotBuilder {
                 name: plugin.name,
                 ...(plugin.version ? { version: plugin.version } : {}),
                 source: turnPluginSource(plugin.source),
+                marketplace: plugin.id.marketplace,
                 hostCapabilities: plugin.hostCapabilities,
                 ...(plugin.iconPath ? { iconUrl: localIconUrl(plugin.iconPath) } : {}),
                 ...(plugin.darkIconPath ? { darkIconUrl: localIconUrl(plugin.darkIconPath) } : {}),
@@ -121,6 +123,7 @@ function createSnapshotBuildState(reservations) {
         agents: [],
         pluginNames: new Set(),
         skillNames: new Set(reservations.skillNames.map(normalizedSkillKey)),
+        nameOwners: new Map(),
     };
 }
 /** True when the Host is a parsable release older than the package's `engines.mcode`. */
@@ -149,11 +152,12 @@ function appendOfficialPackages(packages, state, options) {
             plugin,
             packageContentDigest: entry.contentDigest,
             sourceKind: 'official',
-            includeRuntimeCapabilities: true,
             ...capabilityCollisionState(state),
         });
         if (!accepted)
             continue;
+        const id = { name: plugin.name, marketplace: OFFICIAL_PLUGIN_MARKETPLACE };
+        state.nameOwners.set(collisionKey(plugin.name), id);
         state.officialPackages.push(freeze({
             name: plugin.name,
             ...(plugin.version ? { version: plugin.version } : {}),
@@ -161,62 +165,116 @@ function appendOfficialPackages(packages, state, options) {
             contentDigest: entry.contentDigest,
             ...(plugin.miniapp ? { plugin } : {}),
         }));
-        state.enabledPlugins.push(enabledProjection(plugin));
-        state.skills.push(...accepted.skills);
-        for (const skill of accepted.skills)
-            state.skillOwners.set(skill, plugin.name);
-        state.mcpServers.push(...accepted.mcpServers);
-        state.hooks.push(...accepted.hooks);
-        state.hostBindings.push(...accepted.hostBindings);
+        state.enabledPlugins.push(enabledProjection(plugin, id));
+        appendRuntimeCapabilities(plugin, accepted, state);
+        state.agents.push(...accepted.agents);
     }
 }
+/**
+ * Identity and runtime name are separate: every installed PluginId stays in the
+ * local projection, while at most one enabled Plugin per manifest name is
+ * effective. Official packages claim names first; local Plugins claim in
+ * PluginId order. A disabled or unavailable Plugin never claims a name.
+ */
 function appendLocalPackages(input, state, options) {
-    const sorted = [...input.localPackages].sort((left, right) => normalizedPath(left.plugin.rootPath).localeCompare(normalizedPath(right.plugin.rootPath)));
-    for (const entry of sorted)
-        appendLocalPlugin(entry, input.isLocalEnabled, state, options);
+    const candidates = localCandidates(input, state);
+    for (const candidate of candidates) {
+        if (!candidate.enabled || candidate.entry.unavailableReason)
+            continue;
+        const key = collisionKey(candidate.entry.plugin.name);
+        if (!state.nameOwners.has(key))
+            state.nameOwners.set(key, candidate.id);
+    }
+    for (const candidate of candidates)
+        appendLocalPlugin(candidate, state, options);
 }
-function appendLocalPlugin(entry, isLocalEnabled, state, options) {
+function localCandidates(input, state) {
+    const ordered = [...input.localPackages]
+        .map((entry) => ({
+        entry,
+        id: entry.id ?? { name: entry.plugin.name, marketplace: LOCAL_PLUGIN_MARKETPLACE },
+    }))
+        .sort((left, right) => compareText(pluginIdKey(left.id), pluginIdKey(right.id)) ||
+        normalizedPath(left.entry.plugin.rootPath).localeCompare(normalizedPath(right.entry.plugin.rootPath)));
+    const seenIds = new Set();
+    const candidates = [];
+    for (const { entry, id } of ordered) {
+        const { plugin } = entry;
+        if (seenIds.has(pluginIdKey(id))) {
+            // Two roots with one identity: the first in path order is the installed copy.
+            state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_ID_CONFLICT', pluginName: plugin.name }));
+            continue;
+        }
+        seenIds.add(pluginIdKey(id));
+        if (entry.unavailableReason)
+            pushReaderDiagnostics(plugin, state.diagnostics);
+        else if (!acceptLocalPackage(plugin, state.diagnostics))
+            continue;
+        candidates.push({
+            entry,
+            id,
+            ownership: entry.ownership ?? 'owned',
+            enabled: input.isLocalEnabled(plugin.rootPath),
+        });
+    }
+    return candidates;
+}
+function acceptLocalPackage(plugin, diagnostics) {
+    pushReaderDiagnostics(plugin, diagnostics);
+    if (!isDetailPathSegment(plugin.name)) {
+        diagnostics.push(freeze({ code: 'PLUGIN_NAME_INVALID', pluginName: plugin.name }));
+        return false;
+    }
+    if (!hasSupportedCapability(plugin)) {
+        diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NO_SUPPORTED_CAPABILITY', pluginName: plugin.name }));
+        return false;
+    }
+    return true;
+}
+function appendLocalPlugin(candidate, state, options) {
+    const { entry, id } = candidate;
+    // A package whose only capability is a withheld Mini App stays visible and uninstallable:
+    // `localCandidates` admits it on the authored package, and only the served one is gated.
     const plugin = gateMiniAppEngines(entry.plugin, options, state.diagnostics);
-    const enabled = isLocalEnabled(plugin.rootPath);
-    if (state.pluginNames.has(collisionKey(plugin.name))) {
-        state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NAME_CONFLICT', pluginName: plugin.name }));
+    const owner = state.nameOwners.get(collisionKey(plugin.name));
+    const effective = owner !== undefined && samePluginId(owner, id);
+    state.localPlugins.push(localProjection(candidate, plugin, effective ? undefined : owner));
+    if (!effective) {
+        if (candidate.enabled && !entry.unavailableReason) {
+            state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NAME_CONFLICT', pluginName: plugin.name }));
+        }
         return;
     }
-    const accepted = acceptPackageCapabilities({
+    state.pluginNames.add(collisionKey(plugin.name));
+    const accepted = acceptRuntimeCapabilities({
         plugin,
         packageContentDigest: entry.contentDigest,
         sourceKind: 'local',
-        includeRuntimeCapabilities: enabled,
-        ...capabilityCollisionState(state),
+        pluginId: id,
+        skillNames: state.skillNames,
+        diagnostics: state.diagnostics,
     });
-    if (!accepted)
-        return;
-    // A package whose only capability is a withheld Mini App stays visible and uninstallable.
-    if (!hasSupportedLocalCapability(entry.plugin)) {
-        state.diagnostics.push(freeze({ code: 'LOCAL_PLUGIN_NO_SUPPORTED_CAPABILITY', pluginName: plugin.name }));
-        return;
-    }
-    state.localPlugins.push(localProjection(entry.plugin, plugin, entry.contentDigest, enabled));
-    if (!enabled)
-        return;
-    state.enabledPlugins.push(enabledProjection(plugin));
+    state.enabledPlugins.push(enabledProjection(plugin, id));
+    appendRuntimeCapabilities(plugin, accepted, state);
+    state.agents.push(...accepted.agents);
+}
+function appendRuntimeCapabilities(plugin, accepted, state) {
     state.skills.push(...accepted.skills);
     for (const skill of accepted.skills)
         state.skillOwners.set(skill, plugin.name);
     state.mcpServers.push(...accepted.mcpServers);
     state.hooks.push(...accepted.hooks);
     state.hostBindings.push(...accepted.hostBindings);
-    state.agents.push(...accepted.agents);
 }
-function hasSupportedLocalCapability(plugin) {
-    return (plugin.skills.length > 0 ||
-        plugin.mcpServers.length > 0 ||
-        (plugin.hooks?.length ?? 0) > 0 ||
-        (plugin.agents?.length ?? 0) > 0 ||
-        Boolean(plugin.miniapp));
+/** The local Plugin whose capabilities the snapshot loads for its manifest name. */
+export function isEffectiveLocalPlugin(plugin) {
+    return plugin.enabled && plugin.nameOwner === undefined && plugin.unavailableReason === undefined;
 }
-function localProjection(authoredPlugin, plugin, contentDigest, enabled) {
+function localProjection(candidate, plugin, nameOwner) {
+    const { plugin: authoredPlugin, contentDigest, unavailableReason } = candidate.entry;
     return freeze({
+        id: freeze({ ...candidate.id }),
+        ownership: candidate.ownership,
         name: plugin.name,
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
         ...(plugin.version ? { version: plugin.version } : {}),
@@ -227,7 +285,9 @@ function localProjection(authoredPlugin, plugin, contentDigest, enabled) {
         rootPath: plugin.rootPath,
         contentDigest,
         source: plugin.source,
-        enabled,
+        enabled: candidate.enabled,
+        ...(nameOwner ? { nameOwner: freeze({ ...nameOwner }) } : {}),
+        ...(unavailableReason ? { unavailableReason } : {}),
         plugin,
         ...(authoredPlugin === plugin ? {} : { authoredPlugin }),
     });
@@ -240,40 +300,41 @@ function capabilityCollisionState(state) {
     };
 }
 function acceptPackageCapabilities(input) {
-    const { plugin } = input;
+    pushReaderDiagnostics(input.plugin, input.diagnostics);
+    if (!acceptPluginName(input))
+        return undefined;
+    input.pluginNames.add(collisionKey(input.plugin.name));
+    return acceptRuntimeCapabilities(input);
+}
+function pushReaderDiagnostics(plugin, diagnostics) {
     for (const diagnostic of plugin.diagnostics) {
-        input.diagnostics.push(freeze({
+        diagnostics.push(freeze({
             code: diagnostic.code,
             pluginName: plugin.name,
             ...(diagnostic.name ? { capabilityName: diagnostic.name } : {}),
         }));
     }
-    if (!acceptPluginName(input))
-        return undefined;
-    const pluginKey = collisionKey(plugin.name);
-    input.pluginNames.add(pluginKey);
-    if (!input.includeRuntimeCapabilities) {
-        return { skills: [], mcpServers: [], hooks: [], hostBindings: [], agents: [] };
-    }
+}
+function acceptRuntimeCapabilities(input) {
     const skills = acceptPackageSkills(input);
     return {
         skills,
         mcpServers: acceptPackageServers(input),
-        hooks: [...(plugin.hooks ?? [])],
+        hooks: [...(input.plugin.hooks ?? [])],
         hostBindings: acceptHostBindings(input, skills),
-        agents: input.sourceKind === 'local' ? acceptPackageAgents(input) : [],
+        agents: (input.plugin.agents ?? []).map((agent) => turnPluginAgent(input, agent)),
     };
 }
-function acceptPackageAgents(input) {
-    return (input.plugin.agents ?? []).map((agent) => turnPluginAgent(input.plugin, input.packageContentDigest, agent));
-}
-function turnPluginAgent(plugin, packageDigest, agent) {
+function turnPluginAgent(input, agent) {
+    const { plugin, pluginId } = input;
     return freeze({
         scopedName: agent.scopedName,
         pluginName: plugin.name,
+        ...(pluginId ? { pluginMarketplace: pluginId.marketplace } : {}),
         agentName: agent.name,
         sourceFormat: agent.sourceFormat === 'MINIMAX' ? 'minimax' : '\u0063\u006c\u0061\u0075\u0064\u0065',
-        packageDigest,
+        origin: input.sourceKind,
+        packageDigest: input.packageContentDigest,
         pluginRoot: plugin.rootPath,
         description: agent.description,
         ...(agent.displayName ? { displayName: agent.displayName } : {}),
@@ -371,8 +432,9 @@ function conflictCode(sourceKind, capability) {
 function turnPluginSource(source) {
     return source === 'OFFICIAL' ? 'official' : 'local';
 }
-function enabledProjection(plugin) {
+function enabledProjection(plugin, id) {
     return freeze({
+        id: freeze({ ...id }),
         name: plugin.name,
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
         ...(plugin.version ? { version: plugin.version } : {}),
@@ -380,9 +442,7 @@ function enabledProjection(plugin) {
         ...(plugin.darkIconPath ? { darkIconPath: plugin.darkIconPath } : {}),
         source: plugin.source,
         hostCapabilities: plugin.source === 'OFFICIAL' ? freeze([...(plugin.hostCapabilities ?? [])]) : freeze([]),
-        appProviders: plugin.source === 'OFFICIAL'
-            ? freeze([...new Set(plugin.apps.map((app) => app.provider))])
-            : freeze([]),
+        appProviders: freeze([...new Set(plugin.apps.map((app) => app.provider))]),
     });
 }
 function localIconUrl(iconPath) {
@@ -395,6 +455,12 @@ function collisionKey(value) {
 }
 function normalizedSkillKey(value) {
     return value.trim().normalize('NFKC').toLocaleLowerCase('en-US');
+}
+/** Code-unit order: deterministic across locales, like Codex's PluginId sort. */
+function compareText(left, right) {
+    if (left === right)
+        return 0;
+    return left < right ? -1 : 1;
 }
 function normalizedPath(value) {
     return path.normalize(value).normalize('NFC').toLocaleLowerCase('en-US');

@@ -1,13 +1,14 @@
-import { getModels, getProviders, } from '@earendil-works/pi-ai';
+import { DEFAULT_LOCAL_PI_API, lookupLocalModelLimits, lookupLocalCatalogModel, positive, } from '../../../infra/config/model-catalog.js';
+import {} from '@earendil-works/pi-ai';
 import { knownMaxImagesPerRequestForBaseUrl, normalizeMaxImagesPerRequest, } from '@mavis/agent-core/pi-turn-runner';
 import { isFirstPartyMinimaxMessagesRoute, resolveProviderAuthMode, resolveProviderCredential, } from '@mavis/config';
 import { ThinkingLevel } from '@mavis/protocol';
 import { withOpenCodeGoHeaders, withOpenRouterAttributionHeaders } from '@mavis/shared';
 import { normalizeProviderBaseUrl } from '../connectivity/provider-request.js';
-import { isModelProviderApi, MANAGED_MINIMAX_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID, } from '../identity.js';
+import { isModelProviderApi, MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID, } from '../identity.js';
 import { parseProviderId } from './model-key.js';
-import { isMiniMaxM3ModelId, isMiniMaxM3ThinkingMode, isThinkingEffortDisabled, modelRefForModel, readSelectedThinkingEffort, resolveByokThinkingProtocol, supportsJsonObjectOutput, } from './model-ref.js';
-import { firstBuiltinModel, planCustomProviderResolution, planMinimaxApiResolution, readStringRecord, } from './model-resolver-byok.js';
+import { isMiniMaxM3ModelId, isMiniMaxM3ThinkingMode, isThinkingEffortDisabled, readSelectedThinkingEffort, resolveByokThinkingProtocol, supportsJsonObjectOutput, } from './model-ref.js';
+import { planCustomProviderResolution, planMinimaxApiResolution, readStringRecord, } from './model-resolver-byok.js';
 import { buildLocalProviderHeaders, createManagedAuthRetryFetch, readAgentHeaderId, stripUrlCredentials, } from './model-resolver-helpers.js';
 import { hasOpenPlatformThinkingVariants } from './openplatform-thinking.js';
 import { withByokErrorAttribution } from './byok-error-attribution.js';
@@ -22,12 +23,7 @@ import { resolveLocalFileApiGatewayAuth } from './file-api-gateway-auth.js';
 const LOCAL_DEFAULT_MAX_IMAGES_PER_REQUEST = 100;
 const MINIMAX_M3_MAX_IMAGES_PER_REQUEST = 20;
 const MINIMAX_M3_FAMILY = /^minimax-m3(?:[.-]|$)/iu;
-const FALLBACK_MODEL_LIMITS = {
-    contextWindow: 200_000,
-    maxTokens: 128_000,
-};
-const DEFAULT_LOCAL_PI_API = 'anthropic-messages';
-const MANAGED_PROVIDER_API_KEY_PLACEHOLDER = 'sk-xxx';
+export const MANAGED_PROVIDER_API_KEY_PLACEHOLDER = 'sk-xxx';
 const THINKING_LEVEL_TO_PI = {
     [ThinkingLevel.OFF]: 'off',
     [ThinkingLevel.MINIMAL]: 'minimal',
@@ -169,9 +165,12 @@ function selectModel(agentConfig, providerConfig, options) {
     const byokPlan = selectExternalByokPlan(identity, parsed, providerConfig, options);
     if (byokPlan)
         return { identity, byokPlan, route: parsed.source };
-    return {
-        identity: fallbackBuiltinIdentity(identity, providerConfig, options.logger),
-    };
+    // byok-v2 §8: a deleted provider, a disabled or removed model, or a missing
+    // connection is a configuration error; never switch to another provider.
+    throw unavailableByokModelError(identity.provider, identity.modelId);
+}
+function unavailableByokModelError(provider, modelId) {
+    return new Error(`LocalModelResolver: BYOK model configuration "${provider}/${modelId}" is unavailable or disabled.`);
 }
 function requireModelIdentity(agentConfig) {
     const modelRef = agentConfig.model;
@@ -201,22 +200,6 @@ function selectExternalByokPlan(identity, parsed, providerConfig, options) {
         modelId: identity.modelId,
     });
 }
-function fallbackBuiltinIdentity(original, providerConfig, logger) {
-    const fallback = firstBuiltinModel(providerConfig);
-    if (!fallback) {
-        throw new Error(`LocalModelResolver: provider "${original.provider}" not found and no builtin fallback model is configured.`);
-    }
-    logger?.warn({
-        provider: original.provider,
-        fallbackProvider: fallback.provider,
-        fallbackModelId: fallback.modelId,
-    }, 'LocalModelResolver: provider not found; falling back to builtin managed model');
-    return {
-        provider: fallback.provider,
-        modelId: fallback.modelId,
-        modelRef: modelRefForModel(fallback.provider, fallback.modelId, providerConfig?.[fallback.provider]?.models?.[fallback.modelId]),
-    };
-}
 function selectMinimaxByok(identity, providerConfig, options) {
     const byok = options.byokConfigGetter?.();
     if (identity.provider !== MANAGED_MINIMAX_PROVIDER_ID ||
@@ -229,7 +212,10 @@ function selectMinimaxByok(identity, providerConfig, options) {
         modelId: identity.modelId,
         catalog: lookupLocalModelLimits(MANAGED_MINIMAX_PROVIDER_ID, identity.modelId),
     });
-    return byokPlan ? { identity, byokPlan, route: 'minimax_api_key' } : { identity };
+    // The user chose their own MiniMax API key; managed login is not a fallback.
+    if (!byokPlan)
+        throw unavailableByokModelError(MINIMAX_API_PROVIDER_ID, identity.modelId);
+    return { identity, byokPlan, route: 'minimax_api_key' };
 }
 async function resolveProviderApiKey(provider, configuredApiKey, options) {
     if (provider !== OPENAI_CODEX_PROVIDER_ID)
@@ -441,18 +427,6 @@ function resolveModelStream(input, streamFn) {
         ...(dynamicStream ? { streamFn: dynamicStream } : {}),
     });
 }
-export function lookupLocalModelLimits(provider, modelId) {
-    const entry = lookupLocalCatalogModel(provider, modelId);
-    if (!entry)
-        return { ...FALLBACK_MODEL_LIMITS, fromCatalog: false };
-    return {
-        contextWindow: positive(entry.contextWindow) || FALLBACK_MODEL_LIMITS.contextWindow,
-        maxTokens: positive(entry.maxTokens) || FALLBACK_MODEL_LIMITS.maxTokens,
-        fromCatalog: true,
-        ...(entry.api ? { api: entry.api } : {}),
-        ...(entry.baseUrl ? { baseUrl: entry.baseUrl } : {}),
-    };
-}
 export function resolveLocalProviderCredentials(provider, modelRef, providerConfig, authContext) {
     const options = providerConfig?.[provider]?.options;
     const configuredBaseUrl = modelRef.base_url?.trim() || options?.baseURL?.trim();
@@ -535,14 +509,5 @@ function deriveModelInput(modelRef) {
     return modelRef.capabilities?.support_image || modelRef.capabilities?.support_video
         ? ['text', 'image']
         : ['text'];
-}
-function lookupLocalCatalogModel(provider, modelId) {
-    const knownProvider = getProviders().find((candidate) => candidate === provider);
-    if (!knownProvider)
-        return undefined;
-    return getModels(knownProvider).find((model) => model.id === modelId);
-}
-function positive(value) {
-    return typeof value === 'number' && value > 0 ? value : 0;
 }
 //# sourceMappingURL=local-model-resolver.js.map

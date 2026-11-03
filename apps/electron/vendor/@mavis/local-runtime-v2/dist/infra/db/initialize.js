@@ -1,3 +1,4 @@
+import { DatabaseClient } from './client.js';
 import { createDatabaseBackupIfPending, pruneSupersededDatabaseBackups, } from './backup.js';
 import { runMigrations, runMigrationsWithRecovery, } from './migrate.js';
 import { ALL_MIGRATIONS } from './migrations.js';
@@ -8,6 +9,8 @@ import { quarantineMigrations, readMigrationQuarantine, } from './migration-quar
 import { assertDatabaseSchemaConsistent } from './schema-consistency.js';
 import { ensureSchemaSnapshot } from './safe-mode-snapshot-ensure.js';
 import { disableLegacyCronsWithoutFutureRun } from './legacy-cron-recovery.js';
+import { ensureCurrentLocalRuntimeDataMigratedToV2OrThrow } from '../legacy-db/v2-migration.js';
+import { resolveAgentBashEnvPolicy } from '../process/ensure-rm-shim.js';
 import { repairCronSessionResourcesVersionCollision } from './migrations/cron/migration-0033-repair-cron-session-resources-version-collision.js';
 import { recoverLegacySessionRecordsBeforeBackfill } from './legacy-session-recovery.js';
 import { recoverProjectPreferencesBeforeBackfill, recoverSessionProjectMetadataBeforeRepair, } from './project-migration-recovery.js';
@@ -362,6 +365,49 @@ function reportDatabaseMigration(observer, phase, startedAtEpochMs, pendingMigra
     }
     catch {
         // Synchronous notification only: never wait for delivery or replace a DB error.
+    }
+}
+/** Completes legacy layout migration before opening the authoritative V2 database. */
+export async function initializeRuntimeStorage(options) {
+    const measure = (stage, run) => {
+        const started = Date.now();
+        try {
+            return run();
+        }
+        finally {
+            options.stageTimings[stage] = Math.max(0, Date.now() - started);
+        }
+    };
+    const layoutMigration = measure('layout_migration_ms', () => ensureCurrentLocalRuntimeDataMigratedToV2OrThrow(() => options.dataDir, options.nowMs));
+    const database = measure('db_open_ms', () => new DatabaseClient({
+        dataDir: options.dataDir,
+        ...(options.sqlite3ModulePath ? { sqlite3ModulePath: options.sqlite3ModulePath } : {}),
+    }));
+    const started = Date.now();
+    try {
+        const initialization = await initializeDatabase({
+            database,
+            dataDir: options.dataDir,
+            onMigration: options.onMigration,
+        });
+        return {
+            database,
+            initialization,
+            layoutMigration,
+            resolveBashEnvPolicy: (nativeDelete) => resolveAgentBashEnvPolicy(options.dataDir, process.platform, nativeDelete),
+        };
+    }
+    catch (error) {
+        try {
+            database.close();
+        }
+        catch {
+            // 初始化失败保持为主要错误。
+        }
+        throw error;
+    }
+    finally {
+        options.stageTimings.db_initialize_ms = Math.max(0, Date.now() - started);
     }
 }
 //# sourceMappingURL=initialize.js.map

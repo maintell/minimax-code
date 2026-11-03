@@ -1,4 +1,4 @@
-import { RespDataType, Role, ToolCallStatus } from '@mavis/agent-core/protocol/agent-message';
+import { MsgType, RespDataType, Role, ToolCallStatus, } from '@mavis/agent-core/protocol/agent-message';
 import { RuntimeEventStatus, RuntimeEventType } from '@mavis/protocol';
 const BYOK_ERROR_PREFIX = 'BYOK upstream error';
 const BYOK_UPSTREAM_ERROR_SOURCE = 'byok_upstream';
@@ -16,6 +16,7 @@ export function deriveLocalTurnRuntimeOutcome(events) {
         ...(state.errorDetail ? { errorDetail: state.errorDetail } : {}),
         ...(state.errorProviderId ? { errorProviderId: state.errorProviderId } : {}),
         ...(state.messageId ? { messageId: state.messageId } : {}),
+        ...(state.replyMessageId ? { replyMessageId: state.replyMessageId } : {}),
         ...(state.waitingForUser ? { waitingForUser: true } : {}),
     };
 }
@@ -64,6 +65,7 @@ function updateOutcome(state, event) {
     if (event.type === RuntimeEventType.STREAM_RESP) {
         const eventMessageId = readAssistantMessageId(event);
         state.messageId = eventMessageId ?? state.messageId;
+        state.replyMessageId = readReplyMessageId(event) ?? state.replyMessageId;
         updateWaitingForUser(state, event, eventMessageId);
         return;
     }
@@ -187,6 +189,18 @@ function readAssistantMessageId(event) {
             : undefined;
     }
     return undefined;
+}
+/** msg_id of an assistant frame with visible text; see `replyMessageId`. */
+function readReplyMessageId(event) {
+    const message = readParsedAgentMessage(parseStreamResponse(event));
+    if (!message ||
+        message.role !== Role.Assistant ||
+        message.msg_type === MsgType.SystemEvent ||
+        !isNonEmptyString(message.msg_content) ||
+        typeof message.msg_id !== 'string' ||
+        !message.msg_id)
+        return undefined;
+    return message.msg_id;
 }
 function hasWaitingForUserToolResult(parsed) {
     const calls = readToolCalls(parsed);

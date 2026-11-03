@@ -91,6 +91,13 @@ export class GoalContinuationRearm {
             return;
         this.arm(goal);
     }
+    /**
+     * Arm for a kickoff steered into an ordinary Turn: that Turn is not bound to
+     * the Goal, so nothing else gives the Goal its own Turn after it settles.
+     */
+    armSteeredKickoff(goal) {
+        this.arm(goal);
+    }
     arm(goal) {
         this.generations += 1;
         this.pending.set(goal.sessionId, { goalId: goal.goalId, generation: this.generations });

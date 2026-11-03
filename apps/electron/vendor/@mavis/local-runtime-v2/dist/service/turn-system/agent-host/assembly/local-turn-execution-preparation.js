@@ -3,6 +3,7 @@ import { resolveAskUserReminder, } from '../preparation/config/ask-user-reminder
 import { LocalTurnPermissionGate } from '../runner/policy/local-turn-permission-gate.js';
 import { LocalTurnInputPreparer } from './local-turn-input-preparation.js';
 import { readTrustedBuiltinAgentProfileIdentity } from './local-turn-tool-catalog-source.js';
+import { readAuthorizedTurnTools } from '../execution/ptc/catalog.js';
 import { emitLocalPluginHookWarnings, localPluginHookCoordinator, } from './local-turn-plugin-hooks.js';
 /**
  * Native v2 execution-preparation adapter. It is deliberately constructed
@@ -177,7 +178,7 @@ function isValidPluginPermissionRewrite(execution, toolUseId, toolName, updatedI
                     },
                 },
             ], toolName, updatedInput)
-            : isRuntimeToolInputValid(execution.assembly.tools, toolName, updatedInput)));
+            : isRuntimeToolInputValid(readAuthorizedTurnTools(execution.assembly.tools), toolName, updatedInput)));
 }
 function toPluginPermissionDecision(decision, updatedInput) {
     const stopped = decision.continue === false || decision.interrupt === true;
@@ -215,6 +216,9 @@ function createToolContext(execution, eventWriter, browserAssets, channelContext
         turnId: execution.lease.turnId,
         agentName: execution.agent.agentName,
         parentAgentConfig: execution.preparation.agentConfig,
+        ...(execution.preparation.additionalWorkspaceRoots
+            ? { workspaceRoots: [...execution.preparation.additionalWorkspaceRoots] }
+            : {}),
         eventWriter,
         browserAssets,
         ...(forceReadOnlyFilesystem ? { forceReadOnlyFilesystem: true } : {}),
@@ -225,6 +229,8 @@ function createToolContext(execution, eventWriter, browserAssets, channelContext
         // ask_user picks the Plan policy from the same fact the ask-user-policy
         // reminder reads (assemblyContext.plan), so the two cannot disagree.
         ...(execution.assemblyContext.plan?.active === true ? { askUserPlanActive: true } : {}),
+        // Same fact the permission gate reads as `sessionLineage.miniApp`.
+        ...(execution.session.miniAppOrigin !== undefined ? { askUserMiniAppSession: true } : {}),
         ...(channelContext ? { channelContext } : {}),
     };
 }

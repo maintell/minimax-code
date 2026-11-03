@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { MsgType, RespDataType, Role, ToolCallStatus, } from '@mavis/agent-core/protocol/agent-message';
 import { RuntimeEventType } from '@mavis/agent-core/protocol';
-import { ComputerUseCaptureReporter, isComputerUseTool } from './computer-use-capture/reporter.js';
+import { callableTurnToolNames, ComputerUseCaptureReporter, isComputerUseTool, } from './computer-use-capture/reporter.js';
 /** Keeps eval capture fail-open around the native V2 runner. */
 export async function runWithLocalEvalReporter(factory, input, execute, logger) {
     const localCapture = input.computerUseCapture?.enabled === true
@@ -37,7 +37,8 @@ export async function runWithLocalEvalReporter(factory, input, execute, logger) 
 }
 function isComputerUseTurn(input) {
     return (input.computerUseCapture !== undefined ||
-        Boolean(input.tools?.some((tool) => isComputerUseTool(tool.def.name))) ||
+        // A PTC Turn lists computer_* only inside run_code.
+        callableTurnToolNames(input.tools).some(isComputerUseTool) ||
         Boolean(input.history?.some((message) => (message.role === 'toolResult' && isComputerUseTool(message.toolName)) ||
             (message.role === 'assistant' &&
                 message.content.some((part) => part.type === 'toolCall' && isComputerUseTool(part.name))))));

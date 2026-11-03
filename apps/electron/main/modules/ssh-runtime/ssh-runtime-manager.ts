@@ -30,6 +30,12 @@ export class SshRuntimeManager {
     getDaemonInstanceId() {
         return this.isReady() ? (this.client?.getDaemonInstanceId?.() ?? null) : null;
     }
+    getRuntimeFeatures() {
+        return this.isReady() ? (this.client?.getRuntimeFeatures?.() ?? []) : [];
+    }
+    getRemoteEnvironmentPaths() {
+        return this.isReady() ? this.client?.getRemoteEnvironmentPaths?.() : undefined;
+    }
     isConnecting() {
         return this.connectPromise !== null;
     }

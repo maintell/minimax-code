@@ -1,11 +1,14 @@
-import { chmod, cp, lstat, mkdir, mkdtemp, readdir, realpath, rename, rm, rmdir, utimes, writeFile, } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { access, chmod, cp, lstat, mkdir, mkdtemp, readdir, realpath, rename, rm, rmdir, stat as statPath, utimes, writeFile, } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
 import { PluginSystemError } from '../../errors.js';
 import { findEnabledCachedPackage, normalizedPluginName, settleInBackground, } from '../../plugin-system-helpers.js';
 import { computeMiniAppPackageDigests, computePluginDirectoryDigest, pluginDigestCacheKey, } from '../package/package-contract.js';
-import { readMiniMaxPlugin, scanLocalPluginPackages } from '../package/package-readers.js';
+import { readLinkedPluginPackage, readMiniMaxPlugin, scanLocalPluginPackages, } from '../package/package-readers.js';
+import { pluginIdFromInstallDirectory } from '../local/install-directory.js';
+import { PluginLinkRegistry, unavailableLinkedPackage, } from '../local/plugin-links.js';
 import { WorkspaceMiniAppStorage, } from './miniapp/workspace-storage.js';
 /**
  * Hook roots are immutable and content-addressed. Returned Hook handler objects
@@ -29,13 +32,19 @@ const DEFAULT_HOOK_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 const HOOK_CACHE_LOCK_STALE_MS = 30_000;
 const HOOK_CACHE_KEY = /^sha256-tree-v1-[0-9a-f]{64}$/;
 const OWNED_TEMPORARY_ROOT = /^\.tmp-([1-9]\d*)-[0-9a-f-]+-/;
-/** Owns Plugin package discovery, cache restore, and local uninstall staging. */
+/**
+ * Owns Plugin package discovery, cache restore, and local uninstall staging.
+ * Local Plugins are the owned roots below `${dataDir}/plugins` plus the linked
+ * roots of the link registry; linked roots are only ever read.
+ */
 export class PluginPackageStorage {
     options;
     officialPackageReads = new Map();
     workspaceMiniAppStorage;
+    links;
     constructor(options) {
         this.options = options;
+        this.links = options.links ?? new PluginLinkRegistry(options.dataDir);
         this.workspaceMiniAppStorage = new WorkspaceMiniAppStorage(options.dataDir, {
             stageAccepted: (canonicalRoot) => this.stageAcceptedLocalRoot(canonicalRoot),
             acceptImported: (stagingRoot, pluginName) => this.acceptImportedLocalRoot(stagingRoot, pluginName),
@@ -44,11 +53,20 @@ export class PluginPackageStorage {
     async scanLocalPackages() {
         const startedAt = Date.now();
         try {
-            const scan = await scanLocalPluginPackages(path.join(this.options.dataDir, 'plugins'));
-            const materialized = await Promise.allSettled(scan.plugins.map((entry) => this.materializeHookPackage(entry)));
+            const [scan, linked] = await Promise.all([
+                scanLocalPluginPackages(path.join(this.options.dataDir, 'plugins')),
+                this.scanLinkedPackages(),
+            ]);
+            const owned = scan.plugins.map((entry) => ({
+                ...entry,
+                id: pluginIdFromInstallDirectory(path.basename(entry.plugin.rootPath), entry.plugin.name),
+                ownership: 'owned',
+            }));
+            const materialized = await Promise.allSettled([...owned, ...linked.packages].map(async (entry) => entry.unavailableReason ? entry : this.materializeHookPackage(entry)));
             const plugins = materialized.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
             await this.collectHookCacheGarbage();
             const diagnosticCount = scan.diagnostics.length +
+                linked.diagnosticCount +
                 materialized.filter((result) => result.status === 'rejected').length;
             const status = diagnosticCount > 0 ? 'partial' : 'success';
             this.options.metrics.localScan(status, startedAt, plugins.length, diagnosticCount);
@@ -62,6 +80,43 @@ export class PluginPackageStorage {
     /** Where an installed local plugin of this name lives; it may not exist. */
     localPluginRoot(pluginName) {
         return path.join(this.options.dataDir, 'plugins', pluginName);
+    }
+    /** Canonical linked roots, for change watching. */
+    async listLinkedRoots() {
+        return (await this.links.read()).map((record) => record.rootPath);
+    }
+    /**
+     * A linked root whose directory exists but cannot be read as a Plugin is left
+     * out, so the last good projection of an in-place edit stays published. A
+     * missing or unreadable directory stays listed as `SOURCE_MISSING`.
+     */
+    async scanLinkedPackages() {
+        const records = await this.links.read();
+        const results = await Promise.all(records.map((record) => this.readLinkedRoot(record)));
+        return {
+            packages: results.flatMap((entry) => (entry ? [entry] : [])),
+            diagnosticCount: results.filter((entry) => !entry || entry.unavailableReason).length,
+        };
+    }
+    async readLinkedRoot(record) {
+        try {
+            const entry = await readLinkedPluginPackage(record.rootPath, {
+                dataDir: this.options.dataDir,
+                ...(record.manifest ? { declaredManifest: record.manifest } : {}),
+            });
+            return { ...entry, id: record.id, ownership: 'linked' };
+        }
+        catch {
+            if (await isReadableDirectory(record.rootPath))
+                return undefined;
+            return {
+                plugin: unavailableLinkedPackage(record, 'PLUGIN_SOURCE_MISSING'),
+                contentDigest: '',
+                id: record.id,
+                ownership: 'linked',
+                unavailableReason: 'SOURCE_MISSING',
+            };
+        }
     }
     async readLocalMiniAppPackageRoot(packageRoot) {
         return this.workspaceMiniAppStorage.readPackageRoot(packageRoot);
@@ -352,7 +407,8 @@ export class PluginPackageStorage {
             },
         };
     }
-    async acceptImportedLocalRoot(stagingRoot, pluginName) {
+    /** Renames a staged package to `${dataDir}/plugins/<directoryName>`. */
+    async acceptImportedLocalRoot(stagingRoot, directoryName) {
         const pluginsRoot = path.join(this.options.dataDir, 'plugins');
         await mkdir(pluginsRoot, { recursive: true });
         const canonicalPluginsRoot = await realpath(pluginsRoot);
@@ -364,7 +420,10 @@ export class PluginPackageStorage {
             !isWithin(canonicalImportRoot, source)) {
             throw new PluginSystemError('LOCAL_IMPORT_UNSAFE', 'staged Plugin root is unsafe');
         }
-        const target = path.join(canonicalPluginsRoot, pluginName);
+        const target = path.join(canonicalPluginsRoot, directoryName);
+        if (path.dirname(target) !== canonicalPluginsRoot) {
+            throw new PluginSystemError('LOCAL_IMPORT_UNSAFE', 'Plugin directory name is unsafe');
+        }
         try {
             await lstat(target);
             throw new PluginSystemError('PLUGIN_ALREADY_EXISTS', 'local Plugin directory already exists');
@@ -755,6 +814,17 @@ async function makeTreeReadOnly(root) {
             await chmod(target, 0o555);
     }));
     await chmod(root, 0o555);
+}
+async function isReadableDirectory(root) {
+    try {
+        if (!(await statPath(root)).isDirectory())
+            return false;
+        await access(root, fsConstants.R_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
 }
 function isWithin(root, candidate) {
     const relative = path.relative(root, candidate);

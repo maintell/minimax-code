@@ -32,12 +32,14 @@ export class ProjectRuntimeRegistry {
             repository: options.repository,
             resolveConnection: (runtimeId) => this.getOrCreateManager(runtimeId),
             retainOperation: (runtimeId) => this.retainOperation(runtimeId),
+            runtimeMediaRoots: (host) => this.runtimeMediaRoots(host),
         });
         this.recovery = new HostRuntimeRecovery({
             configure: (host) => ({
                 configRevision: this.hostRevisions.get(host) ?? 0,
                 attemptTimeoutMs: () => this.connectOptions.get(host)?.timeoutMs,
                 getDaemonInstanceId: (manager) => manager.getDaemonInstanceId?.() ?? null,
+                getRuntimeFeatures: (manager) => manager.getRuntimeFeatures?.() ?? [],
                 run: async (context) => {
                     const connection = this.options.connections.get(host);
                     if (!connection?.enabled)
@@ -114,6 +116,20 @@ export class ProjectRuntimeRegistry {
         if (this.options.connections.get(host)?.enabled)
             controller.retainDemand('enabled');
         return controller;
+    }
+    /**
+     * Attachment directories owned by the ready host Runtime. Uploaded files and
+     * their asset snapshots live there, outside any project workspace.
+     */
+    runtimeMediaRoots(host) {
+        const manager = this.hostManagers.get(host);
+        const paths = manager?.isReady() ? manager.getRemoteEnvironmentPaths?.() : undefined;
+        if (!paths)
+            return [];
+        return [
+            posix.join(paths.dataDir, 'v2', 'assets'),
+            posix.join(paths.homeDir, '.minimax', 'ssh-uploads'),
+        ];
     }
     getReadyProbe(host) {
         if (!this.options.connections.get(host)?.enabled || !this.hostManagers.get(host)?.isReady())

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createExecutionCoordinator, } from './execution/execution.coordinator.js';
 import { hasUserQueueInputSince } from './execution/message-query-authorship.js';
 import { createSteerSessionService } from './execution/steering/steer-session.service.js';
+import { createSideMessageDelivery } from './execution/steering/side-message/delivery.js';
 import { createTurnController } from './execution/turn-controller/turn.controller.js';
 import { createTurnExecutionService } from './execution/turn-execution.service.js';
 import { createSessionOperationGate } from './lifecycle/session-operation-gate.js';
@@ -57,6 +58,7 @@ export async function initializeTurnSystem(options) {
         // ownership, so a stop-then-send Turn reads the rows (TS-75).
         steeringTeardown: steeringRequeue,
         ...(options.turnSettlement ? { turnSettlement: options.turnSettlement } : {}),
+        ...(options.logger ? { logger: options.logger } : {}),
     });
     const execution = createTurnExecutionService({
         repository,
@@ -113,22 +115,16 @@ export async function initializeTurnSystem(options) {
         ...(options.nowMs ? { nowMs: options.nowMs } : {}),
     });
     const submissionOptions = turnSubmissionOptions(options);
-    const submission = createTurnSubmissionService({
-        activation: messageDelivery.activation,
+    const createSubmission = (activation) => createTurnSubmissionService({
+        activation,
         queue: options.sessions.queue.submission,
         dispatcher,
         completions,
         activeTurnId: (sessionId) => execution.activeTurnId(sessionId),
         ...submissionOptions,
     });
-    const trustedSubmission = createTurnSubmissionService({
-        activation: trustedMessageDelivery.activation,
-        queue: options.sessions.queue.submission,
-        dispatcher,
-        completions,
-        activeTurnId: (sessionId) => execution.activeTurnId(sessionId),
-        ...submissionOptions,
-    });
+    const submission = createSubmission(messageDelivery.activation);
+    const trustedSubmission = createSubmission(trustedMessageDelivery.activation);
     const historyMutation = createHistoryMutationCapability({
         sessions: options.sessions.sessions.historyMutation,
         forkProjections: options.forkProjections,
@@ -147,7 +143,8 @@ export async function initializeTurnSystem(options) {
         steer,
         continuation,
         deletion,
-        onQueueWakeFailure: options.onQueueWakeFailure,
+        receipts: repository,
+        options,
     });
     let readyPromise;
     let closed = false;
@@ -211,6 +208,19 @@ export async function initializeTurnSystem(options) {
             return closePromise;
         },
     };
+}
+/** User side messages: steer, else the Queue fallback of the same message. */
+function createRuntimeSideMessageDelivery(options, steer, submission, receipts) {
+    return createSideMessageDelivery({
+        steer,
+        submission,
+        queue: options.sessions.queue.submission,
+        receipts,
+        ...(options.sideMessages?.faults ? { faults: options.sideMessages.faults } : {}),
+        ...(options.sideMessages?.observe ? { observe: options.sideMessages.observe } : {}),
+        ...(options.sideMessages?.undelivered ? { undelivered: options.sideMessages.undelivered } : {}),
+        ...(options.sideMessages?.nowMs ? { nowMs: options.sideMessages.nowMs } : {}),
+    });
 }
 /**
  * Prepares a claimed queue item to run as `turnId` and tells the
@@ -434,6 +444,7 @@ function createRuntimeRecoveryCoordinator(options, repository, subagentQueueWake
         await options.sessions.sessions.recovery.recoverPreviousProcess({
             processStartedAtMs: options.processStartedAtMs,
             ...(protectedSessionIds.length > 0 ? { protectedSessionIds } : {}),
+            ...sessionRecoveryEvidence(restarted.terminalFacts),
         });
         const taskRecoveryState = JSON.stringify([...protectedSessionIds].sort());
         if (taskRecoveryState !== lastTaskRecoveryState || pendingRecoveredTurnIds.size > 0) {
@@ -530,6 +541,9 @@ function createRuntimeRecoveryCoordinator(options, repository, subagentQueueWake
         },
     };
 }
+function sessionRecoveryEvidence(terminalFacts) {
+    return terminalFacts.length > 0 ? { terminalFacts } : {};
+}
 function currentRecoveryObservationMs(options) {
     const observedAtMs = options.nowMs?.() ?? Date.now();
     if (!Number.isFinite(observedAtMs)) {
@@ -576,6 +590,7 @@ function createQueuedTurnControl(options, repository, steeringRequeue) {
     return { controller, completions };
 }
 function createTurnFacade(input) {
+    const sideMessages = createRuntimeSideMessageDelivery(input.options, input.steer, input.submission, input.receipts);
     return {
         prepareSideChat: (request) => input.historyMutation.prepareSideChat(request),
         fork: (request) => input.historyMutation.fork(request),
@@ -591,7 +606,7 @@ function createTurnFacade(input) {
                 ? input.completions.requestCancellation(request.sessionId, request.turnId, request.reason)
                 : false;
             if (pending)
-                queueMicrotask(() => void wakeCancelledQueue(input.dispatcher, input, request.sessionId));
+                queueMicrotask(() => void wakeCancelledQueue(input.dispatcher, input.options, request.sessionId));
             const result = await abortQueuedExecution(input, request);
             if (pending &&
                 request.turnId &&
@@ -603,6 +618,7 @@ function createTurnFacade(input) {
             return result;
         },
         steer: (request) => input.steer.steer(request),
+        deliverSideMessage: (request, callOptions) => sideMessages.deliver(request, callOptions),
         dispatchSessionQueue: (sessionId) => input.dispatcher.continuePaused(sessionId),
         dispatchQueue: (sessionId) => input.dispatcher.dispatch(sessionId),
         sessionDeletion: (sessionId, cleanup) => input.deletion.run(sessionId, cleanup),

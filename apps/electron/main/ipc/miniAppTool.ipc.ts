@@ -29,11 +29,15 @@ export function setupMiniAppToolIPC() {
         const names = value?.names;
         if (!Array.isArray(names))
             return { success: false, code: 'invalid_request' };
+        const release = manager.observeMiniAppPageEnd(event.sender, () => undefined);
         try {
             return await requestUtilityMiniAppTools({ pluginId: caller.pluginId, names });
         }
         catch {
             return { success: false, code: 'runtime_unavailable' };
+        }
+        finally {
+            release();
         }
     });
     return () => {

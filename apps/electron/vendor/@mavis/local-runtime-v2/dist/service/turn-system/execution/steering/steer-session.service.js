@@ -2,19 +2,21 @@ import { isUserSteeringProducer } from '../../agent-host/contracts.js';
 import { captureAgentHostSteeringInput } from '../../agent-host/canonical-user-input.js';
 import { resolveGenuineUserQueryText } from '../message-query-authorship.js';
 import { steeringMessageKey, steeringReceiptId } from '../../steering-identity.js';
-import { createUserMessageId } from '../../../session-system/shared/user-message-id.js';
-import { sessionClioSteeringQueryId } from '../../../session-clio/query-identity.js';
+import { createUserMessageId } from '../../../session-system/index.js';
+import { sessionClioSteeringQueryId } from '../../../session-clio/index.js';
 export function createSteerSessionService(options) {
+    const run = (runOptions, input) => {
+        const submittedAtMs = (runOptions.nowMs ?? Date.now)();
+        return deliver(runOptions, identifyVisibleSteering({
+            ...input,
+            ...(isUserSteeringProducer(input.producerId)
+                ? { createdAt: input.createdAt ?? submittedAtMs }
+                : {}),
+        }), submittedAtMs);
+    };
     return {
-        steer: (input) => {
-            const submittedAtMs = (options.nowMs ?? Date.now)();
-            return deliver(options, identifyVisibleSteering({
-                ...input,
-                ...(isUserSteeringProducer(input.producerId)
-                    ? { createdAt: input.createdAt ?? submittedAtMs }
-                    : {}),
-            }), submittedAtMs);
-        },
+        steer: (input) => run(options, input),
+        steerWithTargetHook: (input, onTargetSelected) => run({ ...options, onTargetSelected }, input),
     };
 }
 async function deliver(options, input, submittedAtMs) {
@@ -88,6 +90,7 @@ async function reserveActiveDeliveryReceipt(options, input, clientRequestId, tur
 async function deliverToReservedActive(options, delivery) {
     const { activeTurnId, input } = delivery;
     try {
+        await options.onTargetSelected?.({ sessionId: input.sessionId, turnId: activeTurnId });
         await input.preDelivery?.accept({ mode: 'steered', turnId: activeTurnId });
     }
     catch (error) {

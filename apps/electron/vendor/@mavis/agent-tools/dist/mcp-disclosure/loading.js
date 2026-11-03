@@ -47,6 +47,7 @@ export function buildToolLoadingCatalog(input) {
             createBoundedToolSearchTool(index, {
                 topKDefault: input.options?.topKDefault ?? 5,
                 topKMax: input.options?.topKMax ?? 20,
+                ...(input.ptc ? { ptc: true } : {}),
             }),
             {
                 ...invoke,

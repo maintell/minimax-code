@@ -182,7 +182,7 @@ export function initializeSessionSystem(options) {
             records,
             root: roots,
             activation,
-            recovery: new SessionRecoveryService({ sessions }),
+            recovery: new SessionRecoveryService({ sessions, messages, canonicalHistory }),
             state: createSessionStateWriter(sessions),
             execution: createSessionExecutionSource(sessions, legacy),
             interactionMode,
@@ -299,6 +299,7 @@ function createSessionRecordService(input) {
         sessionDefaultWorkspaceDir: (sessionId) => path.join(options.dataDir, 'sessions', sessionId, 'workspace'),
         ...(options.makeSessionId ? { makeSessionId: options.makeSessionId } : {}),
         ...(options.backfillDiagnostics ? { backfillDiagnostics: options.backfillDiagnostics } : {}),
+        ...(options.toolCallMode ? { toolCallMode: options.toolCallMode } : {}),
         nowMs,
     });
 }
@@ -482,6 +483,9 @@ function createAgentCapabilities(input) {
         compactionFacts: composeCompactionFactSink(input.llmCalls, input.options.compactionFacts),
         ...(input.options.compactionMetrics
             ? { compactionMetrics: input.options.compactionMetrics }
+            : {}),
+        ...(input.options.toolCallMode
+            ? { toolCallMode: { policy: input.options.toolCallMode, sessions: input.sessions } }
             : {}),
         nowMs: input.nowMs,
     });

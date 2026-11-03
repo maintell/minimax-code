@@ -479,7 +479,11 @@ function reconcileMutation(lease, intent) {
             },
         };
     }
-    const mode = intent.kind === 'abort-reconcile' ? 'abort' : 'network';
+    let mode = 'network';
+    if (intent.kind === 'abort-reconcile')
+        mode = 'abort';
+    if (intent.kind === 'safety-reconcile')
+        mode = 'safety';
     return {
         kind: 'settle-turn-tail',
         sessionId: lease.sessionId,

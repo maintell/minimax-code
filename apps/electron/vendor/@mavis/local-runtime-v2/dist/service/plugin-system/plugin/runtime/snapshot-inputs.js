@@ -1,15 +1,31 @@
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { pluginMcpNameKey } from '@mavis/mcp';
+import { pluginIdKey } from '@mavis/shared';
 import { PluginSnapshotBuilder } from './snapshot-builder.js';
+export function readOfficialPluginInstallations(repository, scope) {
+    if (!scope)
+        return [];
+    try {
+        return repository.loadOfficialState(scope)?.installations ?? [];
+    }
+    catch {
+        return [];
+    }
+}
 /** Reads package state while retaining a last-good local package during partial writes. */
 export async function readPluginSnapshotInputs(input) {
     const scanned = await input.packageStorage.scanLocalPackages();
     const localPackages = scanned.filter((entry) => !input.buildOptions.excludedLocalRoots?.has(entry.plugin.rootPath));
     const scannedRoots = new Set(localPackages.map((entry) => entry.plugin.rootPath));
+    // An unlinked folder still exists, so only a registered linked root keeps its last good copy.
+    const linkedRoots = input.desiredSnapshot.localPlugins.some((previous) => previous.ownership === 'linked')
+        ? new Set(await input.packageStorage.listLinkedRoots())
+        : new Set();
     for (const previous of input.desiredSnapshot.localPlugins) {
         if (scannedRoots.has(previous.rootPath) ||
             input.buildOptions.excludedLocalRoots?.has(previous.rootPath) ||
+            (previous.ownership === 'linked' && !linkedRoots.has(previous.rootPath)) ||
             !(await isExistingLocalPluginDirectory(previous.rootPath))) {
             continue;
         }
@@ -68,19 +84,30 @@ export function localSnapshotInventory(snapshot, inventory) {
     const serverNames = new Set(snapshot.mcpServers.map((entry) => pluginMcpNameKey(entry.source, entry.pluginName, entry.server.name)));
     return inventory.filter((entry) => serverNames.has(entry.serverName));
 }
-export function removedPluginHookNames(current, next) {
-    const nextNames = new Set((next.turnCapabilities.hooks ?? []).map((handler) => handler.pluginName));
-    return [
-        ...new Set((current.turnCapabilities.hooks ?? [])
-            .map((handler) => handler.pluginName)
-            .filter((pluginName) => !nextNames.has(pluginName))),
-    ];
+/**
+ * Manifest names whose effective Plugin stops being effective when `next`
+ * replaces `current`: it was removed or disabled, or another PluginId took the
+ * name over. Shadowed copies are never effective, so changing them is silent.
+ * An effective Plugin keeps its PluginId across updates, including official
+ * updates that move it to a new content-addressed cache root.
+ */
+export function deactivatedPluginNames(current, next) {
+    const nextOwners = new Map(next.enabledPlugins.map((plugin) => [nameKey(plugin.name), pluginIdKey(plugin.id)]));
+    return current.enabledPlugins
+        .filter((plugin) => nextOwners.get(nameKey(plugin.name)) !== pluginIdKey(plugin.id))
+        .map((plugin) => plugin.name);
+}
+function nameKey(value) {
+    return value.trim().normalize('NFKC').toLocaleLowerCase('en-US');
 }
 /** Rebuilds from the authored package so each build re-applies the engines gate. */
 function lastGoodLocalPackage(projection) {
     return {
         plugin: projection.authoredPlugin ?? projection.plugin,
         contentDigest: projection.contentDigest,
+        id: projection.id,
+        ownership: projection.ownership,
+        ...(projection.unavailableReason ? { unavailableReason: projection.unavailableReason } : {}),
     };
 }
 /**

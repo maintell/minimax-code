@@ -1,6 +1,7 @@
 import { PeekContextService, StaleCompactionMessageRepair } from './messages/index.js';
 import { initializeSessionDiffCapability } from './diffs/index.js';
 import { RootArchiveTitleService, SessionDeletionService, SessionLifecycleService, SessionMaintenanceService, } from './sessions/index.js';
+import { ConnectorMediaClient, SessionMediaIdentityService, } from './media-identity/index.js';
 export * from './sessions/repo/drizzle.js';
 export * from './sessions/representation/canonical-history.js';
 export * from './usage/repo/drizzle.js';
@@ -93,6 +94,13 @@ export function initializeSessionApplicationSystem(options) {
             peekContext,
         },
         files: owner.files,
+        mediaIdentity: options.compatibility.mediaIdentityCloud
+            ? new SessionMediaIdentityService({
+                sessions: owner.repositories.sessions,
+                history: owner.canonicalHistory,
+                cloud: new ConnectorMediaClient(options.compatibility.mediaIdentityCloud),
+            })
+            : undefined,
         usage: owner.usage.service,
         queryCollapse: owner.queryCollapse.state,
         root: {

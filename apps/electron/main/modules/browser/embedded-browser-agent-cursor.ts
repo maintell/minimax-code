@@ -1,4 +1,6 @@
+import { nativeImage } from "electron";
 import { normalizeAgentCursorBridgeMessage } from "./agent-cursor-bridge";
+import { captureWebviewFullPage } from "./webview-full-page-screenshot";
 export function withDevicePreviewLease(tab, operation) {
     const previous = tab.devicePreviewTaskTail ?? Promise.resolve();
     const task = previous.catch(() => undefined).then(operation);
@@ -104,7 +106,20 @@ export async function captureTabScreenshotWithoutAgentCursor(tab, params, getWeb
             const cdp = tab.controller.getCDPHelper();
             if (!cdp)
                 throw new Error('CDP helper not available');
-            return cdp.captureScreenshot({ scope: params.scope, clip: params.clip });
+            if (!tab.controller.usesWebview?.()) {
+                return cdp.captureScreenshot({ scope: params.scope, clip: params.clip });
+            }
+            return captureWebviewFullPage(cdp, {
+                decodePng: (data) => {
+                    const image = nativeImage.createFromBuffer(Buffer.from(data, 'base64'));
+                    const size = image.getSize();
+                    return { ...size, bitmap: image.toBitmap() };
+                },
+                encodePng: ({ width, height, bitmap }) => tab.controller
+                    .normalizeCapturedImage(nativeImage.createFromBitmap(bitmap, { width, height }))
+                    .toPNG()
+                    .toString('base64'),
+            });
         }
         const webContents = getWebContents(tab);
         if (!webContents || webContents.isDestroyed())
@@ -121,9 +136,10 @@ export async function captureTabScreenshotWithoutAgentCursor(tab, params, getWeb
         }
         const capturedSize = image.getSize();
         const outputSize = tab.controller.getCapturePageOutputSize(params, capturedSize);
-        const outputImage = outputSize.width === capturedSize.width && outputSize.height === capturedSize.height
+        const resizedImage = outputSize.width === capturedSize.width && outputSize.height === capturedSize.height
             ? image
             : image.resize({ ...outputSize, quality: 'best' });
+        const outputImage = tab.controller.normalizeCapturedImage?.(resizedImage) ?? resizedImage;
         return {
             data: outputImage.toPNG().toString('base64'),
             width: outputSize.width,
@@ -147,7 +163,8 @@ export async function captureFrameWithoutAgentCursor(options) {
     }
     try {
         const { image, previewFrameBounds } = await options.withTabOperation(tab, 'capture-frame', () => withAgentCursorHiddenForCapture(tab, async () => {
-            const image = await webContents.capturePage();
+            const captured = await webContents.capturePage();
+            const image = tab.controller.normalizeCapturedImage?.(captured) ?? captured;
             // Read before the background host releases its lease; only the foreground
             // fixed-preview window has a placement in the File Panel's coordinate space.
             return { image, previewFrameBounds: tab.controller.getDevicePreviewFrameBounds() };

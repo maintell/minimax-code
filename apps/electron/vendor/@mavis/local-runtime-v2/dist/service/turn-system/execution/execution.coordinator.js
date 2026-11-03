@@ -114,6 +114,10 @@ async function settleAgentTurn(options, turn, request, pending) {
     }
     catch (error) {
         outcome = { status: 'failed', error };
+        // Close admission cancellation before this terminal write; settleAndRelease
+        // repeats the idempotent call.
+        options.onBeginSettlement?.(turn.sessionId, turn.turnId);
+        await projectPostHostFailure(options, turn, error);
     }
     const settlementError = await settleAndRelease(options, {
         turn,
@@ -124,6 +128,38 @@ async function settleAgentTurn(options, turn, request, pending) {
             : outcome.status === 'aborted' && wakesQueueOnAbort(turn.signal.reason),
     });
     return settlementError ? { status: 'failed', error: settlementError } : outcome;
+}
+/**
+ * A rejected Host run may have died before writing its own terminal Session
+ * state (for example when a full disk fails that write), which would leave the
+ * Session `started` forever. Project the failure once more while this Turn
+ * still holds its durable lock and in-process owner. When the Host already
+ * wrote its terminal, the Session state fence rejects this write as a
+ * conflict: an expected no-op that never changes the Turn outcome.
+ */
+async function projectPostHostFailure(options, turn, error) {
+    try {
+        await options.failures.project({
+            sessionId: turn.sessionId,
+            turnId: turn.turnId,
+            turnSequence: turn.acceptedSequence,
+            eventId: `${turn.turnId}:post-host-failed`,
+            error,
+        });
+    }
+    catch (projectionError) {
+        try {
+            options.logger?.debug?.({
+                event: 'turn_post_host_failure_projection_skipped',
+                session_id: turn.sessionId,
+                turn_id: turn.turnId,
+                error: describeError(projectionError),
+            }, '[local-runtime-v2] Post-Host failure projection skipped');
+        }
+        catch {
+            // Diagnostics must never change the Turn outcome.
+        }
+    }
 }
 async function settlePreHostFailure(options, turn, error) {
     const projectionError = await projectPreHostTerminal(options.failures, turn, error);
@@ -203,8 +239,10 @@ async function settleAndRelease(options, input) {
         outcome: input.outcome,
         ...(queuePauseCause ? { queuePauseCause } : {}),
     });
-    if (settlement.error)
+    if (settlement.error) {
+        await releaseUnsettledTurn(options, input, settlement.error);
         return settlement.error;
+    }
     if (input.controllerTurn)
         options.controller.complete(input.controllerTurn);
     await notifyAfterSettlement(options, settlement.value, input.turn, input.outcome);
@@ -228,6 +266,65 @@ async function settleAndRelease(options, input) {
     return settlement.value?.status === 'stale-owner'
         ? new Error(`Turn settlement lost ownership: ${input.turn.sessionId}/${input.turn.turnId}`)
         : undefined;
+}
+/**
+ * Terminal persistence failed after its retry. The repository keeps a pending
+ * settlement that the next admission recovers inside its own transaction,
+ * failing the Turn and applying the same Queue pause, so the durable lock heals
+ * itself. The in-process owner has no such recovery: left registered, a stop
+ * times out and every later send or rewind of the Session fails until the
+ * Runtime restarts. Release it here unless discarded steering of this Turn is
+ * still unpersisted. No Queue wake: nothing durable changed, and the next
+ * admission must recover the lock and pause first.
+ */
+async function releaseUnsettledTurn(options, input, error) {
+    const release = !hasUnpersistedSteering(options, input.turn);
+    // The decision and the release stay synchronous: no await in between.
+    if (release && input.controllerTurn)
+        options.controller.complete(input.controllerTurn);
+    logSettlementPersistenceFailure(options, input, error, release);
+    if (release && input.turn.busyReason === 'turn' && options.turnSettlement) {
+        await abandonProductTurn(options.turnSettlement, input.turn);
+    }
+}
+function hasUnpersistedSteering(options, turn) {
+    const steering = options.steeringTeardown;
+    if (!steering?.hasPendingForTurn)
+        return false;
+    try {
+        return steering.hasPendingForTurn({ sessionId: turn.sessionId, turnId: turn.turnId });
+    }
+    catch {
+        // Unknown durability: keep the owner rather than let the next Turn overtake it.
+        return true;
+    }
+}
+function logSettlementPersistenceFailure(options, input, error, ownerReleased) {
+    const logger = options.logger;
+    if (!logger)
+        return;
+    try {
+        const fields = {
+            event: 'turn_settlement_persist_failed',
+            session_id: input.turn.sessionId,
+            turn_id: input.turn.turnId,
+            busy_reason: input.turn.busyReason,
+            outcome: input.outcome,
+            owner_released: ownerReleased,
+            error: describeError(error),
+        };
+        const message = '[local-runtime-v2] Turn settlement persistence failed';
+        if (logger.error)
+            logger.error(fields, message);
+        else
+            logger.warn(fields, message);
+    }
+    catch {
+        // Diagnostics must never change the Turn outcome.
+    }
+}
+function describeError(error) {
+    return error instanceof Error ? error.message : String(error);
 }
 async function notifyAfterSettlement(options, settlement, turn, outcome) {
     if (settlement?.status !== 'settled')

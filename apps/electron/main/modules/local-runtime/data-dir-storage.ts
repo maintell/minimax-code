@@ -2,12 +2,17 @@ import { execFile } from "node:child_process";
 import * as path from "node:path";
 import { dataDirFs } from "./data-dir-fs.js";
 export class DataDirStorageError extends Error {
-    constructor(code, detail) {
+    constructor(code, detail, diskCheck) {
         super(detail ? `${code}: ${detail}` : code);
         this.code = code;
+        this.diskCheck = diskCheck;
     }
 }
 
+// Storage enum names (e.g. "NVMe", "File Backed Virtual"). Anything else is not echoed.
+function safeStorageEnumName(value) {
+    return /^[A-Za-z0-9 _-]{1,32}$/.test(value) ? value : 'Unrecognized';
+}
 // Cold Storage/PnP providers can exceed 20s on otherwise valid internal disks.
 const STORAGE_TIMEOUT_MS = 60000;
 // Sync clients lock, replace or dehydrate files behind the Runtime's back, which breaks
@@ -198,18 +203,27 @@ export function assertInternalDiskReport(output) {
     }
     // Unknown, RAID, virtual, USB, SD, iSCSI, etc. are deliberately not an allowlist match.
     // CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL=1; CM_DEVCAP_REMOVABLE=4, DOCKDEVICE=8.
-    if (report.driveType !== 'Fixed' ||
-        !['ATA', 'SATA', 'NVMe'].includes(report.busType) ||
-        policies.some((policy) => policy !== 1) ||
-        capabilities.some((caps) => (caps & 12) !== 0)) {
-        throw new DataDirStorageError('TARGET_NOT_INTERNAL_DISK');
+    const reason = report.driveType !== 'Fixed'
+        ? 'drive-type'
+        : !['ATA', 'SATA', 'NVMe'].includes(report.busType)
+            ? 'bus-type'
+            : policies.some((policy) => policy !== 1) || capabilities.some((caps) => (caps & 12) !== 0)
+                ? 'removable'
+                : null;
+    if (reason) {
+        const driveType = safeStorageEnumName(report.driveType);
+        const busType = safeStorageEnumName(report.busType);
+        // Numeric PnP flags only; they explain hot-plug/dock verdicts without identifying hardware.
+        throw new DataDirStorageError('TARGET_NOT_INTERNAL_DISK', `reason=${reason}; driveType=${driveType}; busType=${busType}; removalPolicies=${policies.join(',')}; capabilities=${capabilities.join(',')}`, { reason, driveType, busType });
     }
 }
 export async function assertInternalDataDirStorage(realDirectory) {
     // realpath may return an extended-length local path, which is distinct from UNC.
     const directory = realDirectory.replace(/^\\\\\?\\(?=[a-z]:\\)/i, '');
     if (!/^[a-z]:\\/i.test(directory)) {
-        throw new DataDirStorageError('TARGET_NOT_INTERNAL_DISK');
+        throw new DataDirStorageError('TARGET_NOT_INTERNAL_DISK', 'reason=not-local-path', {
+            reason: 'not-local-path',
+        });
     }
     if (isInsideOneDriveRoot(directory)) {
         throw new DataDirStorageError('TARGET_CLOUD_SYNCED');

@@ -120,7 +120,7 @@ function validateTurnMutation(mutation) {
     }
 }
 function validateSettlementMutation(mutation) {
-    const expected = mutation.mode === 'abort' ? 'abort-reconcile' : 'network-reconcile';
+    const expected = `${mutation.mode}-reconcile`;
     const expectedVariant = mutation.mode === 'network' ? 'network' : undefined;
     if (mutation.operation.kind !== expected || mutation.operation.variant !== expectedVariant) {
         throw new TypeError('Turn history settlement operation is invalid.');

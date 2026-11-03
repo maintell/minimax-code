@@ -13,6 +13,12 @@ export function modelInWhitelist(provider, id, list) {
         return re.test(key);
     });
 }
+/**
+ * Configured tools above this count are deferred even when their estimated schema fits the token
+ * budget: providers cap function counts (OpenAI-compatible APIs reject more than 128), and large
+ * context windows would otherwise admit hundreds of inline tools next to the builtins.
+ */
+export const MAX_INLINE_CONFIGURED_TOOLS = 64;
 function defaultEstimate(def) {
     return Math.ceil(JSON.stringify({ name: def.name, description: def.description, schema: def.schema }).length / 4);
 }
@@ -32,10 +38,11 @@ export function planMcpDisclosure(input) {
     const thresholdTokens = options && validContext ? options.thresholdPct * model.contextWindow : 0;
     const automaticallyDefer = Boolean(options?.enabled &&
         model &&
-        validContext &&
         modelInWhitelist(model.provider, model.id, options.modelWhitelist) &&
         candidates.length >= options.minDeferCount &&
-        candidates.reduce((sum, { tool }) => sum + estimate(tool.def), 0) > thresholdTokens);
+        (candidates.length > MAX_INLINE_CONFIGURED_TOOLS ||
+            (validContext &&
+                candidates.reduce((sum, { tool }) => sum + estimate(tool.def), 0) > thresholdTokens)));
     const deferredEntries = entries.filter(({ tool, source }) => explicitlyDeferred(tool) ||
         (automaticallyDefer && source === 'configured' && tool.def.loading !== 'default'));
     if (deferredEntries.length === 0) {

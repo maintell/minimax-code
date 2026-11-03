@@ -132,6 +132,12 @@ export const PluginCapabilityType = {
     MCP: 2,
     SKILL: 3,
 };
+export const PluginMarketplaceSourceKind = {
+    OFFICIAL: 1,
+    LOCAL: 2,
+    GIT: 3,
+    DIRECTORY: 4,
+};
 export const SkillScope = {
     AGENT: 1,
     GLOBAL: 2,
@@ -275,6 +281,16 @@ export const FeedbackCategory = {
     MODEL_QUALITY: 1,
     APP_BUG: 2,
     OTHER: 3,
+    SESSION_ISSUE: 4,
+    APP_ISSUE: 5,
+    SUGGESTION: 6,
+};
+export const FeedbackDiagnosticLogStatus = {
+    FEEDBACK_DIAGNOSTIC_LOG_STATUS_UNSPECIFIED: 0,
+    NOT_REQUIRED: 1,
+    UPLOADING: 2,
+    UPLOADED: 3,
+    FAILED: 4,
 };
 export const WebsiteManagementCode = {
     OK: 0,
@@ -409,5 +425,44 @@ export const AgentShellFamily = {
     PWSH: 1,
     WINDOWS_POWERSHELL: 2,
     GIT_BASH: 3,
+};
+export const WorkShareKind = {
+    UNSPECIFIED: 0,
+    PLUGIN: 1,
+    SKILL: 2,
+};
+export const WorkShareStatus = {
+    UNSPECIFIED: 0,
+    ACTIVE: 1,
+    REVOKED: 2,
+    TAKEN_DOWN: 3,
+};
+export const WorkShareCreateResult = {
+    UNSPECIFIED: 0,
+    OK: 1,
+    UNCHANGED: 2,
+    PACKAGE_INVALID: 3,
+    SECRET_DETECTED: 4,
+    MODERATION_REJECTED: 5,
+    MODERATION_UNAVAILABLE: 6,
+    CONTENT_BLOCKED: 7,
+    NAME_TAKEN_DOWN: 8,
+    QUOTA_EXCEEDED: 9,
+    CONTENT_TOO_LARGE: 10,
+    DISABLED: 11,
+};
+export const WorkSharePackDiagnosticCode = {
+    UNSPECIFIED: 0,
+    NOT_SHAREABLE: 1,
+    UNREADABLE: 2,
+    LIMIT_EXCEEDED: 3,
+    INVALID_PATH: 4,
+    SYMLINK_REJECTED: 5,
+    INVALID_SKILL: 6,
+};
+export const WorkShareConflictKind = {
+    NONE: 0,
+    OVERWRITABLE: 1,
+    BLOCKED: 2,
 };
 //# sourceMappingURL=types.js.map

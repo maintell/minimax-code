@@ -22,7 +22,7 @@
  *    unrestricted.
  */
 import { validateThreadGoalObjective, } from '@mavis/goal';
-import { GOAL_VERIFIER_SESSION_FORBIDDEN, globalUsageRecovery } from '../../service/goal/index.js';
+import { GOAL_VERIFIER_SESSION_FORBIDDEN, globalEffectiveLimits, globalOwnLimits, globalUsageRecovery, } from '../../service/goal/index.js';
 const VALID_STATUSES = new Set([
     'active',
     'paused',
@@ -58,8 +58,12 @@ export class ThreadGoalContractError extends Error {
         this.name = 'ThreadGoalContractError';
     }
 }
-/** Map the internal canonical goal record onto the generated flat GoalState. */
-export function goalStateToGoalState(state) {
+/**
+ * Map the internal canonical goal record onto the generated flat GoalState.
+ * `effectiveLimits` is the owner's resolution of the limits in force; without
+ * it the wire carries only the Goal's own limits.
+ */
+export function goalStateToGoalState(state, effectiveLimits) {
     return {
         goalId: state.goalId,
         sessionId: state.sessionId,
@@ -95,20 +99,40 @@ export function goalStateToGoalState(state) {
             : {}),
         // `null` cap surfaces as omitted (0 / absent = uncapped on the wire).
         ...(state.tokenBudget !== null ? { tokenBudget: state.tokenBudget } : {}),
+        // The Goal's own request / time caps (absent = none), then what is in force.
+        ...globalOwnLimits(state),
+        ...(effectiveLimits ? globalEffectiveLimits(effectiveLimits) : {}),
         // Omitted entirely when nothing blocks the Goal, so an unblocked Goal looks
         // identical to one from a runtime that predates this field.
-        ...(state.executionWait !== null
-            ? {
-                execution: {
-                    waitReason: state.executionWait.reason,
-                    waitSince: state.executionWait.sinceMs,
-                },
-            }
-            : {}),
+        ...executionToWire(state.executionWait),
         ...requestAccountingToWire(state.accounting),
         ...tokenUsageToWire(state.tokenUsage),
         // Spec §7: only whether the Goal resumes by itself, never the reset time.
         ...globalUsageRecovery(state),
+    };
+}
+/** Why an active Goal is parked, with its background wait details (spec G2-07) when read. */
+function executionToWire(wait) {
+    if (wait === null)
+        return {};
+    return {
+        execution: {
+            waitReason: wait.reason,
+            waitSince: wait.sinceMs,
+            ...(wait.waitedTasks
+                ? {
+                    waitedTasks: wait.waitedTasks.map((task) => ({
+                        taskId: task.taskId,
+                        name: task.name,
+                        startedAt: task.startedAt,
+                    })),
+                }
+                : {}),
+            ...(wait.finishedTaskCount !== undefined
+                ? { finishedTaskCount: wait.finishedTaskCount }
+                : {}),
+            ...(wait.backgroundTasksUnreadable ? { backgroundTasksUnreadable: true } : {}),
+        },
     };
 }
 /**
@@ -170,6 +194,14 @@ export function createGoalReqToCreateInput(req, policy = DEFAULT_GOAL_CONTRACT_P
         ...(tokenBudget !== null ? { tokenBudget } : {}),
         ...(kickoffAttachments.length > 0 ? { kickoffAttachments } : {}),
     };
+}
+/** How the composer sent the creating message; absent keeps the kickoff in the Queue. */
+export function createGoalReqSendBehavior(req) {
+    if (req.sendBehavior === undefined)
+        return undefined;
+    if (req.sendBehavior === 'queue' || req.sendBehavior === 'steer')
+        return req.sendBehavior;
+    throw new ThreadGoalContractError(400, `Invalid send_behavior: "${req.sendBehavior}"`, 'VALIDATION_ERROR');
 }
 /**
  * Build an internal `ThreadGoalPatchInput` from the generated PatchGoalReq.

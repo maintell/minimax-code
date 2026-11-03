@@ -58,4 +58,17 @@ export function countTurnGraceRequests(db, turnId) {
         .get();
     return Number(row?.count ?? 0);
 }
+/**
+ * Every Turn that sent a ledger request for this Goal. A Goal Turn's id is
+ * durable here, so it still identifies the Goal's own background work after
+ * the in-memory Turn history is gone (for example after a restart).
+ */
+export function listGoalRequestTurnIds(db, goalId) {
+    return db
+        .selectDistinct({ turnId: requests.turnId })
+        .from(requests)
+        .where(eq(requests.goalId, goalId))
+        .all()
+        .map((row) => row.turnId);
+}
 //# sourceMappingURL=request-projection.js.map

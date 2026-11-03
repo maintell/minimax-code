@@ -29,6 +29,7 @@ files:
 npmRebuild: false
 asarUnpack:
   - node_modules/@earendil-works/**
+  - node_modules/@jitl/**
   - node_modules/@mariozechner/**
   - node_modules/@minimax/**
   - node_modules/@trycua/**
@@ -38,6 +39,9 @@ asarUnpack:
   - node_modules/jszip/**
   - node_modules/node-pty/**
   - node_modules/node-screenshots-win32-x64-msvc/**
+  # 3.1.10 adds the QuickJS wasm runtime the PTC agent host loads.
+  - node_modules/quickjs-emscripten/**
+  - node_modules/quickjs-emscripten-core/**
 
 extraResources:
   - from: resources

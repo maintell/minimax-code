@@ -1,8 +1,9 @@
 export { isLocalSourceProvenanceEnabled } from './source-provenance.js';
+export { isPtcTurnEnabled } from './ptc-turn.js';
 export { writeTuiStatusLineSetting } from './tui-status-line-write.js';
 export { parseRunawayGuardOverride, resolveRunawayGuardConfig } from './runaway-guard-config.js';
-export { parsePromptSuggestionRemotePolicy } from './prompt-suggestion-config.js';
-export { BRAND, DEFAULT_PORT, getConfig, resolvePromptConfig, resetConfig, setLegacyByokProviderMigrationEnabled, setManagedPresetBaseUrlSyncEnabled, getProfile, getDataDir, getConfigPath, detectGitPortInfo, resetGitDetect, resolvePort, getOpenCodePort, OPENCODE_PORT_OFFSET, RUNTIME_ENV_PREFIX, getRuntimeRegion, getRuntimeBuildEnv, allowsManagedMinimaxProviderOverride, isBetaFeatureProdReady, resolveBetaFeature, isInternalBuild, isManagedRuntime, getRuntimePresetKey, DEFAULT_MODEL_PRESETS, isProposalEligibleAgent, } from './config.js';
+export { parsePromptSuggestionRemotePolicy, resolvePromptSuggestionEnabled, withEffectivePromptSuggestion, } from './prompt-suggestion-config.js';
+export { BRAND, DEFAULT_PORT, getConfig, resolvePromptConfig, resetConfig, setLegacyByokProviderMigrationEnabled, setManagedPresetBaseUrlSyncEnabled, getProfile, getDataDir, getConfigPath, detectGitPortInfo, resetGitDetect, resolvePort, getOpenCodePort, OPENCODE_PORT_OFFSET, RUNTIME_ENV_PREFIX, getRuntimeRegion, getRuntimeBuildEnv, allowsManagedMinimaxProviderOverride, isBetaFeatureProdReady, resolveBetaFeature, currentBetaResolutionContext, isInternalBuild, isManagedRuntime, getRuntimePresetKey, DEFAULT_MODEL_PRESETS, isProposalEligibleAgent, } from './config.js';
 export { minimaxApiModels } from './byok-config.js';
 export { DATA_CONTRIBUTION_CONFIG_DEFAULTS, parseDataContributionConfig, readDataContributionEnabled, } from './data-contribution-config.js';
 export { CONVERSATION_STOP_CONFIG_DEFAULTS, parseConversationStopConfig, readConversationStopConfig, } from './conversation-config.js';

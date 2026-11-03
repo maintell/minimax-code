@@ -46,7 +46,9 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
     async saveWorkspaceFile(ctx, req) {
         void ctx;
         try {
-            return await this.requireWorkspaceFile().saveFile({
+            const save = this.services.saveWorkspaceFile ??
+                this.requireWorkspaceFile().saveFile.bind(this.requireWorkspaceFile());
+            return await save({
                 workspace: req.workspace,
                 filePath: req.path,
                 ...(req.content !== undefined ? { content: req.content } : {}),
@@ -62,6 +64,18 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
                 throw mapWorkspaceFileError(error);
             throw new AppError(422, 'FILE_SAVE_FAILED', describeError(error));
         }
+    }
+    async streamWorkspaceFileSearch(ctx, req) {
+        try {
+            return { ok: true, source: await this.requireWorkspaceFile().streamSearch(req, ctx.signal) };
+        }
+        catch (error) {
+            throw mapWorkspaceFileError(error);
+        }
+    }
+    async stopWorkspaceFileSearch(_ctx, req) {
+        this.requireWorkspaceFile().stopSearch(req.searchId);
+        return { ok: true };
     }
     async searchWorkspaceFiles(ctx, req) {
         void ctx;

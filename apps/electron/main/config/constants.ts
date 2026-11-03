@@ -105,10 +105,12 @@ export let IPC_CHANNELS = {
     SYSTEM_SET_THEME_SOURCE: 'system:set-theme-source',
     SYSTEM_OPEN_DIR: 'system:open-dir',
     SYSTEM_CREATE_DIR: 'system:create-dir',
+    SYSTEM_ENSURE_DEFAULT_PROJECT_DIR: 'system:ensure-default-project-dir',
     SYSTEM_OPEN_FILE_IN_FOLDER: 'system:open-file-in-folder',
     SYSTEM_SHOW_IMAGE_CONTEXT_MENU: 'system:show-image-context-menu',
     SYSTEM_GET_HOME_PATH: 'system:get-home-path',
     SYSTEM_GET_APP_INSTALL_DIR: 'system:get-app-install-dir',
+    SYSTEM_GET_APP_VERSION_SYNC: 'system:get-app-version-sync',
     // 窗口控制
     WINDOW_MINIMIZE: 'window:minimize',
     WINDOW_RESTORE: 'window:restore',
@@ -192,6 +194,8 @@ export let IPC_CHANNELS = {
     DESKTOP_GET_RUN_ON_STARTUP: 'desktop:get-run-on-startup',
     DESKTOP_SET_KEEP_AWAKE: 'desktop:set-keep-awake',
     DESKTOP_GET_KEEP_AWAKE: 'desktop:get-keep-awake',
+    DESKTOP_SET_FILE_OPEN_WITH_ENHANCED: 'desktop:set-file-open-with-enhanced',
+    DESKTOP_GET_FILE_OPEN_WITH_ENHANCED: 'desktop:get-file-open-with-enhanced',
     DESKTOP_START_COMPUTER_USE_RUNTIME: 'desktop:start-computer-use-runtime',
     DESKTOP_APPEARANCE_CHANGED: 'desktop:appearance-changed',
     // 全局快捷键设置
@@ -207,6 +211,14 @@ export let IPC_CHANNELS = {
     NOTIFICATION_SHOW: 'notification:show',
     NOTIFICATION_CLICK: 'notification:click',
     // FilePanel embedded browser
+    BROWSER_BACKEND_BEGIN_REFRESH: 'browser-backend:begin-refresh',
+    BROWSER_BACKEND_APPLY_REFRESH: 'browser-backend:apply-refresh',
+    BROWSER_BACKEND_GET_DIAGNOSTICS: 'browser-backend:get-diagnostics',
+    BROWSER_BACKEND_GET_LAUNCH: 'browser-backend:get-launch',
+    BROWSER_BACKEND_LAUNCH_DECIDED: 'browser-backend:launch-decided',
+    BROWSER_TELEMETRY_REPORT: 'browser-telemetry:report',
+    BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST: 'browser-telemetry:diagnostics-request',
+    BROWSER_TELEMETRY_DIAGNOSTICS_RESPONSE: 'browser-telemetry:diagnostics-response',
     EMBEDDED_BROWSER_CREATE: 'embedded-browser:create',
     EMBEDDED_BROWSER_SHOW: 'embedded-browser:show',
     EMBEDDED_BROWSER_SET_BOUNDS: 'embedded-browser:set-bounds',
@@ -241,6 +253,14 @@ export let IPC_CHANNELS = {
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
     EMBEDDED_BROWSER_CAPTURE_FRAME: 'embedded-browser:capture-frame',
     EMBEDDED_BROWSER_AGENT_ACTION: 'embedded-browser:agent-action',
+    /** renderer → main: find text in a Browser tab page (shared Cmd/Ctrl+F bar). */
+    EMBEDDED_BROWSER_FIND_IN_PAGE: 'embedded-browser:find-in-page',
+    EMBEDDED_BROWSER_STOP_FIND_IN_PAGE: 'embedded-browser:stop-find-in-page',
+    /** main → renderer: progress of a tab's latest find request. */
+    EMBEDDED_BROWSER_FIND_RESULT: 'embedded-browser:find-result',
+    /** main → renderer: Cmd/Ctrl+F was pressed inside a Browser page. */
+    EMBEDDED_BROWSER_FIND_REQUESTED: 'embedded-browser:find-requested',
+    EMBEDDED_BROWSER_TAB_RECOVERED: 'embedded-browser:tab-recovered',
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
@@ -302,6 +322,7 @@ export let IPC_CHANNELS = {
     UPDATER_OPEN_MODAL: 'updater:open-modal', // 通知渲染进程打开更新弹窗
     // Deep Link
     DEEPLINK_RECEIVED: 'deeplink:received',
+    DEEPLINK_TAKE_WORKSPACE_OPEN: 'deeplink:take-workspace-open',
     // file tools
     FILE_READ: 'file:read',
     FILE_STAGE_ATTACHMENT: 'file:stage-attachment',
@@ -501,6 +522,9 @@ export let IPC_CHANNELS = {
     APP_QUIT_CONFIRMATION_REQUEST: 'app:quit-confirmation-request',
     APP_QUIT_CONFIRMATION_RESULT: 'app:quit-confirmation-result',
     APP_QUIT_CONFIRMATION_ABORT: 'app:quit-confirmation-abort',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST: 'miniapp:window-transfer-confirmation-request',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT: 'miniapp:window-transfer-confirmation-result',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT: 'miniapp:window-transfer-confirmation-abort',
     APP_CONFIRM_QUIT: 'app:confirm-quit',
     APP_BRING_TO_FRONT: 'app:bring-to-front',
     // Dock file drop (macOS)

@@ -4,6 +4,10 @@ const DAY_MS = 24 * HOUR_MS;
 const FOUR_DAYS_MS = 4 * DAY_MS;
 const RECENT_CALENDAR_DAYS = 7;
 const EN_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const EN_MONTHS = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+];
 const ZH_WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 const DEFAULT_TIME_ZONE = (() => {
     try {
@@ -156,6 +160,10 @@ export function formatProductTime(timestampMs, options) {
             return formatDateTime(timestamp, locale, true);
         case 'audit-date':
             return formatDate(timestamp, locale, true);
+        case 'subscription-date':
+            return locale === 'zh'
+                ? `${timestamp.year}年${timestamp.month}月${timestamp.day}日`
+                : `${EN_MONTHS[timestamp.month - 1]} ${timestamp.day}, ${timestamp.year}`;
     }
 }
 //# sourceMappingURL=product-time.js.map

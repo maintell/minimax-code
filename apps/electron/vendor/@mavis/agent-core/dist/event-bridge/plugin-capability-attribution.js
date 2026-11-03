@@ -1,3 +1,4 @@
+import { InstalledPluginSource } from '@mavis/protocol';
 import { parseAppCliToolName } from './app-cli-command.js';
 /**
  * Build the host-independent resolver over a turn-local immutable attribution
@@ -31,9 +32,14 @@ function resolvePluginCapabilityAttribution(index, input) {
             const suffix = toolName.slice(prefix.length);
             return toolName.startsWith(prefix) && /^[A-Za-z0-9_.-]{1,96}$/.test(suffix);
         });
-        if (matches.length !== 1)
+        // A local provider that prefixes or extends an official one must not erase the official
+        // attribution by making the match ambiguous.
+        const resolved = matches.length > 1
+            ? matches.filter(([, owners]) => owners.some((owner) => owner.source === InstalledPluginSource.OFFICIAL))
+            : matches;
+        if (resolved.length !== 1)
             return undefined;
-        return matches[0]?.[1].map((owner) => ({
+        return resolved[0]?.[1].map((owner) => ({
             ...owner,
             capability_name: toolName,
         }));

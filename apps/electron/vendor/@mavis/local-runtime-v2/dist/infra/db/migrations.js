@@ -47,7 +47,9 @@ import { migration as m0045 } from './migrations/goal/migration-0045-repair-goal
 import { migration as m0046 } from './migrations/goal/migration-0046-create-goal-owner-table.js';
 import { migration as m0047 } from './migrations/goal/migration-0047-create-goal-request-ledger.js';
 import { migration as m0048 } from './migrations/goal/migration-0048-add-goal-token-usage.js';
+import { migration as m0052 } from './migrations/goal/migration-0052-add-goal-request-and-time-limits.js';
 import { migration as m0049 } from './migrations/background-task/migration-0049-adopt-background-tasks.js';
+import { migration as m0053 } from './migrations/session/migration-0053-add-project-display-name.js';
 export const ALL_MIGRATIONS = [
     m0001,
     m0002,
@@ -99,5 +101,7 @@ export const ALL_MIGRATIONS = [
     m0049,
     m0050,
     m0051,
+    m0052,
+    m0053,
 ];
 //# sourceMappingURL=migrations.js.map

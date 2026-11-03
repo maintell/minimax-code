@@ -40,8 +40,9 @@ export function publishThreadGoalEvent(publish, event) {
                 turnsUsed: event.goal.turnsUsed,
                 timeUsedSeconds: event.goal.timeUsedSeconds,
                 tokenBudget: event.goal.tokenBudget,
+                ...globalOwnLimits(event.goal),
                 statusReason: event.goal.statusReason,
-                executionWait: event.goal.executionWait,
+                executionWait: globalExecutionWait(event.goal.executionWait),
                 ...(event.goal.lastVerification !== undefined
                     ? {
                         lastVerification: {
@@ -61,6 +62,74 @@ export function publishThreadGoalEvent(publish, event) {
             },
         },
     });
+}
+/**
+ * The Goal's own request and time caps in the shared event shape (the
+ * generated `GoalState` field names); absent when the Goal has none.
+ */
+export function globalOwnLimits(goal) {
+    return {
+        ...(typeof goal.requestLimit === 'number' ? { requestLimit: goal.requestLimit } : {}),
+        ...(typeof goal.activeSecondsLimit === 'number'
+            ? { activeSecondsLimit: goal.activeSecondsLimit }
+            : {}),
+    };
+}
+/**
+ * The limits in force in the shared event shape (`GoalState.effectiveLimits`):
+ * present whenever the runtime resolved them, with a member only for a limited
+ * dimension, so `{}` reads as "nothing is limited".
+ */
+export function globalEffectiveLimits(limits) {
+    return {
+        effectiveLimits: {
+            ...(limits.tokens !== null ? { tokenLimit: limits.tokens } : {}),
+            ...(limits.mainTurns !== null ? { requestLimit: limits.mainTurns } : {}),
+            ...(limits.activeSeconds !== null ? { activeSecondsLimit: limits.activeSeconds } : {}),
+        },
+    };
+}
+/**
+ * Stamp the limits in force onto every `thread_goal.updated` event. The Goal
+ * owner wraps its publisher once, so every producer of a Goal snapshot (and
+ * there are many) carries the same resolution the budget gates use, without
+ * each one reading the config.
+ */
+export function withThreadGoalEffectiveLimits(publish, resolve) {
+    return (event) => {
+        if (event.type !== 'thread_goal.updated') {
+            publish(event);
+            return;
+        }
+        const goal = event.payload.goal;
+        publish({
+            ...event,
+            payload: { ...event.payload, goal: { ...goal, ...globalEffectiveLimits(resolve(goal)) } },
+        });
+    };
+}
+/**
+ * A Goal's execution wait in the shared event shape. The background wait
+ * details (spec G2-07) appear only when the owner attached them.
+ */
+export function globalExecutionWait(wait) {
+    if (!wait)
+        return null;
+    return {
+        reason: wait.reason,
+        sinceMs: wait.sinceMs,
+        ...(wait.waitedTasks
+            ? {
+                waitedTasks: wait.waitedTasks.map((task) => ({
+                    taskId: task.taskId,
+                    name: task.name,
+                    startedAt: task.startedAt,
+                })),
+            }
+            : {}),
+        ...(wait.finishedTaskCount !== undefined ? { finishedTaskCount: wait.finishedTaskCount } : {}),
+        ...(wait.backgroundTasksUnreadable ? { backgroundTasksUnreadable: true } : {}),
+    };
 }
 /**
  * The four token parts in the shared event shape (the generated `GoalState`
@@ -118,14 +187,14 @@ export function globalUsageRecovery(goal) {
  * sees the model's writes immediately.
  *
  * `update_goal` records terminal proposals through the host collector and
- * delegates token-budget edits to the supplied host mutation port.
+ * delegates limit edits to the supplied host mutation port.
  */
-export function buildThreadGoalRuntimeTools(store, disabled, signalCollector, budgetMutation) {
+export function buildThreadGoalRuntimeTools(store, disabled, signalCollector, host = {}) {
     if (disabled)
         return [];
     return [
-        toRuntimeTool(new UpdateGoalTool(store, signalCollector, budgetMutation)),
-        toRuntimeTool(new GetGoalTool(store)),
+        toRuntimeTool(new UpdateGoalTool(store, signalCollector, host.budgetMutation, host.limitsOf)),
+        toRuntimeTool(new GetGoalTool(store, host.limitsOf)),
     ];
 }
 //# sourceMappingURL=wiring.js.map

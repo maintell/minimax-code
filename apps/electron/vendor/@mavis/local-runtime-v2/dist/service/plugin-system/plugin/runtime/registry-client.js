@@ -149,6 +149,15 @@ function readMarketplaceDetail(value) {
             };
         }),
         ...optionalArrayProjection(record, ['example_queries', 'exampleQueries'], 'exampleQueries', requireStringValue),
+        ...optionalArrayProjection(record, ['agents', 'agents'], 'agents', readPluginAgent),
+    };
+}
+function readPluginAgent(value) {
+    const agent = requireRecord(value, 'Plugin Agent');
+    return {
+        name: requireString(agent, 'name', 'name'),
+        ...optionalStringProjection(agent, 'description', 'description', 'description'),
+        content: requireString(agent, 'content', 'content'),
     };
 }
 function readMarketplaceSummary(value) {
@@ -280,6 +289,7 @@ function readCapabilities(value) {
         mcpServerCount: requireNumber(record, 'mcp_server_count', 'mcpServerCount'),
         skillCount: requireNumber(record, 'skill_count', 'skillCount'),
         ...optionalNumberProjection(record, 'hook_count', 'hookCount', 'hookCount'),
+        ...optionalNumberProjection(record, 'agent_count', 'agentCount', 'agentCount'),
     };
 }
 function readPluginApp(value) {

@@ -5,7 +5,7 @@ import { resolveAgentPromptSurface } from '../../service/turn-system/index.js';
 import { isTaskSession, isCurrentSessionAgentDefinition, } from '../../service/session-system/index.js';
 export function createV2AgentProfileSource(agentService, configGetter, runtimeOwnerKind, capabilityProfile) {
     return {
-        render: async ({ session, agent, agentBinding, promptRead }) => {
+        render: async ({ session, agent, agentBinding, promptRead, ptcRequested }) => {
             const definition = requireCurrentDefinition(session, agentBinding);
             const metadata = agent.metadata ?? {};
             // Freeze one config snapshot for the complete profile render so a live
@@ -29,11 +29,18 @@ export function createV2AgentProfileSource(agentService, configGetter, runtimeOw
                     isLegacyMemoryRecallEnabled(config.memory, agent.agentName),
                 cronEnabled: !isCommandLineRuntimeOwner(runtimeOwnerKind),
                 dataDirToken: config.dataDir,
-                ...(promptRead ? { promptReadContext: promptRead } : {}),
+                ...turnScopedRequest(promptRead, ptcRequested),
             };
             const profile = await renderProfile(agentService, request, definition);
             return toLocalAgentExecutionProfile(applySourcePromptPolicy(profile, runtimeOwnerKind));
         },
+    };
+}
+/** Facts that belong to this one Turn, never to the Agent definition. */
+function turnScopedRequest(promptRead, ptcRequested) {
+    return {
+        ...(promptRead ? { promptReadContext: promptRead } : {}),
+        ...(ptcRequested ? { ptcRequested: true } : {}),
     };
 }
 function renderProfile(agentService, request, definition) {

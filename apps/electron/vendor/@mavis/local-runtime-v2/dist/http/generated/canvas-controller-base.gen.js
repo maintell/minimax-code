@@ -15,5 +15,15 @@ export class CanvasControllerBase {
         void req;
         throw new NotImplementedError('applyCanvasOperation');
     }
+    async removeCanvasImageBackground(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('removeCanvasImageBackground');
+    }
+    async enhanceCanvasImage(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('enhanceCanvasImage');
+    }
 }
 //# sourceMappingURL=canvas-controller-base.gen.js.map

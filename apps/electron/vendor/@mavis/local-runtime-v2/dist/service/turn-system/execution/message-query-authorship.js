@@ -40,8 +40,14 @@ export function hasPriorityUserQueueItem(items) {
  * the product owner, 2026-09-24).
  */
 export function hasUserQueueInputSince(items, sinceMs) {
-    return items.some((item) => item.createdAt >= sinceMs &&
-        isUserAuthoredSource(item.source) &&
-        !isOrdinaryQuestionnaireResponseOrigin(item.message.origin));
+    return items.some((item) => item.createdAt >= sinceMs && isUserQueueInput(item));
+}
+/**
+ * Queue input the person typed (see hasUserQueueInputSince): a user-authored
+ * source that is not a questionnaire answer. The AskUser v2 async countdown
+ * queue gate holds exactly these items, so both rules stay one rule.
+ */
+export function isUserQueueInput(item) {
+    return (isUserAuthoredSource(item.source) && !isOrdinaryQuestionnaireResponseOrigin(item.message.origin));
 }
 //# sourceMappingURL=message-query-authorship.js.map

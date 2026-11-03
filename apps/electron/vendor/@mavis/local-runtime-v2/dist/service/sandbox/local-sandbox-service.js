@@ -301,6 +301,7 @@ export class LocalSandboxService {
             const sessionTempDir = await this.#tempManager.sessionDir(input.identity.sessionId);
             const context = await resolveSandboxInvocationContext({
                 workspaceRoot: input.workspaceRoot,
+                workspaceRoots: input.workspaceRoots,
                 cwd: input.cwd,
                 sessionTempDir,
                 runtimeTempInstanceDir: this.#tempManager.instanceDir,

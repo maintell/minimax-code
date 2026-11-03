@@ -253,7 +253,7 @@ export async function searchWorkspaceFiles(workspace, query, limit = 50, include
         return [];
     const root = await existingRoot(workspace);
     const candidates = includeDirectories
-        ? [...(await mentionSearchCandidates(root))]
+        ? await listWorkspaceSearchCandidates(root, true)
         : ((await gitSearchCandidates(root)) ?? (await fsSearchCandidates(root))).filter(isSearchablePath);
     const rootPath = `${root.replaceAll('\\', '/').replace(/\/$/u, '')}/`;
     const rootName = `${basename(root)}/`;
@@ -306,7 +306,7 @@ export async function listFileSystemDirectories(input) {
     const limit = clamp(input.limit, 1, 200, 50);
     const needle = (input.query ?? '').toLowerCase();
     const entries = [];
-    await walkDirectories(root, maxDepth, Boolean(input.hideDotFiles ?? true), async (absolute, entry, depth) => {
+    await walkDirectories(root, maxDepth, { hideDotFiles: Boolean(input.hideDotFiles ?? true) }, async (absolute, entry, depth) => {
         // The V1 directory picker returns children of the requested directory;
         // the walk never visits the root itself.
         if (!entry.isDirectory() || depth > maxDepth)
@@ -339,7 +339,7 @@ export async function getFileSystemGitInfo(path) {
         hasHead,
     };
 }
-async function existingRoot(workspace) {
+export async function existingRoot(workspace) {
     if (!workspace.trim()) {
         throw new WorkspaceFileError('WORKSPACE_NOT_FOUND', 'Workspace directory is unavailable');
     }
@@ -471,44 +471,57 @@ function toRelativePath(root, path) {
     const value = relative(root, path).split('\\').join('/');
     return value || '.';
 }
-async function gitSearchCandidates(root) {
+async function gitSearchCandidates(root, signal) {
     const [tracked, deleted] = await Promise.all([
-        git(['ls-files', '-co', '--exclude-standard', '-z'], root),
-        git(['ls-files', '-d', '-z'], root),
+        git(['ls-files', '-co', '--exclude-standard', '-z'], root, { signal }),
+        git(['ls-files', '-d', '-z'], root, { signal }),
     ]);
     if (tracked.code !== 0 || deleted.code !== 0)
         return undefined;
     const deletedSet = new Set(deleted.stdout.split('\0').filter(Boolean));
     return Array.from(new Set(tracked.stdout.split('\0').filter((path) => path && !deletedSet.has(path))));
 }
-async function searchChildDirectories(root, directory, hideDotFiles, stopAtGitBoundary = false) {
+async function searchGitChildDirectories(root, directory) {
     const entries = (await optional(() => readdir(directory, { withFileTypes: true }))) ?? [];
-    if (stopAtGitBoundary && directory !== root && entries.some((entry) => entry.name === '.git')) {
+    if (directory !== root && entries.some((entry) => entry.name === '.git')) {
         return [];
     }
     return entries
-        .filter((entry) => entry.isDirectory() && !shouldSkipWalkEntry(entry, hideDotFiles))
+        .filter((entry) => entry.isDirectory() && !shouldSkipWalkEntry(entry, false))
         .map((entry) => `${toRelativePath(root, join(directory, entry.name))}/`);
 }
-async function mentionSearchCandidates(root) {
-    // Detect repository membership without waiting for the entire file inventory.
-    // Files and directories then scan concurrently; no stale candidate cache.
+export async function listWorkspaceSearchCandidates(root, includeDirectories, options = {}) {
     const [gitCandidates, directories] = await Promise.all([
-        gitSearchCandidates(root),
         (async () => {
-            const repository = await git(['rev-parse', '--is-inside-work-tree'], root);
-            return searchDirectoryCandidates(root, repository.code === 0 && repository.stdout.trim() === 'true');
+            const paths = await gitSearchCandidates(root, options.signal);
+            const files = paths?.filter(isSearchablePath);
+            if (files)
+                options.onBatch?.(files);
+            return files;
         })(),
+        includeDirectories
+            ? (async () => {
+                const repository = await git(['rev-parse', '--is-inside-work-tree'], root, options);
+                return repository.code === 0 && repository.stdout.trim() === 'true'
+                    ? searchGitDirectoryCandidates(root, options)
+                    : undefined;
+            })()
+            : undefined,
     ]);
-    const files = (gitCandidates ?? (await fsSearchCandidates(root))).filter(isSearchablePath);
-    return [...files, ...directories];
+    // Non-Git files and directories share one walk. Git inventories still run in parallel.
+    if (!gitCandidates) {
+        const files = await fsSearchCandidates(root, includeDirectories && !directories, options);
+        return directories ? [...files, ...directories] : files;
+    }
+    return [...gitCandidates, ...(directories ?? [])];
 }
-async function searchDirectoryCandidates(root, isGit) {
+async function searchGitDirectoryCandidates(root, options = {}) {
     const result = [];
     let pending = [root];
     // Bound keyword search to six directory levels; empty-query browsing
     // remains available for navigating deeper directories.
     for (let depth = 0; depth < 6 && pending.length > 0; depth += 1) {
+        options.signal?.throwIfAborted();
         const children = [];
         // Bound filesystem concurrency instead of serializing every directory's I/O.
         // Keep nested repository roots selectable without checking their descendants
@@ -516,35 +529,42 @@ async function searchDirectoryCandidates(root, isGit) {
         for (let offset = 0; offset < pending.length; offset += 32) {
             const batches = await Promise.all(pending
                 .slice(offset, offset + 32)
-                .map((directory) => searchChildDirectories(root, directory, !isGit, isGit)));
+                .map((directory) => searchGitChildDirectories(root, directory)));
             for (const batch of batches)
                 children.push(...batch);
         }
         if (children.length === 0)
             break;
-        let ignored = new Set();
-        if (isGit) {
-            const checked = await git(['check-ignore', '--stdin', '-z'], root, {
-                input: `${children.join('\0')}\0`,
-            });
-            // Exit 1 means no matches. On failure do not expose possibly ignored directories.
-            if (checked.code !== 0 && checked.code !== 1)
-                break;
-            ignored = new Set(checked.stdout.split('\0').filter(Boolean));
-        }
+        const checked = await git(['check-ignore', '--stdin', '-z'], root, {
+            input: `${children.join('\0')}\0`,
+            signal: options.signal,
+        });
+        // Exit 1 means no matches. On failure do not expose possibly ignored directories.
+        if (checked.code !== 0 && checked.code !== 1)
+            break;
+        const ignored = new Set(checked.stdout.split('\0').filter(Boolean));
         const visible = children.filter((path) => !ignored.has(path));
         result.push(...visible);
+        options.onBatch?.(visible);
         pending = visible.map((path) => join(root, path));
     }
     return result;
 }
-async function fsSearchCandidates(root) {
+async function fsSearchCandidates(root, includeDirectories = false, options = {}) {
     const result = [];
-    await walkDirectories(root, 20, true, async (absolute, entry) => {
+    await walkDirectories(root, 20, { hideDotFiles: true, signal: options.signal }, async (absolute, entry, depth) => {
+        let candidate;
         if (entry.isFile()) {
             const rel = toRelativePath(root, absolute);
             if (isSearchablePath(rel))
-                result.push(rel);
+                candidate = rel;
+        }
+        else if (includeDirectories && entry.isDirectory() && depth <= 6) {
+            candidate = `${toRelativePath(root, absolute)}/`;
+        }
+        if (candidate) {
+            result.push(candidate);
+            options.onBatch?.([candidate]);
         }
     });
     return result;
@@ -554,21 +574,27 @@ async function fsSearchCandidates(root) {
  * stat each entry: inside Electron that opens user `.asar` files as archives,
  * walks into them and keeps the file locked on Windows until process exit.
  */
-async function walkDirectories(root, maxDepth, hideDotFiles, visit) {
-    const walk = async (directory, depth) => {
-        if (depth >= maxDepth)
-            return;
-        const entries = (await optional(() => readdir(directory, { withFileTypes: true }))) ?? [];
-        for (const entry of entries) {
-            if (shouldSkipWalkEntry(entry, hideDotFiles))
-                continue;
-            const absolute = join(directory, entry.name);
-            await visit(absolute, entry, depth + 1);
-            if (entry.isDirectory())
-                await walk(absolute, depth + 1);
+async function walkDirectories(root, maxDepth, options, visit) {
+    let pending = [root];
+    for (let depth = 0; depth < maxDepth && pending.length > 0; depth += 1) {
+        const children = [];
+        // Cap concurrent reads across the whole level, including wide directory trees.
+        for (let offset = 0; offset < pending.length; offset += 32) {
+            await Promise.all(pending.slice(offset, offset + 32).map(async (directory) => {
+                options.signal?.throwIfAborted();
+                const entries = (await optional(() => readdir(directory, { withFileTypes: true }))) ?? [];
+                for (const entry of entries) {
+                    if (shouldSkipWalkEntry(entry, options.hideDotFiles))
+                        continue;
+                    const absolute = join(directory, entry.name);
+                    await visit(absolute, entry, depth + 1);
+                    if (entry.isDirectory())
+                        children.push(absolute);
+                }
+            }));
         }
-    };
-    await walk(root, 0);
+        pending = children;
+    }
 }
 function shouldSkipWalkEntry(entry, hideDotFiles) {
     if (entry.isSymbolicLink() || entry.name === '.git')

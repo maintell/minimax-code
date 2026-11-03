@@ -35,6 +35,7 @@ export function createRuntimeConversationApplication(options) {
         threadGoal: { pauseActiveForAbort: options.pauseActiveForAbort },
         steer: (input) => options.runtimeConversation.ingress.steer(input),
         queueSteer,
+        ...(options.undeliveredMessages ? { undeliveredMessages: options.undeliveredMessages } : {}),
         ...(options.turnSystem.inspection ? { turnInspection: options.turnSystem.inspection } : {}),
         ...(options.metrics ? { metrics: options.metrics } : {}),
     });

@@ -71,7 +71,11 @@ export class MemoryQuotaTransport {
     }
     async remains(context, groupId) {
         const origin = OPEN_PLATFORM_ORIGINS[context.region][context.buildEnv];
-        return this.request(new URL('/v1/api/openplatform/coding_plan/remains', origin), {
+        const url = new URL('/v1/api/openplatform/coding_plan/remains', origin);
+        url.searchParams.set('business', 'Agent');
+        // Production Memory V2 is enabled only for the Electron-owned Runtime.
+        url.searchParams.set('device_platform', 'desktop');
+        return this.request(url, {
             method: 'GET',
             headers: {
                 ...context.routingHeaders,

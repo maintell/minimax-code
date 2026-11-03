@@ -10,7 +10,9 @@ export async function readCompatiblePluginPackage(packageRoot, options = {}) {
     const root = await canonicalizePluginRoot(packageRoot, { rejectSymlink: true });
     const kind = options.kind ?? 'CLAUDE_CODE';
     const manifestRelativePath = kind === 'CODEX' ? CODEX_MANIFEST_PATH : CLAUDE_MANIFEST_PATH;
-    const { path: manifestPath, value: manifest } = await readPluginJsonObject(root, manifestRelativePath);
+    const { path: manifestPath, value: manifest } = options.declaredManifest
+        ? { path: root.path, value: options.declaredManifest }
+        : await readPluginJsonObject(root, manifestRelativePath);
     const name = stringValue(manifest.name);
     if (!name)
         readerFail('MANIFEST_SCHEMA_INVALID', 'Compatible Plugin name is required');

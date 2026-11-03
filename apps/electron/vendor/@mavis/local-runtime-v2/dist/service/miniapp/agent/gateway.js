@@ -754,13 +754,15 @@ async function creationContext(state, bound, caller, agent) {
     const { pluginId, hostSessionId } = caller;
     const host = hostSessionId ? await bound.resolveHostSession(hostSessionId) : undefined;
     if (!host?.agentName) {
-        const agentName = agent ?? MINIAPP_AGENT_NAME;
+        const agentName = await bound.resolveAgentWriteTarget(agent ?? MINIAPP_AGENT_NAME);
         if (hostSessionId) {
             state.options.logger.info({ pluginId, hostSessionId, agentName, workspaceSource: 'plugin' }, 'Mini App Agent host chat session not found; using the default agent');
         }
         return pluginWorkspace(state, pluginId, agentName, await bound.defaultSessionModel());
     }
-    return hostCreationContext(state, bound, caller, { host, agentName: agent ?? host.agentName });
+    // A host session already owns a persisted identity; only logical selections need resolving.
+    const agentName = agent === undefined ? host.agentName : await bound.resolveAgentWriteTarget(agent);
+    return hostCreationContext(state, bound, caller, { host, agentName });
 }
 async function hostCreationContext(state, bound, caller, target) {
     const { host, agentName } = target;

@@ -2,7 +2,6 @@ import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { canonicalActiveHistoryRevision, canonicalHistoryRevision, inspectCanonicalHistorySequence, } from '../../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../../sessions/representation/canonical-history.js';
-import { CanonicalHistoryIndexWriteError, createCanonicalHistoryIndexAdapter, } from './canonical-history-index.js';
 import { ensureCanonicalHistoryMaterialized, } from '../canonical-history-materializer.js';
 import { scanCanonicalHistoryArtifacts } from './canonical-history-scanner.js';
 import { createSessionHistoryLocationResolver, } from '../session-history-location.js';
@@ -436,13 +435,6 @@ async function validatePublished(paths, sessionId, generation, cleanupUnexpected
     }
     if (published.catalog.activeGeneration !== generation || published.orphans.length > 0) {
         throw new Error('Published canonical history generation is not reachable');
-    }
-    try {
-        await createCanonicalHistoryIndexAdapter(paths.sessionDir).rebuild(published);
-    }
-    catch (error) {
-        if (!(error instanceof CanonicalHistoryIndexWriteError))
-            throw error;
     }
 }
 async function createStaging(paths, operationId) {

@@ -1,5 +1,5 @@
 import { Type } from '@sinclair/typebox';
-import { defineRuntimeTool, validateRuntimeToolInput, } from '@mavis/agent-core/tools';
+import { coerceRuntimeToolInput, defineRuntimeTool, validateRuntimeToolInput, } from '@mavis/agent-core/tools';
 const METADATA = new WeakMap();
 const MCP_INVOKE_METADATA = Symbol('mavis.mcp-invoke.metadata');
 const MAX_ARGUMENTS_JSON_BYTES = 256 * 1024;
@@ -146,7 +146,15 @@ function resolveTarget(input, registry, referenceRegistry) {
         return { kind: 'error', message: `Prepared arguments for "${selector}" must be an object.` };
     }
     const inputSchema = reference?.inputSchema ?? target.def.schema;
-    const mismatch = schemaMismatch(inputSchema, selector, prepared, selectorKind === 'tool_ref');
+    // Built-in deferred tools get the same primitive coercion a direct call would
+    // ("2" -> 2 for integer fields). Host-bound tool_ref payloads stay structure-preserving.
+    let finalArguments = prepared;
+    if (selectorKind === 'tool_name') {
+        const coerced = coerceRuntimeToolInput(inputSchema, prepared);
+        if (isRecord(coerced))
+            finalArguments = coerced;
+    }
+    const mismatch = schemaMismatch(inputSchema, selector, finalArguments, selectorKind === 'tool_ref');
     if (mismatch)
         return { kind: 'error', message: mismatch };
     return {
@@ -154,7 +162,7 @@ function resolveTarget(input, registry, referenceRegistry) {
         selectorKind,
         selector,
         target,
-        arguments: prepared,
+        arguments: finalArguments,
         inputSchema,
         ...(reference?.pluginName ? { pluginName: reference.pluginName } : {}),
     };

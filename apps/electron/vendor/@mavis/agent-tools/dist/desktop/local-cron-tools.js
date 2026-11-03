@@ -1,7 +1,8 @@
-import { defineRuntimeTool } from '@mavis/agent-core/tools';
+import { defineRuntimeTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
 import { Value } from '@sinclair/typebox/value';
 import { cronCommand, cronToolDefinitions, cronToolFailure, LocalSelfReminderToolDef, } from '../cron/tool-defs.js';
-import { DESKTOP_MANAGEMENT_MAX_TOKENS, currentLocalCronModel, dispatchLocalMavis, limitLocalManagementOutput, } from './local-mavis.js';
+import { DESKTOP_MANAGEMENT_MAX_TOKENS, currentLocalCronModel, dispatchLocalMavis, isCronCallableInRunCode, limitLocalManagementOutput, } from './local-mavis.js';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 export function buildLocalCronTools(deps) {
     const crud = cronToolDefinitions('cron_id').map((def) => defineRuntimeTool({
         ...def,
@@ -40,7 +41,9 @@ export function buildLocalCronTools(deps) {
                     currentSessionId: ctx.sessionId,
                     currentModel: currentLocalCronModel(ctx),
                 }, command, args, signal);
-                const recovery = 'Use mcp_invoke with cron_read and a smaller limit or exact task ID. Do not repeat successful creation or updates.';
+                const recovery = isCronCallableInRunCode(ctx)
+                    ? 'Call tools.cron_read again inside run_code with a smaller limit or exact task ID. Do not repeat successful creation or updates.'
+                    : 'Use mcp_invoke with cron_read and a smaller limit or exact task ID. Do not repeat successful creation or updates.';
                 const limited = limitLocalManagementOutput(ctx, JSON.stringify(output), output, def.name, recovery);
                 const text = limited.text;
                 return {
@@ -64,6 +67,12 @@ export function buildLocalCronTools(deps) {
                             : {}),
                     },
                     ...(output.ok ? {} : { isError: true }),
+                    // Same rule as mavis: the whole object, or only ok and command after a cut.
+                    programmatic: {
+                        data: limited.truncated
+                            ? { ok: output.ok, command: output.command }
+                            : JSON.parse(JSON.stringify(output)),
+                    },
                 };
             }
             catch (error) {
@@ -77,26 +86,26 @@ export function buildLocalCronTools(deps) {
             ...LocalSelfReminderToolDef,
             execute: async (ctx, args, signal) => {
                 if (!Value.Check(LocalSelfReminderToolDef.schema, args))
-                    return cronToolFailure('self_reminder', 'Invalid self_reminder arguments.');
+                    return selfReminderFailure('Invalid self_reminder arguments.');
                 const adapter = deps.cronAdapter;
                 try {
                     let response;
                     if (args.action === 'cancel') {
                         if (args.delay_seconds !== undefined || args.prompt !== undefined)
-                            return cronToolFailure('self_reminder', 'cancel accepts only action.');
+                            return selfReminderFailure('cancel accepts only action.');
                         if (!adapter.cancelSelfReminder)
-                            return cronToolFailure('self_reminder', 'Self reminders are unavailable on this host.', 'SELF_REMINDER_UNAVAILABLE');
+                            return selfReminderFailure('Self reminders are unavailable on this host.', 'SELF_REMINDER_UNAVAILABLE');
                         response = await adapter.cancelSelfReminder({ sessionId: ctx.sessionId }, signal);
                     }
                     else {
                         if (!args.prompt?.trim())
-                            return cronToolFailure('self_reminder', 'prompt is required for set.');
+                            return selfReminderFailure('prompt is required for set.');
                         if (args.delay_seconds === undefined)
-                            return cronToolFailure('self_reminder', 'delay_seconds is required for set.');
+                            return selfReminderFailure('delay_seconds is required for set.');
                         if (!ctx.agentName || !ctx.toolCallId || !ctx.turnId)
-                            return cronToolFailure('self_reminder', 'Current agent and complete creation provenance are required.');
+                            return selfReminderFailure('Current agent and complete creation provenance are required.');
                         if (!adapter.setSelfReminder)
-                            return cronToolFailure('self_reminder', 'Self reminders are unavailable on this host.', 'SELF_REMINDER_UNAVAILABLE');
+                            return selfReminderFailure('Self reminders are unavailable on this host.', 'SELF_REMINDER_UNAVAILABLE');
                         response = await adapter.setSelfReminder({
                             sessionId: ctx.sessionId,
                             turnId: ctx.turnId,
@@ -109,20 +118,26 @@ export function buildLocalCronTools(deps) {
                         }, signal);
                     }
                     const text = JSON.stringify({ ok: true, response });
-                    return {
+                    return withDesktopCompletenessReport('self_reminder', {
                         tool_name: 'self_reminder',
                         text,
                         content: [{ type: 'text', text }],
                         details: { output: { ok: true, response } },
-                    };
+                    }, { data: { ok: true, response } });
                 }
                 catch (error) {
-                    return cronToolFailure('self_reminder', error instanceof Error ? error.message : String(error), error instanceof Error && 'code' in error && typeof error.code === 'string'
+                    return selfReminderFailure(error instanceof Error ? error.message : String(error), error instanceof Error && 'code' in error && typeof error.code === 'string'
                         ? error.code
                         : 'SELF_REMINDER_FAILED');
                 }
             },
         }),
     ];
+}
+/** PTC failures of self_reminder keep only the outcome; the reason is r.error. */
+function selfReminderFailure(message, code) {
+    return withProgrammaticResult(cronToolFailure('self_reminder', message, code), {
+        data: { ok: false },
+    });
 }
 //# sourceMappingURL=local-cron-tools.js.map

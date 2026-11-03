@@ -3,9 +3,9 @@ import { logger } from '@mavis/shared/local-runtime-logging';
 import { agents } from '../../infra/db/schema/agents.js';
 import { createAgentRuntimeOwner } from './initialize.js';
 import { BuiltinAgentCatalog } from './builtin/catalog.js';
-import { importLegacyAgents, isLegacyAgentTargetBootstrapEligible, } from './storage/_migration-legacy-agents.js';
+import { importLegacyAgents, isLegacyAgentTargetBootstrapEligible, } from './storage/legacy-migration/_migration-legacy-agents.js';
 import { AgentFiles } from './storage/agent-files.js';
-import { LegacyAgentBootstrapImportReceipt } from './storage/legacy-agent-bootstrap-receipt.js';
+import { LegacyAgentBootstrapImportReceipt } from './storage/legacy-migration/legacy-agent-bootstrap-receipt.js';
 const EMPTY_REFERENCE_COUNTS = {
     primaryDatabase: 0,
     runtimeDatabase: 0,
@@ -124,6 +124,7 @@ export async function createRuntimeAgentComposition(options) {
                 ...(options.reportLegacyCustomMaterialization
                     ? { reportLegacyCustomMaterialization: options.reportLegacyCustomMaterialization }
                     : {}),
+                reportBuiltinConfigRepair: reportBuiltinAgentConfigRepair,
             });
             emit(progress.phase, 'completed');
             progress.phase = 'builtin_seed';
@@ -327,6 +328,57 @@ async function completeBootstrapReceipt(receipt, progress) {
 }
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
+}
+/**
+ * Builtin source repair runs in both startup passes and is the only trace of a
+ * user's archived edits; a startup reload is the only trace that non-model
+ * edits were replaced by the bundled content. A use-time reseed is the only trace that another
+ * process deleted a Builtin file while this runtime was running. A skipped repair
+ * records that a file judged corrupted was fixed or deleted before it was archived.
+ * Fields stay bounded: the archive is named by file name only, and no dataDir path or
+ * prompt content reaches runtime logs.
+ */
+function reportBuiltinAgentConfigRepair(event) {
+    if (event.kind === 'reloaded') {
+        logger.info({
+            event: 'builtin_agent_config_reloaded',
+            agent_name: event.agentName,
+            model_kept: event.modelKept,
+        }, 'V2 Builtin Agent config reloaded to the bundled content');
+        return;
+    }
+    if (event.kind === 'reseeded') {
+        logger.warn({
+            event: 'builtin_agent_config_reseeded',
+            agent_name: event.agentName,
+            trigger: event.trigger,
+        }, 'V2 Builtin Agent config reseeded after it went missing');
+        return;
+    }
+    if (event.kind === 'archived') {
+        logger.warn({
+            event: 'builtin_agent_config_archived',
+            agent_name: event.agentName,
+            error_code: event.errorCode,
+            archive_file: event.archiveFile,
+        }, 'V2 Builtin Agent config archived before repair');
+        return;
+    }
+    if (event.kind === 'repair_skipped') {
+        logger.info({
+            event: 'builtin_agent_config_repair_skipped',
+            agent_name: event.agentName,
+            error_code: event.errorCode,
+            reason: event.reason,
+        }, 'V2 Builtin Agent config repair skipped; the file was fixed or deleted before it ran');
+        return;
+    }
+    logger.error({
+        event: 'builtin_agent_config_repair_failed',
+        agent_name: event.agentName,
+        error_code: event.errorCode,
+        stage: event.stage,
+    }, 'V2 Builtin Agent config repair failed');
 }
 function reportBuiltinNameConflictConfigDiagnostic(report, agentName, errorCode, reason) {
     try {

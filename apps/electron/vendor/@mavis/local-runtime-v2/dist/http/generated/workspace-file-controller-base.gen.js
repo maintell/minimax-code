@@ -25,6 +25,11 @@ export class WorkspaceFileControllerBase {
         void req;
         throw new NotImplementedError('searchWorkspaceFiles');
     }
+    async stopWorkspaceFileSearch(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('stopWorkspaceFileSearch');
+    }
     async previewWorkspaceFile(ctx, req) {
         void ctx;
         void req;
@@ -229,6 +234,11 @@ export class WorkspaceFileControllerBase {
         void ctx;
         void req;
         throw new NotImplementedError('searchWorkspaceReviewDiffs');
+    }
+    async streamWorkspaceFileSearch(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('streamWorkspaceFileSearch');
     }
 }
 //# sourceMappingURL=workspace-file-controller-base.gen.js.map

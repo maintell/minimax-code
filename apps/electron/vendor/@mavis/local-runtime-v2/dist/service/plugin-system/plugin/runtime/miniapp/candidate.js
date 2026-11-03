@@ -1,5 +1,6 @@
 import { MINIAPP_AGENT_DEFAULT_CONCURRENCY, } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
+import { isEffectiveLocalPlugin } from '../snapshot-builder.js';
 export function sameMiniAppCandidate(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -22,7 +23,7 @@ export function listEnabledMiniAppDefinitions(snapshot) {
     const packages = [
         ...snapshot.officialPackages.flatMap(({ plugin }) => (plugin?.miniapp ? [plugin] : [])),
         ...snapshot.localPlugins
-            .filter((projection) => projection.enabled && projection.plugin.miniapp !== undefined)
+            .filter((projection) => isEffectiveLocalPlugin(projection) && projection.plugin.miniapp !== undefined)
             .map(({ plugin }) => plugin),
     ];
     return packages

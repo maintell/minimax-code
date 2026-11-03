@@ -1,4 +1,5 @@
 import { MiniAppError } from '../../../../miniapp/index.js';
+import { LOCAL_PLUGIN_MARKETPLACE } from '@mavis/shared';
 import { normalizeMiniAppPreparationError, } from '../../../publication.js';
 import { PluginSystemError } from '../../../errors.js';
 import { deferred, ignoreFailure, officialPackageRetentionOption, runAllFinally, settleInBackground, } from '../../../plugin-system-helpers.js';
@@ -127,7 +128,10 @@ export class PluginMiniAppPublicationController {
                 await transaction.install();
                 throwIfAborted(input.signal);
                 const inputs = await this.options.readSnapshotBuildInputs();
-                const installed = inputs.localPackages.find(({ plugin }) => plugin.name === input.pluginId);
+                // Workspace Mini Apps are owned `<pluginId>@local` roots; a same-name
+                // Plugin from a user-added marketplace is a different identity.
+                const installed = inputs.localPackages.find((entry) => entry.plugin.name === input.pluginId &&
+                    (entry.id?.marketplace ?? LOCAL_PLUGIN_MARKETPLACE) === LOCAL_PLUGIN_MARKETPLACE);
                 if (!installed?.plugin.miniapp || installed.contentDigest !== transaction.contentDigest) {
                     throw new PluginSystemError('MINIAPP_PREPARATION_FAILED', 'installed MiniApp candidate identity changed', { reasonCode: 'CANDIDATE_CHANGED' });
                 }
@@ -135,7 +139,7 @@ export class PluginMiniAppPublicationController {
                     throw new PluginSystemError('MINIAPP_PREPARATION_FAILED', 'this MCode version is older than the Mini App engines.mcode', { reasonCode: 'MINIAPP_HOST_TOO_OLD' });
                 }
                 const next = this.buildPublicationSnapshot(inputs, {});
-                const projection = next.localPlugins.find(({ name }) => name === input.pluginId);
+                const projection = next.localPlugins.find(({ id }) => id.name === input.pluginId && id.marketplace === LOCAL_PLUGIN_MARKETPLACE);
                 if (!projection?.enabled) {
                     throw new PluginSystemError('PLUGIN_NOT_ENABLED', 'Mini App Plugin is disabled');
                 }

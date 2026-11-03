@@ -3,6 +3,12 @@
   "version": "0.2.1",
   "type": "module",
   "exports": {
+    "./browser-webview": {
+      "import": "./dist/browser-webview.js"
+    },
+    "./browser-backend": {
+      "import": "./dist/browser-backend.js"
+    },
     "./memory-limits": {
       "import": "./dist/memory-limits.js"
     },
@@ -256,6 +262,9 @@
     "./plugin-mention": {
       "import": "./dist/plugin-mention.js"
     },
+    "./plugin-id": {
+      "import": "./dist/plugin-id.js"
+    },
     "./memory-version": {
       "import": "./dist/memory-version.js",
       "default": "./dist/memory-version.js"
@@ -271,6 +280,10 @@
     },
     "./data-dir-variables": {
       "import": "./dist/data-dir-variables.js"
+    },
+    "./project-icon": {
+      "import": "./dist/project-icon.js",
+      "default": "./dist/project-icon.js"
     }
   },
   "main": "./dist/index.js",
@@ -452,6 +465,9 @@
       ],
       "data-dir-variables": [
         "src/data-dir-variables.ts"
+      ],
+      "project-icon": [
+        "src/project-icon.ts"
       ]
     }
   },

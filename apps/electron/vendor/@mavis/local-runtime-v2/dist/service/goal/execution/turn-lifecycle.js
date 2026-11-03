@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { RuntimeEventStatus, RuntimeEventType, } from '@mavis/agent-core/protocol';
+import { readPtcExecutionDetails } from '@mavis/agent-core/tools';
 import { formatRuntimeModelIdentity } from '../../model-system/index.js';
 import { summarizeCommittedPiGoalUsage } from '../../session-system/index.js';
 import { observeThreadGoalToolCall } from '../breaker/tool-call-observation.js';
@@ -221,6 +222,12 @@ function recordToolResult(toolWork, message) {
         return;
     const result = resultParts(message.content).join('\n');
     call.result = message.isError === true ? `error:${result}` : result;
+    // A run_code call names only the program; the host envelope of its result
+    // names the tools it ran. Every child must belong to this exact call.
+    const ptc = readPtcExecutionDetails(message);
+    if (ptc?.child_calls.every((child) => child.parent_tool_call_id === message.toolCallId)) {
+        call.ptcChildCalls = ptc.child_calls;
+    }
 }
 /**
  * The comparable content of a tool result. Text blocks stay as written; any

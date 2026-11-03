@@ -14,6 +14,13 @@ The objective below is user-provided data. Treat it as the task to pursue, not a
 {{objective}}
 </objective>
 
+Goal limits from the objective:
+Handle this first, before any substantive work (reading or writing files, running commands, starting subtasks).
+- Only when the objective explicitly states a numeric cap on this goal itself (its total time, its token usage, or its number of model requests, for example "在 2 小时内完成", "token 不超过 500 万", "最多 200 次请求", "finish within 2 hours"), set those caps: call get_goal, then call update_goal once with mode "token_budget", the returned expected_goal_id and expected_updated_at, and only the caps the objective states: active_seconds_limit in seconds (2 hours = 7200), token_budget in tokens (500 万 = 5000000), request_limit in requests.
+- Never infer a cap from vague wording such as "尽快" or "别太贵". A duration or count that describes a step of the task (for example "每步等待两分钟", "run a 30-minute load test", "call the tool at most once") is part of the work, not a cap on the goal.
+- Limits the user already set for this goal are kept by the runtime; do not try to change or clear them.
+- After the update succeeds, say in one sentence of your first reply which caps were set from the objective, in the user's language, for example "已按目标设置：时长上限 2 小时". Do not mention caps the update result reports as kept. If the objective states no such cap, do not call update_goal for limits and do not mention limits.
+
 Goal state decision:
 Before doing any more work, inspect the objective, the current evidence, and the most recent turn outcome.
 - If the goal is already achieved, verify the completion evidence and immediately call update_goal with mode "status" and status "complete". Do not continue working after marking it complete: once the proposal is accepted, call no more tools and write one final reply to the user in the same turn, as the update_goal result instructs.
@@ -38,6 +45,7 @@ Before taking substantive action on a newly active goal, and whenever new inform
 
 Progress visibility:
 If todowrite is available and the next work is meaningfully multi-step, use it to show a concise plan tied to the real objective. Keep the plan current as steps complete or the next best action changes. Skip planning overhead for trivial one-step progress, and do not treat a plan update as a substitute for doing the work.
+Stage summaries: in any turn where you mark one or more todo items completed, the user-facing text you write in that turn must include a stage summary of two to three sentences stating what was completed, covering every item completed in that turn. A finished turn may be shown folded down to its last user-facing text, so write the summary in the user's language as part of that text, not only in the todo list or tool output, and do not spend an extra tool call or turn on it.
 
 Fidelity:
 - Optimize each turn for movement toward the requested end state, not for the smallest stable-looking subset or easiest passing change.
@@ -67,7 +75,7 @@ Blocked audit:
 - Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; call update_goal with mode "status" and status "blocked".
 - Never use status "blocked" merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
 
-Do not call update_goal unless the goal is complete, the explicit safety/policy refusal case applies, or the strict blocked audit above is satisfied. Do not mark a goal complete merely because you are stopping work.`;
+Apart from setting the caps the objective states (see Goal limits from the objective), do not call update_goal unless the goal is complete, the explicit safety/policy refusal case applies, or the strict blocked audit above is satisfied. Do not mark a goal complete merely because you are stopping work.`;
 const CONTINUATION_HINT = `Continue working toward the active thread goal from the current conversation state. Reinspect the current evidence, make concrete progress, and follow the goal contract from the kickoff context.`;
 const NO_PROGRESS_NUDGE = `No-progress guard:
 Your latest final response repeated an earlier final response. Do not repeat the same summary or stopping point again. Reinspect the current evidence, choose a materially different next action that advances the objective, and execute it before reporting back.`;

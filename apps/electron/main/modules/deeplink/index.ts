@@ -15,6 +15,7 @@
  * - minimax://chat?message=hello      打开并发送消息
  * - minimax://navigate?url=xxx        打开并导航到指定页面
  * - minimax://auth-callback           OAuth 完成后仅唤起应用；凭证仍由 Shared OAuth Core 读取
+ * - minimax://workspace/open?path=xxx 以本机目录新建任务（`mcode app`），见 workspace-open.ts
  */
 import * as path from "path";
 import { app } from "electron";
@@ -27,6 +28,7 @@ import { resolveLocalRuntimeDataDir } from "../local-runtime/data-dir";
 import { getWindowsOpenFilePaths } from "../dock/windows-file-arguments";
 import { buildSingleInstanceLockKey } from "./single-instance-lock";
 import { isSupportedDeepLinkUrl, parseDeepLink } from "./parse";
+import { WORKSPACE_OPEN_ACTION, rememberWorkspaceOpenRequest, setupWorkspaceOpen } from "./workspace-open";
 function getProtocolEnvSuffix() {
     const domainUrl = process.env.NEXT_PUBLIC_DOMAIN_URL || '';
     if (isTest ||
@@ -55,7 +57,9 @@ function isDeepLinkUrl(url) {
     return isSupportedDeepLinkUrl(url);
 }
 // 注册的处理器
-const handlers = new Map();
+const handlers = new Map([
+    [WORKSPACE_OPEN_ACTION, rememberWorkspaceOpenRequest],
+]);
 let deepLinkEventHandlersInstalled = false;
 /**
  * 处理 Deep Link
@@ -71,6 +75,29 @@ async function handleDeepLink(url) {
         return;
     }
     console.log('[DeepLink] Parsed action:', parsed.action, 'params:', Object.keys(parsed.params));
+    // 只有注册了处理器的 action（目前仅 workspace/open）走下面的分支；其他深链保持原有流程。
+    const handler = handlers.get(parsed.action);
+    if (handler) {
+        // 在等待处理器之前记录：ready 前到达的深链把建窗交给启动流程。
+        const arrivedAfterReady = app.isReady();
+        // 先记下请求再通知渲染进程：冷启动时窗口可能尚未创建，渲染进程收到通知时就能取到请求。
+        try {
+            await handler(parsed);
+        }
+        catch (error) {
+            console.warn('[DeepLink] Handler failed for action:', parsed.action, error);
+        }
+        // macOS 冷启动时 open-url 早于 ready：抢先创建会占住 createInitialWindow 的进行中标记，
+        // 让启动流程跳过建窗。但处理器（如慢盘上的目录检查）可能在启动流程建好窗口、渲染进程
+        // 已领取过之后才完成，这时仍要通知已有窗口。
+        if (!arrivedAfterReady) {
+            const startupWindow = getMainWindow();
+            if (startupWindow && !startupWindow.isDestroyed()) {
+                startupWindow.webContents.send(IPC_CHANNELS.DEEPLINK_RECEIVED, parsed);
+            }
+            return;
+        }
+    }
     // 确保窗口存在并聚焦
     let mainWindow = getMainWindow();
     if (!mainWindow) {
@@ -85,12 +112,7 @@ async function handleDeepLink(url) {
         // 通知渲染进程
         mainWindow.webContents.send(IPC_CHANNELS.DEEPLINK_RECEIVED, parsed);
     }
-    // 调用注册的处理器
-    const handler = handlers.get(parsed.action);
-    if (handler) {
-        handler(parsed);
-    }
-    else {
+    if (!handler) {
         // 默认处理：只聚焦窗口
         console.log('[DeepLink] No handler for action:', parsed.action);
     }
@@ -147,6 +169,7 @@ export function setupDeepLinkEventHandlers() {
     if (deepLinkEventHandlersInstalled)
         return;
     deepLinkEventHandlersInstalled = true;
+    setupWorkspaceOpen();
     app.on('second-instance', (_event, commandLine) => {
         const url = commandLine.find(isDeepLinkUrl);
         if (url) {

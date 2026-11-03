@@ -2,7 +2,7 @@
 
 This package is the desktop client of MiniMax Code: the Electron application
 whose shell, main process, renderer bundle and runtime resources were restored
-from the publicly distributed Windows build (`MiniMax Code` 3.1.6, Electron
+from the publicly distributed Windows build (`MiniMax Code` 3.1.10, Electron
 42.8.0). See [RESTORATION.md](./RESTORATION.md) for exactly what was recovered,
 how, and which parts are shipped as prebuilt artifacts.
 
@@ -38,6 +38,11 @@ pnpm package                        # build + electron-builder -> dist/installer
 `resources/`, `node_modules/`) and launches Electron against it. Set
 `MMX_USER_DATA_DIR` to run with an isolated profile so the instance does not
 collide with an installed client's single-instance lock.
+
+`pnpm build` also drops outputs left behind by a previous shipped build: tsc
+only emits the modules that still have a source, so a removed module would
+otherwise stay in `dist/main` (or `dist/model-menu`) and be packaged into the
+installer.
 
 `pnpm package` writes `dist/installers/win-unpacked/` and an NSIS installer.
 Native modules are shipped prebuilt for Electron 42 (extracted from the

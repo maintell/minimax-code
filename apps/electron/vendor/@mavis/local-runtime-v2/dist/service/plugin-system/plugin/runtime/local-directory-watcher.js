@@ -6,52 +6,64 @@ const DEFAULT_DEBOUNCE_MS = 150;
 const EVENT_DELIVERY_GRACE_MS = 20;
 const DEFAULT_ADMISSION_WAIT_TIMEOUT_MS = 20_000;
 /**
- * Coalesces external changes below `<dataDir>/plugins` into one runtime rebuild.
+ * Coalesces external changes below `<dataDir>/plugins` and every linked root
+ * into one runtime rebuild.
  * @internal Exported for focused watcher tests; owners use `createLocalPluginDirectoryWatcher`.
  */
 export class LocalPluginDirectoryWatcher {
-    root;
+    roots;
     onChange;
     debounceMs;
     admissionWaitTimeoutMs;
-    watcher;
+    watchers = new Map();
     timer;
     idle;
     requestedGeneration = 0;
     running = false;
+    started = false;
     closed = false;
-    constructor(root, onChange, debounceMs = DEFAULT_DEBOUNCE_MS, admissionWaitTimeoutMs = DEFAULT_ADMISSION_WAIT_TIMEOUT_MS) {
-        this.root = root;
+    constructor(roots, onChange, debounceMs = DEFAULT_DEBOUNCE_MS, admissionWaitTimeoutMs = DEFAULT_ADMISSION_WAIT_TIMEOUT_MS) {
+        this.roots = roots;
         this.onChange = onChange;
         this.debounceMs = debounceMs;
         this.admissionWaitTimeoutMs = admissionWaitTimeoutMs;
     }
     async start() {
-        if (this.watcher || this.closed)
+        if (this.started || this.closed)
             return;
+        this.started = true;
         try {
-            await mkdir(this.root, { recursive: true });
-            if (this.closed)
-                return;
-            this.watcher = this.createWatcher(this.root, () => this.markChanged());
+            await mkdir(this.roots.owned, { recursive: true });
         }
         catch {
             // Native watching is an optimization. Explicit Marketplace refresh and
             // mutation APIs remain available when the platform cannot create it.
-            return;
         }
-        // A watcher error must not surface as an uncaught EventEmitter error and
-        // terminate the Desktop process. Keep the last published snapshot; the
-        // explicit Marketplace refresh remains the recovery path.
-        this.watcher.on('error', () => {
-            this.watcher?.close();
-            this.watcher = undefined;
-            if (this.timer)
-                clearTimeout(this.timer);
-            this.timer = undefined;
-            if (!this.running)
-                this.settleIdle();
-        });
+        await this.refreshRoots();
+    }
+    async refreshRoots() {
+        if (!this.started || this.closed)
+            return;
+        let linked = [];
+        try {
+            linked = (await this.roots.linked?.()) ?? [];
+        }
+        catch {
+            // An unreadable link registry leaves only the owned root watched.
+        }
+        if (this.closed)
+            return;
+        const desired = new Set([this.roots.owned, ...linked]);
+        for (const [root, watcher] of this.watchers) {
+            if (desired.has(root))
+                continue;
+            watcher.close();
+            this.watchers.delete(root);
+        }
+        for (const root of desired) {
+            if (!this.watchers.has(root))
+                this.watchRoot(root);
+        }
     }
     createWatcher(root, onChange) {
         return watch(root, { persistent: false, recursive: true }, onChange);
@@ -70,13 +82,40 @@ export class LocalPluginDirectoryWatcher {
         if (this.closed)
             return;
         this.closed = true;
-        this.watcher?.close();
-        this.watcher = undefined;
+        for (const watcher of this.watchers.values())
+            watcher.close();
+        this.watchers.clear();
         if (this.timer)
             clearTimeout(this.timer);
         this.timer = undefined;
         if (!this.running)
             this.settleIdle();
+    }
+    watchRoot(root) {
+        let watcher;
+        try {
+            watcher = this.createWatcher(root, () => this.markChanged());
+        }
+        catch {
+            // A missing linked root is listed as unavailable; a later refresh retries.
+            return;
+        }
+        this.watchers.set(root, watcher);
+        // A watcher error must not surface as an uncaught EventEmitter error and
+        // terminate the Desktop process. Keep the last published snapshot and the
+        // other roots; the explicit Marketplace refresh remains the recovery path.
+        watcher.on('error', () => {
+            watcher.close();
+            if (this.watchers.get(root) === watcher)
+                this.watchers.delete(root);
+            if (this.watchers.size === 0) {
+                if (this.timer)
+                    clearTimeout(this.timer);
+                this.timer = undefined;
+                if (!this.running)
+                    this.settleIdle();
+            }
+        });
     }
     markChanged() {
         if (this.closed)
@@ -128,10 +167,13 @@ export class LocalPluginDirectoryWatcher {
         this.idle = undefined;
     }
 }
-/** Watches `<dataDir>/plugins` unless the owner supplies its own watcher (test seam). */
-export function createLocalPluginDirectoryWatcher(owner, onChange) {
+/**
+ * Watches `<dataDir>/plugins` and every linked root unless the owner supplies
+ * its own watcher (test seam).
+ */
+export function createLocalPluginDirectoryWatcher(owner, onChange, linked) {
     return owner.localDirectoryWatcherFactory
         ? owner.localDirectoryWatcherFactory(onChange)
-        : new LocalPluginDirectoryWatcher(path.join(owner.dataDir, 'plugins'), onChange);
+        : new LocalPluginDirectoryWatcher({ owned: path.join(owner.dataDir, 'plugins'), ...(linked ? { linked } : {}) }, onChange);
 }
 //# sourceMappingURL=local-directory-watcher.js.map

@@ -23,11 +23,15 @@ userActivated = true) {
     // Captured before any mutation below: was the page visible in the panel
     // right before this detach.
     const wasVisibleInPanel = tab.hiddenAt == null && tab.bounds.x >= 0 && tab.bounds.y >= 0;
+    const previousController = tab.controller;
+    const previousBounds = tab.bounds;
     const pluginId = miniApp?.pluginId;
     // Page request > memory > manifest declaration > wherever the tab last sat in the panel.
     const memory = pluginId ? readMiniAppWindowMemory(pluginId) : null;
     const { minWidth, minHeight } = resolveDetachedWindowMinSize(declaredWindow);
-    const window = host.detachedWindowFactory({
+    const window = (host.createWindow
+        ? (options) => host.createWindow(tab, options)
+        : host.detachedWindowFactory)({
         title: miniApp ? (miniApp.displayName ?? miniApp.pluginId) : tab.title,
         width: Math.max(minWidth, Math.round(initialSize?.width ?? memory?.width ?? declaredWindow?.width ?? initialPanelSize.width)),
         height: Math.max(minHeight, Math.round(initialSize?.height ?? memory?.height ?? declaredWindow?.height ?? initialPanelSize.height)),
@@ -83,12 +87,21 @@ userActivated = true) {
         if (tab.detachedWindow !== window || host.isAppQuitting())
             return;
         event.preventDefault();
-        attachDetachedTab(host, tab);
+        if (host.requestAttach)
+            host.requestAttach(tab);
+        else
+            attachDetachedTab(host, tab);
     });
     // Cmd/Ctrl+W inside the pop-out is equivalent to the close button: return
     // to the panel instead of falling through to the app menu's `role:
     // 'close'`. See BrowserController's before-input-event handler.
-    tab.controller.setOnRequestCloseDetached(() => attachDetachedTab(host, tab));
+    const requestAttach = () => {
+        if (host.requestAttach)
+            host.requestAttach(tab);
+        else
+            attachDetachedTab(host, tab);
+    };
+    tab.controller.setOnRequestCloseDetached(requestAttach);
     window.on('closed', () => {
         if (tab.detachedWindow !== window)
             return;
@@ -114,7 +127,11 @@ userActivated = true) {
         if (declaredWindow?.clickThrough)
             window.setIgnoreMouseEvents(true, { forward: true });
         tab.bounds = contentBounds();
-        tab.controller.attachToParent(window, tab.bounds);
+        if (host.transferPage)
+            await host.transferPage(tab, window, tab.bounds, signal);
+        else
+            tab.controller.attachToParent(window, tab.bounds);
+        tab.controller.setOnRequestCloseDetached(requestAttach);
         // BaseWindow transparency alone leaves the WebContentsView's own
         // background opaque; a `frame:false, transparent:true` Mini App needs
         // both cleared to an alpha-channel color.
@@ -122,7 +139,20 @@ userActivated = true) {
             tab.controller.setBackgroundColor('#00000000');
     }
     catch (error) {
-        attachDetachedTab(host, tab);
+        if (tab.backendSelection?.rendererBackend === 'webview') {
+            clearDetachedWindowState(tab);
+            if (tab.controller === previousController) {
+                tab.bounds = previousBounds;
+            }
+            else {
+                tab.bounds = OFFSCREEN_BOUNDS;
+                host.markTabHidden(tab);
+            }
+            if (!window.isDestroyed())
+                window.destroy();
+        }
+        else
+            attachDetachedTab(host, tab);
         throw error;
     }
     tab.hiddenAt = null;
@@ -142,10 +172,24 @@ userActivated = true) {
     tab.presentationRevision += 1;
 }
 /** Returns a detached page to the File Panel host, parked offscreen; a no-op when inline. */
-export function attachDetachedTab(host, tab) {
+export function attachDetachedTab(host, tab, signal) {
     const window = tab.detachedWindow;
     if (!window)
         return;
+    if (tab.backendSelection?.rendererBackend === 'webview' && host.transferPage) {
+        const target = host.getHostWindow();
+        if (!target)
+            return Promise.reject(new Error('BROWSER_WEBVIEW_HOST_UNAVAILABLE'));
+        return host.transferPage(tab, target, OFFSCREEN_BOUNDS, signal).then(() => {
+            tab.detachedWindowBoundsPersistence?.flush();
+            clearDetachedWindowState(tab);
+            tab.bounds = OFFSCREEN_BOUNDS;
+            tab.presentationRevision += 1;
+            host.markTabHidden(tab);
+            if (!window.isDestroyed())
+                window.destroy();
+        });
+    }
     // Final write before the window goes away: resize/move only persist on a
     // throttle, so a quick pop-out/attach could otherwise lose the latest bounds.
     tab.detachedWindowBoundsPersistence?.flush();

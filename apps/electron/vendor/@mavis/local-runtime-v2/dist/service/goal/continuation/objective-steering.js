@@ -1,8 +1,14 @@
 import { createHash } from 'node:crypto';
+/**
+ * The objective steer's pre-delivery withdrawal: its observed Turn or gates
+ * changed before delivery, and the Goal continuation takes the edit instead.
+ * Named `AbortError` so a withdrawn activation is projected as a cancelled
+ * pre-host Turn rather than a Session `turn-system` failure (WN5G6FPQ).
+ */
 export class ObjectiveSteeringTargetChangedError extends Error {
+    name = 'AbortError';
     constructor() {
         super('Thread Goal objective steering target changed before delivery.');
-        this.name = 'ObjectiveSteeringTargetChangedError';
     }
 }
 export function objectiveUpdateSteeringKey(goal) {

@@ -18,6 +18,7 @@ function createCore(options) {
         oauthClient: new HttpOAuthClient({ ...options.endpoints, fetchImpl: options.fetchImpl }),
         initialize: () => migrateLegacyAuthNamespace(namespace),
         onDiagnostic: options.onDiagnostic,
+        onRefreshDiagnostic: options.onRefreshDiagnostic,
     });
 }
 //# sourceMappingURL=factory.js.map

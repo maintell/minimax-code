@@ -80,6 +80,7 @@ const defaultConfig = {
     localLinkOpenDestination: 'embedded',
     fileLineWrapEnabled: true,
     fileOpenInNewTabEnabled: true,
+    fileOpenWithEnhancedEnabled: false,
     contextWindowUsageEnabled: true,
     uiBaseFontSize: DEFAULT_DESKTOP_TYPOGRAPHY.uiBaseFontSize,
     codeFontSize: DEFAULT_DESKTOP_TYPOGRAPHY.codeFontSize,
@@ -501,6 +502,8 @@ export function clearDesktopConfig() {
         plainTextEditorEnabled: current.plainTextEditorEnabled ?? true,
         activityGroupsExpandedByDefault: current.activityGroupsExpandedByDefault ?? defaultConfig.activityGroupsExpandedByDefault,
         fileOpenInNewTabEnabled: current.fileOpenInNewTabEnabled ?? defaultConfig.fileOpenInNewTabEnabled,
+        // Mirrors registry state that outlives the signed-in account.
+        fileOpenWithEnhancedEnabled: current.fileOpenWithEnhancedEnabled ?? defaultConfig.fileOpenWithEnhancedEnabled,
         globalAccessShortcut: current.globalAccessShortcut ?? defaultConfig.globalAccessShortcut,
         shortcutOverrides: current.shortcutOverrides ?? defaultConfig.shortcutOverrides,
         shortcutsEnabled: current.shortcutsEnabled ?? defaultConfig.shortcutsEnabled,
@@ -510,6 +513,9 @@ export function clearDesktopConfig() {
         scheduleNotification: current.scheduleNotification ?? defaultConfig.scheduleNotification,
         localRuntimeDataParentDir: current.localRuntimeDataParentDir,
         localRuntimePreviousDataParentDirs: current.localRuntimePreviousDataParentDirs,
+        // Sign-out must not end the post-relocation health check or drop its pending notice.
+        localRuntimeDataDirPendingVerification: current.localRuntimeDataDirPendingVerification,
+        localRuntimeDataDirRollbackNotice: current.localRuntimeDataDirRollbackNotice,
         developerOptions: current.developerOptions ?? defaultConfig.developerOptions,
         // Remote collection policy, not user data. Dropping it on sign-out would
         // silently re-open collection until Apollo is reachable again.

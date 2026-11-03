@@ -1,4 +1,15 @@
-export const OUTPUT_REVISION_PROMPT_KEY = 'desktop-task/output-revision/system.md';
+import { PromptSnapshotInvalidError } from '@mavis/agent-runtime';
+export async function readOutputRevisionInstruction(scope) {
+    if (!scope)
+        return DEFAULT_OUTPUT_REVISION_INSTRUCTION;
+    const result = await scope.source.read(scope.snapshot, OUTPUT_REVISION_PROMPT_KEY);
+    if (result.kind === 'found')
+        return result.content;
+    if (result.kind === 'missing')
+        return DEFAULT_OUTPUT_REVISION_INSTRUCTION;
+    throw new PromptSnapshotInvalidError(`Workflow prompt cannot be read: ${OUTPUT_REVISION_PROMPT_KEY}`);
+}
+const OUTPUT_REVISION_PROMPT_KEY = 'desktop-task/output-revision/system.md';
 export const RETRY_CONTINUATION_PROMPT_KEY = 'desktop-task/retry/continuation.md';
 export const DEFAULT_RETRY_CONTINUATION_PROMPT = [
     '<system-reminder>',

@@ -19,7 +19,7 @@ import { patchThreadGoal } from './store-patch.js';
 import { listThreadGoalsAwaitingUsageRecovery, resumeThreadGoalAfterUsageRecovery, } from './store-usage-recovery.js';
 import { recordThreadGoalVerification } from './store-verification.js';
 import { markGoalRequestDispatching, recordGoalRequestAttempts, recoverInterruptedGoalRequests, reserveGoalRequest, settleGoalRequest, } from '../accounting/request-ledger.js';
-import { countTurnGraceRequests } from '../accounting/request-projection.js';
+import { countTurnGraceRequests, listGoalRequestTurnIds, } from '../accounting/request-projection.js';
 import { chargeGoalTokenRequest, recoverInterruptedGoalTokenCharges, } from '../accounting/token-charges.js';
 import { newThreadGoalId, positiveOrNull, readGoalRow, rowsToThreadGoalStates, withGoalAccounting, } from './store-row.js';
 /** The dismissed Goal is not this Session's current completed Goal. */
@@ -108,6 +108,42 @@ export class DrizzleGoalStore {
             const result = tx
                 .update(goals)
                 .set({ status: input.status, statusReason: input.statusReason, updatedAtMs: nextEpoch })
+                .where(activeAtEpoch(goalId, expectedEpoch))
+                .run();
+            if (result.changes === 0)
+                return undefined;
+            return readGoalRow(tx, eq(goals.goalId, goalId));
+        });
+    }
+    /**
+     * Set some of the Goal's own limits from inside its running Goal Turn (a
+     * budget update the kickoff takes from the objective). Writes only at the
+     * exact active epoch and keeps that epoch: the running Turn still owns the
+     * Goal's next step, so the edit must not retire it. Returns `undefined` when
+     * the Goal moved on.
+     */
+    async setOwnLimitsAtEpoch(goalId, expectedEpoch, limits) {
+        const columns = {
+            ...(limits.tokenBudget !== undefined
+                ? { tokenBudget: positiveOrNull(limits.tokenBudget) }
+                : {}),
+            ...(limits.requestLimit !== undefined
+                ? { requestLimit: positiveOrNull(limits.requestLimit) }
+                : {}),
+            ...(limits.activeSecondsLimit !== undefined
+                ? { activeSecondsLimit: positiveOrNull(limits.activeSecondsLimit) }
+                : {}),
+        };
+        return this.write((tx) => {
+            if (Object.keys(columns).length === 0) {
+                const current = readGoalRow(tx, eq(goals.goalId, goalId));
+                return current?.status === 'active' && current.updatedAt === expectedEpoch
+                    ? current
+                    : undefined;
+            }
+            const result = tx
+                .update(goals)
+                .set(columns)
                 .where(activeAtEpoch(goalId, expectedEpoch))
                 .run();
             if (result.changes === 0)
@@ -329,6 +365,10 @@ export class DrizzleGoalStore {
     }
     countTurnGraceRequests(turnId) {
         return countTurnGraceRequests(this.db, turnId);
+    }
+    /** Turns that sent a request for this Goal (durable Goal Turn membership). */
+    listGoalTurnIds(goalId) {
+        return listGoalRequestTurnIds(this.db, goalId);
     }
     write(mutation) {
         return runWithWriteLock(this.db, mutation);

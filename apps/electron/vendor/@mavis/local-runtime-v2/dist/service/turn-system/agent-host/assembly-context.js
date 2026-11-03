@@ -21,6 +21,7 @@ const AGENT_CONFIG_ALLOWLIST = [
     'builtinCapabilities',
     'computerUseActive',
     'desktopPluginSkills',
+    'ptc_enabled',
     'capability_ceiling',
     'agent_profile',
 ];

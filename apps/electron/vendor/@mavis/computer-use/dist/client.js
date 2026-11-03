@@ -5,7 +5,7 @@ import { createCuaDriverRuntime, CuaLocalAbortError, } from './cua-driver-runtim
 import { createCuaStructuredLogger } from './cua-logging.js';
 import { callCuaToolWithDeliveryMode, mapRequestToCuaTool, normalizeCuaResult } from './mapping.js';
 import { observeLaunchedWindows } from './cua-launch-observation.js';
-import { startOwnedDaemon, requestComponentPermissions } from './daemon.js';
+import { startOwnedDaemon, stopOrphanDaemon, requestComponentPermissions, } from './daemon.js';
 import { acquireDesktopLock, desktopLockRoot } from './desktop-lock.js';
 import { ComputerUseError, record, structured, } from './contracts.js';
 /** Call only after Runtime checks plugin, Skill, explicit selection and tool policy. */
@@ -26,6 +26,8 @@ export function createComputerUseClient(options) {
     let operation;
     let cleaning;
     let generation = 0;
+    // Set after reclaiming a lock from an exited owner whose last native action is unknown.
+    let observationRequired = false;
     let admissionRevision = 0;
     const endedTurns = new Set();
     // No eviction: dropping an accepted ID would turn a later replay into a new input.
@@ -271,11 +273,36 @@ export function createComputerUseClient(options) {
         });
         return cleaning;
     }
+    async function acquireLock(request) {
+        const context = { sessionId: request.sessionId, turnId: request.turnId };
+        let lock;
+        try {
+            lock = await acquireDesktopLock(desktopLockRoot(), options.ownerId, { stopOrphanDaemon });
+        }
+        catch (error) {
+            if (error instanceof ComputerUseError && error.code === 'computer_busy')
+                logger.warn('lease_busy', { ...context, errorCode: error.code, reason: error.message });
+            throw error;
+        }
+        if (lock.recovered) {
+            // The previous owner's interrupted action is never replayed; the desktop must be re-read.
+            observationRequired = true;
+            observedSessions.clear();
+            logger.warn('lease_recover', {
+                ...context,
+                previousOwnerId: lock.recovered.ownerId,
+                previousPid: lock.recovered.pid,
+                heldMs: lock.recovered.heldMs,
+                daemonStopped: lock.recovered.daemonStopped,
+            });
+        }
+        return lock;
+    }
     async function call(request, signal) {
         open();
         if (!request.sessionId.trim() ||
             endedTurns.has(JSON.stringify([request.sessionId, request.turnId]))) {
-            throw new ComputerUseError('computer_aborted', 'This control session/turn has been released.');
+            throw new ComputerUseError('computer_aborted', 'Computer Use was stopped for this turn. Do not call computer_* tools again in this turn; tell the user what was done and what remains.');
         }
         signal?.throwIfAborted();
         if (!operation && !cleaning && lease?.released) {
@@ -317,9 +344,10 @@ export function createComputerUseClient(options) {
         requestSignal.addEventListener('abort', abort, { once: true });
         const work = (async () => {
             try {
-                active.lock ??= await acquireDesktopLock(desktopLockRoot(), options.ownerId);
+                active.lock ??= await acquireLock(request);
                 requestSignal.throwIfAborted();
                 await prepareRuntime();
+                await active.lock.recordDaemon(daemon && { pid: daemon.pid, endpoint: daemon.endpoint });
                 envelope = { ...envelope, generation };
                 requestSignal.throwIfAborted();
                 if (revision !== admissionRevision)
@@ -328,7 +356,7 @@ export function createComputerUseClient(options) {
                 if (!status.granted)
                     throw new ComputerUseError(status.code ?? 'computer_permission_required', status.message ??
                         'Grant system permissions to the standalone MiniMax Computer Use App.');
-                if (generation > 1 &&
+                if ((generation > 1 || observationRequired) &&
                     !isObservation(request.kind) &&
                     !observedSessions.has(request.sessionId))
                     throw new ComputerUseError('computer_observation_required', 'The Computer Use connection was restored. Inspect the desktop or exact window again before sending input; prior actions were not replayed.');

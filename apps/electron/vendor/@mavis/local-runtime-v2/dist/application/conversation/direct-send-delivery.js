@@ -92,7 +92,7 @@ export class DirectSendDeliveryService {
     async openComposerSteerSend(input, reservation) {
         const workspaceGate = this.options.workspaceGate;
         const idempotencyKey = input.requestedTurnId ?? `composer-steer:${randomUUID()}`;
-        const result = await this.options.turns.steer({
+        const request = {
             sessionId: input.sessionId,
             input: input.input,
             provenance: input.provenance,
@@ -122,29 +122,11 @@ export class DirectSendDeliveryService {
                     }
                 },
             },
-        });
-        if (!result.delivered) {
-            reservation.discardIfEmpty();
-            return { accepted: false, reason: result.reason };
-        }
-        if (result.mode === 'duplicate') {
-            reservation.discardIfEmpty();
-            return { accepted: false, reason: 'duplicate', turnId: result.turnId };
-        }
-        if (result.mode === 'activated') {
-            observeCompletion(result.completion, reservation.complete);
-            return {
-                accepted: true,
-                turnId: result.turnId,
-                completion: result.completion,
-                frames: reservation.source,
-            };
-        }
-        return {
-            accepted: true,
-            turnId: result.turnId,
-            frames: completeOnTurnTerminal(reservation),
         };
+        const result = await (input.recordUndelivered === false
+            ? this.options.turns.deliverSideMessage(request, { recordUndelivered: false })
+            : this.options.turns.deliverSideMessage(request));
+        return composerSideMessageResult(input.sessionId, reservation, result);
     }
     async openPausedQueueSend(input, reservation) {
         const workspaceGate = this.options.workspaceGate;
@@ -228,6 +210,49 @@ export class DirectSendDeliveryService {
             this.pendingQueuePauseCleanups.delete(cleanupKey);
         }
     }
+}
+function composerSideMessageResult(sessionId, reservation, result) {
+    if (result.status === 'delivered') {
+        const delivered = result.result;
+        if (delivered.mode === 'duplicate') {
+            reservation.discardIfEmpty();
+            return { accepted: true, outcome: 'duplicate', sessionId, turnId: delivered.turnId };
+        }
+        if (delivered.mode === 'activated') {
+            observeCompletion(delivered.completion, reservation.complete);
+            return {
+                accepted: true,
+                turnId: delivered.turnId,
+                completion: delivered.completion,
+                frames: reservation.source,
+            };
+        }
+        return {
+            accepted: true,
+            turnId: delivered.turnId,
+            frames: completeOnTurnTerminal(reservation),
+        };
+    }
+    reservation.discardIfEmpty();
+    if (result.status === 'queued') {
+        // The queued Turn reports through the Session stream; this request only acknowledges it.
+        return {
+            accepted: true,
+            outcome: 'queued',
+            sessionId,
+            turnId: result.turnId,
+            race: result.race,
+            queue: result.queue,
+        };
+    }
+    if (result.status === 'rejected')
+        return { accepted: false, reason: result.reason };
+    return {
+        accepted: false,
+        reason: 'side-message-undelivered',
+        race: result.race,
+        ...(result.record ? { undelivered: result.record } : {}),
+    };
 }
 async function continueQueueAfterDeliveredSteer(queue, sessionId, expectedPause) {
     if (!expectedPause)

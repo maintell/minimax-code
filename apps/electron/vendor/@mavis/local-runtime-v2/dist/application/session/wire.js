@@ -144,6 +144,7 @@ export function toSessionTreeChildView(session) {
         compressed: session.archived,
         status: toSessionStatusInfoView(session),
         sessionKind: SESSION_KIND_TO_DESKTOP[session.sessionKind],
+        ...(session.purpose ? { purpose: session.purpose } : {}),
     };
 }
 function toSessionStatusInfoView(session) {

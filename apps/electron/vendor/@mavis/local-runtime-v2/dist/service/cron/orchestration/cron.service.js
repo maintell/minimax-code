@@ -187,6 +187,30 @@ class SchedulerBackedCronService {
             ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
         };
     }
+    listSessionWakes(sessionId) {
+        const wakes = [];
+        let before;
+        do {
+            const page = this.deps.definitions.listPage({ sessionId, before, take: 100 });
+            for (const definition of page) {
+                // Scheduler triggers persist their pending Run synchronously (acceptScheduledTrigger),
+                // so a pending Run row is the complete "owed delivery" fact.
+                if (this.deps.runs.hasPendingForCronId(definition.cronId)) {
+                    wakes.push({ cronId: definition.cronId, kind: 'run' });
+                }
+                const job = this.deps.scheduler.inspect(definition.schedulerId);
+                if (job?.state === 'active' && job.nextRunAtMs !== undefined) {
+                    wakes.push({ cronId: definition.cronId, kind: 'schedule', nextRunAtMs: job.nextRunAtMs });
+                }
+            }
+            const last = page.at(-1);
+            before =
+                page.length === 100 && last
+                    ? { createdAtMs: last.createdAtMs, cronId: last.cronId }
+                    : undefined;
+        } while (before);
+        return wakes;
+    }
     toDefinitionView(definition) {
         const job = requireSchedulerJob(this.deps.scheduler.inspect(definition.schedulerId));
         return this.composeView(definition, job);

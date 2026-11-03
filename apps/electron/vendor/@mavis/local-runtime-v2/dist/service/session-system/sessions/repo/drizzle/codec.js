@@ -100,6 +100,7 @@ export function sessionExtraDataFromRecord(record) {
         titleSource: record.titleSource,
         runLocation: record.runLocation,
         appMode: record.sessionType === 'branch' ? record.appMode : undefined,
+        toolCallMode: record.toolCallMode,
         interactionMode: record.interactionMode,
         memoryPolicy: record.memoryPolicy,
         errorSource: record.errorSource,
@@ -157,8 +158,16 @@ export function parseSessionExtraData(raw) {
         sessionDataVersion: readOptionalSafeInteger(record, 'sessionDataVersion', 'extra_data_json'),
         sessionOrigin: readOptionalEnum(record, 'sessionOrigin', ['local-runtime', 'legacy-opencode', 'unknown'], 'extra_data_json'),
         miniAppOrigin: readMiniAppOrigin(record.miniAppOrigin),
+        toolCallMode: readToolCallMode(record.toolCallMode),
         createdBySessionId: readOptionalString(record, 'createdBySessionId', 'extra_data_json'),
     });
+}
+/**
+ * Lenient like the Mini App origin: a value this build does not know (written by a newer
+ * client) reads as absent, i.e. `native`, instead of making the whole Session undecodable.
+ */
+function readToolCallMode(value) {
+    return value === 'native' || value === 'ptc' ? value : undefined;
 }
 /** Lenient: an unrecognized origin shape means "not a Mini App session", never a decode failure. */
 function readMiniAppOrigin(value) {

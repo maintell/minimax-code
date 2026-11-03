@@ -43,6 +43,15 @@ export function projectStep(message, toolResults, state, policies, maxBytes, ver
                 ...(trustedToolProvenance ? { trustedToolProvenance } : {}),
             };
             const progressProjection = projectProgressBestEffort(configuredPolicy, toolStep);
+            if (toolStep.result) {
+                projectChildSteps(configuredPolicy, toolStep, policies, state, maxBytes, {
+                    detectActionKeys,
+                    pollingActionKeys,
+                    detectResultKeys,
+                    errorFamilyKeys,
+                    remindableErrorFamilyKeys,
+                });
+            }
             const pollingControl = policy === 'polling' ? progressProjection?.polling : undefined;
             appendPollingControl(progress, pollingControl, progressProjection, block.name, state, maxBytes);
             if (!pollingControl)
@@ -146,6 +155,130 @@ export function projectStep(message, toolResults, state, policies, maxBytes, ver
             ? fingerprint(state.secret, `action-batch\u0000${detectActionKeys.join('\u0000')}`)
             : undefined,
     };
+}
+/**
+ * A program's child calls are invisible as top-level calls, and a failed child
+ * does not fail run_code, so they are projected as calls of the same step
+ * under their own policies. Identical keys from one program count once: an
+ * ordinary loop inside a program (one read per file, waiting on a task) is not
+ * a repeat, while the same call in consecutive programs accumulates exactly
+ * like consecutive steps.
+ */
+function projectChildSteps(policy, step, policies, state, maxBytes, sinks) {
+    const children = childStepsBestEffort(policy, step);
+    state.childStepsProjected += children.length;
+    const detectActions = new Set();
+    const pollingActions = new Set();
+    const detectResults = new Set();
+    const errorFamilies = new Set();
+    for (const child of children) {
+        const childPolicy = policies.get(child.toolName);
+        const kind = childPolicy?.kind ?? 'detect';
+        if (kind === 'exempt')
+            continue;
+        const keys = childActionKeys(child, childPolicy, kind, state, maxBytes);
+        if (keys) {
+            (kind === 'polling' ? pollingActions : detectActions).add(keys.actionKey);
+            if (keys.resultKey)
+                detectResults.add(keys.resultKey);
+        }
+        const familyKey = childErrorFamilyKey(child, childPolicy, keys?.actionKey, state, maxBytes);
+        if (!familyKey)
+            continue;
+        errorFamilies.add(familyKey);
+        if (kind === 'detect')
+            sinks.remindableErrorFamilyKeys.add(familyKey);
+    }
+    sinks.detectActionKeys.push(...detectActions);
+    sinks.pollingActionKeys.push(...pollingActions);
+    sinks.detectResultKeys.push(...detectResults);
+    sinks.errorFamilyKeys.push(...errorFamilies);
+}
+/**
+ * The parent keeps arguments for only a few tools; a child without them is
+ * indistinguishable from any other call of the same tool, so it gets no action
+ * or result identity rather than a false "same arguments" repeat.
+ */
+function childActionKeys(child, policy, kind, state, maxBytes) {
+    if (child.arguments === undefined)
+        return undefined;
+    const actionValue = projectActionKeyBestEffort(policy, child.arguments);
+    const actionKey = fingerprintWithinBudget(state.secret, { toolName: child.toolName, actionKey: actionValue }, maxBytes);
+    if (!actionKey) {
+        state.fingerprintSkippedCount += 1;
+        return undefined;
+    }
+    if (kind !== 'detect')
+        return { actionKey };
+    // A child record has no result content, so the result identity is the
+    // action plus its outcome; otherwise every successful child would match.
+    const resultKey = fingerprintWithinBudget(state.secret, {
+        toolName: child.toolName,
+        childResult: {
+            actionKey: actionValue,
+            isError: child.isError,
+            errorCode: child.toolErrorCode ?? child.errorCode ?? null,
+        },
+    }, maxBytes);
+    if (!resultKey)
+        state.fingerprintSkippedCount += 1;
+    return resultKey ? { actionKey, resultKey } : { actionKey };
+}
+/**
+ * A child with kept arguments uses the native key (tool, code, action), so a
+ * model probing different paths one by one is not flagged while the same
+ * failing call still is. Without arguments only a code the tool itself
+ * reported can tell "different tools hitting the same error" (several
+ * computer_* tools stopped the same way), so it groups failures across tools;
+ * the parent's generic code only groups failures of one tool. A tool with an
+ * expected-failure rule (search no-match) never starts an error streak from a
+ * child: that rule needs the result text, which a child record lacks.
+ */
+function childErrorFamilyKey(child, policy, actionKey, state, maxBytes) {
+    if (!child.isError || policy?.isExpectedResult)
+        return undefined;
+    const toolErrorCode = boundedErrorCode(child.toolErrorCode);
+    const errorCode = boundedErrorCode(child.errorCode);
+    let family;
+    if (child.arguments !== undefined) {
+        const code = toolErrorCode ?? errorCode;
+        // An unfingerprintable action was already counted as skipped.
+        if (!code || !actionKey)
+            return undefined;
+        family = { family: `${child.toolName}\u0000code:${code}`, actionKey };
+    }
+    else if (toolErrorCode)
+        family = { childToolErrorCode: toolErrorCode };
+    else if (errorCode)
+        family = { childToolName: child.toolName, childErrorCode: errorCode };
+    if (!family)
+        return undefined;
+    const key = fingerprintWithinBudget(state.secret, family, maxBytes);
+    if (!key)
+        state.fingerprintSkippedCount += 1;
+    return key;
+}
+function boundedErrorCode(value) {
+    return value !== undefined && value.length > 0 && value.length <= 128 ? value : undefined;
+}
+function childStepsBestEffort(policy, step) {
+    if (!policy?.projectChildSteps)
+        return [];
+    try {
+        const children = policy.projectChildSteps(step);
+        return Array.isArray(children) ? children.filter(validChildStep) : [];
+    }
+    catch {
+        return [];
+    }
+}
+function validChildStep(value) {
+    return (isRecord(value) &&
+        typeof value.toolName === 'string' &&
+        value.toolName.length > 0 &&
+        typeof value.isError === 'boolean' &&
+        (value.errorCode === undefined || typeof value.errorCode === 'string') &&
+        (value.toolErrorCode === undefined || typeof value.toolErrorCode === 'string'));
 }
 function appendPollingControl(progress, control, projection, toolName, state, maxBytes) {
     if (control?.mode !== 'reset' || !projection)

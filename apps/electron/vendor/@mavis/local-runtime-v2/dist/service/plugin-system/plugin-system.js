@@ -1,18 +1,23 @@
+import { LOCAL_PLUGIN_MARKETPLACE } from '@mavis/shared';
 import { PluginSystemError } from './errors.js';
 import { PluginSystemMetrics } from './metrics.js';
 import { PluginCapabilityGenerationRegistry } from './mcp/generation-registry.js';
 import { PluginMcpRuntime } from './mcp/runtime.js';
 import { PluginMiniAppPublicationController } from './plugin/runtime/miniapp/controller.js';
 import { prepareMiniAppTurn } from './plugin/runtime/miniapp/turn-preparation.js';
-import { deferred, assertOfficialMutationScope, assertPluginNameAvailable, revokeOfficialPluginSelection, assertPluginSystemPublicationAttached, capturePluginSystemTurnCapabilities, findLocalPlugin, ignoreFailure, normalizedPluginName, runAfter, scopeKey, resolvePluginRepositoryScope, settleInBackground, waitForScopedOperation, } from './plugin-system-helpers.js';
+import { deferred, assertOfficialMutationScope, revokeOfficialPluginSelection, assertPluginSystemPublicationAttached, capturePluginSystemTurnCapabilities, ignoreFailure, runAfter, scopeKey, resolvePluginRepositoryScope, settleInBackground, waitForScopedOperation, } from './plugin-system-helpers.js';
+import { LocalPluginLifecycle } from './plugin/local/local-plugin-lifecycle.js';
 import { createLocalPluginDirectoryWatcher, } from './plugin/runtime/local-directory-watcher.js';
 import { MarketplacePreviewCache, PluginMarketplacePreview, } from './plugin/runtime/marketplace-preview.js';
 import { decidePreparedOfficialSync, handleIncompleteOfficialSync, OfficialPluginRecovery, prepareOfficialFullState, prepareOfficialMutation, waitForOfficialPublication, } from './plugin/runtime/official-operations.js';
-import { buildCustomOnlySnapshot, localSnapshotInventory, readPluginSnapshotInputs, removedPluginHookNames, } from './plugin/runtime/snapshot-inputs.js';
-import { PluginPackageStorage, } from './plugin/runtime/package-storage.js';
+import { buildCustomOnlySnapshot, deactivatedPluginNames, localSnapshotInventory, readOfficialPluginInstallations, readPluginSnapshotInputs, } from './plugin/runtime/snapshot-inputs.js';
+import { PluginPackageStorage } from './plugin/runtime/package-storage.js';
 import { materializeOfficialPluginArchive, } from './plugin/package/archive-cache.js';
 import { PluginSnapshotBuilder, EMPTY_PLUGIN_SNAPSHOT, withPluginMcpRuntime, withPluginSnapshotRevision, } from './plugin/runtime/snapshot-builder.js';
 import { assertPluginPublicationFence, completePluginPublication, commitPreparedPluginPublication, isPublicationSuperseded, officialPublicationOptions, preparePluginPublication, recoverDestructivePluginPublication, throwRecoveredDestructivePublicationFailure, preparedPluginPublicationFinalizer, PluginMcpDiscoveryScheduler, rollbackPreparedPluginPublication, sameLocalPluginProjection, } from './publication.js';
+function toSelector(selector) {
+    return typeof selector === 'string' ? { name: selector } : selector;
+}
 export class PluginSystem {
     options;
     builder;
@@ -54,6 +59,7 @@ export class PluginSystem {
     metrics;
     packageStorage;
     localDirectoryWatcher;
+    local;
     constructor(options) {
         this.options = options;
         this.builder = new PluginSnapshotBuilder(options.mcpNames, {
@@ -106,7 +112,27 @@ export class PluginSystem {
             requestCachedRebuild: () => this.scheduleCachedRebuild(),
             officialReconciler: options.officialReconciler,
         });
-        this.localDirectoryWatcher = createLocalPluginDirectoryWatcher(options, () => this.publishExternalLocalPluginChanges());
+        this.localDirectoryWatcher = createLocalPluginDirectoryWatcher(options, () => this.publishExternalLocalPluginChanges(), () => this.packageStorage.listLinkedRoots());
+        this.local = new LocalPluginLifecycle({
+            dataDir: options.dataDir,
+            repository: options.repository,
+            packageStorage: this.packageStorage,
+            admit: async () => {
+                await this.initialization.promise;
+                this.assertUsable();
+            },
+            runExclusive: (operation) => this.runExclusive(operation),
+            readInputs: () => this.readSnapshotBuildInputs(this.readScope(), false, {}),
+            project: (inputs) => this.marketplacePreview.buildFromInputs(inputs),
+            buildPublication: (inputs, buildOptions) => this.miniAppPublication.buildPublicationSnapshot(inputs, buildOptions),
+            publish: (next, publicationOptions) => this.miniAppPublication.prepareSnapshotPublication(next, publicationOptions),
+            readProjection: () => this.refreshLocalPluginsForMarketplace({ reuseCached: true }),
+            recordMutation: () => {
+                this.localStateRevision += 1;
+                this.marketplacePreview.invalidate();
+            },
+            linksChanged: () => settleInBackground(this.localDirectoryWatcher.refreshRoots?.() ?? Promise.resolve()),
+        });
         this.mcpRuntime = options.mcpRuntime ?? new PluginMcpRuntime();
         this.capabilityGenerations = new PluginCapabilityGenerationRegistry(this.snapshot.revision, this.mcpRuntime);
         this.officialRecovery = new OfficialPluginRecovery({
@@ -130,6 +156,10 @@ export class PluginSystem {
     }
     get currentSnapshot() {
         return this.snapshot;
+    }
+    /** Install surface for packages that do not come from the official Registry. */
+    get localInstaller() {
+        return this.local;
     }
     attachPublicationPort(port) {
         if (this.publicationPort)
@@ -220,7 +250,11 @@ export class PluginSystem {
     async revokeOfficialSelection(pluginName, scope, reason) {
         this.assertUsable();
         assertOfficialMutationScope(scope, this.desiredScopeKey, this.readScope());
-        await this.options.onOfficialPluginRevoked?.({ pluginName, scope, ...(reason ? { reason } : {}) });
+        await this.options.onOfficialPluginRevoked?.({
+            pluginName,
+            scope,
+            ...(reason ? { reason } : {}),
+        });
     }
     requestOfficialRecovery(expectedScope) {
         if (this.disposed ||
@@ -260,9 +294,6 @@ export class PluginSystem {
                 await this.miniAppPublication.prepareSnapshotPublication(next, officialPublicationOptions(prepared, completion, () => new PluginSystemError('SCOPE_CHANGED', 'official Plugin identity changed')));
                 this.officialStateRevision += 1;
                 this.marketplacePreview.invalidate();
-                if (!mutation.installExists || !mutation.enabled) {
-                    this.options.onPluginDeactivated?.(mutation.pluginName);
-                }
             }
             catch (error) {
                 await prepared?.abort();
@@ -273,14 +304,7 @@ export class PluginSystem {
     async listOfficialPluginInstallations() {
         await this.initialization.promise;
         const scope = this.captureOfficialScope();
-        if (!scope)
-            return [];
-        try {
-            return this.options.repository.loadOfficialState(scope)?.installations ?? [];
-        }
-        catch {
-            return [];
-        }
+        return readOfficialPluginInstallations(this.options.repository, scope);
     }
     async listOfficialPluginStates() {
         return this.packageStorage.readInstalledOfficialPluginStates(await this.listOfficialPluginInstallations());
@@ -292,70 +316,12 @@ export class PluginSystem {
             cacheRoot: this.options.officialCacheRoot,
         });
     }
-    async setLocalPluginEnabled(pluginName, enabled) {
-        await this.initialization.promise;
-        this.assertUsable();
-        return this.runExclusive(async () => {
-            const inputs = await this.readSnapshotBuildInputs(this.readScope(), false, {});
-            const discovered = this.marketplacePreview.buildFromInputs(inputs);
-            const target = findLocalPlugin(discovered, pluginName);
-            if (!target) {
-                throw new PluginSystemError('PLUGIN_NOT_FOUND', 'local Plugin is not installed');
-            }
-            const priorEnabled = this.options.repository.isLocalPluginEnabled(target.rootPath);
-            const completion = deferred();
-            const next = this.miniAppPublication.buildPublicationSnapshot(inputs, {
-                localEnabledOverrides: new Map([[target.rootPath, enabled]]),
-            });
-            await this.miniAppPublication.prepareSnapshotPublication(next, {
-                completion,
-                commit: async () => this.options.repository.setLocalPluginEnabled(target.rootPath, enabled),
-                rollback: async () => this.options.repository.setLocalPluginEnabled(target.rootPath, priorEnabled),
-            });
-            this.localStateRevision += 1;
-            if (!enabled)
-                this.options.onPluginDeactivated?.(target.name);
-            this.marketplacePreview.invalidate();
-            return { installExists: true, enabled };
-        });
+    /** A bare string is a Plugin name without a marketplace. */
+    setLocalPluginEnabled(selector, enabled) {
+        return this.local.setEnabled(toSelector(selector), enabled);
     }
-    async uninstallLocalPlugin(pluginName) {
-        await this.initialization.promise;
-        this.assertUsable();
-        return this.runExclusive(async () => {
-            const inputs = await this.readSnapshotBuildInputs(this.readScope(), false, {});
-            const discovered = this.marketplacePreview.buildFromInputs(inputs);
-            const target = findLocalPlugin(discovered, pluginName);
-            if (!target)
-                return { installExists: false, enabled: false };
-            const rootPath = target.rootPath;
-            const priorEnabled = this.options.repository.isLocalPluginEnabled(rootPath);
-            const completion = deferred();
-            const next = this.miniAppPublication.buildPublicationSnapshot(inputs, {
-                excludedLocalRoots: new Set([rootPath]),
-            });
-            let staged;
-            await this.miniAppPublication.prepareSnapshotPublication(next, {
-                completion,
-                commit: async () => {
-                    staged = await this.packageStorage.stageAcceptedLocalRoot(rootPath);
-                    this.options.repository.setLocalPluginEnabled(rootPath, true);
-                },
-                rollback: async () => {
-                    try {
-                        this.options.repository.setLocalPluginEnabled(rootPath, priorEnabled);
-                    }
-                    finally {
-                        await staged?.restore();
-                    }
-                },
-                finalize: async () => staged?.discard(),
-            });
-            this.localStateRevision += 1;
-            this.options.onPluginDeactivated?.(target.name);
-            this.marketplacePreview.invalidate();
-            return { installExists: false, enabled: false };
-        });
+    uninstallLocalPlugin(selector) {
+        return this.local.uninstallLocal(toSelector(selector));
     }
     async importGithubPlugin(source) {
         await this.initialization.promise;
@@ -364,43 +330,14 @@ export class PluginSystem {
             throw new PluginSystemError('PLUGIN_IMPORT_UNAVAILABLE', 'GitHub Plugin import is unavailable');
         }
         const prepared = await this.options.githubImporter.prepare(source);
-        try {
-            if (!prepared.canImport) {
-                throw new PluginSystemError('PLUGIN_NO_SUPPORTED_CAPABILITY', 'Plugin contains no valid Skill, MCP, or Hook capability');
-            }
-            return await this.runExclusive(async () => {
-                const officialInstallations = await this.listOfficialPluginInstallations();
-                const currentInputs = await this.readSnapshotBuildInputs(this.readScope(), false, {});
-                const current = this.marketplacePreview.buildFromInputs(currentInputs);
-                const key = normalizedPluginName(prepared.plugin.name);
-                assertPluginNameAvailable(prepared.plugin.name, officialInstallations, current);
-                const accepted = await this.packageStorage.acceptImportedLocalRoot(prepared.stagingRoot, prepared.plugin.name);
-                try {
-                    const nextInputs = await this.readSnapshotBuildInputs(this.readScope(), false, {});
-                    const imported = nextInputs.localPackages.find((item) => normalizedPluginName(item.plugin.name) === key)?.plugin;
-                    if (!imported) {
-                        throw new PluginSystemError('PLUGIN_IMPORT_INVALID', 'Imported Plugin was not readable');
-                    }
-                    const completion = deferred();
-                    const next = this.miniAppPublication.buildPublicationSnapshot(nextInputs, {});
-                    await this.miniAppPublication.prepareSnapshotPublication(next, {
-                        completion,
-                        commit: async () => this.options.repository.setLocalPluginEnabled(accepted.rootPath, true),
-                        rollback: accepted.restore,
-                    });
-                    this.localStateRevision += 1;
-                    this.marketplacePreview.invalidate();
-                    return imported;
-                }
-                catch (error) {
-                    await ignoreFailure(accepted.restore());
-                    throw error;
-                }
-            });
-        }
-        finally {
+        if (!prepared.canImport) {
             await prepared.discard();
+            throw new PluginSystemError('PLUGIN_NO_SUPPORTED_CAPABILITY', 'Plugin contains no valid App, Skill, MCP, Hook, Agent, or Mini App capability');
         }
+        const accepted = await this.local.acceptPreparedPackage(prepared, {
+            id: { name: prepared.plugin.name, marketplace: LOCAL_PLUGIN_MARKETPLACE },
+        });
+        return accepted.plugin;
     }
     async dispose() {
         if (this.disposed)
@@ -511,11 +448,7 @@ export class PluginSystem {
                 }
                 this.localStateRevision += 1;
                 const completion = deferred();
-                const removedHookPlugins = removedPluginHookNames(this.snapshot, next);
                 await this.miniAppPublication.prepareSnapshotPublication(next, { completion });
-                for (const pluginName of removedHookPlugins) {
-                    this.options.onPluginDeactivated?.(pluginName);
-                }
             });
         }
         catch {
@@ -729,10 +662,7 @@ export class PluginSystem {
         if (inventory)
             nextRuntime.importInventory?.(inventory);
         this.mcpRuntime = nextRuntime;
-        this.snapshot = next;
-        if (!this.disposed)
-            this.options.onCapabilitiesChanged?.(this.snapshot.turnCapabilities);
-        this.desiredSnapshot = next;
+        this.replaceSnapshot(next);
         this.capabilityGenerations.replace(next.revision, nextRuntime);
         this.metrics.snapshot(next);
     }
@@ -824,10 +754,7 @@ export class PluginSystem {
                 }, recovery, recovery.preparedRuntime),
                 adoptOwnerFailure: (snapshot) => {
                     const adopted = this.adoptPublishedSnapshot(snapshot, this.snapshot);
-                    this.snapshot = adopted;
-                    if (!this.disposed)
-                        this.options.onCapabilitiesChanged?.(this.snapshot.turnCapabilities);
-                    this.desiredSnapshot = adopted;
+                    this.replaceSnapshot(adopted);
                     this.capabilityGenerations.replaceRevision(adopted.revision);
                     settleInBackground(this.capabilityGenerations.adoptManagedServers(adopted.mcpServers));
                 },
@@ -846,10 +773,7 @@ export class PluginSystem {
         assertPluginPublicationFence(pending.scopeKey, this.desiredScopeKey);
         this.mcpRuntime = preparedRuntime;
         const published = this.adoptPublishedSnapshot(prepared.snapshot);
-        this.snapshot = published;
-        if (!this.disposed)
-            this.options.onCapabilitiesChanged?.(this.snapshot.turnCapabilities);
-        this.desiredSnapshot = published;
+        this.replaceSnapshot(published);
         this.capabilityGenerations.replace(published.revision, preparedRuntime, preparedPluginPublicationFinalizer(prepared));
         await this.capabilityGenerations.adoptManagedServers(published.mcpServers);
         pending.completion?.resolve();
@@ -868,16 +792,28 @@ export class PluginSystem {
         if (reservations)
             this.snapshotReservations.set(published, reservations);
         const adopted = this.adoptPublishedSnapshot(published, prepared.snapshot);
-        this.snapshot = adopted;
-        if (!this.disposed)
-            this.options.onCapabilitiesChanged?.(this.snapshot.turnCapabilities);
-        this.desiredSnapshot = adopted;
+        this.replaceSnapshot(adopted);
         this.capabilityGenerations.replaceRevision(adopted.revision);
         await this.capabilityGenerations.adoptManagedServers(adopted.mcpServers);
         pending.completion?.resolve();
         const finalize = preparedPluginPublicationFinalizer(prepared);
         if (finalize)
             settleInBackground(ignoreFailure(finalize()));
+    }
+    /**
+     * Makes `next` the published snapshot. Effective Plugins that lose their
+     * manifest name are deactivated before capabilities are announced, so a
+     * same-name copy that never loaded cannot stop the effective one.
+     */
+    replaceSnapshot(next) {
+        const previous = this.snapshot;
+        this.snapshot = next;
+        this.desiredSnapshot = next;
+        for (const pluginName of deactivatedPluginNames(previous, next)) {
+            this.options.onPluginDeactivated?.(pluginName);
+        }
+        if (!this.disposed)
+            this.options.onCapabilitiesChanged?.(next.turnCapabilities);
     }
     adoptPublishedSnapshot(snapshot, buildContextSource = snapshot) {
         const reservations = this.snapshotReservations.get(snapshot);

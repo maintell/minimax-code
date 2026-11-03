@@ -65,5 +65,15 @@ export const APP_SERVER_DESKTOP_SERVICE_CAPABILITIES = {
     defaultStreamWindow: RUNTIME_TRANSPORT_DEFAULT_STREAM_WINDOW,
     maxStreamWindow: RUNTIME_TRANSPORT_MAX_STREAM_WINDOW,
 };
+/**
+ * Remote project icon updates through DesktopService `updateProject`.
+ * Desktop reads the same value as `RUNTIME_FEATURE_PROJECT_ICON_UPDATE`.
+ */
+export const APP_SERVER_FEATURE_PROJECT_ICON_UPDATE = 'project.icon.update';
+/**
+ * Additive business features declared in `initialize.capabilities.features`.
+ * New features extend this list without changing the protocol version.
+ */
+export const APP_SERVER_FEATURES = [APP_SERVER_FEATURE_PROJECT_ICON_UPDATE];
 export const APP_SERVER_DAEMON_STATE_VERSION = 1;
 //# sourceMappingURL=constants.js.map

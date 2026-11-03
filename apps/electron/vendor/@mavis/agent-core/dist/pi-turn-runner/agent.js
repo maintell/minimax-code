@@ -2,6 +2,7 @@ import { Agent } from '@earendil-works/pi-agent-core';
 import { projectAgentMessagesForModel } from './outbound-message-normalizer.js';
 import { resolveMaxImagesPerRequest } from './request-image-limit.js';
 import { failureReason } from './terminal.js';
+import { newRuntimeTool } from './tools.js';
 export function toPiUserMessage(input) {
     const message = {
         role: 'user',
@@ -73,6 +74,12 @@ export function newAgent(turn) {
         streamFn: turn.streamFn,
         getApiKey: (provider) => (provider === turn.llm.model.provider ? turn.llm.apiKey : undefined),
         toolExecution: 'parallel',
+        ...(turn.input.toolConfig.missingToolMessage
+            ? { missingToolMessage: turn.input.toolConfig.missingToolMessage }
+            : {}),
+        ...(turn.input.toolConfig.resolveMissingTool
+            ? { resolveMissingTool: (toolCall) => resolveMissingTool(turn, toolCall) }
+            : {}),
         sessionId: turn.input.sessionId,
         ...(turn.input.shouldStopAfterSteering
             ? { shouldStopAfterSteering: turn.input.shouldStopAfterSteering }
@@ -86,6 +93,20 @@ export function newAgent(turn) {
         ...(turn.llm.payloadTransform ? { onPayload: turn.llm.payloadTransform } : {}),
         ...(turn.llm.responseObserver ? { onResponse: turn.llm.responseObserver } : {}),
     });
+}
+/**
+ * A direct call the host resolves outside this turn's catalog gets the same Pi wrapper as a
+ * catalog tool: the turn's tool context, no PTC parent, no result observer.
+ */
+function resolveMissingTool(turn, toolCall) {
+    const runtimeTool = turn.input.toolConfig.resolveMissingTool?.({
+        id: toolCall.id,
+        name: toolCall.name,
+        arguments: toolCall.arguments,
+    });
+    if (runtimeTool?.def.name !== toolCall.name)
+        return undefined;
+    return newRuntimeTool(runtimeTool, turn.input.toolConfig.context, () => turn.bridge.getActiveAssistantMessageId());
 }
 /**
  * Pi ends its loop on a provider error, so a response an afterLlmCall hook

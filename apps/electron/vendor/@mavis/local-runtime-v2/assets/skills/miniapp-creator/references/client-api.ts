@@ -516,8 +516,12 @@ export interface MiniAppWindowOptions {
 }
 
 export type MiniAppWindowState =
-  | { readonly mode: 'inline' }
-  | { readonly mode: 'window'; readonly window: MiniAppWindowOptions };
+  | { readonly mode: 'inline'; readonly modeChangeReloadsPage?: boolean }
+  | {
+      readonly mode: 'window';
+      readonly window: MiniAppWindowOptions;
+      readonly modeChangeReloadsPage?: boolean;
+    };
 
 /** Every field is optional; omitted fields are left unchanged. */
 export type MiniAppWindowPatch = Partial<{
@@ -548,7 +552,10 @@ export interface MiniAppWindowHandle {
   /**
    * `update({ mode: ... })` or `focus()` require the call to originate from a
    * user gesture (`navigator.userActivation.isActive`); otherwise they reject
-   * with `not_permitted` before any Host round trip.
+   * with `not_permitted` before any Host round trip. The `click` handler of a
+   * `Notification` the page created counts as one.
+   * When getState().modeChangeReloadsPage is true, mode changes end this document.
+   * Do not rely on the old Promise continuation; read state on the destination page.
    */
   update(patch: MiniAppWindowPatch): Promise<MiniAppWindowState>;
   focus(): Promise<void>;

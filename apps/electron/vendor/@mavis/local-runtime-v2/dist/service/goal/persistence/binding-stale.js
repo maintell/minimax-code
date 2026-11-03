@@ -38,6 +38,28 @@ export function classifyThreadGoalAccountingStale(state, expected) {
         ? 'objective_digest'
         : undefined;
 }
+/**
+ * True while an already admitted Goal Turn may keep working although its Goal
+ * is paused: the pause came from an undelivered user side message (spec 4.4),
+ * it is the very pause this Turn was marked for, and the objective is the one
+ * the Turn was admitted for. Any later write (resume, edit, user pause,
+ * deletion) moves the epoch or the reason, and the Turn is stale again.
+ */
+export function isUndeliveredMessageDrain(state, bound) {
+    const drain = bound.undeliveredMessageDrain;
+    if (!state || !drain)
+        return false;
+    if (state.goalId !== bound.binding.goalId)
+        return false;
+    if (state.status !== 'paused' || state.statusReason !== 'paused(message_undelivered)') {
+        return false;
+    }
+    if (digestThreadGoalObjective(state.objective) !== bound.binding.objectiveDigest)
+        return false;
+    return drain.pausedEpoch === undefined
+        ? state.updatedAt > drain.fromEpoch
+        : state.updatedAt === drain.pausedEpoch;
+}
 /** Store-shaped wrapper for the two operations that must refuse a stale binding. */
 export function threadGoalStaleDecision(state, expected) {
     const staleReason = classifyThreadGoalBindingStale(state, expected);

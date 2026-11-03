@@ -37,6 +37,7 @@ export function createMiniAppAgentSessionPorts(options) {
         },
         listModels: () => listModelOptions(options),
         listAgents: () => listAgentOptions(options),
+        resolveAgentWriteTarget: (requestRef) => options.agents.resolveAgentWriteTarget(requestRef),
         defaultSessionModel: () => resolveDefaultSessionModel(options),
         resolveModel: async (requested) => requested
             ? resolveRequestedModel(options, requested)

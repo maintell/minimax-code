@@ -7,6 +7,12 @@ export class MessageWriteWaitAbortedError extends Error {
         this.signal = signal;
     }
 }
+/**
+ * Display kind of a user side message the runtime received but could neither
+ * steer into a Turn nor queue while a Goal was active. It has no Turn id, so it
+ * never becomes canonical context; it stays until it is retried or discarded.
+ */
+export const UNDELIVERED_USER_MESSAGE_KIND = 'undelivered_user';
 export class MessageDataCorruptionError extends Error {
     sessionId;
     messageId;

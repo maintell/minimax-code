@@ -55,6 +55,7 @@ import { createWriteTool } from '@earendil-works/pi-coding-agent';
 import { assertOfficeGuard, hasOfficeGuardGate } from './office-guard.js';
 import { resolveWithinWorkspace } from './path-guard.js';
 import { buildWriteToolResult, createCapturingWriteOperations } from '../shared/write-capture.js';
+import { fileStorageFailure } from './storage-failure.js';
 let CloudWriteTool = (() => {
     let _classDecorators = [bindTool(WriteToolDef)];
     let _classDescriptor;
@@ -89,7 +90,16 @@ let CloudWriteTool = (() => {
             // concurrent writes. Bind capture to this single execute instead.
             const { operations, takeCapture } = createCapturingWriteOperations();
             const tool = createWriteTool(this.workspaceRoot, { operations });
-            const res = await tool.execute('', { ...input, path: abs }, signal);
+            let res;
+            try {
+                res = await tool.execute('', { ...input, path: abs }, signal);
+            }
+            catch (error) {
+                const failure = signal?.aborted ? undefined : fileStorageFailure(WriteToolDef.name, error);
+                if (!failure)
+                    throw error;
+                return failure;
+            }
             const capture = takeCapture(abs);
             const piFallbackText = res.content
                 .filter((c) => c.type === 'text')

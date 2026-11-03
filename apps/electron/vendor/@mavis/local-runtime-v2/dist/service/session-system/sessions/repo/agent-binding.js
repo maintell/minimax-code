@@ -85,12 +85,7 @@ function validateFrozenDefinition(definition) {
     }
     if (definition.promptSnapshot !== undefined)
         decodeAgentPromptSnapshot(definition.promptSnapshot);
-    for (const field of REQUIRED_FROZEN_CAPABILITY_FIELDS) {
-        validateStringArray(definition.capabilities[field]);
-    }
-    if (definition.capabilities.disallowedTools !== undefined) {
-        validateStringArray(definition.capabilities.disallowedTools);
-    }
+    validateCapabilities(definition.capabilities);
     if (definition.definitionVersion === 1)
         return;
     if (definition.definitionVersion !== 2 || !definition.exactOwnerName.trim()) {
@@ -102,6 +97,14 @@ function validateFrozenDefinition(definition) {
         throw new Error('Frozen Session Agent owner instance is invalid.');
     }
     validatePluginSourceOwner(definition);
+}
+function validateCapabilities(capabilities) {
+    for (const field of REQUIRED_FROZEN_CAPABILITY_FIELDS) {
+        validateStringArray(capabilities[field]);
+    }
+    if (capabilities.disallowedTools !== undefined)
+        validateStringArray(capabilities.disallowedTools);
+    decodeSelectorVersion(capabilities.selectorVersion);
 }
 /** A Plugin Agent has no Custom Agent incarnation and is owned by its scoped name. */
 function validatePluginSourceOwner(definition) {
@@ -126,15 +129,7 @@ function freezeDefinition(definition) {
         ...(definition.promptSnapshot === undefined
             ? {}
             : { promptSnapshot: decodeAgentPromptSnapshot(definition.promptSnapshot) }),
-        capabilities: Object.freeze({
-            tools: Object.freeze([...definition.capabilities.tools]),
-            ...(definition.capabilities.disallowedTools === undefined
-                ? {}
-                : { disallowedTools: Object.freeze([...definition.capabilities.disallowedTools]) }),
-            mcpServers: Object.freeze([...definition.capabilities.mcpServers]),
-            skills: Object.freeze([...definition.capabilities.skills]),
-            extensionSkills: Object.freeze([...definition.capabilities.extensionSkills]),
-        }),
+        capabilities: freezeCapabilities(definition.capabilities),
     };
     if (definition.definitionVersion === 1) {
         return Object.freeze({ definitionVersion: 1, ...base });
@@ -162,14 +157,37 @@ function freezeDefinition(definition) {
         ...base,
     });
 }
+function freezeCapabilities(capabilities) {
+    return Object.freeze({
+        tools: Object.freeze([...capabilities.tools]),
+        ...(capabilities.disallowedTools === undefined
+            ? {}
+            : { disallowedTools: Object.freeze([...capabilities.disallowedTools]) }),
+        mcpServers: Object.freeze([...capabilities.mcpServers]),
+        skills: Object.freeze([...capabilities.skills]),
+        extensionSkills: Object.freeze([...capabilities.extensionSkills]),
+        ...(capabilities.selectorVersion === undefined
+            ? {}
+            : { selectorVersion: capabilities.selectorVersion }),
+    });
+}
 function decodeCapabilities(capabilities) {
+    const selectorVersion = decodeSelectorVersion(capabilities.selectorVersion);
     return {
         tools: requiredStringArray(capabilities, 'tools'),
         ...optionalStringArray(capabilities, 'disallowedTools'),
         mcpServers: requiredStringArray(capabilities, 'mcpServers'),
         skills: requiredStringArray(capabilities, 'skills'),
         extensionSkills: requiredStringArray(capabilities, 'extensionSkills'),
+        ...(selectorVersion === undefined ? {} : { selectorVersion }),
     };
+}
+function decodeSelectorVersion(value) {
+    if (value === undefined)
+        return undefined;
+    if (value !== 2)
+        throw new Error('Frozen Task Agent capability selectorVersion is invalid.');
+    return value;
 }
 function decodeModel(value) {
     if (!isRecord(value))
@@ -227,10 +245,15 @@ function validateModel(model) {
         optionalPositiveInteger(model.maxOutputTokens, 'maxOutputTokens');
 }
 const PLUGIN_SOURCE_FORMATS = new Set(['minimax', '\u0063\u006c\u0061\u0075\u0064\u0065']);
+const PLUGIN_SOURCE_ORIGINS = {
+    official: true,
+    local: true,
+};
 function decodePluginSource(value) {
     if (!isRecord(value) ||
         value.kind !== 'plugin' ||
-        !PLUGIN_SOURCE_FORMATS.has(String(value.format))) {
+        !PLUGIN_SOURCE_FORMATS.has(String(value.format)) ||
+        (value.origin !== undefined && !Object.hasOwn(PLUGIN_SOURCE_ORIGINS, String(value.origin)))) {
         throw new Error('Frozen Session Agent Plugin source is invalid.');
     }
     return {
@@ -240,6 +263,7 @@ function decodePluginSource(value) {
         agentName: requiredNonEmptyString(value.agentName, 'pluginSource.agentName'),
         scopedName: requiredNonEmptyString(value.scopedName, 'pluginSource.scopedName'),
         packageDigest: requiredNonEmptyString(value.packageDigest, 'pluginSource.packageDigest'),
+        ...(value.origin === undefined ? {} : { origin: value.origin }),
     };
 }
 function validateProject(project) {

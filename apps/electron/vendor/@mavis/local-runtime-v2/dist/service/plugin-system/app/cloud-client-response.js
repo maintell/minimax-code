@@ -1,4 +1,5 @@
 import { PluginSystemCloudTransportError } from '../cloud-transport.js';
+import { isRecord } from '../plugin/package/filesystem.js';
 /** Validates a CloudConnectorService tool-list DTO; snake_case and camelCase are both accepted. */
 export function readConnectedToolsResponse(payload) {
     const record = requireRecord(payload, 'Connector tools response');
@@ -44,6 +45,51 @@ function optionalAgentToolMode(record) {
         invalid('agent_tool_mode');
     return { agentToolMode: value };
 }
+/** Validates a CloudConnectorService catalog DTO; only the App projection fields are kept. */
+export function readConnectorListResponse(payload) {
+    const record = requireRecord(payload, 'Connector list response');
+    const connectors = field(record, 'connectors', 'connectors');
+    if (connectors === undefined || connectors === null)
+        return freeze([]);
+    if (!Array.isArray(connectors))
+        invalid('connectors');
+    return freeze(connectors.map(readConnectorCatalogEntry));
+}
+function readConnectorCatalogEntry(value) {
+    const record = requireRecord(value, 'Connector');
+    const connection = field(record, 'connection', 'connection');
+    const actions = field(record, 'actions', 'actions');
+    return freeze({
+        provider: requireString(record, 'provider', 'provider'),
+        ...optionalString(record, 'display_name', 'displayName', 'displayName'),
+        ...optionalString(record, 'logo_url', 'logoUrl', 'logoUrl'),
+        ...optionalString(record, 'status', 'status', 'status'),
+        // Desktop HTTP encoding reads only camelCase field names, so nested views are rebuilt here.
+        ...(connection === undefined || connection === null
+            ? {}
+            : { connection: readConnectionView(requireRecord(connection, 'connection')) }),
+        ...(actions === undefined || actions === null
+            ? {}
+            : { actions: readActionState(requireRecord(actions, 'actions')) }),
+    });
+}
+function readConnectionView(record) {
+    return freeze({
+        ...optionalString(record, 'status', 'status', 'status'),
+        ...optionalNumber(record, 'connected_at_ms', 'connectedAtMs', 'connectedAtMs'),
+        ...optionalNumber(record, 'expires_at_ms', 'expiresAtMs', 'expiresAtMs'),
+        ...optionalNumber(record, 'last_used_at_ms', 'lastUsedAtMs', 'lastUsedAtMs'),
+        ...optionalString(record, 'status_reason', 'statusReason', 'statusReason'),
+    });
+}
+function readActionState(record) {
+    return freeze({
+        ...optionalBoolean(record, 'can_connect', 'canConnect', 'canConnect'),
+        ...optionalBoolean(record, 'can_disconnect', 'canDisconnect', 'canDisconnect'),
+        ...optionalString(record, 'connect_button_text', 'connectButtonText', 'connectButtonText'),
+        ...optionalString(record, 'disabled_reason', 'disabledReason', 'disabledReason'),
+    });
+}
 function readProviderFailure(value) {
     const record = requireRecord(value, 'Connector provider failure');
     return freeze({
@@ -54,7 +100,7 @@ function readProviderFailure(value) {
     });
 }
 function requireRecord(value, label) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value))
+    if (!isRecord(value))
         invalid(label);
     return value;
 }

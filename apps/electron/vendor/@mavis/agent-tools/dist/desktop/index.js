@@ -24,6 +24,7 @@ export * from './local-ask-user.js';
 export * from './local-feature-enable.js';
 export * from './local-browser.js';
 export * from './local-pi-tools.js';
+export * from './ptc-result-projection.js';
 export * from './local-bash-result.js';
 export * from './local-bash-timing.js';
 export * from './local-bash-input.js';
@@ -36,6 +37,7 @@ export * from './local-rg-runner.js';
 export * from './local-skill.js';
 export * from './local-mavis.js';
 export * from './local-mavis-commands.js';
+export * from './local-mavis-ptc.js';
 export * from './local-mavis-cron-adapter.js';
 export * from './local-memory.js';
 export * from './local-code-review.js';
@@ -132,6 +134,6 @@ export function buildLocalToolRegistry(deps) {
 export { CloudSessionReader, CloudSessionReadError, } from './cloud-session-reader.js';
 export { buildLocalCronTools } from './local-cron-tools.js';
 export { CRON_TOOL_NAMES, MAVIS_CAPABILITY_TOOL_NAMES, LocalSelfReminderToolDef, LocalSelfReminderToolDef as SelfReminderToolDef, cronToolDefinitions, selfReminderIntervalMinutes, } from '../cron/tool-defs.js';
-export { DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, } from './output-limit.js';
+export { DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, PTC_CHILD_FULL_OUTPUT_MAX_BYTES, } from './output-limit.js';
 export * from './background-task-runtime.js';
 //# sourceMappingURL=index.js.map

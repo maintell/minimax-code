@@ -74,6 +74,8 @@ USAGE
 GROUPS (high-frequency commands shown; call \`<group> help\` for the rest)
 
 agent — your roster
+  Suggest agent creation or tool setup only after repeated work shows a need, supported by facts from memory; do not promote setup flows.
+  Use agent create only after the user explicitly asks for or approves creating an agent.
   agent list      args: { cursor?: string, limit?: number }
   agent get       args: { agent_name: string }
   agent create    args: { name: string, system_prompt?: string, persona?: string, description?: string, avatar?: string }

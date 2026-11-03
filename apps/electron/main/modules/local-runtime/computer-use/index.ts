@@ -1,4 +1,5 @@
 import { CuaDesktopOverlay } from "./cua-overlay";
+import { parseCuaOverlayTarget } from "./cua-overlay-target";
 import { CuaWindowHandoff } from "./cua-window-handoff";
 import { clearCuaPreviewTargets, releaseCuaPreviewTarget, publishCuaPreviewTarget } from "./cua-preview";
 /**
@@ -92,8 +93,26 @@ export async function ensureComputerUseUtilityStarted(host) {
         return false;
     }
 }
-export function stopComputerUseUtility() {
-    clearCuaUtilityState();
+/** Upper bound for a quit/stop to let the bridge release its desktop lock. */
+const CUA_SHUTDOWN_WAIT_MS = 5000;
+/**
+ * Asks the bridge to drain and waits a bounded time for it to exit, so a normal quit
+ * releases the desktop lock before the host process ends. A slower drain keeps running;
+ * a later Computer Use owner reclaims the lock once this host has exited.
+ */
+export async function stopComputerUseUtility() {
+    const child = clearCuaUtilityState();
+    if (!child)
+        return;
+    const exited = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(false), CUA_SHUTDOWN_WAIT_MS);
+        child.once('exit', () => {
+            clearTimeout(timer);
+            resolve(true);
+        });
+    });
+    if (!exited)
+        logger.warn(`[CuaUtility] shutdown still draining after ${CUA_SHUTDOWN_WAIT_MS}ms; continuing host stop`);
 }
 function clearCuaUtilityState() {
     windowHandoff.clear();
@@ -113,13 +132,7 @@ function clearCuaUtilityState() {
     }
     cuaControlPort?.close();
     cuaControlPort = null;
-    if (child) {
-        const timer = setTimeout(() => {
-            logger.warn('[CuaUtility] shutdown is still draining; not killing an unconfirmed native action');
-        }, 10000);
-        timer.unref();
-        child.once('exit', () => clearTimeout(timer));
-    }
+    return child;
 }
 async function ensureCuaUtilityStarted() {
     // `cuaRuntimePort` is transferred to local-runtime once that process is
@@ -263,7 +276,7 @@ async function ensureCuaUtilityStarted() {
                         desktopOverlay.finish(turn, controlMessage.requestId);
                     }
                     else {
-                        desktopOverlay.show(turn, controlMessage.requestId);
+                        desktopOverlay.show(turn, controlMessage.requestId, parseCuaOverlayTarget(controlMessage.overlayTarget));
                         void windowHandoff.begin(turn);
                     }
                     return;

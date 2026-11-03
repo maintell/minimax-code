@@ -6,6 +6,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { LocalMavisMcpServiceAdapter } from '../tools/local-mavis-adapter.js';
 import { mapMcpContent, normalizeCallResult } from '../tools/result-mapping.js';
+import { localMcpCallFailureResult, withMcpProgrammatic } from '../tools/programmatic-result.js';
 import { callLocalMcpToolUnfolded } from '../tools/miniapp-call.js';
 import { listMcpRuntimeToolEntriesForTurn } from '../tools/runtime-tools.js';
 import { readConfiguredMcpServerNames } from './config-file.js';
@@ -572,14 +573,15 @@ export class LocalMcpService {
                             signal,
                         });
                         const mapped = mapMcpContent(result);
-                        return {
+                        // PTC-only payload (structuredContent as data, raw protocol error) rides along.
+                        return withMcpProgrammatic(result, {
                             tool_name: def.name,
                             text: mapped.text,
                             content: mapped.content,
                             ...(result.isError !== undefined ? { isError: result.isError } : {}),
                             details: { mcp: result, server: tool.server, tool: tool.toolName },
                             output: { mcp: result },
-                        };
+                        });
                     },
                 },
                 source: tool.source,
@@ -694,10 +696,7 @@ export class LocalMcpService {
                 if (err instanceof McpToolCallNotDispatchedError)
                     throw err;
                 this.recordPublicRuntimeFailure(server, context, 'MCP server connection failed. Retry or check its configuration.', config);
-                return {
-                    isError: true,
-                    content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
-                };
+                return localMcpCallFailureResult(err);
             }
         }
         return {

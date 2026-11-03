@@ -15,12 +15,11 @@ export class JsonlAppendCommitUncertainError extends Error {
         this.cause = cause;
     }
 }
-export async function readJsonl(filePath, decode, onMalformedLine, 
-/** Strict private reads return immutable arrays when a cache is supplied. */
-readCache) {
-    // Tolerant readers must still report every malformed line on every read.
-    if (readCache && !onMalformedLine)
-        return readCachedJsonl(filePath, decode, readCache);
+const JSONL_PREFIX_SAMPLE_BYTES = 4 * 1024;
+export function createJsonlReadCache() {
+    return { records: [], size: 0 };
+}
+export async function readJsonl(filePath, decode, onMalformedLine) {
     const contents = await readFile(filePath, 'utf-8');
     const records = [];
     const lines = contents.split('\n');
@@ -41,47 +40,113 @@ readCache) {
     }
     return records;
 }
-async function readCachedJsonl(filePath, decode, cache) {
-    // Always read fresh bytes: timestamps and file size cannot prove an unchanged
-    // prefix. Compare before decoding to avoid allocating a whole-history string.
-    const bytes = await readFile(filePath);
-    if (bytes.equals(cache.bytes))
-        return cache.records;
-    const reuse = canReusePrefix(bytes, cache.bytes);
-    const records = reuse ? [...cache.records] : [];
-    let offset = reuse ? cache.bytes.length : 0;
-    const limit = 4 * 1024 * 1024;
-    let retainedEnd = offset;
-    let retainedRecords = records.length;
-    while (offset < bytes.length) {
-        const newline = bytes.indexOf(10, offset);
-        const end = newline === -1 ? bytes.length : newline;
-        // Decode each line separately so values cannot retain whole-file strings.
-        records.push(decodeCachedLine(bytes.toString('utf8', offset, end), decode, {
-            path: filePath,
-            lineNo: records.length + 1,
-        }));
-        offset = newline === -1 ? bytes.length : newline + 1;
-        if (newline !== -1 && offset <= limit) {
-            retainedEnd = offset;
-            retainedRecords = records.length;
-        }
+/**
+ * Strict read that decodes only bytes appended since the cached read. The cached prefix is
+ * reused when the file identity matches, the file did not shrink, an unchanged size keeps its
+ * mtime, and the first and last bytes of the prefix still match; otherwise the whole file is
+ * decoded again. The caller must serialize reads and writes of one file.
+ */
+export async function readJsonlIncrementally(filePath, decode, cache) {
+    const handle = await open(filePath, 'r');
+    try {
+        const info = await handle.stat();
+        const reused = await canReuseCachedPrefix(handle, info, cache);
+        const start = reused ? cache.size : 0;
+        const bytes = await readFileRange(handle, start, Math.max(0, info.size - start));
+        return decodeIncrement({ filePath, decode, cache, info }, { reused, start, bytes });
     }
-    if (bytes.length <= limit) {
-        cache.bytes = bytes;
-        cache.records = Object.freeze(records);
+    finally {
+        await handle.close();
     }
-    else {
-        // Copy the bounded prefix so it cannot retain the entire file's buffer.
-        cache.bytes = Buffer.from(bytes.subarray(0, retainedEnd));
-        cache.records = Object.freeze(records.slice(0, retainedRecords));
-    }
-    return Object.freeze(records);
 }
-function canReusePrefix(bytes, prefix) {
-    return (prefix.at(-1) === 10 &&
-        bytes.length >= prefix.length &&
-        bytes.subarray(0, prefix.length).equals(prefix));
+async function canReuseCachedPrefix(handle, info, cache) {
+    const identity = cache.identity;
+    if (!identity || cache.size === 0)
+        return false;
+    if (info.dev !== identity.dev || info.ino !== identity.ino || info.size < cache.size)
+        return false;
+    if (info.size === cache.size && info.mtimeMs !== identity.mtimeMs)
+        return false;
+    const head = await readFileRange(handle, 0, identity.head.length);
+    if (!head.equals(identity.head))
+        return false;
+    const tail = await readFileRange(handle, cache.size - identity.tail.length, identity.tail.length);
+    return tail.equals(identity.tail);
+}
+function decodeIncrement(target, read) {
+    const { cache } = target;
+    const previous = read.reused ? cache.records : [];
+    const completeEnd = read.bytes.lastIndexOf(10) + 1;
+    const decoded = decodeLines(target, read.bytes.subarray(0, completeEnd), previous.length);
+    const cached = decoded.length === 0 ? previous : Object.freeze([...previous, ...decoded]);
+    if (completeEnd > 0 || !read.reused) {
+        rememberCachedPrefix(target, {
+            records: cached,
+            previousIdentity: read.reused ? cache.identity : undefined,
+            covered: read.bytes.subarray(0, completeEnd),
+            size: read.start + completeEnd,
+        });
+    }
+    if (completeEnd === read.bytes.length) {
+        return { records: cached, reusedCount: previous.length, cachedCount: cached.length };
+    }
+    const trailing = decodeCachedLine(read.bytes.toString('utf8', completeEnd), target.decode, {
+        path: target.filePath,
+        lineNo: cached.length + 1,
+    });
+    return {
+        records: Object.freeze([...cached, trailing]),
+        reusedCount: previous.length,
+        cachedCount: cached.length,
+    };
+}
+function decodeLines(target, bytes, lineOffset) {
+    const records = [];
+    let offset = 0;
+    while (offset < bytes.length) {
+        const end = bytes.indexOf(10, offset);
+        // Decode each line separately so values cannot retain whole-file strings. On real histories
+        // the decoded records then take about 1.1x the file bytes; decoding the whole file as one
+        // string and splitting it measured about 3x.
+        records.push(decodeCachedLine(bytes.toString('utf8', offset, end), target.decode, {
+            path: target.filePath,
+            lineNo: lineOffset + records.length + 1,
+        }));
+        offset = end + 1;
+    }
+    return records;
+}
+function rememberCachedPrefix(target, prefix) {
+    const previousHead = prefix.previousIdentity?.head ?? Buffer.alloc(0);
+    const previousTail = prefix.previousIdentity?.tail ?? Buffer.alloc(0);
+    target.cache.records = prefix.records;
+    target.cache.size = prefix.size;
+    target.cache.identity = {
+        dev: target.info.dev,
+        ino: target.info.ino,
+        mtimeMs: target.info.mtimeMs,
+        // Copy the samples so the cache never retains the read buffer.
+        // Concatenate at most one sample of new bytes so a full read is never copied whole.
+        head: Buffer.concat([
+            previousHead,
+            prefix.covered.subarray(0, JSONL_PREFIX_SAMPLE_BYTES - previousHead.length),
+        ]),
+        tail: Buffer.concat([
+            previousTail,
+            prefix.covered.subarray(-JSONL_PREFIX_SAMPLE_BYTES),
+        ]).subarray(-JSONL_PREFIX_SAMPLE_BYTES),
+    };
+}
+async function readFileRange(handle, position, length) {
+    const contents = Buffer.alloc(length);
+    let offset = 0;
+    while (offset < length) {
+        const { bytesRead } = await handle.read(contents, offset, length - offset, position + offset);
+        if (bytesRead === 0)
+            break;
+        offset += bytesRead;
+    }
+    return offset === length ? contents : contents.subarray(0, offset);
 }
 function decodeCachedLine(line, decode, location) {
     try {

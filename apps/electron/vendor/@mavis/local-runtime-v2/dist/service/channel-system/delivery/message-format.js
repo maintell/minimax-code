@@ -140,7 +140,8 @@ export function extractToolDetail(toolName, argsJson) {
     try {
         const args = JSON.parse(argsJson);
         const name = toolName.toLowerCase();
-        return (urlToolDetail(name, args) ??
+        return (programToolDetail(name, args) ??
+            urlToolDetail(name, args) ??
             fileToolDetail(name, args) ??
             shellToolDetail(name, args) ??
             searchToolDetail(name, args) ??
@@ -151,6 +152,17 @@ export function extractToolDetail(toolName, argsJson) {
         // malformed JSON
     }
     return '';
+}
+/**
+ * run_code's first argument is the program source, so the generic first-string
+ * fallback would print JavaScript into the IM reply. Show the model's one-line
+ * description instead, or nothing; the children it ran are listed on their own.
+ */
+function programToolDetail(name, args) {
+    if (name !== 'run_code')
+        return undefined;
+    const description = args.description;
+    return typeof description === 'string' ? description.replace(/\n/g, ' ').trim() : '';
 }
 /** URL-based tools: show hostname (falls back to the raw value). */
 function urlToolDetail(name, args) {

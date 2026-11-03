@@ -1,6 +1,6 @@
 import { getConfig } from '@mavis/config';
 import { createProcessLocalGoalApplication } from './process-local-goal-application.js';
-import { ThreadGoalContractError, createGoalReqToCreateInput, goalStateToGoalState, patchGoalReqToPatchInput, toThreadGoalContractError, } from './goal-contract.js';
+import { ThreadGoalContractError, createGoalReqSendBehavior, createGoalReqToCreateInput, goalStateToGoalState, patchGoalReqToPatchInput, toThreadGoalContractError, } from './goal-contract.js';
 /** Goal HTTP errors keep the DesktopService error body clients already parse. */
 class GoalHttpError extends Error {
     status;
@@ -48,8 +48,13 @@ export function createGoalHttpApplication(deps) {
         createGoal: (req) => mapGoalErrors(async () => {
             const owner = requireGoals();
             await assertSessionMutable(req.sessionId);
-            const created = await owner.createGoal(createGoalReqToCreateInput(req, deps.contractPolicy()), { requireKickoffAdmission: true });
-            return { goal: goalStateToGoalState(created) };
+            const input = createGoalReqToCreateInput(req, deps.contractPolicy());
+            const sendBehavior = createGoalReqSendBehavior(req);
+            const created = await owner.createGoal(input, {
+                requireKickoffAdmission: true,
+                ...(sendBehavior ? { sendBehavior } : {}),
+            });
+            return { goal: goalStateToGoalState(created, owner.effectiveBudgetLimits(created)) };
         }),
         getGoal: (req) => {
             const owner = requireGoals();
@@ -57,7 +62,9 @@ export function createGoalHttpApplication(deps) {
                 const sessionId = requireSessionId(req.sessionId);
                 // The owner projects a persisted row while the local Turn is live.
                 const state = await owner.getGoalForResponse(sessionId);
-                return state ? { goal: goalStateToGoalState(state) } : {};
+                return state
+                    ? { goal: goalStateToGoalState(state, owner.effectiveBudgetLimits(state)) }
+                    : {};
             });
         },
         patchGoal: (req) => {
@@ -80,7 +87,9 @@ export function createGoalHttpApplication(deps) {
                     : await owner.patchGoal(sessionId, patch);
                 if (!goalForResponse)
                     throw goalNotFound(sessionId);
-                return { goal: goalStateToGoalState(goalForResponse) };
+                return {
+                    goal: goalStateToGoalState(goalForResponse, owner.effectiveBudgetLimits(goalForResponse)),
+                };
             });
         },
         deleteGoal: (req) => {
@@ -104,7 +113,8 @@ export function createGoalHttpApplication(deps) {
                     throw new ThreadGoalContractError(400, 'goal_id is required.', 'VALIDATION_ERROR');
                 }
                 await assertSessionMutable(sessionId);
-                return { goal: goalStateToGoalState(await owner.dismissGoal(sessionId, goalId)) };
+                const dismissed = await owner.dismissGoal(sessionId, goalId);
+                return { goal: goalStateToGoalState(dismissed, owner.effectiveBudgetLimits(dismissed)) };
             });
         },
     };

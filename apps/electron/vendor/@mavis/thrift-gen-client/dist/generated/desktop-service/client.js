@@ -68,6 +68,12 @@ export function createDesktopServiceClient(options) {
         applyCanvasOperation(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.applyCanvasOperation, req, callOptions);
         },
+        removeCanvasImageBackground(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.removeCanvasImageBackground, req, callOptions);
+        },
+        enhanceCanvasImage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.enhanceCanvasImage, req, callOptions);
+        },
         listMarketplacePlugins(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listMarketplacePlugins, req, callOptions);
         },
@@ -100,6 +106,42 @@ export function createDesktopServiceClient(options) {
         },
         importGithubPlugin(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.importGithubPlugin, req, callOptions);
+        },
+        updatePlugin(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.updatePlugin, req, callOptions);
+        },
+        listPluginMarketplaces(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listPluginMarketplaces, req, callOptions);
+        },
+        addPluginMarketplace(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.addPluginMarketplace, req, callOptions);
+        },
+        refreshPluginMarketplaces(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.refreshPluginMarketplaces, req, callOptions);
+        },
+        setPluginMarketplaceAutoUpdate(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setPluginMarketplaceAutoUpdate, req, callOptions);
+        },
+        removePluginMarketplace(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.removePluginMarketplace, req, callOptions);
+        },
+        packShareWork(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.packShareWork, req, callOptions);
+        },
+        publishShareWork(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.publishShareWork, req, callOptions);
+        },
+        prepareSharedInstall(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.prepareSharedInstall, req, callOptions);
+        },
+        commitSharedInstall(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.commitSharedInstall, req, callOptions);
+        },
+        discardSharedInstall(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.discardSharedInstall, req, callOptions);
+        },
+        listShareInstallations(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listShareInstallations, req, callOptions);
         },
         listLocalMcpServers(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listLocalMcpServers, req, callOptions);
@@ -437,6 +479,9 @@ export function createDesktopServiceClient(options) {
         getLatestPlanReview(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getLatestPlanReview, req, callOptions);
         },
+        recordPluginRecommendationDecline(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.recordPluginRecommendationDecline, req, callOptions);
+        },
         getSkillEvolveUsage(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSkillEvolveUsage, req, callOptions);
         },
@@ -517,6 +562,9 @@ export function createDesktopServiceClient(options) {
         },
         listProjectSessions(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listProjectSessions, req, callOptions);
+        },
+        createProject(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.createProject, req, callOptions);
         },
         updateProject(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.updateProject, req, callOptions);
@@ -689,6 +737,12 @@ export function createDesktopServiceClient(options) {
         listSessionFiles(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listSessionFiles, req, callOptions);
         },
+        getSessionFileSyncs(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSessionFileSyncs, req, callOptions);
+        },
+        recordSessionFileSync(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.recordSessionFileSync, req, callOptions);
+        },
         deliverCron(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deliverCron, req, callOptions);
         },
@@ -844,6 +898,9 @@ export function createDesktopServiceClient(options) {
         },
         searchWorkspaceFiles(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.searchWorkspaceFiles, req, callOptions);
+        },
+        stopWorkspaceFileSearch(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.stopWorkspaceFileSearch, req, callOptions);
         },
         previewWorkspaceFile(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.previewWorkspaceFile, req, callOptions);
@@ -1060,6 +1117,9 @@ export function createDesktopServiceClient(options) {
         },
         continueTurn(req, callOptions) {
             return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.continueTurn, req, callOptions);
+        },
+        streamWorkspaceFileSearch(req, callOptions) {
+            return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.streamWorkspaceFileSearch, req, callOptions);
         },
     };
 }

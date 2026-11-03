@@ -110,7 +110,7 @@ function setupImageContextMenuIPC() {
                 },
             },
         ];
-        if (revealableFilePath) {
+        if (revealableFilePath && params.showInFolder !== false) {
             template.push({ type: 'separator' }, createShowImageInFolderMenuItem(revealableFilePath, isEn));
         }
         const menu = Menu.buildFromTemplate(template);

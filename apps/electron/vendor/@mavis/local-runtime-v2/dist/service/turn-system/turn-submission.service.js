@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { basename } from 'node:path';
 import { isInlineDisplayDataUrl, sanitizeDisplayAttachment, QueueServiceError, } from '../session-system/index.js';
 import { queueModelFromAgentHost } from './agent-host/index.js';
-import { createUserMessageId } from '../session-system/shared/user-message-id.js';
+import { createUserMessageId } from '../session-system/index.js';
 import { resolveGenuineUserQueryText } from './execution/message-query-authorship.js';
-import { sessionClioQueuedQueryId } from '../session-clio/query-identity.js';
+import { sessionClioQueuedQueryId } from '../session-clio/index.js';
 /** Owns immediate-vs-queued submit semantics above pure Turn execution. */
 export function createTurnSubmissionService(options) {
     const makeTurnId = options.makeTurnId ?? (() => `turn_${randomUUID()}`);
@@ -320,7 +320,11 @@ function queueAttachmentMetadata(input, filePath) {
         mimeType,
     };
 }
-function toQueueChannelContext(input) {
+/**
+ * Queue-level IM origin of an input. Shared with the steering requeue lane so a
+ * requeued IM follow-up carries the same channel context as an IM submit.
+ */
+export function toQueueChannelContext(input) {
     const context = provenanceChannelContext(input);
     const fallback = input.input.channelContext;
     const platform = channelField(context, fallback?.platform, 'platform');

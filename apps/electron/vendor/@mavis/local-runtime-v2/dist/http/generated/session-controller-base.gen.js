@@ -225,6 +225,16 @@ export class SessionControllerBase {
         void req;
         throw new NotImplementedError('listSessionFiles');
     }
+    async getSessionFileSyncs(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getSessionFileSyncs');
+    }
+    async recordSessionFileSync(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('recordSessionFileSync');
+    }
     async deliverCron(ctx, req) {
         void ctx;
         void req;

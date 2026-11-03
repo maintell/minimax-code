@@ -2,7 +2,7 @@ import { readFile, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { KeyedOperationLane } from '@mavis/shared/keyed-operation-lane';
 import { appendJsonl, publishFileIfAbsent, publishJsonlIfAbsent, readJsonl, replaceFileAtomically, } from '../../infra/file/jsonl.js';
-import { resolveSessionHistoryPaths } from '../session-system/messages/index.js';
+import { resolveSessionHistoryPaths } from '../session-system/index.js';
 const INSPECTOR_DIRECTORY = 'llm-context-inspector';
 const EVENT_FILE = 'events.jsonl';
 const PAYLOAD_DIRECTORY = 'payloads';
@@ -86,6 +86,9 @@ export class LlmContextInspectorHistoryStore {
                     callId: input.callId,
                     toolCallId: input.toolCallId,
                     startedAtMs: input.startedAtMs,
+                    ...(input.child
+                        ? { parentToolCallId: input.child.parentToolCallId, toolName: input.child.toolName }
+                        : {}),
                 },
             ]);
         });
@@ -304,6 +307,10 @@ function toCallEvent(record, request, response) {
         modelId: record.modelId,
         apiId: record.apiId,
         attemptCount: record.attemptCount,
+        ...(record.attemptStartedAtMs === undefined
+            ? {}
+            : { attemptStartedAtMs: record.attemptStartedAtMs }),
+        ...(record.firstEventAtMs === undefined ? {} : { firstEventAtMs: record.firstEventAtMs }),
         ...(record.usage ? { usage: record.usage } : {}),
         expectedTools: record.expectedTools,
         requestState: request.state,
@@ -356,7 +363,7 @@ function projectOverview(events) {
             continue;
         }
         if (event.type === 'tool.execution_started' || event.type === 'tool.execution_completed') {
-            projectToolEvent(callsById.get(event.callId), event);
+            applyToolEvent(callsById.get(event.callId), event);
             continue;
         }
         let turn = turns.get(event.turnId);
@@ -373,6 +380,10 @@ function projectOverview(events) {
             modelId: event.modelId,
             apiId: event.apiId,
             attemptCount: event.attemptCount,
+            ...(event.attemptStartedAtMs === undefined
+                ? {}
+                : { attemptStartedAtMs: event.attemptStartedAtMs }),
+            ...(event.firstEventAtMs === undefined ? {} : { firstEventAtMs: event.firstEventAtMs }),
             ...(event.usage ? { usage: event.usage } : {}),
             tools: event.expectedTools.map((tool) => ({ ...tool })),
             hasCompactionBefore: pendingCompactionEpoch === event.captureEpoch,
@@ -383,6 +394,12 @@ function projectOverview(events) {
         pendingCompactionEpoch = undefined;
     }
     return { turns: [...turns.values()] };
+}
+function applyToolEvent(call, event) {
+    if (call && event.type === 'tool.execution_started' && event.parentToolCallId) {
+        appendChildTool(call, event.toolCallId, event.parentToolCallId, event.toolName);
+    }
+    projectToolEvent(call, event);
 }
 function projectToolEvent(call, event) {
     if (!call)
@@ -403,6 +420,25 @@ function projectToolEvent(call, event) {
     }
     tool.durationMs = event.endedAtMs - tool.startedAtMs;
     tool.isError = event.isError;
+}
+/**
+ * A PTC child is not in the Response, so its first start event adds it after
+ * the declared tools. The parent must be a declared, non-child tool of the same
+ * Call; anything else stays out of the projection like other orphan events.
+ */
+function appendChildTool(call, toolCallId, parentToolCallId, toolName) {
+    if (!toolName)
+        return;
+    const parentMatches = call.tools.filter((tool) => tool.toolCallId === parentToolCallId && tool.parentToolCallId === undefined);
+    if (parentMatches.length !== 1)
+        return;
+    if (call.tools.some((tool) => tool.toolCallId === toolCallId))
+        return;
+    call.tools.push({
+        toolCallId,
+        toolName,
+        parentToolCallId,
+    });
 }
 async function readEvents(path) {
     let contents;
@@ -484,7 +520,19 @@ function decodeToolStartedEvent(value) {
         callId: requiredString(value.callId),
         toolCallId: requiredString(value.toolCallId),
         startedAtMs: finiteNumber(value.startedAtMs),
+        ...(value.parentToolCallId === undefined
+            ? {}
+            : {
+                parentToolCallId: requiredString(value.parentToolCallId),
+                toolName: requiredString(value.toolName),
+            }),
     };
+}
+function optionalFiniteNumber(value) {
+    return value === undefined ? undefined : finiteNumber(value);
+}
+function optionalField(key, value) {
+    return (value === undefined ? {} : { [key]: value });
 }
 function decodeToolCompletedEvent(value) {
     return {
@@ -508,6 +556,8 @@ function decodeCallEvent(value) {
         modelId: requiredString(value.modelId),
         apiId: requiredString(value.apiId),
         attemptCount: finiteNumber(value.attemptCount),
+        ...optionalField('attemptStartedAtMs', optionalFiniteNumber(value.attemptStartedAtMs)),
+        ...optionalField('firstEventAtMs', optionalFiniteNumber(value.firstEventAtMs)),
         ...(isUsage(value.usage) ? { usage: value.usage } : {}),
         expectedTools: decodeExpectedTools(value.expectedTools),
         requestState: payloadState(value.requestState),

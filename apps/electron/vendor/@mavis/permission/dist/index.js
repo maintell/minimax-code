@@ -29,6 +29,7 @@ export { PermissionEngine } from './engine.js';
 export { registerDefaultCheckers } from './tools/index.js';
 export { unwrapCommandWrappers, unwrapBashCommandWrappers, readBashInlineScript, } from './tools/bash-wrapper-unwrap.js';
 export { isRmCommand, parseRmTargets, splitCommand } from './tools/bash-permission.js';
+export { stripDataHeredocBodies } from './tools/bash-safety-scan.js';
 export { splitShellSourceSegments } from './tools/bash-split.js';
 export { parseScriptPlainCommands, parseShellLcPlainCommands, parseShellLcSingleCommandPrefix, } from './tools/bash-ast.js';
 export { parseWindowsNativeDelete, } from './tools/windows-native-delete.js';
@@ -44,7 +45,7 @@ export { extractBashPathIntents } from './tools/path-capability.js';
 export { readBashCommand, gitBashCommandName } from './tools/bash-command.js';
 export { findHeredocBodies } from './tools/bash-split.js';
 export { isShellCommentStart, findShellCommentLineEnd, readBashExpansion, } from './tools/bash-expansion.js';
-export { commandHasExecutedHeredocBody } from './tools/bash-safety-scan.js';
+export { commandHasExecutedHeredocBody, commandHasShellScriptHeredocBody, } from './tools/bash-safety-scan.js';
 // ── Permission Core contract / reducer ──
 export { reducePermissionClassifierDecision, reducePermissionDecision, reducePermissionEvaluation, permissionModeToProfile, } from './permission-core.js';
 export { adaptLegacyPermissionResult, evaluateLegacyPermission, } from './legacy-permission-adapter.js';

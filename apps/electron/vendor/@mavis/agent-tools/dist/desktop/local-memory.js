@@ -35,7 +35,8 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 import { bindTool } from '@mavis/agent-core/tools';
 import { MEMORY_TOOL_OUTPUT_MAX_BYTES } from '@mavis/shared/memory-limits';
 import { LocalMemoryToolDef } from './builtin-defs.js';
-import { applyDesktopTextLimit, limitDesktopHeadTailLines, } from './output-limit.js';
+import { applyDesktopTextLimit, isPtcChildCall, limitDesktopHeadTailLines, } from './output-limit.js';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 let LocalMemoryTool = (() => {
     let _classDecorators = [bindTool(LocalMemoryToolDef)];
     let _classDescriptor;
@@ -63,14 +64,42 @@ let LocalMemoryTool = (() => {
                 text: result.text,
                 content: [{ type: 'text', text: result.text }],
                 details: { kind: 'memory', ...(result.details ?? {}) },
+                // A failed operation is an error result, not text that reads like memory.
+                ...(result.details?.ok === false ? { isError: true } : {}),
             };
-            return applyDesktopTextLimit(toolResult, limitDesktopHeadTailLines(result.text, {
+            if (isPtcChildCall(ctx)) {
+                // A run_code child gets the whole text and data (see isPtcChildCall).
+                const uncappedOutput = Buffer.byteLength(result.text, 'utf8') > MEMORY_TOOL_OUTPUT_MAX_BYTES;
+                return withDesktopCompletenessReport(LocalMemoryToolDef.name, toolResult, {
+                    ...(result.data ? { data: result.data } : {}),
+                    ...(uncappedOutput ? { uncappedOutput } : {}),
+                });
+            }
+            const limited = applyDesktopTextLimit(toolResult, limitDesktopHeadTailLines(result.text, {
                 maxBytes: MEMORY_TOOL_OUTPUT_MAX_BYTES,
                 notice: () => '[Memory output truncated. Narrow the memory search query or use the read tool with a file path and offset/limit to inspect more.]',
             }));
+            const cut = limited.details?.desktop_output_truncation !== undefined;
+            const data = result.data && (cut ? memoryMetadata(result.data) : result.data);
+            return withDesktopCompletenessReport(LocalMemoryToolDef.name, limited, data ? { data } : {});
         }
     };
     return LocalMemoryTool = _classThis;
 })();
 export { LocalMemoryTool };
+/**
+ * The head+tail cut drops the middle of the text, so no content field could
+ * end where the text does; only counts and sizes survive it.
+ */
+function memoryMetadata(data) {
+    const { ok, target, operation, sizeBytes, matches, topics } = data;
+    return {
+        ok,
+        target,
+        operation,
+        ...(sizeBytes === undefined ? {} : { sizeBytes }),
+        ...(Array.isArray(matches) ? { matchCount: matches.length } : {}),
+        ...(Array.isArray(topics) ? { topicCount: topics.length } : {}),
+    };
+}
 //# sourceMappingURL=local-memory.js.map

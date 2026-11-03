@@ -75,8 +75,27 @@ const SIDE_EFFECT_FREE_COMMANDS = new Set([
 export function observeThreadGoalToolCall(call) {
     return {
         fingerprint: fingerprintThreadGoalToolCall(call),
-        readOnly: isKnownReadOnlyToolCall(call.name, call.arguments),
+        readOnly: call.name === 'run_code'
+            ? isKnownReadOnlyProgram(call.ptcChildCalls)
+            : isKnownReadOnlyToolCall(call.name, call.arguments),
     };
+}
+/**
+ * A run_code call is read-only when every tool its program called is, by the
+ * same rules as a direct call. The children come from the host envelope, never
+ * from the program text or its output. Unknown children, or a program that
+ * called no tool, keep the run_code call possibly writing. The envelope keeps
+ * a shell child's command masked for known secret patterns; a masked command
+ * is not the one that ran, so it is not judged either.
+ */
+function isKnownReadOnlyProgram(children) {
+    if (!children || children.length === 0)
+        return false;
+    return children.every((child) => !keptMasked(child, 'command') && isKnownReadOnlyToolCall(child.tool_name, child.input));
+}
+function keptMasked(child, field) {
+    const masked = child.input?.redacted_fields;
+    return Array.isArray(masked) && masked.includes(field);
 }
 /**
  * A call is read-only when it is a known read tool, or a shell tool whose whole

@@ -2,6 +2,7 @@ import { AgentShellController } from './agent-shell.controller.js';
 import { BackgroundTaskController } from './background-task.controller.js';
 import { SkillEvolveController, } from './skill-evolve.controller.js';
 import { SandboxControllerBase } from '../generated/sandbox-controller-base.gen.js';
+import { ShareControllerBase } from '../generated/share-controller-base.gen.js';
 import { AgentShellControllerBase } from '../generated/agent-shell-controller-base.gen.js';
 import { WebsiteControllerBase } from '../generated/website-controller-base.gen.js';
 import { LlmContextInspectorController } from './llm-context-inspector.controller.js';
@@ -37,6 +38,8 @@ const CLOSED_GLOBAL_EVENTS = {
 };
 const websiteController = new WebsiteControllerBase();
 const sandboxController = new SandboxControllerBase();
+/** Work Share routes stay unmounted until a host composes the share service (!8314). */
+const shareController = new ShareControllerBase();
 /**
  * 根据具名服务创建 HTTP 适配器，并装配生成的 `DesktopControllers` 映射。
  * `DesktopControllers` 负责通过类型检查保证完整性，具体控制器仍在 HTTP 层构造。
@@ -50,6 +53,7 @@ export function createControllers(services) {
         canvas: new CanvasController(services.canvas),
         events: createEventsController(services.globalEvents ?? CLOSED_GLOBAL_EVENTS),
         plugin: createPluginAdapter(services),
+        share: shareController,
         mcp: createMcpController(services.mcp, services.mcpRuntime),
         hook: createHookController(services.hookConfig),
         modelProvider: createModelProviderAdapter(services),
@@ -135,6 +139,7 @@ function createWorkspaceFileAdapter(services) {
     // test/host compositions that have no V2 Git owner.
     const useV2WorktreeOwner = Boolean(services.workspace?.git && services.workspace?.file);
     return createWorkspaceFileController({
+        ...(services.saveWorkspaceFile ? { saveWorkspaceFile: services.saveWorkspaceFile } : {}),
         ...(!useV2WorktreeOwner && services.managedWorktrees
             ? { managedWorktrees: services.managedWorktrees }
             : {}),
@@ -154,13 +159,17 @@ function hasWorkspaceFileServices(services) {
     ].some(Boolean);
 }
 function createSessionAdapter(services) {
-    if (!services.applications && !services.cronDelivery && !services.conversation) {
+    if (!services.applications &&
+        !services.cronDelivery &&
+        !services.conversation &&
+        !services.sessionActivity) {
         return sessionController;
     }
     return createSessionController({
         ...(services.applications ? { applications: services.applications } : {}),
         ...(services.cronDelivery ? { cronDelivery: services.cronDelivery } : {}),
         ...(services.conversation ? { conversation: services.conversation } : {}),
+        ...(services.sessionActivity ? { sessionActivity: services.sessionActivity } : {}),
     });
 }
 //# sourceMappingURL=create.js.map

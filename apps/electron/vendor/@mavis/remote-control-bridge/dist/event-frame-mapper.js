@@ -134,6 +134,7 @@ export function mapBusEventToFrame(type, payload, tsMs) {
                     // convention (complex archon types → JSON carrier), it ships as a
                     // JSON string rather than a re-keyed struct.
                     request_json: jsonString(payload.request),
+                    delivery_reason: str(payload.deliveryReason),
                     ts_ms: tsMs,
                 }),
             };
@@ -217,6 +218,7 @@ function compactionTokenUsage(value) {
 function threadGoalUpdated(payload, tsMs) {
     const goal = rec(payload.goal);
     const executionWait = rec(goal?.executionWait);
+    const effectiveLimits = rec(goal?.effectiveLimits);
     return {
         type: evt('thread_goal.updated'),
         payload: prune({
@@ -247,10 +249,20 @@ function threadGoalUpdated(payload, tsMs) {
                     turns_used: num(goal.turnsUsed),
                     time_used_seconds: num(goal.timeUsedSeconds),
                     token_budget: num(goal.tokenBudget),
+                    request_limit: num(goal.requestLimit),
+                    active_seconds_limit: num(goal.activeSecondsLimit),
+                    effective_limits: effectiveLimits
+                        ? prune({
+                            token_limit: num(effectiveLimits.tokenLimit),
+                            request_limit: num(effectiveLimits.requestLimit),
+                            active_seconds_limit: num(effectiveLimits.activeSecondsLimit),
+                        })
+                        : undefined,
                     execution: executionWait
                         ? prune({
                             wait_reason: str(executionWait.reason),
                             wait_since: num(executionWait.sinceMs),
+                            ...goalWaitDetails(executionWait),
                         })
                         : null,
                 })
@@ -258,6 +270,28 @@ function threadGoalUpdated(payload, tsMs) {
             ts_ms: tsMs,
         }),
     };
+}
+/** The background wait details of `GoalExecutionState`, absent unless the runtime sent them. */
+function goalWaitDetails(executionWait) {
+    const waitedTasks = Array.isArray(executionWait.waitedTasks)
+        ? executionWait.waitedTasks.flatMap((entry) => {
+            const task = rec(entry);
+            return task
+                ? [
+                    prune({
+                        task_id: str(task.taskId),
+                        name: str(task.name),
+                        started_at: nonNegativeNum(task.startedAt),
+                    }),
+                ]
+                : [];
+        })
+        : undefined;
+    return prune({
+        waited_tasks: waitedTasks,
+        finished_task_count: nonNegativeNum(executionWait.finishedTaskCount),
+        background_tasks_unreadable: executionWait.backgroundTasksUnreadable === true ? true : undefined,
+    });
 }
 function str(value) {
     return typeof value === 'string' && value.length > 0 ? value : undefined;

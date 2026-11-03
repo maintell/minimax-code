@@ -7,7 +7,7 @@ import { readFrozenTaskOwner } from './frozen-task-owner.js';
 import { asAgentConfigServiceError, createAgentPromptSelection, buildAgentGreetingReminder, readCanonicalAgentConfig, readCanonicalCustomAvatar, readBuiltinAgentContent, renderAgentProfile, renderFrozenAgentProfile, resolveAgentProfileRenderContext, } from './agent-profile.js';
 import { parseCanonicalAgentMarkdown, } from '../storage/canonical-agent-config.js';
 import { deleteAgentAllowingInvalidConfig } from './agent-delete-recovery.js';
-import { rebuildBuiltinCanonicalFiles, } from './config/builtin-canonical-files.js';
+import { rebuildBuiltinCanonicalFiles, reseedMissingBuiltinCanonicalFile, } from './config/builtin-canonical-files.js';
 import { AgentConfigDocuments } from './config/agent-config-documents.js';
 import { toConfiguredModelSelection } from './config/config-document.js';
 import { convergeLegacyPrimaryProfile, detachLegacyBuiltinIdentities, } from './_migration-legacy-identity-detach.js';
@@ -564,7 +564,15 @@ export class LocalAgentService extends AgentConfigDocuments {
             repository: this.options.repository,
             catalog: this.catalog,
             resolveContext: (input) => this.resolveProfileRenderContext(input),
+            reseedMissingBuiltinConfig: (name) => this.reseedMissingBuiltinConfig(name),
         };
+    }
+    /** Same template and model group as the startup seed; see renderBuiltinProfile. */
+    async reseedMissingBuiltinConfig(name) {
+        const definition = await this.definitionFor(name);
+        if (!definition)
+            return;
+        await reseedMissingBuiltinCanonicalFile({ ...this.builtinSeedInput(), definition });
     }
     listBuiltinDefinitions() {
         return this.catalog.listDefinitions();
@@ -653,17 +661,22 @@ export class LocalAgentService extends AgentConfigDocuments {
         return this.list();
     }
     rebuildBuiltinDefinitions(definitions) {
-        return rebuildBuiltinCanonicalFiles({
+        return rebuildBuiltinCanonicalFiles({ ...this.builtinSeedInput(), definitions });
+    }
+    builtinSeedInput() {
+        return {
             repository: this.options.repository,
             catalog: this.catalog,
-            definitions,
             ...(this.builtinModelGroupResolver
                 ? { modelGroupResolver: this.builtinModelGroupResolver }
                 : {}),
             ...(this.bundledBuiltinModelGroup
                 ? { bundledModelGroup: this.bundledBuiltinModelGroup }
                 : {}),
-        });
+            ...(this.options.reportBuiltinConfigRepair
+                ? { report: this.options.reportBuiltinConfigRepair }
+                : {}),
+        };
     }
     async insertBuiltinDefinition(definition, now) {
         // Detached historic Agents keep their own rows, Sessions and definitions.

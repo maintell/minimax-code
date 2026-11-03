@@ -80,6 +80,9 @@ export class V1ConversationCompatibilityService {
                     completion: this.resolveAcceptedTurn(input.sessionId, result.turnId, result.completion),
                 };
             }
+            if (result.mode === 'queued') {
+                return { turnId: result.turnId, mode: 'queued', queue: result.queue };
+            }
             return { turnId: result.turnId, mode: result.mode };
         },
         listQueued: async (sessionId) => (await this.options.sessions.queue.list(sessionId)).map(toQueuedItem),
@@ -305,6 +308,7 @@ function sessionPresentation(input) {
     return {
         ...(input.title !== undefined ? { title: input.title } : {}),
         ...(input.runLocation ? { runLocation: input.runLocation } : {}),
+        ...(input.runLocationRequest ? { runLocationRequest: input.runLocationRequest } : {}),
         ...(input.appMode ? { appMode: input.appMode } : {}),
     };
 }

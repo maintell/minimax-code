@@ -41,6 +41,21 @@ export function restartsOrRetargetsGoal(patch) {
         patch.tokenBudget !== undefined);
 }
 /**
+ * An objective edit resets the Goal's limits (Limit Reset): every cap the
+ * edit does not set itself is cleared, so the Goal Turn that follows takes
+ * the caps the new objective states. Used amounts are untouched.
+ */
+export function withLimitResetOnObjectiveEdit(patch) {
+    if (patch.objective === undefined)
+        return patch;
+    return {
+        ...patch,
+        tokenBudget: patch.tokenBudget === undefined ? null : patch.tokenBudget,
+        requestLimit: patch.requestLimit === undefined ? null : patch.requestLimit,
+        activeSecondsLimit: patch.activeSecondsLimit === undefined ? null : patch.activeSecondsLimit,
+    };
+}
+/**
  * Derive the user-authored status reason a bare status patch implies.
  *
  * This lives in the domain rather than in the wire contract: a `PatchGoalReq`

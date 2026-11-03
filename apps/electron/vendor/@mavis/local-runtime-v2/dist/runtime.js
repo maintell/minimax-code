@@ -1,15 +1,14 @@
-import { LocalQuestionnaireService, acquireLocalRuntimeMigrationLock, createLocalRuntimeHost as createLocalRuntimeHostV1, ensureCurrentLocalRuntimeDataMigratedToV2OrThrow, isLocalRuntimeStartupExecutionEnabled, createDeferredLocalAgentRuntimePort, resolveAgentBashEnvPolicy, buildLocalTrajectoryId, } from '@mavis/local-runtime';
+import { acquireLocalRuntimeMigrationLock } from '@mavis/shared/local-runtime-migration-lock';
 import { DeferredRuntimeConversation } from '@mavis/conversation-contract';
-import { ownsElectronRuntimeCapabilities, startupRecoveryFaultOption, } from './application/index.js';
+import { bindImFollowUpHostPorts, ownsElectronRuntimeCapabilities, startupRecoveryFaultOption, } from './application/index.js';
 import { logger } from '@mavis/shared/local-runtime-logging';
 import { redactErrorForLog } from '@mavis/shared/logging/redact-log-secret';
 import { createBackgroundRuntime } from './background-runtime.js';
-import { cleanupFailedV1Startup, createV1RuntimeCompatibility, createDeferredAgentRuntimeTelemetry, withAgentStorageScope, } from './compat/v1/runtime.js';
-import { createLocalRuntimeV2FrontDoor, createV2AgentRuntimeManagementPort, ownerCapabilitiesForServices, } from './http/app.js';
-import { DatabaseClient } from './infra/db/client.js';
-import { databaseInitializationTimingFields, initializeDatabase, migrationSafeModeWarning, } from './infra/db/initialize.js';
+import { createDeferredAgentRuntimeTelemetry, createV1RuntimeBridges, } from './compat/v1/runtime.js';
+import { cleanupFailedV1Startup, createV1RuntimeCompatibility, withAgentStorageScope, createLocalRuntimeV2FrontDoor, createLocalRuntimeHost as createLocalRuntimeHostV1, createV2AgentRuntimeManagementPort, ownerCapabilitiesForServices, } from './http/app.js';
+import { databaseInitializationTimingFields, initializeRuntimeStorage, migrationSafeModeWarning, } from './infra/db/initialize.js';
 import { createCliService } from './local/app.js';
-import { createRuntimeAgentComposition, bindAskUserRuntimeProbes, createDeferredLocalSandboxBashOperationsFactory, createRuntimeServices, prepareRuntimeServices, } from './services.js';
+import { createRuntimeAgentComposition, bindAskUserRuntimeProbes, createRuntimeServicePorts, createRuntimeServices, prepareRuntimeServices, } from './services.js';
 const V2_LAYOUT_MIGRATION_RECEIPT_CARRIER = Symbol.for('mavis.local-runtime.v2-layout-migration-receipt');
 /** Creates a fully initialized local runtime. The returned compatibility `ready` is resolved. */
 export function createLocalRuntimeHostV2(options) {
@@ -33,14 +32,11 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
     let v1;
     let legacyClose;
     let ownerRuntime;
-    const agentRuntimePort = createDeferredLocalAgentRuntimePort();
-    const getConfig = () => v1?.apiHost.configGetter() ?? options.configGetter?.();
-    const sandboxOperationsFactory = createRuntimeSandboxOperationsFactory(options, getConfig);
     const agentTelemetry = createDeferredAgentRuntimeTelemetry();
     let database;
     let preparedServices;
     const startupStartedAtMs = Date.now();
-    const { stageTimings, measureStage, measureStageAsync } = createStartupStageTimer();
+    const { stageTimings, measureStageAsync } = createStartupStageTimer();
     try {
         // 2026-09-03: the startup generation checkpoint (whole-dataDir copy +
         // fingerprint verification for the manual `generation rollback` CLI) was
@@ -61,31 +57,18 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
         // Layout migration must complete before the authoritative V2 target is
         // opened.  The services composition below gates all legacy access on the
         // target Agent row count.
-        let completedLayoutMigration;
-        let initialization;
+        let storage;
         try {
-            completedLayoutMigration = measureStage('layout_migration_ms', () => ensureCurrentLocalRuntimeDataMigratedToV2OrThrow(() => options.dataDir, options.nowMs));
-            database = measureStage('db_open_ms', () => new DatabaseClient({
+            storage = await initializeRuntimeStorage({
                 dataDir: options.dataDir,
-                ...(overrides.database?.sqlite3ModulePath
-                    ? { sqlite3ModulePath: overrides.database.sqlite3ModulePath }
-                    : {}),
-            }));
-            const lockedDatabase = database;
-            initialization = await measureStageAsync('db_initialize_ms', () => initializeDatabase({
-                database: lockedDatabase,
-                dataDir: options.dataDir,
+                nowMs: options.nowMs,
+                sqlite3ModulePath: overrides.database?.sqlite3ModulePath,
                 onMigration: options.onDatabaseMigration,
-            }));
-            reportLegacySessionRecovery({
-                recoveredLegacySessionCount: initialization.recoveredLegacySessionCount,
-                degradedLegacySessionCount: initialization.degradedLegacySessionCount,
+                stageTimings,
             });
-            reportProjectMigrationRecovery({
-                recoveredProjectPreferenceCount: initialization.recoveredProjectPreferenceCount,
-                skippedSessionProjectRepairCount: initialization.skippedSessionProjectRepairCount,
-            });
-            reportDatabaseInitializationWarnings(initialization);
+            database = storage.database;
+            const lockedDatabase = storage.database;
+            reportStorageInitialization(storage.initialization);
             // The Agent cutover reads and rewrites legacy Agent storage, so it runs
             // under this lock instead of taking a lock of its own.
             agentOwner = await measureStageAsync('agent_composition_ms', () => createRuntimeAgentComposition({
@@ -105,14 +88,19 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
         finally {
             migrationLock.release();
         }
-        const resolvedDatabase = database;
-        if (!resolvedDatabase)
-            throw new Error('V2 database was not initialized');
+        const resolvedDatabase = storage.database;
+        const { initialization, layoutMigration: completedLayoutMigration } = storage;
+        const getConfig = () => v1?.apiHost.configGetter() ?? options.configGetter?.();
+        const { agentRuntimePort, sandboxOperationsFactory } = createRuntimeServicePorts({
+            sandboxEnabled: () => options.configGetter?.().sandbox?.enabled ?? false,
+            bashEnvPolicy: (plan) => storage.resolveBashEnvPolicy(plan?.nativeDelete ?? getConfig()?.permission?.nativeDelete === true),
+            getSkipParentDeathGuard: () => options.runtimeOwnerKind === 'tui' && getConfig()?.skipParentDeathGuard === true,
+        });
         agentRuntimePort.bindResolver(agentOwner.service);
         preparedServices = compatibility
             ? prepareRuntimeServices({
                 ...options,
-                db: database.db,
+                db: resolvedDatabase.db,
             })
             : undefined;
         const configuredOptions = configureV1HostOptions(options, compatibility, agentRuntimePort, {
@@ -221,9 +209,8 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
 function createV1Compatibility(ownsV2Runtime) {
     if (!ownsV2Runtime)
         return undefined;
-    return createV1RuntimeCompatibility(new DeferredRuntimeConversation(), {
-        createQuestionnaireService: (host) => new LocalQuestionnaireService(host.apiHost.questionnaireServiceDeps()),
-    });
+    const conversation = new DeferredRuntimeConversation();
+    return createV1RuntimeCompatibility(createV1RuntimeBridges(conversation));
 }
 async function startChannelSubsystemAfterOwnerAgentDefinitions(ownerRuntime, apiHost, onOwnerChannelStartupSettled) {
     try {
@@ -262,15 +249,6 @@ function reportDetachedOwnerChannelStartupTiming(startupStartedAtMs, channelStar
 /** Collects per-stage wall-clock timings for the startup telemetry line. */
 function createStartupStageTimer() {
     const stageTimings = {};
-    const measureStage = (stage, run) => {
-        const stageStartedAtMs = Date.now();
-        try {
-            return run();
-        }
-        finally {
-            stageTimings[stage] = Math.max(0, Date.now() - stageStartedAtMs);
-        }
-    };
     const measureStageAsync = async (stage, run) => {
         const stageStartedAtMs = Date.now();
         try {
@@ -280,7 +258,7 @@ function createStartupStageTimer() {
             stageTimings[stage] = Math.max(0, Date.now() - stageStartedAtMs);
         }
     };
-    return { stageTimings, measureStage, measureStageAsync };
+    return { stageTimings, measureStageAsync };
 }
 function createStartedHost(v1, ownerRuntime, ready) {
     const cliService = ownerRuntime ? createCliService(ownerRuntime.services) : undefined;
@@ -408,6 +386,18 @@ function reportStartupTimings(input) {
     }
 }
 /** A degraded database (safe mode) warns on every boot. */
+/** Startup storage facts are reported while the migration lock still holds the segment. */
+function reportStorageInitialization(initialization) {
+    reportLegacySessionRecovery({
+        recoveredLegacySessionCount: initialization.recoveredLegacySessionCount,
+        degradedLegacySessionCount: initialization.degradedLegacySessionCount,
+    });
+    reportProjectMigrationRecovery({
+        recoveredProjectPreferenceCount: initialization.recoveredProjectPreferenceCount,
+        skippedSessionProjectRepairCount: initialization.skippedSessionProjectRepairCount,
+    });
+    reportDatabaseInitializationWarnings(initialization);
+}
 function reportDatabaseInitializationWarnings(initialization) {
     const warning = migrationSafeModeWarning(initialization);
     if (warning)
@@ -539,6 +529,7 @@ function bindOwnerRuntimeIntegrations(input) {
     // V2 Turn system exists. V1-only hosts (and partial test graphs) keep
     // the probe unset, which means never suppress.
     bindAskUserRuntimeProbes(apiHost, ownerRuntime.services.turnSystem);
+    bindImFollowUpHostPorts(apiHost, ownerRuntime.services);
 }
 /**
  * MR2 two-phase assembly, phase 2: hand the v2-owned channel subsystem to
@@ -642,7 +633,7 @@ async function initializeOwnerRuntime(input) {
     let background;
     let services;
     try {
-        const startupExecutionEnabled = isLocalRuntimeStartupExecutionEnabled(options.startupExecutionPolicy);
+        const startupExecutionEnabled = options.startupExecutionPolicy !== 'quarantined';
         const electronOwner = options.runtimeOwnerKind === 'electron';
         background = await createBackgroundRuntime({
             db: database.db,
@@ -654,6 +645,7 @@ async function initializeOwnerRuntime(input) {
             // The SSH app-server owns long-lived scheduled work independently of
             // attached Desktop clients. Interactive CLI/TUI hosts remain timer-free.
             enableScheduler: ownsBackgroundScheduler(options.runtimeOwnerKind),
+            enableHeapUsageMetrics: ownsBackgroundScheduler(options.runtimeOwnerKind),
         });
         services = await createRuntimeServices({
             db: database.db,
@@ -684,7 +676,6 @@ async function initializeOwnerRuntime(input) {
             getRunawayGuardConfig: options.getRunawayGuardConfig,
             getPromptSuggestionPolicy: options.getPromptSuggestionPolicy,
             promptSuggestionSurface: options.promptSuggestionSurface,
-            promptSuggestionUngated: options.promptSuggestionUngated,
             resolveComputerUseCapture: options.resolveComputerUseCapture,
             ...(options.getToolResultCompactionConfig
                 ? {
@@ -698,7 +689,6 @@ async function initializeOwnerRuntime(input) {
                 // Clio ships through it rather than opening its own route to the server.
                 gateway: () => v1.evalReporterFactory,
                 authContext: () => options.authContextGetter?.(),
-                trajectoryId: buildLocalTrajectoryId,
                 // Capture follows its own switch, not raw Eval sampling. Recording is
                 // durable and offline-tolerant, so it stays on while a token is absent;
                 // only the upload waits for receiving capabilities to be ready.
@@ -726,9 +716,6 @@ async function initializeOwnerRuntime(input) {
 }
 function exposeComputerUseClient(client) {
     return client ? { computerUseClient: client } : {};
-}
-function createRuntimeSandboxOperationsFactory(options, getConfig) {
-    return createDeferredLocalSandboxBashOperationsFactory(() => options.configGetter?.().sandbox?.enabled ?? false, (plan) => resolveAgentBashEnvPolicy(options.dataDir, process.platform, plan?.nativeDelete ?? getConfig()?.permission?.nativeDelete === true), () => options.runtimeOwnerKind === 'tui' && getConfig()?.skipParentDeathGuard === true);
 }
 function sandboxRuntimeOptions(options) {
     const sandboxConfig = options.configGetter?.().sandbox;

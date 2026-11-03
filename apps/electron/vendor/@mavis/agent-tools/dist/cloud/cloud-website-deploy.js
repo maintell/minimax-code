@@ -59,7 +59,8 @@ export const WebsiteDeployToolDef = {
         'can view the deployed site. Before invoking this tool you MUST: (1) tell the user the ' +
         'site will be publicly accessible, (2) get explicit confirmation to publish. Do NOT ' +
         'auto-invoke without confirmation, even if the user previously asked to "deploy" or ' +
-        '"build a website" — confirm at the moment of publishing. `source_path` is required and ' +
+        '"build a website" — ask for confirmation in your reply and publish only after the user\'s ' +
+        'next message confirms. `source_path` is required and ' +
         'uploaded to private storage as a separate source archive. Before invoking, tell the user ' +
         'about that private source upload and ask them to confirm it contains no secrets. `.env*`, ' +
         '`.git`, `node_modules`, and symlinks are excluded, but this is not a secrets scanner.\n\n' +

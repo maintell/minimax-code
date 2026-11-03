@@ -5,7 +5,7 @@ import { isTaskSession } from '../repo/drizzle/normalization.js';
 import { isAgentNotFoundError, reportDeletedAgentBackfillSkip, } from './backfill-diagnostics.js';
 import { SessionServiceError } from '../errors.js';
 import { isDefaultProjectWorkspace } from '../../shared/project-workspace.js';
-import { appModeFields, assertNativeMutation, assertTaskParent, createDefaultWorkspaceIdentity, errorMessage, internalDefaultWorkspaceIdentity, internalExplicitWorkspaceDir, metadataSessionKind, modelFieldsFromDefinition, modelKey, nonEmpty, normalizeAppMode, normalizeSessionMutation, optionalModelVariant, sessionCaptureCandidate, sessionNotFound, taskMemoryPolicyFor, taskWorkspaceFor, visibilityForInternalKind, visibilityForKind, whenDefined, whenPresent, } from './record-service-fields.js';
+import { appModeFields, assertNativeMutation, assertTaskParent, createDefaultWorkspaceIdentity, errorMessage, internalDefaultWorkspaceIdentity, internalExplicitWorkspaceDir, resolveRequestedRunLocation, metadataSessionKind, modelFieldsFromDefinition, modelKey, nonEmpty, normalizeAppMode, normalizeSessionMutation, optionalModelVariant, sessionCaptureCandidate, sessionNotFound, taskMemoryPolicyFor, taskWorkspaceFor, visibilityForInternalKind, visibilityForKind, whenDefined, whenPresent, } from './record-service-fields.js';
 export class SessionRecordService {
     deps;
     captureAgentShell;
@@ -191,14 +191,14 @@ export class SessionRecordService {
             taskCapture,
         };
     }
-    async prepareInternalSessionCreate(input) {
+    async prepareInternalSessionCreate(requested) {
         const sessionId = this.makeSessionId();
-        const agent = await this.requireAgentDefaults(input.agentName);
-        const parent = await this.resolveParent(input.parentSessionId);
-        const sessionKind = input.sessionKind ?? 'conversation';
+        const agent = await this.requireAgentDefaults(requested.agentName);
+        const parent = await this.resolveParent(requested.parentSessionId);
+        const sessionKind = requested.sessionKind ?? 'conversation';
         assertTaskParent(sessionKind, parent);
         const taskWorkspace = taskWorkspaceFor(sessionKind, parent);
-        const explicitWorkspaceDir = taskWorkspace ?? internalExplicitWorkspaceDir(input);
+        const explicitWorkspaceDir = taskWorkspace ?? internalExplicitWorkspaceDir(requested);
         const workspace = await this.resolveCreateWorkspace({
             sessionId,
             sessionKind,
@@ -206,6 +206,8 @@ export class SessionRecordService {
             explicitWorkspaceDir,
             agent,
         });
+        const runLocation = await resolveRequestedRunLocation(requested, workspace.workspaceDir, (r, dir) => this.resolveRunLocation(r, dir));
+        const input = { ...requested, ...whenPresent('runLocation', runLocation) };
         const appMode = input.appMode ?? parent?.appMode;
         const sessionType = input.sessionType ?? 'branch';
         const isDefaultWorkspace = taskWorkspace !== undefined
@@ -459,12 +461,14 @@ export class SessionRecordService {
     }
     async createRecord(input) {
         const capture = await this.captureAgentShell?.(input.parentSessionId);
+        const toolCallMode = input.toolCallMode ?? this.deps.toolCallMode?.current();
         const created = await this.deps.metadata.create({
             ...input,
             ...(capture?.agentShell ? { agentShell: capture.agentShell } : {}),
             ...(capture?.agentShellPreference
                 ? { agentShellPreference: capture.agentShellPreference }
                 : {}),
+            ...(toolCallMode ? { toolCallMode } : {}),
         });
         try {
             await this.deps.artifacts?.initialize(created.sessionId);
@@ -543,6 +547,7 @@ function toInternalMetadataCreateInput(context) {
         ...internalBindingFields(context.taskCapture, context.forkedAgentDefinition),
         origin: context.input.origin ?? 'user',
         ...whenPresent('createdBySessionId', context.input.createdBySessionId),
+        ...whenPresent('toolCallMode', context.input.toolCallMode),
     };
 }
 function metadataIdentityFields(context, sessionKind) {

@@ -1,4 +1,4 @@
-import { globalRequestAccounting, globalTokenUsage, globalUsageRecovery, } from '../../service/goal/index.js';
+import { globalEffectiveLimits, globalExecutionWait, globalOwnLimits, globalRequestAccounting, globalTokenUsage, globalUsageRecovery, } from '../../service/goal/index.js';
 import { ThreadGoalContractError } from './goal-contract.js';
 /** Process-local (TUI / CliService) facade over the single Goal owner. */
 export function createProcessLocalGoalApplication(integration, isReadOnlyLegacySession) {
@@ -16,7 +16,7 @@ export function createProcessLocalGoalApplication(integration, isReadOnlyLegacyS
         get: async (sessionId) => {
             requireEnabled();
             const state = await integration.getGoalForResponse(requireGoalSessionId(sessionId));
-            return state ? toProcessLocalGoal(state) : undefined;
+            return state ? toProcessLocalGoal(state, integration) : undefined;
         },
         create: async ({ sessionId, objective: rawObjective, tokenBudget, kickoffAttachments }) => {
             requireEnabled();
@@ -30,7 +30,7 @@ export function createProcessLocalGoalApplication(integration, isReadOnlyLegacyS
                 ...(kickoffAttachments?.length ? { kickoffAttachments } : {}),
             };
             const created = await integration.createGoal(input, { requireKickoffAdmission: true });
-            return toProcessLocalGoal(created);
+            return toProcessLocalGoal(created, integration);
         },
         patch: async (sessionId, patch) => {
             requireEnabled();
@@ -44,7 +44,7 @@ export function createProcessLocalGoalApplication(integration, isReadOnlyLegacyS
                 : await integration.patchGoal(normalizedSessionId, normalizeProcessLocalGoalPatch(patch));
             if (!updated)
                 throw goalNotFound(normalizedSessionId);
-            return toProcessLocalGoal(updated);
+            return toProcessLocalGoal(updated, integration);
         },
         resume: async (sessionId) => {
             requireEnabled();
@@ -55,7 +55,7 @@ export function createProcessLocalGoalApplication(integration, isReadOnlyLegacyS
             });
             if (!result)
                 throw goalNotFound(normalizedSessionId);
-            return toProcessLocalGoalResume(result.goal, result.resume);
+            return toProcessLocalGoalResume(result.goal, result.resume, integration);
         },
         clear: async (sessionId) => {
             requireEnabled();
@@ -71,8 +71,8 @@ export function createProcessLocalGoalApplication(integration, isReadOnlyLegacyS
             : undefined,
     };
 }
-function toProcessLocalGoalResume(goal, resume) {
-    const projected = toProcessLocalGoal(goal);
+function toProcessLocalGoalResume(goal, resume, owner) {
+    const projected = toProcessLocalGoal(goal, owner);
     // A resume that changed nothing about a non-active Goal (for example a
     // `complete` one the store refused) has no outcome of its own.
     if (!resume)
@@ -107,7 +107,7 @@ function normalizeProcessLocalGoalPatch(patch) {
         ...(patch.tokenBudget !== undefined ? { tokenBudget: patch.tokenBudget } : {}),
     };
 }
-function toProcessLocalGoal(state) {
+function toProcessLocalGoal(state, owner) {
     return {
         goalId: state.goalId,
         sessionId: state.sessionId,
@@ -120,8 +120,10 @@ function toProcessLocalGoal(state) {
         turnsUsed: state.turnsUsed,
         timeUsedSeconds: state.timeUsedSeconds,
         tokenBudget: state.tokenBudget,
+        ...globalOwnLimits(state),
+        ...globalEffectiveLimits(owner.effectiveBudgetLimits(state)),
         statusReason: state.statusReason,
-        executionWait: state.executionWait,
+        executionWait: globalExecutionWait(state.executionWait),
         ...(state.lastVerification !== undefined
             ? {
                 lastVerification: {

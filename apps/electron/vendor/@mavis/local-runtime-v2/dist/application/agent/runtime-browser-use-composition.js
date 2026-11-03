@@ -3,6 +3,10 @@ import { initializeBrowserUseService, } from '../../service/browser-use/index.js
 export function ownsElectronRuntimeCapabilities(runtimeOwnerKind) {
     return runtimeOwnerKind === undefined || runtimeOwnerKind === 'electron';
 }
+/** Cron and other scheduled owners also run in the headless app-server. */
+export function ownsScheduledRuntimeCapabilities(runtimeOwnerKind) {
+    return ownsElectronRuntimeCapabilities(runtimeOwnerKind) || runtimeOwnerKind === 'app-server';
+}
 export function createRuntimeBrowserUseComposition(options) {
     const service = initializeBrowserUseService({
         ...(options.browserUse?.adapter ? { adapter: options.browserUse.adapter } : {}),

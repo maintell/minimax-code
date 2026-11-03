@@ -1,4 +1,5 @@
 import { logger } from '../../infra/logging/index.js';
+import { readBackgroundTaskFacts } from './admission/dependency-gates.js';
 import { LocalThreadGoalKickoffQueue, } from './continuation/kickoff-host.js';
 import { createGoalConversationPorts } from './execution/conversation-ports.js';
 import { DeferredGoalConversation } from './execution/deferred-conversation.js';
@@ -54,7 +55,8 @@ export function initializeGoalService(input) {
         settleOverdueGoalQuestionnaire: (sessionId, goalId) => questionnairePolicy.settleOverdue(sessionId, goalId),
         hasPendingPermission: host.hasPendingPermission,
         hasAutomationOwnerConflict: host.hasAutomationOwnerConflict,
-        listUnfinishedBackgroundTasks: host.listUnfinishedBackgroundTasks,
+        listUnfinishedBackgroundTasks: readBackgroundTaskFacts(host.listUnfinishedBackgroundTasks),
+        listFinishedBackgroundTasks: readBackgroundTaskFacts(host.listFinishedBackgroundTasks),
         isGoalVerifierChildSession: host.isGoalVerifierChildSession,
         sessionExists: host.sessionExists,
         ...createGoalConversationPorts({

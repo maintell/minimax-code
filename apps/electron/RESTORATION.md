@@ -9,16 +9,17 @@ a locally installed client.
 
 | | |
 | --- | --- |
-| Installed client | `MiniMax Code` 3.1.6 (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
-| Application | `@mmx-agent/electron` 3.1.6, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
+| Installed client | `MiniMax Code` 3.1.10, taken from the updater's pending installer (`%LOCALAPPDATA%\@mmx-agentelectron-updater\pending\MiniMax Code Setup 3.1.10.exe` → `app-64.7z`) because the installed client was still 3.1.6 |
+| Application | `@mmx-agent/electron` 3.1.10, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
 | Identity | appId `com.minimax.agent.cn`, runtime app name `MiniMax`, user data `%APPDATA%\MiniMax` |
-| Package | `resources/app.asar` (353 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+| Package | `resources/app.asar` (356 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
 
 Version history of this recovery:
 
 | App | Date | Notes |
 | --- | --- | --- |
-| 3.1.6 | 2026-10-27 | Current. Renderer assets moved out of `public/`: the shipped `public/` keeps only the six files the main process and the plugin pages load, and `out/assets/**` carries the images. New packaged Computer Use component (`resources/computer-use/0.34.1/win32-x64/**`) and the vendored `@mavis/computer-use` package it is driven by; mini-app speech/tool IPC, browser device-preview and permission-panel modules are new. `pptx-core` moved to a new content hash. Main process: 357 files (was 346). |
+| 3.1.10 | 2026-11-03 | Current. The v1 local runtime is gone: the shipped tree no longer carries `@mavis/local-runtime` (57 packages remain vendored), and `@mavis/local-runtime-v2` grows by ~700 files. Embedded browser rework in the main process — `native-browser-view`, `webview-browser-view`, guest registry/input, backend policy store, telemetry runtime plus a sanitizer, full-page capture and downloads (`main/modules/browser/**`, `main/ipc/browser*.ipc.ts`). New `main/modules/file-open-with/**` (Windows "打开方式" enhancement, with a generated text-type list), `main/modules/deeplink/workspace-open.ts`, `main/utils/default-project-dir.ts`, auth refresh diagnostics/environment, `data-dir-relocation-guard` and `cua-overlay-target`. `resources/file-associations.nsh` stops writing `OpenWithProgids` (it lists `SupportedTypes` instead), `pptx-core` moved to new content hashes, the session-transfer client was rebuilt, and the QuickJS wasm runtime (`quickjs-emscripten`, `quickjs-emscripten-core`, `@jitl/*`) joins the unpacked set. `@opentelemetry/*` is no longer a direct dependency (transitive only). Main process: 388 files (was 357). |
+| 3.1.6 | 2026-10-27 | Renderer assets moved out of `public/`: the shipped `public/` keeps only the six files the main process and the plugin pages load, and `out/assets/**` carries the images. New packaged Computer Use component (`resources/computer-use/0.34.1/win32-x64/**`) and the vendored `@mavis/computer-use` package it is driven by; mini-app speech/tool IPC, browser device-preview and permission-panel modules are new. `pptx-core` moved to a new content hash. Main process: 357 files (was 346). |
 | 3.1.4 | 2026-10-20 | New `@minimax/mcode-app-server-protocol` dependency, an SSH runtime (`main/modules/ssh-runtime/**`), mini-app agent IPC and detached windows; the Word/Excel editor IPC modules are gone. Renderer grew ~14 MB. |
 | 3.1.1 | 2026-10-17 | Initial recovery. |
 
@@ -26,7 +27,7 @@ Version history of this recovery:
 
 | Part | Method | Fidelity |
 | --- | --- | --- |
-| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **352 of 357 files byte-identically**; the remaining 5 files differ only in the *order* of adjacent export-assignment statements, and one of them additionally inlines an arrow function into its export assignment (9 lines total, semantically inert). See "Verification" below. |
+| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **382 of 388 files byte-identically**; the remaining 6 files differ only in the *order* of adjacent export-assignment statements, and one of them additionally inlines an arrow function into its export assignment (10 lines total, semantically inert). See "Verification" below. |
 | Renderer (`out/**`) | Committed as the prebuilt static Next.js export. | Byte-identical to the shipped `out/`. The upstream UI sources are not part of this distribution and the build carries no source maps, so a source recovery is not possible. |
 | `public/**` | Committed as-is from the shipped app root. | Byte-identical. 3.1.6 moved the renderer images into `out/assets/**`, so only six files remain: the prompt-config key carriers the main process reads (`public/assets/img/breakDown.png`, `computer_use.png`, see `main/config/prompt-config-key.ts`) and four plugin/permission images the renderer loads. The directory stays a runtime dependency, not only renderer input. |
 | Model menu (`model-menu/**`) | Committed as the prebuilt Vite build output. | Byte-identical. |
@@ -40,10 +41,11 @@ Version history of this recovery:
 
 1. **Emit equivalence.** `tools/restore/verify-main.mjs` compiles `main/**` with
    the app `tsconfig.json` and diffs every emitted file against the shipped
-   `dist/main`. Result: 352/357 identical, 5 files with export-order-only
+   `dist/main`. Result: 382/388 identical, 6 files with export-order-only
    differences (`config/env.js`, `ipc/documentPreview.ipc.js`,
    `modules/desktop-appearance.js`, `modules/document-preview/artifact-protocol.js`,
-   `modules/local-runtime/computer-use/component-release.js`),
+   `modules/local-runtime/computer-use/component-release.js`,
+   `modules/observability/browser-telemetry-sanitizer.js`),
    1 prebuilt bundle copied verbatim. The differences are caused by information
    the CommonJS build erases (the position of bare `export {}` re-export
    statements, the hoisting order of exported function assignments, and whether
@@ -57,7 +59,11 @@ Version history of this recovery:
    the renderer from `out/`, the local-runtime utility process reaches the
    `modules-loaded` bootstrap stage, and mcode-tools initializes its launchers
    and auth-lease endpoint in the isolated data directory.
-   Two defects were found and fixed during this verification:
+   This run was performed for 3.1.6. For 3.1.10 the same check is deferred to
+   the packaging run of the `Desktop release` workflow: the update was verified
+   by compile equivalence and the contract checks below, not by booting a
+   packaged build locally.
+   Two defects were found and fixed during the 3.1.6 verification:
    - `public/**` must ship at the app root: the main process reads the
      prompt-config key carriers from `public/assets/img/*.png`
      (`main/config/prompt-config-key.ts`), so the directory is a runtime
@@ -72,7 +78,7 @@ Version history of this recovery:
 
 ## Known deviations
 
-1. **Export-order-only diffs** — the 5 files listed above; 9 lines total.
+1. **Export-order-only diffs** — the 6 files listed above; 10 lines total.
 2. **Erased type annotations.** The shipped build erased all TypeScript types.
    The recovered sources compile to the same JavaScript but do not satisfy a
    full type check (`pnpm typecheck:strict` reports ≈5.3k diagnostics, dominated
@@ -137,7 +143,15 @@ loudly instead of silently restoring the shipped behaviour.
 
 Third-party dependencies are installed from npm at the exact versions the
 shipped client resolved for its direct dependencies, and `package.json`
-(`pnpm.overrides`) pins the rest of the closure:
+(`pnpm.overrides`) pins the rest of the closure. 3.1.10 declares no direct
+`@opentelemetry/*` dependency any more; the two packages stay in the closure
+(and in `pnpm.overrides`, `api` 1.9.0 / `semantic-conventions` 1.44.0) because
+`@mistralai/mistralai`, `drizzle-orm` and the nested `@earendil-works/pi-ai`
+copy require them. The v1 local runtime is gone as well: `@mavis/local-runtime`
+no longer exists in the shipped `node_modules`, so `vendor/**` carries only
+`@mavis/local-runtime-v2`.
+
+The policy for that pinning:
 
 - Single-version packages are pinned to the shipped version.
 - Packages missing from a fresh resolution are added back at the shipped

@@ -3,6 +3,7 @@ import path from "node:path";
 import { isEn } from "../../../config/env";
 import { getCategoryLogger } from "../../../utils/logger";
 import { registerTransparentWindow } from "../../../windows/utils";
+import { displayForOverlayTarget } from "./cua-overlay-target";
 const logger = getCategoryLogger('main', 'computer-use');
 // Navigation is intercepted locally; this is an action marker, not a network endpoint.
 const STOP_URL = 'https://computer-use.invalid/stop';
@@ -76,33 +77,48 @@ export class CuaDesktopOverlay {
             this.displayLayout = currentDisplayLayout();
             const iconPath = path.join(app.getAppPath(), 'public', 'assets', 'logo', 'agentLogo.png');
             const icon = nativeImage.createFromPath(iconPath).toDataURL();
-            for (const display of screen.getAllDisplays()) {
-                // Electron display bounds are already DIP; keep each display's own origin and scale.
-                this.createWindow(display.bounds, 'edge', icon);
-                this.createWindow({
-                    x: display.workArea.x,
-                    // Below a top taskbar or menu bar on both platforms.
-                    y: display.workArea.y + 24,
-                    width: display.workArea.width,
-                    height: 50,
-                }, 'bar', icon);
-            }
+            const display = this.currentDisplay();
+            this.displayId = display.id;
+            // Electron display bounds are already DIP; keep the display's own origin and scale.
+            this.createWindow(display.bounds, 'edge', icon);
+            this.createWindow({
+                x: display.workArea.x,
+                // Below a top taskbar or menu bar on both platforms.
+                y: display.workArea.y + 24,
+                width: display.workArea.width,
+                height: 50,
+            }, 'bar', icon);
         };
     }
-    show(turn, requestId) {
+    /**
+     * Shows supervision on one display only: the display of the operated window, the primary
+     * display for desktop-scoped input, or the current/primary display when the target is unknown.
+     */
+    show(turn, requestId, target) {
         if (!['win32', 'darwin'].includes(process.platform))
             return;
         this.cancelIdleHide();
+        const targetDisplay = this.resolveTargetDisplay(target);
         if (this.turn?.sessionId === turn.sessionId && this.turn.turnId === turn.turnId) {
             this.activeRequests.add(requestId);
-            this.expand();
+            if (targetDisplay && targetDisplay.id !== this.displayId) {
+                // Follow the operation to another display; the bar returns to its default position.
+                this.displayId = targetDisplay.id;
+                this.collapsed = false;
+                logger.info('overlay_display_changed', { ...turn, displayId: this.displayId });
+                this.rebuild();
+            }
+            else {
+                this.expand();
+            }
             this.updateState();
             return;
         }
         this.clear();
         this.turn = { ...turn };
+        this.displayId = targetDisplay?.id ?? screen.getPrimaryDisplay().id;
         this.activeRequests.add(requestId);
-        logger.info('overlay_started', turn);
+        logger.info('overlay_started', { ...turn, displayId: this.displayId });
         this.rebuild();
         screen.on('display-added', this.onDisplaysChanged);
         screen.on('display-removed', this.onDisplaysChanged);
@@ -140,6 +156,7 @@ export class CuaDesktopOverlay {
             clearTimeout(this.displayTimer);
         this.displayTimer = undefined;
         this.displayLayout = undefined;
+        this.displayId = undefined;
         this.activeRequests.clear();
         this.turn = undefined;
         this.stopping = false;
@@ -208,6 +225,20 @@ export class CuaDesktopOverlay {
                 errorMessage: String(error),
             }));
         }
+    }
+    resolveTargetDisplay(target) {
+        try {
+            return displayForOverlayTarget(screen, target);
+        }
+        catch (error) {
+            logger.warn('overlay_target_display_unavailable', { errorMessage: String(error) });
+            return undefined;
+        }
+    }
+    /** A removed display falls back to the primary display. */
+    currentDisplay() {
+        return (screen.getAllDisplays().find((display) => display.id === this.displayId) ??
+            screen.getPrimaryDisplay());
     }
     destroyWindows() {
         this.loadedWindows.clear();
@@ -299,6 +330,7 @@ export class CuaDesktopOverlay {
                 logger.info('overlay_window_shown', {
                     kind,
                     ...owningTurn,
+                    displayId: this.displayId,
                     requestedBounds: bounds,
                     actualBounds: window.getBounds(),
                     visible: window.isVisible(),

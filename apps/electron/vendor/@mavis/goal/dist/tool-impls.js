@@ -44,11 +44,21 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     return useValue ? value : void 0;
 };
 import { bindTool, TURN_TERMINATING_TOOL_RESULT_DETAIL } from '@mavis/agent-core/tools';
-import { ThreadGoalAlreadyExistsError } from './store-port.js';
-import { CreateGoalToolDef, GetGoalToolDef, UpdateGoalToolDef, resolveUpdateGoalMode, } from './tool-defs.js';
+import { ThreadGoalAlreadyExistsError, } from './store-port.js';
+import { CreateGoalToolDef, GetGoalToolDef, UPDATE_GOAL_LIMIT_FIELDS, UpdateGoalToolDef, resolveUpdateGoalMode, } from './tool-defs.js';
 import { validateThreadGoalObjective, } from './types.js';
 import { digestThreadGoalObjective } from './objective-digest.js';
 import { GOAL_FINAL_REPLY_INSTRUCTION } from './final-reply.js';
+const LIMIT_NAME_BY_FIELD = {
+    token_budget: 'tokenBudget',
+    request_limit: 'requestLimit',
+    active_seconds_limit: 'activeSecondsLimit',
+};
+const FIELD_BY_LIMIT_NAME = {
+    tokenBudget: 'token_budget',
+    requestLimit: 'request_limit',
+    activeSecondsLimit: 'active_seconds_limit',
+};
 /** Build the canonical text+content payload returned to the model. */
 function ok(toolName, body) {
     const text = JSON.stringify(body);
@@ -99,7 +109,7 @@ function endTurn(result) {
         terminate: true,
     };
 }
-function serializeGoal(goal) {
+function serializeGoal(goal, limitsOf) {
     return {
         goalId: goal.goalId,
         sessionId: goal.sessionId,
@@ -111,7 +121,18 @@ function serializeGoal(goal) {
         tokensUsed: goal.tokensUsed,
         timeUsedSeconds: goal.timeUsedSeconds,
         tokenBudget: goal.tokenBudget,
+        requestLimit: goal.requestLimit ?? null,
+        activeSecondsLimit: goal.activeSecondsLimit ?? null,
+        ...(limitsOf ? { effectiveLimits: serializeEffectiveLimits(limitsOf(goal)) } : {}),
         ...(goal.accounting ? serializeRequestAccounting(goal.accounting) : {}),
+    };
+}
+/** The limits in force; `null` means that dimension is unlimited. */
+function serializeEffectiveLimits(limits) {
+    return {
+        tokenLimit: limits.tokens,
+        requestLimit: limits.mainTurns,
+        activeSecondsLimit: limits.activeSeconds,
     };
 }
 /** The request ledger the Goal's budget is counted in (accounting version 2). */
@@ -209,19 +230,21 @@ let UpdateGoalTool = (() => {
         store;
         collector;
         budgetMutation;
+        limitsOf;
         successfulBudgetUpdateTurns = new Set();
-        constructor(store, collector, budgetMutation) {
+        constructor(store, collector, budgetMutation, limitsOf) {
             this.store = store;
             this.collector = collector;
             this.budgetMutation = budgetMutation;
+            this.limitsOf = limitsOf;
         }
         async execute(ctx, input) {
             const mode = resolveUpdateGoalMode(input);
             if (mode === 'mixed') {
-                return err(UpdateGoalToolDef.name, 'cannot combine status and token_budget in one update; set mode to "status" or "token_budget" to disambiguate');
+                return err(UpdateGoalToolDef.name, 'cannot combine status and token_budget (or another limit) in one update; set mode to "status" or "token_budget" to disambiguate');
             }
             if (mode === 'none') {
-                return err(UpdateGoalToolDef.name, 'provide either status or token_budget');
+                return err(UpdateGoalToolDef.name, 'provide either status or token_budget (or request_limit / active_seconds_limit)');
             }
             if (mode === 'token_budget')
                 return this.updateTokenBudget(ctx, input);
@@ -248,10 +271,10 @@ let UpdateGoalTool = (() => {
                 ...(summary ? { summary } : {}),
             });
             if (collection === 'not_a_goal_turn') {
-                return err(UpdateGoalToolDef.name, 'cannot update goal because this turn is not bound to the goal; continue handling the user request in this turn without updating goal status. This tool cannot resume a goal', { reason: collection, currentGoal: serializeGoal(existing) });
+                return err(UpdateGoalToolDef.name, 'cannot update goal because this turn is not bound to the goal; continue handling the user request in this turn without updating goal status. This tool cannot resume a goal', { reason: collection, currentGoal: serializeGoal(existing, this.limitsOf) });
             }
             if (collection === 'stale') {
-                return endTurn(err(UpdateGoalToolDef.name, 'cannot update goal because the objective changed during this turn; stop the stale turn and continue with the updated goal before completing or blocking it', { currentGoal: serializeGoal(existing) }));
+                return endTurn(err(UpdateGoalToolDef.name, 'cannot update goal because the objective changed during this turn; stop the stale turn and continue with the updated goal before completing or blocking it', { currentGoal: serializeGoal(existing, this.limitsOf) }));
             }
             if (collection === 'no_goal') {
                 return err(UpdateGoalToolDef.name, 'cannot update goal because this thread has no goal');
@@ -266,19 +289,16 @@ let UpdateGoalTool = (() => {
                     accepted: true,
                     settlement: 'pending_host_validation',
                 },
-                goal: serializeGoal(existing),
+                goal: serializeGoal(existing, this.limitsOf),
                 goalSnapshotPhase: 'before_host_settlement',
                 ...(status === 'complete' ? { instruction: GOAL_FINAL_REPLY_INSTRUCTION } : {}),
             });
             return status === 'complete' ? accepted : endTurn(accepted);
         }
         async updateTokenBudget(ctx, input) {
-            if (input.token_budget !== null &&
-                (typeof input.token_budget !== 'number' ||
-                    !Number.isInteger(input.token_budget) ||
-                    input.token_budget <= 0)) {
-                return err(UpdateGoalToolDef.name, 'token_budget must be a positive integer or null');
-            }
+            const limits = readRequestedLimits(input);
+            if (typeof limits === 'string')
+                return err(UpdateGoalToolDef.name, limits);
             if (typeof input.expected_goal_id !== 'string' ||
                 input.expected_goal_id.length === 0 ||
                 typeof input.expected_updated_at !== 'number' ||
@@ -294,21 +314,31 @@ let UpdateGoalTool = (() => {
                 return err(UpdateGoalToolDef.name, 'already updated the token budget during this turn; start a new explicit user turn for another update');
             }
             const result = await this.budgetMutation.updateTokenBudget(ctx, {
-                tokenBudget: input.token_budget ?? null,
+                ...limits,
                 expectedGoalId: input.expected_goal_id,
                 expectedUpdatedAt: input.expected_updated_at,
             });
             if (!result.updated) {
                 return err(UpdateGoalToolDef.name, result.error, {
-                    ...(result.currentGoal ? { currentGoal: serializeGoal(result.currentGoal) } : {}),
+                    ...(result.currentGoal
+                        ? { currentGoal: serializeGoal(result.currentGoal, this.limitsOf) }
+                        : {}),
                 });
             }
             this.successfulBudgetUpdateTurns.add(turnKey);
+            const kept = (result.kept ?? []).map((name) => FIELD_BY_LIMIT_NAME[name]);
             return ok(UpdateGoalToolDef.name, {
                 updated: true,
                 previousTokenBudget: result.previousTokenBudget,
-                goal: serializeGoal(result.goal),
+                ...(result.previousLimits ? { previousLimits: result.previousLimits } : {}),
+                goal: serializeGoal(result.goal, this.limitsOf),
                 resumed: result.resumed,
+                ...(kept.length > 0
+                    ? {
+                        keptUserLimits: kept,
+                        note: `${kept.join(', ')} already set by the user and kept unchanged; do not mention them as set from the objective`,
+                    }
+                    : {}),
             });
         }
     };
@@ -331,18 +361,44 @@ let GetGoalTool = (() => {
             __runInitializers(_classThis, _classExtraInitializers);
         }
         store;
-        constructor(store) {
+        limitsOf;
+        constructor(store, limitsOf) {
             this.store = store;
+            this.limitsOf = limitsOf;
         }
         async execute(ctx, _input) {
             const goal = await this.store.getBySession(ctx.sessionId);
             if (!goal) {
                 return ok(GetGoalToolDef.name, { goal: null });
             }
-            return ok(GetGoalToolDef.name, { goal: serializeGoal(goal) });
+            return ok(GetGoalToolDef.name, { goal: serializeGoal(goal, this.limitsOf) });
         }
     };
     return GetGoalTool = _classThis;
 })();
 export { GetGoalTool };
+/**
+ * The limits a budget-mode call asks to change, keyed by host name, or the
+ * rejection message. Each present limit is `null` (clear) or a positive
+ * integer; at least one must be present.
+ */
+function readRequestedLimits(input) {
+    const requested = {};
+    for (const field of UPDATE_GOAL_LIMIT_FIELDS) {
+        if (!Object.hasOwn(input, field) || input[field] === undefined)
+            continue;
+        const value = input[field];
+        if (value !== null && !isPositiveInteger(value)) {
+            return `${field} must be a positive integer or null`;
+        }
+        requested[LIMIT_NAME_BY_FIELD[field]] = value;
+    }
+    if (Object.keys(requested).length === 0) {
+        return 'provide at least one of token_budget, request_limit, or active_seconds_limit (a positive integer, or null to clear)';
+    }
+    return requested;
+}
+function isPositiveInteger(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
 //# sourceMappingURL=tool-impls.js.map

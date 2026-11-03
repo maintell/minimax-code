@@ -1,7 +1,10 @@
 import { canonicalActiveHistoryRevision, inspectCanonicalHistorySequence, } from '../../../sessions/representation/canonical-history-contract.js';
+import { sanitizePtcSafetyHistoryMessage } from '../../ptc/safety-reconcile.js';
 /** Plans the existing abort/network tail fold against the latest envelopes. */
 export function planSettleTurnTail(active, input) {
     assertMutationIdentity(input);
+    if (input.mode === 'safety')
+        return planSafetyTurnTail(active, input);
     const last = active.at(-1);
     if (!last || last.turn_id !== input.turnId || last.message.role !== 'assistant') {
         return unchangedSettle(active);
@@ -28,6 +31,24 @@ export function planSettleTurnTail(active, input) {
     if (sameJson(active, next))
         return unchangedSettle(active);
     assertSettled(next, 'Turn tail settlement');
+    return { status: 'committed', active: next, deletedMessageIds };
+}
+function planSafetyTurnTail(active, input) {
+    if (active.at(-1)?.turn_id !== input.turnId)
+        return unchangedSettle(active);
+    const deletedMessageIds = [];
+    const next = active.flatMap((record) => {
+        if (record.turn_id !== input.turnId)
+            return [record];
+        const message = sanitizePtcSafetyHistoryMessage(record.message);
+        if (message)
+            return [{ ...record, message }];
+        deletedMessageIds.push(record.message_id);
+        return [];
+    });
+    if (sameJson(active, next))
+        return unchangedSettle(active);
+    assertSettled(next, 'Safety Turn tail settlement');
     return { status: 'committed', active: next, deletedMessageIds };
 }
 /** Plans a target-Turn suffix removal across the reachable compaction lineage. */
@@ -85,7 +106,7 @@ export function toTurnHistoryMutationCommit(input) {
         status: input.status,
         revision: canonicalActiveHistoryRevision(input.active),
         generation: input.generation,
-        messages: input.active.map(({ message }) => structuredClone(message)),
+        messages: Object.freeze(input.active.map(({ message }) => message)),
         identityVector: input.active.map(({ message_id }) => message_id),
         deletedMessageIds: [...input.deletedMessageIds],
     };

@@ -1,9 +1,9 @@
 import { isAwaitingUsageRecovery, ThreadGoalEpochConflictError, ThreadGoalStatusConflictError, } from '@mavis/goal';
 import { ThreadGoalAutomationOwnerConflictError, ThreadGoalSessionNotFoundError, ThreadGoalVerifierSessionError, } from './gate.js';
-import { isStatusOnlyResume, restartsOrRetargetsGoal, withUserStatusReason, } from './lifecycle-patch-intent.js';
+import { isStatusOnlyResume, restartsOrRetargetsGoal, withLimitResetOnObjectiveEdit, withUserStatusReason, } from './lifecycle-patch-intent.js';
 import { buildThreadGoalRuntimeTools, publishThreadGoalEvent } from '../observability/wiring.js';
 import { withPreparedGoalResources } from './objective-resources.js';
-import { rejectTokenBudgetMutation, tokenBudgetConflictResult } from './token-budget-mutation.js';
+import { goalChangedResult, ownGoalLimits, partitionGoalTurnLimits, rejectTokenBudgetMutation, requestedGoalLimits, tokenBudgetConflictResult, } from './token-budget-mutation.js';
 import { isCurrentEpochThreadGoalContinuation } from '../continuation/kickoff.js';
 const HANDED_OFF = { kind: 'handed_off' };
 /**
@@ -15,8 +15,14 @@ const RESUME_PAUSES = ['user-stop', 'turn-final-failure'];
 /** Owns CRUD, pause/resume, tool exposure, and live response projection. */
 export class GoalLifecycle {
     deps;
+    objectiveReplacedObservers = new Set();
     constructor(deps) {
         this.deps = deps;
+    }
+    /** Late-bound by the Application layer, which owns the Goal's display rows. */
+    observeObjectiveReplaced(observer) {
+        this.objectiveReplacedObservers.add(observer);
+        return () => this.objectiveReplacedObservers.delete(observer);
     }
     async createGoal(input, options = {}) {
         if (!(await this.deps.sessionExists(input.sessionId))) {
@@ -38,11 +44,11 @@ export class GoalLifecycle {
             },
         });
         if (!options.requireKickoffAdmission) {
-            await this.handleCreated(created);
+            await this.handleCreated(created, options.sendBehavior);
             return created;
         }
         try {
-            await this.deps.continuation.reconcileInitial(created, false);
+            await this.deps.continuation.startInitial(created, false, options.sendBehavior);
         }
         catch (error) {
             await this.deps.continuation.rollbackFailedCreation(created);
@@ -98,12 +104,14 @@ export class GoalLifecycle {
      * Apply a user patch. When the patch brings a stopped Goal back to `active`
      * the call does not return until that resume has landed (spec §6): a Goal
      * Turn was admitted, the Goal waits on a recorded reason, or the resume
-     * failed and the Goal was stopped again (thrown).
+     * failed and the Goal was stopped again (thrown). An objective edit first
+     * resets the Goal's limits.
      */
-    async patchGoalWithOutcome(sessionId, patch) {
+    async patchGoalWithOutcome(sessionId, userPatch) {
         const existing = await this.deps.store().getBySession(sessionId);
         if (!existing)
             return undefined;
+        const patch = resumeBudgetLimitedOnObjectiveEdit(existing, withLimitResetOnObjectiveEdit(userPatch));
         await this.assertUserPatchAllowed(sessionId, existing, patch);
         if (isStatusOnlyResume(patch) && existing.status === 'active') {
             return this.resumeActiveGoal(existing, patch);
@@ -119,6 +127,7 @@ export class GoalLifecycle {
     async publishUserPatch(existing, updated, patch) {
         const { sessionId } = updated;
         this.deps.runtime.emitStateTransition(existing.status, updated);
+        await this.notifyObjectiveReplaced(existing, updated, patch);
         const shouldProjectRunningTime = patch.status === 'paused' || patch.status === 'active';
         const projected = shouldProjectRunningTime
             ? ((await this.getGoalForResponse(sessionId, updated)) ?? updated)
@@ -289,14 +298,18 @@ export class GoalLifecycle {
         if (!existing) {
             return { updated: false, error: 'cannot update goal because this thread has no goal' };
         }
-        const rejected = rejectTokenBudgetMutation(existing, input);
+        const scope = this.budgetMutationScope(context, existing);
+        const rejected = rejectTokenBudgetMutation(existing, input, scope);
         if (rejected)
             return rejected;
-        const resumed = existing.status === 'budget_limited';
+        if (scope === 'goal_turn')
+            return this.fillLimitsInGoalTurn(context, existing, input);
+        const requested = requestedGoalLimits(input);
+        const resumed = existing.status === 'budget_limited' && requested.tokenBudget !== undefined;
         let updated;
         try {
             updated = await this.deps.store().patchByUser(existing.goalId, {
-                tokenBudget: input.tokenBudget,
+                ...requested,
                 rejectIfUpdatedAtChangedFrom: input.expectedUpdatedAt,
                 ...(resumed ? { status: 'active', statusReason: null } : {}),
             });
@@ -315,6 +328,58 @@ export class GoalLifecycle {
             userPatch: true,
             ...(resumed && existing.statusReason ? { resumedFromReason: existing.statusReason } : {}),
         });
+        this.emitBudgetUpdated(context, existing, updated, { resumed, scope: 'user_turn', kept: [] });
+        return {
+            updated: true,
+            goal: updated,
+            previousTokenBudget: existing.tokenBudget,
+            previousLimits: ownGoalLimits(existing),
+            resumed,
+        };
+    }
+    /** A budget update from the Goal's own running Turn fills caps; any other adjusts them. */
+    budgetMutationScope(context, existing) {
+        return this.deps.turnContext.goalIdForTurn(context.sessionId, context.turnId) ===
+            existing.goalId
+            ? 'goal_turn'
+            : 'user';
+    }
+    /**
+     * A budget update made inside the Goal's own running Turn: in practice the
+     * kickoff setting the caps its objective states (spec 6.4). It fills only
+     * limits the Goal does not have yet, so a value the user set (the
+     * `/goal budget=` command at creation) wins deterministically (spec 6.6),
+     * and it keeps the decision epoch so the running Turn stays current.
+     */
+    async fillLimitsInGoalTurn(context, existing, input) {
+        const { apply, kept } = partitionGoalTurnLimits(existing, requestedGoalLimits(input));
+        const updated = await this.deps
+            .store()
+            .setOwnLimitsAtEpoch(existing.goalId, input.expectedUpdatedAt, apply);
+        if (!updated) {
+            return goalChangedResult(await this.deps.store().getBySession(context.sessionId));
+        }
+        if (Object.keys(apply).length > 0) {
+            publishThreadGoalEvent(this.deps.runtime.publishGlobalEvent, {
+                type: 'updated',
+                goal: updated,
+            });
+        }
+        this.emitBudgetUpdated(context, existing, updated, {
+            resumed: false,
+            scope: 'goal_turn',
+            kept,
+        });
+        return {
+            updated: true,
+            goal: updated,
+            previousTokenBudget: existing.tokenBudget,
+            previousLimits: ownGoalLimits(existing),
+            ...(kept.length > 0 ? { kept } : {}),
+            resumed: false,
+        };
+    }
+    emitBudgetUpdated(context, existing, updated, outcome) {
         this.deps.runtime.emitRuntimeEvent({
             type: 'goal.budget_updated',
             at: this.deps.runtime.nowMs(),
@@ -325,16 +390,16 @@ export class GoalLifecycle {
                 ...(context.toolCallId ? { toolCallId: context.toolCallId } : {}),
                 oldTokenBudget: existing.tokenBudget,
                 newTokenBudget: updated.tokenBudget,
+                oldRequestLimit: existing.requestLimit ?? null,
+                newRequestLimit: updated.requestLimit ?? null,
+                oldActiveSecondsLimit: existing.activeSecondsLimit ?? null,
+                newActiveSecondsLimit: updated.activeSecondsLimit ?? null,
+                scope: outcome.scope,
+                ...(outcome.kept.length > 0 ? { kept: [...outcome.kept] } : {}),
                 status: updated.status,
-                resumed,
+                resumed: outcome.resumed,
             },
         });
-        return {
-            updated: true,
-            goal: updated,
-            previousTokenBudget: existing.tokenBudget,
-            resumed,
-        };
     }
     async assertUserPatchAllowed(sessionId, existing, patch) {
         // Reactivating or re-aiming a Goal on a verifier child would restart the
@@ -449,6 +514,100 @@ export class GoalLifecycle {
             kickoffCancelled: true,
         });
     }
+    /**
+     * A user side message reached the runtime but could be neither steered nor
+     * queued while this Goal was `active` (spec 4.4). The Goal stops starting new
+     * Goal Turns; the Goal Turn already running is marked so request and tool
+     * admission let it finish instead of cutting it off at the next boundary.
+     * Verification in flight is aborted like any other pause: its verdict could
+     * no longer land on the moved epoch, and a resumed Goal proposes again.
+     * Returns the paused Goal, or undefined when it was no longer `active`.
+     */
+    async pauseForUndeliveredMessage(sessionId, goalId) {
+        if (!this.deps.runtime.isEnabled())
+            return undefined;
+        const reason = 'paused(message_undelivered)';
+        try {
+            const existing = await this.deps.store().getBySession(sessionId);
+            if (existing?.goalId !== goalId || existing.status !== 'active')
+                return undefined;
+            const drain = this.deps.turnContext.beginUndeliveredMessageDrain(sessionId, goalId, existing.updatedAt);
+            let paused;
+            try {
+                paused = await this.deps.store().transitionActiveAtEpoch(goalId, existing.updatedAt, {
+                    status: 'paused',
+                    statusReason: reason,
+                });
+            }
+            catch (error) {
+                drain.cancel();
+                throw error;
+            }
+            if (!paused) {
+                drain.cancel();
+                return undefined;
+            }
+            drain.commit(paused.updatedAt);
+            this.deps.runtime.abortVerification(sessionId, reason);
+            this.deps.runtime.emitStateTransition('active', paused);
+            const projected = (await this.getGoalForResponse(sessionId, paused)) ?? paused;
+            this.deps.runtime.handleChanged({
+                type: 'updated',
+                goal: projected.goalId === paused.goalId ? projected : paused,
+            });
+            return paused;
+        }
+        catch (error) {
+            this.deps.runtime.reportFailure(sessionId, `thread_goal_undelivered_message_pause_failed:${this.deps.runtime.formatError(error)}`);
+            return undefined;
+        }
+    }
+    /**
+     * Every undelivered side message of this Goal was delivered or discarded
+     * (spec 4.5): resume it through the same path as the banner's continue, but
+     * only while it is still the Goal paused for that reason. The resume is
+     * guarded by the paused epoch, so a concurrent pause, edit, resume or
+     * deletion keeps its own result. Returns whether this call resumed it.
+     */
+    async resumeFromUndeliveredMessagePause(sessionId, goalId) {
+        if (!this.deps.runtime.isEnabled())
+            return false;
+        const existing = await this.deps.store().getBySession(sessionId);
+        if (existing?.goalId !== goalId ||
+            existing.status !== 'paused' ||
+            existing.statusReason !== 'paused(message_undelivered)') {
+            return false;
+        }
+        try {
+            const result = await this.patchGoalWithOutcome(sessionId, {
+                status: 'active',
+                expectedGoalId: goalId,
+                rejectIfUpdatedAtChangedFrom: existing.updatedAt,
+            });
+            return result?.goal.status === 'active';
+        }
+        catch (error) {
+            if (error instanceof ThreadGoalEpochConflictError)
+                return false;
+            if (error instanceof ThreadGoalStatusConflictError)
+                return false;
+            throw error;
+        }
+    }
+    async notifyObjectiveReplaced(existing, updated, patch) {
+        if (existing.goalId !== updated.goalId)
+            return;
+        if (patch.objective === undefined || patch.objective === existing.objective)
+            return;
+        for (const observer of this.objectiveReplacedObservers) {
+            try {
+                await observer(updated);
+            }
+            catch (error) {
+                this.deps.runtime.reportFailure(updated.sessionId, `thread_goal_objective_replaced_observer_failed:${this.deps.runtime.formatError(error)}`);
+            }
+        }
+    }
     async pauseActiveGoalForAbort(sessionId) {
         await this.pauseActiveGoal(sessionId, 'paused(user_requested)', 'thread_goal_abort_pause_failed');
     }
@@ -487,7 +646,10 @@ export class GoalLifecycle {
         if (!this.deps.runtime.isEnabled() || disabled)
             return [];
         return buildThreadGoalRuntimeTools(this.deps.store(), false, this.deps.signalCollector, {
-            updateTokenBudget: (context, input) => this.updateTokenBudget(context, input),
+            budgetMutation: {
+                updateTokenBudget: (context, input) => this.updateTokenBudget(context, input),
+            },
+            limitsOf: this.deps.runtime.effectiveLimits,
         });
     }
     async getGoalForResponse(sessionId, persistedState) {
@@ -514,12 +676,12 @@ export class GoalLifecycle {
         this.deps.timeAccounting.finish(timing);
         this.deps.turnContext.finish(timing);
     }
-    async handleCreated(goal) {
+    async handleCreated(goal, sendBehavior) {
         if (!this.deps.runtime.isEnabled())
             return;
         publishThreadGoalEvent(this.deps.runtime.publishGlobalEvent, { type: 'created', goal });
         try {
-            await this.deps.continuation.reconcileInitial(goal, true);
+            await this.deps.continuation.startInitial(goal, true, sendBehavior);
         }
         catch (error) {
             this.deps.runtime.reportFailure(goal.sessionId, `thread_goal_kickoff_materialize_failed:${this.deps.runtime.formatError(error)}`);
@@ -547,6 +709,17 @@ export class GoalLifecycle {
             return undefined;
         }
     }
+}
+/**
+ * A budget-limited Goal has no other way back: editing its objective resets
+ * its limits, so the edit also puts it back to work unless it names a status.
+ */
+function resumeBudgetLimitedOnObjectiveEdit(existing, patch) {
+    return existing.status === 'budget_limited' &&
+        patch.objective !== undefined &&
+        patch.status === undefined
+        ? { ...patch, status: 'active' }
+        : patch;
 }
 function userPatchChangedEvent({ existing, updated, projected, patch, }) {
     // Any write that reactivates a stopped Goal — an explicit resume or a budget

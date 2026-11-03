@@ -11,13 +11,29 @@ const releasedManifestDigests = {};
 export function componentInstallRoot(dataDir, platform = process.platform, arch = process.arch) {
     return path.join(dataDir, 'computer-use', 'components', CUA_VERSION, `${platform}-${arch}`);
 }
+/**
+ * The host-selected profile root may itself be a link (for example a Windows junction that
+ * moves `~/.minimax` to another drive). Resolve only that root; every path created below it is
+ * still checked for links and unsafe ancestors. A root that does not exist yet, or that the
+ * volume cannot resolve (some virtual, RAM or network drives), stays unchanged: the strict
+ * ancestor checks then apply to the original path exactly as they did before this resolution.
+ */
+export async function resolveProfileDataDir(dataDir) {
+    try {
+        return await realpath(dataDir);
+    }
+    catch {
+        return dataDir;
+    }
+}
 export async function discoverComponent(input) {
     const platform = input.platform ?? process.platform;
     const arch = input.arch ?? process.arch;
     if (!['darwin', 'win32'].includes(platform) || !['arm64', 'x64'].includes(arch)) {
         throw new ComputerUseError('computer_platform_unsupported', 'Computer Use requires macOS or Windows on arm64/x64.');
     }
-    const root = input.trustedInstalledComponent?.root ?? componentInstallRoot(input.dataDir, platform, arch);
+    const root = input.trustedInstalledComponent?.root ??
+        componentInstallRoot(await resolveProfileDataDir(input.dataDir), platform, arch);
     if (!path.isAbsolute(root))
         throw invalid('Component root must be absolute.');
     await assertNoSymlink(root);

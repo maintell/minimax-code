@@ -18,6 +18,7 @@ export function reportAuthDiagnostic(context, observer, outcome, error, retryCou
         outcome,
         retryCount,
         ...safeErrorFields(error),
+        ...nativeErrorCodeField(error),
     };
     try {
         observer?.(diagnostic);
@@ -46,6 +47,61 @@ export async function persistAuth(context, observer, operation) {
             throw new AuthCredentialSaveError(diagnostic, cause);
         }
     });
+}
+// Chromium reports network failures only inside Error.message, e.g.
+// `net::ERR_EMPTY_RESPONSE`. Only the strict token is kept; the message is not.
+const ELECTRON_NET_ERROR_PATTERN = /\bnet::(ERR_[A-Z0-9_]{1,64})\b/u;
+// Node system errors (ECONNRESET), Node internals (ERR_*), undici (UND_ERR_*).
+const NATIVE_ERROR_CODE_PATTERN = /^(?:E[A-Z0-9]{2,31}|ERR_[A-Z0-9_]{1,60}|UND_ERR_[A-Z0-9_]{1,56})$/u;
+const MAX_NATIVE_ERROR_MESSAGE_SCAN = 2_048;
+const MAX_NATIVE_ERROR_CAUSE_DEPTH = 3;
+/**
+ * Extract a bounded native error code without retaining the error or its
+ * message. Reading hostile getters is isolated; unrecognized errors are
+ * reported as `unknown`, never as their free-form message.
+ */
+export function extractNativeErrorCode(error) {
+    let current = error;
+    for (let depth = 0; depth < MAX_NATIVE_ERROR_CAUSE_DEPTH && current && typeof current === 'object'; depth += 1) {
+        const found = readNativeErrorCode(current);
+        if (found)
+            return found;
+        current = readErrorProperty(current, 'cause');
+    }
+    return 'unknown';
+}
+function nativeErrorCodeField(error) {
+    try {
+        if (error === undefined || error === null)
+            return {};
+        // OAuth protocol errors already carry the received HTTP status and code.
+        if (typeof readErrorProperty(error, 'httpStatus') === 'number')
+            return {};
+        return { nativeErrorCode: extractNativeErrorCode(error) };
+    }
+    catch {
+        return {};
+    }
+}
+function readNativeErrorCode(value) {
+    const message = readErrorProperty(value, 'message');
+    if (typeof message === 'string') {
+        const match = ELECTRON_NET_ERROR_PATTERN.exec(message.slice(0, MAX_NATIVE_ERROR_MESSAGE_SCAN));
+        if (match?.[1])
+            return match[1];
+    }
+    const code = readErrorProperty(value, 'code');
+    return typeof code === 'string' && NATIVE_ERROR_CODE_PATTERN.test(code) ? code : undefined;
+}
+function readErrorProperty(value, key) {
+    if (!value || typeof value !== 'object')
+        return undefined;
+    try {
+        return value[key];
+    }
+    catch {
+        return undefined;
+    }
 }
 function safeErrorFields(error) {
     if (!error || typeof error !== 'object')

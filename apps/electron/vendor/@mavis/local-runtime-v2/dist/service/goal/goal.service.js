@@ -1,22 +1,30 @@
 import { digestThreadGoalObjective } from '@mavis/goal';
 import { composeGoalHostModules } from './composition.js';
 import { emitThreadGoalRuntimeEvent, } from './observability/events.js';
-import { isThreadGoalEnabled } from './lifecycle/gate.js';
+import { isThreadGoalEnabled, resolveThreadGoalBudgetLimits, } from './lifecycle/gate.js';
 import { selectGoalReminderPromptKind } from './prompts/reminder-policy.js';
-import { publishThreadGoalEvent } from './observability/wiring.js';
+import { publishThreadGoalEvent, withThreadGoalEffectiveLimits } from './observability/wiring.js';
+import { GoalBackgroundWaits } from './admission/background-wait.js';
 /** The single Goal owner; domain decisions live in the composed deep modules. */
 export class GoalService {
-    deps;
     store;
     modules;
+    deps;
+    backgroundWaits = new GoalBackgroundWaits();
     configGetter;
     constructor(deps, store) {
-        this.deps = deps;
         this.store = store;
+        // Every Goal snapshot this owner publishes carries the limits in force and
+        // the live details of a background wait.
+        this.deps = {
+            ...deps,
+            publishGlobalEvent: this.backgroundWaits.wrapPublisher(withThreadGoalEffectiveLimits(deps.publishGlobalEvent, (goal) => this.effectiveBudgetLimits(goal))),
+        };
         this.modules = composeGoalHostModules({
-            deps,
+            deps: this.deps,
+            backgroundWaits: this.backgroundWaits,
             getStore: () => this.store,
-            configGetter: () => (this.configGetter ?? deps.configGetter)?.() ?? {},
+            configGetter: () => this.resolvedConfig(),
             isEnabled: () => this.isEnabled(),
             emitRuntimeEvent: (event) => this.emitRuntimeEvent(event),
             emitStateTransition: (from, goal) => this.emitStateTransition(from, goal),
@@ -27,6 +35,16 @@ export class GoalService {
     }
     bindConfigGetter(configGetter) {
         this.configGetter = configGetter;
+    }
+    /**
+     * The limits in force for a Goal (spec 6.2): its own value, else the global
+     * default, else unlimited. The same resolution every budget gate applies.
+     */
+    effectiveBudgetLimits(goal) {
+        return resolveThreadGoalBudgetLimits(goal, () => this.resolvedConfig());
+    }
+    resolvedConfig() {
+        return (this.configGetter ?? this.deps.configGetter)?.() ?? {};
     }
     bindVerifier(verifier, transcriptWindowReader) {
         this.modules.settlement.bindVerifier(verifier, transcriptWindowReader);
@@ -51,12 +69,15 @@ export class GoalService {
     createGoal(input, options = {}) {
         return this.modules.lifecycle.createGoal(input, options);
     }
-    patchGoal(sessionId, patch) {
-        return this.modules.lifecycle.patchGoal(sessionId, patch);
+    /** The patched Goal as clients read it: a resumed background wait keeps its live details. */
+    async patchGoal(sessionId, patch) {
+        const state = await this.modules.lifecycle.patchGoal(sessionId, patch);
+        return state ? this.backgroundWaits.decorate(state) : undefined;
     }
     /** `patchGoal`, plus what a resume led to when the patch was one (spec §6). */
-    patchGoalWithOutcome(sessionId, patch) {
-        return this.modules.lifecycle.patchGoalWithOutcome(sessionId, patch);
+    async patchGoalWithOutcome(sessionId, patch) {
+        const result = await this.modules.lifecycle.patchGoalWithOutcome(sessionId, patch);
+        return result ? { ...result, goal: this.backgroundWaits.decorate(result.goal) } : undefined;
     }
     pauseGoalByUser(sessionId) {
         return this.modules.lifecycle.pauseGoalByUser(sessionId);
@@ -92,11 +113,25 @@ export class GoalService {
     pauseActiveGoalForRetraction(sessionId) {
         return this.modules.lifecycle.pauseActiveGoalForRetraction(sessionId);
     }
+    /** Pause an `active` Goal for an undelivered side message; its running Turn finishes. */
+    pauseForUndeliveredMessage(sessionId, goalId) {
+        return this.modules.lifecycle.pauseForUndeliveredMessage(sessionId, goalId);
+    }
+    /** Resume the Goal paused for undelivered side messages once none are left. */
+    resumeFromUndeliveredMessagePause(sessionId, goalId) {
+        return this.modules.lifecycle.resumeFromUndeliveredMessagePause(sessionId, goalId);
+    }
+    /** Observe a user objective replacement that keeps the same Goal id. */
+    observeObjectiveReplaced(observer) {
+        return this.modules.lifecycle.observeObjectiveReplaced(observer);
+    }
     runtimeToolsFor(disabled, sessionId) {
         return this.modules.lifecycle.runtimeToolsFor(disabled, sessionId);
     }
-    getGoalForResponse(sessionId, persistedState) {
-        return this.modules.lifecycle.getGoalForResponse(sessionId, persistedState);
+    /** The Goal as clients read it, with the live details of a background wait. */
+    async getGoalForResponse(sessionId, persistedState) {
+        const state = await this.modules.lifecycle.getGoalForResponse(sessionId, persistedState);
+        return state ? this.backgroundWaits.decorate(state) : undefined;
     }
     handleTurnTimingFinished(timing) {
         this.modules.lifecycle.handleTurnTimingFinished(timing);

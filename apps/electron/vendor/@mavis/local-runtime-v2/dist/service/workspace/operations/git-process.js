@@ -1,3 +1,4 @@
+import { realpath } from 'node:fs/promises';
 import { addGitObservation, startGitCommandObservation, finishGitCommandObservation, } from '../git-read-observation.js';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -126,5 +127,21 @@ function isAbortFailure(error, signal) {
 }
 function bufferToString(value) {
     return Buffer.isBuffer(value) ? value.toString('utf-8') : String(value ?? '');
+}
+export async function gitRoot(workspace) {
+    const result = await git(['rev-parse', '--show-toplevel'], workspace);
+    return result.code === 0 ? result.stdout.trim() : undefined;
+}
+export async function gitCommonDir(workspace) {
+    const result = await git(['rev-parse', '--git-common-dir'], workspace);
+    if (result.code !== 0 || !result.stdout.trim())
+        return undefined;
+    const commonDir = resolve(workspace, result.stdout.trim());
+    try {
+        return await realpath(commonDir);
+    }
+    catch {
+        return commonDir;
+    }
 }
 //# sourceMappingURL=git-process.js.map

@@ -116,7 +116,8 @@ export const SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA = [
             'project_kind',
         ],
         columnDefinitions: [
-            ...finalProjectMetadata.columnDefinitions.filter(({ name }) => name !== 'project_kind'),
+            // The m0006 shape predates both project_kind and m0053's display_name.
+            ...finalProjectMetadata.columnDefinitions.filter(({ name }) => name !== 'project_kind' && name !== 'display_name'),
             {
                 ...requireColumn(finalProjectMetadata.columnDefinitions, 'project_kind'),
                 notNull: false,

@@ -1,7 +1,6 @@
-import { McpNameRegistry, pluginMcpNameKey, McpConnectionPool, } from '@mavis/mcp';
+import { attachProgrammaticErrorRaw } from '@mavis/agent-core/tools';
+import { describeMcpCallError, McpNameRegistry, pluginMcpNameKey, McpConnectionPool, } from '@mavis/mcp';
 const LIST_TOOLS_CONCURRENCY = 4;
-const MAX_TOOLS_PER_SERVER = 128;
-const MAX_TOOLS_PER_SNAPSHOT = 256;
 /**
  * Desktop Plugin MCP owner. Its pool and lookup are deliberately separate
  * from v1 LocalMcpService, whose connections belong to the user's mcp.json.
@@ -56,7 +55,6 @@ export class PluginMcpRuntime {
         const inventories = await mapBounded(entries, LIST_TOOLS_CONCURRENCY, async (entry) => shouldDiscoverInventory(entry, inventoryMode)
             ? this.resolveInventory(entry, options.reuseExistingInventory === true)
             : this.resolveCachedInventory(entry));
-        await this.enforceInventoryLimits(entries, inventories, inventoryMode);
         for (const [index, entry] of entries.entries()) {
             const inventory = inventories[index];
             if (!inventory || inventory.failed) {
@@ -201,9 +199,6 @@ export class PluginMcpRuntime {
             return existing;
         try {
             const tools = await withTimeout(this.pool.listTools(poolName(entry)), this.listToolsTimeoutMs, `Plugin MCP tools/list timed out for ${entry.server.name}`);
-            if (tools.length > MAX_TOOLS_PER_SERVER) {
-                throw new Error(`Plugin MCP server ${entry.server.name} returned more than ${MAX_TOOLS_PER_SERVER} tools`);
-            }
             this.metrics?.incr('plugin_mcp_list_total', { status: 'ok' });
             const inventory = freeze({ lifecycleKey: key, tools: freeze([...tools]), failed: false });
             this.inventories.set(poolName(entry), inventory);
@@ -227,54 +222,6 @@ export class PluginMcpRuntime {
             return inventory;
         }
     }
-    async rejectInventory(entry, key, reason) {
-        await this.disconnectBounded(poolName(entry));
-        this.metrics?.incr('plugin_mcp_list_total', { status: 'limit' });
-        this.logger.warn('Plugin MCP tools/list inventory rejected', {
-            pluginName: entry.pluginName,
-            source: entry.source,
-            serverName: entry.server.name,
-            reason,
-        });
-        const inventory = freeze({
-            lifecycleKey: key,
-            tools: freeze([]),
-            failed: true,
-        });
-        this.inventories.set(poolName(entry), inventory);
-        return inventory;
-    }
-    async enforceInventoryLimits(entries, inventories, inventoryMode) {
-        let acceptedToolCount = 0;
-        for (const [index, entry] of entries.entries()) {
-            const inventory = inventories[index];
-            if (!inventory || inventory.failed)
-                continue;
-            const exceedsServer = inventory.tools.length > MAX_TOOLS_PER_SERVER;
-            const exceedsSnapshot = acceptedToolCount + inventory.tools.length > MAX_TOOLS_PER_SNAPSHOT;
-            if (exceedsServer || exceedsSnapshot) {
-                const reason = exceedsServer
-                    ? `Plugin MCP server returned more than ${MAX_TOOLS_PER_SERVER} tools`
-                    : `Plugin MCP snapshot exceeds ${MAX_TOOLS_PER_SNAPSHOT} tools`;
-                inventories[index] = shouldDiscoverInventory(entry, inventoryMode)
-                    ? await this.rejectInventory(entry, inventory.lifecycleKey, reason)
-                    : this.rejectCachedInventory(entry, inventory.lifecycleKey, reason);
-                continue;
-            }
-            acceptedToolCount += inventory.tools.length;
-        }
-    }
-    rejectCachedInventory(entry, key, reason) {
-        this.metrics?.incr('plugin_mcp_list_total', { status: 'limit' });
-        this.logger.warn('Plugin MCP cached inventory rejected', {
-            pluginName: entry.pluginName,
-            source: entry.source,
-            serverName: entry.server.name,
-            reason,
-        });
-        this.inventories.delete(poolName(entry));
-        return freeze({ lifecycleKey: key, tools: freeze([]), failed: true });
-    }
     replaceLookup(entries) {
         this.servers.clear();
         this.lifecycleKeys.clear();
@@ -294,7 +241,25 @@ export class PluginMcpRuntime {
             def,
             impl: freeze({
                 execute: async (_context, input, signal) => {
-                    const result = await this.pool.callTool(poolName(entry), tool.name, toRecord(input), undefined, signal ? { signal } : undefined);
+                    let result;
+                    try {
+                        result = await this.pool.callTool(poolName(entry), tool.name, toRecord(input), undefined, signal ? { signal } : undefined);
+                    }
+                    catch (error) {
+                        // The thrown error still fails the call exactly as before; PTC
+                        // scripts additionally get the JSON-RPC or connection error as
+                        // `error.raw`. Only the error class and code are logged.
+                        const raw = describeMcpCallError(error);
+                        const attached = raw !== undefined && attachProgrammaticErrorRaw(error, raw);
+                        this.logger.warn('Plugin MCP tool call failed', {
+                            pluginName: entry.pluginName,
+                            serverName: entry.server.name,
+                            toolName: tool.name,
+                            errorCode: raw?.code ?? null,
+                            rawAttached: attached,
+                        });
+                        throw error;
+                    }
                     const text = mcpContentToText(result);
                     const content = toToolResultContent(result, text);
                     return {
@@ -309,6 +274,10 @@ export class PluginMcpRuntime {
                             plugin: entry.pluginName,
                         },
                         output: { mcp: result },
+                        // PTC-only: structuredContent becomes `data` on success and on isError.
+                        ...(isPlainRecord(result.structuredContent)
+                            ? { programmatic: { data: result.structuredContent } }
+                            : {}),
                     };
                 },
             }),
@@ -378,6 +347,9 @@ function toRecord(value) {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value
         : {};
+}
+function isPlainRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 function toToolResultContent(result, fallbackText) {
     const content = result.content.map((item) => {

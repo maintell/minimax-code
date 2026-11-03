@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { assertNoSymlink, componentInstallRoot, CUA_VERSION, discoverComponent, } from './component.js';
+import { assertNoSymlink, componentInstallRoot, CUA_VERSION, discoverComponent, resolveProfileDataDir, } from './component.js';
 import { ComputerUseError, record } from './contracts.js';
 import { privateDirectory } from './desktop-lock.js';
 const releasePrefix = 'minimax-cu-release-v1.';
@@ -46,10 +46,11 @@ export async function prepareInstalledPackagedComponent(input) {
     if (!path.isAbsolute(input.dataDir) || !path.isAbsolute(input.packagedRoot)) {
         throw new ComputerUseError('computer_component_invalid', 'Component and profile roots must be absolute host-owned paths.');
     }
+    const dataDir = await resolveProfileDataDir(input.dataDir);
     const source = path.join(input.packagedRoot, CUA_VERSION, target);
     const verify = async (root, installed) => {
         await discoverComponent({
-            dataDir: input.dataDir,
+            dataDir,
             platform,
             arch,
             trustedInstalledComponent: { root, manifestSha256 },
@@ -67,7 +68,7 @@ export async function prepareInstalledPackagedComponent(input) {
         }
         throw error;
     }
-    const parent = componentInstallRoot(input.dataDir, platform, arch);
+    const parent = componentInstallRoot(dataDir, platform, arch);
     await privateDirectory(parent);
     const root = path.join(parent, manifestSha256);
     const trusted = { root, manifestSha256 };

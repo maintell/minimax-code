@@ -25,8 +25,8 @@ export function createProductionConversationMutationWorkflow(input) {
         createSideSession: (request) => fork.forkSideSession(request),
         forkSession: (_ctx, request) => mapFork(request, fork, input),
         getSessionRewindPreview: (_ctx, request) => mapRewindPreview(request, input),
-        rewindSession: (_ctx, request) => mapRewind(request, rewindEdit, input.sessionFork, input.mutationPlanState),
-        editSessionMessage: (_ctx, request) => mapEdit(request, rewindEdit, input.sessionFork, input.mutationPlanState),
+        rewindSession: (_ctx, request) => mapRewind(request, rewindEdit, input.sessionFork, input),
+        editSessionMessage: (_ctx, request) => mapEdit(request, rewindEdit, input.sessionFork, input),
     };
 }
 async function mapRewindPreview(request, input) {
@@ -416,9 +416,10 @@ function toForkRequest(request, planState) {
             : {}),
     };
 }
-async function mapRewind(request, service, capability, planStateReader) {
+async function mapRewind(request, service, capability, guards) {
     try {
-        await requirePlanInactive(request.id, planStateReader);
+        await requirePlanInactive(request.id, guards.mutationPlanState);
+        await requireTurnNotOwnedByOtherRuntime(request.id, guards.activeTurn);
         await requireMutationEligibleSession(request.id, capability);
         const result = await service.rewind({
             sessionId: request.id,
@@ -446,9 +447,10 @@ async function mapRewind(request, service, capability, planStateReader) {
         throw mapMutationError(error);
     }
 }
-async function mapEdit(request, service, capability, planStateReader) {
+async function mapEdit(request, service, capability, guards) {
     try {
-        await requirePlanInactive(request.id, planStateReader);
+        await requirePlanInactive(request.id, guards.mutationPlanState);
+        await requireTurnNotOwnedByOtherRuntime(request.id, guards.activeTurn);
         await requireMutationEligibleSession(request.id, capability);
         const result = await service.edit({
             sessionId: request.id,
@@ -483,6 +485,16 @@ async function requirePlanInactive(sessionId, planStateReader) {
     if (!state?.active)
         return;
     throw toApplicationError(CONVERSATION_MUTATION_BUSY, 'Rewind and Edit are unavailable while Plan Mode or Plan lifecycle is active');
+}
+/**
+ * Rewind/Edit abort the active Turn before rewriting history. A Turn owned by
+ * another Runtime cannot be aborted from here, so rewriting would race its
+ * appends; reject instead of treating the remote Turn as stopped.
+ */
+async function requireTurnNotOwnedByOtherRuntime(sessionId, activeTurn) {
+    if (!(await activeTurn?.(sessionId))?.ownedByOtherRuntime)
+        return;
+    throw toApplicationError(CONVERSATION_MUTATION_BUSY, 'Rewind and Edit are unavailable while the Session is running in another MCode process');
 }
 function asForkManifest(value) {
     if (!value || typeof value !== 'object')

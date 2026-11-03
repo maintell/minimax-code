@@ -1,7 +1,7 @@
 import { MINIAPP_LOOPBACK_TOKEN_HEADER, miniAppBusyReason, miniAppFailureReasonCode, } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
 import { runAllFinally } from '../../../plugin-system-helpers.js';
-import { withPluginMcpRuntime, } from '../snapshot-builder.js';
+import { isEffectiveLocalPlugin, withPluginMcpRuntime, } from '../snapshot-builder.js';
 import { listAcceptedMiniApps, listEnabledMiniAppDefinitions, miniAppCandidateFromPackage, sameMiniAppCandidate, sameRunningGeneration, } from './candidate.js';
 import { acceptedFromTransition, buildSelectiveMiniAppInputs, changesOfficialMiniApp, divergentRosterOverrides, heldEntriesStillRunning, heldOfficialBuildContext, miniAppManagedServerNames, ordinaryPackageContribution, releaseOfficialRoots, releaseRetainedOfficialRoots, retainAcceptedOfficialRoots, retainRuntimeMiniAppContribution, withEnabledPluginRoster, } from './projection.js';
 /** Adapts accepted MiniApp contributions to the ordinary Plugin publication transaction. */
@@ -478,13 +478,15 @@ function retainAcceptedPackageIdentity(merged, current) {
             rootPath: current.plugin.rootPath,
             manifestPath: current.plugin.manifestPath,
         },
+        id: current.id,
+        ownership: current.ownership,
     };
 }
 function currentAcceptedMiniAppProjections(snapshot, accepted) {
     const projections = new Map();
     for (const projection of snapshot.localPlugins) {
         const expected = accepted.get(projection.name);
-        if (!expected || !projection.enabled || !projection.plugin.miniapp)
+        if (!expected || !isEffectiveLocalPlugin(projection) || !projection.plugin.miniapp)
             continue;
         const candidate = miniAppCandidateFromPackage({
             plugin: projection.plugin,
@@ -515,10 +517,12 @@ function mergeOrdinaryWithAcceptedMiniApp(ordinary, current) {
 }
 function acceptedMiniAppContribution(current) {
     const miniapp = current.plugin.miniapp;
+    const identity = { id: current.id, ownership: current.ownership };
     if (!miniapp)
-        return { plugin: current.plugin, contentDigest: current.contentDigest };
+        return { plugin: current.plugin, contentDigest: current.contentDigest, ...identity };
     const managedServers = miniAppManagedServerNames(miniapp);
     return {
+        ...identity,
         contentDigest: current.contentDigest,
         plugin: {
             ...current.plugin,

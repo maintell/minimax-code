@@ -1,4 +1,5 @@
 import { settleInBackground as settleDetached } from '../../infra/async/settle.js';
+import { pluginIdKey } from '@mavis/shared';
 import { PluginSystemError } from './errors.js';
 export function deferred() {
     let resolve;
@@ -111,16 +112,28 @@ export function scopeKey(scope) {
 export function normalizedPluginName(value) {
     return value.trim().normalize('NFKC').toLocaleLowerCase('en-US');
 }
-export function findLocalPlugin(snapshot, pluginName) {
-    const key = normalizedPluginName(pluginName);
-    return snapshot.localPlugins.find((plugin) => normalizedPluginName(plugin.name) === key);
-}
-export function assertPluginNameAvailable(pluginName, officialInstallations, snapshot) {
-    const key = normalizedPluginName(pluginName);
-    if (officialInstallations.some((item) => item.installed && normalizedPluginName(item.name) === key) ||
-        snapshot.localPlugins.some((item) => normalizedPluginName(item.name) === key)) {
-        throw new PluginSystemError('PLUGIN_ALREADY_EXISTS', 'Plugin name is already installed');
+/**
+ * Resolves an installed local Plugin. A selector with a marketplace addresses
+ * exactly one PluginId. A bare name matches the name part of every installed
+ * PluginId and is rejected when more than one Plugin shares it.
+ */
+export function findLocalPlugin(snapshot, selector) {
+    if (selector.marketplace !== undefined) {
+        return findInstalledLocalPlugin(snapshot, {
+            name: selector.name,
+            marketplace: selector.marketplace,
+        });
     }
+    const key = normalizedPluginName(selector.name);
+    const matches = snapshot.localPlugins.filter((plugin) => normalizedPluginName(plugin.id.name) === key);
+    if (matches.length > 1) {
+        throw new PluginSystemError('PLUGIN_ID_AMBIGUOUS', 'Plugin name matches several installed Plugins; specify its marketplace');
+    }
+    return matches[0];
+}
+export function findInstalledLocalPlugin(snapshot, id) {
+    const key = pluginIdKey(id);
+    return snapshot.localPlugins.find((plugin) => pluginIdKey(plugin.id) === key);
 }
 function freeze(value) {
     return Object.freeze(value);

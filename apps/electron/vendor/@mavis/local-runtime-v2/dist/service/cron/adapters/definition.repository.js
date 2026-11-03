@@ -293,6 +293,7 @@ export function listCronTargetSessionIds(db) {
         .from(cronDefinitions)
         .where(and(isNull(cronDefinitions.deletedAtMs), isNotNull(cronDefinitions.targetSessionId)))
         .all()
-        .map((row) => row.id);
+        .map((row) => row.id)
+        .filter((id) => id !== null);
 }
 //# sourceMappingURL=definition.repository.js.map

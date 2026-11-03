@@ -24,8 +24,8 @@ import { MemoryFileStoreImpl } from '../src/service/memory-system/adapters/file-
 import { SessionMemorySourceAdapter } from '../src/service/memory-system/adapters/session-source.js';
 import { createProductionSessionSystemPort } from '../src/service/memory-system/adapters/session-source.production.js';
 import { MemoryDiagnostics, traceMemoryPort } from '../src/service/memory-system/diagnostics.js';
-import { MemoryScopeMutationCoordinator } from '../src/service/memory-system/scope-mutation.js';
-import { accessPolicy } from '../src/service/memory-system/access-policy.js';
+import { MemoryScopeMutationCoordinator } from '../src/service/memory-system/policies/scope-mutation.js';
+import { accessPolicy } from '../src/service/memory-system/policies/access-policy.js';
 import { MemoryCaptureService } from '../src/service/memory-system/orchestration/capture-service.js';
 import { MemoryConsolidationService } from '../src/service/memory-system/orchestration/consolidation-service.js';
 import { MemoryLegacyMigrationService } from '../src/service/memory-system/orchestration/legacy-migration-service.js';

@@ -1,5 +1,6 @@
 import { EXPECTED_TABLES, SESSION_QUERY_INDEX_NAMES, AGENT_COLUMN_DEFINITIONS, MEMORY_TABLE_NAMES, MEMORY_COLUMN_DEFINITIONS, MEMORY_CHECKS, } from './schema-consistency.contracts.js';
 import { readName, readNullableString, readNumber, readSql, readString, } from './schema-consistency.metadata-rows.js';
+import { readIndexColumns, readIndexDefinition } from './schema-consistency.index-metadata.js';
 import { canonicalizeSqlContract as compactSql, canonicalizeSqlDefault, canonicalizeSqlDefinition as normalizeDefinition, canonicalizeSqlExpression, extractSqlCheckContracts, } from './sql-contract.js';
 import { SESSION_STORAGE_RAW_OBJECTS, SESSION_STORAGE_SCHEMA, SESSION_STORAGE_TABLE_METADATA, SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA, SESSION_STORAGE_TRIGGER_METADATA, SESSION_STORAGE_VIRTUAL_TABLE_METADATA, } from './schema/session-storage.js';
 import { MINIAPP_STATE_TABLE_METADATA } from './schema/miniapp.js';
@@ -76,6 +77,8 @@ const SESSION_QUERY_QUEUE_COLUMNS = new Set([
     'routing_fingerprint',
 ]);
 const SESSION_HISTORY_LOCATION_COLUMNS = new Set(['history_relative_dir']);
+/** Added by m0053; required only after that migration ran or the column exists. */
+const PROJECT_DISPLAY_NAME_COLUMNS = new Set(['display_name']);
 const REQUIRED_INDEXES = [
     'idx_v2_cron_definitions_scheduler',
     'idx_v2_cron_definitions_active_name',
@@ -700,86 +703,6 @@ function sessionSideChatsSchemaActive(db) {
 function tableExists(db, name) {
     return db.prepare(`PRAGMA table_info(${name})`).all().length > 0;
 }
-function readIndexDefinition(db, name) {
-    const row = db
-        .prepare("SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?")
-        .get(name);
-    const table = readString(row, 'tbl_name');
-    const listRow = db
-        .prepare(`PRAGMA index_list(${table})`)
-        .all()
-        .find((candidate) => readName(candidate) === name);
-    if (!listRow)
-        throw new Error(`Database schema index metadata missing: ${name}`);
-    const index = readIndexColumns(db, name);
-    const createSql = readSql(row);
-    const where = /\bWHERE\b([\s\S]+)$/iu.exec(createSql)?.[1];
-    return {
-        name,
-        table,
-        unique: readNumber(listRow, 'unique') === 1,
-        columns: index.columns,
-        collations: index.collations,
-        where: where ? canonicalizeSqlExpression(where, table) : null,
-    };
-}
-function readIndexColumns(db, name) {
-    const createRow = db
-        .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
-        .get(name);
-    const declaredColumns = splitIndexColumns(readNullableString(createRow, 'sql') ?? '');
-    const rows = db
-        .prepare(`PRAGMA index_xinfo(${name})`)
-        .all()
-        .filter((column) => readNumber(column, 'key') === 1)
-        .sort((left, right) => readNumber(left, 'seqno') - readNumber(right, 'seqno'));
-    return {
-        columns: rows.map((column, index) => {
-            const declared = declaredColumns[index];
-            const columnName = readNullableString(column, 'name');
-            if (columnName === null && declared === undefined) {
-                throw new Error(`Database schema expression index metadata missing: ${name}`);
-            }
-            return normalizeSql(`${columnName ?? declared}${readNumber(column, 'desc') === 1 ? ' desc' : ''}`);
-        }),
-        collations: rows.map((column) => readString(column, 'coll').toUpperCase()),
-    };
-}
-function splitIndexColumns(createSql) {
-    const onIndex = createSql.search(/\bON\b/iu);
-    const start = createSql.indexOf('(', onIndex);
-    if (onIndex < 0 || start < 0)
-        return [];
-    const columns = [];
-    let depth = 0;
-    let segmentStart = start + 1;
-    for (let index = start + 1; index < createSql.length; index += 1) {
-        const character = createSql[index];
-        const step = indexColumnStep(character, depth);
-        depth = step.depth;
-        if (!step.boundary)
-            continue;
-        columns.push(createSql.slice(segmentStart, index).trim());
-        if (step.complete)
-            break;
-        segmentStart = index + 1;
-    }
-    return columns;
-}
-function indexColumnStep(character, depth) {
-    if (character === '(')
-        return { depth: depth + 1, boundary: false, complete: false };
-    if (character === ')' && depth > 0) {
-        return { depth: depth - 1, boundary: false, complete: false };
-    }
-    if (depth === 0 && character === ',') {
-        return { depth, boundary: true, complete: false };
-    }
-    if (depth === 0 && character === ')') {
-        return { depth, boundary: true, complete: true };
-    }
-    return { depth, boundary: false, complete: false };
-}
 function currentTableColumns(db, table) {
     if (table.name === 'local_runtime_queue_items' && !queryIndexesApplied(db)) {
         return table.columns.filter((column) => !SESSION_QUERY_QUEUE_COLUMNS.has(column));
@@ -787,12 +710,19 @@ function currentTableColumns(db, table) {
     if (table.name === 'local_runtime_sessions' && !sessionHistoryLocationApplied(db)) {
         return table.columns.filter((column) => !SESSION_HISTORY_LOCATION_COLUMNS.has(column));
     }
+    if (table.name === 'local_runtime_projects' && !projectDisplayNameApplied(db)) {
+        return table.columns.filter((column) => !PROJECT_DISPLAY_NAME_COLUMNS.has(column));
+    }
     return table.columns;
 }
 function currentColumnDefinitions(db, table) {
-    const compatibleDefinitions = table.name === 'local_runtime_sessions'
-        ? table.columnDefinitions.filter((column) => !SESSION_HISTORY_LOCATION_COLUMNS.has(column.name))
-        : table.columnDefinitions;
+    let compatibleDefinitions = table.columnDefinitions;
+    if (table.name === 'local_runtime_sessions') {
+        compatibleDefinitions = compatibleDefinitions.filter((column) => !SESSION_HISTORY_LOCATION_COLUMNS.has(column.name));
+    }
+    else if (table.name === 'local_runtime_projects' && !projectDisplayNameApplied(db)) {
+        compatibleDefinitions = compatibleDefinitions.filter((column) => !PROJECT_DISPLAY_NAME_COLUMNS.has(column.name));
+    }
     if (table.name === 'local_runtime_queue_items' && !queryIndexesApplied(db)) {
         return compatibleDefinitions.filter((column) => !SESSION_QUERY_QUEUE_COLUMNS.has(column.name));
     }
@@ -853,6 +783,9 @@ function miniAppStateContractApplied(db) {
 function taskSessionBindingsApplied(db) {
     return (migration35ConvergenceApplied(db) || tableExists(db, 'local_runtime_task_session_bindings'));
 }
+function projectDisplayNameApplied(db) {
+    return migrationApplied(db, 53) || tableHasColumn(db, 'local_runtime_projects', 'display_name');
+}
 function sessionHistoryLocationApplied(db) {
     return (migration35ConvergenceApplied(db) ||
         tableHasColumn(db, 'local_runtime_sessions', 'history_relative_dir'));
@@ -888,9 +821,6 @@ function tableHasColumn(db, tableName, columnName) {
     return (db.prepare(`SELECT name FROM pragma_table_info('${tableName}') WHERE name = ?`).all(columnName)
         .length > 0);
 }
-function normalizeSql(value) {
-    return value.replaceAll('"', '').replace(/\s+/gu, ' ').trim().replace(/;$/u, '').toLowerCase();
-}
 function expectedTableColumnsForDatabase(db, table, expected) {
     let expectedColumns = expected;
     if (table === 'local_runtime_v2_cron_definitions' && !migration35ConvergenceApplied(db)) {
@@ -917,7 +847,10 @@ const GOAL_TOKEN_USAGE_COLUMNS = new Set([
     'cache_read_tokens',
     'output_tokens',
 ]);
-/** Goal columns whose migration (48 token usage, 51 cache write unreported) has not run yet. */
+/**
+ * Goal columns whose migration (48 token usage, 51 cache write unreported,
+ * 52 per-Goal request and time limits) has not run yet.
+ */
 function pendingGoalColumns(db) {
     const pending = new Set();
     if (!migrationVersionApplied(db, 48))
@@ -925,8 +858,13 @@ function pendingGoalColumns(db) {
             pending.add(column);
     if (!migrationVersionApplied(db, 51))
         pending.add('cache_write_unreported');
+    if (!migrationVersionApplied(db, 52))
+        for (const column of GOAL_LIMIT_COLUMNS)
+            pending.add(column);
     return pending;
 }
+/** Goal columns added by migration 52 (per-Goal request and time limits). */
+const GOAL_LIMIT_COLUMNS = new Set(['request_limit', 'active_seconds_limit']);
 function migrationVersionApplied(db, version) {
     return Boolean(db.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = ?').get(version));
 }

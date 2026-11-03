@@ -1,2 +1,0 @@
-export { DesktopMatrixMediaClient as LocalMatrixMediaClient, MATRIX_INLINE_LIMIT_BYTES, MATRIX_MAX_UPLOAD_BYTES, guessMimeType, sanitizeFilename, } from '@mavis/agent-tools/desktop';
-//# sourceMappingURL=local-matrix-media-client.js.map

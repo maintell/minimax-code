@@ -13,7 +13,8 @@ import os from "node:os";
 import { app } from "electron";
 import { recordElectronStartupMainEntry } from "./modules/observability/startup-performance";
 import { isDev, isTest, isStaging, isInternalBuild, isZh, buildEnv } from "./config";
-import { setConfiguredLocalRuntimeDataParentDir, synchronizeLocalRuntimeDataDirEnv } from "./modules/local-runtime/data-dir";
+import { isConfiguredLocalRuntimeDataParentDirEffective, setConfiguredLocalRuntimeDataParentDir, synchronizeLocalRuntimeDataDirEnv } from "./modules/local-runtime/data-dir";
+import { verifyDataDirAtStartup, configureDataDirRelocationGuard } from "./modules/local-runtime/data-dir-relocation-guard";
 import { resolveDevelopmentUserDataPath } from "./config/development-user-data";
 import { resolveAppIdentity } from "./config/app-identity";
 import { resolveDevelopmentSwimLaneOverride } from "./config/development-swim-lane";
@@ -43,13 +44,6 @@ function getAppNameAndId() {
 const { appName: APP_NAME, appId: APP_ID, userDataAppName: USER_DATA_APP_NAME } = getAppNameAndId();
 app.setName(APP_NAME);
 app.setAppUserModelId(APP_ID);
-// HTTP/3 is unreliable on the paths this client runs over: Chromium keeps
-// negotiating QUIC through proxies and middleboxes that drop or mangulate it,
-// and the request then dies mid-stream with net::ERR_QUIC_PROTOCOL_ERROR —
-// measured as 291k consecutive failures on one logical call. Forcing TCP costs a
-// negligible latency difference and removes the whole failure class. Must be set
-// before app ready so the network service picks it up.
-app.commandLine.appendSwitch('disable-quic');
 // 开发环境下设置数据目录名称，确保不同环境数据隔离
 // 生产环境由 electron-builder 的 productName 自动设置
 // 必须在 app ready 之前设置
@@ -66,9 +60,19 @@ if (isDev) {
 const { getDesktopConfig, setDesktopConfig } = require('./ipc/storage.ipc');
 const developmentSwimLaneOverride = resolveDevelopmentSwimLaneOverride(process.argv, isDev);
 const desktopConfig = getDesktopConfig();
-setConfiguredLocalRuntimeDataParentDir(typeof desktopConfig.localRuntimeDataParentDir === 'string'
-    ? desktopConfig.localRuntimeDataParentDir
-    : null);
+// A relocated data directory stays on probation until its Runtime reports ready; launches
+// that never got there restore the previous directory before anything reads it. A launch
+// whose data-dir env points elsewhere neither verifies nor rolls back the configured dir.
+const dataDirVerification = verifyDataDirAtStartup(desktopConfig, setDesktopConfig, {
+    isConfiguredDirInUse: (parentDir) => isConfiguredLocalRuntimeDataParentDirEffective(parentDir),
+});
+if (dataDirVerification.action === 'rolled-back') {
+    // A rollback is only computed when the data-dir env is absent or names the failed
+    // directory (inherited through an in-app relaunch); drop it so the restored one wins.
+    delete process.env.MINIMAX_DATA_DIR;
+    delete process.env.MAVIS_DATA_DIR;
+}
+setConfiguredLocalRuntimeDataParentDir(dataDirVerification.parentDir ?? null);
 // This must run before any Electron main-process config consumer reads
 // config.yaml, so it shares the configured runtime data directory.
 synchronizeLocalRuntimeDataDirEnv();
@@ -76,6 +80,14 @@ const { acquireSingleInstanceLock, setupDeepLinkEventHandlers } = require('./mod
 const hasSingleInstanceLock = acquireSingleInstanceLock();
 if (hasSingleInstanceLock)
     setupDeepLinkEventHandlers();
+if (hasSingleInstanceLock) {
+    // Only the instance that keeps running may persist a rollback or watch the Runtime.
+    dataDirVerification.commit();
+    if (dataDirVerification.action === 'rolled-back') {
+        logger.warn('[DataDirGuard] Relocated data directory never became ready; restored previous');
+    }
+    configureDataDirRelocationGuard({ getConfig: getDesktopConfig, saveConfig: setDesktopConfig, logger: logger }, dataDirVerification);
+}
 if (hasSingleInstanceLock) {
     const { setupFileOpenEventHandlers } = require('./modules/dock');
     setupFileOpenEventHandlers();

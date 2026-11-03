@@ -14,7 +14,7 @@ import { serializeChannelBinding } from '../binding/channel-binding-codec.js';
 import { validateImBindingTargetSession } from '../binding/im-binding-target-validation.js';
 import { channelImNewCreatedReceiptText, channelRouteBrokenReceiptText, imReceiptForRoute, imReceiptFromRouteError, isMissingEnqueueSessionError, keepImReceiptInternal, logImReceipt, resolveChannelEnqueueRejectionInboundResult, } from '../delivery/channel-im-receipts.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
-import { buildEnqueueChannelContext, channelPrefersZh, compactionReply, compactionStartReply, mapAccessDenial, } from './channel-inbound-helpers.js';
+import { buildEnqueueChannelContext, channelPrefersZh, compactionReply, compactionStartReply, enqueueOutcomeFields, mapAccessDenial, } from './channel-inbound-helpers.js';
 export class LocalChannelBridgeInfra {
     options;
     bindingStore;
@@ -293,6 +293,9 @@ export class LocalChannelBridgeInfra {
                 source: `channel:${input.ctx.platform}`,
                 clientRequestId,
                 dedupeKey: clientRequestId,
+                // Only the ordinary IM message path follows the desktop follow-up
+                // preference; every other enqueue caller keeps the plain queue.
+                followComposerSendBehavior: true,
             });
         }
         catch (error) {
@@ -302,8 +305,7 @@ export class LocalChannelBridgeInfra {
             handled: true,
             route,
             sessionId: route.sessionId,
-            ...(queued ? { queueItemId: queued.itemId } : {}),
-            ...(queued?.ahead !== undefined ? { queueAhead: queued.ahead } : {}),
+            ...enqueueOutcomeFields(queued),
             lane,
         };
     }
@@ -755,8 +757,7 @@ export class LocalChannelBridgeInfra {
             reply: `Queued BTW question for session: ${route.sessionId}`,
             route,
             sessionId: route.sessionId,
-            ...(queued ? { queueItemId: queued.itemId } : {}),
-            ...(queued?.ahead !== undefined ? { queueAhead: queued.ahead } : {}),
+            ...enqueueOutcomeFields(queued),
             lane,
         };
     }

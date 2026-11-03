@@ -485,13 +485,20 @@ function queueDeliveryIdentity(claim) {
         unstartedFromTurnIds: attempts.map((attempt) => attempt.turnId),
     };
 }
+/**
+ * A redelivery admits under a per-claim id (an earlier attempt may hold the
+ * item's own id) and keeps the item's id as a receipt alias, so a repeated
+ * request for that item still finds the Turn that consumed it.
+ */
 function queueClientRequestIdentity(claim) {
     if (!claim.clientRequestId)
         return {};
-    const clientRequestId = claim.item.deliveryAttempts?.length
-        ? `queue-delivery:${claim.claimId}`
-        : claim.clientRequestId;
-    return { clientRequestId };
+    if (!claim.item.deliveryAttempts?.length)
+        return { clientRequestId: claim.clientRequestId };
+    return {
+        clientRequestId: `queue-delivery:${claim.claimId}`,
+        receiptAliases: [claim.clientRequestId],
+    };
 }
 function exactRejectedResult(queueItemId, result) {
     if (result.queueDisposition === 'defer')

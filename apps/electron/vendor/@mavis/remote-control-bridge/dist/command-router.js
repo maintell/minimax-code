@@ -513,6 +513,9 @@ async function sessionSend(deps, cmd, payload) {
     const sessionId = readString(payload.session_id);
     if (!sessionId)
         return missingField('session_id');
+    const action = readSideMessageAction(payload);
+    if (action)
+        return sessionSideMessageAction(deps, cmd, sessionId, action, payload);
     const content = readString(payload.content);
     if (content === undefined)
         return missingField('content');
@@ -569,7 +572,8 @@ async function sessionSend(deps, cmd, payload) {
         };
     }
     const sendErr = await readErrorBody(sendResponse);
-    if (sendResponse.status === 409 && isBusyCode(sendErr.rawCode)) {
+    if (sendResponse.status === 409 &&
+        isQueueFallbackCode(sendErr.rawCode, desktopBody.client_intent !== undefined)) {
         // D-8: busy path — enqueue instead (Desktop queue keeps turn ordering).
         const desktopQueuePath = `${DESKTOP_API}/session/${encodeURIComponent(sessionId)}/queue`;
         const legacyQueuePath = `${LEGACY_MAVIS_API}/session/${encodeURIComponent(sessionId)}/queue`;
@@ -587,6 +591,50 @@ async function sessionSend(deps, cmd, payload) {
         return { kind: 'err', err: await toErrShape(queueResponse, 'session') };
     }
     return { kind: 'err', err: errShapeFrom(sendResponse.status, sendErr, 'session') };
+}
+function readSideMessageAction(payload) {
+    const retry = readString(payload.retry_message_id) ?? readString(payload.retryMessageId);
+    const discard = readString(payload.discard_message_id) ?? readString(payload.discardMessageId);
+    if (retry && discard)
+        return { kind: 'conflict' };
+    if (retry)
+        return { kind: 'retry', messageId: retry };
+    if (discard)
+        return { kind: 'discard', messageId: discard };
+    return undefined;
+}
+/**
+ * Retry / discard of an undelivered side message: the same Desktop send route
+ * with `retry_message_id` / `discard_message_id`; the runtime ignores content.
+ * Forwarded as-is: never a legacy fallback (a 404 means the row is gone) and
+ * never a Queue fallback (the runtime already applied the side-message rules).
+ * Both conflicting ids still reach the runtime, which owns that rejection.
+ */
+async function sessionSideMessageAction(deps, cmd, sessionId, action, payload) {
+    const body = {
+        content: typeof payload.content === 'string' ? payload.content : '',
+        ...modelBody(payload.model),
+    };
+    if (action.kind === 'conflict') {
+        body.retry_message_id = readString(payload.retry_message_id) ?? payload.retryMessageId;
+        body.discard_message_id = readString(payload.discard_message_id) ?? payload.discardMessageId;
+    }
+    else if (action.kind === 'retry') {
+        body.retry_message_id = action.messageId;
+    }
+    else {
+        body.discard_message_id = action.messageId;
+    }
+    const response = await invokeLocal(deps, cmd, postJson(`${DESKTOP_API}/session/${encodeURIComponent(sessionId)}/message`, body));
+    if (response.ok) {
+        deps.logger.info(`[rc.router] ${cmd.type} id=${cmd.id} side_message_action=${action.kind} status=${response.status} disposition=sent`);
+        return {
+            kind: 'ack',
+            payload: { disposition: 'sent' },
+            stream: { sessionId, response },
+        };
+    }
+    return { kind: 'err', err: await toErrShape(response, 'session') };
 }
 // ─── 4. cmd.session.new (create-only, AD-5 — no content leg) ────────────
 async function sessionNew(deps, cmd, payload) {
@@ -1664,6 +1712,21 @@ async function readJson(response) {
 function isBusyCode(rawCode) {
     return rawCode === 'local_session_busy' || rawCode === 'local_session_has_queued_messages';
 }
+/**
+ * Turn-switch races a plain send can lose: the target Turn ingress conflicted
+ * or its continuation became unavailable. Like a busy session they belong in
+ * the Queue. Intent sends (plan entry/exit, continuation retry) keep only the
+ * busy codes: their own rejection must not turn into a queued plain message.
+ */
+const TURN_SWITCH_RACE_CODES = new Set([
+    'local_turn_ingress_conflict',
+    'local_turn_continuation_unavailable',
+]);
+function isQueueFallbackCode(rawCode, hasClientIntent) {
+    if (isBusyCode(rawCode))
+        return true;
+    return !hasClientIntent && rawCode !== undefined && TURN_SWITCH_RACE_CODES.has(rawCode);
+}
 function toDesktopBatchPermissionDecision(decision) {
     switch (decision) {
         case 'allowOnce':
@@ -1679,11 +1742,13 @@ function toDesktopBatchPermissionDecision(decision) {
 async function readErrorBody(response) {
     const body = await readJson(response);
     const rawCode = readString(body.key) ?? readString(body.code);
+    const detail = readString(body.detail);
     return {
         ...(rawCode ? { rawCode } : {}),
         ...((readString(body.error) ?? readString(body.message))
             ? { message: readString(body.error) ?? readString(body.message) }
             : {}),
+        ...(detail ? { detail } : {}),
         body,
     };
 }
@@ -1701,7 +1766,12 @@ export function errShapeFrom(status, body, domain) {
     if (status === 503)
         return { code: 'DAEMON_UNAVAILABLE', message, retryable: true };
     if (body.rawCode) {
-        return { code: body.rawCode.replace(/^local_/, '').toUpperCase(), message, retryable };
+        return {
+            code: body.rawCode.replace(/^local_/, '').toUpperCase(),
+            message,
+            retryable,
+            ...(body.detail ? { detail: body.detail } : {}),
+        };
     }
     switch (status) {
         case 400:

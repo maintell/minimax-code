@@ -7,7 +7,7 @@ import os from "os";
 import path from "path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { app, globalShortcut, BrowserWindow, shell, ipcMain } from "electron";
+import { app, globalShortcut, BrowserWindow, shell, dialog, ipcMain } from "electron";
 import { createTray, getTray, destroyTray } from "../modules/tray";
 import { toggleArchonMiniChatWindow } from "../windows";
 import { windowManager } from "../windows/manager";
@@ -17,8 +17,29 @@ import { requestRendererRelaunch } from "../lifecycle/application-bootstrap";
 import { getDesktopConfig, setDesktopConfig } from "./storage.ipc";
 import { startPowerSourceMonitoring, setKeepAwakeEnabled } from "../modules/power";
 import { ensureComputerUseUtilityStarted, stopLocalRuntime, prepareLocalRuntime } from "../modules/local-runtime";
-import { getLocalRuntimeDataDirInfo, relocateLocalRuntimeDataDir, LocalRuntimeDataDirRelocationError } from "../modules/local-runtime/data-dir-relocation";
+import { clearDataDirEnv, getLocalRuntimeDataDirInfo, relocateLocalRuntimeDataDir, LocalRuntimeDataDirRelocationError } from "../modules/local-runtime/data-dir-relocation";
+import { queueFileOpenWithRegistration } from "../modules/file-open-with";
+import { takeDataDirRollbackNotice, setDataDirRelocationGuardRelaunch } from "../modules/local-runtime/data-dir-relocation-guard";
+import { getIsEn } from "../utils/tool";
 let localRuntimeDataDirRelocationInProgress = false;
+/** Only installed Windows builds own the registry entries this setting changes. */
+function supportsFileOpenWithEnhanced() {
+    return process.platform === 'win32' && app.isPackaged;
+}
+/** Re-applies the saved preference; installs and upgrades remove the candidates. */
+function syncFileOpenWithEnhanced(enabled) {
+    if (!supportsFileOpenWithEnhanced())
+        return;
+    queueFileOpenWithRegistration({ enabled, exePath: app.getPath('exe') })
+        .then((status) => {
+        if (status === 'not-registered') {
+            logger.info('[Desktop Settings] Open With registration skipped: no installer handler');
+        }
+    })
+        .catch((error) => {
+        logger.warn(`[Desktop Settings] Failed to sync Open With registration: ${String(error)}`);
+    });
+}
 function createTrayWithLifecycleQuit(options) {
     createTray({
         onQuit: () => {
@@ -257,13 +278,47 @@ export function initDesktopSettings(options = {}) {
     // 是否存在 RC producer binding 由 remote-control bridge 的状态订阅同步。
     startPowerSourceMonitoring();
     setKeepAwakeEnabled(!!config.keepAwake);
+    // The installer drops Open With candidates on install/upgrade; restore the
+    // opt-in. A disabled preference needs no work because nothing re-adds them.
+    if (config.fileOpenWithEnhancedEnabled === true) {
+        syncFileOpenWithEnhanced(true);
+    }
     // 全局快捷键（MiniChat 等）延迟到 AppWindow 打开时注册，
     // 由 WindowManager 的 windowConfig.main.onSwitch 触发。
+    const rollbackNotice = takeDataDirRollbackNotice(config, setDesktopConfig);
+    if (rollbackNotice)
+        void showDataDirRollbackNotice(rollbackNotice);
+}
+async function showDataDirRollbackNotice(notice) {
+    const isEnglish = getIsEn();
+    try {
+        await dialog.showMessageBox({
+            type: 'warning',
+            message: isEnglish
+                ? 'The new data directory could not start, so the previous one was restored'
+                : '新数据目录无法正常启动，已自动切回原数据目录',
+            detail: isEnglish
+                ? `The local service did not start from the new data directory (${notice.reasonCode ?? notice.reason}). Your data in the previous directory was not changed. The new directory is kept in the history list; you can upload logs from Settings and try again later.`
+                : `本地服务无法在新数据目录中启动（${notice.reasonCode ?? notice.reason}）。原目录中的数据没有被改动；新目录保留在历史列表中，可在设置中上传日志后再试。`,
+            buttons: [isEnglish ? 'OK' : '知道了'],
+        });
+    }
+    catch {
+        logger.warn('[DataDirGuard] Failed to show data directory rollback notice');
+    }
 }
 /**
  * 设置桌面设置 IPC 处理器
  */
 export function setupDesktopSettingsIPC(options = {}) {
+    const requestQuit = options.requestQuit;
+    if (requestQuit) {
+        setDataDirRelocationGuardRelaunch(async () => {
+            // The inherited env still points at the directory that failed.
+            clearDataDirEnv();
+            await requestRendererRelaunch({ requestQuit }, 'data-dir-relocation');
+        });
+    }
     // 设置托盘可见性
     ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_TRAY_VISIBLE, (_, visible) => {
         try {
@@ -321,6 +376,33 @@ export function setupDesktopSettingsIPC(options = {}) {
     // RC binding 和供电状态只决定偏好当前是否生效，不覆盖已保存的用户选择。
     ipcMain.handle(IPC_CHANNELS.DESKTOP_GET_KEEP_AWAKE, () => {
         return !!getDesktopConfig().keepAwake;
+    });
+    // Windows-only opt-in that lists MCode for text-like types like VS Code does.
+    ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_FILE_OPEN_WITH_ENHANCED, async (_, enabled) => {
+        if (typeof enabled !== 'boolean') {
+            return { success: false, error: 'Invalid Open With state' };
+        }
+        if (!supportsFileOpenWithEnhanced()) {
+            return { success: false, error: 'unsupported' };
+        }
+        try {
+            const status = await queueFileOpenWithRegistration({
+                enabled,
+                exePath: app.getPath('exe'),
+            });
+            if (status === 'not-registered') {
+                return { success: false, error: 'not_registered' };
+            }
+            setDesktopConfig({ fileOpenWithEnhancedEnabled: enabled });
+            return { success: true };
+        }
+        catch (error) {
+            logger.warn(`[Desktop Settings] Failed to update Open With registration: ${String(error)}`);
+            return { success: false, error: String(error) };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.DESKTOP_GET_FILE_OPEN_WITH_ENHANCED, () => {
+        return getDesktopConfig().fileOpenWithEnhancedEnabled === true;
     });
     ipcMain.handle(IPC_CHANNELS.DESKTOP_START_COMPUTER_USE_RUNTIME, async () => {
         try {
@@ -451,7 +533,12 @@ export function setupDesktopSettingsIPC(options = {}) {
         catch (error) {
             logger.error(`[Desktop Settings] Failed to relocate local runtime data dir: ${String(error)}`);
             if (error instanceof LocalRuntimeDataDirRelocationError) {
-                return { success: false, errorCode: error.code, error: error.message };
+                return {
+                    success: false,
+                    errorCode: error.code,
+                    error: error.message,
+                    ...(error.diskCheck ? { diskCheck: error.diskCheck } : {}),
+                };
             }
             return { success: false, errorCode: 'MIGRATION_FAILED', error: String(error) };
         }

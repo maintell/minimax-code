@@ -1,4 +1,5 @@
 export * from './builtin-defs.js';
+export * from './cloud-ask-user.js';
 export * from './runtime-types.js';
 export * from './cloud-bash.js';
 export * from './cloud-communicate.js';

@@ -97,6 +97,15 @@ export function internalExplicitWorkspaceDir(input) {
     }
     return nonEmpty(input.workspaceDir ?? input.runLocation?.resolvedDir);
 }
+/** Creates or attaches the requested worktree in the workspace the Session resolved to. */
+export async function resolveRequestedRunLocation(input, workspaceDir, resolve) {
+    if (!input.runLocationRequest)
+        return input.runLocation;
+    if (input.runLocation) {
+        throw new SessionServiceError('run-location-invalid', 'runLocation and runLocationRequest cannot both be set');
+    }
+    return resolve(input.runLocationRequest, workspaceDir);
+}
 export function internalDefaultWorkspaceIdentity(input, implicitDefaultWorkspace) {
     if (input.preserveDefaultWorkspaceIdentity && input.isDefaultWorkspace !== undefined) {
         return input.isDefaultWorkspace;

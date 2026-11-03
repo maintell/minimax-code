@@ -26,8 +26,9 @@ export function trustedHost(event) {
     }
 }
 export function setupMiniAppComposerIPC() {
+    const manager = getEmbeddedBrowserManager();
     const broker = new MiniAppComposerBroker({
-        manager: getEmbeddedBrowserManager(),
+        manager,
         getAccountId: () => {
             const id = getUserInfo().realUserID;
             return typeof id === 'string' && id.trim() ? id : null;
@@ -39,7 +40,15 @@ export function setupMiniAppComposerIPC() {
             broker.reply(event, value);
     };
     ipcMain.on(IPC_CHANNELS.MINIAPP_COMPOSER_REPLY, reply);
-    ipcMain.handle(IPC_CHANNELS.MINIAPP_COMPOSER_APPEND, (event, value) => broker.append(event, value));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_COMPOSER_APPEND, async (event, value) => {
+        const release = manager.observeMiniAppPageEnd(event.sender, () => undefined);
+        try {
+            return await broker.append(event, value);
+        }
+        finally {
+            release();
+        }
+    });
     return () => {
         broker.dispose();
         ipcMain.removeListener(IPC_CHANNELS.MINIAPP_COMPOSER_REPLY, reply);

@@ -127,19 +127,20 @@ export class SshWorkspaceFileReader {
         // Preserve the exact requested file: never try an alternative basename.
         const absolutePath = posix.join(workspace, path);
         const candidates = [
-            source,
+            source.workspaceDir,
             ...this.options.repository.list().flatMap((project) => {
                 const target = this.options.repository.getRuntimeTarget(project.id);
-                return target?.host === source.host ? [target] : [];
+                return target?.host === source.host ? [target.workspaceDir] : [];
             }),
-        ].sort((left, right) => right.workspaceDir.length - left.workspaceDir.length);
-        for (const target of candidates) {
-            const relativePath = posix.relative(target.workspaceDir, absolutePath);
+            ...(this.options.runtimeMediaRoots?.(source.host) ?? []).filter(isSafeAbsoluteRemotePath),
+        ].sort((left, right) => right.length - left.length);
+        for (const root of candidates) {
+            const relativePath = posix.relative(root, absolutePath);
             if (!relativePath || relativePath === '..' || relativePath.startsWith('../'))
                 continue;
             // Runtime still performs physical-path containment and Unix permission
-            // checks. A rejected symlink must not fall back to a broader project.
-            return { workspace: target.workspaceDir, path: relativePath };
+            // checks. A rejected symlink must not fall back to a broader root.
+            return { workspace: root, path: relativePath };
         }
         return null;
     }

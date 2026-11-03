@@ -1,5 +1,5 @@
 import { listInternalDefaultRootIds } from '../../shared/internal-default-roots.js';
-import { projectActivityExpression } from '../repo/activity.js';
+import { explicitWorkspaceProjectPredicate, projectListActivityExpression, } from '../repo/activity.js';
 import { and, asc, desc, eq, exists as sqlExists, getTableColumns, gt, inArray, lte, or, sql, } from 'drizzle-orm';
 import { sessions as s } from '../../../../infra/db/schema/sessions.js';
 import { projects as p } from '../../../../infra/db/schema/projects.js';
@@ -41,20 +41,21 @@ export class SidebarQueryService {
             // A workspace project stays listed after all of its conversations are
             // archived; only an explicit removal (hidden) takes it out of the sidebar.
             // The default "no project" bucket still needs an active conversation.
-            const isListedProject = or(hasEligibleSession(false), and(eq(p.projectKind, 'workspace'), hasEligibleSession(true)));
+            // A project the user created explicitly is listed before its first conversation.
+            const isListedProject = or(hasEligibleSession(false), and(eq(p.projectKind, 'workspace'), hasEligibleSession(true)), explicitWorkspaceProjectPredicate);
             const rows = tx
                 .select({
-                project: { ...getTableColumns(p), latestActivityAtMs: projectActivityExpression },
+                project: { ...getTableColumns(p), latestActivityAtMs: projectListActivityExpression },
                 matchedCount: count,
             })
                 .from(p)
                 .where(and(sidebarProjectPredicate(q), hasFilters ? gt(count, 0) : isListedProject, tupleAfter([
                 sql `${p.pinned}`,
                 sql `${p.orderIndex}`,
-                projectActivityExpression,
+                projectListActivityExpression,
                 sql `${p.projectId}`,
             ], last, [true, false, true, false])))
-                .orderBy(desc(p.pinned), asc(p.orderIndex), desc(projectActivityExpression), asc(p.projectId))
+                .orderBy(desc(p.pinned), asc(p.orderIndex), desc(projectListActivityExpression), asc(p.projectId))
                 .limit(limit + 1)
                 .all();
             const page = rows.slice(0, limit);
@@ -75,7 +76,7 @@ export class SidebarQueryService {
                     return undefined;
                 return tx
                     .select({
-                    project: { ...getTableColumns(p), latestActivityAtMs: projectActivityExpression },
+                    project: { ...getTableColumns(p), latestActivityAtMs: projectListActivityExpression },
                     matchedCount: count,
                 })
                     .from(p)

@@ -1,9 +1,19 @@
 export function createSessionsService(repository) {
     return repository;
 }
+/** Owned update fields present as undefined clear the stored values (see rewind commit). */
+const CLEARED_ERROR = {
+    errorMessage: undefined,
+    errorCode: undefined,
+    errorSource: undefined,
+    errorDetail: undefined,
+    errorProviderId: undefined,
+};
 export function createSessionStateWriter(repository) {
     return {
-        markStarted: (input) => repository.applyAgentState({ ...input, update: { status: 'started' } }),
+        // A starting Turn supersedes the Session's current error. History keeps the
+        // failed messages; only the Session-level status fields are cleared.
+        markStarted: (input) => repository.applyAgentState({ ...input, update: { status: 'started', ...CLEARED_ERROR } }),
         markIdle: (input) => repository.applyAgentState({ ...input, update: { status: 'idle' } }),
         markTerminal: (input) => repository.applyAgentState({
             ...input,

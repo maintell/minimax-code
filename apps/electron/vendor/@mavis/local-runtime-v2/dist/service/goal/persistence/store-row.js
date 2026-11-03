@@ -48,6 +48,7 @@ export function rowToThreadGoalState(row) {
         // NULL or any non-positive budget collapses to `null` (= "no cap") so
         // the banner never displays an absurd `0 / 0` denominator.
         tokenBudget: positiveOrNull(row.tokenBudget),
+        ...ownLimitFields(positiveOrNull(row.requestLimit), positiveOrNull(row.activeSecondsLimit)),
         replyFingerprint: typeof row.replyFingerprint === 'string' ? row.replyFingerprint : null,
         noProgressStreak: numericOrZero(row.noProgressStreak),
         noToolStreak: numericOrZero(row.noToolStreak),
@@ -260,6 +261,17 @@ export function numericOrZero(value) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0)
         return 0;
     return Math.floor(value);
+}
+/**
+ * The Goal's own request and time caps (migration 52), present only when set:
+ * an absent one means the Goal has none and the global default applies, so a
+ * Goal without own caps reads exactly as it did before the migration.
+ */
+export function ownLimitFields(requestLimit, activeSecondsLimit) {
+    return {
+        ...(requestLimit !== null ? { requestLimit } : {}),
+        ...(activeSecondsLimit !== null ? { activeSecondsLimit } : {}),
+    };
 }
 /** Coerce an invalid or absent token budget to the canonical uncapped value. */
 export function positiveOrNull(value) {

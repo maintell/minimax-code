@@ -83,6 +83,11 @@ const SESSION_MUTATION_EVENT_TYPES = new Set([
     'session.deleted',
     'session.interaction_mode.changed',
 ]);
+/**
+ * 发送成功时不写日志的事件。工作区 git 变化随文件改动触发，一天几千条，这行日志只有事件类型和
+ * status=sent，没有可追查的信息。发送失败、连接断开丢弃照记。
+ */
+const SENT_UNLOGGED_EVENT_TYPES = new Set(['workspace.git.changed']);
 export class PermissionUpstream {
     deps;
     controller = null;
@@ -206,6 +211,8 @@ export class PermissionUpstream {
             this.bufferNotificationEvent({ type, payload, timestamp }, 'send_failed');
     }
     logGenericEventDelivery(type, wsType, status, sessionId, turnId, requestId) {
+        if (status === 'sent' && SENT_UNLOGGED_EVENT_TYPES.has(type))
+            return;
         // Redaction: correlation IDs only — never payload/title contents.
         const message = `component=rc_event_upstream event=event_forward event_type=${type} ws_type=${wsType}${sessionId ? ` session_id=${sessionId}` : ''}${turnId ? ` turn_id=${turnId}` : ''}${requestId ? ` request_id=${requestId}` : ''} status=${status}`;
         if (status === 'sent') {

@@ -1,4 +1,5 @@
 import { responseHeadersFromHttpServiceContext } from '@mavis/thrift-gen/runtime';
+import { settleInBackground } from '../../service/plugin-system/index.js';
 import { toErrorBody } from '../errors.js';
 function hasGetResponse(err) {
     return (typeof err === 'object' &&
@@ -15,15 +16,10 @@ function describeError(err) {
 export function cancelDiscardedBody(body) {
     if (!body)
         return;
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises -- cancellation is intentionally detached so a pending stream cannot block the replacement response
-    (async () => {
-        try {
-            await body.cancel();
-        }
-        catch {
-            // A rejected cancel still allows the replacement response to proceed.
-        }
-    })();
+    settleInBackground(cancelBody(body));
+}
+async function cancelBody(body) {
+    await body.cancel();
 }
 /**
  * Catches pre-open failures only. Once an SSE stream Response is returned

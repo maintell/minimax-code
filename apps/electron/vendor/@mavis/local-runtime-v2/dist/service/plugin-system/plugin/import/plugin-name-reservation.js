@@ -1,18 +1,26 @@
+import { LOCAL_PLUGIN_MARKETPLACE, pluginIdKey } from '@mavis/shared';
 import { PluginSystemError } from '../../errors.js';
 import { normalizedPluginName } from '../../plugin-system-helpers.js';
-/** Applies one authoritative installed-name policy to every local Plugin acceptance path. */
+/**
+ * Admission for a Host-authored `<name>@local` Plugin (Mini App workspace
+ * publication). An installed official Plugin of the same name stays read-only
+ * for this path. Local conflicts are by PluginId: a same-name Plugin from a
+ * user-added marketplace does not block, and the snapshot decides which copy
+ * is effective.
+ */
 export class PluginNameReservation {
     source;
     constructor(source) {
         this.source = source;
     }
     async assertAvailable(pluginName, options = {}) {
-        const key = normalizedPluginName(pluginName);
         const officialInstallations = await this.source.readOfficialInstallations();
-        if (officialInstallations.some((installation) => installation.installed && normalizedPluginName(installation.name) === key)) {
+        const nameKey = normalizedPluginName(pluginName);
+        if (officialInstallations.some((installation) => installation.installed && normalizedPluginName(installation.name) === nameKey)) {
             throw alreadyInstalled(options.allowEnabledMiniAppUpdate ? 'OFFICIAL_PLUGIN_READ_ONLY' : undefined);
         }
-        const localOwners = (await this.source.readLocalPackages()).filter(({ plugin }) => normalizedPluginName(plugin.name) === key);
+        const key = pluginIdKey({ name: pluginName, marketplace: LOCAL_PLUGIN_MARKETPLACE });
+        const localOwners = (await this.source.readLocalPackages()).filter((entry) => pluginIdKey(entry.id ?? { name: entry.plugin.name, marketplace: LOCAL_PLUGIN_MARKETPLACE }) === key);
         if (localOwners.length === 0)
             return;
         const current = localOwners[0];

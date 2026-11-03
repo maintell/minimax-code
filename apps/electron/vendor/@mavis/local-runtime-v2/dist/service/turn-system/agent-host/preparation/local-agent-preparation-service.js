@@ -19,6 +19,10 @@ export class LocalAgentPreparationService {
     bindTaskSessionBindings(bindings) {
         this.options.configBuilder.bindTaskSessionBindings(bindings);
     }
+    /** Late-bound Project folder reader; absent keeps the single-folder behavior. */
+    bindAdditionalWorkspaceRoots(read) {
+        this.options.configBuilder.bindAdditionalWorkspaceRoots(read);
+    }
     async prepare(input) {
         const model = toModelOverride(input.request.input.model);
         return this.prepareResolved({
@@ -67,6 +71,9 @@ export class LocalAgentPreparationService {
                 ? { retryContinuationPrompt: built.retryContinuationPrompt }
                 : {}),
             ...(built.promptRead ? { promptRead: built.promptRead } : {}),
+            ...(built.additionalWorkspaceRoots
+                ? { additionalWorkspaceRoots: built.additionalWorkspaceRoots }
+                : {}),
         };
     }
 }

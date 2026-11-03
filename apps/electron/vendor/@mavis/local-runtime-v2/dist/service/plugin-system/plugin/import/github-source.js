@@ -1,18 +1,45 @@
 import { PluginSystemError } from '../../errors.js';
+import { resolveHead, resolveRoute } from '../source/git-checkout.js';
+import { GitRemote } from '../source/git-remote.js';
+import { GitCommandError } from '../source/git-runner.js';
+/**
+ * GitHub HTTPS URLs keep the REST + codeload fast path. Every other source
+ * (HTTPS, ssh, scp-like, `owner/repo[@ref]`) is resolved with non-interactive git.
+ * Browser pages on either path (`…/tree/<ref>/<dir>`, GitLab `…/-/tree/…`,
+ * blob pages, page queries) name the repository, the ref and the directory.
+ */
 export async function resolveGitRepositorySource(sourceUrl, options) {
-    let parsedUrl;
-    try {
-        parsedUrl = new URL(sourceUrl.trim());
+    if (isGithubRepositoryUrl(sourceUrl)) {
+        return resolveGithubPluginSource(githubTreeUrl(sourceUrl), options.fetchImpl, options.signal);
     }
-    catch {
-        fail('GIT_REPOSITORY_URL_INVALID', 'An HTTPS Git repository URL is required');
-    }
-    if (isGithubHost(parsedUrl.hostname)) {
-        return resolveGithubPluginSource(sourceUrl, options.fetchImpl, options.signal);
-    }
-    const url = parseGitRepositoryUrl(sourceUrl);
-    const commitSha = await resolveRemoteHead(url.toString(), options.signal);
-    return { repositoryUrl: url.toString().replace(/\.git$/iu, ''), commitSha };
+    const { remote, ref: shorthandRef, route } = parseGitRepositorySource(sourceUrl);
+    const target = route
+        ? await remoteCall(() => resolveRoute(remote, route, gitCallOptions(options)), options.signal)
+        : undefined;
+    const ref = target?.ref ?? shorthandRef;
+    const commitSha = await remoteCall(() => resolveHead(remote, ref, gitCallOptions(options)), options.signal);
+    const subPath = normalizeSubPath(target?.path);
+    return { repositoryUrl: repositoryUrlOf(remote), commitSha, ...(subPath ? { subPath } : {}) };
+}
+/** A GitHub page in the form the fast path reads: `owner/repo[/tree/<ref>[/<dir>]]`. */
+function githubTreeUrl(value) {
+    const parsed = GitRemote.parse(value);
+    // Forms the parser refuses (credentials, odd paths) go on to the strict GitHub checks.
+    if (!parsed)
+        return value;
+    const repository = `https://github.com/${parsed.remote.repositoryPath}`;
+    const tail = parsed.ref ? [parsed.ref] : directoryRoute(parsed.route);
+    return tail.length > 0
+        ? `${repository}/tree/${tail.map(encodeURIComponent).join('/')}`
+        : repository;
+}
+function directoryRoute(route) {
+    if (!route)
+        return [];
+    return route.kind === 'blob' ? route.tail.slice(0, -1) : route.tail;
+}
+function gitCallOptions(options) {
+    return { ...(options.signal ? { signal: options.signal } : {}), timeoutMs: TIMEOUT_MS };
 }
 export function isGithubRepositoryUrl(value) {
     try {
@@ -23,78 +50,53 @@ export function isGithubRepositoryUrl(value) {
     }
 }
 export function validateGitRepositorySource(source) {
-    const url = parseGitRepositoryUrl(source.repositoryUrl);
+    if (isGithubRepositoryUrl(source.repositoryUrl)) {
+        if (!FULL_SHA.test(source.commitSha.toLowerCase())) {
+            fail('GIT_REPOSITORY_SOURCE_INVALID', 'commit_sha must be a full SHA');
+        }
+        return validateGithubPluginSource(source);
+    }
+    const { remote } = parseGitRepositorySource(source.repositoryUrl);
     const commitSha = source.commitSha.toLowerCase();
     if (!FULL_SHA.test(commitSha))
         fail('GIT_REPOSITORY_SOURCE_INVALID', 'commit_sha must be a full SHA');
-    if (isGithubHost(url.hostname))
-        return validateGithubPluginSource(source);
     if (source.subPath !== undefined)
         return {
-            repositoryUrl: url.toString().replace(/\.git$/iu, ''),
+            repositoryUrl: repositoryUrlOf(remote),
             commitSha,
             subPath: normalizeSubPath(source.subPath),
         };
-    return { repositoryUrl: url.toString().replace(/\.git$/iu, ''), commitSha };
+    return { repositoryUrl: repositoryUrlOf(remote), commitSha };
 }
-function parseGitRepositoryUrl(value) {
-    if (value.length > 2_048)
-        fail('GIT_REPOSITORY_URL_INVALID', 'Git repository URL is too long');
-    const url = parseHttpsUrl(value);
-    const parts = url.pathname.split('/').filter(Boolean);
-    if (parts.length < 2 || parts.some((part) => !/^[A-Za-z0-9_.~-]+$/u.test(part))) {
-        fail('GIT_REPOSITORY_URL_INVALID', 'URL must identify a Git repository');
+function parseGitRepositorySource(value) {
+    const parsed = GitRemote.parse(value);
+    if (!parsed) {
+        fail('GIT_REPOSITORY_URL_INVALID', 'An HTTPS or SSH Git repository URL without credentials is required');
     }
-    if (!parts.at(-1)?.endsWith('.git'))
-        url.pathname = `${url.pathname}.git`;
-    return url;
+    return parsed;
 }
-function parseHttpsUrl(value) {
-    let url;
-    try {
-        url = new URL(value.trim());
-    }
-    catch {
-        fail('GIT_REPOSITORY_URL_INVALID', 'An HTTPS Git repository URL is required');
-    }
-    if (url.protocol !== 'https:' ||
-        url.username ||
-        url.password ||
-        url.port ||
-        url.search ||
-        url.hash) {
-        fail('GIT_REPOSITORY_URL_INVALID', 'An HTTPS Git repository URL without credentials is required');
-    }
-    return url;
+// HTTPS sources keep their historical `.git`-less form; ssh forms stay verbatim.
+function repositoryUrlOf(remote) {
+    return remote.transport === 'https' ? remote.url.replace(/\.git$/iu, '') : remote.url;
 }
 function isGithubHost(hostname) {
     return ['github.com', 'www.github.com'].includes(hostname.toLowerCase());
 }
-async function resolveRemoteHead(url, signal) {
-    const { execFile } = await import('node:child_process');
-    const { promisify } = await import('node:util');
-    const run = promisify(execFile);
+/** Runs one git call against the remote and maps its failure to a stable import error. */
+async function remoteCall(call, signal) {
     try {
-        const result = await run('git', ['ls-remote', '--symref', url, 'HEAD'], {
-            timeout: TIMEOUT_MS,
-            maxBuffer: 64 * 1024,
-            signal,
-            windowsHide: true,
-        });
-        const sha = result.stdout
-            .split(/\r?\n/u)
-            .map((line) => line.split(/\s+/u)[0])
-            .find((value) => FULL_SHA.test(value ?? ''));
-        if (!sha)
-            fail('GIT_REPOSITORY_REF_NOT_FOUND', 'Git repository HEAD could not be resolved');
-        return sha.toLowerCase();
+        return await call();
     }
     catch (error) {
-        if (error instanceof PluginSystemError)
-            throw error;
         if (signal?.aborted)
             throw error;
-        fail('GIT_REPOSITORY_UNAVAILABLE', 'Git repository could not be reached');
+        const category = error instanceof GitCommandError ? error.category : undefined;
+        if (category === 'REF_NOT_FOUND' || category === 'REPO_EMPTY') {
+            fail('GIT_REPOSITORY_REF_NOT_FOUND', 'Git repository HEAD could not be resolved');
+        }
+        throw new PluginSystemError('GIT_REPOSITORY_UNAVAILABLE', 'Git repository could not be reached', {
+            ...(category ? { reasonCode: category } : {}),
+        });
     }
 }
 const FULL_SHA = /^[a-f0-9]{40}$/u;

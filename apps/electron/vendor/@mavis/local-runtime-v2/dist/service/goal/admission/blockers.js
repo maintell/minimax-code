@@ -16,9 +16,11 @@ export async function firstGoalBlocker(gates, input) {
         return 'permission';
     if (gates.hasPendingPlan && (await gates.hasPendingPlan(input.sessionId)))
         return 'plan';
-    if (await gates.hasRequiredBackgroundWork(input.sessionId, input.goalId)) {
+    const background = await gates.hasRequiredBackgroundWork(input.sessionId, input.goalId);
+    if (background === 'unreadable')
+        return 'dependency_unavailable';
+    if (background)
         return 'required_background';
-    }
     if (await gates.hasAutomationOwnerConflict(input.sessionId))
         return 'automation_owner_conflict';
     return undefined;

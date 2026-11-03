@@ -407,4 +407,17 @@ async function recoverPendingForksFailSoft(input) {
         reportStartupFailure(input, 'pending-fork-recovery', `owner=session;stage=pending-fork-recovery;error=${describeError(error)}`);
     }
 }
+export async function closeRuntimeServiceResources(promptLifecycle, hookPermissions, safety) {
+    try {
+        await promptLifecycle.close();
+    }
+    finally {
+        try {
+            await hookPermissions.close();
+        }
+        finally {
+            await safety.close();
+        }
+    }
+}
 //# sourceMappingURL=runtime-services-lifecycle.js.map

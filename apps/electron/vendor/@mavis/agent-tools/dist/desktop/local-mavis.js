@@ -38,9 +38,11 @@ import { z } from 'zod';
 import { normalizeMavisCommand } from '../shared/mavis-operation-classifier.js';
 import { CRON_CREATE_ME_REJECTED_MESSAGE, isCronDedicatedSessionTarget, isCronFixedSessionId, isMeSessionSentinel, } from '../shared/cron-schedule-input.js';
 import { LocalMavisToolDef } from './builtin-defs.js';
-import { LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, } from './local-mavis-commands.js';
+import { LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, localMavisArchiveCall, mavisRecoveryInstruction, ptcMavisHelpOutput, ptcMavisRunCodeTool, } from './local-mavis-commands.js';
 import { LocalMavisCronUnsupportedError, LocalMavisCronValidationError, } from './local-mavis-cron-adapter.js';
-import { createDesktopOutputContinuation } from './output-limit.js';
+import { projectSessionMessagesPage, sessionMessagesView } from './local-mavis-session-messages.js';
+import { createDesktopOutputContinuation, isPtcChildCall } from './output-limit.js';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 import { toAgentRequestRef } from './subagent-roles.js';
 export const DESKTOP_MANAGEMENT_MAX_TOKENS = 16_000;
 const MAVIS_TOKEN_ESTIMATOR = createDefaultTokenEstimator();
@@ -212,6 +214,10 @@ const sessionMessagesSchema = z.object({
     source: sessionReadSource,
     limit: optionalNumber,
     before: optionalString,
+    include_tool_outputs: optionalBoolean,
+    // Values above SESSION_MESSAGES_MAX_OUTPUT_CHARS use the maximum.
+    max_output_chars: z.number().int().positive().optional(),
+    include_thinking: optionalBoolean,
 });
 const mcpTransportSchema = z.enum(['stdio', 'http', 'streamable-http', 'sse']);
 const mcpStringMapSchema = z.record(z.string(), z.string());
@@ -282,8 +288,8 @@ const mcpUpdateSchema = z
 });
 const mcpDeleteSchema = z.object({ name: z.string().min(1) }).strict();
 // `Record<LocalMavisCommandName, ...>` 让本表和 `LOCAL_MAVIS_COMMANDS` 词表
-// 保持强同步：少一条或多一条命令都会直接编译失败。
-const COMMAND_SCHEMAS = {
+// 保持强同步：少一条或多一条命令都会直接编译失败。PTC 的 mavis_* 子工具从这里转出参数 schema。
+export const LOCAL_MAVIS_COMMAND_SCHEMAS = {
     'agent list': pageParamSchema,
     'agent get': agentGetSchema,
     'agent create': agentCreateSchema,
@@ -380,10 +386,12 @@ let LocalMavisTool = (() => {
                     error: {
                         kind: 'validation',
                         code: 'SESSION_CREATE_MOVED',
-                        message: 'Search for session_create with tool_search, then call mcp_invoke.',
+                        message: isCallableInRunCode(ctx, 'session_create')
+                            ? 'Search for session_create with tool_search, then call it inside run_code, e.g. await tools.session_create(args).'
+                            : 'Search for session_create with tool_search, then call mcp_invoke.',
                     },
                 });
-                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+                return mavisRefusal(text);
             }
             if (normalizeCommand(input.command) === 'session delete') {
                 // Deletion stays a user action. Answering here, before the unknown-command
@@ -395,20 +403,22 @@ let LocalMavisTool = (() => {
                     error: {
                         kind: 'validation',
                         code: 'SESSION_DELETE_NOT_ALLOWED',
-                        message: 'Deleting a session is reserved for the user. Ask the user to delete it in the app, or archive it with session update (archived: true).',
+                        message: `Deleting a session is reserved for the user. Ask the user to delete it in the app, or archive it with ${localMavisArchiveCall(ctx)}.`,
                     },
                 });
-                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+                return mavisRefusal(text);
             }
             if (normalizeCommand(input.command).startsWith('cron ')) {
                 const text = JSON.stringify({
                     ok: false,
                     error: {
                         code: 'CRON_TOOL_MOVED',
-                        message: 'Use self_reminder for task follow-up. Search for cron_create, cron_read, cron_update or cron_delete with tool_search, then call mcp_invoke.',
+                        message: isCronCallableInRunCode(ctx)
+                            ? 'Use self_reminder for task follow-up. Search for cron_create, cron_read, cron_update or cron_delete with tool_search, then call the chosen tool inside run_code, e.g. await tools.cron_read(args).'
+                            : 'Use self_reminder for task follow-up. Search for cron_create, cron_read, cron_update or cron_delete with tool_search, then call mcp_invoke.',
                     },
                 });
-                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+                return mavisRefusal(text);
             }
             const command = normalizeCommand(input.command);
             if (!LOCAL_MAVIS_COMMANDS.includes(command)) {
@@ -421,7 +431,7 @@ let LocalMavisTool = (() => {
                         known_commands: LOCAL_MAVIS_COMMANDS,
                     },
                 });
-                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+                return mavisRefusal(text);
             }
             const output = await dispatchLocalMavis({
                 agentAdapter: this.agentAdapter,
@@ -433,7 +443,7 @@ let LocalMavisTool = (() => {
                 currentTurnId: ctx.turnId,
                 currentModel: currentLocalCronModel(ctx),
             }, input.command, input.args, signal);
-            const text = JSON.stringify(output, null, 2);
+            const text = JSON.stringify(ptcMavisHelpOutput(ctx, output), null, 2);
             const historyOutput = JSON.parse(text);
             const result = {
                 tool_name: LocalMavisToolDef.name,
@@ -442,17 +452,32 @@ let LocalMavisTool = (() => {
                 details: { command: output.command, output: historyOutput },
                 ...(output.ok ? {} : { isError: true }),
             };
-            const limited = limitLocalManagementOutput(ctx, text, output);
-            if (!limited.truncated)
-                return result;
+            if (isPtcChildCall(ctx)) {
+                // A run_code child gets the whole response in output and data; only the
+                // program's return value reaches the model (see isPtcChildCall).
+                const uncappedOutput = estimateMavisResultTokens(ctx, text, !output.ok) > DESKTOP_MANAGEMENT_MAX_TOKENS;
+                return withDesktopCompletenessReport(LocalMavisToolDef.name, result, {
+                    data: historyOutput,
+                    ...(uncappedOutput ? { uncappedOutput } : {}),
+                });
+            }
+            const recovery = mavisRecoveryInstruction(output.command, ptcMavisRunCodeTool(ctx, output.command));
+            const limited = limitLocalManagementOutput(ctx, text, output, 'mavis', recovery);
+            // PTC data is the object the text serializes; a head+tail preview cannot
+            // be matched by a partial object, so a cut keeps only ok and command.
+            if (!limited.truncated) {
+                return withDesktopCompletenessReport(LocalMavisToolDef.name, result, {
+                    data: historyOutput,
+                });
+            }
             const continuation = createDesktopOutputContinuation({
                 continuation_hint: {
                     tool: 'mavis',
                     preserve_args: ['command', 'args'],
-                    instruction: mavisRecoveryInstruction(output.command),
+                    instruction: recovery,
                 },
             });
-            return {
+            return withDesktopCompletenessReport(LocalMavisToolDef.name, {
                 ...result,
                 text: limited.text,
                 content: [{ type: 'text', text: limited.text }],
@@ -468,12 +493,22 @@ let LocalMavisTool = (() => {
                     },
                     desktop_output_continuation: continuation,
                 },
-            };
+            }, { data: { ok: output.ok, command: output.command } });
         }
     };
     return LocalMavisTool = _classThis;
 })();
 export { LocalMavisTool };
+/** A command answered before dispatch; PTC data is the same object as the text. */
+function mavisRefusal(text) {
+    return {
+        tool_name: 'mavis',
+        text,
+        content: [{ type: 'text', text }],
+        isError: true,
+        programmatic: { data: JSON.parse(text) },
+    };
+}
 export function limitLocalManagementOutput(ctx, text, output, toolName = 'mavis', recoveryInstruction = mavisRecoveryInstruction(output.command)) {
     const originalTokens = estimateMavisResultTokens(ctx, text, !output.ok);
     if (originalTokens <= DESKTOP_MANAGEMENT_MAX_TOKENS) {
@@ -556,32 +591,6 @@ function isHighSurrogate(code) {
 function isLowSurrogate(code) {
     return code >= 0xdc00 && code <= 0xdfff;
 }
-const LOCAL_MAVIS_MUTATION_COMMANDS = new Set([
-    'agent create',
-    'agent update',
-    'agent delete',
-    'cron create',
-    'cron self',
-    'cron once',
-    'cron update',
-    'cron delete',
-    'cron trigger',
-    'session update',
-    'session interrupt',
-    'session send',
-    'mcp create',
-    'mcp update',
-    'mcp delete',
-]);
-function mavisRecoveryInstruction(command) {
-    if (LOCAL_MAVIS_MUTATION_COMMANDS.has(command)) {
-        return (`do not repeat the mutation command ${JSON.stringify(command)} automatically; ` +
-            'inspect current state with the corresponding get/list command');
-    }
-    return (`call mavis again with command=${JSON.stringify(command)} and narrower args ` +
-        '(prefer a smaller limit, tighter search/filter, pagination cursor, or a specific get command); ' +
-        'preserve the same logical query');
-}
 export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
     const command = normalizeCommand(rawCommand);
     if (rawArgs?.source !== undefined) {
@@ -614,7 +623,7 @@ export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
             code: 'CRON_CREATE_ME_REJECTED',
         });
     }
-    const schema = COMMAND_SCHEMAS[command];
+    const schema = LOCAL_MAVIS_COMMAND_SCHEMAS[command];
     let substitutedArgs;
     try {
         substitutedArgs = substituteMe(rawArgs ?? {}, ctx.currentAgentName, ctx.currentSessionId);
@@ -846,6 +855,20 @@ export function currentLocalCronModel(ctx) {
         return undefined;
     return `${provider}/${modelId}`;
 }
+/**
+ * True when this Turn runs with programmatic tool calling (PTC) and the
+ * on-demand cron tools are run_code children. There mcp_invoke does not route
+ * them, so recovery text that says "call mcp_invoke" would send the model into
+ * a failed call. The PTC executor answers only for this Turn's run_code
+ * children, so ordinary Turns keep their original wording.
+ */
+export function isCronCallableInRunCode(ctx) {
+    return isCallableInRunCode(ctx, 'cron_read');
+}
+/** Same check for one on-demand tool, such as session_create. */
+function isCallableInRunCode(ctx, toolName) {
+    return ctx.ptcExecutor?.getToolExecutionMode(toolName) !== undefined;
+}
 async function handleCronUpdate(ctx, args, signal) {
     const adapter = requireCronAdapter(ctx);
     const session = args.session ? toAdapterCronSession(ctx, args.session) : undefined;
@@ -1047,12 +1070,15 @@ async function handleSessionInterrupt(ctx, args, signal) {
 }
 async function handleSessionMessages(ctx, args, signal) {
     const sessionId = resolveSessionId(ctx, args.session_id);
-    return success(ctx.command, await requireSessionAdapter(ctx).listMessages({
+    const page = await requireSessionAdapter(ctx).listMessages({
         sessionId,
         ...(args.source ? { source: args.source } : {}),
         ...(args.limit !== undefined ? { limit: args.limit } : {}),
         ...(args.before ? { before: args.before } : {}),
-    }, signal));
+    }, signal);
+    // Projected here, before the caller serializes and token-counts the response,
+    // so a stored multi-megabyte tool result is never copied whole.
+    return success(ctx.command, projectSessionMessagesPage(page, sessionMessagesView(args)));
 }
 async function handleSessionHelp(ctx) {
     return success(ctx.command, {
@@ -1081,7 +1107,7 @@ async function handleSessionHelp(ctx) {
             {
                 command: 'session interrupt',
                 args: ['session_id', 'turn_id?'],
-                summary: 'Stop the target session\'s current turn and keep the session. Queued messages still run afterwards; background work and the goal are untouched. Returns outcome aborted or not_running. Cannot target the calling session.',
+                summary: "Stop the target session's current turn and keep the session. Queued messages still run afterwards; background work and the goal are untouched. Returns outcome aborted or not_running. Cannot target the calling session.",
                 examples: ['mavis({ command: "session interrupt", args: { session_id: "mvs_target" } })'],
             },
             {
@@ -1091,7 +1117,11 @@ async function handleSessionHelp(ctx) {
                     'source? (local|cloud; default local)',
                     'limit? (cloud default 20, max 100)',
                     'before?',
+                    'include_tool_outputs? (default false)',
+                    'max_output_chars? (default 2000, max 20000)',
+                    'include_thinking? (default false)',
                 ],
+                summary: 'Message text is returned in full. Each tool call is summarized as tool_name, tool_call_id, status, parent_tool_call_id (the run_code that made a child call), args_preview (first 200 characters), args_chars and result_chars, without its result; thinking and usage statistics are omitted. include_tool_outputs: true returns args and result instead, include_thinking: true adds thinking_content, each cut to max_output_chars with *_truncated: true when cut.',
             },
         ],
     });
@@ -1458,6 +1488,7 @@ const INPUT_CONDITION_ERROR_CODES = new Set([
     'SESSION_CREATE_INVALID_CONTENT',
     'SESSION_CREATE_UNKNOWN_AGENT',
     'SESSION_CREATE_INVALID_WORKSPACE',
+    'SESSION_CREATE_INVALID_LOCATION',
     'SESSION_CREATE_MODEL_UNRESOLVED',
 ]);
 /**

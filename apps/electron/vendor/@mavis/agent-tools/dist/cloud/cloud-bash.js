@@ -51,7 +51,9 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     }
     return useValue ? value : void 0;
 };
+import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { Type } from '@sinclair/typebox';
+import { shellQuote } from './sandbox-rg-runner.js';
 import { bindTool, } from '@mavis/agent-core/tools';
 import { CloudBashToolDef as BashToolDef, } from './builtin-defs.js';
 import { SHELL_EXECUTION_POLICY, logger } from './runtime-types.js';
@@ -59,6 +61,18 @@ import { BackgroundTaskKind, BackgroundTaskStatus, ShellExecutionPolicy, ShellJo
 import { tryLocalDispatch } from './local-shell/index.js';
 import { collectSecretEnvVars } from './secret-env-inject.js';
 import { withCloudCompatibleToolResponse } from './cloud-plugin-hook-response.js';
+import { shellStorageFailure, withStorageFailure } from './storage-failure.js';
+/** Trusted context routing, compatible with ExecuteShellReq's existing command field.
+ * A failed cd exits the subshell before ANY user command (including multiline input).
+ * The subshell also prevents a persistent shell's previous cwd from leaking into turns.
+ * This selects cwd; it is not an OS/shell security sandbox.
+ */
+export function wrapShellCommandInWorkspace(command, workspaceRoot) {
+    if (!isAbsolute(workspaceRoot) || workspaceRoot.includes('\0')) {
+        throw new Error('CLOUD_SHELL_WORKSPACE_UNAVAILABLE');
+    }
+    return `(\ncd -- ${shellQuote(workspaceRoot)} || { printf '%s\\n' 'CLOUD_SHELL_WORKSPACE_UNAVAILABLE' >&2; exit 125; }\nexec /bin/bash -c ${shellQuote(command)}\n)`;
+}
 const DEFAULT_BACKGROUND_HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_BACKGROUND_MAX_RUN_MS = 30 * 60 * 1000;
 const BackgroundBashToolDef = {
@@ -99,9 +113,20 @@ let CloudBashTool = (() => {
         }
         archonServer;
         background;
-        constructor(archonServer, background) {
+        workspace;
+        constructor(archonServer, background, workspace) {
             this.archonServer = archonServer;
             this.background = background;
+            this.workspace = workspace;
+        }
+        isBaseWorkspace(ctx) {
+            const base = this.workspace?.baseWorkspaceRoot;
+            return base !== undefined && resolvePath(ctx.workspaceRoot) === resolvePath(base);
+        }
+        shellCommand(ctx, command) {
+            return this.isBaseWorkspace(ctx)
+                ? command
+                : wrapShellCommandInWorkspace(command, ctx.workspaceRoot);
         }
         async execute(ctx, input, signal) {
             if (signal?.aborted)
@@ -147,7 +172,7 @@ let CloudBashTool = (() => {
             let res;
             try {
                 res = await this.archonServer.executeShell(ctx, {
-                    command: input.command,
+                    command: this.shellCommand(ctx, input.command),
                     ...(input.timeout ? { timeout_seconds: input.timeout } : {}),
                     execution_policy: SHELL_EXECUTION_POLICY.ReusePersistent,
                     ...(envVars ? { env_vars: envVars } : {}),
@@ -180,7 +205,7 @@ let CloudBashTool = (() => {
             // marker survives whenever any tail budget is left).
             const rawText = (res.stdout ?? '') + (res.stderr ?? '');
             const text = res.output_truncated ? `${rawText}${BASH_OUTPUT_TRUNCATED_MARKER}` : rawText;
-            return withCloudCompatibleToolResponse({
+            return withCloudCompatibleToolResponse(withStorageFailure({
                 tool_name: BashToolDef.name,
                 text,
                 content: [{ type: 'text', text }],
@@ -192,7 +217,7 @@ let CloudBashTool = (() => {
                     dispatched_locally: false,
                     local_dispatch_skip_reason: outcome.reason,
                 },
-            }, {
+            }, shellStorageFailure(res.stdout ?? '', res.stderr ?? '', res.exit_code)), {
                 stdout: res.stdout ?? '',
                 stderr: res.stderr ?? '',
                 interrupted: res.timed_out === true,
@@ -268,7 +293,8 @@ let CloudBashTool = (() => {
                 shellJob = await this.background.shellJobClient.start({
                     task_id: taskId,
                     session_id: ctx.sessionId,
-                    command: input.command,
+                    ...(this.isBaseWorkspace(ctx) ? {} : { cwd: ctx.workspaceRoot }),
+                    command: this.shellCommand(ctx, input.command),
                     ...(input.timeout ? { timeout_seconds: input.timeout } : {}),
                     execution_policy: ShellExecutionPolicy.ReusePersistent,
                     ...(envVars ? { env_vars: envVars } : {}),

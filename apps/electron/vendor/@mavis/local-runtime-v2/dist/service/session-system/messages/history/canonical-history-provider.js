@@ -7,7 +7,6 @@ import { repairCanonicalHistory } from './canonical-history-recovery.js';
 import { deleteSessionHistory } from './session-history-paths.js';
 import { createSessionHistoryLocationResolver, } from './session-history-location.js';
 import { ensureCanonicalHistoryMaterialized, } from './canonical-history-materializer.js';
-import { CanonicalHistoryIndexWriteError, createCanonicalHistoryIndexAdapter, } from './mutation/canonical-history-index.js';
 import { HistoryScannerError, scanCanonicalHistoryArtifacts, } from './mutation/canonical-history-scanner.js';
 import { isUserMessageId } from '../../shared/user-message-id.js';
 import { isSideChatModeMessage } from '../../shared/sidechat-mode.js';
@@ -19,7 +18,8 @@ function historySnapshot(records, useActiveRevision) {
         revision: useActiveRevision
             ? canonicalActiveHistoryRevision(records)
             : canonicalHistoryRevision(records),
-        messages: records.map(({ message }) => detached(message)),
+        // The reader's records are deeply frozen and owned by it; share them instead of copying.
+        messages: Object.freeze(records.map(({ message }) => message)),
         identityVector: records.map(({ message_id }) => message_id),
     };
 }
@@ -51,21 +51,20 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
     const ioLane = options.ioLane ?? createSessionHistoryIoLane();
     const locations = options.locations ??
         createSessionHistoryLocationResolver({ dataDir: options.dataDir, sessions: options.sessions });
-    const indexes = new Map();
     const verifiedRecovery = new WeakMap();
     return {
         read: (sessionId) => inLane(sessionId, () => readSnapshot(sessionId, false)),
         readActive: (sessionId) => inLane(sessionId, () => readSnapshot(sessionId, true)),
         inspectActive: (sessionId) => inLane(sessionId, () => inspectActiveSnapshot(sessionId)),
         initialize: (sessionId) => inLane(sessionId, async () => {
-            const paths = await ensureInitialized(sessionId, 'allocate');
-            await syncIndex(sessionId, paths);
+            await ensureInitialized(sessionId, 'allocate');
         }),
         delete: (sessionId) => inLane(sessionId, async () => {
             const located = await locations.resolveSession(sessionId);
             if (!located)
                 return;
             deleteSessionHistory(options.dataDir, located.session, located.paths);
+            files.forget?.(located.paths.messages);
             options.activity?.notify(sessionId);
         }),
         append: (change) => inLane(change.sessionId, async () => {
@@ -104,6 +103,8 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
         }),
         compact: (change) => inLane(change.sessionId, async () => {
             const paths = await ensureInitialized(change.sessionId);
+            // The snapshot and the replacement rewrite the whole file, so start from a full disk read.
+            files.forget?.(paths.messages);
             const active = await files.readActiveStrict(paths.messages);
             await scanCompactionLineageAllowingMissingParent(paths, change.sessionId);
             const generation = activeGeneration(active);
@@ -129,11 +130,10 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             if (committedGeneration !== generation + 1) {
                 throw new Error(`Canonical compaction generation verification failed: ${change.sessionId}`);
             }
-            await syncIndex(change.sessionId, paths, true, committed);
             const result = {
                 revision: canonicalActiveHistoryRevision(committed),
                 generation: committedGeneration,
-                messages: committed.map(({ message }) => detached(message)),
+                messages: Object.freeze(committed.map(({ message }) => message)),
                 identityVector: committed.map(({ message_id }) => message_id),
             };
             options.activity?.notify(change.sessionId);
@@ -149,7 +149,6 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             verifiedRecovery,
             notify: () => options.activity?.notify(sessionId),
         });
-        await syncIndex(sessionId, paths, true, records);
         return historySnapshot(records, allowPendingToolCallTail);
     }
     async function inspectActiveSnapshot(sessionId) {
@@ -175,28 +174,6 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
         });
         return paths;
     }
-    async function syncIndex(sessionId, paths, allowMissingParent = false, verifiedRecords) {
-        const active = verifiedRecords ?? (await files.readActiveStrict(paths.messages));
-        const adapter = indexes.get(sessionId) ?? createCanonicalHistoryIndexAdapter(paths.sessionDir);
-        indexes.set(sessionId, adapter);
-        try {
-            await adapter.loadOrRebuild({
-                sessionId,
-                activeGeneration: activeGeneration(active),
-                activeRevision: canonicalActiveHistoryRevision(active),
-            }, 
-            // Only the default reader owns reusable immutable records. Preserve the
-            // independent on-disk scanner for externally supplied adapters.
-            (scannerPaths) => scanCanonicalHistoryArtifacts(scannerPaths, options.files ? undefined : files), { activePath: paths.messages, snapshotsPath: paths.snapshots, sessionId });
-        }
-        catch (error) {
-            if (error instanceof CanonicalHistoryIndexWriteError)
-                return;
-            if (allowMissingParent && isMissingParentScannerError(error))
-                return;
-            throw error;
-        }
-    }
     async function inLane(sessionId, operation) {
         return ioLane.run(sessionId, operation);
     }
@@ -215,17 +192,30 @@ async function persistCanonical(operation, retryDelay, attempt = 1) {
     }
 }
 async function appendWithInterruptedToolRoundRecovery(input) {
-    const combined = [...input.existing, ...input.appended];
-    const recovery = repairCanonicalHistory(combined, { allowPendingToolCallTail: true });
+    if (!repairedCommittedTail(input.existing, input.appended)) {
+        await input.files.append(input.path, input.appended, input.existing);
+        return;
+    }
+    // The repair rewrites the whole file, so decide it again from a full disk read.
+    input.files.forget?.(input.path);
+    const existing = await input.files.readActiveStrict(input.path);
+    assertAppendIdentityBoundary(existing, input.appended);
+    const repaired = repairedCommittedTail(existing, input.appended);
+    if (repaired)
+        await input.files.replaceActive(input.path, repaired);
+    else
+        await input.files.append(input.path, input.appended, existing);
+}
+/** The repaired records when the only issue is an interrupted tool round already on disk. */
+function repairedCommittedTail(existing, appended) {
+    const recovery = repairCanonicalHistory([...existing, ...appended], {
+        allowPendingToolCallTail: true,
+    });
     const [issue] = recovery.issues;
     const repairsCommittedTail = recovery.issues.length === 1 &&
         issue?.kind === 'interrupted-tool-round' &&
-        issue.recordIndex < input.existing.length;
-    if (repairsCommittedTail) {
-        await input.files.replaceActive(input.path, recovery.records);
-        return;
-    }
-    await input.files.append(input.path, input.appended, input.existing);
+        issue.recordIndex < existing.length;
+    return repairsCommittedTail ? recovery.records : undefined;
 }
 function appendEnvelopes(change) {
     const identityHints = appendIdentityHints(change);
@@ -376,7 +366,8 @@ function historyMessage(value) {
         !Number.isFinite(timestamp)) {
         throw new TypeError('Canonical history contains an invalid Pi message.');
     }
-    return detached(value);
+    // Written records are decoded again from the file, so the caller's objects are never retained.
+    return value;
 }
 function readMinimalCompactionSummary(value) {
     if (Reflect.get(value, 'role') !== 'compactionSummary')
@@ -592,10 +583,12 @@ function replacementSnapshotId(metadata) {
     const value = Reflect.get(metadata, 'replacementId');
     return typeof value === 'string' && value.trim() ? value : undefined;
 }
-function detached(value) {
-    return structuredClone(value);
-}
-async function replaceRecoveredHistory(files, path, records, allowPendingToolCallTail) {
+/** The repair rewrites the whole file, so it is computed again from a full disk read. */
+async function replaceRecoveredHistory(files, path, allowPendingToolCallTail) {
+    files.forget?.(path);
+    const { records } = repairCanonicalHistory(await files.readEnvelopesStrict(path), {
+        allowPendingToolCallTail,
+    });
     if (allowPendingToolCallTail) {
         await files.replaceActive(path, records);
         return files.readActiveStrict(path);
@@ -611,8 +604,7 @@ async function recoverReadHistory(files, path, decoded, options) {
     if ((verifiedModes & recoveryMode) === 0) {
         const recovery = repairCanonicalHistory(decoded, { allowPendingToolCallTail });
         if (recovery.issues.length > 0) {
-            records = recovery.records;
-            records = await replaceRecoveredHistory(files, path, records, allowPendingToolCallTail);
+            records = await replaceRecoveredHistory(files, path, allowPendingToolCallTail);
             options.notify();
         }
         else if (reusable) {

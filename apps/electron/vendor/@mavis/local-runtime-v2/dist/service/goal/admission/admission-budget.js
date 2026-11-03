@@ -1,4 +1,5 @@
 import { digestThreadGoalObjective, } from '@mavis/goal';
+import { isUndeliveredMessageDrain } from '../persistence/binding-stale.js';
 import { firstExhaustedThreadGoalBudget, resolveThreadGoalBudgetLimits, threadGoalBudgetGraceSteps, } from '../lifecycle/gate.js';
 /** Enforce the live Goal budget immediately before a v2 tool call. */
 export async function checkThreadGoalTurnBudget(input, deps) {
@@ -20,7 +21,9 @@ export async function checkThreadGoalTurnBudget(input, deps) {
     // and goes on as an ordinary Turn, whose tools are not fenced.
     if (deps.turnContext.getBinding(input.turnId) !== boundTurn)
         return { decision: 'allow' };
-    if (!goal || !isBoundGoalCurrent(goal, input.sessionId, boundTurn.binding)) {
+    if (!goal ||
+        (!isBoundGoalCurrent(goal, input.sessionId, boundTurn.binding) &&
+            !isUndeliveredMessageDrain(goal, boundTurn))) {
         return {
             decision: 'stop',
             message: 'GOAL_TURN_NOT_CURRENT: This Goal turn is no longer current. Do not call another tool; provide a brief final response.',
@@ -28,15 +31,7 @@ export async function checkThreadGoalTurnBudget(input, deps) {
     }
     const timing = deps.turnTimingReader.getByTurn(input.sessionId, input.turnId);
     const activeSeconds = timing ? deps.turnTimingReader.elapsedSeconds(timing) : 0;
-    // Every settled request already charged its tokens to the Goal, so the
-    // persisted total is current. The request budget closes the Turn at the next
-    // request boundary instead of cutting off the last request's tool calls, so
-    // it is not fenced here.
-    const dimension = firstExhaustedThreadGoalBudget({
-        tokens: goal.tokensUsed,
-        mainTurns: 0,
-        activeSeconds: goal.timeUsedSeconds + activeSeconds,
-    }, resolveThreadGoalBudgetLimits(goal, deps.configGetter));
+    const dimension = exhaustedAtToolTime(goal, activeSeconds, deps.configGetter);
     if (!dimension)
         return { decision: 'allow' };
     if (boundTurn.graceStepsUsed < threadGoalBudgetGraceSteps(deps.configGetter)) {
@@ -50,6 +45,25 @@ export async function checkThreadGoalTurnBudget(input, deps) {
         decision: 'stop',
         message: `GOAL_BUDGET_EXHAUSTED(${dimension}): Tool execution remains disabled for this Goal turn.`,
     };
+}
+/**
+ * Every settled request already charged its tokens to the Goal, so the
+ * persisted total is current. The request budget closes the Turn at the next
+ * request boundary instead of cutting off the last request's tool calls, so it
+ * is fenced here only when the requests already taken exceed the limit: a
+ * limit set below them (an edited objective naming a smaller cap) stops the
+ * tools the same response asked for.
+ */
+function exhaustedAtToolTime(goal, activeSeconds, configGetter) {
+    const limits = resolveThreadGoalBudgetLimits(goal, configGetter);
+    return (firstExhaustedThreadGoalBudget({
+        tokens: goal.tokensUsed,
+        mainTurns: 0,
+        activeSeconds: goal.timeUsedSeconds + activeSeconds,
+    }, limits) ?? (exceedsRequestLimit(goal, limits.mainTurns) ? 'main_turn' : undefined));
+}
+function exceedsRequestLimit(goal, limit) {
+    return limit !== null && (goal.accounting?.workOccupied ?? 0) > limit;
 }
 function isBoundGoalCurrent(goal, sessionId, binding) {
     return (goal.sessionId === sessionId &&

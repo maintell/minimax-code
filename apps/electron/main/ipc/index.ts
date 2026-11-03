@@ -34,6 +34,9 @@ import { setupPPTPreviewIPC } from "./pptPreview.ipc";
 import { setupDocumentPreviewIPC } from "./documentPreview.ipc";
 import { setupPreviewClipboardIPC } from "./previewClipboard.ipc";
 import { setupEmbeddedBrowserIPC } from "./embeddedBrowser.ipc";
+import { setupBrowserBackendIPC } from "./browserBackend.ipc.js";
+import { setupBrowserWebviewIPC } from "./browserWebview.ipc.js";
+import { setupBrowserTelemetryIPC } from "./browserTelemetry.ipc.js";
 import { setupMiniAppIPC } from "./miniApp.ipc";
 import { setupMiniAppComposerIPC } from "./miniAppComposer.ipc";
 import { setupMiniAppAgentIPC } from "./miniAppAgent.ipc";
@@ -179,6 +182,9 @@ export async function setupAllIPC(options) {
     let disposeMiniAppTool;
     let disposeMiniAppAgent;
     let disposeMiniAppSpeech;
+    let disposeBrowserBackend;
+    let disposeBrowserWebview;
+    let disposeBrowserTelemetry;
     const disposeModelMenuPopup = setupModelMenuPopupIPC();
     try {
         documentPreview = setupDocumentPreviewIPC({
@@ -197,6 +203,9 @@ export async function setupAllIPC(options) {
         });
         setupPPTPreviewIPC();
         setupEmbeddedBrowserIPC();
+        disposeBrowserBackend = setupBrowserBackendIPC();
+        disposeBrowserWebview = setupBrowserWebviewIPC();
+        disposeBrowserTelemetry = setupBrowserTelemetryIPC();
         setupMiniAppIPC();
         disposeMiniAppComposer = setupMiniAppComposerIPC();
         disposeMiniAppAgent = setupMiniAppAgentIPC();
@@ -211,6 +220,9 @@ export async function setupAllIPC(options) {
         disposeMiniAppAgent?.();
         disposeMiniAppTool?.();
         disposeMiniAppSpeech?.();
+        disposeBrowserBackend?.();
+        disposeBrowserWebview?.();
+        disposeBrowserTelemetry?.();
         disposeModelMenuPopup();
         disposeOSSSharedAuth();
         try {
@@ -232,6 +244,9 @@ export async function setupAllIPC(options) {
         disposeMiniAppAgent?.();
         disposeMiniAppTool?.();
         disposeMiniAppSpeech?.();
+        disposeBrowserBackend?.();
+        disposeBrowserWebview?.();
+        disposeBrowserTelemetry?.();
         disposeModelMenuPopup();
         disposeOSSSharedAuth();
     }, shutdownCuPermission);

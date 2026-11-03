@@ -72,6 +72,7 @@ const SESSION_TURN_METHODS = new Set([
     'cancelPromptSuggestion',
     'getPromptSuggestion',
 ]);
+const SESSION_ACTIVITY_METHODS = new Set(['getSessionActivity']);
 /** Desktop Plugin Marketplace and standalone Skill management. */
 const PLUGIN_SERVICE_METHODS = new Set([
     'listMarketplacePlugins',
@@ -109,6 +110,12 @@ const PLUGIN_SERVICE_METHODS = new Set([
     'refreshPlugins',
     'previewGithubPlugin',
     'importGithubPlugin',
+    'updatePlugin',
+    'listPluginMarketplaces',
+    'addPluginMarketplace',
+    'refreshPluginMarketplaces',
+    'setPluginMarketplaceAutoUpdate',
+    'removePluginMarketplace',
     'setSkillEnabled',
 ]);
 const MODEL_PROVIDER_METHODS = new Set([
@@ -177,6 +184,8 @@ const WORKSPACE_FILE_METHODS = new Set([
     'readWorkspaceFile',
     'saveWorkspaceFile',
     'searchWorkspaceFiles',
+    'streamWorkspaceFileSearch',
+    'stopWorkspaceFileSearch',
     'previewWorkspaceFile',
     'createWorkspaceGitWorktree',
     'removeWorkspaceGitWorktree',
@@ -284,6 +293,7 @@ const OWNER_METHOD_GROUPS = {
     channel: CHANNEL_OWNER_METHODS,
     memoryV2: MEMORY_V2_METHODS,
     goal: GOAL_OWNER_METHODS,
+    sessionActivity: SESSION_ACTIVITY_METHODS,
 };
 /** Worktree routes are always owned by the V2 front door and never fall through. */
 const WORKTREE_METHODS = new Set([
@@ -368,6 +378,8 @@ const SESSION_APPLICATION_METHODS = new Set([
     'querySidebarAgents',
     'getSidebarSession',
     'listProjects',
+    'createProject',
+    'updateProject',
     'listProjectSessions',
     'setProjectPinned',
     'setProjectHidden',

@@ -8,4 +8,12 @@ export { initializeRuntimeMemoryV2System, initializeProductionMemoryV2System, } 
 // §5.15 DesktopAdapter 需要的作用域展示标识；全局单作用域下即 scopeKey 本身。
 export { GLOBAL_SCOPE_KEY } from './contracts.js';
 export { createMemoryExecutionQuery } from './execution/query.js';
+export { DesktopMemoryService } from './desktop/desktop-memory-service.js';
+export { handleMemoryBusEvent } from './files/local-memory-orchestration.js';
+export { createLocalMemorySubsystem } from './host-memory.js';
+export { recordMemorySessionTerminal } from './files/local-memory-orchestration.js';
+export { v1AutoMemoryWritesStopped } from './files/local-memory-orchestration.js';
+export { executeLocalMemoryTool } from './files/local-memory-tool.js';
+export * from './policies/cli-sunset-notice.js';
+export { createGlobalMemoryModelCompletion } from './model-call/completion.js';
 //# sourceMappingURL=index.js.map

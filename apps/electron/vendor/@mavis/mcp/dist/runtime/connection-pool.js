@@ -48,8 +48,8 @@ export class McpToolCallNotDispatchedError extends Error {
  */
 export class McpToolCallTimeoutError extends Error {
     timeoutMs;
-    constructor(serverName, toolName, timeoutMs) {
-        super(`MCP tool call failed: MCP tool call "${toolName}" on "${serverName}" timed out after ${timeoutMs}ms`);
+    constructor(serverName, toolName, timeoutMs, options) {
+        super(`MCP tool call failed: MCP tool call "${toolName}" on "${serverName}" timed out after ${timeoutMs}ms`, options);
         this.timeoutMs = timeoutMs;
         this.name = 'McpToolCallTimeoutError';
     }
@@ -279,10 +279,13 @@ export class McpConnectionPool {
                 return shaped;
             }
             catch (err) {
+                // Keep the SDK error as `cause`: its JSON-RPC `code`/`data` (McpError)
+                // or connection `code` is the only machine-readable reason, and
+                // programmatic callers hand it to scripts as a raw error.
                 if (!options?.signal?.aborted && isToolCallTimeout(err)) {
-                    throw new McpToolCallTimeoutError(serverName, toolName, timeoutMs);
+                    throw new McpToolCallTimeoutError(serverName, toolName, timeoutMs, { cause: err });
                 }
-                throw new Error(`MCP tool call failed: ${err instanceof Error ? err.message : String(err)}`);
+                throw new Error(`MCP tool call failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
             }
         }
         catch (err) {

@@ -1,3 +1,4 @@
+import { formatPluginId, LOCAL_PLUGIN_MARKETPLACE } from '@mavis/shared';
 import { buildPluginId, parsePluginMentions } from '@mavis/shared/plugin-mention';
 import { attachPluginCapabilityAttribution, normalizedPluginSkillAttributionKey, selectPreferredAppPluginOwners, } from '@mavis/agent-core/event-bridge';
 import { authorizeMcpInvokeReference, buildToolLoadingCatalog, createMcpInvokeTool, getMcpInvokeRegistries, revokeMcpInvokeReferenceAuthorization, resolveMcpInvokeTarget, } from '@mavis/agent-tools';
@@ -48,7 +49,7 @@ export function detectReferencedOfficialHostCapabilityPlugins(input) {
         plugin.hostCapabilities?.includes(input.capability) === true)
         .map((plugin) => ({
         name: plugin.name,
-        pluginId: buildPluginId(plugin.name, plugin.source),
+        pluginId: turnPluginId(plugin),
         appTools: [],
         mcpTools: [],
         skills: [],
@@ -68,14 +69,21 @@ export function mergeAgentHostTurnCapabilities(input) {
         const reminder = buildPluginReferenceReminder([], parsePluginMentions(input.userText ?? '').map((mention) => mention.pluginId));
         return { ...merged, ...(reminder ? { reminder } : {}) };
     }
+    const attributedTools = attachPluginCapabilityAttribution(merged.tools, buildAttributionIndex({
+        capabilities,
+        effectivePluginSkills: input.effectivePluginSkills,
+        finalTools: merged.tools,
+        plan: merged.plan,
+    }));
+    // Attribution maps one to one; a wrapper is a different object at the same index.
+    const wrappers = new Map(merged.tools.flatMap((tool, index) => {
+        const wrapper = attributedTools[index];
+        return wrapper && wrapper !== tool ? [[tool, wrapper]] : [];
+    }));
     const attributed = {
         ...merged,
-        tools: attachPluginCapabilityAttribution(merged.tools, buildAttributionIndex({
-            capabilities,
-            effectivePluginSkills: input.effectivePluginSkills,
-            finalTools: merged.tools,
-            plan: merged.plan,
-        })),
+        tools: attributedTools,
+        ...(wrappers.size > 0 ? { attributed: wrappers } : {}),
     };
     if (input.userText === undefined)
         return attributed;
@@ -98,18 +106,34 @@ export function mergeAgentHostTurnCapabilities(input) {
                 plugin.mcpTools.length > 0 ||
                 plugin.hostTools?.some((group) => group.tools.length > 0))));
     const reminder = [
-        buildPluginReferenceReminder(detectPluginReferencesForMessages([{ content: input.userText }], input.userText, inventory), unavailable),
+        buildPluginReferenceReminder(detectPluginReferencesForMessages([{ content: input.userText }], input.userText, inventory), unavailable, 
+        // PTC Turn: Tool Search results are called inside run_code, not via mcp_invoke.
+        input.ptc ? { ptc: true } : {}),
         renderPluginAgentRoster(capabilities.agents, merged.tools),
     ]
         .filter(Boolean)
         .join('\n\n');
     return { ...attributed, ...(reminder ? { reminder } : {}) };
 }
-/** Plugin Agents come only from LOCAL packages and are callable only through `task`. */
+/** Plugin Agents are callable only through `task`; the id keeps each Agent's source. */
 function delegablePluginIds(agents, tools) {
     if (!agents?.length || !tools.some((tool) => tool.def.name === 'task'))
         return new Set();
-    return new Set(agents.map((agent) => buildPluginId(agent.pluginName, 'local')));
+    return new Set(agents.map((agent) => agent.origin === 'local'
+        ? localPluginId(agent.pluginName, agent.pluginMarketplace)
+        : buildPluginId(agent.pluginName, agent.origin)));
+}
+/** `@` mentions address Plugins by id; LOCAL ids carry their marketplace. */
+function turnPluginId(plugin) {
+    return plugin.source === 'local'
+        ? localPluginId(plugin.name, plugin.marketplace)
+        : buildPluginId(plugin.name, plugin.source);
+}
+function localPluginId(name, marketplace) {
+    return formatPluginId({
+        name: name.trim(),
+        marketplace: marketplace ?? LOCAL_PLUGIN_MARKETPLACE,
+    });
 }
 const PLUGIN_AGENT_DESCRIPTION_LIMIT = 200;
 /**
@@ -166,7 +190,7 @@ function buildAttributionIndex(input) {
     }
     const appProviders = new Map();
     for (const provider of new Set(input.capabilities.plugins.flatMap((plugin) => plugin.appProviders))) {
-        const owners = selectPreferredAppPluginOwners(provider, input.capabilities.plugins.filter((plugin) => plugin.appProviders.includes(provider)));
+        const owners = appProviderOwners(provider, input.capabilities.plugins);
         appProviders.set(provider, owners.map((plugin) => provenance(plugin, PluginCapabilityType.APP, provider)));
     }
     return { directTools, deferredTools, skills, appProviders };
@@ -178,7 +202,16 @@ function bindingOwners(binding, plugins, allPlugins) {
         const plugin = plugins.get(normalizedName(binding.pluginName));
         return plugin ? [plugin] : [];
     }
-    return selectPreferredAppPluginOwners(binding.source, allPlugins.filter((plugin) => plugin.appProviders.includes(binding.source)));
+    return appProviderOwners(binding.source, allPlugins);
+}
+/**
+ * Official declarations own an App before local ones, so a user-authored Plugin cannot take an
+ * official App's attribution by naming itself after the provider.
+ */
+function appProviderOwners(provider, plugins) {
+    const declaring = plugins.filter((plugin) => plugin.appProviders.includes(provider));
+    const official = declaring.filter((plugin) => plugin.source === 'official');
+    return selectPreferredAppPluginOwners(provider, official.length > 0 ? official : declaring);
 }
 function provenance(plugin, capabilityType, capabilityName) {
     return {
@@ -234,6 +267,7 @@ function mergeTools(input) {
         model: input.model,
         options: input.options,
         alwaysExpose: true,
+        ...(input.ptc ? { ptc: true } : {}),
     });
 }
 function replaceMcpInvoke(tools, hostReferences) {
@@ -267,7 +301,7 @@ function buildCapabilityInventory(input) {
     return input.capabilities.plugins.map((plugin) => ({
         name: plugin.name,
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
-        pluginId: buildPluginId(plugin.name, plugin.source),
+        pluginId: turnPluginId(plugin),
         ...((plugin.source === 'official' || plugin.source === 'builtin') &&
             plugin.hostCapabilities?.includes('computer-use')
             ? {

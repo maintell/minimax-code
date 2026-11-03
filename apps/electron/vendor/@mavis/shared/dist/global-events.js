@@ -3,6 +3,8 @@ export const GLOBAL_EVENT_TYPES = [
     'background_task.updated',
     'agent.created',
     'agent.updated',
+    'project.icon_updated',
+    'project.metadata_updated',
     'session.created',
     'session.visibility_updated',
     'session.deleted',

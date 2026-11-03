@@ -123,7 +123,7 @@ const MINIAPP_FAILURE_CATALOG = {
         stage: 'workspace',
         recovery: 'edit_workspace',
         message: 'The Mini App device access declaration is invalid.',
-        hint: 'Declare deviceAccess as a string array that contains only microphone.',
+        hint: 'Declare deviceAccess as a string array that contains only microphone, camera or notifications.',
     },
     MINIAPP_MANIFEST_FIELD_UNSUPPORTED: {
         lifecycleCode: 'PREPARATION_FAILED',

@@ -6,7 +6,7 @@
  */
 import * as path from "path";
 import { shell } from "electron";
-import { MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT, isDev, PAGE_URLS, IPC_CHANNELS } from "../config";
+import { MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT, PAGE_URLS, isDev, IPC_CHANNELS } from "../config";
 import { waitForServer } from "../utils";
 import { waitForLocalRuntime, getLocalRuntimeFailReason } from "../modules/local-runtime";
 import { getDeviceInfo } from "../utils/device-info";
@@ -19,6 +19,7 @@ import { recordElectronStartupMainMilestone } from "../modules/observability/sta
 import { readMainWindowStartupState, attachMainWindowStatePersistence } from "../modules/window-state";
 import { createDesktopRendererWindow } from "./desktopRendererWindow";
 import { WINDOWS_TITLEBAR_HEIGHT, installWindowsTitlebar } from "./windows-titlebar";
+import { browserGuestRegistry } from "../modules/browser/browser-guest-registry.js";
 let primaryRendererIncidentHandler;
 /** Register the lifecycle-owned observer for every primary Archon renderer. */
 export function setPrimaryRendererIncidentHandler(handler) {
@@ -50,12 +51,26 @@ export async function createArchonChatWindow(context) {
         backgroundColor: getBackgroundColor(),
         webPreferences: {
             ...DEFAULT_SECURE_WEB_PREFERENCES,
+            webviewTag: true,
             scrollBounce: isMac,
             preload: path.join(__dirname, '..', 'preload.js'),
         },
         show: false,
     });
     recordElectronStartupMainMilestone('browser_window_created');
+    browserGuestRegistry.install(window, (value) => {
+        try {
+            const url = new URL(value);
+            const expected = new URL(PAGE_URLS.ARCHON_CHAT);
+            return (url.origin === expected.origin &&
+                url.protocol === expected.protocol &&
+                url.host === expected.host &&
+                url.pathname.replace(/\/$/, '') === expected.pathname.replace(/\/$/, ''));
+        }
+        catch {
+            return false;
+        }
+    });
     context.setWindow(window);
     installWindowsTitlebar(window);
     context.setWindowType('archon');

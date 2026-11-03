@@ -141,7 +141,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             reportBootstrapProgress('modules-runtime-v2-done');
             return module;
         }),
-        importEsm('@mavis/local-runtime/common').then((module) => {
+        importEsm('@mavis/local-runtime-v2/logging').then((module) => {
             reportBootstrapProgress('modules-common-done');
             return module;
         }),
@@ -563,7 +563,7 @@ if (parentPort) {
             // The dynamic import is cached after the first call; before the
             // runtime ever loaded the module, both flush functions are safe
             // no-ops (disk transports not configured yet).
-            const common = await importEsm('@mavis/local-runtime/common');
+            const common = await importEsm('@mavis/local-runtime-v2/logging');
             await Promise.allSettled([common.flushLocalRuntimeLogging(), common.flushImLogger()]);
         },
         log: (message, fields) => {

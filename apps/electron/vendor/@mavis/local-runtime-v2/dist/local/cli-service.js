@@ -319,6 +319,24 @@ export class CliService {
     uninstallPlugin(req) {
         return this.options.application.plugins.uninstallPlugin(req);
     }
+    updatePlugin(req) {
+        return this.options.application.plugins.updatePlugin(req);
+    }
+    listPluginMarketplaces(req) {
+        return this.options.application.plugins.listPluginMarketplaces(req);
+    }
+    addPluginMarketplace(req) {
+        return this.options.application.plugins.addPluginMarketplace(req);
+    }
+    refreshPluginMarketplaces(req) {
+        return this.options.application.plugins.refreshPluginMarketplaces(req);
+    }
+    setPluginMarketplaceAutoUpdate(req) {
+        return this.options.application.plugins.setPluginMarketplaceAutoUpdate(req);
+    }
+    removePluginMarketplace(req) {
+        return this.options.application.plugins.removePluginMarketplace(req);
+    }
     getPermissionMode() {
         return this.requireCapability('configuration', 'Configuration').getPermissionMode();
     }
@@ -332,6 +350,14 @@ export class CliService {
     /** Undefined when this host cannot persist the next-message suggestion switch. */
     setPromptSuggestionEnabled(enabled) {
         return this.options.application.configuration?.setPromptSuggestionEnabled?.({ enabled });
+    }
+    /** Undefined when this host cannot read the PTC switch. */
+    getPtcEnabled() {
+        return this.options.application.configuration?.getPtcEnabled?.();
+    }
+    /** Undefined when this host cannot persist the PTC switch. */
+    setPtcEnabled(enabled) {
+        return this.options.application.configuration?.setPtcEnabled?.({ enabled });
     }
     listModels(input) {
         return this.requireCapability('models', 'Model').list(input);

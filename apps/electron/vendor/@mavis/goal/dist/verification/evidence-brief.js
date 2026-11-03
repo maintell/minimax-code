@@ -1,4 +1,5 @@
 import { isInternalContextMessage } from '../internal-context-fragment.js';
+import { readPtcExecutionDetails } from '@mavis/agent-core/tools';
 export const MAX_VERIFICATION_BRIEF_CHARS = 14_000;
 export const MAX_SUBAGENT_VERIFICATION_PROMPT_CHARS = 16_000;
 export const MAX_EVALUATOR_TAIL_CHARS = 32_000;
@@ -112,14 +113,17 @@ function safeJsonStringify(value) {
 function extractChanges(messages) {
     const files = new Set();
     const commands = new Set();
+    const ptcCalls = [];
+    const seenPtcChildIds = new Set();
     let truncated = false;
+    const itemCount = () => files.size + commands.size + ptcCalls.length;
     const add = (target, value, maxChars) => {
         const bounded = truncate(value, maxChars);
         if (bounded !== value)
             truncated = true;
         if (target.has(bounded))
             return;
-        if (files.size + commands.size >= MAX_CHANGE_ITEMS) {
+        if (itemCount() >= MAX_CHANGE_ITEMS) {
             truncated = true;
             return;
         }
@@ -138,21 +142,68 @@ function extractChanges(messages) {
                     add(commands, command, 2_000);
             }
         }
+        const ptc = readPtcExecutionDetails(message);
+        for (const call of ptc?.child_calls ?? []) {
+            if (seenPtcChildIds.has(call.child_tool_call_id))
+                continue;
+            seenPtcChildIds.add(call.child_tool_call_id);
+            if (itemCount() >= MAX_CHANGE_ITEMS) {
+                truncated = true;
+                break;
+            }
+            const evidence = ptcCallEvidence(ptc, call);
+            ptcCalls.push(evidence);
+            if (call.status !== 'completed')
+                continue;
+            const name = call.tool_name.toLowerCase();
+            if (['write', 'edit', 'apply_patch'].includes(name)) {
+                for (const path of evidence.files ?? [])
+                    add(files, path, 1_000);
+            }
+            if (['bash', 'shell', 'exec', 'exec_command'].includes(name) && evidence.command) {
+                add(commands, evidence.command, 2_000);
+            }
+        }
     }
-    return capChanges([...files], [...commands], truncated);
+    return capChanges([...files], [...commands], ptcCalls, truncated);
 }
-function capChanges(files, commands, initiallyTruncated) {
+function ptcCallEvidence(ptc, call) {
+    const paths = filePaths(call.input);
+    const command = commandText(call.input);
+    const exitCode = ptc ? ptcBashExitCode(ptc, call.child_tool_call_id) : undefined;
+    return {
+        childToolCallId: call.child_tool_call_id,
+        toolName: call.tool_name,
+        status: call.status,
+        ...(paths.length > 0 ? { files: paths } : {}),
+        ...(command ? { command } : {}),
+        ...(exitCode === undefined ? {} : { exitCode }),
+        ...(call.is_error === undefined ? {} : { isError: call.is_error }),
+        ...(call.outcome_unknown === undefined ? {} : { outcomeUnknown: call.outcome_unknown }),
+        ...(Array.isArray(call.input?.redacted_fields) && call.input.redacted_fields.length > 0
+            ? { inputRedacted: true }
+            : {}),
+    };
+}
+function ptcBashExitCode(details, childToolCallId) {
+    const fact = details.retained_facts.find((candidate) => candidate.kind === 'bash_exit' && candidate.child_tool_call_id === childToolCallId);
+    return fact?.kind === 'bash_exit' ? fact.exit_code : undefined;
+}
+function capChanges(files, commands, ptcCalls, initiallyTruncated) {
     let truncated = initiallyTruncated;
-    let serialized = safeJsonStringify({ files, commands, truncated });
-    while (serialized.length > MAX_CHANGE_CHARS && (commands.length > 0 || files.length > 0)) {
-        if (commands.length >= files.length)
+    let serialized = safeJsonStringify({ files, commands, ptcCalls, truncated });
+    while (serialized.length > MAX_CHANGE_CHARS &&
+        (commands.length > 0 || files.length > 0 || ptcCalls.length > 0)) {
+        if (commands.length >= files.length && commands.length >= ptcCalls.length)
             commands.pop();
-        else
+        else if (files.length >= ptcCalls.length)
             files.pop();
+        else
+            ptcCalls.pop();
         truncated = true;
-        serialized = safeJsonStringify({ files, commands, truncated });
+        serialized = safeJsonStringify({ files, commands, ptcCalls, truncated });
     }
-    return { files, commands, truncated };
+    return { files, commands, ptcCalls, truncated };
 }
 function toolCalls(message) {
     if (!isRecord(message) || message.role !== 'assistant' || !Array.isArray(message.content)) {

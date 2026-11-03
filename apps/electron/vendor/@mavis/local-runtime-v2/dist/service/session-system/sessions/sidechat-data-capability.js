@@ -135,7 +135,7 @@ export function createSideChatDataCapability(options) {
                     status: 'idle',
                     isDefaultWorkspace: source.isDefaultWorkspace,
                     runLocation: source.runLocation,
-                    appMode: source.appMode,
+                    ...inheritedSettings(source),
                     ...initialModelSnapshot(source, model),
                     sessionOrigin: 'local-runtime',
                     sessionDataVersion: CURRENT_SESSION_DATA_VERSION,
@@ -180,6 +180,18 @@ export function createSideChatDataCapability(options) {
                 return { session, queued, consumed };
             }, { behavior: 'immediate' });
         },
+    };
+}
+/**
+ * A Side copies the main conversation's history, so it keeps the settings that history was built
+ * under. An absent tool call mode stays absent, which reads as native; an absent memory policy
+ * reads as the default.
+ */
+function inheritedSettings(source) {
+    return {
+        appMode: source.appMode,
+        toolCallMode: source.toolCallMode,
+        memoryPolicy: source.memoryPolicy,
     };
 }
 function initialModelSnapshot(source, model) {

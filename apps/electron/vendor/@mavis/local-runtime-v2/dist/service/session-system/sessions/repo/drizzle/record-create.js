@@ -9,6 +9,7 @@ export function recordFromCreate(input, nowMs) {
         ...recordErrorFields(input),
         ...recordModelFields(input),
         ...recordProvenanceFields(input, nowMs),
+        ...(input.toolCallMode ? { toolCallMode: input.toolCallMode } : {}),
     };
 }
 function recordIdentityFields(input, sessionType) {

@@ -1,7 +1,8 @@
 import { getModels, getProviders } from '@earendil-works/pi-ai';
+import { LEGACY_MESSAGES_PROVIDER_MARKERS } from '../../../../infra/legacy-db/legacy-opencode-provider-api.js';
 // Conversion keeps provider catalog lookup next to the native message mapper.
 const DEFAULT_LOCAL_PI_API = 'anthropic-messages';
-export const LEGACY_MESSAGES_PROVIDER_MARKERS = ['anthropic', 'claude'];
+export { LEGACY_MESSAGES_PROVIDER_MARKERS };
 function lookupCatalogApi(provider, modelId) {
     const knownProvider = getProviders().find((candidate) => candidate === provider);
     if (!knownProvider)

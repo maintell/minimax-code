@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readPromptWithBuiltinFallback } from '../agent/index.js';
 import { resolveBuiltinPromptAssetsDir } from '../prompt-config/index.js';
-import { createGlobalMemoryModelCompletion, } from '../turn-system/index.js';
+import { createGlobalMemoryModelCompletion } from './model-call/completion.js';
 import { createMemoryAgentExtension, createMemorySessionDeletionHook, } from './adapters/runtime-bridge.js';
 import { resolveMemorySystemConfig, resolveMemoryV2Config } from './config.js';
 import { initializeMemorySystem } from './initialize.js';
@@ -97,6 +97,8 @@ export function initializeRuntimeMemoryV2System(input) {
         ...system,
         // 唤醒与引用记账都由扩展承载（turn_start / after_llm_call，§5.10、§5.7）。
         agentExtension: createMemoryAgentExtension(system.agent, system.turnObserver, input.nowMs),
+        // 摘要以隐藏消息放在历史里，由 Turn 系统决定位置与压缩后的补回（§2.5）。
+        summaryContext: (sessionId) => system.agent.loadSummaryContext(sessionId),
         sessionDeletion: createMemorySessionDeletionHook(system.governance),
     };
 }

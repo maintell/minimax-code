@@ -91,6 +91,10 @@ function toCallSummary(call) {
         modelId: call.modelId,
         apiId: call.apiId,
         attemptCount: call.attemptCount,
+        ...(call.attemptStartedAtMs === undefined
+            ? {}
+            : { attemptStartedAtMs: call.attemptStartedAtMs }),
+        ...(call.firstEventAtMs === undefined ? {} : { firstEventAtMs: call.firstEventAtMs }),
         ...(call.usage
             ? {
                 usage: {
@@ -120,6 +124,7 @@ function toCallSummary(call) {
             ...(tool.startedAtMs === undefined ? {} : { startedAtMs: tool.startedAtMs }),
             ...(tool.durationMs === undefined ? {} : { durationMs: tool.durationMs }),
             ...(tool.isError === undefined ? {} : { isError: tool.isError }),
+            ...(tool.parentToolCallId === undefined ? {} : { parentToolCallId: tool.parentToolCallId }),
         })),
     };
 }

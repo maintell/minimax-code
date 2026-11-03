@@ -23,10 +23,12 @@ const IPC_CHANNELS = {
     SYSTEM_SET_THEME_SOURCE: 'system:set-theme-source',
     SYSTEM_OPEN_DIR: 'system:open-dir',
     SYSTEM_CREATE_DIR: 'system:create-dir',
+    SYSTEM_ENSURE_DEFAULT_PROJECT_DIR: 'system:ensure-default-project-dir',
     SYSTEM_OPEN_FILE_IN_FOLDER: 'system:open-file-in-folder',
     SYSTEM_SHOW_IMAGE_CONTEXT_MENU: 'system:show-image-context-menu',
     SYSTEM_GET_HOME_PATH: 'system:get-home-path',
     SYSTEM_GET_APP_INSTALL_DIR: 'system:get-app-install-dir',
+    SYSTEM_GET_APP_VERSION_SYNC: 'system:get-app-version-sync',
     // 窗口控制
     WINDOW_MINIMIZE: 'window:minimize',
     WINDOW_RESTORE: 'window:restore',
@@ -133,6 +135,8 @@ const IPC_CHANNELS = {
     DESKTOP_GET_RUN_ON_STARTUP: 'desktop:get-run-on-startup',
     DESKTOP_SET_KEEP_AWAKE: 'desktop:set-keep-awake',
     DESKTOP_GET_KEEP_AWAKE: 'desktop:get-keep-awake',
+    DESKTOP_SET_FILE_OPEN_WITH_ENHANCED: 'desktop:set-file-open-with-enhanced',
+    DESKTOP_GET_FILE_OPEN_WITH_ENHANCED: 'desktop:get-file-open-with-enhanced',
     DESKTOP_START_COMPUTER_USE_RUNTIME: 'desktop:start-computer-use-runtime',
     DESKTOP_APPEARANCE_CHANGED: 'desktop:appearance-changed',
     // 全局快捷键
@@ -145,6 +149,14 @@ const IPC_CHANNELS = {
     DESKTOP_GET_LOCAL_RUNTIME_DATA_DIR_INFO: 'desktop:get-local-runtime-data-dir-info',
     DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR: 'desktop:relocate-local-runtime-data-dir',
     // FilePanel embedded browser
+    BROWSER_BACKEND_BEGIN_REFRESH: 'browser-backend:begin-refresh',
+    BROWSER_BACKEND_APPLY_REFRESH: 'browser-backend:apply-refresh',
+    BROWSER_BACKEND_GET_DIAGNOSTICS: 'browser-backend:get-diagnostics',
+    BROWSER_BACKEND_GET_LAUNCH: 'browser-backend:get-launch',
+    BROWSER_BACKEND_LAUNCH_DECIDED: 'browser-backend:launch-decided',
+    BROWSER_TELEMETRY_REPORT: 'browser-telemetry:report',
+    BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST: 'browser-telemetry:diagnostics-request',
+    BROWSER_TELEMETRY_DIAGNOSTICS_RESPONSE: 'browser-telemetry:diagnostics-response',
     EMBEDDED_BROWSER_CREATE: 'embedded-browser:create',
     EMBEDDED_BROWSER_SHOW: 'embedded-browser:show',
     EMBEDDED_BROWSER_SET_BOUNDS: 'embedded-browser:set-bounds',
@@ -177,6 +189,14 @@ const IPC_CHANNELS = {
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
     EMBEDDED_BROWSER_CAPTURE_FRAME: 'embedded-browser:capture-frame',
     EMBEDDED_BROWSER_AGENT_ACTION: 'embedded-browser:agent-action',
+    /** renderer → main: find text in a Browser tab page (shared Cmd/Ctrl+F bar). */
+    EMBEDDED_BROWSER_FIND_IN_PAGE: 'embedded-browser:find-in-page',
+    EMBEDDED_BROWSER_STOP_FIND_IN_PAGE: 'embedded-browser:stop-find-in-page',
+    /** main → renderer: progress of a tab's latest find request. */
+    EMBEDDED_BROWSER_FIND_RESULT: 'embedded-browser:find-result',
+    /** main → renderer: Cmd/Ctrl+F was pressed inside a Browser page. */
+    EMBEDDED_BROWSER_FIND_REQUESTED: 'embedded-browser:find-requested',
+    EMBEDDED_BROWSER_TAB_RECOVERED: 'embedded-browser:tab-recovered',
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
@@ -209,6 +229,7 @@ const IPC_CHANNELS = {
     UPDATER_OPEN_MODAL: 'updater:open-modal',
     // Deep Link
     DEEPLINK_RECEIVED: 'deeplink:received',
+    DEEPLINK_TAKE_WORKSPACE_OPEN: 'deeplink:take-workspace-open',
     // file api
     // file tools
     FILE_READ: 'file:read',
@@ -372,6 +393,9 @@ const IPC_CHANNELS = {
     APP_QUIT_CONFIRMATION_REQUEST: 'app:quit-confirmation-request',
     APP_QUIT_CONFIRMATION_RESULT: 'app:quit-confirmation-result',
     APP_QUIT_CONFIRMATION_ABORT: 'app:quit-confirmation-abort',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST: 'miniapp:window-transfer-confirmation-request',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT: 'miniapp:window-transfer-confirmation-result',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT: 'miniapp:window-transfer-confirmation-abort',
     APP_CONFIRM_QUIT: 'app:confirm-quit',
     APP_BRING_TO_FRONT: 'app:bring-to-front',
     // Dock file drop (macOS)
@@ -523,6 +547,16 @@ try {
 catch {
     // 主进程可能还没准备好，忽略错误
 }
+// 安装包版本（app.getVersion()，含 -preview/-inside 等通道后缀）。热更新只替换渲染资源，
+// 渲染包构建时写入的版本号不带通道后缀，接口上报的桌面端版本必须取安装包版本。
+let appVersion = null;
+try {
+    const value = ipcRenderer.sendSync(IPC_CHANNELS.SYSTEM_GET_APP_VERSION_SYNC);
+    appVersion = typeof value === 'string' && value ? value : null;
+}
+catch {
+    // 主进程可能还没准备好，渲染进程回落到构建时版本
+}
 const platformInfo = {
     platform: process.platform,
     arch: process.arch,
@@ -533,6 +567,7 @@ const platformInfo = {
     windowKind: desktopWindowKind,
     capabilities: desktopWindowCapabilities,
     hotUpdateVersion,
+    appVersion,
 };
 let appInstanceId = `app_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
 try {
@@ -614,6 +649,7 @@ const electronAPI = {
     },
     openDir: (dirPath) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_OPEN_DIR, dirPath),
     createDir: (dirPath) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_CREATE_DIR, dirPath),
+    ensureDefaultProjectDir: (projectName) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_ENSURE_DEFAULT_PROJECT_DIR, projectName),
     openFileInFolder: (filePath) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_OPEN_FILE_IN_FOLDER, filePath),
     showImageContextMenu: (params) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_SHOW_IMAGE_CONTEXT_MENU, params),
     getHomePath: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_HOME_PATH),
@@ -837,6 +873,9 @@ const electronAPI = {
     // 保持唤醒
     setKeepAwake: (enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_KEEP_AWAKE, enabled),
     getKeepAwake: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_KEEP_AWAKE),
+    // Windows 文本类型“打开方式”增强登记
+    setFileOpenWithEnhanced: (enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_FILE_OPEN_WITH_ENHANCED, enabled),
+    getFileOpenWithEnhanced: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_FILE_OPEN_WITH_ENHANCED),
     startComputerUseRuntime: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_START_COMPUTER_USE_RUNTIME),
     // 快捷键
     setGlobalAccessShortcut: (globalAccessShortcut) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_GLOBAL_ACCESS_SHORTCUT, globalAccessShortcut),
@@ -1028,6 +1067,64 @@ const electronAPI = {
             pending.clear();
             ipcRenderer.removeListener(IPC_CHANNELS.APP_QUIT_CONFIRMATION_REQUEST, handler);
             ipcRenderer.removeListener(IPC_CHANNELS.APP_QUIT_CONFIRMATION_ABORT, abort);
+        };
+    },
+    onMiniAppWindowTransferConfirmationRequest: (callback) => {
+        const pending = new Map();
+        const handler = (_event, requestId) => {
+            if (typeof requestId !== 'string' || !requestId || pending.has(requestId))
+                return;
+            const controller = new AbortController();
+            pending.set(requestId, controller);
+            const reply = (confirmed) => {
+                pending.delete(requestId);
+                if (!controller.signal.aborted) {
+                    ipcRenderer.send(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT, {
+                        requestId,
+                        confirmed,
+                    });
+                }
+            };
+            try {
+                const result = callback((listener) => {
+                    if (controller.signal.aborted) {
+                        listener();
+                        return () => undefined;
+                    }
+                    controller.signal.addEventListener('abort', listener, { once: true });
+                    return () => controller.signal.removeEventListener('abort', listener);
+                });
+                if (typeof result === 'boolean')
+                    reply(result);
+                else {
+                    ipcRenderer.send(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT, {
+                        requestId,
+                        pending: true,
+                    });
+                    void result.then(reply, () => reply(false));
+                }
+            }
+            catch {
+                reply(false);
+            }
+        };
+        const abort = (_event, requestId) => {
+            pending.get(requestId)?.abort();
+            pending.delete(requestId);
+        };
+        ipcRenderer.on(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST, handler);
+        ipcRenderer.on(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT, abort);
+        return () => {
+            for (const [requestId, controller] of pending) {
+                ipcRenderer.send(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT, {
+                    requestId,
+                    confirmed: false,
+                });
+                controller.abort();
+            }
+            pending.clear();
+            ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST, handler);
+            ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT, abort);
         };
     },
     /**
@@ -1504,6 +1601,64 @@ networkEventTarget.addEventListener?.('online', projectRuntimeTransportAPI.netwo
 // 渲染进程可以通过 window.electronPlatform 同步访问
 // ============================================
 contextBridge.exposeInMainWorld('electronPlatform', platformInfo);
+if (desktopWindowKind === 'main') {
+    const browserWebviewHostAPI = {
+        onGuestInteraction: (listener) => {
+            const receive = () => listener();
+            ipcRenderer.on('browser-webview:interaction', receive);
+            return () => ipcRenderer.removeListener('browser-webview:interaction', receive);
+        },
+        onPrepareNative: (listener) => {
+            const receive = (_event, id) => {
+                void Promise.resolve()
+                    .then(listener)
+                    .then((blocked) => ipcRenderer.send('browser-webview:native-ready', id, blocked), () => ipcRenderer.send('browser-webview:native-ready', id, true));
+            };
+            ipcRenderer.on('browser-webview:prepare-native', receive);
+            return () => ipcRenderer.removeListener('browser-webview:prepare-native', receive);
+        },
+        onAgentPointer: (listener) => {
+            const receive = (_event, id) => listener(id);
+            ipcRenderer.on('browser-webview:agent-pointer', receive);
+            return () => ipcRenderer.removeListener('browser-webview:agent-pointer', receive);
+        },
+        ready: () => ipcRenderer.invoke('browser-webview:ready'),
+        applied: (id, revision) => ipcRenderer.send('browser-webview:applied', id, revision),
+        onSnapshot: (listener) => {
+            const receive = (_event, snapshot) => listener(snapshot);
+            ipcRenderer.on('browser-webview:snapshot', receive);
+            return () => ipcRenderer.removeListener('browser-webview:snapshot', receive);
+        },
+    };
+    contextBridge.exposeInMainWorld('browserWebviewHostAPI', browserWebviewHostAPI);
+    const browserBackendPolicyAPI = {
+        beginRefresh: () => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_BEGIN_REFRESH),
+        applyRefresh: (leaseId, config) => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_APPLY_REFRESH, leaseId, config),
+        getLaunchBackend: () => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_GET_LAUNCH),
+        onLaunchBackend: (listener) => {
+            const receive = (_event, backend) => listener(backend);
+            ipcRenderer.on(IPC_CHANNELS.BROWSER_BACKEND_LAUNCH_DECIDED, receive);
+            return () => ipcRenderer.removeListener(IPC_CHANNELS.BROWSER_BACKEND_LAUNCH_DECIDED, receive);
+        },
+        getDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_GET_DIAGNOSTICS),
+        reportTelemetry: (batch) => ipcRenderer.send(IPC_CHANNELS.BROWSER_TELEMETRY_REPORT, batch),
+        onDiagnosticsRequest: (provider) => {
+            const respond = (_event, requestId) => {
+                let state = null;
+                try {
+                    state = provider();
+                }
+                catch {
+                    state = null;
+                }
+                ipcRenderer.send(IPC_CHANNELS.BROWSER_TELEMETRY_DIAGNOSTICS_RESPONSE, requestId, state);
+            };
+            ipcRenderer.on(IPC_CHANNELS.BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST, respond);
+            return () => ipcRenderer.removeListener(IPC_CHANNELS.BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST, respond);
+        },
+    };
+    contextBridge.exposeInMainWorld('browserBackendPolicyAPI', browserBackendPolicyAPI);
+}
 const embeddedBrowserAPI = {
     create: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_CREATE, params),
     show: (bounds, params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SHOW, bounds, params),
@@ -1558,6 +1713,62 @@ const embeddedBrowserAPI = {
         };
         ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_ACTION, handler);
         return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_ACTION, handler);
+    },
+    findInPage: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_IN_PAGE, params),
+    stopFindInPage: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_STOP_FIND_IN_PAGE, params),
+    onFindResult: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const raw = payload;
+            if (typeof raw.tabId !== 'number' ||
+                typeof raw.text !== 'string' ||
+                typeof raw.requestId !== 'number' ||
+                typeof raw.activeMatchOrdinal !== 'number' ||
+                typeof raw.matches !== 'number') {
+                return;
+            }
+            callback({
+                sessionId: typeof raw.sessionId === 'string' ? raw.sessionId : null,
+                tabId: raw.tabId,
+                text: raw.text,
+                requestId: raw.requestId,
+                activeMatchOrdinal: raw.activeMatchOrdinal,
+                matches: raw.matches,
+                finalUpdate: raw.finalUpdate === true,
+            });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_RESULT, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_RESULT, handler);
+    },
+    onFindRequested: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, tabId } = payload;
+            if (typeof tabId !== 'number')
+                return;
+            callback({ sessionId: typeof sessionId === 'string' ? sessionId : null, tabId });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_REQUESTED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_REQUESTED, handler);
+    },
+    /** Main rebuilt (or failed to rebuild) a tab whose webview page was lost. */
+    onTabRecovered: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, tabId, recovered } = payload;
+            if (typeof tabId !== 'number')
+                return;
+            callback({
+                sessionId: typeof sessionId === 'string' ? sessionId : null,
+                tabId,
+                recovered: recovered === true,
+            });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_TAB_RECOVERED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_TAB_RECOVERED, handler);
     },
 };
 contextBridge.exposeInMainWorld('embeddedBrowserAPI', embeddedBrowserAPI);
@@ -1763,6 +1974,8 @@ const deepLinkAPI = {
         ipcRenderer.on(IPC_CHANNELS.DEEPLINK_RECEIVED, handler);
         return () => ipcRenderer.removeListener(IPC_CHANNELS.DEEPLINK_RECEIVED, handler);
     },
+    // Claim the directory from the latest `workspace/open` link; null once taken.
+    takePendingWorkspaceOpen: () => ipcRenderer.invoke(IPC_CHANNELS.DEEPLINK_TAKE_WORKSPACE_OPEN),
 };
 contextBridge.exposeInMainWorld('deepLinkAPI', deepLinkAPI);
 // ============================================

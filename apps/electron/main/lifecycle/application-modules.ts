@@ -120,7 +120,12 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
                     dependencies.cleanupPPTPreviewCache();
                 }
                 finally {
-                    dependencies.disconnectRemoteControlBridgeBeforeQuit();
+                    try {
+                        dependencies.flushBrowserTelemetryBeforeQuit?.();
+                    }
+                    finally {
+                        dependencies.disconnectRemoteControlBridgeBeforeQuit();
+                    }
                 }
             },
             dispose: () => ipcHandle?.shutdown(),

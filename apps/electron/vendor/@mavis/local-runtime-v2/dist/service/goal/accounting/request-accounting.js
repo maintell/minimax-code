@@ -1,6 +1,6 @@
 import { GOAL_BUDGET_WRAP_UP_INSTRUCTION, GOAL_FINAL_REPLY_INSTRUCTION, GOAL_TOKEN_BUDGET_WRAP_UP_INSTRUCTION, } from '@mavis/goal';
 import { logger } from '../../../infra/logging/index.js';
-import { classifyThreadGoalBindingStale } from '../persistence/binding-stale.js';
+import { classifyThreadGoalBindingStale, isUndeliveredMessageDrain, } from '../persistence/binding-stale.js';
 import { resolveThreadGoalBudgetLimits, threadGoalBudgetGraceSteps, } from '../lifecycle/gate.js';
 /**
  * Counts Goal main execution in logical LLM requests.
@@ -71,7 +71,9 @@ export class GoalRequestAccounting {
             expectedEpoch: bound.binding.admittedGoalUpdatedAt,
             objectiveDigest: bound.binding.objectiveDigest,
         });
-        if (stale || !goal)
+        // A pause for an undelivered side message lets this already admitted Turn
+        // finish (spec 4.4); its budget below still applies.
+        if (!goal || (stale && !isUndeliveredMessageDrain(goal, bound)))
             return { next: 'stop' };
         if (!goal.accounting)
             return { next: 'untracked' };

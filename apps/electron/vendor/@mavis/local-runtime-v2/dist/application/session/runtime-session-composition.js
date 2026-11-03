@@ -1,13 +1,14 @@
 import { isLocalSourceProvenanceEnabled } from '@mavis/config';
 import { initializeModelSystem, freezeManagedQueueModel, resolveRequestedSessionModel, LocalModelProviderError, resolveBuiltinAgentModelGroup, previewAgentModelSelection, resolveEffectiveAgentModelSelection, AgentModelSelectionError, } from '../../service/model-system/index.js';
 import { createSessionSystemPinBridge, initializePinService, } from '../../service/pin/index.js';
-import { createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, } from '../../service/session-system/index.js';
+import { createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, readSessionAdditionalWorkspaceRoots, } from '../../service/session-system/index.js';
 import { createProductionAgentPreparation, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionModelRepair, agentHostModelFromQueue, } from '../../service/turn-system/index.js';
 import { createRuntimeAgentProduct } from '../agent/runtime-agent-product.js';
 import { withGoalAgentProduct } from './goal-agent-product.js';
 import { createRuntimeGoalPort } from './runtime-goal-port.js';
 import { initializeGoalService, isGoalVerifierChildSession, } from '../../service/goal/index.js';
 import { createApplicationFactPorts, createCommittedModelProviderSessionPort, } from './fact-ports.js';
+import { createSessionToolCallModePolicy } from './session-tool-call-mode-policy.js';
 import { createPinnedAgentLookup } from './pin-agent-lookup.js';
 import { ModelProviderApplication } from './model-provider-application.js';
 import { ChannelAgentModelSelectionError, previewChannelAgentModelSelection, resolveChannelAgentQueueModel, selectChannelAgentModel, } from './channel-agent-model-selection.js';
@@ -50,11 +51,7 @@ export function createProductionSessionComposition(input) {
         ...(product.fileApi?.fetchImpl ? { fetchImpl: product.fileApi.fetchImpl } : {}),
         ...(tuiProductPolicy ? { implicitCustomProviderThinking: true } : {}),
     });
-    input.agentService.bindBuiltinModelGroupResolver(async ({ previous, bundled }) => resolveBuiltinAgentModelGroup({
-        config: input.modelConfig.read(),
-        previous,
-        bundled,
-    }));
+    input.agentService.bindBuiltinModelGroupResolver(async ({ previous, bundled }) => resolveBuiltinAgentModelGroup({ config: input.modelConfig.read(), previous, bundled }));
     bindAgentConfigModelPorts({
         agentService: input.agentService,
         modelConfig: input.modelConfig,
@@ -75,12 +72,12 @@ export function createProductionSessionComposition(input) {
         rootAgents: input.agentSessionPorts.roots,
         defaultWorkspaceDir: input.compatibility.workspace.defaultDirectory,
         titlePolicy: createSessionTitlePolicy({
-            runtimeOwnerKind: input.runtimeOwnerKind,
             config: input.modelConfig.read,
             safety: input.safety,
             readDefinition: (sessionId) => sessionSystem.repositories.sessions.getSessionAgentDefinition(sessionId),
         }),
         resolveRequestedModel: (model) => resolveRequestedSessionModel(input.modelConfig.read(), model),
+        toolCallMode: createSessionToolCallModePolicy(input.modelConfig.read, input.logger),
         backfillDiagnostics: createSessionBackfillDiagnostics({
             logger: input.logger,
             reportFailure: product.executor.reportFailure,
@@ -124,6 +121,7 @@ export function createProductionSessionComposition(input) {
     input.compatibility.bindSessionPinReader((sessionId) => pinService.isSessionPinned(sessionId));
     preparation.bindSessionModelRepair(createSessionModelRepair(sessionSystem.sessions.records, input.logger, modelUpdatedFactSink(facts)));
     preparation.bindTaskSessionBindings(sessionSystem.sessions.records);
+    preparation.bindAdditionalWorkspaceRoots((sessionId) => readSessionAdditionalWorkspaceRoots(sessionSystem.repositories.projects, sessionId));
     const modelProviderApplication = new ModelProviderApplication({
         publish: input.publishGlobalEvent,
         tuiProductPolicy,

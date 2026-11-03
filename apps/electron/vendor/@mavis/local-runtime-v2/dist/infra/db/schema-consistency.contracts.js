@@ -166,6 +166,8 @@ export const EXPECTED_TABLES = {
         'cache_read_tokens',
         'output_tokens',
         'cache_write_unreported',
+        'request_limit',
+        'active_seconds_limit',
     ],
     local_runtime_v2_goal_requests: [
         'request_id',

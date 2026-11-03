@@ -1,14 +1,14 @@
 import { MemoryExecutionLedger } from './execution/ledger.js';
 import { MemoryDiagnostics, traceMemoryPort } from './diagnostics.js';
 import { GLOBAL_SCOPE_KEY } from './contracts.js';
-import { accessPolicy } from './access-policy.js';
+import { accessPolicy } from './policies/access-policy.js';
 import { MemoryCaptureService } from './orchestration/capture-service.js';
 import { MemoryConsolidationService } from './orchestration/consolidation-service.js';
 import { MemoryGovernanceService } from './orchestration/governance-service.js';
 import { MemoryLegacyMigrationService } from './orchestration/legacy-migration-service.js';
 import { MemoryRecallService } from './orchestration/recall-service.js';
 import { MemoryReconciler } from './orchestration/reconciler.js';
-import { MemoryScopeMutationCoordinator } from './scope-mutation.js';
+import { MemoryScopeMutationCoordinator, MemorySummaryEditorImpl } from './policies/scope-mutation.js';
 import { MemoryOnboardingStore } from './onboarding.js';
 import { MemoryAgentContributionAdapter } from './adapters/agent-contribution.js';
 import { MemoryFileStoreImpl } from './adapters/file-store.js';
@@ -140,6 +140,11 @@ export function initializeMemorySystem(options) {
     const agent = new MemoryAgentContributionAdapter(recall, governance);
     const turnObserver = traceMemoryPort(diagnostics, 'turnObserver', new MemoryTurnObserverAdapter(reconciler, source, diagnostics));
     return {
+        summaryEditor: new MemorySummaryEditorImpl({
+            dataDir: options.dataDir,
+            repository,
+            scopeMutation,
+        }),
         executions: execution.query,
         async inspect(createdBeforeMs) {
             return diagnostics.run('inspection', { createdBeforeMs }, async () => ({

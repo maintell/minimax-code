@@ -73,4 +73,21 @@ export function buildEnqueueChannelContext(ctx, route) {
         ...(route.targetAgentId ? { targetAgentId: route.targetAgentId } : {}),
     };
 }
+/**
+ * Projects the host enqueue result onto the inbound result: a merged message
+ * carries `steered` (no queue item), a queued one carries its queue fields
+ * plus the reason it could not be sent immediately, when there is one.
+ */
+export function enqueueOutcomeFields(queued) {
+    if (!queued)
+        return {};
+    if ('steered' in queued)
+        return { steered: queued.steered };
+    return {
+        queueItemId: queued.itemId,
+        ...(queued.ahead !== undefined ? { queueAhead: queued.ahead } : {}),
+        ...(queued.position !== undefined ? { queuePosition: queued.position } : {}),
+        ...(queued.queueReason ? { queueReason: queued.queueReason } : {}),
+    };
+}
 //# sourceMappingURL=channel-inbound-helpers.js.map

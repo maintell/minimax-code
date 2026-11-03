@@ -125,7 +125,10 @@ function canForkFrom(message, messageId, nextBoundary) {
 }
 function isSpecial(message) {
     return ((typeof message.kind === 'string' && message.kind.length > 0) ||
-        (typeof message.displayKind === 'string' && message.displayKind.length > 0));
+        (typeof message.displayKind === 'string' && message.displayKind.length > 0) ||
+        // A retried undelivered side message: a display row without a Turn of its
+        // own (its delivery ran under `delivered_as`), so it is no rewind boundary.
+        message.delivered_as !== undefined);
 }
 function isConversationMessage(message) {
     return message.role === 'assistant' || isCommittedUserMessage(message, message.msg_id);

@@ -1,61 +1,6 @@
-import { release } from 'node:os';
 import { parse as parsePath } from 'node:path';
 export async function callCuaToolWithDeliveryMode(runtime, name, payload, signal) {
-    const shortcutRefusal = foregroundShortcutRefusal(runtime.driverVersion, name, payload);
-    if (shortcutRefusal)
-        return shortcutRefusal;
-    if (shouldAvoidNativeBackgroundClick(runtime.driverVersion, name, payload, process.platform)) {
-        return {
-            isError: true,
-            text: 'Background coordinate click was NOT sent: this CUA version has an unsafe background pixel path. The requested background mode was preserved; no foreground retry occurred. Use a fresh accessible element token if supported. Tell the user you will work in the foreground before retrying this action with foreground delivery, unless the user requires background-only. Do not silently retry or bypass target ownership checks.',
-            structuredJson: JSON.stringify({
-                code: 'computer_background_coordinate_unavailable',
-                effect: 'refused',
-            }),
-        };
-    }
     return runtime.callTool(name, payload, signal);
-}
-/** macOS 14.6 crash dumps identify activate_without_raise -> SLPSPostEventRecordTo. */
-export function shouldAvoidNativeBackgroundClick(driverVersion, name, payload, platform = process.platform) {
-    if (platform !== 'darwin' || driverVersion !== '0.22.1')
-        return false;
-    if (name !== 'click' || payload.delivery_mode === 'foreground')
-        return false;
-    if ((payload.button ?? 'left') !== 'left')
-        return false;
-    return (isRecord(payload.target) &&
-        payload.target.kind === 'window' &&
-        typeof payload.x === 'number' &&
-        typeof payload.y === 'number');
-}
-function isUnsafeWindowChord(name, payload) {
-    if (name === 'press_key')
-        return Array.isArray(payload.modifiers) && payload.modifiers.length > 0;
-    if (name !== 'hotkey' || !Array.isArray(payload.keys) || payload.keys.length < 2)
-        return false;
-    // Token-only hotkeys use the same unsafe foreground keyboard path. Coordinate
-    // hotkeys explicitly focus a control and use the separate flagged HID route.
-    return typeof payload.x !== 'number' || typeof payload.y !== 'number';
-}
-/** Refuse the observed modifier-loss path before it can insert a bare letter. */
-export function foregroundShortcutRefusal(driverVersion, name, payload, platform = process.platform, osRelease = release()) {
-    if (platform !== 'darwin' || !osRelease.startsWith('23.') || driverVersion !== '0.22.1')
-        return;
-    if (payload.delivery_mode !== 'foreground')
-        return;
-    if (!isRecord(payload.target) || payload.target.kind !== 'window')
-        return;
-    if (!isUnsafeWindowChord(name, payload))
-        return;
-    return {
-        isError: true,
-        text: 'Window shortcut was NOT sent: CUA 0.22.1 on macOS 14 can drop modifiers in foreground window input and insert the base letter. For window or application commands, first inspect the exact window for the intended button or observed menu path, and use computer_click or computer_secondary_action. Do not click arbitrary list/document content just to focus a window. For a shortcut that needs a particular input control, inspect computer_app_state with include_screenshot:true, then use computer_key with delivery_mode:foreground and x/y inside that intended control; omit element_token. This coordinate path performs a real click BEFORE the guarded hotkey: even if the key is refused, selection, navigation or rename state may already have changed. Re-observe after failure; do not infer that nothing happened. Otherwise inspect computer_desktop_state, locate the intended app/control on the primary display, click it with scope:"desktop", verify focus, then send the shortcut with scope:"desktop" and omit pid/window_ref/element_token. Stop if the target is not visible. For editable values use a fresh element token with computer_set_value.',
-        structuredJson: JSON.stringify({
-            code: 'computer_foreground_shortcut_unavailable',
-            dispatched: false,
-        }),
-    };
 }
 function parseStructuredResult(value) {
     if (!isRecord(value))
@@ -251,13 +196,13 @@ export async function mapRequestToCuaTool(runtime, request, signal) {
         throw new Error('computer_desktop_input_coordinates_unsupported: no input was sent. Desktop key/type act on the current foreground focus; x/y do not target a control. Inspect computer_desktop_state, click the intended visible control separately if necessary, verify focus/selection, then send key/type with x/y omitted or null. Do not assume a click preserves an existing text selection.');
     }
     if (process.platform === 'darwin' &&
-        runtime.driverVersion === '0.22.1' &&
         ['key', 'select_text'].includes(request.kind) &&
         payload.scope !== 'desktop' &&
         payload.delivery_mode !== 'foreground') {
-        // Coordinates opt into focus only on the explicit foreground rung. Strict
-        // model providers may otherwise fill these optional numeric fields with 0.
-        // Preserve ordinary background keyboard delivery without a pixel click.
+        // Coordinates opt into focus only on the explicit foreground rung. Native
+        // press_key/hotkey otherwise turn background x/y into a pixel focus click,
+        // which can activate the target app. Strict model providers may also fill
+        // these optional numeric fields with 0.
         delete payload.x;
         delete payload.y;
     }
@@ -404,21 +349,7 @@ export async function mapRequestToCuaTool(runtime, request, signal) {
                 };
                 payload.key = arrows[payload.key.toLowerCase()] ?? payload.key;
             }
-            const mapped = await withWindowTarget(runtime, payload, signal);
-            // The coordinate hotkey route focuses the observed control and uses
-            // flagged HID events. The coordinate-free press_key route uses bare
-            // modifier transitions, which can lose the chord on macOS 14.
-            if (process.platform === 'darwin' &&
-                runtime.driverVersion === '0.22.1' &&
-                mapped.delivery_mode === 'foreground' &&
-                typeof mapped.x === 'number' &&
-                typeof mapped.y === 'number' &&
-                Array.isArray(mapped.modifiers) &&
-                mapped.modifiers.length > 0) {
-                const { key, modifiers, ...target } = mapped;
-                return { name: 'hotkey', payload: { ...target, keys: [...modifiers, key] } };
-            }
-            return { name: 'press_key', payload: mapped };
+            return { name: 'press_key', payload: await withWindowTarget(runtime, payload, signal) };
         }
         case 'scroll':
             // The native count is wheel notches/key repetitions, never screenshot pixels.

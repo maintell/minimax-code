@@ -2,6 +2,8 @@ import { logger } from '@mavis/shared/local-runtime-logging';
 import { parseAgentShellPreference, selectAgentShell, } from './contracts.js';
 const PREFERENCE_KEY = 'agent-command-shell-preference';
 const DISCOVERY_TTL_MS = 30_000;
+/** A failed same-family rebind is not retried before this, so a removed shell stays a fast error. */
+const REBIND_RETRY_MS = DISCOVERY_TTL_MS;
 /** Expose only bounded reason codes, never probe output or private executable paths. */
 function executionFailureReason(candidate) {
     if (candidate?.available)
@@ -20,7 +22,20 @@ function executionFailureReason(candidate) {
 /** Only detector failures are recoverable; preference and Session storage errors must propagate. */
 class AgentShellDetectionError extends Error {
 }
-/** Profile-local discovery and session bindings; never changes shell on command failure. */
+/** The execution probe must confirm the exact persisted family and path. */
+function matchesBinding(shell, candidate) {
+    return Boolean(candidate?.available &&
+        candidate.version &&
+        candidate.family === shell.family &&
+        candidate.executablePath === shell.executablePath);
+}
+function sameExecutable(a, b) {
+    return a.family === b.family && a.executablePath === b.executablePath;
+}
+/**
+ * Profile-local discovery and session bindings; never changes shell on command failure.
+ * The only rebind is to the same family after the bound executable has disappeared.
+ */
 export class AgentShellService {
     options;
     sessions;
@@ -28,6 +43,8 @@ export class AgentShellService {
     sessionOperation = Promise.resolve();
     discovery;
     warming;
+    /** Shared across Sessions because rediscovery itself is shared. */
+    rebindRetryAt = 0;
     discovered;
     nowMs;
     constructor(options) {
@@ -197,29 +214,93 @@ export class AgentShellService {
             release();
         }
     }
-    /** Actual execution still validates the fixed binary; failure never selects another shell. */
+    /**
+     * Actual execution still validates the fixed binary; failure never selects another shell
+     * family. When the bound executable no longer exists (for example a PowerShell MSI install
+     * replaced by MSIX), the Session is rebound to a discovered executable of the same family.
+     */
     async resolveForExecution(sessionId) {
         if (this.options.platform !== 'win32')
             return undefined;
         const shell = await this.ensureSession(sessionId);
         if (!shell)
             throw new Error('AGENT_SHELL_UNAVAILABLE: install PowerShell or Git for Windows');
-        let candidate;
+        const candidate = await this.probe(shell);
+        if (matchesBinding(shell, candidate))
+            return { ...shell, version: candidate.version };
+        const reason = executionFailureReason(candidate);
+        if (reason === 'not-installed') {
+            const rebound = await this.rebindMissingShell(sessionId, shell);
+            if (rebound)
+                return rebound;
+        }
+        logger.warn({ sessionId, family: shell.family, reason }, '[agent-shell] execution shell validation failed');
+        const recovery = reason === 'not-installed'
+            ? `install ${shell.family} again and retry; no new conversation is needed`
+            : 'restore the session shell to run commands';
+        throw new Error(`AGENT_SHELL_UNAVAILABLE: ${shell.family} (${reason}); ${recovery}; conversation and other tools remain available`);
+    }
+    async probe(shell) {
         try {
-            candidate = await this.options.detector.validate(shell);
+            return await this.options.detector.validate(shell);
         }
         catch {
-            candidate = undefined;
+            return undefined;
         }
-        if (!candidate?.available ||
-            !candidate.version ||
-            candidate.family !== shell.family ||
-            candidate.executablePath !== shell.executablePath) {
-            const reason = executionFailureReason(candidate);
-            logger.warn({ sessionId, family: shell.family, reason }, '[agent-shell] execution shell validation failed');
-            throw new Error(`AGENT_SHELL_UNAVAILABLE: ${shell.family} (${reason}); restore the session shell to run commands; conversation and other tools remain available`);
+    }
+    /**
+     * Same family only, so the conversation's shell syntax never changes. Fresh discovery is
+     * shared by every Session and is skipped for REBIND_RETRY_MS after it found nothing.
+     */
+    async rebindMissingShell(sessionId, shell) {
+        let rebound = await this.validatedReplacement(shell, this.cachedCandidates() ?? []);
+        if (!rebound) {
+            if (this.nowMs() < this.rebindRetryAt)
+                return undefined;
+            let candidates = [];
+            try {
+                candidates = await this.discover(true);
+            }
+            catch (error) {
+                if (!(error instanceof AgentShellDetectionError))
+                    throw error;
+            }
+            rebound = await this.validatedReplacement(shell, candidates);
         }
-        return { ...shell, version: candidate.version };
+        if (!rebound) {
+            this.rebindRetryAt = this.nowMs() + REBIND_RETRY_MS;
+            return undefined;
+        }
+        const next = rebound;
+        return this.serializeSession(async () => {
+            const current = (await this.requireSession(sessionId)).agentShell;
+            // A concurrent execution in this Session already replaced the missing binding.
+            if (current && !sameExecutable(current, shell))
+                return current;
+            await this.sessions.save(sessionId, next);
+            logger.info({ sessionId, family: next.family }, '[agent-shell] rebound missing session shell to the same family');
+            return next;
+        });
+    }
+    async validatedReplacement(shell, candidates) {
+        const found = candidates.find((item) => item.family === shell.family &&
+            item.available &&
+            item.version &&
+            item.executablePath &&
+            item.executablePath.toLowerCase() !== shell.executablePath.toLowerCase());
+        if (!found?.executablePath || !found.version)
+            return undefined;
+        const next = {
+            schemaVersion: 1,
+            requestedPreference: shell.requestedPreference,
+            family: shell.family,
+            executablePath: found.executablePath,
+            version: found.version,
+            resolvedAt: this.nowMs(),
+        };
+        // Cached discovery may be up to DISCOVERY_TTL_MS old; probe the exact path being bound.
+        const candidate = await this.probe(next);
+        return matchesBinding(next, candidate) ? { ...next, version: candidate.version } : undefined;
     }
     async requireSession(sessionId) {
         if (!this.sessions)

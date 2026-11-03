@@ -28,7 +28,7 @@
  *     }
  *
  * The cloud side is intentionally untouched. Prompt assembly stays in the
- * local runtime (`packages/local-runtime/prompts/llm-gate-classifier.md`),
+ * local runtime (`packages/local-runtime-v2/assets/prompts/llm-gate-classifier.md`),
  * conversation context is rendered runtime-side (see `conversation-renderer.ts`),
  * and the cloud endpoint remains a thin wrapper around gemini-flash with the
  * same prompt baked in.

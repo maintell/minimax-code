@@ -158,7 +158,9 @@ export class ContextManager {
                 triggerAt,
             };
         }
-        const shouldCompact = count.tokens > triggerAt;
+        // 重发一次被模型拒绝的请求（超窗、图片太多、请求太大）时，拒绝本身说明已经
+        // 超限，不看计数直接压缩，做法对齐 local-runtime-v2。
+        const shouldCompact = input.recovery !== undefined || count.tokens > triggerAt;
         return {
             shouldCompact,
             reason: shouldCompact ? undefined : 'context_manager_below_threshold',

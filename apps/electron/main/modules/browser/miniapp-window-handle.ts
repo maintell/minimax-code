@@ -27,18 +27,24 @@ function fail(code) {
     return { success: false, code };
 }
 function liveWindow(tab) {
+    if (tab.backendSelection?.rendererBackend === 'webview' && tab.webviewWindowMode === 'inline')
+        return null;
     const window = tab.detachedWindow;
     return window && !window.isDestroyed() ? window : null;
 }
 export function readMiniAppWindowState(tab) {
+    const behavior = tab.backendSelection?.rendererBackend === 'webview'
+        ? { modeChangeReloadsPage: true }
+        : {};
     const window = liveWindow(tab);
     if (!window)
-        return { mode: 'inline' };
+        return { mode: 'inline', ...behavior };
     const declared = tab.miniApp?.window;
     const flags = appliedFlags.get(window);
     const bounds = window.getContentBounds();
     return {
         mode: 'window',
+        ...behavior,
         window: {
             width: bounds.width,
             height: bounds.height,
@@ -143,7 +149,9 @@ async function switchMode(tab, target, fields, options) {
             return null;
         }
         // Patch size is explicit intent: patch > position memory > manifest > panel size.
-        await options.host.detach(tab, { width: fields.width, height: fields.height }, options.userActivated);
+        const moved = await options.host.detach(tab, { width: fields.width, height: fields.height }, options.userActivated);
+        if (moved === false)
+            return null;
         const window = liveWindow(tab);
         if (!window)
             return 'result_unknown';
@@ -153,7 +161,7 @@ async function switchMode(tab, target, fields, options) {
         const rejected = applyToWindow(tab, window, rest, options.userActivated);
         // Position is only checkable against the created window; undo the pop-out.
         if (rejected)
-            await options.host.attach(tab);
+            await options.host.attach(tab, true);
         return rejected;
     }
     catch (error) {
@@ -164,7 +172,7 @@ async function switchMode(tab, target, fields, options) {
     }
 }
 export async function updateMiniAppWindow(tab, patch, options) {
-    if (switchingTabs.has(tab))
+    if (switchingTabs.has(tab) || tab.rebuildingPage || tab.windowTransferPhase)
         return fail('busy');
     // Main re-checks the preload gate: a mode switch opens or closes a window.
     if (patch.mode !== undefined && !options.userActivated)
@@ -197,7 +205,7 @@ export async function updateMiniAppWindow(tab, patch, options) {
 export function focusMiniAppWindow(tab, options) {
     if (!options.userActivated)
         return fail('not_permitted');
-    if (switchingTabs.has(tab))
+    if (switchingTabs.has(tab) || tab.rebuildingPage || tab.windowTransferPhase)
         return fail('busy');
     const window = liveWindow(tab);
     if (window)

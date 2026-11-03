@@ -4,13 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { digest } from './component.js';
-import { privateDirectory } from './desktop-lock.js';
+import { digest, resolveProfileDataDir } from './component.js';
+import { privateDirectory, processAlive as alive } from './desktop-lock.js';
 import { daemonControl, validateDaemonMetadata } from './daemon-control.js';
 import { ComputerUseError, record, structured } from './contracts.js';
 /** Standalone App owns macOS permission identity; Windows inherits the interactive user. */
 export async function startOwnedDaemon(component, dataDir, ownerId) {
-    const root = path.join(dataDir, 'cu');
+    const root = path.join(await resolveProfileDataDir(dataDir), 'cu');
     await privateDirectory(root);
     const directory = await mkdtemp(path.join(root, `${digest(ownerId).slice(0, 8)}-`));
     await privateDirectory(directory);
@@ -83,16 +83,7 @@ export async function startOwnedDaemon(component, dataDir, ownerId) {
                             throw new ComputerUseError('computer_permission_mode_invalid', 'Only standard driver permission mode is admitted.');
                     },
                     async stop() {
-                        if (!alive(pid))
-                            return;
-                        // Recheck identity immediately before sending a deny-only PID-bound command.
-                        validateDaemonMetadata(await daemonControl(endpoint, 'metadata'), pid);
-                        await daemonControl(endpoint, 'shutdown_if_pid', { expected_pid: pid });
-                        const stopDeadline = Date.now() + 35_000;
-                        while (alive(pid) && Date.now() < stopDeadline)
-                            await delay(50);
-                        if (alive(pid))
-                            throw new ComputerUseError('computer_stop_unconfirmed', 'Owned daemon shutdown is unconfirmed; desktop lock is retained.', 'unknown');
+                        await stopVerifiedDaemon(endpoint, pid, 35_000);
                     },
                 };
                 await owned.check();
@@ -168,13 +159,31 @@ function cleanEnvironment() {
     // No inherited grants, policy overrides, embedding identity, or global endpoint selection.
     return { ...env, CUA_TELEMETRY_ENABLED: '0' };
 }
-function alive(pid) {
+/**
+ * Stops a daemon recorded in a desktop lock whose host process exited. An endpoint with no
+ * listener proves the recorded daemon no longer serves control requests.
+ */
+export async function stopOrphanDaemon(daemon) {
     try {
-        process.kill(pid, 0);
-        return true;
+        await stopVerifiedDaemon(daemon.endpoint, daemon.pid, 10_000);
     }
     catch (error) {
-        return error.code !== 'ESRCH';
+        const code = error.code;
+        if (code === 'ENOENT' || code === 'ECONNREFUSED')
+            return;
+        throw error;
     }
+}
+async function stopVerifiedDaemon(endpoint, pid, timeoutMs) {
+    if (!alive(pid))
+        return;
+    // Recheck identity immediately before sending a deny-only PID-bound command.
+    validateDaemonMetadata(await daemonControl(endpoint, 'metadata'), pid);
+    await daemonControl(endpoint, 'shutdown_if_pid', { expected_pid: pid });
+    const stopDeadline = Date.now() + timeoutMs;
+    while (alive(pid) && Date.now() < stopDeadline)
+        await delay(50);
+    if (alive(pid))
+        throw new ComputerUseError('computer_stop_unconfirmed', 'Owned daemon shutdown is unconfirmed; desktop lock is retained.', 'unknown');
 }
 //# sourceMappingURL=daemon.js.map

@@ -1,15 +1,16 @@
 import { fileURLToPath } from 'node:url';
-import { mergeConfig } from 'vitest/config';
-import config from './vitest.config';
+import { defineConfig, mergeConfig } from 'vitest/config';
+import { resolveWorkspaceSourceAliases } from '../../scripts/ci/workspace-source-aliases.mjs';
+import unitConfig from './vitest.config.js';
 
-// Selection must follow changes in the shared hook implementation, not its dist output.
-// Execution keeps vitest.config.ts so the runtime still tests built workspace dependencies.
-export default mergeConfig(config, {
-  resolve: {
-    alias: {
-      '@mavis/plugin-hooks': fileURLToPath(
-        new URL('../agent-modules/plugin-hooks/src/index.ts', import.meta.url),
-      ),
+export default mergeConfig(
+  unitConfig,
+  defineConfig({
+    resolve: {
+      alias: resolveWorkspaceSourceAliases({
+        root: fileURLToPath(new URL('../..', import.meta.url)),
+        packageName: '@mavis/local-runtime-v2',
+      }),
     },
-  },
-});
+  }),
+);

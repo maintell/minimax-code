@@ -86,6 +86,7 @@ export const initializeApplications = (options) => {
         maintenance: options.sessionSystem.session.maintenance,
         staleCompactionRepair: options.sessionSystem.messages.staleCompactionRepair,
         files: options.sessionSystem.files,
+        mediaIdentity: options.sessionSystem.mediaIdentity,
         inputSummaries: options.sessionSystem.messages.inputSummaries,
         usage: options.sessionSystem.usage,
         peekContext: options.sessionSystem.messages.peekContext,
@@ -109,6 +110,7 @@ export const initializeApplications = (options) => {
         attachmentRegistration: options.attachmentRegistration,
     });
     const project = new ProjectApplication({
+        publishGlobalEvent: options.publishGlobalEvent,
         sidebar: options.sessionSystem.sidebar,
         sidebarBindings: options.compatibility.channelBindings,
         sidebarAgents: options.sidebarAgents,

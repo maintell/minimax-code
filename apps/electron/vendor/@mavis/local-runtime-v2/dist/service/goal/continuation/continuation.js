@@ -1,5 +1,5 @@
 import { isContinuationStatus, isVerificationInterruptedReason, } from '@mavis/goal';
-import { buildThreadGoalContinuationMessage, threadGoalRearmClientRequestId } from './kickoff.js';
+import { buildThreadGoalContinuationMessage, buildThreadGoalKickoffMessage, threadGoalKickoffClientRequestId, threadGoalRearmClientRequestId, } from './kickoff.js';
 import { GoalInitialKickoffCoordinator } from './initial-kickoff.js';
 import { ObjectiveSteeringTargetChangedError, objectiveUpdateSteeringKey, } from './objective-steering.js';
 import { GoalContinuationRearm } from './continuation-rearm.js';
@@ -209,6 +209,83 @@ export class GoalContinuation {
     async reconcileInitial(goal, dispatch) {
         return this.initialKickoff.reconcile(goal, dispatch);
     }
+    /**
+     * Deliver a just-created Goal's kickoff. Sent with `steer` (the composer's
+     * rule for an ordinary message), a Goal created while an ordinary Turn runs
+     * joins that Turn instead of waiting behind it in the Queue.
+     */
+    async startInitial(goal, dispatch, sendBehavior) {
+        if (sendBehavior === 'steer' && (await this.steerInitialKickoff(goal)))
+            return 'consumed';
+        return this.initialKickoff.reconcile(goal, dispatch);
+    }
+    /**
+     * Steer the kickoff into the running Turn and report whether it joined.
+     *
+     * The joined Turn stays unbound: it neither counts toward the Goal nor can
+     * complete it. It carries the kickoff's prompt, attachments and the user's
+     * objective as its visible message, so the kickoff is consumed here, and the
+     * re-arm hands the Goal its own Turn once the joined Turn settles. Anything
+     * that would hold the steer back — a pending questionnaire or permission, or
+     * the Turn ending before delivery — leaves the kickoff to the Queue.
+     */
+    async steerInitialKickoff(goal) {
+        if (!(await this.canSteerInitialKickoff(goal)))
+            return false;
+        if (!(await this.deliverKickoffSteer(goal)))
+            return false;
+        this.rearm.armSteeredKickoff(goal);
+        try {
+            await this.initialKickoff.consume(goal);
+        }
+        catch (error) {
+            // The kickoff already rides the joined Turn. A durable `pending` left by
+            // a failed write is rebuilt as a kickoff by the re-arm (at least once).
+            this.deps.external.reportFailure(goal.sessionId, `thread_goal_kickoff_state_failed:${this.deps.external.formatError(error)}`);
+        }
+        return true;
+    }
+    async canSteerInitialKickoff(goal) {
+        if (!this.deps.external.steerContinuationTurn ||
+            !this.deps.runtime.isEnabled() ||
+            goal.status !== 'active' ||
+            goal.kickoffState !== 'pending' ||
+            !this.deps.gates.isSessionBusy(goal.sessionId)) {
+            return false;
+        }
+        return !(await this.hasKickBlocker(goal));
+    }
+    /** Whether the kickoff joined the Turn running when the Goal was created. */
+    async deliverKickoffSteer(goal) {
+        const steer = this.deps.external.steerContinuationTurn;
+        if (!steer)
+            return false;
+        const observedTurnId = this.deps.turnTimingReader.getBySession(goal.sessionId)?.turnId;
+        try {
+            const prompt = await this.preparePrompt(goal, 'kickoff');
+            const steered = await steer({
+                sessionId: goal.sessionId,
+                message: buildThreadGoalKickoffMessage(goal, prompt.content, goal.kickoffAttachments.map((attachment) => ({ ...attachment }))),
+                displayContent: goal.objective,
+                idempotencyKey: threadGoalKickoffClientRequestId(goal.goalId),
+                ...(prompt.internalPromptRead ? { internalPromptRead: prompt.internalPromptRead } : {}),
+                onAccepted: async ({ mode, turnId }) => {
+                    if (mode !== 'steered' ||
+                        turnChanged(observedTurnId, turnId) ||
+                        (await this.hasKickBlocker(goal))) {
+                        throw new ObjectiveSteeringTargetChangedError();
+                    }
+                },
+            });
+            return steered.mode !== 'activated' && !turnChanged(observedTurnId, steered.turnId);
+        }
+        catch (error) {
+            if (!(error instanceof ObjectiveSteeringTargetChangedError)) {
+                this.deps.external.reportFailure(goal.sessionId, `thread_goal_kickoff_steering_failed:${this.deps.external.formatError(error)}`);
+            }
+            return false;
+        }
+    }
     rollbackFailedCreation(goal) {
         return this.initialKickoff.rollbackFailedCreation(goal);
     }
@@ -366,7 +443,7 @@ export class GoalContinuation {
     async hasKickBlocker(goal) {
         return ((await this.deps.gates.hasPendingQuestionnaire(goal.sessionId, goal.goalId)) ||
             (await this.deps.gates.hasPendingPermission(goal.sessionId)) ||
-            (await this.deps.gates.hasRequiredBackgroundWork(goal.sessionId, goal.goalId)));
+            (await this.deps.gates.hasRequiredBackgroundWork(goal.sessionId, goal.goalId)) !== false);
     }
     async startKick(goal, event, observedRearm) {
         try {

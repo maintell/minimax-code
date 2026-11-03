@@ -1,6 +1,7 @@
 import { parsePluginMentions } from '@mavis/shared/plugin-mention';
 import { randomUUID } from 'node:crypto';
 import { UserMessageCommitAdmissionError, UserMessageCommitConflictError, retryUserMessageCommit, writeQueryCollapseView, } from '../../service/session-system/index.js';
+import { CHANNEL_STEER_PRODUCER_ID } from '../../service/channel-system/index.js';
 import { isUserSteeringProducer, resolveGenuineUserQueryText, } from '../../service/turn-system/index.js';
 import { sessionClioDirectQueryId, sessionClioSteeringQueryId, } from '../../service/session-clio/index.js';
 import { queryCollapseQueryKey } from './query-collapse-identity.js';
@@ -35,9 +36,9 @@ export class UserMessageTurnDeliveryService {
         const attachments = deliveryAttachments(delivery, input.message.message.attachments);
         const queryKey = await resolveQueryKeyForTurn(this.options, input.sessionId, input.turnId);
         // 此处只处理当前 Turn 的追加消息；启动新 Turn 的 task 输入走 deliver()。
-        // task 追加与用户 steer 使用相同的展示标记，避免被拆成新的对话轮次。
-        const displayAsUserSteer = isUserSteeringProducer(input.message.producerId) ||
-            input.message.provenance.source === 'task';
+        // task 追加、IM 追加（channel-steer）与用户 steer 使用相同的展示标记，
+        // 避免被拆成新的对话轮次。只影响展示，不改变 channel-steer 的执行语义。
+        const displayAsUserSteer = displaysAsUserSteer(input.message);
         const commit = await commitMessage(this.options, {
             sessionId: input.sessionId,
             turnId: input.turnId,
@@ -59,6 +60,11 @@ export class UserMessageTurnDeliveryService {
         });
         projectCommitted(this.options, commit);
     }
+}
+function displaysAsUserSteer(message) {
+    return (isUserSteeringProducer(message.producerId) ||
+        message.producerId === CHANNEL_STEER_PRODUCER_ID ||
+        message.provenance.source === 'task');
 }
 async function executeDelivery(options, input) {
     const start = createStartFence();

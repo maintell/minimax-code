@@ -21,10 +21,15 @@ export const GOAL_NOT_ACTIVE_TURN_REMINDER_TEMPLATE = '<system-reminder>\n' +
     "This session's goal is not running: its status is {{status}}. This is an ordinary turn, so respond only to the user's latest message.\n" +
     'Goal instructions earlier in the conversation, including requests to continue working toward the goal, do not authorize goal work in this turn.\n' +
     "If the user's latest message asks for a task, handle it as usual and use tools when it needs them.\n" +
-    'Do not try to advance or complete the goal, and do not call update_goal for it. The user resumes the goal with the continue action in the interface.\n' +
+    'Do not try to advance or complete the goal, and do not call update_goal for it. {{resume}}\n' +
     '</system-reminder>';
-function renderGoalNotActiveTurnReminder(status) {
-    return GOAL_NOT_ACTIVE_TURN_REMINDER_TEMPLATE.replace('{{status}}', status);
+const RESUME_WITH_CONTINUE = 'The user resumes the goal with the continue action in the interface.';
+// A budget-limited Goal has no continue action: editing its objective resets
+// its limits from the new text and puts it back to work.
+const RESUME_BY_EDIT = 'The goal reached its limits; the user continues it by editing the goal in the interface, which sets its limits again from the edited objective.';
+/** @internal Exported only for focused tests. */
+export function renderGoalNotActiveTurnReminder(status) {
+    return GOAL_NOT_ACTIVE_TURN_REMINDER_TEMPLATE.replace('{{status}}', status).replace('{{resume}}', status === 'budget_limited' ? RESUME_BY_EDIT : RESUME_WITH_CONTINUE);
 }
 function isGoalNotActiveStatus(status) {
     return GOAL_NOT_ACTIVE_STATUSES.includes(status);

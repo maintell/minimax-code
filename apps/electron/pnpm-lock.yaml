@@ -41,7 +41,7 @@ overrides:
   '@modelcontextprotocol/sdk': 1.30.0
   '@nodable/entities': 2.1.1
   '@opentelemetry/api': 1.9.0
-  '@opentelemetry/semantic-conventions': 1.43.0
+  '@opentelemetry/semantic-conventions': 1.44.0
   '@protobufjs/inquire': 1.1.0
   '@sinclair/typebox': 0.34.49
   '@slack/types': 2.20.1
@@ -179,9 +179,6 @@ importers:
       '@mavis/goal':
         specifier: file:./vendor/@mavis/goal
         version: file:vendor/@mavis/goal
-      '@mavis/local-runtime':
-        specifier: file:./vendor/@mavis/local-runtime
-        version: file:vendor/@mavis/local-runtime
       '@mavis/local-runtime-v2':
         specifier: file:./vendor/@mavis/local-runtime-v2
         version: file:vendor/@mavis/local-runtime-v2(@opentelemetry/api@1.9.0)
@@ -239,12 +236,6 @@ importers:
       '@minimax/mcode-sandbox-runtime':
         specifier: file:./vendor/@minimax/mcode-sandbox-runtime
         version: file:vendor/@minimax/mcode-sandbox-runtime
-      '@opentelemetry/api':
-        specifier: 1.9.0
-        version: 1.9.0
-      '@opentelemetry/semantic-conventions':
-        specifier: 1.43.0
-        version: 1.43.0
       '@slack/socket-mode':
         specifier: 2.0.6
         version: 2.0.6
@@ -602,6 +593,21 @@ packages:
     resolution: {integrity: sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w==}
     engines: {node: '>=18.0.0'}
 
+  '@jitl/quickjs-ffi-types@0.31.0':
+    resolution: {integrity: sha512-1yrgvXlmXH2oNj3eFTrkwacGJbmM0crwipA3ohCrjv52gBeDaD7PsTvFYinlAnqU8iPME3LGP437yk05a2oejw==}
+
+  '@jitl/quickjs-wasmfile-debug-asyncify@0.31.0':
+    resolution: {integrity: sha512-YkdzQdr1uaftFhgEnTRjTTZHk2SFZdpWO7XhOmRVbi6CEVsH9g5oNF8Ta1q3OuSJHRwwT8YsuR1YzEiEIJEk6w==}
+
+  '@jitl/quickjs-wasmfile-debug-sync@0.31.0':
+    resolution: {integrity: sha512-8XvloaaWBONqcHXYs5tWOjdhQVxzULilIfB2hvZfS6S+fI4m2+lFiwQy7xeP8ExHmiZ7D8gZGChNkdLgjGfknw==}
+
+  '@jitl/quickjs-wasmfile-release-asyncify@0.31.0':
+    resolution: {integrity: sha512-uz0BbQYTxNsFkvkurd7vk2dOg57ElTBLCuvNtRl4rgrtbC++NIndD5qv2+AXb6yXDD3Uy1O2PCwmoaH0eXgEOg==}
+
+  '@jitl/quickjs-wasmfile-release-sync@0.31.0':
+    resolution: {integrity: sha512-hYduecOByj9AsAfsJhZh5nA6exokmuFC8cls39+lYmTCGY51bgjJJJwReEu7Ff7vBWaQCL6TeDdVlnp2WYz0jw==}
+
   '@larksuiteoapi/node-sdk@1.60.0':
     resolution: {integrity: sha512-MS1eXx7K6HHIyIcCBkJLb21okoa8ZatUGQWZaCCUePm6a37RWFmT6ZKlKvHxAanSX26wNuNlwP0RhgscsE+T6g==}
 
@@ -710,9 +716,6 @@ packages:
   '@mavis/local-runtime-v2@file:vendor/@mavis/local-runtime-v2':
     resolution: {directory: vendor/@mavis/local-runtime-v2, type: directory}
 
-  '@mavis/local-runtime@file:vendor/@mavis/local-runtime':
-    resolution: {directory: vendor/@mavis/local-runtime, type: directory}
-
   '@mavis/mcode-tools-host@file:vendor/@mavis/mcode-tools-host':
     resolution: {directory: vendor/@mavis/mcode-tools-host, type: directory}
     engines: {node: '>=20'}
@@ -803,10 +806,6 @@ packages:
   '@opentelemetry/api@1.9.0':
     resolution: {integrity: sha512-3giAOQvZiH5F9bMlMiv8+GSPMeqg0dbaeo58/0SlA9sxSqZhnUtxzX9/2FzyhS9sWQf5S0GJE0AKBrFqjpeYcg==}
     engines: {node: '>=8.0.0'}
-
-  '@opentelemetry/semantic-conventions@1.43.0':
-    resolution: {integrity: sha512-eSYWTm620tTk45EKSedaUL8MFYI8hW164hIXsgIHyxu3VobUB3fFCu5t0hQby6OoWRPsG1KkKUG2M5UadiLiVg==}
-    engines: {node: '>=14'}
 
   '@peculiar/asn1-schema@2.11.0':
     resolution: {integrity: sha512-8xh4avo53/vXO6UEv9yaoJ83hY581geaLTygf61NPIXP5AeIZCPjJhpTaYU23IZkG+NpLN/C9FYzWp7hphIT9A==}
@@ -3036,6 +3035,13 @@ packages:
     resolution: {integrity: sha512-WuyALRjWPDGtt/wzJiadO5AXY+8hZ80hVpe6MyivgraREW751X3SbhRvG3eLKOYN+8VEvqLcf3wdnt44Z4S4SA==}
     engines: {node: '>=10'}
 
+  quickjs-emscripten-core@0.31.0:
+    resolution: {integrity: sha512-oQz8p0SiKDBc1TC7ZBK2fr0GoSHZKA0jZIeXxsnCyCs4y32FStzCW4d1h6E1sE0uHDMbGITbk2zhNaytaoJwXQ==}
+
+  quickjs-emscripten@0.31.0:
+    resolution: {integrity: sha512-K7Yt78aRPLjPcqv3fIuLW1jW3pvwO21B9pmFOolsjM/57ZhdVXBr51GqJpalgBlkPu9foAvhEAuuQPnvIGvLvQ==}
+    engines: {node: '>=16.0.0'}
+
   range-parser@1.2.1:
     resolution: {integrity: sha512-Hrgsx+orqoygnmhFbKaHE6c296J+HTAQXoxEF6gNupROmmGJRoyzfG3ccAveqCBrwr/2yxQ5BVd/GTl5agOwSg==}
     engines: {node: '>= 0.6'}
@@ -4157,6 +4163,24 @@ snapshots:
     dependencies:
       minipass: 7.1.3
 
+  '@jitl/quickjs-ffi-types@0.31.0': {}
+
+  '@jitl/quickjs-wasmfile-debug-asyncify@0.31.0':
+    dependencies:
+      '@jitl/quickjs-ffi-types': 0.31.0
+
+  '@jitl/quickjs-wasmfile-debug-sync@0.31.0':
+    dependencies:
+      '@jitl/quickjs-ffi-types': 0.31.0
+
+  '@jitl/quickjs-wasmfile-release-asyncify@0.31.0':
+    dependencies:
+      '@jitl/quickjs-ffi-types': 0.31.0
+
+  '@jitl/quickjs-wasmfile-release-sync@0.31.0':
+    dependencies:
+      '@jitl/quickjs-ffi-types': 0.31.0
+
   '@larksuiteoapi/node-sdk@1.60.0':
     dependencies:
       axios: 1.13.6
@@ -4295,24 +4319,33 @@ snapshots:
       '@mavis/config': file:vendor/@mavis/config
       '@mavis/context-manager': file:vendor/@mavis/context-manager
       '@mavis/conversation-contract': file:vendor/@mavis/conversation-contract
+      '@mavis/cron': file:vendor/@mavis/cron
       '@mavis/goal': file:vendor/@mavis/goal
-      '@mavis/local-runtime': file:vendor/@mavis/local-runtime
       '@minimax/mcode-sandbox-runtime': file:vendor/@minimax/mcode-sandbox-runtime
+      '@modelcontextprotocol/sdk': 1.30.0(zod@3.25.76)
       '@sinclair/typebox': 0.34.49
       better-sqlite3: file:vendor/better-sqlite3
       bmp-js: 0.1.0
       croner: 9.1.0
+      diff: 8.0.4
       drizzle-orm: 0.45.2(@opentelemetry/api@1.9.0)(better-sqlite3@file:vendor/better-sqlite3)
       gpt-tokenizer: 3.4.0
       handlebars: 4.7.9
       hono: 4.13.0
+      jpeg-js: 0.4.4
       js-yaml: 4.1.1
       jszip: file:vendor/jszip
+      lazystream: 1.0.1
       pngjs: 6.0.0
       proper-lockfile: 4.1.2
+      quickjs-emscripten: 0.31.0
+      saxes: 6.0.0
       smol-toml: 1.7.0
       typebox: 1.1.38
       yaml: 2.9.1
+      zod: 3.25.76
+    optionalDependencies:
+      '@larksuiteoapi/node-sdk': 1.60.0
     transitivePeerDependencies:
       - '@aws-sdk/client-rds-data'
       - '@cfworker/json-schema'
@@ -4346,40 +4379,6 @@ snapshots:
       - prisma
       - sql.js
       - sqlite3
-      - supports-color
-      - utf-8-validate
-
-  '@mavis/local-runtime@file:vendor/@mavis/local-runtime':
-    dependencies:
-      '@mavis/agent-core': file:vendor/@mavis/agent-core
-      '@mavis/agent-tools': file:vendor/@mavis/agent-tools
-      '@mavis/background-task': file:vendor/@mavis/background-task
-      '@mavis/config': file:vendor/@mavis/config
-      '@mavis/context-manager': file:vendor/@mavis/context-manager
-      '@mavis/conversation-contract': file:vendor/@mavis/conversation-contract
-      '@mavis/cron': file:vendor/@mavis/cron
-      '@mavis/goal': file:vendor/@mavis/goal
-      '@modelcontextprotocol/sdk': 1.30.0(zod@3.25.76)
-      better-sqlite3: file:vendor/better-sqlite3
-      croner: 9.1.0
-      diff: 8.0.4
-      handlebars: 4.7.9
-      hono: 4.13.0
-      jpeg-js: 0.4.4
-      js-yaml: 4.1.1
-      jszip: file:vendor/jszip
-      lazystream: 1.0.1
-      pngjs: 6.0.0
-      proper-lockfile: 4.1.2
-      saxes: 6.0.0
-      zod: 3.25.76
-    optionalDependencies:
-      '@larksuiteoapi/node-sdk': 1.60.0
-    transitivePeerDependencies:
-      - '@cfworker/json-schema'
-      - '@napi-rs/canvas'
-      - bufferutil
-      - debug
       - supports-color
       - utf-8-validate
 
@@ -4526,9 +4525,8 @@ snapshots:
 
   '@nodable/entities@2.1.1': {}
 
-  '@opentelemetry/api@1.9.0': {}
-
-  '@opentelemetry/semantic-conventions@1.43.0': {}
+  '@opentelemetry/api@1.9.0':
+    optional: true
 
   '@peculiar/asn1-schema@2.11.0':
     dependencies:
@@ -6869,6 +6867,18 @@ snapshots:
   quick-format-unescaped@4.0.4: {}
 
   quick-lru@5.1.1: {}
+
+  quickjs-emscripten-core@0.31.0:
+    dependencies:
+      '@jitl/quickjs-ffi-types': 0.31.0
+
+  quickjs-emscripten@0.31.0:
+    dependencies:
+      '@jitl/quickjs-wasmfile-debug-asyncify': 0.31.0
+      '@jitl/quickjs-wasmfile-debug-sync': 0.31.0
+      '@jitl/quickjs-wasmfile-release-asyncify': 0.31.0
+      '@jitl/quickjs-wasmfile-release-sync': 0.31.0
+      quickjs-emscripten-core: 0.31.0
 
   range-parser@1.2.1: {}
 

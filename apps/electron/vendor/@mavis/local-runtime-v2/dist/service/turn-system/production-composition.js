@@ -5,7 +5,7 @@ import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExten
 import { describeLocalBrowserToolInput } from '@mavis/agent-tools/desktop';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
 import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
-import { isPeekSession } from '../session-system/sessions/repo/normalization.js';
+import { isPeekSession } from '../session-system/index.js';
 import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, LocalAgentHost, } from './agent-host/index.js';
 import { validateCanonicalHistoryMessages } from './agent-host/history/canonical-history-validation.js';
 import { readCompactionCommitMetadata } from './agent-host/compaction/compaction-commit-metadata.js';
@@ -18,15 +18,14 @@ import { ToolOutputArtifactRepository } from './persistence/tool-output-artifact
 import { compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './agent-host/runner/policy/session-readable-grants.js';
 import { isProductionRuntimeErrorRetryable } from './runtime-error-retry-policy.js';
 import { createTodoCadenceReminderHook } from './execution/reminder/todo-cadence-reminder.js';
-import { createBackgroundCadenceReminder } from './execution/reminder/background-cadence-reminder.js';
+import { createHostTurnReminders } from './execution/reminder/host-turn-reminders.js';
 import { createSessionIdentityReminderHook } from './execution/reminder/session-identity-reminder.js';
-import { fitsReminderInFinalRequest } from './execution/reminder/reminder-admission.js';
 import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/session-agent-execution-snapshot.js';
 import { McpToolResultHistoryExternalizer } from './agent-host/execution/mcp-tool-result-history-externalizer.js';
 import { createBrowserHostCapabilityAdapter } from './agent-host/assembly/host-capability/browser.js';
 import { createComputerUseHostCapabilityAdapter } from './agent-host/assembly/host-capability/computer.js';
 import { HostCapabilityRegistry } from './agent-host/assembly/host-capability/registry.js';
-export { createGlobalMemoryModelCompletion } from './memory-model/completion.js';
+export { createGlobalMemoryModelCompletion } from '../memory-system/index.js';
 /** Creates the one process-local AgentConfig/model preparation shared by title and AgentHost. */
 export function createProductionAgentPreparation(options) {
     return createNativeLocalAgentPreparation(options);
@@ -91,6 +90,8 @@ export function createProductionRootArchiveTitleModel(product, nowMs) {
                         stream: (model, context, options) => resolvedStream(model, mutableTitleContext(context), options),
                     }
                     : {}),
+                // 和本轮正文同一判断：BYOK 模型生成的归档标题不送 MiniMax 审核。
+                contentReviewRequired: resolved.managedProvider === true,
             };
         },
         review: product.safety.review,
@@ -138,7 +139,10 @@ export async function createLocalAgentHost(options) {
     const isSideChat = (sessionId) => options.sessions.sideChats.relation(sessionId) !== undefined;
     const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
     const contextUsageAnchor = new ContextUsageAnchorState();
-    const toolOutputArtifacts = createToolOutputArtifactRepository(options);
+    const toolOutputArtifacts = new ToolOutputArtifactRepository({
+        resolveSessionReportsDirectory: (id) => options.sessions.artifacts.ensureReportsDirectory(id),
+        inspectSessionReportsDirectory: (id) => options.sessions.artifacts.inspectReportsDirectory(id),
+    });
     const getToolResultCompactionConfig = createToolResultCompactionConfigGetter(options);
     const getRequestMediaConfig = createRequestMediaConfigGetter(options);
     const getImageEncoding = () => requestImageEncoding(getRequestMediaConfig().image);
@@ -192,6 +196,8 @@ export async function createLocalAgentHost(options) {
             },
             config: options.product.preparation.configBuilder.config().mcpToolSearch,
             env: process.env,
+            // run_code saves a return value over 64 KiB where oversized results are externalized.
+            writePtcReturnArtifact: (input) => toolOutputArtifacts.write(input),
         },
         inputPreparation: { ...options.product.inputPreparation, getImageEncoding },
         permission: createHostPermissionPolicy(options, toolOutputArtifacts),
@@ -206,8 +212,7 @@ export async function createLocalAgentHost(options) {
             ...options.product.executor,
             nativeDelete: () => options.product.preparation.configBuilder.config().permission?.nativeDelete === true,
             logger: options.product.runner.logger,
-            backgroundCadenceReminder: createBackgroundCadenceReminder(contextUsageAnchor),
-            canAppendExecutionBudgetReminder: (input, marker) => fitsReminderInFinalRequest(input, marker, contextUsageAnchor),
+            ...createHostTurnReminders(contextUsageAnchor, options.memorySummaryContext),
             fileApi: {
                 uploadStores: createFileApiUploadStoreSource({
                     db: options.db,
@@ -416,12 +421,6 @@ function createEarlierFilesResolver(options, toolOutputArtifacts) {
         ]);
         return { snapshots, toolOutputs };
     };
-}
-function createToolOutputArtifactRepository(options) {
-    return new ToolOutputArtifactRepository({
-        resolveSessionReportsDirectory: (sessionId) => options.sessions.artifacts.ensureReportsDirectory(sessionId),
-        inspectSessionReportsDirectory: (sessionId) => options.sessions.artifacts.inspectReportsDirectory(sessionId),
-    });
 }
 function createRequestMediaConfigGetter(options) {
     return () => {

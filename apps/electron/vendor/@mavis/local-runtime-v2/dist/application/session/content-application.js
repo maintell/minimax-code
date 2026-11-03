@@ -8,6 +8,7 @@ import { MessageQueryServiceError, PeekContextServiceError, SessionInputSummaryS
 import { AppError } from '../errors.js';
 import { queryCollapseSteeringProjection } from '../conversation/query-collapse-identity.js';
 import { projectPeerMessageOrigin } from '../conversation/peer-message-origin.js';
+import { isUndeliveredRetryCopy } from '../conversation/undelivered-side-messages.js';
 /** Owns generated Session content mapping and the message repair-fence workflow. */
 export class SessionContentApplication {
     options;
@@ -25,8 +26,11 @@ export class SessionContentApplication {
                 ...(request.limit !== undefined ? { limit: request.limit } : {}),
                 ...(request.before ? { before: request.before } : {}),
             });
-            const queryCollapseViews = await this.readQueryCollapseViews(request.id, page.messages);
-            const messages = await this.toSessionMessageViews(request.id, page.messages);
+            // The copy a retried undelivered message delivered is never shown; the
+            // retried row itself stays the visible message (spec 4.3).
+            const displayed = page.messages.filter((message) => !isUndeliveredRetryCopy(message));
+            const queryCollapseViews = await this.readQueryCollapseViews(request.id, displayed);
+            const messages = await this.toSessionMessageViews(request.id, displayed);
             const lastMsgId = messages.at(-1)?.msgId;
             return {
                 messages,
@@ -90,7 +94,7 @@ export class SessionContentApplication {
             ...(request.cursor ? { cursor: request.cursor } : {}),
         });
         return {
-            nodes: page.files.map((file) => toDriveNode(request.id, file)),
+            nodes: ((await this.options.mediaIdentity?.enrich(request.id, page.files)) ?? page.files).map((file) => toDriveNode(request.id, file)),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
@@ -653,7 +657,7 @@ function parseAssetMetadata(raw) {
         const value = JSON.parse(raw);
         if (!isRecord(value))
             return {};
-        const driveNodeId = maybeString(firstDefined([value.driveNodeId, value.drive_node_id]));
+        const driveNodeId = maybeString(firstDefined([value.driveNodeId, value.drive_node_id, value.nodeId, value.node_id]));
         const artifactId = maybeString(firstDefined([value.artifactId, value.artifact_id]));
         return {
             ...(driveNodeId ? { driveNodeId } : {}),

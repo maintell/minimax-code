@@ -32,20 +32,20 @@
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.Importer.Wasm.1ve8ltf1zs.wasm",
-      "sha256": "sha256:c3092877e34855bc9d6ac4361a4bfa995fed367d05ef9769e1be90c54558e4ea",
+      "path": "_framework/Mavis.Pptx.Importer.Wasm.73xzi6k66x.wasm",
+      "sha256": "sha256:437c13c08143da0f7f1085fee8f4e1d3d10ee932e655a31151c9c1038fb36f51",
       "sizeBytes": 22805,
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.Importer.rttnlpy4tr.wasm",
-      "sha256": "sha256:bf4f9755dd161c7758721bc6d1b424cdaa6398d3777c378759ccaa43ae2f7ff3",
+      "path": "_framework/Mavis.Pptx.Importer.tedze088wg.wasm",
+      "sha256": "sha256:5b8395e4185a17a4e0f5da12afbc7fe53718d30230f532ad26669d778ef981c2",
       "sizeBytes": 468757,
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.SafeOpc.joi4e1d8bm.wasm",
-      "sha256": "sha256:6d8692432d52ead2f273f77ef13a84a701639c57c1cfc9816596875ad8e4c46f",
+      "path": "_framework/Mavis.Pptx.SafeOpc.d0uyzqg6c1.wasm",
+      "sha256": "sha256:6df7b4261661002d55876e73a659dbf62026a91a6867d64daa633b90bda9fe74",
       "sizeBytes": 72981,
       "mimeType": "application/wasm"
     },
@@ -1089,7 +1089,7 @@
     },
     {
       "path": "_framework/dotnet.js",
-      "sha256": "sha256:19d5caff0f6ef85eb9bac7a439039fbbc19ac843e03ce459f1b7dafdd7db888d",
+      "sha256": "sha256:979561b0f5719535d538358b5c7d1d2181fe1dc9b9b46c8623ba9e65eaac60d6",
       "sizeBytes": 82393,
       "mimeType": "text/javascript"
     },
@@ -1310,5 +1310,5 @@
       "mimeType": "text/javascript"
     }
   ],
-  "runtimeHash": "sha256:c112b75702cbcd32839b571be2d64cb56f92f1445d601df768e39f9e8c8a8af3"
+  "runtimeHash": "sha256:bc78fa3f230ef88f04b4a189a557c7791f3ff4337d4b404d8ff4c7a5d445aa70"
 }

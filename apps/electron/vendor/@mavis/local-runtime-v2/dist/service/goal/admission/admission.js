@@ -235,14 +235,29 @@ export class GoalAdmission {
      *
      * The store no-ops when the reason is unchanged or the epoch has moved on, so
      * repeated drains neither reset the user-visible wait timer nor emit
-     * redundant events.
+     * redundant events. The one exception is a background wait whose task list
+     * changed (spec G2-07): the unchanged wait is republished so the list and
+     * counts update live, still without touching `sinceMs` or the epoch.
      */
     async projectExecutionWait(goal, reason) {
-        await this.publishExecutionWaitChange(goal.sessionId, () => this.deps.store().setExecutionWaitAtEpoch({
-            goalId: goal.goalId,
-            expectedUpdatedAt: goal.updatedAt,
-            reason,
-        }));
+        await this.publishExecutionWaitChange(goal.sessionId, async () => {
+            const updated = await this.deps.store().setExecutionWaitAtEpoch({
+                goalId: goal.goalId,
+                expectedUpdatedAt: goal.updatedAt,
+                reason,
+            });
+            return updated ?? this.readWaitWithChangedDetails(goal, reason);
+        });
+    }
+    /** The current wait, when it is this one and only its background details changed. */
+    async readWaitWithChangedDetails(goal, reason) {
+        if (!this.deps.backgroundWaits.hasUnpublishedChange(goal.goalId, reason))
+            return undefined;
+        const current = await this.deps.store().getById(goal.goalId);
+        if (current?.updatedAt !== goal.updatedAt || current.executionWait?.reason !== reason) {
+            return undefined;
+        }
+        return current;
     }
     async clearExecutionWait(sessionId, goalId, expectedUpdatedAt) {
         await this.publishExecutionWaitChange(sessionId, () => this.deps.store().clearExecutionWaitAtEpoch({ goalId, expectedUpdatedAt }));

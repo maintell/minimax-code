@@ -5,6 +5,7 @@ export class SessionController extends SessionControllerBase {
     applications;
     cronDelivery;
     conversation;
+    sessionActivity;
     constructor(options = {}) {
         super();
         if (options.applications)
@@ -13,6 +14,13 @@ export class SessionController extends SessionControllerBase {
             this.cronDelivery = options.cronDelivery;
         if (options.conversation)
             this.conversation = options.conversation;
+        if (options.sessionActivity)
+            this.sessionActivity = options.sessionActivity;
+    }
+    async getSessionActivity(ctx, req) {
+        if (!this.sessionActivity)
+            throw new NotImplementedError('session activity');
+        return this.sessionActivity.getSessionActivity(ctx, req);
     }
     createSideChat(ctx, req) {
         return this.requireApplications().session.sideChat.createSideChat(ctx, req);

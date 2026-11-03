@@ -3,6 +3,7 @@ import { basename } from 'node:path';
 import { createUserMessageId, isQueueMessageSource } from '../../../session-system/index.js';
 import { isTeardownDurableSteeringProducer } from '../../agent-host/contracts.js';
 import { queueModelFromAgentHost } from '../../agent-host/index.js';
+import { toQueueChannelContext } from '../../turn-submission.service.js';
 import { pausesQueueOnAbort } from '../queue-pause-on-abort.js';
 // Wake publications may legitimately outlive `drain` — they await
 // `turnReleased`, which a timed-out shutdown abort never resolves — and they
@@ -15,8 +16,9 @@ const PRERELEASE_COMMIT_TIMEOUT_MS = 2_000;
  * exit-close batches return to the Session queue as queued items and wake the
  * dispatcher; abort/abnormal-seal batches fall into the conversation instead.
  * Non-user producers keep drop semantics on both lanes, except the teardown-
- * durable machine producers (AskUser v2 answers): the user already answered,
- * so dropping the steer would lose the answer for good.
+ * durable machine producers (AskUser v2 answers, merged IM follow-ups): the
+ * user already gave that input and was acknowledged, so dropping the steer
+ * would lose it for good. A requeued batch of IM follow-ups keeps its IM origin.
  */
 export function createSteeringRequeue(options) {
     const inflight = new Map();
@@ -103,6 +105,7 @@ export function createSteeringRequeue(options) {
                 return;
             const retry = { batch, messages, route: resolveRoute(batch) };
             pending.set(key, retry);
+            logHandOver(options, retry);
             if (retry.route === 'requeue') {
                 const firstAttempt = start(key, retry);
                 // Settlement is the normal handoff boundary; it also resolves claimed
@@ -158,6 +161,13 @@ export function createSteeringRequeue(options) {
             if (waits.length === 0)
                 return;
             await boundedSettle(Promise.all(waits), timeoutMs ?? PRERELEASE_COMMIT_TIMEOUT_MS);
+        },
+        hasPendingForTurn({ sessionId, turnId }) {
+            for (const retry of pending.values()) {
+                if (retry.batch.sessionId === sessionId && retry.batch.turnId === turnId)
+                    return true;
+            }
+            return false;
         },
         async drain() {
             await Promise.all([...inflight.values()]);
@@ -230,6 +240,23 @@ function earliestCreatedAt(messages) {
 function resolveRoute(batch) {
     return resolveCause(batch) === 'exit-close' ? 'requeue' : 'teardown';
 }
+/** Shared identity fields for every lane log line (never message content). */
+function laneLogFields(batch, messages) {
+    return {
+        sessionId: batch.sessionId,
+        turnId: batch.turnId,
+        cause: resolveCause(batch),
+        producerIds: messages.map((message) => message.producerId),
+        idempotencyKeys: messages.map((message) => message.idempotencyKey),
+    };
+}
+function logHandOver(options, retry) {
+    options.logger?.info?.({
+        ...laneLogFields(retry.batch, retry.messages),
+        route: retry.route,
+        workClosed: retry.batch.workClosed === true,
+    }, 'Unconsumed steering kept at Turn teardown');
+}
 function markSettled(settled, batch, key) {
     const completed = settled.get(batch.turnReleased) ?? new Set();
     completed.add(key);
@@ -255,6 +282,7 @@ async function persistTeardown(options, batch, messages) {
                     committedIdentities.add(identity);
             },
         })) {
+            options.logger?.info?.({ ...laneLogFields(batch, messages), route: 'teardown' }, 'Unconsumed steering committed into the conversation');
             return { committed: true, committedIdentities };
         }
     }
@@ -292,7 +320,8 @@ async function persistRequeue(options, batch, messages) {
     let committed = 0;
     try {
         const session = await options.queue.requireMutableSession(batch.sessionId);
-        const result = await options.queue.enqueue(toBatchRequeueInput(batch, session.agentName, messages));
+        const input = withImOrigin(toBatchRequeueInput(batch, session.agentName, messages), messages);
+        const result = await options.queue.enqueue(input);
         if (result === undefined)
             throw new Error('Immediate-send batch enqueue rejected');
         // An abort that pauses settlement — a user stop, or leaving the conversation
@@ -318,6 +347,12 @@ async function persistRequeue(options, batch, messages) {
             });
         }
         committed = 1;
+        options.logger?.info?.({
+            ...laneLogFields(batch, messages),
+            route: 'requeue',
+            source: input.source,
+            channelContext: input.message.channelContext !== undefined,
+        }, 'Unconsumed steering returned to the Session queue');
     }
     catch (error) {
         // Keep this admitted batch in memory for a later hand-off/drain retry.
@@ -376,6 +411,45 @@ function toBatchRequeueInput(batch, agentName, messages) {
         message: batchQueueMessage(members),
         ...(model ? { model } : {}),
     };
+}
+/**
+ * Where the requeued batch replies. When every member came from the same IM
+ * chat (merged `channel-steer` follow-ups) it keeps that channel source and
+ * context, so the follow-up Turn answers in IM like an IM submit would. Any
+ * other batch, including a mixed one, keeps the composer / Mini App source.
+ */
+function withImOrigin(input, messages) {
+    const origin = sharedChannelOrigin(messages);
+    if (!origin)
+        return input;
+    return {
+        ...input,
+        source: origin.source,
+        message: { ...input.message, channelContext: origin.channelContext },
+    };
+}
+function sharedChannelOrigin(messages) {
+    const source = messages[0]?.provenance.source;
+    if (!source?.startsWith('channel:') || !isQueueMessageSource(source))
+        return undefined;
+    const contexts = messages.map((message) => message.provenance.source === source
+        ? toQueueChannelContext({ input: message.message, provenance: message.provenance })
+        : undefined);
+    const [firstContext] = contexts;
+    // The latest IM event carries the freshest reply context (message id, token).
+    const latestContext = contexts.at(-1);
+    if (!firstContext ||
+        !latestContext ||
+        contexts.some((context) => !context || !isSameChat(context, firstContext))) {
+        return undefined;
+    }
+    return { source, channelContext: latestContext };
+}
+function isSameChat(left, right) {
+    return (left.platform === right.platform &&
+        left.clientName === right.clientName &&
+        left.chatId === right.chatId &&
+        (left.threadId ?? '') === (right.threadId ?? ''));
 }
 /**
  * Requeued user steering is the user's own composer input, except a batch of only Mini App text:

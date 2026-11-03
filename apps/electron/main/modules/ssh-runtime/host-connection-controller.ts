@@ -107,7 +107,12 @@ export class HostConnectionController {
         };
     }
     getSnapshot() {
-        return { ...this.snapshot, error: this.snapshot.error ? { ...this.snapshot.error } : null };
+        const { runtimeFeatures, ...snapshot } = this.snapshot;
+        return {
+            ...snapshot,
+            ...(runtimeFeatures ? { runtimeFeatures: [...runtimeFeatures] } : {}),
+            error: this.snapshot.error ? { ...this.snapshot.error } : null,
+        };
     }
     /** Reprioritize queued work without changing intent, retry timing, or running attempts. */
     setPriority(priority) {
@@ -256,9 +261,11 @@ export class HostConnectionController {
             }
             this.value = { current: value };
             this.readySince = this.clock.monotonicNow();
+            const runtimeFeatures = this.options.getRuntimeFeatures?.(value);
             this.publish({
                 state: 'ready',
                 daemonInstanceId: this.options.getDaemonInstanceId?.(value) ?? null,
+                runtimeFeatures: runtimeFeatures?.length ? [...runtimeFeatures] : undefined,
                 phase: 'ready',
                 lastSuccessAtMs: this.clock.now(),
                 error: null,
@@ -325,6 +332,7 @@ export class HostConnectionController {
             generation: this.snapshot.generation + 1,
             state: 'idle',
             daemonInstanceId: null,
+            runtimeFeatures: undefined,
         };
         const pending = this.pending;
         this.pending = undefined;
@@ -367,7 +375,9 @@ export class HostConnectionController {
         this.snapshot = {
             ...this.snapshot,
             ...patch,
-            ...((patch.state ?? this.snapshot.state) === 'ready' ? {} : { daemonInstanceId: null }),
+            ...((patch.state ?? this.snapshot.state) === 'ready'
+                ? {}
+                : { daemonInstanceId: null, runtimeFeatures: undefined }),
             revision: this.snapshot.revision + 1,
             phaseStartedAtMs: patch.phase !== undefined && patch.phase !== this.snapshot.phase
                 ? this.clock.now()

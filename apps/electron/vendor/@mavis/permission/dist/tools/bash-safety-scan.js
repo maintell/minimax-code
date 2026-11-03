@@ -17,18 +17,23 @@
  * must ignore literal data unless it is actually executed by the shell.
  */
 import { ALL_DANGEROUS_COMMAND_PATTERNS } from '../classifier/dangerous-patterns.js';
+import { findHeredocBodies, splitCommand } from './bash-split.js';
 import { shellTokenize } from './shell-tokenize.js';
 // ---------------------------------------------------------------------------
 // Permission-check surface (heredoc bodies + echo/printf + option-value masking)
 // ---------------------------------------------------------------------------
 const HEREDOC_PATTERN = /<<-?\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|<>]+))/;
-const STDIN_CODE_INTERPRETERS = new Set([
+/** Interpreters whose stdin payload is shell syntax. */
+const STDIN_SHELL_INTERPRETERS = new Set([
     'bash',
     'sh',
     'zsh',
     'fish',
     'ksh',
     'dash',
+]);
+const STDIN_CODE_INTERPRETERS = new Set([
+    ...STDIN_SHELL_INTERPRETERS,
     'node',
     'deno',
     'python',
@@ -64,13 +69,133 @@ const TEXT_DATA_LONG_OPTIONS = new Set([
 export function getShellPermissionCheckSurface(command) {
     return stripNonExecutedEchoPrintfData(stripNonExecutedOptionValues(stripNonExecutedHeredocBodies(command)));
 }
+/** A heredoc body runs as code: a shell script or another stdin interpreter's program. */
 export function commandHasExecutedHeredocBody(command) {
+    return commandFeedsHeredocTo(command, STDIN_CODE_INTERPRETERS);
+}
+/**
+ * A heredoc body runs as a shell script. Use this, not
+ * {@link commandHasExecutedHeredocBody}, before parsing a body with shell
+ * grammar: a Python or Node program is not shell syntax, so `print(3>2)`
+ * there is a comparison, not a redirect to a file named `2)`.
+ */
+export function commandHasShellScriptHeredocBody(command) {
+    return commandFeedsHeredocTo(command, STDIN_SHELL_INTERPRETERS);
+}
+function commandFeedsHeredocTo(command, interpreters) {
     if (!HEREDOC_PATTERN.test(command))
         return false;
     return command
         .replace(/\r\n/g, '\n')
         .split('\n')
-        .some((line) => HEREDOC_PATTERN.test(line) && heredocBodyIsExecuted(line));
+        .some((line) => HEREDOC_PATTERN.test(line) && heredocBodyIsExecuted(line, interpreters));
+}
+/**
+ * Commands that only read a heredoc as data. Any other command word in the
+ * same command line (a shell, `xargs`, `ssh`, `./script`, a `$(...)` command
+ * position, ...) could route the text into execution. CLIs with user-defined
+ * shell aliases (`gh`, `glab`) are deliberately absent, as is `printf`, whose
+ * `-v NAME` form assigns shell variables such as `PATH`.
+ */
+const HEREDOC_DATA_ONLY_COMMANDS = new Set([
+    'cat',
+    'tee',
+    'echo',
+    'cd',
+    'mkdir',
+    'ls',
+    'pwd',
+    'true',
+    'false',
+    ':',
+]);
+/**
+ * Git built-ins used around commit messages written via `-F -`. Git ignores
+ * aliases that shadow built-in commands, so these names cannot become shell
+ * aliases. Subcommands that spawn commands (`submodule foreach`, `rebase -x`,
+ * `bisect run`, `difftool`) are deliberately absent.
+ */
+const GIT_MESSAGE_SUBCOMMANDS = new Set(['commit', 'tag', 'notes']);
+/** `-e`/`--edit` and interactive `add` hand the inherited stdin to an editor or prompt. */
+const GIT_STDIN_PROGRAM_OPTION = /^(?:--edit|--patch|--interactive|-[A-Za-z]*[epi][A-Za-z]*)$/;
+function readsMessageFromStdin(args) {
+    return args.some((arg, i) => arg === '-F-' || arg === '--file=-' || (/^(?:-F|--file)$/.test(arg) && args[i + 1] === '-'));
+}
+function isDataOnlyHeredocConsumer(segment) {
+    // Segments still carry their heredoc bodies; only the shell words count.
+    const tokens = shellTokenize(removeRanges(segment, findHeredocBodies(segment)));
+    // A path (`./cat`, `/tmp/x/cat`) can name any program; only trust bare
+    // command names resolved by the shell.
+    const word = tokens[0]?.toLowerCase();
+    if (word === undefined || word.includes('/'))
+        return false;
+    if (HEREDOC_DATA_ONLY_COMMANDS.has(word))
+        return true;
+    if (word !== 'git')
+        return false;
+    // Only `-C <dir>` may precede the subcommand. `-c`, `--config-env` and
+    // `--exec-path` can define shell aliases or swap the executed program.
+    let i = 1;
+    while (tokens[i] === '-C')
+        i += 2;
+    const subcommand = tokens[i] ?? '';
+    const args = tokens.slice(i + 1);
+    if (args.some((arg) => GIT_STDIN_PROGRAM_OPTION.test(arg)))
+        return false;
+    if (subcommand === 'add')
+        return true;
+    // Without `-F -` git opens the configured editor, which inherits the body.
+    return GIT_MESSAGE_SUBCOMMANDS.has(subcommand) && readsMessageFromStdin(args);
+}
+/** Replace each range with a line break so surrounding commands never merge. */
+function removeRanges(text, ranges) {
+    let result = '';
+    let cursor = 0;
+    for (const range of ranges) {
+        result += `${text.slice(cursor, range.start)}\n`;
+        cursor = range.end;
+    }
+    return result + text.slice(cursor);
+}
+/**
+ * Shell structure outside the bodies that can redirect a body into execution
+ * or change what a command name resolves to: substitutions, subshells, group
+ * commands, function definitions and variable assignments such as `PATH=.`.
+ */
+const HEREDOC_UNSAFE_SURFACE = /[(){}`]|(?:^|[;&|\n])\s*[A-Za-z_][A-Za-z0-9_]*=/;
+/**
+ * Drop data-only heredoc bodies for checks that scan a whole, unsplit command.
+ *
+ * Unlike {@link getShellPermissionCheckSurface}, this keeps every executed
+ * line and only removes heredoc bodies, using the quote-aware split parser
+ * so `echo "<<EOF"` cannot hide the commands after it. Bodies are removed
+ * only when every command in the line is a bare, known data-only consumer and
+ * the shell structure outside the bodies (after folding line continuations)
+ * has no substitution, subshell, group, function definition or assignment;
+ * otherwise the command is returned unchanged. An unquoted-delimiter body
+ * whose `$()` or backticks the shell would run also keeps the command intact.
+ */
+export function stripDataHeredocBodies(command) {
+    const bodies = findHeredocBodies(command);
+    if (bodies.length === 0)
+        return command;
+    const bodyRunsSubstitution = bodies.some((body) => !body.quoted && /\$\(|`/.test(command.slice(body.start, body.end).replace(/\\\r?\n/g, '')));
+    if (bodyRunsSubstitution)
+        return command;
+    const surface = removeRanges(command, bodies);
+    // Bash removes line continuations first, so `>\<NL>(sh)` is still `>(sh)`.
+    const structure = surface.replace(/\\\r?\n/g, '');
+    if (HEREDOC_UNSAFE_SURFACE.test(structure))
+        return command;
+    const segments = splitCommand(command);
+    if (!segments.every(isDataOnlyHeredocConsumer))
+        return command;
+    // Git reads config and attributes that a body written earlier in the same
+    // line could change (`cat >> .git/config` then `git commit` runs the editor).
+    const writesFiles = />/.test(structure) || segments.some((s) => shellTokenize(s)[0] === 'tee');
+    if (writesFiles && segments.some((s) => shellTokenize(s)[0] === 'git'))
+        return command;
+    return surface;
 }
 function stripNonExecutedHeredocBodies(command) {
     if (!HEREDOC_PATTERN.test(command))
@@ -274,15 +399,16 @@ function containsExecutableExpansion(rawValue, quote) {
     }
     return false;
 }
-function heredocBodyIsExecuted(commandLine) {
-    return hasUnquotedPipeToShell(commandLine) || startsWithShellInterpreter(commandLine);
+function heredocBodyIsExecuted(commandLine, interpreters = STDIN_CODE_INTERPRETERS) {
+    return (hasUnquotedPipeToInterpreter(commandLine, interpreters) ||
+        startsWithInterpreter(commandLine, interpreters));
 }
-function hasUnquotedPipeToShell(input) {
+function hasUnquotedPipeToInterpreter(input, interpreters) {
     const pipeIndex = findUnquotedPipe(input);
     if (pipeIndex === -1)
         return false;
     const tokens = shellTokenize(input.slice(pipeIndex + 1).trim());
-    return isStdinCodeInterpreterToken(tokens[skipShellWrappers(tokens)]);
+    return isInterpreterToken(tokens[skipShellWrappers(tokens)], interpreters);
 }
 function hasUnquotedPipe(input) {
     return findUnquotedPipe(input) !== -1;
@@ -375,10 +501,10 @@ function findUnquotedPipe(input) {
     }
     return -1;
 }
-function startsWithShellInterpreter(commandLine) {
+function startsWithInterpreter(commandLine, interpreters) {
     const withoutHeredoc = commandLine.replace(HEREDOC_PATTERN, '');
     const tokens = shellTokenize(withoutHeredoc);
-    return isStdinCodeInterpreterToken(tokens[skipShellWrappers(tokens)]);
+    return isInterpreterToken(tokens[skipShellWrappers(tokens)], interpreters);
 }
 function skipShellWrappers(tokens) {
     let i = 0;
@@ -394,9 +520,9 @@ function skipShellWrappers(tokens) {
     }
     return i;
 }
-function isStdinCodeInterpreterToken(token) {
+function isInterpreterToken(token, interpreters) {
     const executable = token?.split('/').pop();
-    return executable ? STDIN_CODE_INTERPRETERS.has(executable) : false;
+    return executable ? interpreters.has(executable) : false;
 }
 // ---------------------------------------------------------------------------
 // Soft pre-scan

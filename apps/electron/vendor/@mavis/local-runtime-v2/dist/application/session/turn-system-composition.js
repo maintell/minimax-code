@@ -1,4 +1,4 @@
-import { getRuntimeRegion, isInternalBuild, isLocalSourceProvenanceEnabled, } from '@mavis/config';
+import { getRuntimeRegion, isLocalSourceProvenanceEnabled, } from '@mavis/config';
 import { createRuntimeAuthSubmissionPreparation } from './runtime-execution-auth.js';
 import { SAFETY_SCENE } from '../../service/content-safety/index.js';
 import { isCommandLineRuntimeOwner } from '../agent/profile-source.js';
@@ -7,9 +7,10 @@ import { createGoalFinalReply } from '../agent/goal-final-reply.js';
 import { createRuntimeSourceReferenceExtension } from '../agent/source-reference-extension.js';
 import { createPlanEntrySubmissionPreparation, } from '../../service/plan/index.js';
 import { withSessionClioTurnSettlement, } from '../../service/session-clio/index.js';
-import { combineAgentEventObservers, composeTurnSubmissionPreparations, createContentReviewSlowEventObserver, createGoalTurnSubmissionPreparation, createLocalAgentHost, createSessionLLMRetryEventObserver, createPromptSuggestionService, createPromptSuggestionEligibility, hasPriorityUserQueueItem, initializeTurnSystem, requireAgentRuntime, } from '../../service/turn-system/index.js';
+import { combineAgentEventObservers, composeTurnSubmissionPreparations, createContentReviewSlowEventObserver, createGoalTurnSubmissionPreparation, createSubmissionMemoryMetricsPreparation, createLocalAgentHost, createSessionLLMRetryEventObserver, createPromptSuggestionService, createSideMessageFallbackLog, createSteerFaultFilePort, hasPriorityUserQueueItem, initializeTurnSystem, requireAgentRuntime, } from '../../service/turn-system/index.js';
+import { createRuntimeUndeliveredSideMessages } from './runtime-user-applications.js';
 import { createQuestionnaireAnswerAdmissionPreparation, createQuestionnaireAnswerSteeringMarker, observeQuestionnaireAnswerSteering, } from './questionnaire-answer-admission.js';
-import { createRuntimeQueueSelection } from './runtime-queue-selection.js';
+import { createRuntimeQueueSelection, } from './runtime-queue-selection.js';
 import { createRuntimeTurnAdmissionOptions } from './runtime-services-composition.js';
 import { createApprovedTitleHandler, createConsumedSteeringHandler, createQueueWakeFailureReporter, createTurnSystemMessageDelivery, } from './turn-message-delivery.js';
 /** A Turn detached from its deleted Goal goes on as an ordinary Turn. */
@@ -42,29 +43,18 @@ function createRuntimePromptSuggestions(input) {
             return next.accessToken?.trim() ? String(authEpoch) : undefined;
         },
     };
-    // Advisory only: the suggestion runs outside the main Turn's waiting path and
-    // consumes the user's own account quota. Trial grants are not wired yet, so
-    // nothing here claims a platform-covered allowance.
-    // Internal builds dogfood the feature on every account and model, so neither
-    // billing gate (subscription check, managed-models-only scope) applies there.
-    // A host may also open every model explicitly (the interactive TUI does).
-    const billingGated = !isInternalBuild() && input.options.promptSuggestionUngated !== true;
+    // The suggestion runs outside the main Turn's waiting path. No account or
+    // model is special-cased; only the remote policy narrows it.
     // Only a host that can show the suggestion pays for it. Headless command-line
     // owners have no composer; the interactive TUI opts in explicitly.
     const hasSuggestionSurface = input.options.promptSuggestionSurface ??
         !isCommandLineRuntimeOwner(input.options.runtimeOwnerKind);
     const suggestions = createPromptSuggestionService({
+        // `enabled` is already the effective opt-in: the host's config read boundary
+        // fills in the explicit choice, else the remote default (on when absent).
         enabled: () => hasSuggestionSurface &&
             input.product.preparation.configBuilder.config().promptSuggestion?.enabled === true,
         publish: input.writeGlobalEvent,
-        // The extra generation is billed to the account. While gated, it runs only
-        // for a confirmed subscription, and this gate is the enforcement point; the
-        // settings hint is advisory and may be stale. Internal builds and hosts
-        // that set `promptSuggestionUngated` skip it, so there the user's
-        // `promptSuggestion.enabled` switch is the only check.
-        ...(billingGated
-            ? { eligibility: createPromptSuggestionEligibility(input.options.compatibility.commerce) }
-            : {}),
         hasPendingInput: async (sessionId) => (await input.sessionSystem.queue.committed.list(sessionId)).length > 0,
         policy,
         identity,
@@ -73,17 +63,40 @@ function createRuntimePromptSuggestions(input) {
     });
     const promptSuggestion = {
         enabled: () => suggestions.isEnabled(),
-        allowUnmanagedModels: !billingGated,
         turnStarted: (sessionId) => suggestions.cancel(sessionId),
-        committed: (scope, capture) => suggestions.schedule(scope.sessionId, scope.turnId, capture),
+        committed: (scope, capture) => suggestions.schedule(scope.sessionId, scope.turnId, capture, scope.messageId),
     };
     return { suggestions, promptSuggestion };
+}
+/**
+ * Side message fallback log, plus the steer fault rules that only a
+ * verification instance's `diagnostics.steerFaultFile` config enables; without
+ * that key every steer only reads the config.
+ */
+function createRuntimeSideMessageDiagnostics(input) {
+    const logger = input.options.compatibility.goalHost.observability?.logger;
+    return {
+        faults: createSteerFaultFilePort({
+            filePath: () => input.product.preparation.configBuilder.config().diagnostics?.steerFaultFile,
+            nowMs: input.nowMs,
+            onError: (error) => input.options.logger?.warn({ error: String(error) }, '[steer-fault] rules file unusable'),
+        }),
+        ...(logger ? { observe: createSideMessageFallbackLog(logger, input.nowMs) } : {}),
+        // Spec 4.1-4.4: kept as an undelivered row and the active Goal paused.
+        undelivered: createRuntimeUndeliveredSideMessages({
+            sessionSystem: input.sessionSystem,
+            goalPort: input.goalPort,
+            reportFailure: (sessionId, message) => input.product.executor.reportFailure?.(sessionId, message),
+        }),
+        nowMs: input.nowMs,
+    };
 }
 export async function initializeRuntimeTurnSystem(input, dependencies) {
     const { plan, prepareMiniAppTurn, planEntryEnabled, normalExtensions, resumeSessionDeletion, goalVerifierExtension, goalVerifierOutputTokenCap, } = dependencies;
     const llmRetryObserver = createSessionLLMRetryEventObserver(input.writeGlobalEvent);
     const { suggestions, promptSuggestion } = createRuntimePromptSuggestions(input);
     let agentRuntime;
+    const queueSelection = createTurnQueueSelection(input, plan, planEntryEnabled);
     input.options.compatibility.backgroundTasks.bindRuntimeOwner({
         ownerId: input.runtimeOwnerIdentity.createOwnerId('background-task'),
         isOwnerAlive: input.runtimeOwnerIdentity.isOwnerAlive,
@@ -101,6 +114,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         // attribution follows it.
         onQueuedTurnIdentity: ({ turnId, previousTurnIds }) => input.goalPort.followQueuedTurn({ turnId, previousTurnIds }),
         ...(input.options.logger ? { logger: input.options.logger } : {}),
+        sideMessages: createRuntimeSideMessageDiagnostics(input),
         sessions: input.sessionSystem,
         processStartedAtMs: input.processStartedAtMs,
         makeLeaseId: () => input.runtimeOwnerIdentity.createOwnerId('turn-lease'),
@@ -147,7 +161,9 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                     ? createApprovedTitleHandler(input.sessionSystem, input.product.executor.reportFailure)
                     : () => { },
                 onSteeringConsumed: observeQuestionnaireAnswerSteering(createConsumedSteeringHandler(input.messageDelivery, input.sessionSystem, input.writeGlobalEvent, input.product.executor.reportFailure), questionnaireAnswerObserver(input, 'steering_consumed')),
-                toolPolicyGuard: combineLocalTurnToolPolicyGuards(goalFinalReply.toolPolicyGuard, plan.toolGuard, createGoalBudgetToolPolicyGuard()),
+                toolPolicyGuard: combineLocalTurnToolPolicyGuards(goalFinalReply.toolPolicyGuard, plan.toolGuard, createGoalBudgetToolPolicyGuard({
+                    worksForGoal: (turn) => input.goalPort.goalIdForTurn(turn.sessionId, turn.turnId) !== undefined,
+                })),
                 outputTokenCap: goalVerifierOutputTokenCap,
                 askUserPolicy: createAskUserPolicySource(input),
                 resolveLlmRetry: () => ({ observer: llmRetryObserver }),
@@ -165,6 +181,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                     ...normalExtensions,
                     ...(input.memory ? [input.memory.agentExtension] : []),
                 ],
+                ...memorySummaryHostOptions(input.memory),
                 eventObserver: combineAgentEventObservers(...(input.channelSystem ? [input.channelSystem.terminalReplies] : []), input.turnLifecycleEvents),
                 nowMs: input.nowMs,
                 miniAppApprovals: dependencies.miniAppApprovals,
@@ -197,7 +214,9 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
             }
         },
         ...createRuntimeTurnAdmissionOptions(input, plan.admission),
-        submissionPreparation: composeTurnSubmissionPreparations(createRuntimeAuthSubmissionPreparation(input.options.executionAuthMode, input.product.preparation.modelResolver.authContextGetter), createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
+        submissionPreparation: composeTurnSubmissionPreparations(createRuntimeAuthSubmissionPreparation(input.options.executionAuthMode, input.product.preparation.modelResolver.authContextGetter), 
+        // Counts submissions that passed auth; it never rejects one.
+        createSubmissionMemoryMetricsPreparation(input.options.metrics), createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
             prepare: input.goalPort.prepareTurnAdmission,
             hasPendingPlan: (sessionId) => plan.lifecycleFence.blocks({ sessionId }),
             hasPriorityMailboxWork: async (sessionId) => hasPriorityUserQueueItem(await input.sessionSystem.queue.committed.list(sessionId)),
@@ -218,14 +237,8 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         })),
         ...createRuntimeHistoryProjections(input),
         onTurnDiffRewindSkipped: (event) => input.options.logger?.warn({ ...event }, 'Turn diff rewind phase skipped'),
-        ...createRuntimeQueueSelection({
-            computerUseClient: input.options.computerUseClient,
-            questionnaires: input.options.compatibility.peripherals.questionnaires,
-            goals: input.goalPort,
-            queue: input.sessionSystem.queue.committed,
-            lifecycleFence: plan.lifecycleFence,
-            entryEnabled: planEntryEnabled,
-        }),
+        classifyQueuedItem: queueSelection.classifyQueuedItem,
+        shouldYieldFifoPosition: queueSelection.shouldYieldFifoPosition,
         createMessageDelivery: createTurnSystemMessageDelivery(input.messageDelivery),
         beforeStart: prepareMentionedMiniApps(input, prepareMiniAppTurn),
         ...(input.sessionClio ? { sessionClio: input.sessionClio.capture } : {}),
@@ -243,7 +256,38 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         nowMs: input.nowMs,
     });
     input.options.compatibility.backgroundTasks.bindNotificationReceipts(turnSystem.receipts);
-    return withPromptSuggestionLifecycle(turnSystem, suggestions);
+    queueSelection.bindDispatchQueue((sessionId) => turnSystem.turns.dispatchQueue(sessionId));
+    return withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection);
+}
+/**
+ * Queue selection whose AskUser countdown wake dispatches through the Turn
+ * System. That owner does not exist yet when its options are built, so the
+ * dispatch is bound afterwards; only timers armed by queue classification
+ * call it, and classification runs inside the Turn System.
+ */
+function createTurnQueueSelection(input, plan, planEntryEnabled) {
+    let dispatchQueue;
+    const selection = createRuntimeQueueSelection({
+        computerUseClient: input.options.computerUseClient,
+        questionnaires: input.options.compatibility.peripherals.questionnaires,
+        goals: input.goalPort,
+        queue: input.sessionSystem.queue.committed,
+        lifecycleFence: plan.lifecycleFence,
+        entryEnabled: planEntryEnabled,
+        nowMs: input.nowMs,
+        dispatchQueue: async (sessionId) => {
+            if (!dispatchQueue)
+                throw new Error('Turn System queue dispatch is not bound');
+            await dispatchQueue(sessionId);
+        },
+        ...(input.options.logger ? { logger: input.options.logger } : {}),
+    });
+    return {
+        ...selection,
+        bindDispatchQueue: (dispatch) => {
+            dispatchQueue = dispatch;
+        },
+    };
 }
 /** A session a Mini App started must not cold-start other Mini Apps by mentioning them. */
 function prepareMentionedMiniApps(input, prepareMiniAppTurn) {
@@ -259,7 +303,8 @@ function prepareMentionedMiniApps(input, prepareMiniAppTurn) {
         });
     };
 }
-function withPromptSuggestionLifecycle(turnSystem, suggestions) {
+/** Adds the prompt-suggestion port and stops suggestions and countdown wake timers on close. */
+function withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection) {
     return {
         ...turnSystem,
         turns: {
@@ -271,6 +316,7 @@ function withPromptSuggestionLifecycle(turnSystem, suggestions) {
         },
         close: async () => {
             suggestions.close();
+            queueSelection.close();
             await turnSystem.close();
         },
     };
@@ -321,5 +367,9 @@ function createRuntimeHistoryProjections(input) {
             },
         },
     };
+}
+/** Memory owns the summary text; the Turn system places it in history. */
+function memorySummaryHostOptions(memory) {
+    return memory ? { memorySummaryContext: memory.summaryContext } : {};
 }
 //# sourceMappingURL=turn-system-composition.js.map

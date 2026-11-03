@@ -4,10 +4,11 @@ import { agents } from '../../../infra/db/schema/agents.js';
 import { createLegacyAgentSource, } from '../../../infra/legacy-db/agent-source.js';
 import { decryptIdentityField, encryptIdentityField } from './identity-codec.js';
 import { AgentFiles } from './agent-files.js';
+import { BuiltinAgentFiles } from './builtin-agent-files.js';
 import { canonicalConfigForInsert, discardInitialCustomConfig, isConfigNotFound, mergeLegacyPrompt, runtimeStateUnavailable, unsupportedCustomLegacyAsset, } from './agent-create-publication.js';
-import { LegacyCustomAgentIdentityReceipt } from './legacy-custom-identity-receipt.js';
+import { LegacyCustomAgentIdentityReceipt } from './legacy-migration/legacy-custom-identity-receipt.js';
 import { canonicalCustomRuntimeFields, canonicalCustomTimestamps, runtimeIndexForUpdate, runtimeUpdateValues, } from './runtime-index.js';
-import { resolveFrozenLegacyHistoryNotice } from './_migration-legacy-agents.js';
+import { resolveFrozenLegacyHistoryNotice } from './legacy-migration/_migration-legacy-agents.js';
 import { AgentServiceError } from '../errors.js';
 import { AgentConfigError, } from './canonical-agent-config.js';
 import { LEGACY_PRIMARY_AGENT_NAME, PRIMARY_AGENT_NAME, isReservedName } from '../domain/names.js';
@@ -30,12 +31,14 @@ function primaryFamilyNormalizationValues(row) {
 export class DrizzleAgentRepository {
     options;
     files;
+    builtinFiles;
     identityReceipt;
     observedRoles = new Set();
     legacySourceDisplayNames;
     constructor(options) {
         this.options = options;
         this.files = new AgentFiles(options.dataDir);
+        this.builtinFiles = new BuiltinAgentFiles(this.files, options.dataDir);
         this.identityReceipt = new LegacyCustomAgentIdentityReceipt(options.dataDir);
     }
     withDisplayNameLock(operation) {
@@ -807,8 +810,14 @@ export class DrizzleAgentRepository {
     getBuiltinCanonicalConfig(name) {
         return this.files.getBuiltinCanonicalConfig(name);
     }
-    writeBuiltinCanonicalConfig(name, config) {
-        return this.files.writeBuiltinCanonicalConfig(name, config);
+    writeBuiltinCanonicalConfig(...args) {
+        return this.builtinFiles.seed(...args);
+    }
+    rewriteBuiltinCanonicalConfig(...args) {
+        return this.builtinFiles.reload(...args);
+    }
+    replaceCorruptedBuiltinCanonicalConfig(...args) {
+        return this.builtinFiles.repair(...args);
     }
     removeBuiltinCanonicalConfig(name) {
         return this.files.removeBuiltinCanonicalConfig(name);

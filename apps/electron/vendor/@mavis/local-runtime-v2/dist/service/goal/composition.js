@@ -4,6 +4,7 @@ import { GoalAdmission } from './admission/admission.js';
 import { GoalBreaker } from './breaker/breaker.js';
 import { GoalContinuation } from './continuation/continuation.js';
 import { GoalDependencyGates } from './admission/dependency-gates.js';
+import { resolveThreadGoalBudgetLimits } from './lifecycle/gate.js';
 import { GoalLifecycle } from './lifecycle/lifecycle.js';
 import { GoalResumeOutcomes } from './lifecycle/resume.js';
 import { GoalUsageRecoveryRetention } from './lifecycle/usage-recovery-retention.js';
@@ -27,9 +28,12 @@ export function composeGoalHostModules(input) {
         hasPendingPermission: deps.hasPendingPermission,
         hasAutomationOwnerConflict: deps.hasAutomationOwnerConflict,
         listUnfinishedBackgroundTasks: deps.listUnfinishedBackgroundTasks,
-        isGoalTurn: (goalId, turnId) => turnHistory.has(goalId, turnId),
+        ...(deps.listFinishedBackgroundTasks
+            ? { listFinishedBackgroundTasks: deps.listFinishedBackgroundTasks }
+            : {}),
+        goalTurns: (goalId) => goalTurnMembership(goalId, turnHistory, input.getStore()),
         isGoalVerifierChildSession: deps.isGoalVerifierChildSession,
-    }, { report: deps.reportFailure, format: deps.formatError });
+    }, { report: deps.reportFailure, format: deps.formatError }, input.backgroundWaits);
     let lifecycle;
     let settlement;
     let continuation;
@@ -152,6 +156,7 @@ export function composeGoalHostModules(input) {
             applyChange: input.applyChange,
             reportFailure: deps.reportFailure,
             formatError: deps.formatError,
+            effectiveLimits: (goal) => resolveThreadGoalBudgetLimits(goal, input.configGetter),
         },
     });
     const admission = new GoalAdmission({
@@ -159,6 +164,7 @@ export function composeGoalHostModules(input) {
         turnContext,
         turnHistory,
         gates,
+        backgroundWaits: input.backgroundWaits,
         turnTimingReader: deps.turnTimingReader,
         configGetter: input.configGetter,
         events: {
@@ -195,6 +201,23 @@ export function composeGoalHostModules(input) {
         settlement,
         turnContext,
         usageRecovery,
+    };
+}
+/**
+ * One read's view of which Turns belong to a Goal: this process's Turn history,
+ * then the durable request ledger, so a Turn from before a restart still counts
+ * toward the Goal's finished background tasks. The ledger is read at most once
+ * per membership view, and only when the history does not already answer.
+ */
+function goalTurnMembership(goalId, turnHistory, store) {
+    let ledgerTurns;
+    return {
+        has: (turnId) => {
+            if (turnHistory.has(goalId, turnId))
+                return true;
+            ledgerTurns ??= new Set(store.listGoalTurnIds?.(goalId) ?? []);
+            return ledgerTurns.has(turnId);
+        },
     };
 }
 //# sourceMappingURL=composition.js.map

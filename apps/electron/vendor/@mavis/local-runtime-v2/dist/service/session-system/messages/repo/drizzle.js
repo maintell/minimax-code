@@ -3,7 +3,7 @@ import { runWithWriteLock, WriteLockWaitAbortedError, } from '../../../../infra/
 import { legacyMessages, messageRowMigrations, messageRows, sessionAssetIndexState, sessionAssets, } from '../../../../infra/db/schema/messages.js';
 import { replaceMessageAssets } from '../asset-index.js';
 import { decodeDisplayMessage, decodeMessageSource, normalizeDisplayMessage } from './codec.js';
-import { MessageDataCorruptionError, MessageWriteWaitAbortedError, UserMessageCommitAdmissionError, UserMessageCommitConflictError, } from './contract.js';
+import { MessageDataCorruptionError, MessageWriteWaitAbortedError, UNDELIVERED_USER_MESSAGE_KIND, UserMessageCommitAdmissionError, UserMessageCommitConflictError, } from './contract.js';
 import { ensureMessageRowsReadyInTransaction } from './readiness.js';
 import { syncMessageSourceProjection } from './source-projection.js';
 const INPUT_REJECTED_DISPLAY_KIND = 'input_rejected';
@@ -154,7 +154,7 @@ class DrizzleMessageRepository {
             const userMessageCount = tx
                 .select({ count: sql `count(*)` })
                 .from(messageRows)
-                .where(and(eq(messageRows.sessionId, input.sessionId), eq(messageRows.role, 'user'), sql `coalesce(json_extract(${messageRows.dataJson}, '$.kind'), '') <> ${INPUT_REJECTED_DISPLAY_KIND}`))
+                .where(and(eq(messageRows.sessionId, input.sessionId), eq(messageRows.role, 'user'), sql `coalesce(json_extract(${messageRows.dataJson}, '$.kind'), '') NOT IN (${INPUT_REJECTED_DISPLAY_KIND}, ${UNDELIVERED_USER_MESSAGE_KIND})`))
                 .get()?.count ?? 0;
             return {
                 created: true,
@@ -202,6 +202,84 @@ class DrizzleMessageRepository {
             });
             return { created, messages };
         }, { behavior: 'immediate' });
+    }
+    async commitUndeliveredMessage(input) {
+        if (input.message.kind !== UNDELIVERED_USER_MESSAGE_KIND || input.message.role !== 'user') {
+            throw new TypeError('Undelivered message commit requires an undelivered user row');
+        }
+        const normalized = normalizeDisplayMessage(input.message, {
+            ...(input.source === undefined ? {} : { source: input.source }),
+            ...(input.sourceContext === undefined ? {} : { sourceContext: input.sourceContext }),
+            generatedIdDiscriminator: 'undelivered',
+            nowMs: this.nowMs,
+        });
+        if (normalized.turnId)
+            throw new TypeError('Undelivered message rows carry no Turn id');
+        return this.options.db.transaction((tx) => {
+            const rejection = this.options.userMessageAdmission?.rejectionInTransaction(tx, {
+                sessionId: input.sessionId,
+            });
+            if (rejection)
+                throw new UserMessageCommitAdmissionError(input.sessionId, rejection);
+            this.ensureReadyInTransaction(tx, input.sessionId);
+            const existing = this.readRow(tx, input.sessionId, normalized.msgId);
+            if (existing)
+                return { created: false, message: decodeDisplayMessage(existing) };
+            this.write(tx, input.sessionId, normalized, hasMessageProvenance(input));
+            const inserted = this.readRow(tx, input.sessionId, normalized.msgId);
+            if (!inserted)
+                throw new Error('Undelivered message insert did not produce a row');
+            return { created: true, message: decodeDisplayMessage(inserted) };
+        }, { behavior: 'immediate' });
+    }
+    async listUndeliveredMessages(sessionId) {
+        this.ensureReady(sessionId);
+        return this.options.db
+            .select()
+            .from(messageRows)
+            .where(and(eq(messageRows.sessionId, sessionId), eq(messageRows.role, 'user'), sql `json_extract(${messageRows.dataJson}, '$.kind') = ${UNDELIVERED_USER_MESSAGE_KIND}`))
+            .orderBy(asc(messageRows.id))
+            .all()
+            .map(decodeDisplayMessage);
+    }
+    async updateUndeliveredMessage(sessionId, messageId, decide) {
+        return this.mutationTransaction(sessionId, (tx) => {
+            const row = this.readRow(tx, sessionId, messageId);
+            if (!row)
+                return { status: 'missing' };
+            const current = decodeDisplayMessage(row);
+            if (current.kind !== UNDELIVERED_USER_MESSAGE_KIND || current.role !== 'user') {
+                return { status: 'not-undelivered', message: current };
+            }
+            const update = decide(current);
+            if (update.kind === 'keep')
+                return { status: 'kept', message: current };
+            if (update.kind === 'delete') {
+                tx.delete(messageRows)
+                    .where(and(eq(messageRows.sessionId, sessionId), eq(messageRows.messageId, messageId)))
+                    .run();
+                tx.delete(sessionAssets)
+                    .where(and(eq(sessionAssets.sessionId, sessionId), eq(sessionAssets.messageId, messageId)))
+                    .run();
+                return { status: 'deleted' };
+            }
+            // Same row, same position: only its display data changes. Provenance stays.
+            const normalized = normalizeDisplayMessage({ ...update.message, msg_id: messageId, timestamp: current.timestamp }, { generatedIdDiscriminator: 'undelivered', nowMs: this.nowMs });
+            if (normalized.turnId)
+                throw new TypeError('Undelivered message rows carry no Turn id');
+            this.write(tx, sessionId, normalized, false);
+            const updated = this.readRow(tx, sessionId, messageId);
+            if (!updated)
+                throw new Error('Undelivered message update lost its row');
+            return { status: 'replaced', message: decodeDisplayMessage(updated) };
+        });
+    }
+    readRow(db, sessionId, messageId) {
+        return db
+            .select()
+            .from(messageRows)
+            .where(and(eq(messageRows.sessionId, sessionId), eq(messageRows.messageId, messageId)))
+            .get();
     }
     async upsert(input, options) {
         const [result] = await this.upsertMany([input], options);

@@ -21,6 +21,7 @@ envPolicy) {
             const localOperations = operationsFactory.create({
                 identity: input.identity,
                 workspaceRoot: input.workspaceRoot,
+                ...(input.workspaceRoots ? { workspaceRoots: input.workspaceRoots } : {}),
                 ...(input.permissionExecutionPlan
                     ? { permissionExecutionPlan: input.permissionExecutionPlan }
                     : {}),

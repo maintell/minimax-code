@@ -1,3 +1,4 @@
+import { readPtcChildTools } from '../../execution/ptc/catalog.js';
 import { ComputerUseCaptureStore, sha256 } from './store.js';
 export class ComputerUseCaptureReporter {
     store;
@@ -224,6 +225,20 @@ export class ComputerUseCaptureReporter {
 }
 export function isComputerUseTool(name) {
     return name.startsWith('computer_');
+}
+/**
+ * Names of the tools a Turn can call: the listed ones plus run_code's
+ * children. A PTC Turn lists computer_* only inside run_code, and those
+ * children pass the same before/after tool hooks as direct calls, so turning
+ * capture on and keeping Computer Use evidence away from the network reporter
+ * must count them too. A Turn without run_code gets its listed names as is.
+ */
+export function callableTurnToolNames(tools) {
+    const listed = tools?.map((tool) => tool.def.name) ?? [];
+    const children = readPtcChildTools(tools)?.map((tool) => tool.def.name) ?? [];
+    if (children.length === 0)
+        return listed;
+    return [...listed, ...children.filter((name) => !listed.includes(name))];
 }
 function modelIdentity(model) {
     if (!model || typeof model !== 'object')

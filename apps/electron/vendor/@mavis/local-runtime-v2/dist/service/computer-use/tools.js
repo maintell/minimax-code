@@ -1,6 +1,8 @@
-import { defineRuntimeTool, } from '@mavis/agent-core/tools';
+import { attachProgrammaticErrorData, defineRuntimeTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
 import { Type } from '@sinclair/typebox';
 import { computerUseToolResult } from './client.js';
+import { thrownComputerUseData } from './result/action-data.js';
+import { APP_LIST_PAGE_ARGUMENTS } from './result/app-list.js';
 import { isComputerUseEnabled, registerComputerUseAbortController } from './state.js';
 const ACTIONS = [
     [
@@ -11,6 +13,22 @@ const ACTIONS = [
             name: {
                 type: 'string',
                 description: 'Case-insensitive app name or bundle ID substring. If a localized name has no matches, try the English application name. Omit or use empty string for the default inventory.',
+            },
+            scope: {
+                type: 'string',
+                enum: ['running', 'installed', 'all'],
+                description: 'Without name only. running (default): the native summary of running apps. installed: installed apps that are not running; all: every app. installed and all are listed one page at a time.',
+            },
+            offset: {
+                type: 'integer',
+                minimum: 0,
+                description: 'First app of the page for scope installed or all; default 0.',
+            },
+            limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 200,
+                description: 'Apps per page for scope installed or all; default 50.',
             },
         },
     ],
@@ -106,13 +124,13 @@ const ACTIONS = [
     ],
     [
         'computer_click',
-        'Click using either a full element_token from the latest state or x/y from that exact window screenshot. These target modes are mutually exclusive: set unused target fields to null or omit them; mixed targets are rejected before input. Background delivery is the default; if background is unsupported, tell the user you will work in the foreground BEFORE retrying with foreground delivery, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying. Prefer a supported semantic action from the observed element and verify the resulting UI.',
+        'Click using either a full element_token from the latest state or x/y from that exact window screenshot. These target modes are mutually exclusive: set unused target fields to null or omit them; mixed targets are rejected before input. Background delivery is the default. Prefer a supported semantic action from the observed element; otherwise escalate in order: background element_token, then background x/y on the same exact window, then foreground delivery; move on only after the previous route is refused or verified ineffective. Before foreground delivery, tell the user which app will take focus and why, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying. Verify the resulting UI.',
         'click',
         {
             scope: {
                 type: 'string',
                 enum: ['window', 'desktop'],
-                description: 'Default window. desktop targets the primary display for visible desktop interaction or recovery from verified window-input no-ops. Omit pid, window_ref and element_token. Inspect computer_desktop_state first and establish the intended foreground control before desktop keys or typing.',
+                description: 'Default window. desktop targets the primary display for visible desktop interaction or recovery from verified window-input no-ops. Desktop input is foreground input: it moves the real cursor and acts on whatever is frontmost, so use it only after window-scoped routes fail, with the same foreground notice. Omit pid, window_ref and element_token. Inspect computer_desktop_state first and establish the intended foreground control before desktop keys or typing.',
             },
             pid: { type: 'integer' },
             window_ref: { type: 'string' },
@@ -154,13 +172,13 @@ const ACTIONS = [
     ],
     [
         'computer_type',
-        'Type UTF-8 text into an exact field. In rich-text editors, a multi-line string may not create paragraph breaks: use separate text and Return operations, verifying the resulting blocks. A type_text_incomplete count is not a proven prefix boundary; inspect actual content before recovery. Background delivery is the default; if background is unsupported, tell the user you will work in the foreground BEFORE retrying with foreground delivery, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying. Never replace this with shell or AppleScript GUI automation.',
+        'Type UTF-8 text into an exact field. In rich-text editors, a multi-line string may not create paragraph breaks: use separate text and Return operations, verifying the resulting blocks. A type_text_incomplete count is not a proven prefix boundary; inspect actual content before recovery. Background delivery is the default. Escalate in order: background element_token, then background x/y on the same exact window, then foreground delivery; move on only after the previous route is refused or verified ineffective. Before foreground delivery, tell the user which app will take focus and why, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying. Never replace this with shell or AppleScript GUI automation.',
         'type',
         {
             scope: {
                 type: 'string',
                 enum: ['window', 'desktop'],
-                description: 'Default window. desktop targets the primary display for visible desktop interaction or recovery from verified window-input no-ops. Omit pid, window_ref and element_token. Inspect computer_desktop_state first and establish the intended foreground control before desktop keys or typing.',
+                description: 'Default window. desktop targets the primary display for visible desktop interaction or recovery from verified window-input no-ops. Desktop input is foreground input: it moves the real cursor and acts on whatever is frontmost, so use it only after window-scoped routes fail, with the same foreground notice. Omit pid, window_ref and element_token. Inspect computer_desktop_state first and establish the intended foreground control before desktop keys or typing.',
             },
             pid: { type: 'integer' },
             window_ref: { type: 'string' },
@@ -196,7 +214,7 @@ const ACTIONS = [
     ],
     [
         'computer_select_text',
-        'Select all text in the observed editable field. Use its fresh element_token for background delivery. Before foreground recovery, tell the user which app will take focus and why; then proceed without extra confirmation unless the user requires background-only. If an authorized foreground modifier shortcut is refused, do not retry the same token: inspect the exact window with include_screenshot:true, then use this tool with delivery_mode:"foreground" and x/y inside that field in the original screenshot, omitting element_token. This coordinate route clicks the field before selecting; verify selection or replacement from fresh state.',
+        'Select all text in the observed editable field. Use its fresh element_token for background delivery. Before foreground recovery, tell the user which app will take focus and why; then proceed without extra confirmation unless the user requires background-only. If background selection is refused or verified ineffective, do not retry the same token: inspect the exact window with include_screenshot:true, then use this tool with delivery_mode:"foreground" and x/y inside that field in the original screenshot, omitting element_token. This coordinate route clicks the field before selecting; verify selection or replacement from fresh state.',
         'select_text',
         {
             pid: { type: 'integer' },
@@ -218,13 +236,13 @@ const ACTIONS = [
     ],
     [
         'computer_key',
-        'Press a key or keyboard shortcut in an exact window. Background delivery is the default; if background is unsupported, tell the user you will work in the foreground BEFORE retrying with foreground delivery, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying. Do not use shell/AppleScript as a fallback.',
+        'Press a key or keyboard shortcut in an exact window. Background delivery is the default: use a fresh element_token or a window-level key, and escalate to foreground delivery only after the background key is refused or verified ineffective. Before foreground delivery, tell the user which app will take focus and why, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying. Do not use shell/AppleScript as a fallback.',
         'key',
         {
             scope: {
                 type: 'string',
                 enum: ['window', 'desktop'],
-                description: 'Default window. desktop targets the primary display for visible desktop interaction or recovery from verified window-input no-ops. Omit pid, window_ref and element_token. Inspect computer_desktop_state first and establish the intended foreground control before desktop keys or typing.',
+                description: 'Default window. desktop targets the primary display for visible desktop interaction or recovery from verified window-input no-ops. Desktop input is foreground input: it moves the real cursor and acts on whatever is frontmost, so use it only after window-scoped routes fail, with the same foreground notice. Omit pid, window_ref and element_token. Inspect computer_desktop_state first and establish the intended foreground control before desktop keys or typing.',
             },
             pid: { type: 'integer' },
             window_ref: { type: 'string' },
@@ -255,7 +273,7 @@ const ACTIONS = [
     ],
     [
         'computer_scroll',
-        'Scroll an exact application window or element. Background delivery is the default; if background is unsupported, tell the user you will work in the foreground BEFORE retrying with foreground delivery, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying.',
+        'Scroll an exact application window or element. Background delivery is the default. Escalate in order: background element_token, then background x/y on the same exact window, then foreground delivery; move on only after the previous route is refused or verified ineffective. Before foreground delivery, tell the user which app will take focus and why, without asking for additional confirmation. Respect an explicit background-only constraint and verify prior effects before retrying.',
         'scroll',
         {
             pid: { type: 'integer' },
@@ -624,20 +642,24 @@ export function buildComputerUseRuntimeTools(client, readSessionTitle) {
                     ...(sessionTitle != null ? { sessionTitle } : {}),
                     turnId: ctx.turnId,
                     generation: 0,
-                    payload: (input ?? {}),
+                    payload: driverPayload(kind, input),
                 }, combined.signal);
-                return computerUseToolResult(name, value);
+                return computerUseToolResult(name, value, input);
             }
             catch (error) {
                 const recovery = windowTargetRecovery(error);
-                if (!recovery)
-                    throw error;
-                return {
+                // PTC data of a failure: the code and whether the action may have run.
+                const data = thrownComputerUseData(error);
+                if (!recovery) {
+                    attachProgrammaticErrorData(error, data);
+                    throw describeCompletion(error, kind);
+                }
+                return withProgrammaticResult({
                     tool_name: name,
                     text: recovery,
                     content: [{ type: 'text', text: recovery }],
                     isError: true,
-                };
+                }, { data: { ...data, code: error.message } });
             }
             finally {
                 combined.cleanup();
@@ -645,6 +667,51 @@ export function buildComputerUseRuntimeTools(client, readSessionTitle) {
             }
         },
     }));
+}
+/** app_list paging is done by the host; the driver and utility get the same payload as before. */
+function driverPayload(kind, input) {
+    const payload = (input ?? {});
+    if (kind !== 'app_list' || !APP_LIST_PAGE_ARGUMENTS.some((key) => key in payload))
+        return payload;
+    return Object.fromEntries(Object.entries(payload).filter(([key]) => !APP_LIST_PAGE_ARGUMENTS.includes(key)));
+}
+const COMPLETION_SENTENCES = {
+    not_started: 'The action was not started.',
+    completed: 'The action completed before the error; do not repeat it.',
+    unknown: 'The action may have run; read the window state before repeating it.',
+};
+/**
+ * Observation tools only read the desktop (the same kinds the Computer Use
+ * client treats as observations). A failed read cannot have changed anything,
+ * so "the action may have run" would be false and only prompts a needless
+ * re-read; their errors keep `completion` but get no sentence.
+ */
+const OBSERVATION_KINDS = new Set([
+    'app_list',
+    'window_list',
+    'display_list',
+    'desktop_state',
+    'app_state',
+    'verify_state',
+]);
+/**
+ * A model sees only the message of a thrown error, not its `completion`.
+ * Without it, it cannot tell whether an irreversible action (send, delete)
+ * may already have happened, so it may repeat it or wrongly assume nothing
+ * happened. The sentence is appended in place: the same error object keeps
+ * its type, `code` and `completion` for every other consumer.
+ */
+function describeCompletion(error, kind) {
+    if (!(error instanceof Error) || OBSERVATION_KINDS.has(kind))
+        return error;
+    const completion = Reflect.get(error, 'completion');
+    const sentence = typeof completion === 'string' ? COMPLETION_SENTENCES[completion] : undefined;
+    if (!sentence || error.message.endsWith(sentence))
+        return error;
+    const message = error.message.trimEnd();
+    error.message =
+        `${message}${/[.!?。]$/u.test(message) || !message ? ' ' : '. '}${sentence}`.trim();
+    return error;
 }
 function windowTargetRecovery(error) {
     if (!(error instanceof Error))
