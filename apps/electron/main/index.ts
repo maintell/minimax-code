@@ -43,6 +43,13 @@ function getAppNameAndId() {
 const { appName: APP_NAME, appId: APP_ID, userDataAppName: USER_DATA_APP_NAME } = getAppNameAndId();
 app.setName(APP_NAME);
 app.setAppUserModelId(APP_ID);
+// HTTP/3 is unreliable on the paths this client runs over: Chromium keeps
+// negotiating QUIC through proxies and middleboxes that drop or mangulate it,
+// and the request then dies mid-stream with net::ERR_QUIC_PROTOCOL_ERROR —
+// measured as 291k consecutive failures on one logical call. Forcing TCP costs a
+// negligible latency difference and removes the whole failure class. Must be set
+// before app ready so the network service picks it up.
+app.commandLine.appendSwitch('disable-quic');
 // 开发环境下设置数据目录名称，确保不同环境数据隔离
 // 生产环境由 electron-builder 的 productName 自动设置
 // 必须在 app ready 之前设置
