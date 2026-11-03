@@ -94,9 +94,15 @@ the shipped defaults. `RESTORATION.md` records the patched files.
 3. Update `package.json`: the app version, any new vendored dependency, and the
    third-party versions the new build resolved.
 4. `pnpm install --ignore-workspace`, then `pnpm build`; run `verify-main.mjs`
-   and review every reported difference.
-5. `pnpm package`, then boot the packaged client with an isolated profile and
+   and review every reported difference. The build drops outputs that no longer
+   have a source, so a module the new build removed cannot stay in `dist/`.
+5. Compare `<install>/resources/app.asar.unpacked/node_modules` with the
+   `asarUnpack` list in `electron-builder.yml` and add any package the new build
+   unpacks (3.1.10 added `@jitl/**` and `quickjs-emscripten{,-core}/**`); the
+   packaged layout has to match the shipped one.
+6. `pnpm package`, then boot the packaged client with an isolated profile and
    check the main log for errors.
-6. Re-run `pnpm check:source` in the repository root and review the
+7. Re-run `pnpm check:source` in the repository root and review the
    `scripts/lib/published-client-exceptions.mjs` list against the restored
-   files (see `docs/desktop-client.md`).
+   files (see `docs/desktop-client.md`). Content-hashed chunk and wasm names
+   move with every build, so expect to re-key those entries.
