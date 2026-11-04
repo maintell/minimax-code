@@ -18,7 +18,7 @@ Version history of this recovery:
 
 | App | Date | Notes |
 | --- | --- | --- |
-| 3.1.10 | 2026-11-03 | Current. The v1 local runtime is gone: the shipped tree no longer carries `@mavis/local-runtime` (57 packages remain vendored), and `@mavis/local-runtime-v2` grows by ~700 files. Embedded browser rework in the main process — `native-browser-view`, `webview-browser-view`, guest registry/input, backend policy store, telemetry runtime plus a sanitizer, full-page capture and downloads (`main/modules/browser/**`, `main/ipc/browser*.ipc.ts`). New `main/modules/file-open-with/**` (Windows "打开方式" enhancement, with a generated text-type list), `main/modules/deeplink/workspace-open.ts`, `main/utils/default-project-dir.ts`, auth refresh diagnostics/environment, `data-dir-relocation-guard` and `cua-overlay-target`. `resources/file-associations.nsh` stops writing `OpenWithProgids` (it lists `SupportedTypes` instead), `pptx-core` moved to new content hashes, the session-transfer client was rebuilt, and the QuickJS wasm runtime (`quickjs-emscripten`, `quickjs-emscripten-core`, `@jitl/*`) joins the unpacked set. `@opentelemetry/*` is no longer a direct dependency (transitive only). Main process: 388 files (was 357). |
+| 3.1.10 | 2026-11-03 | Current. The v1 local runtime is gone: the shipped tree no longer carries `@mavis/local-runtime` (57 packages remain vendored), and `@mavis/local-runtime-v2` grows by ~700 files. Embedded browser rework in the main process — `native-browser-view`, `webview-browser-view`, guest registry/input, backend policy store, telemetry runtime plus a sanitizer, full-page capture and downloads (`main/modules/browser/**`, `main/ipc/browser*.ipc.ts`). New `main/modules/file-open-with/**` (Windows "打开方式" enhancement, with a generated text-type list), `main/modules/deeplink/workspace-open.ts`, `main/utils/default-project-dir.ts`, auth refresh diagnostics/environment, `data-dir-relocation-guard` and `cua-overlay-target`. `resources/file-associations.nsh` stops writing `OpenWithProgids` (it lists `SupportedTypes` instead), `pptx-core` moved to new content hashes, the session-transfer client was rebuilt, and the QuickJS wasm runtime (`quickjs-emscripten`, `quickjs-emscripten-core`, `@jitl/*`) joins the unpacked set. The new PTC worker resolves its own module URL against `app.asar.unpacked` (`.../runner/ptc/worker-path.js`), so `@mavis/local-runtime-v2`'s PTC modules and its `package.json` must be unpacked as well — leaving them in the archive fails at runtime with `Cannot find module ... quickjs-worker.js`. `@opentelemetry/*` is no longer a direct dependency (transitive only). Main process: 388 files (was 357). |
 | 3.1.6 | 2026-10-27 | Renderer assets moved out of `public/`: the shipped `public/` keeps only the six files the main process and the plugin pages load, and `out/assets/**` carries the images. New packaged Computer Use component (`resources/computer-use/0.34.1/win32-x64/**`) and the vendored `@mavis/computer-use` package it is driven by; mini-app speech/tool IPC, browser device-preview and permission-panel modules are new. `pptx-core` moved to a new content hash. Main process: 357 files (was 346). |
 | 3.1.4 | 2026-10-20 | New `@minimax/mcode-app-server-protocol` dependency, an SSH runtime (`main/modules/ssh-runtime/**`), mini-app agent IPC and detached windows; the Word/Excel editor IPC modules are gone. Renderer grew ~14 MB. |
 | 3.1.1 | 2026-10-17 | Initial recovery. |
@@ -96,8 +96,13 @@ Version history of this recovery:
 5. **Packaging configuration is reconstructed.** electron-builder options
    (NSIS script wiring, `asarUnpack` list, `extraResources` mapping, updater
    publish URL) were rebuilt from the installed layout and the shipped NSIS
-   scripts. The `asarUnpack` list mirrors `app.asar.unpacked` exactly; the
-   installer artifact name uses electron-builder's default.
+   scripts. The `asarUnpack` list covers the shipped `app.asar.unpacked` set
+   and is a superset of it: whole packages are unpacked rather than the
+   per-file subset the installation ships, and the one place where the choice
+   is load-bearing is repeated on its own (`@mavis/local-runtime-v2`'s PTC
+   worker, which resolves itself against `app.asar.unpacked` and therefore
+   cannot stay inside the archive). The installer artifact name uses
+   electron-builder's default.
 6. **Vendor manifest rewrites** — see below.
 7. **One vendored runtime file carries a deliberate local patch** — the fixed
    three-second retry cadence in `@mavis/agent-core`'s `llm-retry.js`; see
@@ -178,9 +183,10 @@ Both trees satisfy every dependency range.
   packaging run (from `env/prod-zh.env`) and removed afterwards: the
   repository never stores a `.env*` file, and the packaged app still finds its
   environment file at the app root.
-- `asarUnpack` mirrors the installed `app.asar.unpacked` set exactly;
-  `npmRebuild` is disabled because the native modules are the shipped Electron
-  42 binaries.
+- `asarUnpack` covers the installed `app.asar.unpacked` set (whole packages, a
+  superset of the shipped per-file selection, plus the PTC worker files whose
+  module URL is rewritten to the unpacked path); `npmRebuild` is disabled
+  because the native modules are the shipped Electron 42 binaries.
 - `resources/` is used both as electron-builder's `buildResources` directory
   and as the `extraResources` source, which reproduces the installed
   `resources/resources/**` layout.

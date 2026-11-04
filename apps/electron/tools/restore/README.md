@@ -97,9 +97,13 @@ the shipped defaults. `RESTORATION.md` records the patched files.
    and review every reported difference. The build drops outputs that no longer
    have a source, so a module the new build removed cannot stay in `dist/`.
 5. Compare `<install>/resources/app.asar.unpacked/node_modules` with the
-   `asarUnpack` list in `electron-builder.yml` and add any package the new build
-   unpacks (3.1.10 added `@jitl/**` and `quickjs-emscripten{,-core}/**`); the
-   packaged layout has to match the shipped one.
+   `asarUnpack` list in `electron-builder.yml` by file, not by package name, and
+   add whatever the new build unpacks (3.1.10 added `@jitl/**` and
+   `quickjs-emscripten{,-core}/**`). Some packages are unpacked only partially:
+   `@mavis/local-runtime-v2`'s PTC worker and the modules beside it resolve
+   themselves against `app.asar.unpacked` (`worker-path.js`), so leaving them
+   inside the archive breaks PTC at runtime with
+   `Cannot find module ... quickjs-worker.js`.
 6. `pnpm package`, then boot the packaged client with an isolated profile and
    check the main log for errors.
 7. Re-run `pnpm check:source` in the repository root and review the

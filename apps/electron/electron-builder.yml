@@ -39,9 +39,16 @@ asarUnpack:
   - node_modules/jszip/**
   - node_modules/node-pty/**
   - node_modules/node-screenshots-win32-x64-msvc/**
-  # 3.1.10 adds the QuickJS wasm runtime the PTC agent host loads.
+  # QuickJS wasm runtime the PTC agent host loads.
   - node_modules/quickjs-emscripten/**
   - node_modules/quickjs-emscripten-core/**
+  # The PTC worker is loaded as a module by URL and deliberately resolves to
+  # `app.asar.unpacked` (see `.../agent-host/runner/ptc/worker-path.js`), so the
+  # worker and the modules around it must live outside the archive. The shipped
+  # installation unpacks exactly these paths.
+  - node_modules/@mavis/local-runtime-v2/package.json
+  - node_modules/@mavis/local-runtime-v2/dist/service/turn-system/agent-host/execution/ptc/**
+  - node_modules/@mavis/local-runtime-v2/dist/service/turn-system/agent-host/runner/ptc/**
 
 extraResources:
   - from: resources
