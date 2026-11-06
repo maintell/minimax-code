@@ -464,10 +464,14 @@ patchFile("@mavis/shared/dist/llm-error-classifier.js", [
   },
 ]);
 
-// --- renderer string table: show the unbounded retry budget as ∞ ------------
+// --- renderer string table: show the retry budget as 10000000 ------------
 // The prebuilt renderer prints `({{attempt}}/{{total}})`, which would read
 // "(3/2147483647)". The templates are plain strings in the exported bundle, so
-// they are rewritten rather than the surrounding logic.
+// they are rewritten rather than the surrounding logic. The retry policy stays
+// unbounded; `10000000` is only a nominal display cap so the counter shows a
+// finite number. Re-vendoring ships `{{total}}`, an older patched tree may still
+// carry `∞`, and a converged tree carries the number; all three input forms are
+// accepted so re-running the patch is idempotent.
 function patchRendererRetryBudget(outputRoot) {
   const chunksDir = path.join(outputRoot, "_next", "static", "chunks");
   if (!fs.existsSync(chunksDir)) throw new Error(`missing renderer chunks: ${chunksDir}`);
@@ -482,11 +486,13 @@ function patchRendererRetryBudget(outputRoot) {
       }
       if (!entry.isFile() || !entry.name.endsWith(".js")) continue;
       const text = fs.readFileSync(target, "utf8");
-      if (!text.includes("{{total}}")) continue;
-      alreadyPatched += (text.match(/\{\{attempt\}\}\/∞/gu) ?? []).length;
+      if (!text.includes("{{attempt}}/")) continue;
+      alreadyPatched += (text.match(/\{\{attempt\}\}\/10000000/gu) ?? []).length;
       const next = text
-        .replaceAll("({{attempt}}/{{total}})", "({{attempt}}/∞)")
-        .replaceAll("（{{attempt}}/{{total}}）", "（{{attempt}}/∞）");
+        .replaceAll("({{attempt}}/{{total}})", "({{attempt}}/10000000)")
+        .replaceAll("（{{attempt}}/{{total}}）", "（{{attempt}}/10000000）")
+        .replaceAll("({{attempt}}/∞)", "({{attempt}}/10000000)")
+        .replaceAll("（{{attempt}}/∞）", "（{{attempt}}/10000000）");
       if (next !== text) {
         fs.writeFileSync(target, next, "utf8");
         replaced += 1;
