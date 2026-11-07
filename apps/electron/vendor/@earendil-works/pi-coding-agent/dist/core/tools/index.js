@@ -1,5 +1,6 @@
 export { BashExecutionError, createBashTool, createBashToolDefinition, createLocalBashOperations, } from "./bash.js";
 export { createEditTool, createEditToolDefinition, } from "./edit.js";
+export { normalizeToLF, stripBom } from "./edit-diff.js";
 export { withFileMutationQueue } from "./file-mutation-queue.js";
 export { createFindTool, createFindToolDefinition, } from "./find.js";
 export { createGrepTool, createGrepToolDefinition, } from "./grep.js";

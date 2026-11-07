@@ -1,3 +1,4 @@
+import { LIGHTWEIGHT_SESSION_PURPOSE } from '@mavis/shared/mcode-context-mode';
 import { captureSemanticSnapshot } from '../history/semantic-identity.js';
 export class AgentHostSessionReadError extends Error {
     sessionId;
@@ -29,5 +30,17 @@ export function captureAgentHostSession(expectedSessionId, session) {
 }
 function isNonEmptyString(value) {
     return typeof value === 'string' && Boolean(value.trim());
+}
+export function isLightweightRootSession(session) {
+    // An unreadable Session record keeps the standard provider context; Turn
+    // execution stays fail-open for SessionRecord projection failures.
+    try {
+        return (session.purpose === LIGHTWEIGHT_SESSION_PURPOSE &&
+            session.sessionKind === 'conversation' &&
+            !session.parentSessionId);
+    }
+    catch {
+        return false;
+    }
 }
 //# sourceMappingURL=session-read.js.map

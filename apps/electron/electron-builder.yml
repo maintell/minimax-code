@@ -29,6 +29,7 @@ files:
 npmRebuild: false
 asarUnpack:
   - node_modules/@earendil-works/**
+  - node_modules/@jitl/**
   - node_modules/@mariozechner/**
   - node_modules/@minimax/**
   - node_modules/@trycua/**
@@ -38,6 +39,16 @@ asarUnpack:
   - node_modules/jszip/**
   - node_modules/node-pty/**
   - node_modules/node-screenshots-win32-x64-msvc/**
+  # QuickJS wasm runtime the PTC agent host loads.
+  - node_modules/quickjs-emscripten/**
+  - node_modules/quickjs-emscripten-core/**
+  # The PTC worker is loaded as a module by URL and deliberately resolves to
+  # `app.asar.unpacked` (see `.../agent-host/runner/ptc/worker-path.js`), so the
+  # worker and the modules around it must live outside the archive. The shipped
+  # installation unpacks exactly these paths.
+  - node_modules/@mavis/local-runtime-v2/package.json
+  - node_modules/@mavis/local-runtime-v2/dist/service/turn-system/agent-host/execution/ptc/**
+  - node_modules/@mavis/local-runtime-v2/dist/service/turn-system/agent-host/runner/ptc/**
 
 extraResources:
   - from: resources
@@ -45,6 +56,10 @@ extraResources:
 
 win:
   icon: resources/icon.ico
+  # No spaces: release hosts (GitHub releases among them) rewrite spaces in
+  # asset names, which would no longer match the `path` recorded in latest.yml
+  # and break the updater.
+  artifactName: MiniMax-Code-Setup-${version}.${ext}
   target:
     - target: nsis
       arch:
@@ -56,6 +71,13 @@ nsis:
   allowElevation: true
   allowToChangeInstallationDirectory: true
   include: installer-zh-prod.nsh
+  # The shipped resources (3.1.4 and later) carry `installer-diagnostics.nsh`,
+  # whose `un.MavisInstallerLog` is called from a patched app-builder-lib
+  # template that this distribution does not carry. The stock template therefore
+  # leaves the uninstaller function unreferenced, which NSIS reports as warning
+  # 6010 ("zeroing code") and electron-builder escalates to an error. The
+  # function is inert either way, so warnings stay warnings here.
+  warningsAsErrors: false
 
 publish:
   provider: generic

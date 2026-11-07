@@ -1,4 +1,4 @@
-import { collectMessageAssetItems } from '@mavis/shared/asset-markup';
+import { collectMessageAssetItems, getCloudDriveNodeId } from '@mavis/shared/asset-markup';
 import { mkdir, copyFile, lstat, rm, rmdir } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { and, asc, desc, eq, gt, inArray, lt, notExists, or } from 'drizzle-orm';
@@ -31,7 +31,7 @@ export function replaceMessageAssets(db, sessionId, message, nowMs) {
             name: asset.name ?? null,
             assetType: asset.type ?? null,
             artifactId: asset.artifactId ?? null,
-            driveNodeId: asset.driveNodeId ?? null,
+            driveNodeId: getCloudDriveNodeId(asset) ?? null,
             dataJson: JSON.stringify(asset),
             createdAtMs: nowMs,
             updatedAtMs: nowMs,

@@ -156,7 +156,9 @@ const PI_READ_TAIL_NOTICE = /\n\n\[(?:Showing lines \d+-\d+ of \d+|\d+ more line
  * Empty body (empty file) returns the reference CLI system-reminder instead
  * of an empty string.
  */
-export function postprocessPiReadText(outputText, opts = {}) {
+export function postprocessPiReadText(outputText, 
+/** maxLineChars: per-line cap, READ_MAX_LINE_CHARS unless a caller (a PTC child) lifts it. */
+opts = {}) {
     if (outputText === '') {
         return { text: READ_EMPTY_FILE_REMINDER, truncatedLines: [] };
     }
@@ -164,7 +166,7 @@ export function postprocessPiReadText(outputText, opts = {}) {
     const notice = noticeMatch ? noticeMatch[0] : '';
     const body = notice ? outputText.slice(0, -notice.length) : outputText;
     const startLine = opts.offset !== undefined && opts.offset > 0 ? opts.offset : 1;
-    const { text: truncatedBody, truncatedLines } = truncateLongLines(body, READ_MAX_LINE_CHARS, startLine);
+    const { text: truncatedBody, truncatedLines } = truncateLongLines(body, opts.maxLineChars ?? READ_MAX_LINE_CHARS, startLine);
     return {
         text: addLineNumbers(truncatedBody, startLine) + notice,
         truncatedLines,

@@ -8,6 +8,9 @@ export class LocalAgentPreparationService {
     constructor(options) {
         this.options = options;
     }
+    bindAgentShellResolver(resolve) {
+        this.options.configBuilder.bindAgentShellResolver(resolve);
+    }
     /** Late-bound Session model repair; see `session-model-selection.ts`. */
     bindSessionModelRepair(repair) {
         this.options.configBuilder.bindSessionModelRepair(repair);
@@ -15,6 +18,10 @@ export class LocalAgentPreparationService {
     /** Late-bound Task snapshot store. Ordinary Sessions remain live. */
     bindTaskSessionBindings(bindings) {
         this.options.configBuilder.bindTaskSessionBindings(bindings);
+    }
+    /** Late-bound Project folder reader; absent keeps the single-folder behavior. */
+    bindAdditionalWorkspaceRoots(read) {
+        this.options.configBuilder.bindAdditionalWorkspaceRoots(read);
     }
     async prepare(input) {
         const model = toModelOverride(input.request.input.model);
@@ -57,12 +64,16 @@ export class LocalAgentPreparationService {
         });
         return {
             agentConfig: Object.freeze({ ...builtAgentConfig }),
+            ...(built.agentShell ? { agentShell: built.agentShell } : {}),
             llm,
             outputRevisionInstruction: built.outputRevisionInstruction,
             ...(built.retryContinuationPrompt
                 ? { retryContinuationPrompt: built.retryContinuationPrompt }
                 : {}),
             ...(built.promptRead ? { promptRead: built.promptRead } : {}),
+            ...(built.additionalWorkspaceRoots
+                ? { additionalWorkspaceRoots: built.additionalWorkspaceRoots }
+                : {}),
         };
     }
 }

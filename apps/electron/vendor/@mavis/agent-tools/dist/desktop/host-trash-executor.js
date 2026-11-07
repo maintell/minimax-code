@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { sanitizeBashSubprocessEnv, } from '@mavis/agent-core/bash-subprocess-env';
 import { LocalBashToolDef } from './builtin-defs.js';
@@ -27,7 +28,8 @@ export async function executeLocalHostTrashIfRequested(input) {
     if (input.toolInput.command !== 'mavis-trash --' || input.toolInput.run_in_background === true) {
         return windowsTrashError('windows_trash_input_rejected', 'Windows trash execution rejected an invalid effective input.');
     }
-    if (!execution.targets.every((target) => isWindowsTargetInsideWorkspace(target, input.workspaceRoot))) {
+    const allowedTargets = await Promise.all(execution.targets.map((target) => isWindowsTrashTargetAllowed(target, input.workspaceRoot, execution.allowOutsideWorkspaceFiles === true)));
+    if (!allowedTargets.every(Boolean)) {
         return windowsTrashError('windows_trash_target_rejected', 'Windows trash execution rejected a target outside the workspace.');
     }
     const launch = {
@@ -93,16 +95,37 @@ function isAvailableWindowsTrashRuntime(runtime) {
         path.isAbsolute(runtime.scriptPath) &&
         path.basename(runtime.scriptPath).toLowerCase() === 'mavis-trash.js');
 }
-function isWindowsTargetInsideWorkspace(target, workspaceRoot) {
+async function isWindowsTrashTargetAllowed(target, workspaceRoot, allowOutsideWorkspaceFiles) {
     const workspace = path.win32.resolve(workspaceRoot);
     const resolved = path.win32.resolve(workspaceRoot, target);
-    if (/^[a-z]:\\(?:windows|program files(?: \(x86\))?)(?:\\|$)/i.test(resolved))
+    if (isProtectedWindowsTrashPath(resolved))
         return false;
     const relative = path.win32.relative(workspace, resolved);
-    return (relative === '' ||
+    if (relative === '' ||
         (relative !== '..' &&
             !relative.startsWith(`..${path.win32.sep}`) &&
-            !path.win32.isAbsolute(relative)));
+            !path.win32.isAbsolute(relative)))
+        return true;
+    // The plan proves non-recursive rm syntax; the host separately proves the
+    // external operand is a file. Directories, links and unavailable metadata
+    // retain the workspace boundary, even with the trusted opt-in.
+    if (!allowOutsideWorkspaceFiles || !/^[a-z]:[\\/]/i.test(target))
+        return false;
+    try {
+        // Resolve short names and parent-directory aliases before applying the
+        // same protected-path boundary. Keep the approved argv unchanged.
+        if (isProtectedWindowsTrashPath(await realpath(target)))
+            return false;
+        return (await lstat(target)).isFile();
+    }
+    catch {
+        return false;
+    }
+}
+function isProtectedWindowsTrashPath(target) {
+    const canonical = path.win32.normalize(target).replace(/^\\\\\?\\(?=[a-z]:\\)/i, '');
+    return (canonical.startsWith('\\\\') ||
+        /^[a-z]:\\$|^[a-z]:\\(?:windows|program files(?: \(x86\))?)(?:\\|$)/i.test(canonical));
 }
 function unavailableTrashError(platform) {
     if (platform === 'win32') {

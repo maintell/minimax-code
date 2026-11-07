@@ -1,10 +1,21 @@
+import { timingSafeEqual } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { MINIAPP_LOOPBACK_HEALTH_PATH, MINIAPP_LOOPBACK_TOKEN_HEADER, hasMiniAppHostCapability, isMiniAppAgentAccess, } from '../../contracts.js';
+import { MINIAPP_AGENT_MAX_CONCURRENCY } from '../../agent/contracts.js';
 import { boundMiniAppRuntimeErrorText } from '../../errors.js';
 import { createMiniAppHostConnectorRuntimeClient, } from '../host-connector/host-connector.js';
 const MAX_LOG_MESSAGE_LENGTH = 4 * 1024;
 const runnerObservations = new Set();
+const MINIAPP_LISTEN_PORT_ERROR_CODES = new Set([
+    'EADDRINUSE',
+    'LISTEN_EACCES',
+]);
+export function isMiniAppListenPortErrorCode(code) {
+    return MINIAPP_LISTEN_PORT_ERROR_CODES.has(code);
+}
 const MINIAPP_RUNNER_ERROR_CODES = new Set([
     'ENTRY_OUTSIDE_ARTIFACT',
     'HOST_CONNECTOR_UNAVAILABLE',
@@ -25,14 +36,9 @@ export async function startMiniAppModule(init, options = {}) {
     const resolveRealPath = options.resolveRealPath ?? realpath;
     const packageRoot = await resolveRealPath(init.packageRoot);
     const start = await loadStartFunction(init, packageRoot, resolveRealPath, options.loadModule);
-    assertConnectorAvailable(init, options.createHostConnector);
+    const clients = hostOwnedClients(init, options);
     const abortController = new AbortController();
     const logger = createLogger(options.emit);
-    const hostConnector = options.createHostConnector?.({
-        pluginId: init.pluginId,
-        processGeneration: init.processGeneration,
-        policy: init.hostConnectorPolicy,
-    });
     const context = Object.freeze({
         pluginId: init.pluginId,
         pluginRoot: packageRoot,
@@ -41,7 +47,8 @@ export async function startMiniAppModule(init, options = {}) {
         listen: Object.freeze({ ...init.listen }),
         signal: abortController.signal,
         logger,
-        ...(hostConnector ? { hostConnector } : {}),
+        capabilities: Object.freeze({ has: (name) => hasMiniAppHostCapability(name) }),
+        ...clients,
     });
     let result;
     try {
@@ -77,6 +84,53 @@ async function loadStartFunction(init, packageRoot, resolveRealPath, loadModule)
 function assertConnectorAvailable(init, create) {
     if (init.hostConnectorPolicy.kind === 'allowlist' && !create) {
         throw new MiniAppRunnerError('HOST_CONNECTOR_UNAVAILABLE', 'Host Connector access requires a Host-owned client');
+    }
+}
+function assertAgentAvailable(init, create) {
+    if (init.agentPolicy.kind === 'allowlist' && !create) {
+        throw new MiniAppRunnerError('HOST_CONNECTOR_UNAVAILABLE', 'Mini App Agent access requires a Host-owned client');
+    }
+}
+/**
+ * The Host-owned clients of a module context, from the manifest grants alone (a permission
+ * switched off later still leaves the client in place; its calls are refused).
+ */
+function hostOwnedClients(init, factories) {
+    assertConnectorAvailable(init, factories.createHostConnector);
+    assertAgentAvailable(init, factories.createAgent);
+    assertToolAvailable(init, factories.createTool);
+    const identity = { pluginId: init.pluginId, processGeneration: init.processGeneration };
+    const hostConnector = factories.createHostConnector?.({
+        ...identity,
+        policy: init.hostConnectorPolicy,
+    });
+    const agent = factories.createAgent?.({ ...identity, policy: init.agentPolicy });
+    const tool = needsToolClient(init)
+        ? factories.createTool?.({ ...identity, policy: init.toolPolicy })
+        : undefined;
+    return {
+        ...(hostConnector ? { hostConnector } : {}),
+        ...(agent ? { agent } : {}),
+        ...(tool ? { tool } : {}),
+    };
+}
+/** Client factories over one lazily opened `miniapp:connector` channel, for any role. */
+function channelClientFactories(init, channel) {
+    return {
+        ...(init.hostConnectorPolicy.kind === 'allowlist'
+            ? { createHostConnector: () => channel().client }
+            : {}),
+        ...(init.agentPolicy.kind === 'allowlist' ? { createAgent: () => channel().agent } : {}),
+        ...(needsToolClient(init) ? { createTool: () => channel().tool } : {}),
+    };
+}
+/** Only `toolAccess: ["call"]` grants `context.tool`; `hostConnectorAccess` keeps its own client. */
+function needsToolClient(init) {
+    return init.toolPolicy.kind === 'allowlist';
+}
+function assertToolAvailable(init, create) {
+    if (needsToolClient(init) && !create) {
+        throw new MiniAppRunnerError('HOST_CONNECTOR_UNAVAILABLE', 'Mini App tool access requires a Host-owned client');
     }
 }
 function readDispose(result, abortController) {
@@ -132,6 +186,7 @@ export function runMiniAppHostRunner(options = {}) {
     const start = options.start ?? ((init) => startWithIpcConnector(init, send, transport));
     let running;
     let initialized = false;
+    let acceptedListen;
     let stopping;
     const stop = (exitCode) => {
         stopping ??= (async () => {
@@ -143,7 +198,11 @@ export function runMiniAppHostRunner(options = {}) {
         return stopping;
     };
     const fail = async (error) => {
-        send({ type: 'miniapp:error', code: errorCode(error), errorText: errorText(error) });
+        send({
+            type: 'miniapp:error',
+            code: errorCode(error, acceptedListen),
+            errorText: errorText(error),
+        });
         await stop(1);
     };
     const dispatch = (operation) => {
@@ -164,6 +223,7 @@ export function runMiniAppHostRunner(options = {}) {
                 return;
             }
             initialized = true;
+            acceptedListen = message.listen;
             try {
                 const started = await start(message);
                 if (stopping || processPort.connected === false) {
@@ -222,20 +282,19 @@ async function dispatchOperation(operation, processPort, complete) {
 }
 async function startWithIpcConnector(init, emit, transport) {
     let connector;
+    const channel = () => {
+        connector ??= createMiniAppHostConnectorRuntimeClient({ transport });
+        return connector;
+    };
     const closeConnector = () => {
         connector?.close();
     };
+    // Must precede import(entry): plugin servers inherit the guard from the patched prototype.
+    installMiniAppLoopbackGuard({ port: init.listen.port, token: init.loopbackToken });
     try {
         const running = await startMiniAppModule(init, {
             emit,
-            createHostConnector: init.hostConnectorPolicy.kind === 'allowlist'
-                ? () => {
-                    connector = createMiniAppHostConnectorRuntimeClient({
-                        transport,
-                    });
-                    return connector.client;
-                }
-                : undefined,
+            ...channelClientFactories(init, channel),
         });
         return {
             async stop() {
@@ -253,6 +312,68 @@ async function startWithIpcConnector(init, emit, transport) {
         throw error;
     }
 }
+const GUARDED_REQUEST_EVENTS = new Set([
+    'request',
+    'checkContinue',
+    'checkExpectation',
+]);
+const GUARDED_SOCKET_EVENTS = new Set(['upgrade', 'connect']);
+/**
+ * Authenticates every `node:http` server in this process before plugin code can
+ * observe a request. Only the Host-issued token on the exact loopback Host passes;
+ * `GET /__mavis/health` is answered here so readiness proves the guard is in path.
+ */
+function installMiniAppLoopbackGuard(input) {
+    const prototype = http.Server.prototype;
+    const originalEmit = prototype.emit;
+    const expectedHost = `127.0.0.1:${input.port}`;
+    const expectedToken = Buffer.from(input.token, 'utf8');
+    const authorized = (request) => request.headers.host === expectedHost &&
+        tokenMatches(request.headers[MINIAPP_LOOPBACK_TOKEN_HEADER], expectedToken);
+    prototype.emit = function guardedEmit(event, ...args) {
+        if (typeof event === 'string' && GUARDED_REQUEST_EVENTS.has(event)) {
+            const [request, response] = args;
+            if (!authorized(request)) {
+                response.writeHead(401).end();
+                return true;
+            }
+            if (isHealthRequest(request)) {
+                response.writeHead(204).end();
+                return true;
+            }
+            stripLoopbackToken(request);
+        }
+        else if (typeof event === 'string' && GUARDED_SOCKET_EVENTS.has(event)) {
+            const [request, socket] = args;
+            if (!authorized(request)) {
+                socket.destroy();
+                return true;
+            }
+            stripLoopbackToken(request);
+        }
+        return Reflect.apply(originalEmit, this, [event, ...args]);
+    };
+}
+function tokenMatches(value, expected) {
+    if (typeof value !== 'string')
+        return false;
+    const actual = Buffer.from(value, 'utf8');
+    return actual.byteLength === expected.byteLength && timingSafeEqual(actual, expected);
+}
+/** Application code never needs the credential; removing it keeps proxies and header dumps clean. */
+function stripLoopbackToken(request) {
+    delete request.headers[MINIAPP_LOOPBACK_TOKEN_HEADER];
+    const raw = request.rawHeaders;
+    for (let index = raw.length - 2; index >= 0; index -= 2) {
+        if (raw[index]?.toLowerCase() === MINIAPP_LOOPBACK_TOKEN_HEADER)
+            raw.splice(index, 2);
+    }
+}
+function isHealthRequest(request) {
+    const url = request.url ?? '';
+    return (request.method === 'GET' &&
+        (url === MINIAPP_LOOPBACK_HEALTH_PATH || url.startsWith(`${MINIAPP_LOOPBACK_HEALTH_PATH}?`)));
+}
 export function isMiniAppRunnerInitMessage(value) {
     if (!isRecord(value))
         return false;
@@ -266,7 +387,10 @@ export function isMiniAppRunnerInitMessage(value) {
         'dataDir',
         'listen',
         'readiness',
+        'loopbackToken',
         'hostConnectorPolicy',
+        'agentPolicy',
+        'toolPolicy',
     ];
     if (!hasExactKeys(value, keys))
         return false;
@@ -275,7 +399,16 @@ export function isMiniAppRunnerInitMessage(value) {
         hasStringIdentityFields(value) &&
         isListenAddress(value.listen) &&
         isReadinessIdentity(value.readiness) &&
-        isConnectorPolicy(value.hostConnectorPolicy));
+        isLoopbackToken(value.loopbackToken) &&
+        hasAccessPolicies(value));
+}
+function hasAccessPolicies(value) {
+    return (isConnectorPolicy(value.hostConnectorPolicy) &&
+        isAgentPolicy(value.agentPolicy) &&
+        isToolPolicy(value.toolPolicy));
+}
+function isLoopbackToken(value) {
+    return typeof value === 'string' && value.length > 0;
 }
 function hasStringIdentityFields(value) {
     return ['pluginId', 'processGeneration', 'packageRoot', 'nodeEntry', 'dataDir'].every((field) => typeof value[field] === 'string');
@@ -357,6 +490,34 @@ function isConnectorPolicy(value) {
             Array.isArray(value.providers) &&
             value.providers.every((provider) => typeof provider === 'string');
 }
+function isAgentPolicy(value) {
+    if (!isRecord(value))
+        return false;
+    return value.kind === 'deny-all'
+        ? hasExactKeys(value, ['kind'])
+        : value.kind === 'allowlist' &&
+            hasExactKeys(value, ['kind', 'capabilities', 'maxConcurrent']) &&
+            Array.isArray(value.capabilities) &&
+            value.capabilities.every(isMiniAppAgentAccess) &&
+            isAgentConcurrency(value.maxConcurrent);
+}
+function isAgentConcurrency(value) {
+    return (typeof value === 'number' &&
+        Number.isInteger(value) &&
+        value >= 1 &&
+        value <= MINIAPP_AGENT_MAX_CONCURRENCY);
+}
+function isToolPolicy(value) {
+    if (!isRecord(value))
+        return false;
+    return value.kind === 'deny-all'
+        ? hasExactKeys(value, ['kind'])
+        : value.kind === 'allowlist' &&
+            hasExactKeys(value, ['kind', 'capabilities']) &&
+            Array.isArray(value.capabilities) &&
+            value.capabilities.length > 0 &&
+            value.capabilities.every((capability) => capability === 'call');
+}
 function isStopMessage(value) {
     return isRecord(value) && hasExactKeys(value, ['type']) && value.type === 'miniapp:stop';
 }
@@ -379,14 +540,31 @@ function errorText(value) {
 function boundedLogMessage(message) {
     return message.slice(0, MAX_LOG_MESSAGE_LENGTH);
 }
-function errorCode(error) {
+function errorCode(error, listen) {
     if (error instanceof MiniAppRunnerError)
         return error.code;
-    return isRecord(error) && error.code === 'EADDRINUSE' ? error.code : 'RUNNER_START_FAILED';
+    if (!isRecord(error) || typeof error.code !== 'string')
+        return 'RUNNER_START_FAILED';
+    // EADDRINUSE stays code-only to keep the compatibility surface of existing plugins unchanged.
+    if (error.code === 'EADDRINUSE')
+        return error.code;
+    if (error.code === 'EACCES' && isHostListenFailure(error, listen))
+        return 'LISTEN_EACCES';
+    return 'RUNNER_START_FAILED';
+}
+/**
+ * `EACCES` is ambiguous (file access, other sockets, spawn). Only Node's own listen failure on
+ * the Host-assigned address carries `syscall: 'listen'` plus the matching port.
+ */
+function isHostListenFailure(error, listen) {
+    return (listen !== undefined &&
+        error.syscall === 'listen' &&
+        error.port === listen.port &&
+        (error.address === undefined || error.address === listen.host));
 }
 /** Re-validates child IPC before a runner failure crosses into the Host runtime. */
 export function normalizeMiniAppRunnerFailureCode(code) {
-    if (code === 'EADDRINUSE' || code === 'RUNNER_START_FAILED')
+    if (isMiniAppListenPortErrorCode(code) || code === 'RUNNER_START_FAILED')
         return code;
     return MINIAPP_RUNNER_ERROR_CODES.has(code)
         ? code

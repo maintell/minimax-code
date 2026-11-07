@@ -30,5 +30,10 @@ export class QuestionnaireControllerBase {
         void req;
         throw new NotImplementedError('getLatestPlanReview');
     }
+    async recordPluginRecommendationDecline(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('recordPluginRecommendationDecline');
+    }
 }
 //# sourceMappingURL=questionnaire-controller-base.gen.js.map

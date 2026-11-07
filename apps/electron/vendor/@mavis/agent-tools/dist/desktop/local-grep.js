@@ -47,16 +47,17 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     }
     return useValue ? value : void 0;
 };
-import { stat } from 'node:fs/promises';
+import { stat } from '../shared/physical-fs.js';
 import { resolve } from 'node:path';
-import { bindTool } from '@mavis/agent-core/tools';
+import { bindTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
 import { DEFAULT_GREP_OUTPUT_MODE, grepModeFlags, MAX_TOTAL_BYTES, parseCountOutput, parseFilesOutput, parseGrepOutput, splitGlobFilters, } from '../shared/grep-parse.js';
 import { withCompatibleGrepToolResponse } from '../plugin-hooks/vendor-tool-response.js';
 import { defaultScanExcludeArgs } from '../shared/rg-scan-policy.js';
 import { LocalGrepToolDef } from './builtin-defs.js';
 import { resolveGrepTarget, runRg, textResult } from './local-rg-runner.js';
 import { isSensitiveSearchRoot, sensitiveExcludeArgs } from './local-sensitive.js';
-import { applyDesktopTextLimit, createDesktopOutputContinuation, DESKTOP_GREP_CONTENT_MAX_BYTES, limitDesktopPrefixLines, withDesktopOutputContinuation, } from './output-limit.js';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
+import { applyDesktopTextLimit, createDesktopOutputContinuation, DESKTOP_GREP_CONTENT_MAX_BYTES, isPtcChildCall, limitDesktopPrefixLines, withDesktopOutputContinuation, } from './output-limit.js';
 const DEFAULT_GREP_LIMIT = 100;
 export const MAX_FILESIZE_FLAG = '1M';
 const INVALID_REGEX_ERROR_CODE = 'invalid_regex';
@@ -138,7 +139,7 @@ let LocalGrepTool = (() => {
             this.workspaceRoot = workspaceRoot;
             this.rgOptions = rgOptions;
         }
-        async execute(_ctx, input, signal) {
+        async execute(ctx, input, signal) {
             if (!input.pattern)
                 throw new Error('grep pattern is required');
             const effectiveLimit = Math.max(1, Math.floor(input.limit ?? DEFAULT_GREP_LIMIT));
@@ -150,12 +151,12 @@ let LocalGrepTool = (() => {
             // as a misleading "ripgrep binary not found" (CC stats in validateInput too).
             const target = resolveGrepTarget(this.workspaceRoot, input.path);
             if (await isSensitiveSearchRoot(resolve(target.cwd, target.searchPath))) {
-                return withCompatibleGrepToolResponse(textResult(LocalGrepToolDef.name, 'No matches found'), {
+                return reportGrep(withCompatibleGrepToolResponse(textResult(LocalGrepToolDef.name, 'No matches found'), {
                     mode,
                     filenames: [],
                     appliedLimit: effectiveLimit,
                     appliedOffset: offset,
-                });
+                }), emptyGrepData(mode));
             }
             const args = buildGrepArgs(input, effectiveLimit, target.searchPath);
             const result = await runRg(args, target.cwd, {
@@ -165,12 +166,12 @@ let LocalGrepTool = (() => {
             if (result.timedOut)
                 throw new Error('grep timed out');
             if (result.exitCode === 1) {
-                return withCompatibleGrepToolResponse(textResult(LocalGrepToolDef.name, 'No matches found'), {
+                return reportGrep(withCompatibleGrepToolResponse(textResult(LocalGrepToolDef.name, 'No matches found'), {
                     mode,
                     filenames: [],
                     appliedLimit: effectiveLimit,
                     appliedOffset: offset,
-                });
+                }), emptyGrepData(mode));
             }
             // A byte-cap kill ends the child via signal (exitCode null) — that is a
             // truncation, not a failure: fall through and parse the partial stdout.
@@ -197,19 +198,27 @@ let LocalGrepTool = (() => {
                 parsed = parseCountOutput(result.stdout, parseOpts);
             }
             else {
-                parsed = parseGrepOutput(result.stdout, { ...parseOpts, partitionContext: true });
+                parsed = parseGrepOutput(result.stdout, {
+                    ...parseOpts,
+                    partitionContext: true,
+                    // A run_code child keeps whole lines and the whole page (see isPtcChildCall).
+                    ...(isPtcChildCall(ctx) ? { uncapped: true } : {}),
+                });
             }
             const { text, details } = parsed;
             if (result.stdoutTruncated) {
                 details.stdoutTruncated = true;
             }
             if (text.trim().length === 0) {
-                return withCompatibleGrepToolResponse(textResult(LocalGrepToolDef.name, 'No matches found'), {
+                if (result.stdoutTruncated) {
+                    return reportGrep(outputCutBeforePageResult(mode, offset, effectiveLimit, details), emptyGrepData(mode));
+                }
+                return reportGrep(withCompatibleGrepToolResponse(textResult(LocalGrepToolDef.name, 'No matches found'), {
                     mode,
                     filenames: [],
                     appliedLimit: effectiveLimit,
                     appliedOffset: offset,
-                });
+                }), emptyGrepData(mode));
             }
             let modelText = text;
             if (mode === 'files_with_matches' && details.truncated === true) {
@@ -257,9 +266,26 @@ let LocalGrepTool = (() => {
                 appliedLimit: effectiveLimit,
                 appliedOffset: offset,
             });
-            if (mode !== 'content')
-                return toolResult;
+            if (mode !== 'content') {
+                return reportGrep(toolResult, mode === 'count'
+                    ? { counts: [...(parsed.facts.counts ?? [])] }
+                    : { files: [...parsed.facts.filenames] });
+            }
+            if (isPtcChildCall(ctx)) {
+                // A run_code child gets every match line of the page in full; the
+                // 16 KiB cap below is for the model (see isPtcChildCall).
+                return reportGrep(withMatchLimitContinuation(toolResult, details, offset + effectiveLimit), {
+                    matches: (parsed.matchEntries ?? []).map(({ path, line, text: matchText }) => ({
+                        path,
+                        line,
+                        text: matchText,
+                    })),
+                }, parsed.uncappedOutput === true ||
+                    Buffer.byteLength(finalText, 'utf8') > DESKTOP_GREP_CONTENT_MAX_BYTES);
+            }
             let matchLineIndexes = parsed.matchLineIndexes ?? [];
+            // Output line index of the first line still shown after leading context was dropped.
+            let shownFrom = 0;
             const retainedMatchCount = (lineCount) => matchLineIndexes.filter((lineIndex) => lineIndex < lineCount).length;
             const parserWarnings = [];
             if (typeof details.matchLimitReached === 'number') {
@@ -288,6 +314,7 @@ let LocalGrepTool = (() => {
                 const firstMatchIndex = matchLineIndexes[0];
                 if (firstMatchIndex !== undefined && firstMatchIndex > 0) {
                     const modelLines = desktopText.split('\n');
+                    shownFrom = firstMatchIndex;
                     matchLineIndexes = matchLineIndexes.map((lineIndex) => lineIndex - firstMatchIndex);
                     parserWarnings.push('leading context was omitted to keep pagination progressing');
                     desktopText = modelLines.slice(firstMatchIndex).join('\n');
@@ -340,12 +367,59 @@ let LocalGrepTool = (() => {
                     },
                 });
             }
-            return applyDesktopTextLimit(toolResult, limited);
+            // data lists only the match lines the output still shows (no context lines).
+            const shownMatches = (parsed.matchEntries ?? [])
+                .filter(({ lineIndex }) => lineIndex >= shownFrom &&
+                (!limited.truncation || lineIndex - shownFrom < limited.returnedBodyLines))
+                .map(({ path, line, text: matchText }) => ({ path, line, text: matchText }));
+            return reportGrep(withMatchLimitContinuation(applyDesktopTextLimit(toolResult, limited), details, offset + effectiveLimit), { matches: shownMatches });
         }
     };
     return LocalGrepTool = _classThis;
 })();
 export { LocalGrepTool };
+function emptyGrepData(mode) {
+    if (mode === 'content')
+        return { matches: [] };
+    return mode === 'count' ? { counts: [] } : { files: [] };
+}
+/** Every non-error return states its completeness and carries the page as data. */
+function reportGrep(result, data, uncappedOutput = false) {
+    return withDesktopCompletenessReport(LocalGrepToolDef.name, result, {
+        data,
+        ...(uncappedOutput ? { uncappedOutput } : {}),
+    });
+}
+/**
+ * ripgrep's byte cap ended its output before this page, so an empty page does
+ * not prove there are no more matches. Keep the truncation marker and say so
+ * (mirrors glob) instead of "No matches found".
+ */
+function outputCutBeforePageResult(mode, offset, limit, details) {
+    const text = `${offset > 0 ? `No more matches at offset ${offset}` : 'No matches found'}\n\n` +
+        '[Output was truncated before this page could be reached. Refine pattern/path/glob or reduce offset]';
+    return withCompatibleGrepToolResponse({
+        tool_name: LocalGrepToolDef.name,
+        text,
+        content: [{ type: 'text', text }],
+        details: { ...details, stdoutTruncated: true },
+    }, { mode, filenames: [], appliedLimit: limit, appliedOffset: offset });
+}
+/**
+ * At the match limit the next page starts at offset + limit (in matches).
+ * PTC scripts get that as a structured continuation through the programmatic
+ * side channel; details and the model text stay as they were.
+ */
+function withMatchLimitContinuation(result, details, nextOffset) {
+    if (typeof details.matchLimitReached !== 'number')
+        return result;
+    // A Desktop 16 KiB cut already names the exact next offset in details.
+    if (result.details?.desktop_output_truncation !== undefined)
+        return result;
+    return withProgrammaticResult(result, {
+        completeness: { truncated: true, nextOffset, offsetUnit: 'match' },
+    });
+}
 function isRipgrepRegexParseError(stderr) {
     return stderr.toLocaleLowerCase().includes('regex parse error:');
 }

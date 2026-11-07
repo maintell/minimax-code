@@ -20,6 +20,7 @@ import { parseLocalTelegramUpdate } from './telegram-events.js';
 import { TelegramAttachmentDownloader, } from './telegram-attachment-downloader.js';
 import { buildPermissionKeyboard, decodePermissionCallback } from './telegram-keyboard.js';
 import { LocalTelegramPollWire } from './telegram-poll-wire.js';
+import { IDLE_CHANNEL_TRANSPORT, } from '../../ingress/channel-transport-status.js';
 import { TelegramQuestionnaireRuntime } from './questionnaire/telegram-questionnaire-runtime.js';
 import { TelegramSender } from './telegram-sender.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
@@ -161,6 +162,18 @@ export class TelegramPlatformAdapter {
             return true;
         await this.buildAndStartPoller(botToken);
         return this.pollWire?.isRunning() === true;
+    }
+    /**
+     * Live receive-channel state for the Connection list; `undefined` when no
+     * inbound dispatcher is wired (the poller can never run). No wire means
+     * nothing was started (or it was stopped by us): `idle`. A wire whose
+     * poller stopped by itself (401, crash) keeps its `error` verdict until
+     * the next `startPoller` builds a new wire.
+     */
+    inboundTransportStatus() {
+        if (!this.options.dispatchInbound)
+            return undefined;
+        return this.pollWire?.transportStatus() ?? IDLE_CHANNEL_TRANSPORT;
     }
     /** Stop the long-poll. Safe to call without a started poller. */
     shutdown() {

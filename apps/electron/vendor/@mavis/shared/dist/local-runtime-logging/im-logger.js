@@ -21,6 +21,9 @@ import { createDiskLogTransport, createStructuredLogger, wrapTraceContextLogger,
  * teed into the `im-runtime-` file family. Electron's feedback upload path
  * scans that prefix (see `apps/electron/main/utils/extra-log-source.ts`), so
  * user diagnostic bundles automatically include IM audit history.
+ *
+ * 和 runtime 日志一样，每条日志在调用返回前就写进了文件；`loggerOptions.diskOnly` 打开时
+ * （桌面端打包版）只写文件，写文件失败的那一行才打到终端。
  */
 let activeDisk = null;
 let baseLogger = wrapTraceContextLogger(createStructuredLogger());
@@ -67,8 +70,7 @@ export function configureImLogger(opts = {}) {
     }
 }
 /**
- * Flush pending disk writes without tearing down the base logger. Called
- * by the feedback upload path before it reads the log directory.
+ * 日志已经是当场写进文件的，没有排队的写入要等；保留给上传日志前先调一下的调用方。
  */
 export async function flushImLogger() {
     if (!activeDisk)

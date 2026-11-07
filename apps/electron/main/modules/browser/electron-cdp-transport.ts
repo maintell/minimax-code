@@ -1,4 +1,5 @@
 import { browserTransportInterruptionError } from "@mavis/browser-core";
+import { isWebviewGuest, isGuestKeyboardCommand, sendGuestKeyboardCommand, withAgentPointer } from "./webview-guest-input.js";
 /**
  * Electron implementation of the provider-neutral BrowserPageTransport.
  *
@@ -41,12 +42,42 @@ export class ElectronCdpTransport {
     }
     async send(method, params, sessionId, options = {}) {
         this.ensureAvailable();
-        return abortableCommand(() => {
+        return abortableCommand((commandSignal) => {
+            if (sessionId === undefined && method === 'Page.reload')
+                return this.reloadPage(params);
             this.ensureAttached();
-            return (sessionId === undefined
-                ? this.webContents.debugger.sendCommand(method, params)
-                : this.webContents.debugger.sendCommand(method, params, sessionId));
+            if (isWebviewGuest(this.webContents)) {
+                // Root-session keyboard input on a <webview> reaches the focused host
+                // element, not the page; deliver it to the guest instead.
+                if (sessionId === undefined && isGuestKeyboardCommand(method))
+                    return sendGuestKeyboardCommand(this.webContents, (command, commandParams, commandSession) => this.sendDebuggerCommand(command, commandParams, commandSession), (frameId) => this.attachedFrameSession(frameId), method, params, commandSignal);
+                if (method === 'Input.dispatchMouseEvent')
+                    return withAgentPointer(this.webContents, () => this.sendDebuggerCommand(method, params, sessionId), { announce: params?.type === 'mousePressed' });
+            }
+            return this.sendDebuggerCommand(method, params, sessionId);
         }, method, options);
+    }
+    sendDebuggerCommand(method, params, sessionId) {
+        return sessionId === undefined
+            ? this.webContents.debugger.sendCommand(method, params)
+            : this.webContents.debugger.sendCommand(method, params, sessionId);
+    }
+    attachedFrameSession(frameId) {
+        for (const frame of this.attachedFrames.values())
+            if (frame.frameId === frameId)
+                return frame.sessionId;
+        return undefined;
+    }
+    /**
+     * CDP Page.reload on a `<webview>` guest reloads the outermost embedder, which
+     * is the MCode host window. Reload the page's own WebContents instead.
+     */
+    async reloadPage(params) {
+        if (params?.ignoreCache === true)
+            this.webContents.reloadIgnoringCache();
+        else
+            this.webContents.reload();
+        return {};
     }
     async evaluate(expression, options = {}) {
         this.ensureAvailable();
@@ -248,11 +279,17 @@ function asRecord(value) {
 function asString(value) {
     return typeof value === 'string' ? value : '';
 }
+/**
+ * Settles a command on cancellation or deadline. The command receives a signal
+ * that fires at the same moment, so multi-step work (guest keyboard input) can
+ * stop instead of continuing after its caller has already moved on.
+ */
 function abortableCommand(createCommand, label, options) {
     if (options.signal?.aborted) {
         return Promise.reject(browserTransportInterruptionError('ABORTED', `CDP command aborted: ${label}`));
     }
-    const command = createCommand();
+    const commandAbort = new AbortController();
+    const command = createCommand(commandAbort.signal);
     if (!options.signal && !options.timeoutMs)
         return command;
     return new Promise((resolve, reject) => {
@@ -267,10 +304,16 @@ function abortableCommand(createCommand, label, options) {
             options.signal?.removeEventListener('abort', onAbort);
             callback();
         };
-        const onAbort = () => finish(() => reject(browserTransportInterruptionError('ABORTED', `CDP command aborted: ${label}`)));
+        const onAbort = () => finish(() => {
+            commandAbort.abort();
+            reject(browserTransportInterruptionError('ABORTED', `CDP command aborted: ${label}`));
+        });
         options.signal?.addEventListener('abort', onAbort, { once: true });
         if (options.timeoutMs && options.timeoutMs > 0) {
-            timer = setTimeout(() => finish(() => reject(browserTransportInterruptionError('BROWSER_OPERATION_TIMEOUT', `CDP command timed out: ${label}`))), options.timeoutMs);
+            timer = setTimeout(() => finish(() => {
+                commandAbort.abort();
+                reject(browserTransportInterruptionError('BROWSER_OPERATION_TIMEOUT', `CDP command timed out: ${label}`));
+            }), options.timeoutMs);
             timer.unref?.();
         }
         command.then((value) => finish(() => resolve(value)), (error) => finish(() => reject(error)));

@@ -15,11 +15,17 @@ export class ArchiveTitleModelAdapter {
     }
     async summarize(input) {
         const turnId = this.makeTurnId();
+        // 记下这次生成标题用的模型要不要审，标题出来后据此决定是否送审。
+        let contentReviewRequired;
         let raw;
         try {
             raw = await completeTitleModel({
                 buildAgentConfig: this.options.buildAgentConfig,
-                resolveModel: this.options.resolveModel,
+                resolveModel: async (resolveInput) => {
+                    const resolved = await this.options.resolveModel(resolveInput);
+                    contentReviewRequired = resolved.contentReviewRequired;
+                    return resolved;
+                },
                 stream: this.options.stream,
                 nowMs: this.nowMs,
             }, { ...input, turnId });
@@ -32,6 +38,8 @@ export class ArchiveTitleModelAdapter {
         const title = raw ? parseArchiveTitleVerdict(raw) : null;
         if (!title)
             return null;
+        if (contentReviewRequired === false)
+            return title;
         return this.reviewTitle(title);
     }
     async reviewTitle(title) {

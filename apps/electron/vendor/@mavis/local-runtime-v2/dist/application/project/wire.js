@@ -1,4 +1,4 @@
-import { DEFAULT_PROJECT_KEY, requireWorkspaceProjectDir, } from '../../service/session-system/index.js';
+import { DEFAULT_PROJECT_KEY, extraDataWithoutWorkspaceRoots, projectWorkspaceRoots, requireWorkspaceProjectDir, } from '../../service/session-system/index.js';
 const DEFAULT_PROJECT_ORDER_INDEX = 2_147_483_647;
 export function toProjectReference(reference) {
     let projectKey;
@@ -18,8 +18,10 @@ export function toProjectDetail(project, sessionCount) {
     return {
         key: defaultProject ? DEFAULT_PROJECT_KEY : `workspace:${workspaceDir}`,
         projectId: project.projectId,
-        ...(workspaceDir ? { workspaceDir } : {}),
-        displayName: defaultProject ? 'No project selected' : displayName(workspaceDir ?? ''),
+        ...(workspaceDir ? { workspaceDir, workspaceRoots: projectWorkspaceRoots(project) } : {}),
+        displayName: defaultProject
+            ? 'No project selected'
+            : (project.displayName ?? displayName(workspaceDir ?? '')),
         archived: false,
         latestActivityAt: project.latestActivityAtMs,
         sessionCount,
@@ -31,7 +33,7 @@ export function toProjectDetail(project, sessionCount) {
                 : {}),
             ...(project.recentAtMs !== null ? { recentAt: project.recentAtMs } : {}),
         },
-        extraDataJson: project.extraDataJson,
+        extraDataJson: extraDataWithoutWorkspaceRoots(project.extraDataJson),
         createdAt: project.createdAtMs,
         updatedAt: project.updatedAtMs,
     };

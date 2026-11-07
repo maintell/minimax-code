@@ -1,3 +1,4 @@
+import { normalizeAbsolutePath } from '../../session-system/index.js';
 import {} from '../contracts.js';
 class CronSessionCreationError extends Error {
     code;
@@ -15,11 +16,12 @@ export function createHostCronSessionCreation(host) {
     const detachCronSessions = host.detachCronSessions;
     return {
         create: (request) => createSession(host, request),
-        rename: (sessionId, title) => host.renameSession(requireIdentifier(sessionId), requireIdentifier(title)),
+        isTargetArchived: async (sessionId) => (await host.getSession(requireIdentifier(sessionId)))?.archived === true,
+        rename: (sessionId, title, signal) => host.renameSession(requireIdentifier(sessionId), requireIdentifier(title), signal),
         discard: (sessionId) => host.discardSession(requireIdentifier(sessionId)),
         ...(detachCronSessions
             ? {
-                detach: (cronId, targetSessionId) => detachCronSessions(requireIdentifier(cronId), targetSessionId ? requireIdentifier(targetSessionId) : undefined),
+                detach: (cronId, targetSessionId, signal) => detachCronSessions(requireIdentifier(cronId), targetSessionId ? requireIdentifier(targetSessionId) : undefined, signal),
             }
             : {}),
     };
@@ -32,7 +34,7 @@ async function createSession(host, request) {
     const runCreatedAtMs = requireUnixMs(request.runCreatedAtMs);
     if (request.sessionTarget.mode === 'sessionId' && request.sessionTarget.sessionId !== undefined) {
         await requireAgent(host, requestedAgentName);
-        return resolveTargetSession(host, requestedAgentName, request.sessionTarget.sessionId);
+        return resolveTargetSession(host, requestedAgentName, request.sessionTarget.sessionId, request.project);
     }
     const agentName = requireIdentifier(await host.resolveAgentWriteTarget(requestedAgentName));
     const agent = await requireAgent(host, agentName);
@@ -60,7 +62,7 @@ async function requireAgent(host, agentName) {
         return agent;
     throw new CronSessionCreationError('CRON_SESSION_AGENT_NOT_FOUND', 'Cron session agent was not found');
 }
-async function resolveTargetSession(host, agentName, rawSessionId) {
+async function resolveTargetSession(host, agentName, rawSessionId, project) {
     const sessionId = requireIdentifier(rawSessionId);
     const session = await host.getSession(sessionId);
     if (!session) {
@@ -77,6 +79,12 @@ async function resolveTargetSession(host, agentName, rawSessionId) {
     }
     if (session.archived) {
         throw new CronSessionCreationError('CRON_SESSION_TARGET_ARCHIVED', 'Cron target session is archived');
+    }
+    if (project?.trim()) {
+        const expectedWorkspace = normalizeAbsolutePath(project);
+        if (!expectedWorkspace || expectedWorkspace !== normalizeAbsolutePath(session.workspaceDir)) {
+            throw new CronSessionCreationError('CRON_SESSION_TARGET_PROJECT_MISMATCH', 'Cron target session belongs to a different project');
+        }
     }
     return { sessionId };
 }

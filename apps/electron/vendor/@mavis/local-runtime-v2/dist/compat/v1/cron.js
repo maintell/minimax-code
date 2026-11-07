@@ -23,7 +23,7 @@ export function createV1CronAgentCleanupBridge() {
         },
     };
 }
-/** Stable adapter passed to v1 before the v2 HTTP handler exists. */
+/** Stable in-process request adapter; the delivery owner supplies its handler. */
 export function createV1MavisCronAdapterBridge() {
     let handleRequest;
     let reminders;

@@ -5,7 +5,7 @@
  * directory as the search root. Sensitive paths remain owned by
  * `rg-sensitive.ts` and are always appended after these patterns.
  */
-import { realpath } from 'node:fs/promises';
+import { realpath } from './physical-fs.js';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { braceExpand, makeRe, minimatch } from 'minimatch';
 export const DEFAULT_SCAN_DIRECTORY_NAMES = [

@@ -174,7 +174,7 @@ export function createEditToolDefinition(cwd, options) {
         async execute(_toolCallId, input, signal, _onUpdate, _ctx) {
             const { path, edits } = validateEditInput(input);
             const absolutePath = resolveToCwd(path, cwd);
-            return withFileMutationQueue(absolutePath, async () => {
+            const mutate = async () => {
                 // Do not reject from an abort event listener here: that would release the
                 // mutation queue while an in-flight filesystem operation may still finish.
                 // Checking signal.aborted after each await observes the same aborts while
@@ -231,7 +231,8 @@ export function createEditToolDefinition(cwd, options) {
                         patchOmitted,
                     },
                 };
-            });
+            };
+            return withFileMutationQueue(absolutePath, mutate, ops.realpath?.bind(ops));
         },
         renderCall(args, theme, context) {
             const component = getEditCallRenderComponent(context.state, context.lastComponent);

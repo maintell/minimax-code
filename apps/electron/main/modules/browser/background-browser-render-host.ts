@@ -2,6 +2,16 @@ import { BaseWindow } from "electron";
 import { getCategoryLogger } from "../../utils/logger";
 import { OFFSCREEN_BOUNDS } from "./embedded-browser-manager-helpers";
 const browserInputDiagnosticLogger = getCategoryLogger('archon', 'browser-input');
+/**
+ * Abort reason used when a foreground reveal takes over a target from a hidden
+ * background action. The reveal only needs the shared render slot back; page
+ * work the user is about to see (for example an in-flight navigation) must
+ * keep running in the foreground instead of being stopped.
+ */
+export let BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON = 'background-render-target-claimed-by-foreground';
+export function isBackgroundRenderForegroundClaim(signal) {
+    return signal?.reason === BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON;
+}
 export let BACKGROUND_BROWSER_RENDER_BOUNDS = {
     x: 0,
     y: 0,
@@ -216,7 +226,7 @@ export class BackgroundBrowserRenderHost {
         // ownership at dequeue time so a foreground reveal that happened while it
         // waited cannot be undone by a stale background attachment.
         if (this.isForegroundOwned(request.target)) {
-            request.controller.abort('background-render-target-claimed-by-foreground');
+            request.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
             this.settleRequest(request, 'reject', this.foregroundClaimError());
             this.startAvailableRequests();
             return;
@@ -239,20 +249,30 @@ export class BackgroundBrowserRenderHost {
         });
         void (async () => {
             let attached = false;
+            let releaseRendering;
+            let outcome = 'reject';
+            let value;
             try {
                 if (this.disposed)
                     throw this.unavailableError();
                 if (request.controller.signal.aborted)
                     throw this.abortedError();
-                const hostWindow = this.ensureWindow(slot);
-                hostWindow.setBounds({
-                    x: -10000,
-                    y: -10000,
-                    width: request.renderBounds.width,
-                    height: request.renderBounds.height,
-                });
-                request.target.attachToParent(hostWindow, request.renderBounds);
+                if (request.target.usesWebview?.() && request.target.beginBackgroundRendering) {
+                    releaseRendering = await request.target.beginBackgroundRendering(request.renderBounds);
+                }
+                else {
+                    const hostWindow = this.ensureWindow(slot);
+                    hostWindow.setBounds({
+                        x: -10000,
+                        y: -10000,
+                        width: request.renderBounds.width,
+                        height: request.renderBounds.height,
+                    });
+                    request.target.attachToParent(hostWindow, request.renderBounds);
+                }
                 attached = true;
+                if (request.controller.signal.aborted)
+                    throw this.abortedError();
                 const webContents = request.target.getWebContents();
                 if (webContents && !webContents.isDestroyed()) {
                     try {
@@ -265,22 +285,40 @@ export class BackgroundBrowserRenderHost {
                 const result = await this.runActiveOperation(request);
                 if (request.controller.signal.aborted)
                     throw this.abortedError();
-                this.settleRequest(request, 'resolve', result);
+                outcome = 'resolve';
+                value = result;
             }
             catch (error) {
-                this.settleRequest(request, 'reject', error);
+                value = error;
             }
             finally {
                 // Negative bounds detach the view while preserving the WebContents and
                 // its authenticated DOM/form state for the next action or foreground reveal.
                 if (attached && this.isBackgroundOwner(request)) {
-                    request.target.setBounds(OFFSCREEN_BOUNDS);
+                    try {
+                        if (request.target.usesWebview?.())
+                            await request.target.setBounds(OFFSCREEN_BOUNDS);
+                        else
+                            request.target.setBounds(OFFSCREEN_BOUNDS);
+                    }
+                    catch {
+                        /* Host teardown already removed the guest. */
+                    }
+                }
+                try {
+                    releaseRendering?.();
+                }
+                catch {
+                    // A destroyed guest must not prevent releasing the slot and caller.
                 }
                 if (this.isBackgroundOwner(request)) {
                     this.setTargetOwnership(request.target, 'none');
                 }
                 if (slot.activeRequest === request)
                     slot.activeRequest = null;
+                // Foreground claims must wait for the DOM layout and render lease to
+                // finish, not just the action, or late cleanup can hide the revealed page.
+                this.settleRequest(request, outcome, value);
                 this.cleanupRequest(request);
                 browserInputDiagnosticLogger.info({
                     msg: '[EmbeddedBrowserOperation] render-host-active',
@@ -317,7 +355,7 @@ export class BackgroundBrowserRenderHost {
             if (this.isForegroundOwned(request.target)) {
                 this.queue.splice(index, 1);
                 index -= 1;
-                request.controller.abort('background-render-target-claimed-by-foreground');
+                request.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
                 this.settleRequest(request, 'reject', this.foregroundClaimError());
                 continue;
             }
@@ -391,13 +429,13 @@ export class BackgroundBrowserRenderHost {
         for (const slot of this.slots) {
             const active = slot.activeRequest;
             if (active?.target === target) {
-                active.controller.abort('background-render-target-claimed-by-foreground');
+                active.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
             }
         }
         for (const request of [...this.queue]) {
             if (request.target !== target || !this.removeQueuedRequest(request))
                 continue;
-            request.controller.abort('background-render-target-claimed-by-foreground');
+            request.controller.abort(BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON);
             this.settleRequest(request, 'reject', this.foregroundClaimError());
         }
     }

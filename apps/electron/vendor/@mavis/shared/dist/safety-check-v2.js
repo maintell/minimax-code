@@ -20,6 +20,7 @@ export const SAFETY_CHECK_V2_SCENE = {
     AgentConfigName: 205,
     AgentConfigAvatar: 206,
     CronTitle: 210,
+    ProjectName: 211,
 };
 /** biz-gateway V2 HTTP verdicts; these values are not chat-server RPC actions. */
 export const GATEWAY_SAFETY_CHECK_V2_HTTP_ACTION = {
@@ -77,13 +78,15 @@ export class SafetyCheckV2Error extends Error {
 export function isSafetyCheckV2Record(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+/** 单次 SafetyCheckV2 请求的超时时间。 */
+export const SAFETY_CHECK_V2_TIMEOUT_MS = 20_000;
 /** No retry or V1 fallback: transport failures never manufacture an Allow verdict. */
 export async function postSafetyCheckV2(input) {
     let response;
     try {
         const headers = new Headers(input.headers);
         headers.set('Content-Type', 'application/json');
-        const timeout = AbortSignal.timeout(10_000);
+        const timeout = AbortSignal.timeout(SAFETY_CHECK_V2_TIMEOUT_MS);
         response = await (input.fetchImpl ?? fetch)(input.url, {
             method: 'POST',
             headers,

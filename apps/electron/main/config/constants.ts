@@ -105,10 +105,12 @@ export let IPC_CHANNELS = {
     SYSTEM_SET_THEME_SOURCE: 'system:set-theme-source',
     SYSTEM_OPEN_DIR: 'system:open-dir',
     SYSTEM_CREATE_DIR: 'system:create-dir',
+    SYSTEM_ENSURE_DEFAULT_PROJECT_DIR: 'system:ensure-default-project-dir',
     SYSTEM_OPEN_FILE_IN_FOLDER: 'system:open-file-in-folder',
     SYSTEM_SHOW_IMAGE_CONTEXT_MENU: 'system:show-image-context-menu',
     SYSTEM_GET_HOME_PATH: 'system:get-home-path',
     SYSTEM_GET_APP_INSTALL_DIR: 'system:get-app-install-dir',
+    SYSTEM_GET_APP_VERSION_SYNC: 'system:get-app-version-sync',
     // 窗口控制
     WINDOW_MINIMIZE: 'window:minimize',
     WINDOW_RESTORE: 'window:restore',
@@ -128,6 +130,8 @@ export let IPC_CHANNELS = {
     RUNTIME_MEMORY_MONITOR_START_HEAP_SAMPLING: 'runtime-memory-monitor:start-heap-sampling',
     RUNTIME_MEMORY_MONITOR_STOP_HEAP_SAMPLING: 'runtime-memory-monitor:stop-heap-sampling',
     RUNTIME_MEMORY_MONITOR_REVEAL_PROFILE: 'runtime-memory-monitor:reveal-profile',
+    GOAL_DIAGNOSTICS_EXPORT: 'goal-diagnostics:export',
+    GOAL_DIAGNOSTICS_REVEAL: 'goal-diagnostics:reveal',
     ASR_PUSH_TO_TALK_KEY_UP: 'asr:push-to-talk-key-up',
     // 菜单事件
     MENU_NEW_CHAT: 'menu:new-chat',
@@ -190,12 +194,15 @@ export let IPC_CHANNELS = {
     DESKTOP_GET_RUN_ON_STARTUP: 'desktop:get-run-on-startup',
     DESKTOP_SET_KEEP_AWAKE: 'desktop:set-keep-awake',
     DESKTOP_GET_KEEP_AWAKE: 'desktop:get-keep-awake',
+    DESKTOP_SET_FILE_OPEN_WITH_ENHANCED: 'desktop:set-file-open-with-enhanced',
+    DESKTOP_GET_FILE_OPEN_WITH_ENHANCED: 'desktop:get-file-open-with-enhanced',
     DESKTOP_START_COMPUTER_USE_RUNTIME: 'desktop:start-computer-use-runtime',
     DESKTOP_APPEARANCE_CHANGED: 'desktop:appearance-changed',
     // 全局快捷键设置
     DESKTOP_SET_GLOBAL_ACCESS_SHORTCUT: 'desktop:set-global-access-shortcut',
     DESKTOP_GET_GLOBAL_ACCESS_SHORTCUT: 'desktop:get-global-access-shortcut',
     DESKTOP_SET_SHORTCUT_OVERRIDES: 'desktop:set-shortcut-overrides',
+    DESKTOP_SHORTCUTS_CHANGED: 'desktop:shortcuts-changed',
     DESKTOP_OPEN_NOTIFICATION_SETTINGS: 'desktop:open-notification-settings',
     DESKTOP_SET_LANGUAGE: 'desktop:set-language',
     DESKTOP_GET_LOCAL_RUNTIME_DATA_DIR_INFO: 'desktop:get-local-runtime-data-dir-info',
@@ -204,10 +211,19 @@ export let IPC_CHANNELS = {
     NOTIFICATION_SHOW: 'notification:show',
     NOTIFICATION_CLICK: 'notification:click',
     // FilePanel embedded browser
+    BROWSER_BACKEND_BEGIN_REFRESH: 'browser-backend:begin-refresh',
+    BROWSER_BACKEND_APPLY_REFRESH: 'browser-backend:apply-refresh',
+    BROWSER_BACKEND_GET_DIAGNOSTICS: 'browser-backend:get-diagnostics',
+    BROWSER_BACKEND_GET_LAUNCH: 'browser-backend:get-launch',
+    BROWSER_BACKEND_LAUNCH_DECIDED: 'browser-backend:launch-decided',
+    BROWSER_TELEMETRY_REPORT: 'browser-telemetry:report',
+    BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST: 'browser-telemetry:diagnostics-request',
+    BROWSER_TELEMETRY_DIAGNOSTICS_RESPONSE: 'browser-telemetry:diagnostics-response',
     EMBEDDED_BROWSER_CREATE: 'embedded-browser:create',
     EMBEDDED_BROWSER_SHOW: 'embedded-browser:show',
     EMBEDDED_BROWSER_SET_BOUNDS: 'embedded-browser:set-bounds',
     EMBEDDED_BROWSER_SET_DEVICE_PREVIEW_MODE: 'embedded-browser:set-device-preview-mode',
+    EMBEDDED_BROWSER_UPDATE_DEVICE_PREVIEW: 'embedded-browser:update-device-preview',
     EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION: 'embedded-browser:set-native-overlay-occlusion',
     EMBEDDED_BROWSER_HIDE: 'embedded-browser:hide',
     EMBEDDED_BROWSER_DESTROY: 'embedded-browser:destroy',
@@ -224,6 +240,12 @@ export let IPC_CHANNELS = {
     EMBEDDED_BROWSER_CLEAR_CACHE: 'embedded-browser:clear-cache',
     EMBEDDED_BROWSER_SET_COMMENT_MODE: 'embedded-browser:set-comment-mode',
     EMBEDDED_BROWSER_CLEAR_COMMENTS: 'embedded-browser:clear-comments',
+    EMBEDDED_BROWSER_RESOLVE_SENT_COMMENTS: 'embedded-browser:resolve-sent-comments',
+    EMBEDDED_BROWSER_REMOVE_COMMENT: 'embedded-browser:remove-comment',
+    /** main → renderer: the page composer's mic was pressed. */
+    EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST: 'embedded-browser:comment-voice-request',
+    /** renderer → main: ASR state/transcript for the page composer. */
+    EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE: 'embedded-browser:comment-voice-update',
     EMBEDDED_BROWSER_ACK_COMMENT_EVENTS: 'embedded-browser:ack-comment-events',
     EMBEDDED_BROWSER_COMMENT_BRIDGE_EVENT: 'embedded-browser:comment-bridge-event',
     EMBEDDED_BROWSER_AGENT_CURSOR_EVENT: 'embedded-browser:agent-cursor-event',
@@ -231,14 +253,60 @@ export let IPC_CHANNELS = {
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
     EMBEDDED_BROWSER_CAPTURE_FRAME: 'embedded-browser:capture-frame',
     EMBEDDED_BROWSER_AGENT_ACTION: 'embedded-browser:agent-action',
+    /** renderer → main: find text in a Browser tab page (shared Cmd/Ctrl+F bar). */
+    EMBEDDED_BROWSER_FIND_IN_PAGE: 'embedded-browser:find-in-page',
+    EMBEDDED_BROWSER_STOP_FIND_IN_PAGE: 'embedded-browser:stop-find-in-page',
+    /** main → renderer: progress of a tab's latest find request. */
+    EMBEDDED_BROWSER_FIND_RESULT: 'embedded-browser:find-result',
+    /** main → renderer: Cmd/Ctrl+F was pressed inside a Browser page. */
+    EMBEDDED_BROWSER_FIND_REQUESTED: 'embedded-browser:find-requested',
+    EMBEDDED_BROWSER_TAB_RECOVERED: 'embedded-browser:tab-recovered',
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
     MINIAPP_REFRESH: 'miniapp:refresh',
     MINIAPP_STOP: 'miniapp:stop',
+    MINIAPP_DETACH: 'miniapp:detach',
+    MINIAPP_ATTACH: 'miniapp:attach',
+    MINIAPP_APPLY_UPDATE: 'miniapp:apply-update',
+    // Host renderer -> Main: list / switch the permissions a Mini App declares (plugin detail).
+    MINIAPP_PERMISSIONS_LIST: 'miniapp:permissions-list',
+    MINIAPP_PERMISSIONS_SET: 'miniapp:permissions-set',
     MINIAPP_COMPOSER_APPEND: 'miniapp:composer-append',
     MINIAPP_COMPOSER_REQUEST: 'miniapp:composer-request',
     MINIAPP_COMPOSER_REPLY: 'miniapp:composer-reply',
+    MINIAPP_TOOL_PERMISSION_REQUEST: 'miniapp:tool-permission-request',
+    MINIAPP_TOOL_PERMISSION_REPLY: 'miniapp:tool-permission-reply',
+    MINIAPP_TOOL_PERMISSION_CANCEL: 'miniapp:tool-permission-cancel',
+    MINIAPP_TOOL_REQUEST: 'miniapp:tool-request',
+    MINIAPP_AGENT_RUN: 'miniapp:agent-run',
+    MINIAPP_AGENT_CANCEL: 'miniapp:agent-cancel',
+    MINIAPP_AGENT_EVENT: 'miniapp:agent-event',
+    MINIAPP_AGENT_REPLY: 'miniapp:agent-reply',
+    MINIAPP_AGENT_ANSWER: 'miniapp:agent-answer',
+    MINIAPP_AGENT_OPEN: 'miniapp:agent-open',
+    MINIAPP_AGENT_MODELS: 'miniapp:agent-models',
+    MINIAPP_AGENT_AGENTS: 'miniapp:agent-agents',
+    MINIAPP_AGENT_CREATE: 'miniapp:agent-create',
+    // Page -> Main: long-lived observer; its events share MINIAPP_AGENT_EVENT and its cancel
+    // MINIAPP_AGENT_CANCEL, both keyed by its requestId (page-chosen, or generated by the preload).
+    MINIAPP_AGENT_OBSERVE: 'miniapp:agent-observe',
+    MINIAPP_AGENT_SESSIONS: 'miniapp:agent-sessions',
+    MINIAPP_AGENT_SESSION: 'miniapp:agent-session',
+    // Main -> Host renderer: show a Mini App session in the host chat's side panel.
+    MINIAPP_AGENT_OPEN_SESSION: 'miniapp:agent-open-session',
+    // Host renderer -> Main: the preload's answer to MINIAPP_AGENT_OPEN_SESSION (same requestId).
+    MINIAPP_AGENT_OPEN_SESSION_REPLY: 'miniapp:agent-open-session-reply',
+    // Host renderer -> Main: the user closed a Mini App session tab.
+    MINIAPP_AGENT_PANEL_CLOSED: 'miniapp:agent-panel-closed',
+    // Page-facing window handle; invoked only by the Mini App preload.
+    MINIAPP_WINDOW_GET_STATE: 'miniapp:window-get-state',
+    MINIAPP_WINDOW_UPDATE: 'miniapp:window-update',
+    MINIAPP_WINDOW_FOCUS: 'miniapp:window-focus',
+    // Page-facing `window.mcode.miniapp.speech.transcribe`; invoked only by the Mini App preload.
+    MINIAPP_SPEECH_TRANSCRIBE: 'miniapp:speech-transcribe',
+    // Main -> page: partial transcript of one transcribe request (same requestId).
+    MINIAPP_SPEECH_PARTIAL: 'miniapp:speech-partial',
     // Browser profile import (trusted host renderer only)
     BROWSER_PROFILE_IMPORT_LIST: 'browser-profile-import:list',
     BROWSER_PROFILE_IMPORT_START: 'browser-profile-import:start',
@@ -254,6 +322,7 @@ export let IPC_CHANNELS = {
     UPDATER_OPEN_MODAL: 'updater:open-modal', // 通知渲染进程打开更新弹窗
     // Deep Link
     DEEPLINK_RECEIVED: 'deeplink:received',
+    DEEPLINK_TAKE_WORKSPACE_OPEN: 'deeplink:take-workspace-open',
     // file tools
     FILE_READ: 'file:read',
     FILE_STAGE_ATTACHMENT: 'file:stage-attachment',
@@ -331,6 +400,7 @@ export let IPC_CHANNELS = {
     RUNTIME_FAILED: 'runtime:failed',
     RUNTIME_CHECK_READY: 'runtime:check-ready',
     RUNTIME_SET_RUNAWAY_GUARD_CONFIG: 'runtime:set-runaway-guard-config',
+    RUNTIME_SET_PROMPT_SUGGESTION_POLICY: 'runtime:set-prompt-suggestion-policy',
     RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG: 'runtime:set-tool-result-compaction-config',
     RUNTIME_SET_COLLECTION_POLICY_CONFIG: 'runtime:set-collection-policy-config',
     // Always-on Electron utility-process runtime transport.
@@ -338,6 +408,34 @@ export let IPC_CHANNELS = {
     RUNTIME_TRANSPORT_GET_CURRENT: 'runtime:transport-get-current',
     RUNTIME_TRANSPORT_REQUEST_SWITCH: 'runtime:transport-request-switch',
     RUNTIME_TRANSPORT_LOST: 'runtime:transport-lost',
+    SSH_CONNECTIONS_LIST: 'ssh-connections:list',
+    SSH_CONNECTIONS_OPERATION_STATES: 'ssh-connections:operation-states',
+    SSH_CONNECTIONS_OPERATION_STATE: 'ssh-connections:operation-state',
+    SSH_CONNECTIONS_ADD: 'ssh-connections:add',
+    SSH_CONNECTIONS_CANCEL_ADD: 'ssh-connections:cancel-add',
+    SSH_CONNECTIONS_ADD_PROGRESS: 'ssh-connections:add-progress',
+    SSH_CONNECTIONS_UPDATE: 'ssh-connections:update',
+    SSH_CONNECTIONS_SET_ENABLED: 'ssh-connections:set-enabled',
+    SSH_CONNECTIONS_REMOTE_ACCOUNT: 'ssh-connections:remote-account',
+    SSH_CONNECTIONS_REMOVE: 'ssh-connections:remove',
+    SSH_CONNECTIONS_DISCOVER: 'ssh-connections:discover',
+    SSH_CONNECTIONS_PROBE: 'ssh-connections:probe',
+    SSH_CONNECTIONS_CONNECT: 'ssh-connections:connect',
+    SSH_CONNECTIONS_SETUP_CLI: 'ssh-connections:setup-cli',
+    SSH_CONNECTIONS_LIST_DIRECTORIES: 'ssh-connections:list-directories',
+    SSH_PROJECTS_LIST: 'ssh-projects:list',
+    SSH_PROJECTS_CREATE: 'ssh-projects:create',
+    SSH_PROJECTS_UPDATE: 'ssh-projects:update',
+    SSH_PROJECTS_REMOVE: 'ssh-projects:remove',
+    SSH_PROJECTS_UPLOAD_ATTACHMENT: 'ssh-projects:upload-attachment',
+    PROJECT_RUNTIME_TRANSPORT_REQUEST_PORT: 'project-runtime:transport-request-port',
+    PROJECT_RUNTIME_TRANSPORT_DISCONNECT: 'project-runtime:transport-disconnect',
+    PROJECT_RUNTIME_GET_STATUS: 'project-runtime:get-status',
+    PROJECT_RUNTIME_TRANSPORT_LOST: 'project-runtime:transport-lost',
+    PROJECT_RUNTIME_FAILED: 'project-runtime:failed',
+    PROJECT_RUNTIME_STATUS: 'project-runtime:status',
+    PROJECT_RUNTIME_NETWORK_ONLINE: 'project-runtime:network-online',
+    PROJECT_RUNTIME_ACTIVE_PROJECT: 'project-runtime:active-project',
     LOCAL_ASR_SESSION_OPEN: 'local-asr:session-open',
     LOCAL_ASR_SESSION_FRAME: 'local-asr:session-frame',
     LOCAL_ASR_SESSION_AUDIO: 'local-asr:session-audio',
@@ -408,6 +506,15 @@ export let IPC_CHANNELS = {
     // process owns the unbind HTTP call (kept for the account-switch path,
     // which has no renderer axios available).
     RC_MARK_UNBOUND: 'rc:mark-unbound',
+    // Renderer → main: "用户点了解绑，请给我这次 producer 全删的 request_id"。
+    // request_id 由 main 生成并持久化（ADR-011 D12：renderer 刷新会丢），
+    // 已存在未确认记录时复用同一个 id —— 幂等重放靠的就是它（方案 §4.5.4）。
+    RC_BEGIN_UNBIND: 'rc:begin-unbind',
+    // Renderer → main: 冷启动时读取未确认解绑记录，用于恢复重放。
+    RC_GET_PENDING_UNBIND: 'rc:get-pending-unbind',
+    // Renderer → main: 解绑得到**确定结果**（confirmed / rejected）。
+    // 超时与网络错误不走这里 —— 那些保持待确认，不能凭 HTTP 超时判定未解绑。
+    RC_RESOLVE_UNBIND: 'rc:resolve-unbind',
     RC_PUBLISH_SESSION_COMPOSER_MODE: 'rc:publish-session-composer-mode',
     RC_SESSION_COMPOSER_MODE_CHANGED: 'rc:session-composer-mode-changed',
     // 应用生命周期
@@ -415,17 +522,17 @@ export let IPC_CHANNELS = {
     APP_QUIT_CONFIRMATION_REQUEST: 'app:quit-confirmation-request',
     APP_QUIT_CONFIRMATION_RESULT: 'app:quit-confirmation-result',
     APP_QUIT_CONFIRMATION_ABORT: 'app:quit-confirmation-abort',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST: 'miniapp:window-transfer-confirmation-request',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT: 'miniapp:window-transfer-confirmation-result',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT: 'miniapp:window-transfer-confirmation-abort',
     APP_CONFIRM_QUIT: 'app:confirm-quit',
     APP_BRING_TO_FRONT: 'app:bring-to-front',
     // Dock file drop (macOS)
     DOCK_FILE_OPENED: 'dock:file-opened',
+    DOCK_FILE_RECEIVER_READY: 'dock:file-receiver-ready',
 };
 /** 全局快捷键键值 */
 export let SHORTCUT_KEYS = {
     MINI_CHAT_CREATE: 'miniChatCreate',
     MINI_CHAT_TOGGLE: 'miniChat.toggle',
-};
-/** 全局快捷键默认值 */
-export let DEFAULT_SHORTCUT = {
-    MINI_CHAT_CREATE: 'Alt+A',
 };

@@ -29,4 +29,14 @@ export function isLegacyMemoryCleanupTitle(title) {
 export function isSelfReminderId(cronId) {
     return /^self-[a-f0-9]{32}$/.test(cronId ?? '');
 }
+/** 云端自提醒占用的保留名称前缀，与 archon_server 的 `selfReminderNamePrefix` 一致。 */
+export const SELF_REMINDER_NAME_PREFIX = '@self-reminder/';
+/** 云端按保留名称识别自提醒；名称是会话摘要，只用于唯一性，不展示给用户。 */
+export function isSelfReminderName(cronName) {
+    return (cronName ?? '').trim().toLowerCase().startsWith(SELF_REMINDER_NAME_PREFIX);
+}
+/** 自提醒的用户可见名称。本地运行时写入定义，云端由 UI 按任务 ID 生成。 */
+export function formatSelfReminderName(reminderId) {
+    return `Task follow-up (${reminderId.slice(-8)})`;
+}
 //# sourceMappingURL=cron-purpose.js.map

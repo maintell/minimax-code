@@ -7,6 +7,18 @@ import { readMiniMaxPluginPackage } from './minimax-reader.js';
 import { computeMiniAppPackageDigests, computePluginDirectoryDigest, PluginPackageContractError, } from './package-contract.js';
 import { PluginReaderError } from './reader-errors.js';
 const LOCAL_PLUGIN_SCAN_CONCURRENCY = 4;
+/**
+ * Whether a package declares a capability the Desktop loads. Installing, importing, and listing
+ * all use this one check, so a package that one path accepts is never rejected by another.
+ */
+export function hasSupportedCapability(plugin) {
+    return (plugin.apps.length > 0 ||
+        plugin.skills.length > 0 ||
+        plugin.mcpServers.length > 0 ||
+        (plugin.hooks?.length ?? 0) > 0 ||
+        (plugin.agents?.length ?? 0) > 0 ||
+        Boolean(plugin.miniapp));
+}
 export function readMiniMaxPlugin(packageRoot, options) {
     return readMiniMaxPluginPackage(packageRoot, options);
 }
@@ -47,6 +59,21 @@ export async function readLocalMiniMaxPluginPackage(packageRoot, options = {}) {
         requireMiniApp: options.requireMiniApp,
     });
     return digestScannedPackage(plugin, options);
+}
+/**
+ * Reads a linked root in place. A manifest file in the directory wins; the
+ * declared manifest applies only when the directory has none. Plugin data stays
+ * under `dataDir`, never beside the linked directory.
+ */
+export async function readLinkedPluginPackage(rootPath, options) {
+    const root = await canonicalizePluginRoot(rootPath, { rejectSymlink: true });
+    const detected = await detectLocalPluginPackage(root.path, root, options.dataDir);
+    if (detected)
+        return digestScannedPackage(detected);
+    if (!options.declaredManifest) {
+        throw new PluginReaderError('PLUGIN_MANIFEST_MISSING', 'Plugin manifest is missing');
+    }
+    return digestScannedPackage(await readCompatiblePluginPackage(root.path, { declaredManifest: options.declaredManifest }));
 }
 export async function scanLocalPluginPackages(pluginsRoot) {
     try {
@@ -109,9 +136,9 @@ async function readLocalPluginCandidate(candidate) {
         };
     }
 }
-async function detectLocalPluginPackage(rootPath, root) {
+async function detectLocalPluginPackage(rootPath, root, dataDir = path.dirname(path.dirname(rootPath))) {
     if (await pluginPathExists(root, 'plugin.json', 'file')) {
-        const agentPlugin = await tryReadAgentPluginPackage(rootPath);
+        const agentPlugin = await tryReadAgentPluginPackage(rootPath, dataDir);
         if (agentPlugin)
             return agentPlugin;
     }
@@ -172,13 +199,13 @@ async function readCandidatePackage(rootPath, manifests) {
         return readCompatiblePluginPackage(rootPath, { kind: 'CODEX' });
     throw new PluginReaderError('PLUGIN_MANIFEST_MISSING', 'Plugin manifest is missing');
 }
-async function tryReadAgentPluginPackage(rootPath) {
+async function tryReadAgentPluginPackage(rootPath, dataDir) {
     try {
         // A root plugin.json wins only after the Agent Plugins reader accepts the
         // complete portable manifest. An ordinary or malformed root plugin.json
         // therefore cannot shadow a valid MiniMax or compatible vendor manifest.
         return await readAgentPluginPackage(rootPath, {
-            dataDir: path.dirname(path.dirname(rootPath)),
+            dataDir,
             createPluginData: true,
         });
     }

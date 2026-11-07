@@ -1,8 +1,18 @@
-import { configureLocalPluginHookEnabledResolver, configureLocalPluginHookObservability, configureLocalPluginHookSessionEndFence, endAllLocalPluginHookSessionsForLogout, } from '../../service/turn-system/index.js';
-import { createRuntimePluginAuthContextNotifier } from './runtime-services-lifecycle.js';
-/** Binds process-local Plugin Hook observation, SessionEnd fencing, and auth lifecycle. */
+import { initializeHookConfigService, } from '../../service/hook-config/index.js';
+import { configureLocalConfigHookSource, configureLocalPluginHookEnabledResolver, configureLocalPluginHookObservability, configureLocalPluginHookSessionEndFence, endAllLocalPluginHookSessionsForLogout, } from '../../service/turn-system/index.js';
+import { createRuntimePluginAuthContextNotifier, } from './runtime-services-lifecycle.js';
+/**
+ * Binds process-local Plugin Hook observation, SessionEnd fencing, auth
+ * lifecycle, and the user / project config hooks merged ahead of Plugin hooks.
+ */
 export function configureRuntimePluginHooks(input) {
     const { plugin, turnSystem } = input;
+    const hookConfig = initializeHookConfigService({
+        dataDir: input.dataDir,
+        ...(input.nowMs ? { nowMs: input.nowMs } : {}),
+        ...(input.logger ? { logger: input.logger } : {}),
+    });
+    configureLocalConfigHookSource(hookConfig.turnHooks);
     configureLocalPluginHookEnabledResolver(() => plugin.enabledHookPluginNames());
     configureLocalPluginHookSessionEndFence({
         run: async (fenceInput) => {
@@ -54,11 +64,12 @@ export function configureRuntimePluginHooks(input) {
         ...(input.logger ? { logger: input.logger } : {}),
         ...(input.metrics ? { metrics: input.metrics } : {}),
     });
-    return createRuntimePluginAuthContextNotifier({
+    const notifyAuthContextChanged = createRuntimePluginAuthContextNotifier({
         authContextChanged: () => plugin.authContextChanged(),
         enabledHookPluginNames: () => plugin.enabledHookPluginNames(),
         abortSession: (sessionId) => turnSystem.turns.abort({ sessionId, reason: 'logout' }),
         endAllSessionsForLogout: endAllLocalPluginHookSessionsForLogout,
     });
+    return { notifyAuthContextChanged, hookConfig: hookConfig.management };
 }
 //# sourceMappingURL=runtime-plugin-hook-composition.js.map

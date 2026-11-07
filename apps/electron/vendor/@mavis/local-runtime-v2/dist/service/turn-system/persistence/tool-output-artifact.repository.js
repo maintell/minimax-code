@@ -13,27 +13,17 @@ const READABLE_FORMAT = `chunked_jsonl_v${READABLE_FORMAT_VERSION}`;
 // At most 64 KiB for one UTF-8 conversion even if every UTF-16 code unit is
 // encoded independently as a three-byte replacement character.
 const RAW_WRITE_CHUNK_CODE_UNITS = 16 * 1_024;
+/** Located read-grant paths kept per process; each entry is a short path pair. */
+const READABLE_DIRECTORY_CACHE_LIMIT = 512;
 /** Persists oversized tool text under the Session-owned reports directory. */
 export class ToolOutputArtifactRepository {
     options;
+    readableDirectories = new Map();
     constructor(options) {
         this.options = options;
     }
     async write(input) {
-        const reportsDirectory = await this.options.resolveSessionReportsDirectory(input.sessionId);
-        const directory = join(reportsDirectory, TOOL_OUTPUT_DIRECTORY);
-        await mkdir(directory, { recursive: true, mode: 0o700 });
-        const [canonicalReportsDirectory, canonicalDirectory] = await Promise.all([
-            realpath(reportsDirectory),
-            realpath(directory),
-        ]);
-        if (!isPathInside(canonicalDirectory, canonicalReportsDirectory)) {
-            throw new Error('Tool output artifact directory escapes its Session reports directory.');
-        }
-        const directoryInfo = await lstat(canonicalDirectory);
-        if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
-            throw new Error('Tool output artifact directory is not a safe directory.');
-        }
+        const canonicalDirectory = await this.resolveDirectory(input.sessionId);
         const identity = artifactIdentity(input);
         const artifactPath = join(canonicalDirectory, identity.fileName);
         await ensureRawArtifact(artifactPath, input.text, identity.contentSha256);
@@ -63,22 +53,151 @@ export class ToolOutputArtifactRepository {
             },
         };
     }
+    /** Persists a tool result image so history can name a file instead of carrying it. */
+    async writeImage(input) {
+        const canonicalDirectory = await this.resolveDirectory(input.sessionId);
+        const bytes = Buffer.from(input.data, 'base64');
+        const contentSha256 = createHash('sha256').update(bytes).digest('hex');
+        const artifactPath = join(canonicalDirectory, `${callDigest(input)}-${contentSha256}.${imageExtension(input.mimeType)}`);
+        const expected = { bytes: bytes.length, sha256: contentSha256 };
+        const existing = await readSafeFileInfo(artifactPath, 'Existing tool output image');
+        if (existing) {
+            await verifyArtifactInfo(artifactPath, existing, expected, 'Existing tool output image');
+        }
+        else {
+            await publishArtifactAtomically(artifactPath, 'Existing tool output image', async (handle) => {
+                await handle.writeFile(bytes);
+                return expected;
+            });
+        }
+        return { reference: artifactPath };
+    }
+    /** Where this Session's tool output is written; it may not exist yet. */
+    async directory(sessionId) {
+        return join(await this.options.resolveSessionReportsDirectory(sessionId), TOOL_OUTPUT_DIRECTORY);
+    }
+    /**
+     * The Session's own tool-output directory, published to the permission layer
+     * as the Session's read grant. The runtime hands the Agent a path when it
+     * externalizes an oversized tool result, so the Agent must be able to read
+     * that artifact back.
+     *
+     * Side-effect free: the location comes from a read-only lookup (no history
+     * binding, no directory creation), so Sessions that never externalized a
+     * result pay nothing. `undefined` means there is nothing to grant: the
+     * Session is unknown, nothing has been written yet, or the directory fails
+     * the same safety checks the writer applies.
+     *
+     * The grant is the located (lexical) path, never its realpath. Resolving it
+     * here would erase any symlink swapped into an ancestor such as `reports/`
+     * before the permission layer could see it; the permission layer
+     * canonicalizes the lexical path itself and rejects a root reached through
+     * any symlink below the private runtime root.
+     *
+     * Only the located path is cached, bounded by count. The directory itself is
+     * re-validated on every call, so a deleted or swapped-in directory is never
+     * granted from a stale cache entry.
+     */
+    async readableDirectory(sessionId) {
+        const located = await this.locateReadableDirectory(sessionId);
+        if (!located)
+            return undefined;
+        if (!(await isSafeExistingDirectory(located.reports, located.directory))) {
+            this.readableDirectories.delete(sessionId);
+            return undefined;
+        }
+        this.rememberReadableDirectory(sessionId, located);
+        return located.directory;
+    }
+    async locateReadableDirectory(sessionId) {
+        const cached = this.readableDirectories.get(sessionId);
+        if (cached)
+            return cached;
+        const inspect = this.options.inspectSessionReportsDirectory;
+        if (!inspect)
+            return undefined;
+        const reports = await inspect(sessionId);
+        return reports ? { reports, directory: join(reports, TOOL_OUTPUT_DIRECTORY) } : undefined;
+    }
+    rememberReadableDirectory(sessionId, location) {
+        // Refresh recency, then evict the least recently used entries.
+        this.readableDirectories.delete(sessionId);
+        this.readableDirectories.set(sessionId, location);
+        while (this.readableDirectories.size > READABLE_DIRECTORY_CACHE_LIMIT) {
+            const oldest = this.readableDirectories.keys().next().value;
+            if (oldest === undefined)
+                break;
+            this.readableDirectories.delete(oldest);
+        }
+    }
+    async resolveDirectory(sessionId) {
+        const reportsDirectory = await this.options.resolveSessionReportsDirectory(sessionId);
+        const directory = join(reportsDirectory, TOOL_OUTPUT_DIRECTORY);
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        const [canonicalReportsDirectory, canonicalDirectory] = await Promise.all([
+            realpath(reportsDirectory),
+            realpath(directory),
+        ]);
+        if (!isPathInside(canonicalDirectory, canonicalReportsDirectory)) {
+            throw new Error('Tool output artifact directory escapes its Session reports directory.');
+        }
+        const directoryInfo = await lstat(canonicalDirectory);
+        if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
+            throw new Error('Tool output artifact directory is not a safe directory.');
+        }
+        return canonicalDirectory;
+    }
 }
-function isPathInside(candidate, parent) {
-    const pathFromParent = relative(parent, candidate);
-    return pathFromParent !== '' && !pathFromParent.startsWith('..') && !isAbsolute(pathFromParent);
+function imageExtension(mimeType) {
+    const subtype = mimeType.toLowerCase().split('/')[1]?.split(/[;+]/u)[0];
+    if (subtype === 'jpeg')
+        return 'jpg';
+    return subtype && /^[a-z0-9]{1,8}$/u.test(subtype) ? subtype : 'bin';
 }
-function artifactIdentity(input) {
-    // The reports directory already scopes artifacts to a Session. Exclude the
-    // projecting turn so the same historical tool result keeps one stable path.
-    const callDigest = createHash('sha256')
+function callDigest(input) {
+    return createHash('sha256')
         .update(input.toolCallId)
         .update('\0')
         .update(input.toolName)
         .digest('hex')
         .slice(0, 24);
+}
+function isPathInside(candidate, parent) {
+    const pathFromParent = relative(parent, candidate);
+    return pathFromParent !== '' && !pathFromParent.startsWith('..') && !isAbsolute(pathFromParent);
+}
+/**
+ * Whether an existing tool-output directory passes the writer's safety checks,
+ * without creating anything: it must be a real directory (not a symlink) whose
+ * canonical path stays inside the canonical reports directory. Symlinks in
+ * higher ancestors are the permission layer's job (see `readableDirectory`).
+ */
+async function isSafeExistingDirectory(reportsDirectory, directory) {
+    try {
+        const directoryInfo = await lstat(directory);
+        if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink())
+            return false;
+        const [canonicalReportsDirectory, canonicalDirectory] = await Promise.all([
+            realpath(reportsDirectory),
+            realpath(directory),
+        ]);
+        return isPathInside(canonicalDirectory, canonicalReportsDirectory);
+    }
+    catch (error) {
+        if (isMissingPathError(error))
+            return false;
+        throw error;
+    }
+}
+function isMissingPathError(error) {
+    const code = typeof error === 'object' && error !== null ? Reflect.get(error, 'code') : undefined;
+    return code === 'ENOENT' || code === 'ENOTDIR';
+}
+function artifactIdentity(input) {
+    // The reports directory already scopes artifacts to a Session. Exclude the
+    // projecting turn so the same historical tool result keeps one stable path.
     const contentSha256 = sha256Text(input.text);
-    const baseName = `${callDigest}-${contentSha256}`;
+    const baseName = `${callDigest(input)}-${contentSha256}`;
     return {
         fileName: `${baseName}.txt`,
         readableFileName: `${baseName}.readable.v${READABLE_FORMAT_VERSION}.jsonl`,

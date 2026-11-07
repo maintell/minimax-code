@@ -15,6 +15,7 @@ export const PERMISSION_CONFIG_DEFAULTS = {
     storageWriteVersion: 2,
     classifierTimeoutMs: 60_000,
     userConfirmationEnabled: true,
+    nativeDelete: false,
 };
 /**
  * Parse the `permission:` block from raw config. Values below the
@@ -42,6 +43,13 @@ export function parsePermissionConfig(raw, defaults = PERMISSION_CONFIG_DEFAULTS
     const userConfirmationEnabled = typeof obj.userConfirmationEnabled === 'boolean'
         ? obj.userConfirmationEnabled
         : defaults.userConfirmationEnabled;
-    return { policyOwner, storageWriteVersion, classifierTimeoutMs, userConfirmationEnabled };
+    const nativeDelete = obj.nativeDelete === true;
+    return {
+        policyOwner,
+        storageWriteVersion,
+        classifierTimeoutMs,
+        userConfirmationEnabled,
+        nativeDelete,
+    };
 }
 //# sourceMappingURL=permission-config.js.map

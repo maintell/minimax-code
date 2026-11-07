@@ -23,6 +23,7 @@ import { logger } from './host-utils.js';
 export function createToolPermissionContext(config) {
     const ctx = Object.freeze({
         mode: config.mode ?? 'default',
+        nativeDelete: config.nativeDelete ?? false,
         rules: Object.freeze([...(config.rules ?? [])]),
         sandboxEnabled: config.sandboxEnabled ?? false,
         autoAllowBashIfSandboxed: config.autoAllowBashIfSandboxed ?? false,
@@ -32,6 +33,7 @@ export function createToolPermissionContext(config) {
         allowedWorkingPaths: Object.freeze([...(config.allowedWorkingPaths ?? [])]),
         sandboxAllowPaths: Object.freeze([...(config.sandboxAllowPaths ?? [])]),
         trustedExactWritePaths: Object.freeze([...(config.trustedExactWritePaths ?? [])]),
+        sessionOwnedReadablePaths: Object.freeze([...(config.sessionOwnedReadablePaths ?? [])]),
         dataDir: config.dataDir,
         homeDir: config.homeDir,
         isFile: config.isFile,
@@ -40,12 +42,6 @@ export function createToolPermissionContext(config) {
         allowManagedPermissionRulesOnly: config.allowManagedPermissionRulesOnly ?? false,
         interactiveTools: Object.freeze(new Set(config.interactiveTools ?? ['question'])),
     });
-    logger.info({
-        mode: ctx.mode,
-        ruleCount: ctx.rules.length,
-        sandboxEnabled: ctx.sandboxEnabled,
-        workingDirectory: ctx.workingDirectory,
-    }, 'Created ToolPermissionContext');
     return ctx;
 }
 // ---------------------------------------------------------------------------
@@ -76,6 +72,7 @@ export function applyPermissionUpdate(ctx, update) {
 function cloneContextWith(ctx, patch) {
     return Object.freeze({
         mode: patch.mode ?? ctx.mode,
+        nativeDelete: ctx.nativeDelete,
         rules: Object.freeze([...(patch.rules ?? ctx.rules)]),
         sandboxEnabled: ctx.sandboxEnabled,
         autoAllowBashIfSandboxed: ctx.autoAllowBashIfSandboxed,
@@ -85,6 +82,7 @@ function cloneContextWith(ctx, patch) {
         allowedWorkingPaths: ctx.allowedWorkingPaths,
         sandboxAllowPaths: ctx.sandboxAllowPaths,
         trustedExactWritePaths: ctx.trustedExactWritePaths,
+        sessionOwnedReadablePaths: ctx.sessionOwnedReadablePaths,
         dataDir: ctx.dataDir,
         homeDir: ctx.homeDir,
         isFile: ctx.isFile,

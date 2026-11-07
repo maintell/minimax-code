@@ -7,8 +7,12 @@ export const PROJECT_REPOSITORY_CAPABILITIES = [
     'ensureDefault',
     'listPage',
     'listRecent',
+    'setIcon',
+    'setDisplayName',
+    'setMetadata',
     'setPinned',
     'setHidden',
+    'restoreSessionAfterRemoval',
     'putOrder',
     'touchRecent',
 ];

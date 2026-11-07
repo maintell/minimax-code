@@ -1,6 +1,8 @@
 import { Agent } from '@earendil-works/pi-agent-core';
 import { projectAgentMessagesForModel } from './outbound-message-normalizer.js';
+import { resolveMaxImagesPerRequest } from './request-image-limit.js';
 import { failureReason } from './terminal.js';
+import { newRuntimeTool } from './tools.js';
 export function toPiUserMessage(input) {
     const message = {
         role: 'user',
@@ -55,11 +57,29 @@ export function newAgent(turn) {
                     undetermined_image_mime_types: outbound.undeterminedImageMimeTypes,
                 }, '[pi-turn-runner] kept provider-bound images whose dimensions could not be determined');
             }
+            if (outbound.omittedImageCount > 0) {
+                // History keeps every image; only this request copy drops the oldest
+                // ones so it stays within the model's per-request image limit (#425).
+                turn.logger.info({
+                    event: 'outbound_images_limited',
+                    session_id: turn.input.sessionId,
+                    turn_id: turn.input.turnId,
+                    provider: turn.llm.model.provider,
+                    omitted_image_count: outbound.omittedImageCount,
+                    max_images_per_request: resolveMaxImagesPerRequest(turn.llm.model),
+                }, '[pi-turn-runner] replaced older provider-bound images with placeholders');
+            }
             return outbound.messages;
         },
         streamFn: turn.streamFn,
         getApiKey: (provider) => (provider === turn.llm.model.provider ? turn.llm.apiKey : undefined),
         toolExecution: 'parallel',
+        ...(turn.input.toolConfig.missingToolMessage
+            ? { missingToolMessage: turn.input.toolConfig.missingToolMessage }
+            : {}),
+        ...(turn.input.toolConfig.resolveMissingTool
+            ? { resolveMissingTool: (toolCall) => resolveMissingTool(turn, toolCall) }
+            : {}),
         sessionId: turn.input.sessionId,
         ...(turn.input.shouldStopAfterSteering
             ? { shouldStopAfterSteering: turn.input.shouldStopAfterSteering }
@@ -67,9 +87,44 @@ export function newAgent(turn) {
         ...(turn.input.shouldStopAfterTurn
             ? { shouldStopAfterTurn: turn.input.shouldStopAfterTurn }
             : {}),
+        ...(turn.input.unexpectedToolCallFallback
+            ? { unexpectedToolCallFallback: turn.input.unexpectedToolCallFallback }
+            : {}),
         ...(turn.llm.payloadTransform ? { onPayload: turn.llm.payloadTransform } : {}),
         ...(turn.llm.responseObserver ? { onResponse: turn.llm.responseObserver } : {}),
     });
+}
+/**
+ * A direct call the host resolves outside this turn's catalog gets the same Pi wrapper as a
+ * catalog tool: the turn's tool context, no PTC parent, no result observer.
+ */
+function resolveMissingTool(turn, toolCall) {
+    const runtimeTool = turn.input.toolConfig.resolveMissingTool?.({
+        id: toolCall.id,
+        name: toolCall.name,
+        arguments: toolCall.arguments,
+    });
+    if (runtimeTool?.def.name !== toolCall.name)
+        return undefined;
+    return newRuntimeTool(runtimeTool, turn.input.toolConfig.context, () => turn.bridge.getActiveAssistantMessageId());
+}
+/**
+ * Pi ends its loop on a provider error, so a response an afterLlmCall hook
+ * recovered from (already removed from the transcript) is repeated here by
+ * continuing from the same transcript.
+ */
+async function repeatRecoveredRequest(agent, turn, convergeAtIdle) {
+    for (let recovery = turn.recovery.pending; recovery; recovery = turn.recovery.pending) {
+        delete turn.recovery.pending;
+        if (turn.input.signal?.aborted)
+            return;
+        turn.recovery.active = recovery;
+        turn.metrics.forgetLLMFailureObservation();
+        await agent.continue();
+        await agent.waitForIdle();
+        await convergeAtIdle?.();
+        await agent.waitForIdle();
+    }
 }
 export async function runAgent(agent, turn, convergeAtIdle) {
     const startMode = turn.input.startMode ?? 'prompt';
@@ -84,12 +139,14 @@ export async function runAgent(agent, turn, convergeAtIdle) {
             ]);
         }
         await agent.waitForIdle();
+        await repeatRecoveredRequest(agent, turn, convergeAtIdle);
         await convergeAtIdle?.();
         await agent.waitForIdle();
+        await repeatRecoveredRequest(agent, turn, convergeAtIdle);
         if (turn.input.signal?.aborted) {
             return { kind: 'aborted' };
         }
-        if (agent.state.errorMessage) {
+        if (agent.state.errorMessage && !turn.requestStoppedBeforeSend) {
             return failureReason(agent.state.errorMessage, turn.metrics.getLLMFailureObservation()?.normalized);
         }
         return undefined;

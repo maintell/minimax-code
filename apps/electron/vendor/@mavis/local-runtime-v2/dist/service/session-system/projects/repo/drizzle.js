@@ -2,11 +2,12 @@ import { and, asc, desc, eq, getTableColumns, gt, isNotNull, lt, or, sql, } from
 import { DEFAULT_PROJECT_ORDER_INDEX, projects } from '../../../../infra/db/schema/projects.js';
 import { sessions } from '../../../../infra/db/schema/sessions.js';
 import { canonicalProjectWorkspaceDir } from '../../shared/workspace.js';
-import { recordProjectRemoval } from '../../shared/project-removal.js';
+import { recordProjectRemoval, restoreSessionAfterProjectRemoval, } from '../../shared/project-removal.js';
+import { eligible } from '../sidebar/predicate.js';
 import { sessionAgentNamePredicate } from '../../sessions/repo/agent-name-predicate.js';
 import { projectTaskRootPredicate } from '../../sessions/repo/filters.js';
 import { decodeProjectCursor, normalizeProjectLimit, projectPageFromRows, } from './pagination.js';
-import { channelProjectPredicate, projectActivityExpression } from './activity.js';
+import { channelProjectPredicate, explicitWorkspaceProjectPredicate, projectActivityExpression, projectListActivityExpression, } from './activity.js';
 const projectSelection = {
     ...getTableColumns(projects),
     latestActivityAtMs: projectActivityExpression,
@@ -94,19 +95,21 @@ class DrizzleProjectRepository {
             .select({
             project: projects,
             filteredSessionCount: sessionCountExpression,
-            latestActivityAtMs: projectActivityExpression,
+            listActivityAtMs: projectListActivityExpression,
         })
             .from(projects)
-            .where(and(includeHiddenProjects ? undefined : eq(projects.hidden, 0), gt(sessionCountExpression, 0), cursor?.kind === 'catalog-visible' || cursor?.kind === 'catalog-all'
+            .where(and(includeHiddenProjects ? undefined : eq(projects.hidden, 0), hasSessionFilter(options)
+            ? gt(sessionCountExpression, 0)
+            : or(gt(sessionCountExpression, 0), explicitWorkspaceProjectPredicate), cursor?.kind === 'catalog-visible' || cursor?.kind === 'catalog-all'
             ? catalogCursorPredicate(cursor)
             : undefined))
-            .orderBy(desc(projects.pinned), asc(projects.orderIndex), desc(projectActivityExpression), asc(projects.projectId))
+            .orderBy(desc(projects.pinned), asc(projects.orderIndex), desc(projectListActivityExpression), asc(projects.projectId))
             .limit(limit + 1)
             .all()
-            .map(({ project, filteredSessionCount, latestActivityAtMs }) => ({
+            .map(({ project, filteredSessionCount, listActivityAtMs }) => ({
             ...requiredDecode(project),
             sessionCount: Number(filteredSessionCount),
-            latestActivityAtMs,
+            latestActivityAtMs: listActivityAtMs,
         }));
         return projectPageFromRows(values, limit, kind);
     }
@@ -123,6 +126,51 @@ class DrizzleProjectRepository {
             .map(requiredDecode);
         return projectPageFromRows(values, limit, 'recent');
     }
+    async setIcon(projectId, iconJson, nowMs) {
+        return this.setMetadata(projectId, { iconJson }, nowMs);
+    }
+    async setDisplayName(projectId, displayName, nowMs) {
+        return this.setMetadata(projectId, { displayName }, nowMs);
+    }
+    async setMetadata(projectId, metadata, nowMs) {
+        // Metadata and any legacy removal boundary are committed together;
+        // updatedAt advances once and other metadata remains unchanged.
+        const { displayName, iconJson, workspaceRoots, unhide } = metadata;
+        if (displayName === undefined &&
+            iconJson === undefined &&
+            workspaceRoots === undefined &&
+            !unhide) {
+            return this.getById(projectId);
+        }
+        const extraDataPaths = [];
+        if (iconJson !== undefined)
+            extraDataPaths.push(sql `'$.projectIcon', json(${iconJson})`);
+        if (workspaceRoots !== undefined) {
+            extraDataPaths.push(sql `'$.workspaceRoots', json(${JSON.stringify(workspaceRoots)})`);
+        }
+        this.options.db.transaction((tx) => {
+            if (unhide) {
+                const project = tx.select().from(projects).where(eq(projects.projectId, projectId)).get();
+                if (project?.hidden && !JSON.parse(project.extraDataJson).sidebarRemoval) {
+                    recordProjectRemoval(tx, project, project.updatedAtMs);
+                }
+            }
+            tx.update(projects)
+                .set({
+                ...(extraDataPaths.length > 0
+                    ? {
+                        extraDataJson: sql `json_set(${projects.extraDataJson}, ${sql.join(extraDataPaths, sql `, `)})`,
+                    }
+                    : {}),
+                ...(displayName !== undefined ? { displayName } : {}),
+                ...(unhide ? { hidden: 0 } : {}),
+                updatedAtMs: sql `max(${projects.updatedAtMs} + 1, ${nowMs})`,
+            })
+                .where(eq(projects.projectId, projectId))
+                .run();
+        });
+        return this.getById(projectId);
+    }
     async setPinned(projectId, pinned, nowMs) {
         return this.update(projectId, {
             pinned: pinned ? 1 : 0,
@@ -132,15 +180,29 @@ class DrizzleProjectRepository {
     }
     async setHidden(projectId, hidden, nowMs) {
         this.options.db.transaction((tx) => {
-            const project = tx.select().from(projects).where(eq(projects.projectId, projectId)).get();
+            const project = tx
+                .select({ projectId: projects.projectId })
+                .from(projects)
+                .where(eq(projects.projectId, projectId))
+                .get();
             if (!project)
                 return;
             if (hidden)
                 recordProjectRemoval(tx, project, nowMs);
-            tx.update(projects).set({ hidden: hidden ? 1 : 0, updatedAtMs: nowMs })
-                .where(eq(projects.projectId, projectId)).run();
+            tx.update(projects)
+                .set({ hidden: hidden ? 1 : 0, updatedAtMs: nowMs })
+                .where(eq(projects.projectId, projectId))
+                .run();
         });
         return this.getById(projectId);
+    }
+    async restoreSessionAfterRemoval(sessionId, nowMs) {
+        return this.options.db.transaction((tx) => restoreSessionAfterProjectRemoval(tx, sessionId, nowMs, () => Boolean(tx
+            .select({ id: sessions.sessionId })
+            .from(sessions)
+            .innerJoin(projects, eq(sessions.projectId, projects.projectId))
+            .where(and(eq(sessions.sessionId, sessionId), eligible(true)))
+            .get())));
     }
     async putOrder(projectIds, nowMs) {
         this.options.db.transaction((tx) => projectIds.forEach((projectId, orderIndex) => {
@@ -166,9 +228,19 @@ const DEFAULT_PROJECT_SESSION_FILTER = {
 function projectRootPredicate(options) {
     return and(eq(sessions.columnarVersion, 3), eq(sessions.projectId, projects.projectId), sessionAgentNamePredicate(options.agentName), projectTaskRootPredicate(options.sessionFilter ?? DEFAULT_PROJECT_SESSION_FILTER));
 }
+/** Agent or purpose scoping lists only projects that have matching conversations. */
+function hasSessionFilter(options) {
+    const filter = options.sessionFilter;
+    return Boolean(options.agentName ||
+        filter?.archived === true ||
+        filter?.includeSessionKinds?.length ||
+        filter?.excludeSessionKinds?.length ||
+        filter?.includePurposePrefix ||
+        filter?.excludePurposePrefix);
+}
 function catalogCursorPredicate(cursor) {
     const pinned = cursor.pinned ? 1 : 0;
-    return or(lt(projects.pinned, pinned), and(eq(projects.pinned, pinned), gt(projects.orderIndex, cursor.orderIndex)), and(eq(projects.pinned, pinned), eq(projects.orderIndex, cursor.orderIndex), lt(projectActivityExpression, cursor.latestActivityAtMs)), and(eq(projects.pinned, pinned), eq(projects.orderIndex, cursor.orderIndex), eq(projectActivityExpression, cursor.latestActivityAtMs), gt(projects.projectId, cursor.projectId)));
+    return or(lt(projects.pinned, pinned), and(eq(projects.pinned, pinned), gt(projects.orderIndex, cursor.orderIndex)), and(eq(projects.pinned, pinned), eq(projects.orderIndex, cursor.orderIndex), lt(projectListActivityExpression, cursor.latestActivityAtMs)), and(eq(projects.pinned, pinned), eq(projects.orderIndex, cursor.orderIndex), eq(projectListActivityExpression, cursor.latestActivityAtMs), gt(projects.projectId, cursor.projectId)));
 }
 function recentCursorPredicate(cursor) {
     return or(lt(projects.recentAtMs, cursor.recentAtMs), and(eq(projects.recentAtMs, cursor.recentAtMs), gt(projects.projectId, cursor.projectId)));

@@ -20,6 +20,9 @@ export function createAgentRuntimeOwner(input) {
         ...(input.reportLegacyCustomMaterialization
             ? { reportLegacyCustomMaterialization: input.reportLegacyCustomMaterialization }
             : {}),
+        ...(input.reportBuiltinConfigRepair
+            ? { reportBuiltinConfigRepair: input.reportBuiltinConfigRepair }
+            : {}),
     });
     let closed = false;
     return {

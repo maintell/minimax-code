@@ -48,7 +48,7 @@ function loadDocumentPreviewModule() {
     }
     return documentPreviewModulePromise;
 }
-function failure(code, message, retryable = false) {
+function failure(code, message, retryable = false, detail) {
     return {
         ok: false,
         error: {
@@ -56,6 +56,7 @@ function failure(code, message, retryable = false) {
             code,
             message: safePreviewDiagnosticV1(code, message),
             retryable,
+            ...(detail ? { detail } : {}),
         },
     };
 }
@@ -393,7 +394,7 @@ export class DocumentPreviewSourceRegistry {
         }
         const assetResolution = input.assetResolution;
         if (assetResolution && !(await verifyTrustedAssetResolution(assetResolution, senderId))) {
-            return failure('source_outside_workspace', 'Document preview asset is not authorized');
+            return failure('source_outside_workspace', 'Document preview asset is not authorized', false, 'asset_verify_failed');
         }
         const rawFileName = assetResolution
             ? assetResolution.fileName
@@ -426,7 +427,7 @@ export class DocumentPreviewSourceRegistry {
                 realWorkspace = assetResolution.assetRoot;
                 const workspaceInfo = await lstat(realWorkspace, { bigint: true });
                 if (!workspaceInfo.isDirectory() || workspaceInfo.isSymbolicLink()) {
-                    return failure('source_outside_workspace', 'Document preview asset root is not authorized');
+                    return failure('source_outside_workspace', 'Document preview asset root is not authorized', false, 'asset_root_invalid');
                 }
                 workspaceIdentity = {
                     dev: workspaceInfo.dev.toString(),
@@ -444,7 +445,7 @@ export class DocumentPreviewSourceRegistry {
                 if (!isTrustedWorkspaceCapability(input.workspaceCapability) ||
                     claimedWorkspacePath !== input.workspaceCapability.canonicalPath ||
                     !(await verifyTrustedWorkspaceCapability(input.workspaceCapability))) {
-                    return failure('source_outside_workspace', 'Document preview workspace is not authorized');
+                    return failure('source_outside_workspace', 'Document preview workspace is not authorized', false, 'workspace_capability_invalid');
                 }
                 realWorkspace = input.workspaceCapability.canonicalPath;
                 workspaceIdentity = input.workspaceCapability.identity;
@@ -481,10 +482,10 @@ export class DocumentPreviewSourceRegistry {
         }
         if (input.workspaceCapability &&
             !(await verifyTrustedWorkspaceFile(input.workspaceCapability, realFile))) {
-            return failure('source_outside_workspace', 'Document preview file is not authorized');
+            return failure('source_outside_workspace', 'Document preview file is not authorized', false, 'file_identity_changed');
         }
         if (!isContained(realWorkspace, realFile)) {
-            return failure('source_outside_workspace', 'Document preview source is outside the workspace');
+            return failure('source_outside_workspace', 'Document preview source is outside the workspace', false, 'outside_after_realpath');
         }
         const actualExtension = officeExtension(realFile, sourceKind);
         if (!actualExtension || actualExtension !== claimedExtension) {
@@ -504,7 +505,9 @@ export class DocumentPreviewSourceRegistry {
                 if (identity.dev.toString() !== authorizedFile.dev ||
                     identity.ino.toString() !== authorizedFile.ino ||
                     identity.size.toString() !== authorizedFile.size ||
-                    identity.mtimeMs.toString() !== authorizedFile.mtimeMs) {
+                    identity.mtimeMs.toString() !== authorizedFile.mtimeMs ||
+                    (authorizedFile.ctimeMs !== undefined &&
+                        identity.ctimeMs.toString() !== authorizedFile.ctimeMs)) {
                     return failure('source_mutated', 'Document preview delivered file changed while opening');
                 }
             }
@@ -548,6 +551,10 @@ export class DocumentPreviewSourceRegistry {
                 (hashed.fingerprint.size !== assetResolution.bytes ||
                     hashed.fingerprint.sha256 !== assetResolution.sha256)) {
                 return failure('source_mutated', 'Document preview asset changed while opening');
+            }
+            if (input.workspaceCapability?.file &&
+                !(await verifyTrustedWorkspaceFile(input.workspaceCapability, realFile))) {
+                return failure('source_mutated', 'Document preview selected file changed while opening');
             }
             const containedAfterHash = await verifyOpenedFileContainment(handle, realWorkspace, realFile);
             if (!containedAfterHash) {

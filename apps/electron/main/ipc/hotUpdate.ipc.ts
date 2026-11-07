@@ -5,8 +5,8 @@
  */
 
 import { ipcMain } from "electron";
-import { IPC_CHANNELS, isDev } from "../config";
-import { checkForHotUpdate, clearHotUpdateCache, hotUpdateManager } from "../modules/hotUpdate";
+import { IPC_CHANNELS } from "../config";
+import { checkForHotUpdate, clearHotUpdateCache, hotUpdateManager, startHotUpdateAutoCheck as hotUpdateStartHotUpdateAutoCheck, stopHotUpdateAutoCheck as hotUpdateStopHotUpdateAutoCheck } from "../modules/hotUpdate";
 import { getCategoryLogger } from "../utils/logger";
 import { getMainWindow } from "../windows/mainWindow";
 const logger = getCategoryLogger('update');
@@ -14,7 +14,7 @@ const logger = getCategoryLogger('update');
  * 设置热更新 IPC 处理器
  */
 export function setupHotUpdateIPC() {
-    // 检查热更新（会自动下载并应用）
+    // 检查热更新（有新版本时自动下载安装，下次启动生效）
     ipcMain.handle(IPC_CHANNELS.HOT_UPDATE_CHECK, async (_event, force) => {
         try {
             logger.info(`[HotUpdate IPC] Check for update, force: ${force}`);
@@ -27,7 +27,7 @@ export function setupHotUpdateIPC() {
             return { success: false, error: errorMessage };
         }
     });
-    // 清除缓存（回退到打包版本）
+    // 清除缓存（下次启动回到打包版本）
     ipcMain.handle(IPC_CHANNELS.HOT_UPDATE_CLEAR_CACHE, async () => {
         try {
             logger.info('[HotUpdate IPC] Clear cache (rollback to bundled version)');
@@ -40,7 +40,7 @@ export function setupHotUpdateIPC() {
             return { success: false, error: errorMessage };
         }
     });
-    // 应用更新后重新加载页面
+    // 重新加载主窗口。渲染资源根目录在进程内固定，热更新版本需重启应用才会生效。
     ipcMain.handle(IPC_CHANNELS.HOT_UPDATE_RELOAD, () => {
         const mainWindow = getMainWindow();
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -58,20 +58,16 @@ export function setupHotUpdateIPC() {
     ipcMain.on(IPC_CHANNELS.HOT_UPDATE_GET_VERSION_SYNC, (event) => {
         event.returnValue = hotUpdateManager.getCurrentVersion();
     });
-    // 热更新检查
-    if (!isDev) {
-        startHotUpdateAutoCheck();
-    }
 }
 /**
- * 启动热更新自动检查
+ * 启动热更新自动检查（由 lifecycle hot-update-auto-check 模块调用）
  */
 export function startHotUpdateAutoCheck() {
-    hotUpdateManager.startAutoCheck();
+    hotUpdateStartHotUpdateAutoCheck();
 }
 /**
  * 停止热更新自动检查
  */
 export function stopHotUpdateAutoCheck() {
-    hotUpdateManager.stopAutoCheck();
+    hotUpdateStopHotUpdateAutoCheck();
 }

@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
+import { realpathSync, lstatSync } from "node:fs";
 import { realpath, lstat, stat } from "node:fs/promises";
 import path from "node:path";
 const DELIVERED_FILE_PAGE_SIZE = 100;
 const MAX_DELIVERED_FILE_PAGES = 10;
+const MAX_DELIVERED_IDENTITY_PROBES = 16;
 const issuedCapabilities = new WeakSet();
 export function isTrustedWorkspaceCapability(value) {
     return (Boolean(value) &&
@@ -58,6 +60,36 @@ export async function issueTrustedWorkspaceCapability(workspaceDir) {
     const canonical = await canonicalDirectory(workspaceDir);
     return canonical ? issueCapability(canonical) : null;
 }
+/** Main-only exact-file grant for an OS selection; never call with renderer paths. */
+export function issueSelectedFileCapability(filePath) {
+    try {
+        if (!path.isAbsolute(filePath))
+            return null;
+        const canonicalPath = realpathSync(filePath);
+        const info = lstatSync(canonicalPath, { bigint: true });
+        if (!info.isFile() || info.isSymbolicLink() || info.ino === 0n)
+            return null;
+        const root = path.dirname(canonicalPath);
+        const rootInfo = lstatSync(root, { bigint: true });
+        if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink())
+            return null;
+        return issueCapability({
+            canonicalPath: root,
+            identity: { dev: rootInfo.dev.toString(), ino: rootInfo.ino.toString() },
+            file: {
+                canonicalPath,
+                dev: info.dev.toString(),
+                ino: info.ino.toString(),
+                size: info.size.toString(),
+                mtimeMs: info.mtimeMs.toString(),
+                ctimeMs: info.ctimeMs.toString(),
+            },
+        });
+    }
+    catch {
+        return null;
+    }
+}
 /** Verify that a capability's root still names the same directory identity. */
 export async function verifyTrustedWorkspaceCapability(capability) {
     if (!isTrustedWorkspaceCapability(capability))
@@ -91,61 +123,106 @@ export async function verifyTrustedWorkspaceFile(capability, canonicalPath) {
             info.dev.toString() === expected.dev &&
             info.ino.toString() === expected.ino &&
             info.size.toString() === expected.size &&
-            info.mtimeMs.toString() === expected.mtimeMs);
+            info.mtimeMs.toString() === expected.mtimeMs &&
+            (expected.ctimeMs === undefined || info.ctimeMs.toString() === expected.ctimeMs));
     }
     catch {
         return false;
     }
 }
-/** Only the runtime's persisted session deliverables can authorize an external path. */
-export async function isSessionDeliveredFileFromRuntime(sessionId, absolutePath) {
+async function regularFileIdentity(filePath) {
+    try {
+        const info = await lstat(filePath, { bigint: true });
+        // Some network filesystems report no inode; a zero identity proves nothing.
+        if (!info.isFile() || info.isSymbolicLink() || info.ino === 0n)
+            return null;
+        return `${info.dev}:${info.ino}`;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Only the runtime's persisted session deliverables can authorize an external path.
+ * A recorded path whose spelling differs from the claim (Windows drive/name case,
+ * separators) is accepted only when both name the same regular file.
+ */
+export async function lookupSessionDeliveredFileFromRuntime(sessionId, absolutePath) {
     if (!validSessionId(sessionId) || !path.isAbsolute(absolutePath))
-        return false;
+        return 'lookup_failed';
+    const requestedName = path.basename(absolutePath).toLowerCase();
+    const identityCandidates = [];
+    let nodeIdPresent = false;
     try {
         const { handleLocalRuntimeRequest } = await import('../local-runtime');
         const seen = new Set();
         let cursor;
+        let complete = false;
         // Bound historical index IO. Failure or an exhausted budget never grants a directory.
-        for (let page = 0; page < MAX_DELIVERED_FILE_PAGES; page += 1) {
+        for (let page = 0; page < MAX_DELIVERED_FILE_PAGES && !complete; page += 1) {
             const url = new URL(`http://127.0.0.1/minimax-desktop/api/v1/session/${encodeURIComponent(sessionId)}/files`);
             url.searchParams.set('limit', String(DELIVERED_FILE_PAGE_SIZE));
             if (cursor)
                 url.searchParams.set('cursor', cursor);
             const response = await handleLocalRuntimeRequest(new Request(url, { method: 'GET' }));
             if (!response.ok)
-                return false;
+                return 'lookup_failed';
             const body = await response.json();
             if (!body || typeof body !== 'object' || Array.isArray(body))
-                return false;
+                return 'lookup_failed';
             const result = body;
             if (!Array.isArray(result.nodes) || result.nodes.length > DELIVERED_FILE_PAGE_SIZE)
-                return false;
-            if (result.nodes.some((node) => {
+                return 'lookup_failed';
+            for (const node of result.nodes) {
                 if (!node || typeof node !== 'object' || Array.isArray(node))
-                    return false;
+                    continue;
                 const file = node;
-                return ((file.sessionId ?? file.session_id) === sessionId &&
-                    !(file.nodeId ?? file.node_id) &&
-                    typeof file.path === 'string' &&
-                    path.isAbsolute(file.path) &&
-                    path.resolve(file.path) === absolutePath);
-            }))
-                return true;
+                if ((file.sessionId ?? file.session_id) !== sessionId ||
+                    typeof file.path !== 'string' ||
+                    !path.isAbsolute(file.path))
+                    continue;
+                const recordedPath = path.resolve(file.path);
+                const sameName = path.basename(recordedPath).toLowerCase() === requestedName;
+                if (file.nodeId ?? file.node_id) {
+                    if (sameName)
+                        nodeIdPresent = true;
+                    continue;
+                }
+                if (recordedPath === absolutePath)
+                    return 'exact';
+                if (sameName && !identityCandidates.includes(recordedPath))
+                    identityCandidates.push(recordedPath);
+            }
             const next = result.nextCursor ?? result.next_cursor;
-            if (!(result.hasMore ?? result.has_more) ||
-                typeof next !== 'string' ||
-                !next ||
-                next.length > 4096 ||
-                seen.has(next))
-                return false;
+            if (!(result.hasMore ?? result.has_more)) {
+                complete = true;
+                continue;
+            }
+            if (typeof next !== 'string' || !next || next.length > 4096 || seen.has(next))
+                return 'lookup_failed';
             seen.add(next);
             cursor = next;
         }
+        if (identityCandidates.length > 0) {
+            const requestedIdentity = await regularFileIdentity(absolutePath);
+            if (requestedIdentity) {
+                for (const candidate of identityCandidates.slice(0, MAX_DELIVERED_IDENTITY_PROBES)) {
+                    if ((await regularFileIdentity(candidate)) === requestedIdentity)
+                        return { identity: requestedIdentity };
+                }
+            }
+        }
+        if (nodeIdPresent)
+            return 'node_id_present';
+        return complete ? 'not_found' : 'budget_exhausted';
     }
     catch {
-        return false;
+        return 'lookup_failed';
     }
-    return false;
+}
+export async function isSessionDeliveredFileFromRuntime(sessionId, absolutePath) {
+    const lookup = await lookupSessionDeliveredFileFromRuntime(sessionId, absolutePath);
+    return lookup === 'exact' || typeof lookup === 'object';
 }
 export async function fetchSessionWorkspaceFromRuntime(sessionId) {
     try {
@@ -184,7 +261,7 @@ export async function fetchSessionWorkspaceFromRuntime(sessionId) {
  */
 export function createMainOwnedWorkspaceAuthority(options = {}) {
     const fetchSessionWorkspace = options.fetchSessionWorkspace ?? fetchSessionWorkspaceFromRuntime;
-    const isSessionDeliveredFile = options.isSessionDeliveredFile ?? isSessionDeliveredFileFromRuntime;
+    const isSessionDeliveredFile = options.isSessionDeliveredFile ?? lookupSessionDeliveredFileFromRuntime;
     const defaultWorkspaceDir = options.defaultWorkspaceDir;
     let defaultWorkspacePromise = null;
     const resolveDefaultWorkspaceDir = () => {
@@ -225,7 +302,7 @@ export function createMainOwnedWorkspaceAuthority(options = {}) {
         const state = senderStates.get(ticket.senderId);
         return Boolean(state && state.alive && state.epoch === ticket.epoch && state.sequence === ticket.sequence);
     };
-    const commit = (ticket, workspaceDir, sessionId, canonical) => {
+    const commit = (ticket, workspaceDir, sessionId, canonical, fileClaimPath) => {
         if (!current(ticket))
             return null;
         const state = senderStates.get(ticket.senderId);
@@ -238,25 +315,43 @@ export function createMainOwnedWorkspaceAuthority(options = {}) {
             sessionId,
             workspaceDir,
             capability,
+            ...(fileClaimPath ? { fileClaimPath } : {}),
         };
         return canonical.canonicalPath;
     };
-    const resolveTrustedWorkspace = async ({ senderId, claimedWorkspaceDir, claimedFilePath, sessionId, }) => {
-        if (!validSenderId(senderId))
+    const deliveredDenial = {
+        not_found: 'deliverable_not_found',
+        node_id_present: 'deliverable_node_id_present',
+        lookup_failed: 'deliverable_lookup_failed',
+        budget_exhausted: 'deliverable_lookup_budget_exhausted',
+    };
+    const resolveTrustedWorkspace = async ({ senderId, claimedWorkspaceDir, claimedFilePath, sessionId, onDenied, }) => {
+        const deny = (detail) => {
+            try {
+                onDenied?.(detail);
+            }
+            catch {
+                // Observability must never change the authorization result.
+            }
             return null;
+        };
+        if (!validSenderId(senderId))
+            return deny('invalid_sender');
         const ticket = begin(senderId);
         const claimed = await canonicalDirectory(claimedWorkspaceDir);
-        if (!claimed || !current(ticket))
-            return null;
+        if (!current(ticket))
+            return deny('stale_request');
+        if (!claimed)
+            return deny('claimed_dir_unavailable');
         const defaultWorkspace = await canonicalDirectory(await resolveDefaultWorkspaceDir());
         if (!validSessionId(sessionId) && defaultWorkspace?.canonicalPath === claimed.canonicalPath) {
-            return commit(ticket, claimed.canonicalPath, undefined, claimed);
+            return commit(ticket, claimed.canonicalPath, undefined, claimed) ?? deny('stale_request');
         }
         // Every non-default root requires a fresh authoritative session lookup.
         // In particular, a missing/revoked session never falls back to the last
         // sender binding.
         if (!validSessionId(sessionId))
-            return null;
+            return deny('no_session');
         let authoritativeWorkspace = null;
         try {
             authoritativeWorkspace = await fetchSessionWorkspace(sessionId);
@@ -267,11 +362,20 @@ export function createMainOwnedWorkspaceAuthority(options = {}) {
         const authoritative = authoritativeWorkspace
             ? await canonicalDirectory(authoritativeWorkspace)
             : null;
-        if (!authoritative || !current(ticket))
-            return null;
+        if (!current(ticket))
+            return deny('stale_request');
+        if (!authoritativeWorkspace)
+            return deny('session_lookup_failed');
+        if (!authoritative)
+            return deny('session_workspace_unavailable');
         if (authoritative.canonicalPath !== claimed.canonicalPath) {
             // The renderer historically rebases external delivered files to parent + basename.
             // Prove that exact file belongs to this session instead of trusting the rebased root.
+            if (typeof claimedFilePath === 'string' &&
+                /[\\/]/u.test(claimedFilePath) &&
+                !path.isAbsolute(claimedFilePath) &&
+                !claimedFilePath.split(/[\\/]/u).includes('..'))
+                return deny('deliverable_nested_path');
             if (typeof claimedFilePath !== 'string' ||
                 !claimedFilePath ||
                 claimedFilePath.length > 256 ||
@@ -279,16 +383,38 @@ export function createMainOwnedWorkspaceAuthority(options = {}) {
                 claimedFilePath === '.' ||
                 claimedFilePath === '..' ||
                 path.extname(claimedFilePath).toLowerCase() !== '.pptx')
-                return null;
+                return deny('deliverable_path_invalid');
             const requestedPath = path.resolve(claimedWorkspaceDir, claimedFilePath);
-            if (!(await isSessionDeliveredFile(sessionId, requestedPath)) || !current(ticket))
-                return null;
-            const canonicalPath = path.join(claimed.canonicalPath, claimedFilePath);
+            const delivered = await isSessionDeliveredFile(sessionId, requestedPath);
+            if (!current(ticket))
+                return deny('stale_request');
+            const lookup = delivered === true ? 'exact' : delivered === false ? 'not_found' : delivered;
+            if (lookup !== 'exact' && typeof lookup !== 'object')
+                return deny(deliveredDenial[lookup]);
+            const fileClaimPath = path.join(claimed.canonicalPath, claimedFilePath);
             try {
+                const claimedInfo = await lstat(fileClaimPath, { bigint: true });
+                if (!claimedInfo.isFile() || claimedInfo.isSymbolicLink())
+                    return deny('deliverable_file_unavailable');
+                // An identity grant covers only the file verified against the index,
+                // not whatever replaced that spelling afterwards.
+                if (typeof lookup === 'object' &&
+                    `${claimedInfo.dev}:${claimedInfo.ino}` !== lookup.identity)
+                    return deny('deliverable_identity_changed');
+                // The source registry compares against realpath(); a case-folded
+                // spelling must be bound to the on-disk name it will see.
+                const canonicalPath = await realpath(fileClaimPath);
+                if (path.dirname(canonicalPath) !== claimed.canonicalPath)
+                    return deny('deliverable_file_unavailable');
                 const info = await lstat(canonicalPath, { bigint: true });
-                if (!info.isFile() || info.isSymbolicLink())
-                    return null;
-                return commit(ticket, claimed.canonicalPath, sessionId, {
+                if (!info.isFile() ||
+                    info.isSymbolicLink() ||
+                    info.dev !== claimedInfo.dev ||
+                    info.ino !== claimedInfo.ino)
+                    return deny('deliverable_file_unavailable');
+                if (!current(ticket))
+                    return deny('stale_request');
+                return (commit(ticket, claimed.canonicalPath, sessionId, {
                     ...claimed,
                     file: {
                         canonicalPath,
@@ -297,13 +423,13 @@ export function createMainOwnedWorkspaceAuthority(options = {}) {
                         size: info.size.toString(),
                         mtimeMs: info.mtimeMs.toString(),
                     },
-                });
+                }, fileClaimPath) ?? deny('stale_request'));
             }
             catch {
-                return null;
+                return deny('deliverable_file_unavailable');
             }
         }
-        return commit(ticket, authoritative.canonicalPath, sessionId, authoritative);
+        return (commit(ticket, authoritative.canonicalPath, sessionId, authoritative) ?? deny('stale_request'));
     };
     const resolveTrustedWorkspaceCapability = async ({ senderId, claimedWorkspaceDir, sessionId, claimedFilePath, }) => {
         if (!validSenderId(senderId))
@@ -319,7 +445,7 @@ export function createMainOwnedWorkspaceAuthority(options = {}) {
         if (state.binding.capability.file &&
             (!claimedFilePath ||
                 path.join(claimed.canonicalPath, claimedFilePath) !==
-                    state.binding.capability.file.canonicalPath))
+                    (state.binding.fileClaimPath ?? state.binding.capability.file.canonicalPath)))
             return null;
         return state.binding.capability;
     };

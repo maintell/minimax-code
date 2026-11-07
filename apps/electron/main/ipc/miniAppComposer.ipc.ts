@@ -4,7 +4,8 @@ import { DEV_SERVER_URL, IPC_CHANNELS } from "../config/constants.js";
 import { getEmbeddedBrowserManager } from "../modules/browser/embedded-browser-manager.js";
 import { MiniAppComposerBroker } from "../modules/browser/miniapp-composer.js";
 import { getUserInfo } from "./storage.ipc.js";
-function trustedHost(event) {
+/** The sender is the Host window's own main frame on the Archon page (also used by Agent IPC). */
+export function trustedHost(event) {
     if (event.sender.isDestroyed() ||
         !event.senderFrame ||
         event.senderFrame !== event.sender.mainFrame)
@@ -25,8 +26,9 @@ function trustedHost(event) {
     }
 }
 export function setupMiniAppComposerIPC() {
+    const manager = getEmbeddedBrowserManager();
     const broker = new MiniAppComposerBroker({
-        manager: getEmbeddedBrowserManager(),
+        manager,
         getAccountId: () => {
             const id = getUserInfo().realUserID;
             return typeof id === 'string' && id.trim() ? id : null;
@@ -38,7 +40,15 @@ export function setupMiniAppComposerIPC() {
             broker.reply(event, value);
     };
     ipcMain.on(IPC_CHANNELS.MINIAPP_COMPOSER_REPLY, reply);
-    ipcMain.handle(IPC_CHANNELS.MINIAPP_COMPOSER_APPEND, (event, value) => broker.append(event, value));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_COMPOSER_APPEND, async (event, value) => {
+        const release = manager.observeMiniAppPageEnd(event.sender, () => undefined);
+        try {
+            return await broker.append(event, value);
+        }
+        finally {
+            release();
+        }
+    });
     return () => {
         broker.dispose();
         ipcMain.removeListener(IPC_CHANNELS.MINIAPP_COMPOSER_REPLY, reply);

@@ -55,5 +55,35 @@ export class PluginControllerBase {
         void req;
         throw new NotImplementedError('importGithubPlugin');
     }
+    async updatePlugin(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('updatePlugin');
+    }
+    async listPluginMarketplaces(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('listPluginMarketplaces');
+    }
+    async addPluginMarketplace(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('addPluginMarketplace');
+    }
+    async refreshPluginMarketplaces(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('refreshPluginMarketplaces');
+    }
+    async setPluginMarketplaceAutoUpdate(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('setPluginMarketplaceAutoUpdate');
+    }
+    async removePluginMarketplace(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('removePluginMarketplace');
+    }
 }
 //# sourceMappingURL=plugin-controller-base.gen.js.map

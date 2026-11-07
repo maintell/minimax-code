@@ -23,15 +23,21 @@ const IMAGE_EXTENSIONS = new Set([
     'bmp',
     'svg',
     'ico',
+    'tif',
+    'tiff',
     'avif',
 ]);
 /**
  * Image formats that the workspace file preview and Canvas surfaces can render.
  * Keep this narrower than `IMAGE_EXTENSIONS`: formats added here must be
- * supported by both the local Runtime media boundary and Chromium decoding.
+ * supported by the local Runtime media boundary and browser preview pipeline
+ * (TIFF uses a bounded worker conversion to PNG).
  */
 export const WORKSPACE_IMAGE_PREVIEW_MIME_TYPES = {
     bmp: 'image/bmp',
+    ico: 'image/x-icon',
+    tif: 'image/tiff',
+    tiff: 'image/tiff',
     gif: 'image/gif',
     jpg: 'image/jpeg',
     jpeg: 'image/jpeg',
@@ -49,6 +55,8 @@ export const MIME_BY_EXTENSION = {
     bmp: 'image/bmp',
     svg: 'image/svg+xml',
     ico: 'image/x-icon',
+    tif: 'image/tiff',
+    tiff: 'image/tiff',
     avif: 'image/avif',
     pdf: 'application/pdf',
     doc: 'application/msword',

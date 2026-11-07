@@ -63,12 +63,19 @@ export function serializeWeChatBinding(record) {
  * healthy in the UI. `status===null` (monitor not yet reported this boot) is
  * treated as optimistic — keep the disk `connected` to avoid a false alarm
  * during the restoreInboundLoops startup race. Mutates `serialized` in place.
+ *
+ * `transport` is the held receive-channel verdict (`channel-transport-status.ts`).
+ * The monitor's own status is cleared as soon as its loop is released —
+ * an expired session stops the loop within ~0.3 s — which read as `null`,
+ * i.e. "connected", for good. An `error` verdict with no loop running is a
+ * dead receiver however it died, so it gets the same offline answer.
  */
-export function applyMonitorHealthOverlay(serialized, record, health) {
+export function applyMonitorHealthOverlay(serialized, record, health, transport) {
     if (!record.connected)
         return;
     const liveStatus = health?.status ?? null;
-    if (liveStatus === 'session_expired' || liveStatus === 'stopped') {
+    const receiverDead = transport?.status === 'error' && health?.running !== true;
+    if (receiverDead || liveStatus === 'session_expired' || liveStatus === 'stopped') {
         serialized.connected = false;
         serialized.error = 'WeChat receiver offline — reopen WeChat to reconnect';
         serialized.authStatus = 'expired';

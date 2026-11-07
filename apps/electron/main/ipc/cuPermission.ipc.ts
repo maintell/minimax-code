@@ -2,14 +2,14 @@
  * Computer Use Permission IPC Handlers
  *
  * Bridges the Computer Use system-permission flow from the main
- * process to the renderer. Wraps the permission utilities in
- * `modules/screenshot/permission.ts` — does NOT reimplement permission
- * logic. The permission module remains the single source of truth.
+ * process to the renderer. Control permissions belong to the verified
+ * standalone MiniMax Computer Use component; Electron screenshot preview
+ * keeps its independent permission flow.
  */
 import { ipcMain } from "electron";
 import { ComputerUsePermissionGuide } from "../modules/screenshot/permission-guide";
 import { getCategoryLogger } from "../utils/logger";
-import { getComputerUsePermissionStatus, requestComputerUsePermission, openComputerUsePermissionSettings } from "../modules/screenshot/permission";
+import { getComputerUsePermissionStatus, requestComputerUsePermission, openComputerUsePermissionSettings } from "../modules/local-runtime/computer-use/component-permissions";
 /** IPC channel names exposed for the Computer Use permission bridge. */
 export let CU_PERMISSION_CHANNELS = {
     STATUS: 'cu:permission:status',

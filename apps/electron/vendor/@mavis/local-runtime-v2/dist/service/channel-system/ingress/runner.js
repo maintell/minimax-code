@@ -30,6 +30,22 @@ function formatQueuedNoticeText(ahead) {
     const count = Math.max(1, ahead);
     return `⏳ 已加入队列，前方还有 ${count} 条消息，请稍候...`;
 }
+/** Acknowledgement for an IM follow-up merged into the running IM Turn. */
+const STEERED_NOTICE_TEXT = '✅ 已收到，已补充到当前任务中。';
+const QUEUE_REASON_NOTICE_TEXT = {
+    non_im_turn: '⏳ 当前任务不是从 IM 发起的，消息无法立即发送，已加入队列，当前任务结束后处理。',
+    other_im_chat: '⏳ 当前任务来自另一个 IM 对话，消息无法立即发送，已加入队列，当前任务结束后处理。',
+};
+/**
+ * Reason notice for an "immediate send" follow-up that still had to queue. It
+ * replaces the generic queued notice. The text already says the message waits
+ * for the current task, so the count names only the other queued messages in
+ * front of it; the running Turn is not one of them.
+ */
+function formatQueueReasonNoticeText(reason, queuedMessagesAhead) {
+    const text = QUEUE_REASON_NOTICE_TEXT[reason];
+    return queuedMessagesAhead > 0 ? `${text}前方还有 ${queuedMessagesAhead} 条消息。` : text;
+}
 /** Persisted outbound audit history used by real platform clients. */
 export class LocalChannelOutboundStore {
     dataDir;
@@ -307,15 +323,35 @@ export class LocalChannelRunner {
             await this.deliverDirectReply(ctx, inbound);
             return { inbound };
         }
-        if (!inbound.sessionId || !inbound.queueItemId)
-            return { inbound };
-        // Conversation-first: Session V2 owns queued-turn execution. The runner
-        // only surfaces the "queued, N ahead" notice; the final reply arrives via
-        // deliverReplyFromMessages once the committed turn lands.
-        if ((inbound.queueAhead ?? 0) > 0) {
-            await this.deliverQueuedNotice(ctx, inbound.queueAhead ?? 0);
-        }
+        if (inbound.sessionId)
+            await this.deliverAdmissionNotice(ctx, inbound);
         return { inbound };
+    }
+    /**
+     * At most one notice per admitted message. Conversation-first: Session V2
+     * owns queued-turn execution and the final reply arrives via
+     * deliverReplyFromMessages once the committed turn lands; the runner only
+     * tells the sender where the message went.
+     */
+    async deliverAdmissionNotice(ctx, inbound) {
+        if (inbound.steered) {
+            // Merged into the running IM Turn: its reply already lands on this chat.
+            // A `duplicate` replay was acknowledged the first time, so stay quiet.
+            if (inbound.steered === 'merged')
+                await this.deliverNotice(ctx, STEERED_NOTICE_TEXT);
+            return;
+        }
+        if (!inbound.queueItemId)
+            return;
+        if (inbound.queueReason) {
+            // Replaces the generic "queued, N ahead" notice instead of adding to it.
+            // `queueAhead` counts the running Turn as one; the 1-based queue
+            // position does not, so position - 1 is the queued messages in front.
+            const queuedMessagesAhead = Math.max(0, (inbound.queuePosition ?? 1) - 1);
+            await this.deliverNotice(ctx, formatQueueReasonNoticeText(inbound.queueReason, queuedMessagesAhead));
+            return;
+        }
+        await this.deliverQueuedNotice(ctx, inbound.queueAhead ?? 0);
     }
     /** Send a bridge-produced immediate reply; IM receipts log their delivery fate. */
     async deliverDirectReply(ctx, inbound) {
@@ -544,7 +580,13 @@ export class LocalChannelRunner {
     async deliverQueuedNotice(ctx, ahead) {
         if (ahead <= 0)
             return;
-        const text = formatQueuedNoticeText(ahead);
+        await this.deliverNotice(ctx, formatQueuedNoticeText(ahead));
+    }
+    /**
+     * Best-effort admission notice (queued / queue reason / merged): the message
+     * is already admitted, so a send failure is only logged and never fails it.
+     */
+    async deliverNotice(ctx, text) {
         try {
             await this.sendOutbound(ctx, {
                 ctx,

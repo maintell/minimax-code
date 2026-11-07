@@ -1,12 +1,13 @@
 import { streamSimple } from '@earendil-works/pi-ai';
 import { LLM_REQUEST_TIMEOUT_MS } from './defaults.js';
+import { resolveLLMStreamTimeouts, withLLMStreamTimeouts } from './llm-stream-timeout.js';
 export function composeStreamFn(resolved) {
     // Order matters: each wrapper only fills the option it owns, while
     // explicit per-call options from upstream wrappers still win. The host
     // ceiling is the exception and therefore the innermost link: it has to see
     // the fully accumulated options in order to shrink them.
     const callerHeaders = resolved.headers && Object.keys(resolved.headers).length > 0 ? resolved.headers : undefined;
-    const hostClamped = withHostMaxOutputTokens(resolved.streamFn, resolved.hostMaxOutputTokens);
+    const hostClamped = withHostMaxOutputTokens(resolved.streamFn, resolved);
     const cacheWrapped = withCacheRetention(hostClamped, resolved.cacheRetention);
     const maxTokensWrapped = typeof resolved.maxTokens === 'number' && resolved.maxTokens > 0
         ? withMaxTokens(cacheWrapped, resolved.maxTokens)
@@ -15,13 +16,24 @@ export function composeStreamFn(resolved) {
         ? withHeaders(maxTokensWrapped, callerHeaders)
         : maxTokensWrapped;
     const fetchWrapped = resolved.fetch ? withFetch(headerWrapped, resolved.fetch) : headerWrapped;
-    return wrapStreamFnWithTimeout(fetchWrapped, LLM_REQUEST_TIMEOUT_MS);
+    const requestBounded = wrapStreamFnWithTimeout(fetchWrapped, LLM_REQUEST_TIMEOUT_MS);
+    // Outermost so every physical attempt (each `withLLMRetry` retry calls this
+    // function again) gets its own first-event / idle watchdog.
+    return withLLMStreamTimeouts(requestBounded, resolveLLMStreamTimeouts({
+        firstEventTimeoutMs: resolved.firstEventTimeoutMs,
+        streamIdleTimeoutMs: resolved.streamIdleTimeoutMs,
+    }));
 }
 export function setLLMHook(agent, turn, history) {
     if (turn.hooks.beforeLLM.length === 0 && turn.hooks.afterLLM.length === 0)
         return;
     let checkpointCallCount = 0;
     agent.transformContext = async (messages, signal) => {
+        const request = await prepareRequest(messages, signal);
+        turn.recovery.lastRequest = [...request];
+        return request;
+    };
+    const prepareRequest = async (messages, signal) => {
         const rejectedMessages = messages.filter((message) => turn.rejectedAssistantMessages.has(message));
         if (rejectedMessages.length > 0) {
             messages.splice(0, messages.length, ...messages.filter((message) => !turn.rejectedAssistantMessages.has(message)));
@@ -32,7 +44,9 @@ export function setLLMHook(agent, turn, history) {
             return messages;
         const phase = checkpointCallCount === 0 ? 'initial' : 'iteration';
         checkpointCallCount += 1;
-        const checkpoint = await runBeforeLLM(turn, messages, phase, signal);
+        const recovery = turn.recovery.active;
+        delete turn.recovery.active;
+        const checkpoint = await runBeforeLLM(turn, messages, phase, signal, recovery);
         if (checkpoint.type === 'abort') {
             turn.metrics.tryRecordTerminalFailure({
                 errorSource: 'before_llm_hook',
@@ -50,15 +64,10 @@ export function setLLMHook(agent, turn, history) {
         if (checkpoint.type === 'requestOnly') {
             return checkpoint.messages;
         }
-        if (checkpoint.type !== 'replace' && checkpoint.type !== 'append')
+        if (checkpoint.type !== 'commit')
             return messages;
-        const replacement = checkpoint.type === 'replace'
-            ? {
-                messages: checkpoint.durableMessages,
-                metadata: checkpoint.metadata,
-                ...(checkpoint.afterCommit ? { afterCommit: checkpoint.afterCommit } : {}),
-            }
-            : checkpoint.durableReplacement;
+        let requestMessages = checkpoint.messages;
+        const replacement = checkpoint.durableReplacement;
         if (replacement) {
             // Pi passes the provider-bound context array into transformContext, but
             // Agent.state.messages is the transcript later event reducers read. A
@@ -80,17 +89,29 @@ export function setLLMHook(agent, turn, history) {
                 if (invalidAppendReason) {
                     throw new Error(`after_commit append message invalid: ${invalidAppendReason}`);
                 }
-                const appendMessage = checkpoint.type === 'append' ? checkpoint.messages.at(-1) : undefined;
-                checkpoint.messages = appendMessage
-                    ? [...checkpoint.messages.slice(0, -1), postCommitMessage, appendMessage]
-                    : [...checkpoint.messages, postCommitMessage];
+                // The post-commit message belongs to the durable replacement, so it
+                // precedes every tail marker registered by later hooks, both in the
+                // request and in history. A request-only filter may have dropped the
+                // tail markers from the request; then the message simply goes last.
+                const tailMarkers = new Set(checkpoint.tailMessages);
+                const firstTailIndex = requestMessages.findIndex((message) => tailMarkers.has(message));
+                requestMessages =
+                    firstTailIndex < 0
+                        ? [...requestMessages, postCommitMessage]
+                        : [
+                            ...requestMessages.slice(0, firstTailIndex),
+                            postCommitMessage,
+                            ...requestMessages.slice(firstTailIndex),
+                        ];
                 messages.push(postCommitMessage);
                 agent.state.messages = [...agent.state.messages, postCommitMessage];
                 await history.flushTail();
             }
         }
-        if (checkpoint.type === 'replace')
-            return checkpoint.messages;
+        if (checkpoint.tailMessages.length === 0)
+            return requestMessages;
+        // Every tail marker is committed in registration order with a single
+        // delivery ack; any failure keeps the provider call fail-closed.
         messages.push(...checkpoint.tailMessages);
         agent.state.messages = [...agent.state.messages, ...checkpoint.tailMessages];
         try {
@@ -100,15 +121,26 @@ export function setLLMHook(agent, turn, history) {
             const message = err instanceof Error ? err.message : String(err);
             throw new Error(`before_llm_append_persistence_failed: ${message}`);
         }
-        return checkpoint.messages;
+        return requestMessages;
     };
 }
-async function runBeforeLLM(turn, messages, phase, signal) {
+async function runBeforeLLM(turn, messages, phase, signal, recovery) {
     const initialCurrentUser = captureInitialCurrentUser(messages, phase);
+    // Two views flow through the pipeline:
+    // - `currentMessages` is the Provider request view. Request-only hooks may
+    //   rewrite it; every registered append marker is inserted here at once so
+    //   later hooks (e.g. final-request budget admission) see the real request.
+    // - `canonicalMessages` is the canonical history as it will look after this
+    //   checkpoint commits: the durable replacement base (already carrying placed
+    //   markers) followed by every pending tail marker in registration order.
     let currentMessages = [...messages];
     let canonicalMessages = [...messages];
     let requestMessagesReplaced = false;
     let durableReplacement;
+    // Successful appends no longer end the pipeline; tail markers accumulate here
+    // and are committed with one history flush after every hook has run.
+    const pendingTailMessages = [];
+    let pendingAppendCount = 0;
     for (const hook of turn.hooks.beforeLLM) {
         let decision;
         try {
@@ -116,6 +148,7 @@ async function runBeforeLLM(turn, messages, phase, signal) {
                 sessionId: turn.input.sessionId,
                 turnId: turn.input.turnId,
                 phase,
+                ...(recovery ? { recovery } : {}),
                 messages: [...currentMessages],
                 canonicalMessages: [...canonicalMessages],
                 model: turn.llm.model,
@@ -230,11 +263,14 @@ async function runBeforeLLM(turn, messages, phase, signal) {
                 };
             }
             if (decision.placement === 'before-current-user') {
+                // Pending tail markers stay at the request tail after the real user, the
+                // same position they take in canonical history once committed.
+                const pendingTails = new Set(pendingTailMessages);
                 const placement = placeBeforeCurrentUser({
                     phase,
                     initialMessages: messages,
                     initialCurrentUser,
-                    currentMessages,
+                    currentMessages: currentMessages.filter((message) => !pendingTails.has(message)),
                     durableReplacement,
                     marker: decision.message,
                 });
@@ -250,24 +286,44 @@ async function runBeforeLLM(turn, messages, phase, signal) {
                 if (placement.type === 'defer')
                     continue;
                 if (placement.type === 'placed') {
-                    return {
-                        type: 'append',
-                        messages: placement.messages,
-                        message: decision.message,
-                        tailMessages: [],
-                        durableReplacement: placement.durableReplacement,
+                    currentMessages = [
+                        ...placement.messages,
+                        ...currentMessages.filter((message) => pendingTails.has(message)),
+                    ];
+                    durableReplacement = {
+                        ...placement.durableReplacement,
+                        ...(durableReplacement?.afterCommit
+                            ? { afterCommit: durableReplacement.afterCommit }
+                            : {}),
                     };
+                    canonicalMessages = [...durableReplacement.messages, ...pendingTailMessages];
+                    pendingAppendCount += 1;
+                    logAppendRegistered(turn, phase, decision.reason, 'before-current-user');
+                    continue;
                 }
                 // 'tail': a continuation has no current user to precede, so the ordinary
                 // tail append already keeps real user input last.
             }
-            return {
-                type: 'append',
-                messages: [...currentMessages, decision.message],
-                message: decision.message,
-                tailMessages: [decision.message],
-                ...(durableReplacement ? { durableReplacement } : {}),
-            };
+            pendingTailMessages.push(decision.message);
+            currentMessages = [...currentMessages, decision.message];
+            canonicalMessages = [...canonicalMessages, decision.message];
+            pendingAppendCount += 1;
+            logAppendRegistered(turn, phase, decision.reason, 'tail');
+            continue;
+        }
+        if (pendingAppendCount > 0) {
+            // A durable replacement after a registered marker would have to rebase
+            // markers the hook never saw onto a history it rewrote. Production
+            // registers context compaction before every appending reminder, so this
+            // order is a composition bug; fail closed instead of guessing a rebase.
+            const reason = 'beforeLlmCall durable replacement after a pending appendMessage is unsupported';
+            turn.logger.error({
+                session_id: turn.input.sessionId,
+                turn_id: turn.input.turnId,
+                phase,
+                reason,
+            }, '[pi-turn-runner] beforeLlmCall replacement rejected');
+            return { type: 'abort', reason };
         }
         const invalidReplacementReason = validReplacement(decision.metadata);
         if (invalidReplacementReason) {
@@ -309,26 +365,41 @@ async function runBeforeLLM(turn, messages, phase, signal) {
                 : { messages_after: decision.metadata.messagesAfter }),
         }, '[pi-turn-runner] beforeLlmCall replaced context messages');
     }
-    if (durableReplacement) {
+    if (durableReplacement || pendingTailMessages.length > 0) {
         return {
-            type: 'replace',
+            type: 'commit',
             messages: currentMessages,
-            durableMessages: durableReplacement.messages,
-            metadata: durableReplacement.metadata,
-            ...(durableReplacement.afterCommit ? { afterCommit: durableReplacement.afterCommit } : {}),
+            tailMessages: pendingTailMessages,
+            ...(durableReplacement ? { durableReplacement } : {}),
         };
     }
     return requestMessagesReplaced
         ? { type: 'requestOnly', messages: currentMessages }
         : { type: 'unchanged', messages };
 }
+function logAppendRegistered(turn, phase, reason, placement) {
+    turn.logger.info({
+        session_id: turn.input.sessionId,
+        turn_id: turn.input.turnId,
+        phase,
+        reason,
+        placement,
+    }, '[pi-turn-runner] beforeLlmCall registered hidden context message');
+}
 function captureInitialCurrentUser(messages, phase) {
     if (phase !== 'initial')
         return undefined;
     const candidate = messages.at(-1);
-    if (candidate?.role !== 'user')
+    if (candidate?.role !== 'user' || isInternalUserMessage(candidate))
         return undefined;
     return messages.filter((message) => message === candidate).length === 1 ? candidate : undefined;
+}
+function isInternalUserMessage(message) {
+    const hostMetadata = Reflect.get(message, 'hostMetadata');
+    if (typeof hostMetadata !== 'object' || hostMetadata === null || Array.isArray(hostMetadata)) {
+        return false;
+    }
+    return Object.hasOwn(hostMetadata, 'backgroundTaskOrigin');
 }
 function placeBeforeCurrentUser(input) {
     if (input.phase !== 'initial')
@@ -337,14 +408,22 @@ function placeBeforeCurrentUser(input) {
         return { type: 'defer' };
     const currentUser = input.initialCurrentUser;
     if (!currentUser) {
-        // Continuation re-enters from history that can end with a tool round; with
-        // no real user at the tail there is nothing to precede. Aborting here would
-        // discard the durable replacement (e.g. a finished compaction) every retry.
-        if (input.initialMessages.at(-1)?.role !== 'user')
+        const tail = input.initialMessages.at(-1);
+        // A continuation or an explicitly internal user at the tail has no real
+        // user to precede. The ordinary tail path keeps the durable replacement
+        // (e.g. a finished compaction) while still appending the marker.
+        if (tail?.role !== 'user' || isInternalUserMessage(tail))
             return { type: 'tail' };
         return 'before-current-user could not locate one current real user';
     }
     const sourceIndex = input.initialMessages.length - 1;
+    // `currentUserSourceIndex` is reserved for placement (validReplacement
+    // rejects it from hooks), so its presence means an earlier hook in this
+    // pipeline already placed a marker and moved the exact current user to the
+    // tail of both views.
+    if (input.durableReplacement.metadata.currentUserSourceIndex !== undefined) {
+        return placeAfterEarlierPlacement({ ...input, durableReplacement: input.durableReplacement }, currentUser);
+    }
     const sourceIndexes = input.durableReplacement.metadata.replacementSourceIndexes;
     const durableMatches = input.durableReplacement.messages.flatMap((message, index) => message === currentUser || sourceIndexes?.[index] === sourceIndex ? [index] : []);
     if (new Set(durableMatches).size > 1) {
@@ -368,6 +447,44 @@ function placeBeforeCurrentUser(input) {
         },
     };
 }
+/**
+ * Places another marker once an earlier placement already put the exact
+ * current user at the durable tail. Markers keep registration order, all
+ * before the current user. In the request view the user is matched by
+ * identity; if a request-only hook rewrote the user (e.g. a media guard
+ * replacing an image block), the first placement's invariant — the current
+ * user is the last request message — locates it instead.
+ */
+function placeAfterEarlierPlacement(input, currentUser) {
+    const durable = input.durableReplacement.messages;
+    if (durable.at(-1) !== currentUser || durable.indexOf(currentUser) !== durable.length - 1) {
+        return 'before-current-user lost the placed current user';
+    }
+    const identityMatches = input.currentMessages.flatMap((message, index) => message === currentUser ? [index] : []);
+    if (identityMatches.length > 1)
+        return 'before-current-user located multiple request users';
+    const lastIndex = input.currentMessages.length - 1;
+    const requestUserIndex = identityMatches[0] ?? (input.currentMessages[lastIndex]?.role === 'user' ? lastIndex : -1);
+    if (requestUserIndex < 0)
+        return 'before-current-user lost the placed request user';
+    const durableMessages = [...durable.slice(0, -1), input.marker, currentUser];
+    return {
+        type: 'placed',
+        messages: [
+            ...input.currentMessages.slice(0, requestUserIndex),
+            input.marker,
+            ...input.currentMessages.slice(requestUserIndex),
+        ],
+        durableReplacement: {
+            messages: durableMessages,
+            metadata: {
+                ...input.durableReplacement.metadata,
+                messagesAfter: durableMessages.length,
+                placedMarkerCount: (input.durableReplacement.metadata.placedMarkerCount ?? 1) + 1,
+            },
+        },
+    };
+}
 function withCurrentUserTailMetadata(metadata, removedIndex, messagesAfter, currentUserSourceIndex) {
     const replacementSourceIndexes = removedIndex === undefined
         ? metadata.replacementSourceIndexes
@@ -376,6 +493,7 @@ function withCurrentUserTailMetadata(metadata, removedIndex, messagesAfter, curr
         ...metadata,
         messagesAfter,
         currentUserSourceIndex,
+        placedMarkerCount: 1,
         ...(replacementSourceIndexes === undefined ? {} : { replacementSourceIndexes }),
     };
 }
@@ -402,6 +520,9 @@ function validReplacement(metadata) {
         return 'metadata is required';
     if (Object.hasOwn(metadata, 'currentUserSourceIndex')) {
         return 'currentUserSourceIndex is reserved for placement';
+    }
+    if (Object.hasOwn(metadata, 'placedMarkerCount')) {
+        return 'placedMarkerCount is reserved for placement';
     }
     if (!metadata.replacementId)
         return 'replacementId is required';
@@ -471,21 +592,40 @@ function withMaxTokens(inner, maxTokens) {
  * cap, so a provider that allows less still wins and nothing downstream can
  * widen a budget the host already clamped.
  *
- * No cap means the caller keeps its stream function untouched. A cap that is
- * present but not a positive integer is rejected here, while the turn is being
- * assembled, rather than silently degrading into "no ceiling".
+ * No cap means the caller keeps its stream function untouched. Static caps
+ * are validated at assembly; dynamic allowance is re-read and validated at
+ * every physical attempt, so retries cannot reuse an exhausted allowance.
  */
-function withHostMaxOutputTokens(inner, hostMaxOutputTokens) {
-    if (hostMaxOutputTokens === undefined)
-        return inner;
-    if (!Number.isInteger(hostMaxOutputTokens) || hostMaxOutputTokens <= 0) {
-        throw new TypeError(`host_max_output_tokens_invalid: ${String(hostMaxOutputTokens)} is not a positive integer`);
+function assertOutputTokenCap(cap) {
+    if (!Number.isInteger(cap) || cap <= 0) {
+        throw new TypeError(`host_max_output_tokens_invalid: ${String(cap)} is not a positive integer`);
     }
+}
+/** Numeric view for request diagnostics and the final provider admission seam. */
+export function resolveHostOutputTokenCap(config) {
+    const dynamic = config.resolveHostMaxOutputTokens?.();
+    if (dynamic === 0)
+        throw new Error('host_output_budget_exhausted');
+    if (dynamic !== undefined)
+        assertOutputTokenCap(dynamic);
+    if (config.hostMaxOutputTokens !== undefined)
+        assertOutputTokenCap(config.hostMaxOutputTokens);
+    const caps = [dynamic, config.hostMaxOutputTokens].filter((cap) => cap !== undefined);
+    return caps.length ? Math.min(...caps) : undefined;
+}
+function withHostMaxOutputTokens(inner, config) {
+    if (config.hostMaxOutputTokens === undefined && !config.resolveHostMaxOutputTokens)
+        return inner;
+    if (config.hostMaxOutputTokens !== undefined)
+        assertOutputTokenCap(config.hostMaxOutputTokens);
     const base = inner ?? streamSimple;
     return ((model, context, options) => {
+        const cap = resolveHostOutputTokenCap(config);
+        if (cap === undefined)
+            return base(model, context, options);
         return base(model, context, {
             ...(options ?? {}),
-            maxTokens: smallestPositive([hostMaxOutputTokens, options?.maxTokens, model?.maxTokens]),
+            maxTokens: smallestPositive([cap, options?.maxTokens, model?.maxTokens]),
         });
     });
 }

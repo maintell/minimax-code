@@ -1,3 +1,13 @@
+export function createPluginAgentRoster(agents) {
+    const byName = new Map(agents.map((agent) => [pluginAgentKey(agent.scopedName), agent]));
+    return Object.freeze({
+        list: () => agents,
+        resolve: (scopedName) => byName.get(pluginAgentKey(scopedName)),
+    });
+}
+function pluginAgentKey(name) {
+    return name.trim().normalize('NFKC').toLowerCase();
+}
 /**
  * Owns the v2 execution/publication boundary. TurnSystem remains the authority
  * for session admission; this lifecycle leases the capability generation
@@ -25,14 +35,11 @@ export class AgentHostTurnCapabilityLifecycle {
         const allowPendingPublication = [...this.inFlight.values()].some((turn) => turn.sessionId === input.sessionId);
         if (provider)
             await provider.waitUntilReady({ allowPendingPublication });
-        const preparation = provider && input.captureCapabilities !== false
-            ? await provider.prepareTurnCapabilities?.(input.signal)
-            : undefined;
         await this.waitForPublication();
         // No await below this point: capture + registration is one JS critical section.
         input.beforeCapabilityCapture?.();
         const capabilities = provider && input.captureCapabilities !== false
-            ? provider.captureTurnCapabilities(preparation)
+            ? provider.captureTurnCapabilities()
             : undefined;
         if (capabilities)
             provider?.retainTurnCapabilities?.(capabilities);

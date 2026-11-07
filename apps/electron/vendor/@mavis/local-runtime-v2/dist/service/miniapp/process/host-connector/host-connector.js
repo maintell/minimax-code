@@ -1,154 +1,21 @@
 import { randomUUID } from 'node:crypto';
+import { miniAppPermissionId } from '@mavis/shared/miniapp-surface';
 import { ConnectorGatewayError, } from '../../../host-connector-system/index.js';
 import { bindMiniAppIpcChannel, encodeMiniAppIpcMessage, sendMiniAppIpcMessage, } from '../node-runtime/ipc-transport.js';
+import { raceWithSignal } from './host-connector-abort.js';
+import { createHostAgentSession } from './host-connector-agent.js';
+import { createHostToolSession } from './host-connector-tool.js';
 import { createHostConnectorGatewayRelease, HostConnectorSessionLifecycle, } from './host-connector-quiesce.js';
-import { HostConnectorCancelledError, HostConnectorError, HostConnectorProtocolError, HostConnectorRequestTimeoutError, isSafeHostConnectorDiagnosticConstraint, isSafeHostConnectorDiagnosticPath, normalizeGatewayError, providerWireError, serviceRestartedWireError, staleToolWireError, unavailableWireError, } from './host-connector-errors.js';
-const REQUEST_MAX_BYTES = 256 * 1024;
-const RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
-const MAX_IDENTIFIER_BYTES = 256;
-const MAX_PENDING = 16;
-/** Child-side implementation injected into `start(context)`. */
-export function createMiniAppHostConnectorRuntimeClient(options) {
-    const pending = new Map();
-    let nextRequestId = 1n;
-    let closed = false;
-    let writeTail = Promise.resolve();
-    const detach = bindMiniAppIpcChannel(options.transport, {
-        type: 'miniapp:connector',
-        maxBytes: RESPONSE_MAX_BYTES,
-        onMessage: handleResponse,
-        onFatal: fatal,
-    });
-    function fatal(error) {
-        if (closed)
-            return;
-        closed = true;
-        const normalized = error instanceof Error ? error : new HostConnectorProtocolError('Host Connector failed');
-        for (const [id, entry] of pending) {
-            entry.abortCleanup?.();
-            entry.reject(disconnectedError(id, entry));
-        }
-        pending.clear();
-        detach();
-        options.onFatal?.(normalized);
+import { HostConnectorCancelledError, HostConnectorProtocolError, HostConnectorRequestTimeoutError, normalizeGatewayError, notPermittedWireError, providerWireError, serviceRestartedWireError, staleToolWireError, unavailableWireError, } from './host-connector-errors.js';
+import { hasExactKeys, hasHostConnectorRequestCapacity, isAgentMethod, isAgentSessionReadMethod, isAgentStreamMethod, isBoundedIdentifier, isCancelMethod, isRecord, isRequestId, isToolMethod, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, } from './host-connector-wire.js';
+export { createMiniAppHostConnectorRuntimeClient, } from './host-connector-client.js';
+function requireHostRequestAdmission(id, method, highestRequestId, requests) {
+    const numericId = BigInt(id);
+    if (numericId <= highestRequestId ||
+        !hasHostConnectorRequestCapacity(method, requests.values())) {
+        throw new HostConnectorProtocolError('Host Connector request ordering is invalid');
     }
-    function handleResponse(value) {
-        if (!isRecord(value) || value.v !== 1 || !isRequestId(value.id)) {
-            throw new HostConnectorProtocolError('Host Connector response envelope is invalid');
-        }
-        const entry = pending.get(value.id);
-        if (!entry)
-            throw new HostConnectorProtocolError('Host Connector response id is unknown');
-        if (value.receipt === 'admitted') {
-            recordAdmissionReceipt(value, entry);
-            return;
-        }
-        const success = value.ok === true;
-        const keys = success ? ['v', 'id', 'ok', 'result'] : ['v', 'id', 'ok', 'error'];
-        if (!hasExactKeys(value, keys)) {
-            throw new HostConnectorProtocolError('Host Connector response shape is invalid');
-        }
-        if (success) {
-            const result = decodeChildResult(entry.method, value.result);
-            assertInvocationIdentity(entry, result);
-            settle(value.id, entry, undefined, result);
-            return;
-        }
-        const decoded = decodeWireError(value.error);
-        assertInvocationIdentity(entry, decoded);
-        settle(value.id, entry, decoded);
-    }
-    function settle(id, entry, error, result) {
-        pending.delete(id);
-        entry.abortCleanup?.();
-        if (error)
-            entry.reject(error);
-        else
-            entry.resolve(result);
-    }
-    function send(method, params, signal) {
-        if (closed)
-            return Promise.reject(unavailableError());
-        if (signal?.aborted)
-            return Promise.reject(cancelledError());
-        if (pending.size >= MAX_PENDING)
-            return Promise.reject(unavailableError(true));
-        const id = allocateRequestId();
-        let frame;
-        try {
-            frame = encodeMiniAppIpcMessage('miniapp:connector', { v: 1, id, method, params }, REQUEST_MAX_BYTES);
-        }
-        catch {
-            return Promise.reject(method === 'connector.call'
-                ? invalidArgumentsError()
-                : new HostConnectorProtocolError('Host Connector list request is invalid'));
-        }
-        return new Promise((resolve, reject) => {
-            const entry = { method, resolve, reject, written: false };
-            pending.set(id, entry);
-            const onAbort = () => {
-                if (!entry.written) {
-                    settle(id, entry, cancelledError());
-                    return;
-                }
-                enqueueWrite(async () => {
-                    if (pending.has(id)) {
-                        await sendMiniAppIpcMessage(options.transport, encodeMiniAppIpcMessage('miniapp:connector', { v: 1, id, method: 'connector.cancel' }, REQUEST_MAX_BYTES));
-                    }
-                });
-            };
-            if (signal) {
-                signal.addEventListener('abort', onAbort, { once: true });
-                entry.abortCleanup = () => signal.removeEventListener('abort', onAbort);
-            }
-            enqueueWrite(async () => {
-                if (!pending.has(id))
-                    return;
-                await sendMiniAppIpcMessage(options.transport, frame, () => {
-                    entry.written = true;
-                });
-                if (signal?.aborted)
-                    onAbort();
-            });
-        });
-    }
-    function enqueueWrite(operation) {
-        writeTail = runChildWrite(writeTail, operation, fatal);
-    }
-    function allocateRequestId() {
-        if (nextRequestId > 18446744073709551615n) {
-            throw new HostConnectorProtocolError('Host Connector request ids exhausted');
-        }
-        const value = nextRequestId.toString();
-        nextRequestId += 1n;
-        return value;
-    }
-    const client = Object.freeze({
-        async list(callOptions) {
-            return (await send('connector.list', {}, callOptions?.signal));
-        },
-        async call(toolRef, arguments_, callOptions) {
-            if (!isBoundedIdentifier(toolRef) || !isRecord(arguments_)) {
-                throw invalidArgumentsError();
-            }
-            return (await send('connector.call', { toolRef, arguments: arguments_ }, callOptions?.signal));
-        },
-    });
-    return {
-        client,
-        close() {
-            fatal(new HostConnectorProtocolError('Host Connector client closed'));
-        },
-    };
-}
-async function runChildWrite(previous, operation, fatal) {
-    try {
-        await previous;
-        await operation();
-    }
-    catch (error) {
-        fatal(error);
-    }
+    return numericId;
 }
 function markHostRequestDispatched(requests, id) {
     const request = requests.get(id);
@@ -163,14 +30,16 @@ function dispatchedRequestCompletions(requests) {
 function requestCompletions(requests) {
     return [...requests.values()].map((request) => request.completion);
 }
-function registerActiveHostRequest(requests, id, controller) {
+function registerActiveHostRequest(requests, id, controller, method) {
     let resolveCompletion;
     const completion = new Promise((resolve) => {
         resolveCompletion = resolve;
     });
     const request = {
+        method,
         controller,
         completion,
+        endsOnCutover: isAgentStreamMethod(method) || isAgentSessionReadMethod(method),
         dispatched: false,
         complete: () => {
             requests.delete(id);
@@ -179,6 +48,28 @@ function registerActiveHostRequest(requests, id, controller) {
     };
     requests.set(id, request);
     return request;
+}
+/**
+ * Agent turns, observers and session reads never hold a cutover open: once it commits they are
+ * cancelled, so the retired generation receives no more of the user's sessions.
+ */
+function abortAgentRequests(requests) {
+    for (const request of requests.values()) {
+        if (request.endsOnCutover) {
+            request.controller.abort(new HostConnectorCancelledError('Mini App Agent run cancelled'));
+        }
+    }
+}
+/**
+ * A forced cutover stops waiting for dispatched work that missed the drain deadline. Responses
+ * still publish, so each child caller gets its terminal outcome (unknown after dispatch for a
+ * call) before the root stops.
+ */
+function abortDispatchedRequests(requests) {
+    for (const request of requests.values()) {
+        if (request.dispatched)
+            request.controller.abort();
+    }
 }
 /** Host-side generation-bound session backed only by the ConnectorGateway seam. */
 export function createMiniAppHostConnectorSessionFactory(options) {
@@ -198,15 +89,23 @@ function createHostConnectorSession(options, input) {
     let refs = new Map();
     let refsByHandle = new Map();
     const lifecycle = new HostConnectorSessionLifecycle();
+    const connectorSwitches = createConnectorSwitchView(options.permissionSwitches, input.pluginId);
     let handshakeStarted = false;
     let fatalReported = false;
     let publishResponses = true;
-    let writeTail = Promise.resolve();
     let retirePromise;
-    const releaseGateway = createHostConnectorGatewayRelease(options.gateway, input);
     const makeToolRef = options.makeToolRef ?? randomUUID;
     const makeInvocationId = options.makeInvocationId ?? randomUUID;
     const timeouts = hostSessionTimeouts(options);
+    const writer = createHostResponseWriter(input.transport, () => publishResponses && !lifecycle.isRetired() && input.transport.connected !== false);
+    const enqueueResponse = writer.enqueue;
+    const { agent, tool, releaseBindings } = createHostSessionBindings({
+        options,
+        input,
+        lifecycle,
+        makeInvocationId: () => requireInvocationId(makeInvocationId()),
+        enqueueResponse,
+    });
     const detach = bindMiniAppIpcChannel(input.transport, {
         type: 'miniapp:connector',
         maxBytes: REQUEST_MAX_BYTES,
@@ -220,33 +119,31 @@ function createHostConnectorSession(options, input) {
     });
     function handleFrame(value) {
         const frame = decodeRequest(value);
-        if (frame.method === 'connector.cancel') {
-            const request = requests.get(frame.id);
-            if (request) {
-                request.controller.abort(new HostConnectorCancelledError('Request cancelled'));
-            }
-            else if (BigInt(frame.id) > highestRequestId) {
-                throw new HostConnectorProtocolError('Host Connector cancel id is unknown');
-            }
+        if (isCancelMethod(frame.method)) {
+            cancelHostRequest(requests, frame.id, highestRequestId);
             return;
         }
-        const numericId = BigInt(frame.id);
-        if (numericId <= highestRequestId || requests.size >= MAX_PENDING) {
-            throw new HostConnectorProtocolError('Host Connector request ordering is invalid');
-        }
-        highestRequestId = numericId;
+        highestRequestId = requireHostRequestAdmission(frame.id, frame.method, highestRequestId, requests);
         const controller = new AbortController();
-        const request = registerActiveHostRequest(requests, frame.id, controller);
+        const request = registerActiveHostRequest(requests, frame.id, controller, frame.method);
         request.execution = runTimedHostRequest({
             frame,
             controller,
-            timeoutMs: timeouts.requestMs,
+            timeoutMs: isAgentStreamMethod(frame.method) ? undefined : requestTimeoutMs(frame, timeouts),
             dispatch,
             fail,
             complete: request.complete,
         });
     }
     async function dispatch(frame, signal) {
+        if (isAgentMethod(frame.method)) {
+            const markDispatched = () => markHostRequestDispatched(requests, frame.id);
+            return agent.handle({ ...frame, method: frame.method }, signal, markDispatched);
+        }
+        if (isToolMethod(frame.method)) {
+            const markDispatched = () => markHostRequestDispatched(requests, frame.id);
+            return tool.handle({ ...frame, method: frame.method }, signal, markDispatched);
+        }
         const gate = lifecycle.gate();
         if (gate !== 'open') {
             await respondError(frame.id, gate === 'service-restarted' ? serviceRestartedWireError() : unavailableWireError());
@@ -263,81 +160,76 @@ function createHostConnectorSession(options, input) {
             await respondError(frame.id, unavailableWireError());
             return;
         }
-        await call(frame.id, callParams.toolRef, callParams.arguments, signal);
-    }
-    async function list(id, signal) {
-        try {
-            const inventory = await listHostConnectorTools({
-                gateway: options.gateway,
-                pluginId: input.pluginId,
-                processGeneration: input.processGeneration,
-                providers: input.providers,
-                signal,
-                makeToolRef,
-                previousRefs: refsByHandle,
-                markDispatched: () => markHostRequestDispatched(requests, id),
-            });
-            refs = inventory.refs;
-            refsByHandle = inventory.refsByHandle;
-            await respond(id, { tools: inventory.tools, partial: inventory.partial });
-        }
-        catch (error) {
-            await respondError(id, normalizeGatewayError(error));
-        }
-    }
-    async function call(id, toolRef, arguments_, signal) {
         await dispatchHostConnectorCall({
-            id,
-            toolRef,
-            arguments: arguments_,
+            id: frame.id,
+            toolRef: callParams.toolRef,
+            arguments: callParams.arguments,
             signal,
             refs,
+            isPermitted: connectorSwitches.permits,
             gateway: options.gateway,
             pluginId: input.pluginId,
             processGeneration: input.processGeneration,
             makeInvocationId,
             admissionGate: () => lifecycle.gate(),
-            markDispatched: () => markHostRequestDispatched(requests, id),
+            markDispatched: () => markHostRequestDispatched(requests, frame.id),
             enqueueResponse,
             respond,
             respondError,
         });
     }
+    async function list(id, signal) {
+        try {
+            const inventory = await listHostConnectorTools({
+                gateway: options.gateway,
+                session: input,
+                signal,
+                makeToolRef,
+                previousRefs: refsByHandle,
+                markDispatched: () => markHostRequestDispatched(requests, id),
+            });
+            ({ refs, refsByHandle } = inventory);
+            const tools = connectorSwitches.visible(inventory.tools);
+            await respond(id, { tools, partial: inventory.partial });
+        }
+        catch (error) {
+            await respondError(id, normalizeGatewayError(error));
+        }
+    }
     const respond = (id, result) => enqueueResponse({ v: 1, id, ok: true, result });
     const respondError = (id, error) => enqueueResponse({ v: 1, id, ok: false, error });
-    function enqueueResponse(value) {
-        const operation = writeHostResponse(writeTail, () => publishResponses && !lifecycle.isRetired() && input.transport.connected !== false, input.transport, value);
-        writeTail = ignoreFailure(operation);
-        return operation;
-    }
     async function retire() {
         if (!lifecycle.beginRetirement())
             return;
+        abortAgentRequests(requests);
         const pending = requestCompletions(requests);
         if (!(await settleWithin(Promise.allSettled(pending), timeouts.graceMs))) {
             publishResponses = false;
             for (const request of requests.values())
                 request.controller.abort();
         }
-        await settleWithin(Promise.allSettled([...requestCompletions(requests), writeTail]), timeouts.settleMs);
+        await settleWithin(Promise.allSettled([...requestCompletions(requests), writer.idle()]), timeouts.settleMs);
         lifecycle.markRetired();
         refs.clear();
         refsByHandle.clear();
         detach();
-        releaseGateway();
+        releaseBindings();
+    }
+    function teardown() {
+        publishResponses = false;
+        for (const request of requests.values())
+            request.controller.abort();
+        refs.clear();
+        refsByHandle.clear();
+        detach();
+        releaseBindings();
     }
     function fail(error) {
         if (fatalReported || lifecycle.isRetired())
             return;
         fatalReported = true;
         lifecycle.beginRetirement();
-        publishResponses = false;
-        refs.clear();
-        refsByHandle.clear();
-        for (const request of requests.values())
-            request.controller.abort();
-        detach();
-        releaseGateway();
+        teardown();
         retirePromise ??= retire();
         input.onFatal(error instanceof Error ? error : new HostConnectorProtocolError('Host Connector failed'));
     }
@@ -346,33 +238,86 @@ function createHostConnectorSession(options, input) {
             if (!lifecycle.isRetired())
                 handshakeStarted = true;
         },
-        activate: () => lifecycle.activate(),
+        activate() {
+            lifecycle.activate();
+            agent.activate();
+        },
         beginQuiesce(quiesceInput) {
-            return lifecycle.beginQuiesce({
+            const attempt = lifecycle.beginQuiesce({
                 pending: dispatchedRequestCompletions(requests),
                 deadlineMs: quiesceInput.deadlineMs,
                 signal: quiesceInput.signal,
-                commit: () => {
+                // Agent turns are aborted only once the switch is final: a `busy` or resumed quiesce
+                // leaves the old generation running, and its in-flight turns must survive that.
+                commit: (forced) => {
+                    abortAgentRequests(requests);
+                    if (forced)
+                        abortDispatchedRequests(requests);
                     refs.clear();
                     refsByHandle.clear();
-                    releaseGateway();
+                    releaseBindings();
                 },
             });
+            return attempt;
         },
         retire() {
             retirePromise ??= retire();
             return retirePromise;
         },
         close() {
-            publishResponses = false;
-            for (const request of requests.values())
-                request.controller.abort();
-            refs.clear();
-            refsByHandle.clear();
-            detach();
-            releaseGateway();
+            teardown();
             retirePromise ??= retire();
             return retirePromise;
+        },
+    };
+}
+/**
+ * The `connector:<provider>` switches as one session applies them. A switched-off provider is
+ * hidden from `list` but its refs stay valid: calls with them are refused until it is back on.
+ */
+function createConnectorSwitchView(switches, pluginId) {
+    let providersByRef = new Map();
+    const isOn = (provider) => switches?.isEnabled(pluginId, miniAppPermissionId('connector', provider)) ?? true;
+    return {
+        /** Records which provider each listed ref belongs to; returns the tools the user allows. */
+        visible(tools) {
+            providersByRef = new Map(tools.map(({ toolRef, provider }) => [toolRef, provider]));
+            return tools.filter(({ provider }) => isOn(provider));
+        },
+        permits(toolRef) {
+            const provider = providersByRef.get(toolRef);
+            return provider === undefined || isOn(provider);
+        },
+    };
+}
+/** Agent and tool handlers sharing the session's lifecycle, identity and response queue. */
+function createHostSessionBindings(binding) {
+    const { options, input, lifecycle, makeInvocationId, enqueueResponse } = binding;
+    const releaseGateway = createHostConnectorGatewayRelease(options.gateway, input);
+    const agent = createHostAgentSession({
+        gateway: options.agentGateway,
+        identity: input,
+        lifecycle,
+        makeInvocationId,
+        maxFrameBytes: RESPONSE_MAX_BYTES,
+        enqueueResponse,
+        ...(options.logger ? { logger: options.logger } : {}),
+    });
+    const tool = createHostToolSession({
+        gateway: options.toolGateway,
+        identity: input,
+        lifecycle,
+        makeInvocationId,
+        maxFrameBytes: RESPONSE_MAX_BYTES,
+        enqueueResponse,
+    });
+    return {
+        agent,
+        tool,
+        releaseBindings: () => {
+            releaseGateway();
+            agent.release();
+            tool.release();
         },
     };
 }
@@ -380,6 +325,10 @@ async function dispatchHostConnectorCall(input) {
     const handle = input.refs.get(input.toolRef);
     if (!handle) {
         await input.respondError(input.id, staleToolWireError());
+        return;
+    }
+    if (!input.isPermitted(input.toolRef)) {
+        await input.respondError(input.id, notPermittedWireError());
         return;
     }
     let invocationId;
@@ -422,11 +371,23 @@ function hostSessionTimeouts(options) {
         graceMs: Math.max(1, options.graceTimeoutMs ?? 4_000),
         settleMs: Math.max(1, options.settleTimeoutMs ?? 1_000),
         requestMs: Math.max(1, options.requestTimeoutMs ?? 30_000),
+        mcpToolMs: Math.max(1, options.mcpToolRequestTimeoutMs ?? 120_000),
     };
 }
+/**
+ * `tool.call` / `tool.request` wait for the user's approval, so the tool gateway bounds each of
+ * their phases itself; `tool.list` discovers MCP servers and gets the MCP bound.
+ */
+function requestTimeoutMs(frame, timeouts) {
+    if (frame.method === 'tool.call' || frame.method === 'tool.request')
+        return undefined;
+    return frame.method === 'tool.list' ? timeouts.mcpToolMs : timeouts.requestMs;
+}
 async function runTimedHostRequest(input) {
-    const timer = setTimeout(() => input.controller.abort(new HostConnectorRequestTimeoutError('Host Connector request timed out')), input.timeoutMs);
-    timer.unref();
+    const timer = input.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => input.controller.abort(new HostConnectorRequestTimeoutError('Host Connector request timed out')), input.timeoutMs);
+    timer?.unref();
     try {
         await input.dispatch(input.frame, input.controller.signal);
     }
@@ -440,11 +401,11 @@ async function runTimedHostRequest(input) {
 }
 async function listHostConnectorTools(input) {
     const operation = input.gateway.list({
-        providerAllowlist: input.providers,
+        providerAllowlist: input.session.providers,
         caller: {
             kind: 'host-process',
-            pluginId: input.pluginId,
-            processGeneration: input.processGeneration,
+            pluginId: input.session.pluginId,
+            processGeneration: input.session.processGeneration,
         },
         signal: input.signal,
     });
@@ -535,27 +496,31 @@ function mintToolRef(handle, target, makeToolRef) {
     }
     throw new HostConnectorProtocolError('Host Connector could not mint a tool ref');
 }
+function cancelHostRequest(requests, id, highestRequestId) {
+    const request = requests.get(id);
+    if (request) {
+        request.controller.abort(new HostConnectorCancelledError('Request cancelled'));
+    }
+    else if (BigInt(id) > highestRequestId) {
+        throw new HostConnectorProtocolError('Host Connector cancel id is unknown');
+    }
+}
+function createHostResponseWriter(transport, shouldPublish) {
+    let tail = Promise.resolve();
+    return {
+        enqueue(value) {
+            const operation = writeHostResponse(tail, shouldPublish, transport, value);
+            tail = ignoreFailure(operation);
+            return operation;
+        },
+        idle: () => tail,
+    };
+}
 async function writeHostResponse(previous, shouldPublish, transport, value) {
     await previous;
     if (!shouldPublish())
         return;
     await sendMiniAppIpcMessage(transport, encodeMiniAppIpcMessage('miniapp:connector', value, RESPONSE_MAX_BYTES));
-}
-async function raceWithSignal(operation, signal) {
-    if (signal.aborted)
-        return Promise.reject(signal.reason);
-    let rejectOnAbort = () => undefined;
-    const aborted = new Promise((_resolve, reject) => {
-        rejectOnAbort = reject;
-    });
-    const onAbort = () => rejectOnAbort(signal.reason);
-    try {
-        signal.addEventListener('abort', onAbort, { once: true });
-        return await Promise.race([operation, aborted]);
-    }
-    finally {
-        signal.removeEventListener('abort', onAbort);
-    }
 }
 async function ignoreFailure(operation) {
     try {
@@ -577,117 +542,20 @@ function decodeCallParams(params) {
 function decodeRequest(value) {
     if (!isRecord(value) || value.v !== 1 || !isRequestId(value.id))
         throw protocolParamsError();
-    if (value.method === 'connector.cancel' && hasExactKeys(value, ['v', 'id', 'method'])) {
+    if (isCancelMethod(value.method) && hasExactKeys(value, ['v', 'id', 'method'])) {
         return { id: value.id, method: value.method };
     }
-    if ((value.method !== 'connector.list' && value.method !== 'connector.call') ||
+    if (!isParamsMethod(value.method) ||
         !hasExactKeys(value, ['v', 'id', 'method', 'params']) ||
         !isRecord(value.params)) {
         throw protocolParamsError();
     }
     return { id: value.id, method: value.method, params: value.params };
 }
-function decodeChildResult(method, value) {
-    if (!isRecord(value))
-        throw new HostConnectorProtocolError('Host Connector result is invalid');
-    if (method === 'connector.list') {
-        if (!hasExactKeys(value, ['tools', 'partial']) ||
-            !Array.isArray(value.tools) ||
-            typeof value.partial !== 'boolean') {
-            throw new HostConnectorProtocolError('Host Connector inventory is invalid');
-        }
-        return value;
-    }
-    if (!hasExactKeys(value, ['invocationId', 'value']) || !isBoundedIdentifier(value.invocationId)) {
-        throw new HostConnectorProtocolError('Host Connector call result is invalid');
-    }
-    return value;
-}
-function decodeWireError(value) {
-    if (!isWireErrorEnvelope(value)) {
-        throw new HostConnectorProtocolError('Host Connector error is invalid');
-    }
-    const diagnostic = 'diagnostic' in value ? decodeWireDiagnostic(value.diagnostic) : undefined;
-    if ((value.code === 'INVALID_ARGUMENTS' || diagnostic) && !isInvalidArgumentsWireError(value)) {
-        throw new HostConnectorProtocolError('Host Connector error is invalid');
-    }
-    return new HostConnectorError(value.code, value.message, value.disposition, {
-        retryable: value.retryable,
-        ...(typeof value.invocationId === 'string' ? { invocationId: value.invocationId } : {}),
-        ...(diagnostic ? { diagnostic } : {}),
-    });
-}
-function isWireErrorEnvelope(value) {
-    if (!isRecord(value))
-        return false;
-    return (hasExactKeys(value, [
-        'code',
-        'message',
-        'disposition',
-        'retryable',
-        ...('invocationId' in value ? ['invocationId'] : []),
-        ...('diagnostic' in value ? ['diagnostic'] : []),
-    ]) &&
-        typeof value.code === 'string' &&
-        typeof value.message === 'string' &&
-        isHostConnectorDisposition(value.disposition) &&
-        typeof value.retryable === 'boolean' &&
-        (!('invocationId' in value) || isBoundedIdentifier(value.invocationId)));
-}
-function isHostConnectorDisposition(value) {
-    return ['not_dispatched', 'provider_reported', 'unknown_after_dispatch'].includes(String(value));
-}
-function isInvalidArgumentsWireError(value) {
-    return (value.code === 'INVALID_ARGUMENTS' &&
-        value.message === 'Connector arguments are invalid' &&
-        value.disposition === 'not_dispatched' &&
-        !value.retryable);
-}
-function decodeWireDiagnostic(value) {
-    if (!isRecord(value) ||
-        !hasExactKeys(value, ['issues']) ||
-        !Array.isArray(value.issues) ||
-        value.issues.length === 0 ||
-        value.issues.length > 4) {
-        throw new HostConnectorProtocolError('Host Connector error diagnostic is invalid');
-    }
-    return { issues: value.issues.map(decodeWireDiagnosticIssue) };
-}
-function decodeWireDiagnosticIssue(value) {
-    if (!isRecord(value) ||
-        !hasExactKeys(value, ['path', 'constraint', ...('limit' in value ? ['limit'] : [])]) ||
-        !isSafeHostConnectorDiagnosticPath(value.path) ||
-        !isSafeHostConnectorDiagnosticConstraint(value.constraint) ||
-        ('limit' in value && (typeof value.limit !== 'number' || !Number.isFinite(value.limit)))) {
-        throw new HostConnectorProtocolError('Host Connector error diagnostic is invalid');
-    }
-    return {
-        path: value.path,
-        constraint: value.constraint,
-        ...('limit' in value ? { limit: value.limit } : {}),
-    };
-}
-function recordAdmissionReceipt(value, entry) {
-    if (entry.method !== 'connector.call' ||
-        entry.invocationId ||
-        !hasExactKeys(value, ['v', 'id', 'receipt', 'invocationId']) ||
-        !isBoundedIdentifier(value.invocationId)) {
-        throw new HostConnectorProtocolError('Host Connector admission receipt is invalid');
-    }
-    entry.invocationId = value.invocationId;
-}
-function assertInvocationIdentity(entry, value) {
-    if (entry.method !== 'connector.call')
-        return;
-    let actual;
-    if (value instanceof HostConnectorError)
-        actual = value.invocationId;
-    else if (isRecord(value) && typeof value.invocationId === 'string') {
-        actual = value.invocationId;
-    }
-    if (entry.invocationId === actual)
-        return;
-    throw new HostConnectorProtocolError('Host Connector invocation identity is invalid');
+function isParamsMethod(value) {
+    return (value === 'connector.list' ||
+        value === 'connector.call' ||
+        (typeof value === 'string' && (isAgentMethod(value) || isToolMethod(value))));
 }
 function parseJson(json, maxBytes) {
     if (Buffer.byteLength(json) > maxBytes) {
@@ -719,20 +587,6 @@ async function resolvesTrue(operation) {
     await operation;
     return true;
 }
-function disconnectedError(id, request) {
-    return request.method === 'connector.call' && request.written
-        ? new HostConnectorError('CONNECTOR_OUTCOME_UNKNOWN', 'Host Connector transport ended after dispatch became possible', 'unknown_after_dispatch', { retryable: false, invocationId: request.invocationId ?? id })
-        : unavailableError(true);
-}
-function unavailableError(retryable = false) {
-    return new HostConnectorError('CONNECTOR_UNAVAILABLE', 'Host Connector is unavailable', 'not_dispatched', { retryable });
-}
-function cancelledError() {
-    return new HostConnectorError('REQUEST_CANCELLED', 'Host Connector request was cancelled', 'not_dispatched', { retryable: false });
-}
-function invalidArgumentsError() {
-    return new HostConnectorError('INVALID_ARGUMENTS', 'Host Connector arguments must fit one JSON frame', 'not_dispatched', { retryable: false });
-}
 function protocolParamsError() {
     return new HostConnectorProtocolError('Host Connector request is invalid');
 }
@@ -741,28 +595,5 @@ function requireInvocationId(value) {
         throw new HostConnectorProtocolError('Host Connector invocation id is invalid');
     }
     return value;
-}
-function isRecord(value) {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-function isBoundedIdentifier(value) {
-    return (typeof value === 'string' &&
-        value.length > 0 &&
-        Buffer.byteLength(value) <= MAX_IDENTIFIER_BYTES);
-}
-function isRequestId(value) {
-    if (typeof value !== 'string' || !/^[1-9]\d{0,19}$/u.test(value))
-        return false;
-    try {
-        return BigInt(value) <= 18446744073709551615n;
-    }
-    catch {
-        return false;
-    }
-}
-function hasExactKeys(value, keys) {
-    const actual = Object.keys(value).sort();
-    const expected = [...keys].sort();
-    return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 //# sourceMappingURL=host-connector.js.map

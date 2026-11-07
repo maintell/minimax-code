@@ -1,10 +1,11 @@
 import { createV2AgentExecutionSource } from './execution-source.js';
 import { createV2AgentProfileSource } from './profile-source.js';
+import { createComputerUseTurnToolSafetyGuard, } from '../../service/computer-use/index.js';
 import { isGitRepo } from '../../service/workspace/index.js';
 import { resolveAgentPromptSurface, createLocalStaticPromptReader, } from '../../service/turn-system/index.js';
 /** Decorates product-owned AgentHost capabilities with process-local runtime adapters. */
 export function createRuntimeAgentProduct(options) {
-    const { baseProduct, agentService, modelConfig, logger, nowMs, runtimeOwnerKind, capabilityProfile, miniappAvailable, implicitCustomProviderThinking, agentReferenceProjection, inspector, promptSnapshots, internalTurnPromptReads, browserUse, globalInstructions, } = options;
+    const { baseProduct, agentService, modelConfig, logger, nowMs, runtimeOwnerKind, capabilityProfile, miniappAvailable, implicitCustomProviderThinking, systemPromptOverrides, agentReferenceProjection, inspector, promptSnapshots, internalTurnPromptReads, browserUse, globalInstructions, } = options;
     const baseSkills = baseProduct.preparation.configBuilder.skills;
     return {
         ...baseProduct,
@@ -108,6 +109,7 @@ export function createRuntimeAgentProduct(options) {
                 tuiProductPolicy: runtimeOwnerKind === 'tui',
                 ...(promptSnapshots ? { promptSnapshots } : {}),
                 ...(implicitCustomProviderThinking ? { implicitCustomProviderThinking: true } : {}),
+                systemPromptOverrides,
                 profile: createV2AgentProfileSource(agentService, modelConfig.read, runtimeOwnerKind, capabilityProfile),
             },
             modelResolver: {
@@ -137,9 +139,39 @@ export function createRuntimeAgentProduct(options) {
         },
         executor: {
             ...baseProduct.executor,
-            createTurnToolSafetyGuard: () => browserUse.createTurnToolSafetyGuard(),
+            // Browser and Computer Use each keep their own per-turn state; neither
+            // replaces the other. The first guard that blocks a call decides.
+            createTurnToolSafetyGuard: () => combineTurnToolSafetyGuards([
+                browserUse.createTurnToolSafetyGuard(),
+                createComputerUseTurnToolSafetyGuard(),
+            ]),
+            // PTC state logs name the product surface. The TUI exec entry point is
+            // known only to the host process, so exec reads `tui` here.
+            ptcSurface: ptcSurfaceOf(runtimeOwnerKind),
         },
         normalExtensions: [browserUse.extension, ...(baseProduct.normalExtensions ?? [])],
+    };
+}
+function ptcSurfaceOf(runtimeOwnerKind) {
+    if (runtimeOwnerKind === 'electron')
+        return 'desktop';
+    return runtimeOwnerKind === 'tui' ? 'tui' : 'other';
+}
+/** The first guard that blocks decides; every guard observes every result. */
+function combineTurnToolSafetyGuards(guards) {
+    return {
+        async beforeToolCall(input, signal) {
+            for (const guard of guards) {
+                const decision = await guard.beforeToolCall(input, signal);
+                if (decision)
+                    return decision;
+            }
+            return undefined;
+        },
+        async afterToolCall(input, signal) {
+            for (const guard of guards)
+                await guard.afterToolCall(input, signal);
+        },
     };
 }
 function normalizedSkillName(value) {

@@ -47,7 +47,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     return useValue ? value : void 0;
 };
 import { bindTool } from '@mavis/agent-core/tools';
-import { realpath, stat } from 'node:fs/promises';
+import { realpath, stat } from '../shared/physical-fs.js';
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { defaultScanNoiseDirectoriesInSearchRoot, defaultScanExcludeArgs, filterGlobPaths, findGlobMagicIndex, globToPathRegex, isBroadFileScan, isNarrowSearchRoot, resolveGlobStaticSearchRoot, } from '../shared/rg-scan-policy.js';
 import { withCompatibleGlobToolResponse } from '../plugin-hooks/vendor-tool-response.js';
@@ -55,6 +55,7 @@ import { LocalGlobToolDef } from './builtin-defs.js';
 import { resolveSearchRoot, runRg, textResult } from './local-rg-runner.js';
 import { isSensitiveSearchRoot, sensitiveExcludeArgs } from './local-sensitive.js';
 import { createDesktopOutputContinuation } from './output-limit.js';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 const DEFAULT_GLOB_LIMIT = 200;
 function isExactFilePattern(pattern) {
     const normalized = pattern.replaceAll('\\', '/');
@@ -178,20 +179,24 @@ let LocalGlobTool = (() => {
             }
             // Clear error for a missing path — spawn's cwd ENOENT would otherwise
             // surface as a misleading "ripgrep binary not found".
+            let rootStats;
             try {
-                await stat(searchRoot);
+                rootStats = await stat(searchRoot);
             }
             catch {
                 throw new Error(`glob path does not exist: ${input.path ?? searchRoot}`);
             }
+            if (!rootStats.isDirectory()) {
+                throw new Error(`glob path must be a directory: ${input.path ?? searchRoot}`);
+            }
             if (await isSensitiveSearchRoot(searchRoot)) {
-                return withCompatibleGlobToolResponse(textResult(LocalGlobToolDef.name, 'No files matched'), {
+                return reportGlob(withCompatibleGlobToolResponse(textResult(LocalGlobToolDef.name, 'No files matched'), {
                     durationMs: Date.now() - startedAt,
                     filenames: [],
                     truncated: false,
                     totalMatches: 0,
                     countIsComplete: true,
-                });
+                }), []);
             }
             const requestedRoot = resolveGlobStaticSearchRoot(effectivePattern, searchRoot);
             const narrowSearchRoot = await isNarrowSearchRoot(requestedRoot, this.workspaceRoot);
@@ -263,7 +268,7 @@ let LocalGlobTool = (() => {
                             'Refine path/pattern or reduce offset]';
                 }
             }
-            return withCompatibleGlobToolResponse({
+            return reportGlob(withCompatibleGlobToolResponse({
                 tool_name: LocalGlobToolDef.name,
                 text,
                 content: [{ type: 'text', text }],
@@ -274,10 +279,16 @@ let LocalGlobTool = (() => {
                 truncated,
                 totalMatches: allLines.length,
                 countIsComplete: !result.stdoutTruncated,
-            });
+            }), lines);
         }
     };
     return LocalGlobTool = _classThis;
 })();
 export { LocalGlobTool };
+/** PTC data is exactly the page of paths the text lists, plus the completeness statement. */
+function reportGlob(result, paths) {
+    return withDesktopCompletenessReport(LocalGlobToolDef.name, result, {
+        data: { paths: [...paths] },
+    });
+}
 //# sourceMappingURL=local-glob.js.map

@@ -33,7 +33,11 @@ export function buildEmbeddedBrowserToolAdapter(options = {}) {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
             try {
-                return await manager.executeAgentTool(sessionId, action, trustedInput, signal);
+                // The Turn lets the manager re-align a background Agent page with the
+                // page the user is viewing when the next Turn starts.
+                return await manager.executeAgentTool(sessionId, action, trustedInput, signal, {
+                    turnId: ctx.turnId,
+                });
             }
             finally {
                 try {

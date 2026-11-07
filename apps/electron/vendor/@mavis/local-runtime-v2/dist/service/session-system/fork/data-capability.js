@@ -24,6 +24,7 @@ export function createSessionForkDataCapability(input) {
                     agentName: session.agentName,
                     workspaceDir: session.workspaceDir,
                     title: session.title,
+                    titleSource: session.titleSource,
                     sessionType: 'branch',
                     sessionKind: session.sessionKind ?? 'conversation',
                     parentSessionId: session.parentSessionId ?? null,
@@ -35,6 +36,8 @@ export function createSessionForkDataCapability(input) {
                         }
                         : {}),
                     ...(session.appMode ? { appMode: session.appMode } : {}),
+                    // ForkService always sets it from the source; no branch keeps create() under budget.
+                    toolCallMode: session.toolCallMode,
                     ...(session.runLocation ? { runLocation: session.runLocation } : {}),
                     ...(await readForkedBindingFields(input.records, session)),
                     ...(session.effectiveModel !== undefined

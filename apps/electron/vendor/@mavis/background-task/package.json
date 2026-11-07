@@ -7,6 +7,9 @@
   "exports": {
     ".": {
       "import": "./dist/index.js"
+    },
+    "./local": {
+      "import": "./dist/local.js"
     }
   }
 }

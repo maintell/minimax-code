@@ -53,8 +53,8 @@ const TITLE_INPUT_TRUNCATION_MARKER = '\n[…]\n';
 const TITLE_MAX_LEN = SESSION_TITLE_MAX_UNICODE_LENGTH;
 const TITLE_ATTEMPTS = 2;
 const TITLE_PROVIDER_RETRY_DELAYS_MS = [500, 2_000];
-const INJECTED_TAG_RE = /<(agent-message|agent-context|system-reminder|peer-memory-path|engine-message|inbound-context|html-selection-context)\b[^>]*>[\s\S]*?<\/\1>/g;
-/** Owns first-accepted-message title eligibility, freshness fencing and safe writeback. */
+const INJECTED_TAG_RE = /<(agent-message|agent-context|system-reminder|peer-memory-path|engine-message|inbound-context|html-selection-context|user-provided-context|mavis-chat-context|deployed-website-context)\b[^>]*>[\s\S]*?<\/\1>/g;
+/** Owns automatic-title eligibility, freshness fencing and safe writeback. */
 export class SessionTitleService {
     options;
     pending = new Map();
@@ -67,15 +67,15 @@ export class SessionTitleService {
     async generateAfterAcceptedUserMessage(input) {
         if (!input.receipt.acceptedNow || !input.receipt.firstAcceptedForSession)
             return;
-        await this.generateTitle(input.sessionId, input.userMessage);
+        await this.generateTitle(input.sessionId, input.userMessage, input.expectedTitle);
     }
-    generate(sessionId, userMessage) {
-        const operation = this.startGeneration(sessionId, userMessage);
+    generate(sessionId, userMessage, expectedTitle) {
+        const operation = this.startGeneration(sessionId, userMessage, expectedTitle);
         if (operation)
             this.pending.set(sessionId, operation);
     }
-    async generateTitle(sessionId, userMessage) {
-        const operation = this.startGeneration(sessionId, userMessage);
+    async generateTitle(sessionId, userMessage, expectedTitle) {
+        const operation = this.startGeneration(sessionId, userMessage, expectedTitle);
         if (!operation)
             return;
         this.pending.set(sessionId, operation);
@@ -90,15 +90,15 @@ export class SessionTitleService {
         this.closePromise = settlePendingGenerations([...this.pending.values()]);
         return this.closePromise;
     }
-    startGeneration(sessionId, userMessage) {
+    startGeneration(sessionId, userMessage, expectedTitle) {
         const cleanInput = stripSessionTitleInjectedTags(userMessage);
         if (this.closed || !cleanInput || this.pending.has(sessionId))
             return;
-        return this.runGeneration(sessionId, cleanInput);
+        return this.runGeneration(sessionId, cleanInput, expectedTitle);
     }
-    async runGeneration(sessionId, cleanInput) {
+    async runGeneration(sessionId, cleanInput, expectedTitle) {
         try {
-            const session = await this.readEligibleSession(sessionId);
+            const session = await this.readEligibleSession(sessionId, expectedTitle);
             if (!session)
                 return;
             const candidate = await this.generateCandidate(sessionId, session, cleanInput);
@@ -115,11 +115,12 @@ export class SessionTitleService {
                 await this.options.commitTitle(sessionId, candidate.title, session.title ?? null);
             }
             catch (error) {
-                if (error instanceof SessionTitleConflictError) {
+                const reason = error instanceof SessionServiceError ? error.reason : undefined;
+                if (error instanceof SessionTitleConflictError || reason === 'session-not-found') {
                     this.observe('skipped_race');
                     return;
                 }
-                if (error instanceof SessionServiceError && error.reason === 'content-policy-rejected') {
+                if (reason === 'content-policy-rejected') {
                     this.observe('blocked');
                     return;
                 }
@@ -141,13 +142,15 @@ export class SessionTitleService {
             this.report('read', sessionId, error);
             return undefined;
         }
-        if (!session || session.sessionType !== 'branch' || session.sessionKind === 'task') {
+        if (!session ||
+            session.sessionType !== 'branch' ||
+            session.sessionKind === 'task' ||
+            session.titleSource !== 'default') {
             return undefined;
         }
-        if (originalTitle !== undefined && session.title !== originalTitle)
-            return undefined;
-        const title = session.title?.trim() ?? '';
-        return !title || title.endsWith('...') ? session : undefined;
+        if (originalTitle !== undefined)
+            return session.title === originalTitle ? session : undefined;
+        return session;
     }
     async generateCandidate(sessionId, session, userMessage) {
         const systemPrompt = await readPromptWithBuiltinFallback({
@@ -230,11 +233,26 @@ async function settlePendingGenerations(operations) {
 export function normalizeSessionTitleCandidate(input) {
     return normalizeConversationSessionTitle(input) ?? null;
 }
-function fallbackSessionTitle(userMessage) {
+export function fallbackSessionTitle(userMessage) {
     return Array.from(userMessage.replace(/\s+/gu, ' ').trim()).slice(0, TITLE_MAX_LEN).join('');
 }
 export function stripSessionTitleInjectedTags(input) {
-    const withoutInjectedTags = input.replace(INJECTED_TAG_RE, '');
+    // Project the visible Session name before model prompting or fallback truncation.
+    const withoutSessionReferences = input.replace(/<session-reference>([\s\S]*?)<\/session-reference>/gu, (_match, payload) => {
+        try {
+            const reference = JSON.parse(payload);
+            return reference &&
+                typeof reference === 'object' &&
+                'title' in reference &&
+                typeof reference.title === 'string'
+                ? reference.title.trim()
+                : '';
+        }
+        catch {
+            return '';
+        }
+    });
+    const withoutInjectedTags = withoutSessionReferences.replace(INJECTED_TAG_RE, '');
     return parseAgentReferences(withoutInjectedTags)
         .segments.map((segment) => segment.type === 'agent-reference' ? `@${segment.reference.displayName}` : segment.content)
         .join('')

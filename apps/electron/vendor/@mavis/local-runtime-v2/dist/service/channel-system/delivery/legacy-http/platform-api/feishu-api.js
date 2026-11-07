@@ -29,6 +29,7 @@ export class LocalFeishuChannelApi {
     botNameResolver;
     onUnbind;
     wsStatusProvider;
+    wsTransportGate;
     pendingReactionStore;
     constructor(input) {
         this.store = input.store;
@@ -43,6 +44,7 @@ export class LocalFeishuChannelApi {
         this.botNameResolver = input.botNameResolver;
         this.onUnbind = input.onUnbind;
         this.wsStatusProvider = input.wsStatusProvider;
+        this.wsTransportGate = input.wsTransportGate;
         this.pendingReactionStore = input.pendingReactionStore;
     }
     registerClient(record, senderOptions = {}) {
@@ -70,6 +72,17 @@ export class LocalFeishuChannelApi {
             clients[record.clientId] = serializeFeishuBinding(resolved, this.resolveWsStatus(resolved));
         }
         return clients;
+    }
+    /**
+     * Runtime half of the Connection-list transport gate (the per-record half
+     * is `feishuBindingTransport`): false while this process starts no long
+     * connection, so no binding may report live WS state. Without a gate from
+     * the composition nothing says a long connection runs here → false, like
+     * a WeChat / Telegram Api without its status provider. Reads flags only —
+     * never an adapter.
+     */
+    runsWsTransport() {
+        return this.wsTransportGate?.() ?? false;
     }
     /**
      * Resolve the live WS transport status for a binding. Non-websocket
@@ -351,7 +364,10 @@ async function resolveOneFeishuAttachment(ref, envelope, sessionId, downloader) 
     }
 }
 function serializeFeishuBinding(record, 
-/** Optional live WS transport status (additive `wsStatus` / `wsLastError`). */
+/**
+ * Optional live WS transport status (additive `wsStatus` / `wsLastError`
+ * plus the safe `wsLastError*` summary fields).
+ */
 wsStatus) {
     return {
         ok: true,
@@ -373,10 +389,31 @@ wsStatus) {
             ? {
                 wsStatus: wsStatus.status,
                 ...(wsStatus.lastError ? { wsLastError: wsStatus.lastError } : {}),
+                ...serializeWsLastErrorSummary(wsStatus),
             }
             : {}),
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
+    };
+}
+/**
+ * Additive safe summary of the live WS error. Unlike `wsLastError` (raw SDK
+ * text, kept as-is), these hold only a fixed category enum, integers and
+ * whitelisted errno tokens, so a client can render them without echoing
+ * SDK text. Each field is omitted when unknown.
+ */
+function serializeWsLastErrorSummary(wsStatus) {
+    return {
+        ...(wsStatus.lastErrorCategory ? { wsLastErrorCategory: wsStatus.lastErrorCategory } : {}),
+        ...(wsStatus.lastErrorCode !== undefined ? { wsLastErrorCode: wsStatus.lastErrorCode } : {}),
+        ...(wsStatus.lastErrorCodeName ? { wsLastErrorCodeName: wsStatus.lastErrorCodeName } : {}),
+        ...(wsStatus.lastErrorHttpStatus !== undefined
+            ? { wsLastErrorHttpStatus: wsStatus.lastErrorHttpStatus }
+            : {}),
+        ...(wsStatus.lastErrorErrno ? { wsLastErrorErrno: wsStatus.lastErrorErrno } : {}),
+        ...(wsStatus.lastErrorRetryCount !== undefined
+            ? { wsLastErrorRetryCount: wsStatus.lastErrorRetryCount }
+            : {}),
     };
 }
 /** Maps the v2 structured wire error back to the exact v1 400 JSON shape. */

@@ -46,7 +46,7 @@ export class HostConnectorGateway {
         const epochSignal = this.epochController.signal;
         const allowedProviders = providerAllowlist(input.providerAllowlist);
         const hostAdmission = this.captureHostListAdmission(input.caller);
-        if (allowedProviders.size === 0) {
+        if (allowedProviders?.size === 0) {
             this.publishHostInventory(hostAdmission, ++this.inventoryRevision, new Map());
             return Object.freeze({
                 tools: Object.freeze([]),
@@ -60,9 +60,11 @@ export class HostConnectorGateway {
         });
         this.assertEpochCurrent(principalEpoch, undefined, 'not_dispatched');
         this.assertHostAdmissionCurrent(hostAdmission);
-        const descriptors = result.tools.filter((descriptor) => CONNECTOR_PROVIDER.test(descriptor.provider) && allowedProviders.has(descriptor.provider));
+        const descriptors = result.tools.filter((descriptor) => CONNECTOR_PROVIDER.test(descriptor.provider) &&
+            (allowedProviders?.has(descriptor.provider) ?? true));
         const providerFailures = result.providerFailures
-            .filter((failure) => CONNECTOR_PROVIDER.test(failure.provider) && allowedProviders.has(failure.provider))
+            .filter((failure) => CONNECTOR_PROVIDER.test(failure.provider) &&
+            (allowedProviders?.has(failure.provider) ?? true))
             .map((failure) => ({
             provider: failure.provider,
             code: failure.code,
@@ -397,7 +399,10 @@ function captureAuthContext(value) {
         return { state: 'logged_out' };
     return { state: 'authenticated', credential };
 }
+/** `undefined` admits every provider. */
 function providerAllowlist(allowlist) {
+    if (allowlist === 'all')
+        return undefined;
     const providers = new Set();
     for (const provider of allowlist) {
         if (!CONNECTOR_PROVIDER.test(provider)) {

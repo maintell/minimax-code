@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { sanitizeDisplayAttachment } from '../session-system/index.js';
-import { parseBackgroundTaskOriginMetadata, } from '../turn-system/index.js';
+import { parseBackgroundTaskDeliveryOrigin, } from '../turn-system/index.js';
 /**
  * Maps the neutral v1 consumer contract into TurnSystem message delivery.
  */
@@ -52,18 +52,42 @@ export function createV1CompatibleTurnSubmission(options) {
                 message: input.message,
             });
             const message = materialized.message;
-            return retainAcceptedRegistration(() => options.turns.steer({
+            const request = {
                 sessionId: input.sessionId,
                 input: toAgentInput(message, isTrustedBackgroundDelivery(input)),
                 provenance: turnProvenance(input),
                 producerId: input.producerId,
                 idempotencyKey: input.idempotencyKey,
+                ...(input.activationDisplayContent !== undefined
+                    ? { activationDisplayContent: input.activationDisplayContent }
+                    : {}),
                 ...(input.requestedTurnId ? { requestedTurnId: input.requestedTurnId } : {}),
                 preDelivery: input.preDelivery,
+                ...(input.receiptAliases?.length ? { receiptAliases: input.receiptAliases } : {}),
                 delivery: toDeliveryOptions(message),
-            }), (result) => result.delivered, materialized.discardCreated);
+            };
+            return retainAcceptedRegistration(async () => input.raceFallback === 'queue'
+                ? toV1SteerResult(await options.turns.deliverSideMessage(request))
+                : options.turns.steer(request), 
+            // A recorded undelivered row keeps its attachments for a later retry.
+            (result) => result.delivered || ('undeliveredMessageId' in result && !!result.undeliveredMessageId), materialized.discardCreated);
         },
     };
+}
+/** Undelivered keeps today's race rejection; a recorded row is named for attachment retention. */
+function toV1SteerResult(result) {
+    if (result.status === 'delivered')
+        return result.result;
+    if (result.status === 'queued') {
+        // The queued Turn reports through the Session stream; its completion never rejects.
+        return { delivered: true, mode: 'queued', turnId: result.turnId, queue: result.queue };
+    }
+    if (result.status === 'rejected')
+        return { delivered: false, reason: result.reason };
+    if (result.record) {
+        return { delivered: false, reason: result.race, undeliveredMessageId: result.record.messageId };
+    }
+    return { delivered: false, reason: result.race };
 }
 async function retainAcceptedRegistration(operation, accepted, discardCreated) {
     try {
@@ -137,8 +161,10 @@ function isReviewTrigger(value) {
     return value === 'slash' || value === 'natural_language' || value === 'subagent';
 }
 function toAgentInput(message, trustBackgroundOrigin) {
+    // Same contract as the Queue dispatcher: the Bash display snapshot (`tasks`) stays on the
+    // display row; dropping the whole origin would turn the hidden notice into a real user.
     const origin = trustBackgroundOrigin
-        ? parseBackgroundTaskOriginMetadata(message.origin)
+        ? parseBackgroundTaskDeliveryOrigin(message.origin)
         : undefined;
     return {
         text: message.content,

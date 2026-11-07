@@ -1,18 +1,19 @@
 import { ProjectMcpRuntime } from '../project-mcp.service.js';
 import { SessionMcpServers } from './session-servers.js';
 import { projectNativeTools, reserveConfiguredServerNames } from './native-tool-projection.js';
-import { McpNameRegistry } from '@mavis/mcp';
+import { McpNameRegistry, McpToolCallNotDispatchedError } from '@mavis/mcp';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { LocalMavisMcpServiceAdapter } from '../tools/local-mavis-adapter.js';
 import { mapMcpContent, normalizeCallResult } from '../tools/result-mapping.js';
+import { localMcpCallFailureResult, withMcpProgrammatic } from '../tools/programmatic-result.js';
+import { callLocalMcpToolUnfolded } from '../tools/miniapp-call.js';
 import { listMcpRuntimeToolEntriesForTurn } from '../tools/runtime-tools.js';
 import { readConfiguredMcpServerNames } from './config-file.js';
 import { readLocalMcpFile, writeLocalMcpFile } from './configuration.repository.js';
 import { configuredConnectionFailure, configuredDetail, configuredInputFromStored, ConfiguredMcpConnectionTimeoutError, configuredSummary, isUserConfiguredServer, publicTransport, requireConfiguredInput, requireUserConfiguredServer, storedConfigFromInput, toTypeSchema, toManagedServerSummary, validateConfiguredServerName, withConfiguredConnectionTimeout, } from './settings-config.js';
-import { MCP_DEFAULTS } from '@mavis/mcp/runtime/types';
 import { buildBuiltinMatrixServerConfig, buildBuiltinMatrixTokenOverrides, BUILTIN_MATRIX_SERVER_NAME, isBuiltinMatrixConfig, isRetiredLegacyMatrixMcpServerConfig, listBuiltinMatrixMcpToolDescriptors, } from './builtin-matrix.js';
-import { configToTransportConfig, hasLocalCallAdapter, inferAuthStatus, inferTransport, normalizeServerConfig, normalizeServerName, readConfiguredTools, readRecord, readStringArray, } from './config.js';
+import { configToTransportConfig, configuredTimeout, stdioDiscoveryTimeoutFromEnv, hasLocalCallAdapter, inferAuthStatus, inferTransport, normalizeServerConfig, normalizeServerName, readConfiguredTools, readRecord, readStringArray, } from './config.js';
 import { isRetiredLegacyCuMcpServerConfig } from './retired-cu.js';
 import { LocalMcpSettingsError } from '../errors.js';
 export class LocalMcpService {
@@ -356,7 +357,7 @@ export class LocalMcpService {
         const controller = new AbortController();
         const signal = AbortSignal.any([controller.signal, this.shutdownSignal.signal]);
         try {
-            const timeoutMs = config.timeout && config.timeout > 0 ? config.timeout : MCP_DEFAULTS.timeout;
+            const timeoutMs = configuredTimeout(config);
             const tools = await withConfiguredConnectionTimeout((async () => {
                 const overrides = await this.resolveConnectionOverrides(serverName, config);
                 this.assertOpen();
@@ -572,14 +573,15 @@ export class LocalMcpService {
                             signal,
                         });
                         const mapped = mapMcpContent(result);
-                        return {
+                        // PTC-only payload (structuredContent as data, raw protocol error) rides along.
+                        return withMcpProgrammatic(result, {
                             tool_name: def.name,
                             text: mapped.text,
                             content: mapped.content,
                             ...(result.isError !== undefined ? { isError: result.isError } : {}),
                             details: { mcp: result, server: tool.server, tool: tool.toolName },
                             output: { mcp: result },
-                        };
+                        });
                     },
                 },
                 source: tool.source,
@@ -599,7 +601,7 @@ export class LocalMcpService {
         const discoveryTimeoutMs = transport.type === 'stdio'
             ? (this.options.turnStdioDiscoveryTimeoutMs ??
                 this.options.turnDiscoveryTimeoutMs ??
-                15_000)
+                stdioDiscoveryTimeoutFromEnv())
             : turnDiscoveryTimeoutMs;
         const timeoutMs = Math.min(configuredTimeout(config), discoveryTimeoutMs);
         const controller = new AbortController();
@@ -636,7 +638,7 @@ export class LocalMcpService {
         return reserveConfiguredServerNames(this.getRuntimeNameRegistry(), file.mcpServers, (server, error) => this.recordPublicRuntimeFailure(server, context, error, file.mcpServers[server]));
     }
     async call(server, toolName, args, options = {}) {
-        const { context, signal } = options;
+        const { context } = options;
         this.assertOpen();
         const config = await this.getServerConfig(server, context);
         if (!config || config.enabled === false) {
@@ -659,7 +661,7 @@ export class LocalMcpService {
         const mocked = readRecord(mockResponses?.[key]);
         if (mocked)
             return normalizeCallResult(mocked);
-        return this.callLive(server, config, { toolName, args, context, signal });
+        return this.callLive(server, config, { ...options, toolName, args });
     }
     async callLive(server, config, input) {
         const { toolName, args, context, signal } = input;
@@ -690,11 +692,11 @@ export class LocalMcpService {
                 return result;
             }
             catch (err) {
+                // An abort that never reached the server is the caller's, not a server failure.
+                if (err instanceof McpToolCallNotDispatchedError)
+                    throw err;
                 this.recordPublicRuntimeFailure(server, context, 'MCP server connection failed. Retry or check its configuration.', config);
-                return {
-                    isError: true,
-                    content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
-                };
+                return localMcpCallFailureResult(err);
             }
         }
         return {
@@ -707,6 +709,15 @@ export class LocalMcpService {
                 },
             ],
         };
+    }
+    /** Mini App tool port only; the Agent path is `call`. See `callLocalMcpToolUnfolded`. */
+    callForMiniApp(input) {
+        return callLocalMcpToolUnfolded(this, input, {
+            pool: this.options.connectionPool,
+            overrides: (config) => this.resolveConnectionOverrides(input.server, config),
+            signal: (config) => this.connectionSignal(config, input.signal),
+            recorded: (config) => this.recordPublicRuntimeSuccess(input.server, undefined, config),
+        });
     }
     /**
      * `McpServerLookup` view onto this service for the connection pool.
@@ -929,9 +940,6 @@ export class LocalMcpService {
         })();
         return result;
     }
-}
-function configuredTimeout(config) {
-    return config.timeout && config.timeout > 0 ? config.timeout : MCP_DEFAULTS.timeout;
 }
 function matrixTokenOverrides(dataDir, base, context) {
     const matrixOverrides = buildBuiltinMatrixTokenOverrides({

@@ -23,7 +23,7 @@ export class SessionQueryApplication {
             cursor: req.cursor,
         }));
         return {
-            sessions: page.sessions.map(toSessionInfoView),
+            sessions: page.sessions.map((session) => toSessionInfoView(session, this.options.sideChats.relation(session.sessionId))),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
@@ -34,11 +34,18 @@ export class SessionQueryApplication {
             agentName: req.agentName,
             limit: req.limit,
             cursor: req.cursor,
+            // projectIds 是云端的项目筛选，本地和 SSH 按项目 key（旧调用方按工作目录）筛选，不读它。
+            workspaceDirs: req.workspaceDirs,
+            projectKeys: req.projectKeys,
+            includeArchived: req.includeArchived,
         }));
+        const sessionProjects = Object.entries(page.projectKeys ?? {}).map(([sessionId, projectKey]) => ({ sessionId, projectKey }));
         return {
-            sessions: page.sessions.map(toSessionInfoView),
+            sessions: page.sessions.map((session) => toSessionInfoView(session, this.options.sideChats.relation(session.sessionId))),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+            ...(page.messageMatches?.length ? { messageMatches: [...page.messageMatches] } : {}),
+            ...(sessionProjects.length ? { sessionProjects } : {}),
         };
     }
     async getSessionTree(_context, req) {
@@ -55,7 +62,7 @@ export class SessionQueryApplication {
         }));
         return {
             sessions: page.sessions.map(({ session, children }) => ({
-                session: toSessionInfoView(session),
+                session: toSessionInfoView(session, this.options.sideChats.relation(session.sessionId)),
                 childSessions: children.map(toSessionTreeChildView),
             })),
             hasMore: page.hasMore,
@@ -68,7 +75,28 @@ export class SessionQueryApplication {
                 ? () => this.options.cloudReader.getSession(req.id, _context.signal)
                 : undefined);
         const session = await this.invoke(() => this.options.service.get(req.id));
-        return { session: toSessionInfoView(session) };
+        const page = req.includeSideChats
+            ? this.options.sideChats.list(req.id, {
+                limit: req.sideChatsLimit,
+                cursor: req.sideChatsCursor,
+            })
+            : undefined;
+        const view = toSessionInfoView(session, this.options.sideChats.relation(session.sessionId));
+        const wait = this.options.backgroundTaskWait?.(session.sessionId);
+        if (view.status && wait)
+            view.status.backgroundTaskWait = wait;
+        return {
+            session: view,
+            ...(page
+                ? {
+                    sideChats: {
+                        items: page.sessions.map((side) => toSessionInfoView(side, this.options.sideChats.relation(side.sessionId))),
+                        hasMore: page.hasMore,
+                        ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+                    },
+                }
+                : {}),
+        };
     }
     /**
      * Serves the sidebar's cross-Agent Recents page for local(daemon).
@@ -103,7 +131,7 @@ export class SessionQueryApplication {
         }, '[local-runtime-v2] sidebar tree page served');
         return {
             sessions: page.sessions.map(({ session, children }) => ({
-                session: toSessionInfoView(session),
+                session: toSessionInfoView(session, this.options.sideChats.relation(session.sessionId)),
                 childSessions: children.map(toSessionTreeChildView),
             })),
             hasMore: page.hasMore,

@@ -5,8 +5,10 @@ import { screen, powerMonitor, net, app, crashReporter, ipcMain, BrowserWindow, 
 import { autoUpdater } from "electron-updater";
 import { buildEnv, LOCALE, isDev, isTest, isStaging, isInternalBuild, isInsideBuild } from "../config";
 import { DOMAIN_URL, IPC_CHANNELS } from "../config/constants";
-import { setupAllIPC, initDesktopSettings, cleanupDesktopSettings, stopHotUpdateAutoCheck } from "../ipc";
+import { setupAllIPC, initDesktopSettings, cleanupDesktopSettings, startHotUpdateAutoCheck, stopHotUpdateAutoCheck } from "../ipc";
 import { cleanupPPTPreviewCache } from "../ipc/pptPreview.ipc";
+import { flushBrowserTelemetryOnQuit } from "../modules/browser/browser-telemetry-runtime";
+import { browserBackendPolicy } from "../modules/browser/browser-backend-policy";
 import { handleCloudProtocolJsonRequest } from "../ipc/proxy.ipc";
 import { getTokens, clearTokens, getDesktopConfig, replaceSharedUserInfo } from "../ipc/storage.ipc";
 import { createDesktopAccountIdentitySource } from "../modules/auth/account-identity";
@@ -18,6 +20,7 @@ import { recoverSharedRuntimeProjection, refreshSharedRuntimeProjection, watchSh
 import { resolveLocalRuntimeDataDir } from "../modules/local-runtime/data-dir";
 import { resolveRuntimeTransportMode } from "../modules/local-runtime/utility/transport-mode";
 import { createDesktopAuthSession } from "../modules/auth";
+import { recordAuthRefreshPowerEvent } from "../modules/auth/refresh-environment";
 import { createMainOwnedWorkspaceAuthority } from "../modules/document-preview/workspace-authority";
 import { createMainOwnedAssetAuthority } from "../modules/document-preview/asset-authority";
 import { createRuntimeFetchDevToolsInitializer } from "../modules/runtime-fetch-devtools";
@@ -72,15 +75,19 @@ function logDisplayInformation() {
 function createPowerResumeRecovery(controller) {
     return () => {
         powerMonitor.on('lock-screen', () => {
+            recordAuthRefreshPowerEvent('lock-screen');
             logPowerBreadcrumb('[Power] Screen locked');
         });
         powerMonitor.on('unlock-screen', () => {
+            recordAuthRefreshPowerEvent('unlock-screen');
             logPowerBreadcrumb('[Power] Screen unlocked');
         });
         powerMonitor.on('suspend', () => {
+            recordAuthRefreshPowerEvent('suspend');
             logPowerBreadcrumb('[Power] System suspended');
         });
         powerMonitor.on('resume', () => {
+            recordAuthRefreshPowerEvent('resume');
             logger_1.default.info('[Power] System resumed from sleep');
             void invalidateWorkspaceGitSnapshotsAfterResume(handleLocalRuntimeRequest).catch((error) => {
                 logLifecycleWarning('[Power] Failed to invalidate Workspace Git snapshots', error);
@@ -239,6 +246,17 @@ function createProductionComposition(options = {}) {
                     if (window && !window.isDestroyed())
                         window.close();
                 },
+                destroyAll: () => {
+                    for (const window of BrowserWindow.getAllWindows()) {
+                        try {
+                            if (!window.isDestroyed())
+                                window.destroy();
+                        }
+                        catch (error) {
+                            logLifecycleError('Failed to destroy a window during update shutdown', error);
+                        }
+                    }
+                },
             },
             beforeQuit: clearGpuSentinel,
             confirmNormalQuit: () => confirmQuitWithRunningTasks(windowManager.getWindowByType('archon')),
@@ -334,7 +352,13 @@ function createProductionComposition(options = {}) {
                 installObservabilityProbes: () => installElectronObservabilityProbes({
                     onSystemSessionEnd: (evidence) => crashEvidence.recordSystemSessionEnd(evidence),
                 }),
-                setupNativeCrashEvidence: () => crashEvidence.startCrashEvidence(),
+                setupNativeCrashEvidence: () => {
+                    crashEvidence.startCrashEvidence();
+                    const decided = browserBackendPolicy.diagnosticSnapshot().launchBackend;
+                    if (decided)
+                        crashEvidence.recordBrowserBackend(decided);
+                    browserBackendPolicy.onLaunchDecided((decision) => crashEvidence.recordBrowserBackend(decision.backend));
+                },
                 stopPowerSaveBlocker: stopPowerSaveBlocker,
                 setupPowerResumeRecovery: createPowerResumeRecovery(incidentController),
                 setupRendererIncidentRecovery: () => {
@@ -353,6 +377,7 @@ function createProductionComposition(options = {}) {
                 setupAllIPC: () => setupAllIPC({
                     requestQuit: (intent) => quitCoordinator.requestQuit(intent),
                     runtimeTransportMode,
+                    appVersion: app.getVersion(),
                     resolveTrustedWorkspace: documentPreviewWorkspaceAuthority.resolveTrustedWorkspace,
                     resolveTrustedWorkspaceCapability: documentPreviewWorkspaceAuthority.resolveTrustedWorkspaceCapability,
                     onDocumentPreviewSenderDestroyed: documentPreviewWorkspaceAuthority.releaseSender,
@@ -364,6 +389,7 @@ function createProductionComposition(options = {}) {
                 recordStartupMainMilestone: recordElectronStartupMainMilestone,
                 disconnectRemoteControlBridgeBeforeQuit: disconnectRemoteControlBridgeBeforeQuit,
                 cleanupPPTPreviewCache: cleanupPPTPreviewCache,
+                flushBrowserTelemetryBeforeQuit: flushBrowserTelemetryOnQuit,
                 stopLocalRuntime: async () => {
                     // App shutdown owns a global cutoff and may proceed while the old
                     // Utility remains quarantined. Data-dir relocation consumes the
@@ -391,6 +417,7 @@ function createProductionComposition(options = {}) {
                 registerActivateHandler,
                 initDesktopSettings: () => initDesktopSettings({ requestQuit: (intent) => quitCoordinator.requestQuit(intent) }),
                 cleanupDesktopSettings: cleanupDesktopSettings,
+                startHotUpdateAutoCheck: startHotUpdateAutoCheck,
                 stopHotUpdateAutoCheck: stopHotUpdateAutoCheck,
                 disposeTerminalSessions: () => getTerminalManager().disposeAll(),
             };

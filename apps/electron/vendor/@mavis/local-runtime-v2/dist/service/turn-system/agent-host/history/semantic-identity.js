@@ -12,7 +12,7 @@ const fingerprints = new WeakMap();
 export function captureSemanticSnapshot(value, previous) {
     // Native cloning preserves external getters and aliases. Data-only wrappers
     // can instead share descendants already detached and frozen by this module.
-    const snapshot = typeof value === 'object' && value !== null && ownedValues.has(value)
+    const snapshot = typeof value === 'object' && value !== null && adoptFrozenPlainData(value)
         ? value
         : freezeSemanticValue(cloneOwnedWrapper(value, previous) ?? structuredClone(value), new WeakSet());
     let fingerprint;
@@ -55,6 +55,34 @@ function plainDataDescriptors(value) {
 function isOwnedObject(value) {
     return typeof value === 'object' && value !== null && ownedValues.has(value);
 }
+function isShareableObject(value) {
+    return typeof value === 'object' && value !== null && adoptFrozenPlainData(value);
+}
+/**
+ * Deeply frozen plain data can never change, so sharing it is as safe as a detached copy.
+ * Such values, like the records the history reader decodes and freezes, are adopted as owned
+ * instead of being cloned again on every snapshot.
+ */
+function adoptFrozenPlainData(value, ancestors = new WeakSet()) {
+    if (ownedValues.has(value))
+        return true;
+    if (types.isProxy(value) || !Object.isFrozen(value) || ancestors.has(value))
+        return false;
+    const descriptors = plainDataDescriptors(value);
+    if (!descriptors || Object.getOwnPropertySymbols(value).length > 0)
+        return false;
+    ancestors.add(value);
+    const adoptable = Object.values(descriptors).every((descriptor) => !descriptor.enumerable || isAdoptableField(descriptor.value, ancestors));
+    ancestors.delete(value);
+    if (adoptable)
+        ownedValues.add(value);
+    return adoptable;
+}
+function isAdoptableField(value, ancestors) {
+    if (typeof value === 'object' && value !== null)
+        return adoptFrozenPlainData(value, ancestors);
+    return value === null || ['undefined', 'string', 'boolean', 'number'].includes(typeof value);
+}
 function clonePrimitive(value) {
     if (value !== null && !['undefined', 'string', 'boolean', 'number'].includes(typeof value)) {
         throw NATIVE_CLONE_REQUIRED;
@@ -69,7 +97,7 @@ function cloneOwnedWrapper(value, previous) {
     if (!descriptors)
         return undefined;
     if (!reusePrevious &&
-        !Object.values(descriptors).some((d) => d.enumerable && isOwnedObject(d.value))) {
+        !Object.values(descriptors).some((d) => d.enumerable && isShareableObject(d.value))) {
         return undefined;
     }
     try {
@@ -97,7 +125,7 @@ class OwnedWrapperCloner {
     clone(node, prior) {
         if (typeof node !== 'object' || node === null)
             return clonePrimitive(node);
-        if (ownedValues.has(node)) {
+        if (adoptFrozenPlainData(node)) {
             // Mixed owned and fresh inputs cannot merge distinct input aliases.
             if (this.reusePrevious)
                 throw PREVIOUS_SHARING_UNAVAILABLE;

@@ -1,12 +1,20 @@
 import { toNavigationPlainText } from '@mavis/shared/navigation-text';
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
-const INTERNAL_USER_SOURCES = new Set(['system', 'communication', 'team-engine']);
-const SYNTHETIC_RESPONSE_RE = /<(questionnaire|permission)-response\b/u;
+/** 来自这些来源的 user 行不是用户本人输入的。 */
+export const INTERNAL_USER_SOURCES = ['system', 'communication', 'team-engine'];
+/** 替用户发出的问卷回复和权限回复的开头标签。 */
+export const SYNTHETIC_RESPONSE_MARKERS = [
+    '<questionnaire-response',
+    '<permission-response',
+];
+const SYNTHETIC_RESPONSE_RE = new RegExp(`(?:${SYNTHETIC_RESPONSE_MARKERS.join('|')})\\b`, 'u');
 const QUESTIONNAIRE_RESPONSE_RE = /<questionnaire-response\b/u;
 export function isNavigableUserInput(message) {
-    if (message.role !== 'user' || message.kind != null)
+    if (message.role !== 'user')
         return false;
-    if (message.source && INTERNAL_USER_SOURCES.has(message.source))
+    if (message.kind != null && message.kind !== 'steered_user')
+        return false;
+    if (message.source && INTERNAL_USER_SOURCES.includes(message.source))
         return false;
     return !SYNTHETIC_RESPONSE_RE.test(messageContent(message));
 }

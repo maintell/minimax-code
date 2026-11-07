@@ -35,6 +35,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 import { bindTool } from '@mavis/agent-core/tools';
 import { updateTodoState } from '@mavis/system-reminder';
 import { LocalTodoWriteToolDef } from './builtin-defs.js';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
 const TODO_WRITE_SUCCESS = 'success';
 const todosBySession = new Map();
@@ -88,7 +89,7 @@ let LocalTodoWriteTool = (() => {
             const completed = todos.filter((t) => t.status === 'completed').length;
             const cancelled = todos.filter((t) => t.status === 'cancelled').length;
             const text = TODO_WRITE_SUCCESS;
-            return {
+            return withDesktopCompletenessReport(LocalTodoWriteToolDef.name, {
                 tool_name: LocalTodoWriteToolDef.name,
                 text,
                 content: [{ type: 'text', text }],
@@ -100,7 +101,7 @@ let LocalTodoWriteTool = (() => {
                     cancelled,
                     event_emitted: eventEmitted,
                 },
-            };
+            }, { data: { total: todos.length, active, completed, cancelled } });
         }
     };
     return LocalTodoWriteTool = _classThis;

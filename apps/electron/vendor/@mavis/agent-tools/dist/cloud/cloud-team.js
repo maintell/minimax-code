@@ -43,8 +43,63 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 };
 import { Type } from '@sinclair/typebox';
 import { bindTool, } from '@mavis/agent-core/tools';
-import { dispatchTeamTool } from './mavis/commands/team.js';
+import { dispatchTeamTool, normalizeTeamDecision } from './mavis/commands/team.js';
 import { toToolResult } from './mavis/output.js';
+const NonEmptyString = (description) => Type.String({ minLength: 1, description });
+// Mirrors @mavis/team DecisionSchema. Model tool-call decoders rely on these
+// types; an untyped `decision` comes back with arrays collapsed into objects
+// and booleans as strings.
+const TeamDecisionInput = Type.Object({
+    last_cycle: Type.Array(Type.Object({
+        task_id: NonEmptyString('Task id from the cycle report.'),
+        verdict: Type.Union([
+            Type.Literal('accept'),
+            Type.Literal('reject'),
+            Type.Literal('override_accept'),
+            Type.Literal('manual_retry'),
+        ], { description: 'Owner verdict for the task.' }),
+        reason: NonEmptyString('Owner reasoning; required even for accept.'),
+    }), { description: 'Verdict for each task from the last cycle.' }),
+    next_cycle: Type.Array(Type.Object({
+        task_id: NonEmptyString('Task id; reuse an existing id to retry in the same session.'),
+        title: NonEmptyString('Task title.'),
+        prompt: NonEmptyString('Producer prompt.'),
+        assigned_to: NonEmptyString('Producer agent name, copied exactly from agent list.'),
+        verified_by: Type.Optional(Type.Union([
+            NonEmptyString('Verifier agent name.'),
+            Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+        ], {
+            description: 'Verifier agent name(s).',
+        })),
+        verify_skip_reason: Type.Optional(NonEmptyString('Why the task can skip verification; required when verified_by is omitted.')),
+        role: Type.Optional(Type.Union([Type.Literal('produce'), Type.Literal('verify-as-task')])),
+        verify_prompt: Type.Optional(Type.Union([Type.String(), Type.Record(Type.String(), Type.String())], {
+            description: 'Verifier prompt, or a map of verifier name to prompt.',
+        })),
+        timeout_ms: Type.Optional(Type.Integer({ minimum: 1, description: 'Task timeout in ms.' })),
+    }), { description: 'Tasks to execute next; use [] when there are none.' }),
+    plan_complete: Type.Boolean({ description: 'true when the plan objective is achieved.' }),
+    message_to_user: Type.Optional(Type.String({ description: 'Message relayed to the user.' })),
+}, {
+    description: 'Decision object for decision. Pass a JSON object, not a string; arrays stay arrays ([] when empty) and plan_complete is a boolean. Example: {"last_cycle":[{"task_id":"task-1","verdict":"accept","reason":"Output verified."}],"next_cycle":[],"plan_complete":true}',
+});
+const TeamToolSchema = Type.Object({
+    command: Type.String({
+        description: 'Team action verb: run, status, steer, decision, extend-timeout, unblock, or cancel. All commands operate on plans.',
+    }),
+    args: Type.Optional(Type.Object({
+        plan_path: Type.Optional(Type.String({ description: 'Workspace plan YAML path for run.' })),
+        plan_id: Type.Optional(Type.String({ description: 'Team plan id.' })),
+        message: Type.Optional(Type.String({ description: 'Owner guidance for steer.' })),
+        decision: Type.Optional(TeamDecisionInput),
+        task_id: Type.Optional(Type.String({ description: 'Task id for task-scoped commands.' })),
+        extra_minutes: Type.Optional(Type.Number({ description: 'Extra timeout in minutes for extend-timeout.' })),
+        extra_ms: Type.Optional(Type.Number({ description: 'Extra timeout in milliseconds for extend-timeout.' })),
+    }, {
+        additionalProperties: true,
+        description: 'Command-specific arguments object. See the tool description for shapes.',
+    })),
+});
 export const TeamToolDef = {
     name: 'team',
     description: `Dedicated tool for Mavis Agent Team plans — a producer-vs-verifier adversarial workflow with explicit owner decision points. Reach for it when independent verification matters: high-stakes deliverables, complex investigations, work where silent acceptance is too risky, or tasks needing real retries on verifier failure.
@@ -80,25 +135,36 @@ OUTPUT
 EXAMPLES
   team({ command: "run", args: { plan_path: ".mavis/plans/draft/plan.yaml" } })
   team({ command: "status", args: { plan_id: "plan_a1b2c3d4" } })
-  team({ command: "steer", args: { plan_id: "plan_a1b2c3d4", message: "switch to TypeScript types instead of any" } })`,
-    schema: Type.Object({
-        command: Type.String({
-            description: 'Team action verb: run, status, steer, decision, extend-timeout, unblock, or cancel. All commands operate on plans.',
-        }),
-        args: Type.Optional(Type.Object({
-            plan_path: Type.Optional(Type.String({ description: 'Workspace plan YAML path for run.' })),
-            plan_id: Type.Optional(Type.String({ description: 'Team plan id.' })),
-            message: Type.Optional(Type.String({ description: 'Owner guidance for steer.' })),
-            decision: Type.Optional(Type.Unknown({ description: 'Decision object for decision.' })),
-            task_id: Type.Optional(Type.String({ description: 'Task id for task-scoped commands.' })),
-            extra_minutes: Type.Optional(Type.Number({ description: 'Extra timeout in minutes for extend-timeout.' })),
-            extra_ms: Type.Optional(Type.Number({ description: 'Extra timeout in milliseconds for extend-timeout.' })),
-        }, {
-            additionalProperties: true,
-            description: 'Command-specific arguments object. See the tool description for shapes.',
-        })),
-    }),
+  team({ command: "steer", args: { plan_id: "plan_a1b2c3d4", message: "switch to TypeScript types instead of any" } })
+  team({ command: "decision", args: { plan_id: "plan_a1b2c3d4", decision: { last_cycle: [{ task_id: "task-1", verdict: "accept", reason: "Output verified." }], next_cycle: [], plan_complete: true } } })`,
+    schema: TeamToolSchema,
+    prepareArguments: prepareTeamToolArguments,
 };
+function prepareTeamToolArguments(raw) {
+    if (typeof raw !== 'object' || raw === null)
+        return raw;
+    const input = raw;
+    let args = input.args;
+    if (typeof args === 'string' && args.trim().startsWith('{')) {
+        try {
+            args = JSON.parse(args);
+        }
+        catch {
+            return raw;
+        }
+    }
+    if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+        return (args === input.args ? raw : { ...input, args });
+    }
+    const argsRecord = args;
+    if (!('decision' in argsRecord)) {
+        return (args === input.args ? raw : { ...input, args });
+    }
+    return {
+        ...input,
+        args: { ...argsRecord, decision: normalizeTeamDecision(argsRecord.decision) },
+    };
+}
 function normalizeTeamToolArgs(input) {
     return typeof input.args === 'object' && input.args !== null
         ? input.args

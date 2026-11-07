@@ -16,9 +16,10 @@
  */
 import { logger, backgroundCtx } from './host-utils.js';
 import { matchesMcpServerRuntimeName } from './mcp-runtime-name.js';
-import { getContentRulesForTool, hasWholeToolRule, isBypassMode, isInteractiveTool, } from './context.js';
+import { hasWholeToolRule, isBypassMode, isInteractiveTool } from './context.js';
 import { decideUnknownToolPathCapabilities } from './tools/path-capability.js';
 import { reducePermissionDecision } from './permission-core.js';
+import { extractToolInputContent, matchesContentAskRule } from './content-ask-rule.js';
 // ---------------------------------------------------------------------------
 // Rule matching helpers (content-specific rules)
 // ---------------------------------------------------------------------------
@@ -30,58 +31,9 @@ function matchesMcpServerRule(toolName, rule) {
     const ruleToolName = rule.ruleValue.toolName;
     return !rule.ruleValue.ruleContent && matchesMcpServerRuntimeName(toolName, ruleToolName);
 }
-/**
- * Check if any content-specific ask rule matches the given input.
- *
- * Content-specific ask rules are bypass-immune (§4.2 point 3).
- */
-function matchesContentAskRule(toolName, 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- input shape varies per tool
-input, ctx) {
-    const contentAskRules = getContentRulesForTool(ctx, toolName, 'ask');
-    for (const rule of contentAskRules) {
-        // Content rules have ruleContent defined (guaranteed by getContentRulesForTool)
-        // The engine performs a simple substring/equality check here.
-        // Tool-specific matching (wildcard, prefix) is handled by tool checkers.
-        const { ruleContent } = rule.ruleValue;
-        if (!ruleContent)
-            continue;
-        // Extract the relevant input field for matching
-        const inputContent = extractToolInputContent(toolName, input);
-        if (inputContent && inputContent.includes(ruleContent)) {
-            return rule;
-        }
-    }
-    return undefined;
-}
-/**
- * Extract the primary content string from a tool input for rule matching.
- */
-function extractToolInputContent(toolName, 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- tool input shapes vary
-input) {
-    switch (toolName) {
-        case 'bash':
-            return typeof input.command === 'string' ? input.command : undefined;
-        case 'edit':
-        case 'write':
-        case 'read':
-        case 'glob':
-            return typeof input.filePath === 'string'
-                ? input.filePath
-                : typeof input.path === 'string'
-                    ? input.path
-                    : typeof input.pattern === 'string'
-                        ? input.pattern
-                        : undefined;
-        default:
-            // For other tools, try common field names
-            return typeof input.command === 'string'
-                ? input.command
-                : typeof input.url === 'string'
-                    ? input.url
-                    : undefined;
-    }
+function checkerFailureMessage(error) {
+    const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+    return message || 'Unknown tool permission checker failure';
 }
 // ---------------------------------------------------------------------------
 // PermissionEngine
@@ -166,17 +118,17 @@ export class PermissionEngine {
                 : decideUnknownToolPathCapabilities(toolName, input, context);
         }
         catch (err) {
-            checkerError = err.message;
+            checkerError = checkerFailureMessage(err);
             logger.error(ctx, `Tool permission checker threw an error: toolName=${toolName} error=${checkerError}`);
         }
-        this.notifyCheckerDecision(options, Boolean(checker), checkerResult, Boolean(checkerError));
+        this.notifyCheckerDecision(options, Boolean(checker), checkerResult, checkerError !== undefined);
         return reducePermissionDecision({
             toolName,
             input,
             context,
             checkerRegistered: Boolean(checker),
             ...(checkerResult ? { checkerResult } : {}),
-            ...(checkerError ? { checkerError } : {}),
+            ...(checkerError !== undefined ? { checkerError } : {}),
         });
     }
     checkPermissionWithEngine(toolName, 
@@ -212,10 +164,10 @@ export class PermissionEngine {
                 : decideUnknownToolPathCapabilities(toolName, input, context);
         }
         catch (err) {
-            checkerError = err.message;
+            checkerError = checkerFailureMessage(err);
             logger.error(ctx, `Tool permission checker threw an error: toolName=${toolName} error=${checkerError}`);
         }
-        this.notifyCheckerDecision(options, Boolean(checker), toolCheckResult, Boolean(checkerError));
+        this.notifyCheckerDecision(options, Boolean(checker), toolCheckResult, checkerError !== undefined);
         if (toolCheckResult?.behavior === 'deny') {
             logger.debug(ctx, `Step 1d: Tool checker returned deny: toolName=${toolName}`);
             return { behavior: 'deny', reason: toolCheckResult.reason };
@@ -251,7 +203,7 @@ export class PermissionEngine {
                 candidateScopes: this.resolveCandidateScopes(undefined),
             };
         }
-        if (checkerError) {
+        if (checkerError !== undefined) {
             return {
                 behavior: 'ask',
                 reason: {
@@ -285,6 +237,7 @@ export class PermissionEngine {
                 ruleMatchers: this.resolveRuleMatchers(toolCheckResult),
                 candidateScopes: this.resolveCandidateScopes(toolCheckResult),
                 bypassImmune: true,
+                rewrittenInput: toolCheckResult.rewrittenInput,
                 skipAutoClassifier: toolCheckResult.skipAutoClassifier,
             };
         }

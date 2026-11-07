@@ -1,6 +1,6 @@
 import { resolveProviderCredential, minimaxApiModels, getRuntimeRegion } from '@mavis/config';
 import { mergeProviderHeaders } from '../connectivity/provider-request.js';
-import { isModelProviderApi, MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID, } from '../identity.js';
+import { isModelProviderApi, MINIMAX_API_PROVIDER_ID } from '../identity.js';
 const BYOK_FALLBACK_MODEL_LIMITS = {
     contextWindow: 200_000,
     maxTokens: 16_384,
@@ -91,15 +91,6 @@ function resolveCustomProviderApi(value) {
         return value;
     }
     return 'anthropic-messages';
-}
-export function firstBuiltinModel(providerConfig) {
-    const preferredModelId = Object.keys(providerConfig?.[MANAGED_MINIMAX_PROVIDER_ID]?.models ?? {})[0];
-    if (preferredModelId)
-        return { provider: MANAGED_MINIMAX_PROVIDER_ID, modelId: preferredModelId };
-    return Object.entries(providerConfig ?? {}).flatMap(([provider, config]) => {
-        const modelId = Object.keys(config.models ?? {})[0];
-        return modelId ? [{ provider, modelId }] : [];
-    })[0];
 }
 export function readStringRecord(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value))

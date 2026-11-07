@@ -84,12 +84,28 @@ function findPowerShell() {
 }
 /**
  * Infer shell type from a custom shell path.
+ *
+ * Only the executable basename is inspected so that a user whose home folder or
+ * intermediate directory contains "pwsh" / "powershell" (e.g.
+ * `C:/Users/powershell-user/AppData/Local/Programs/Git/bin/bash.exe`) is not
+ * misclassified as a PowerShell binary. Path separators are normalized with
+ * `win32.basename` so the result is stable whether the caller is on Windows,
+ * macOS, or Linux and whether the path uses backslashes or forward slashes.
+ * The accepted names are:
+ *   - `pwsh.exe` / `pwsh`            → pwsh
+ *   - `powershell.exe` / `powershell` → powershell
+ *   - everything else (including `bash`, `sh`, `zsh`, …) → bash
  */
 function inferShellType(shellPath) {
-    const lower = shellPath.toLowerCase();
-    if (lower.includes("pwsh"))
+    // `win32.basename` treats both `\` and `/` as separators and is exported on
+    // every platform, so it returns the trailing component regardless of where
+    // this code is running. Using the host's default `basename` would split
+    // only on POSIX separators and miss Windows backslash paths on macOS/Linux
+    // (and vice versa).
+    const lower = win32.basename(shellPath).toLowerCase();
+    if (lower === "pwsh.exe" || lower === "pwsh")
         return "pwsh";
-    if (lower.includes("powershell"))
+    if (lower === "powershell.exe" || lower === "powershell")
         return "powershell";
     return "bash";
 }

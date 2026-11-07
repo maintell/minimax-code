@@ -4,7 +4,7 @@ import { NotImplementedError } from '../errors.js';
 const MEMORY_V2_DISABLED = { error: { code: 'memory-v2-disabled' } };
 export class MemoryController extends MemoryControllerBase {
     memoryV2;
-    /** v1 方法保持 NotImplemented；v2 八个方法委托给 §5.15 MemoryApplication。 */
+    /** v1 方法保持 NotImplemented；v2 方法全部委托给 §5.15 MemoryApplication。 */
     constructor(memoryV2) {
         super();
         this.memoryV2 = memoryV2;
@@ -32,6 +32,12 @@ export class MemoryController extends MemoryControllerBase {
     }
     async discardLegacyMemoryMigration(_ctx, req) {
         return this.memoryV2 ? this.memoryV2.discardLegacyMigration(req) : MEMORY_V2_DISABLED;
+    }
+    async getMemoryV2Onboarding(_ctx, req) {
+        return this.memoryV2 ? this.memoryV2.getOnboarding(req) : MEMORY_V2_DISABLED;
+    }
+    async completeMemoryV2Onboarding(_ctx, req) {
+        return this.memoryV2 ? this.memoryV2.completeOnboarding(req) : MEMORY_V2_DISABLED;
     }
     async getMemory(ctx, req) {
         void ctx;

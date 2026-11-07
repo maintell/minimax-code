@@ -106,6 +106,7 @@ function readMarketplaceResponse(value) {
     const record = requireRecord(value, 'Marketplace response');
     return {
         plugins: readArray(record, 'plugins', 'plugins').map(readMarketplaceSummary),
+        ...optionalArrayProjection(record, ['tag_definitions', 'tagDefinitions'], 'tagDefinitions', readPluginTag),
         ...optionalStringProjection(record, 'next_cursor', 'nextCursor', 'nextCursor'),
         ...optionalBooleanProjection(record, 'has_more', 'hasMore', 'hasMore'),
         ...optionalNumberProjection(record, 'plugin_total', 'pluginTotal', 'pluginTotal'),
@@ -148,12 +149,22 @@ function readMarketplaceDetail(value) {
             };
         }),
         ...optionalArrayProjection(record, ['example_queries', 'exampleQueries'], 'exampleQueries', requireStringValue),
+        ...optionalArrayProjection(record, ['agents', 'agents'], 'agents', readPluginAgent),
+    };
+}
+function readPluginAgent(value) {
+    const agent = requireRecord(value, 'Plugin Agent');
+    return {
+        name: requireString(agent, 'name', 'name'),
+        ...optionalStringProjection(agent, 'description', 'description', 'description'),
+        content: requireString(agent, 'content', 'content'),
     };
 }
 function readMarketplaceSummary(value) {
     const record = requireRecord(value, 'Plugin Marketplace summary');
     return {
         name: requireString(record, 'name', 'name'),
+        ...optionalArrayProjection(record, ['tags', 'tags'], 'tags', readPluginTag),
         ...optionalStringProjection(record, 'version', 'version', 'version'),
         ...optionalStringProjection(record, 'display_name', 'displayName', 'displayName'),
         ...optionalStringProjection(record, 'description', 'description', 'description'),
@@ -278,6 +289,7 @@ function readCapabilities(value) {
         mcpServerCount: requireNumber(record, 'mcp_server_count', 'mcpServerCount'),
         skillCount: requireNumber(record, 'skill_count', 'skillCount'),
         ...optionalNumberProjection(record, 'hook_count', 'hookCount', 'hookCount'),
+        ...optionalNumberProjection(record, 'agent_count', 'agentCount', 'agentCount'),
     };
 }
 function readPluginApp(value) {
@@ -415,5 +427,12 @@ function invalidResponse(detail) {
 }
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function readPluginTag(value) {
+    const record = requireRecord(value, 'Plugin tag');
+    return {
+        key: requireString(record, 'key', 'key'),
+        displayName: requireString(record, 'display_name', 'displayName'),
+    };
 }
 //# sourceMappingURL=registry-client.js.map

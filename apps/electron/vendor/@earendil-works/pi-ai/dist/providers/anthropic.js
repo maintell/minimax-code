@@ -282,11 +282,15 @@ async function* iterateAnthropicEvents(response, signal) {
     }
     let sawMessageStart = false;
     let sawMessageEnd = false;
+    // Set once any message_delta carries a non-empty string stop_reason. Earlier deltas may
+    // legitimately carry null, so only the whole stream decides.
+    let sawStopReason = false;
     // Structural-integrity counters only: event counts and elapsed timings.
     // Never record SSE payload bodies, prompts, reasoning or credentials here.
     const startedAtMs = Date.now();
     let rawEventCount = 0;
     let messageEventCount = 0;
+    let messageDeltaCount = 0;
     let firstEventAtMs = null;
     let lastEventAtMs = null;
     for await (const sse of iterateSseMessages(response.body, signal)) {
@@ -308,6 +312,14 @@ async function* iterateAnthropicEvents(response, signal) {
             }
             else if (event.type === "message_stop") {
                 sawMessageEnd = true;
+            }
+            else if (event.type === "message_delta") {
+                messageDeltaCount += 1;
+                // Optional chaining: a malformed delta must not turn into a parse error that embeds data.
+                const stopReason = event.delta?.stop_reason;
+                if (typeof stopReason === "string" && stopReason.length > 0) {
+                    sawStopReason = true;
+                }
             }
             yield event;
         }
@@ -333,6 +345,15 @@ async function* iterateAnthropicEvents(response, signal) {
     }
     if (sawMessageStart && !sawMessageEnd) {
         throw new Error("Anthropic stream ended before message_stop");
+    }
+    if (sawMessageStart && sawMessageEnd && !sawStopReason) {
+        // A complete message always reports why it stopped. An empty or missing stop_reason means
+        // the upstream cut the message short (for example mid-thinking); without this guard the
+        // initial stopReason "stop" would turn the truncated answer into a silent success.
+        const diagnostics = `messageDeltaCount=${messageDeltaCount}; rawEventCount=${rawEventCount}; ` +
+            `messageEventCount=${messageEventCount}; lastEventAtMs=${lastEventAtMs ?? "none"}; ` +
+            `eofAtMs=${Date.now() - startedAtMs}`;
+        throw new Error(`Anthropic stream ended without stop_reason (${diagnostics})`);
     }
 }
 export const streamAnthropic = (model, context, options) => {

@@ -1,4 +1,4 @@
-import { withOpenCodeGoHeaders, withOpenRouterAttributionHeaders } from '@mavis/shared';
+import { withMiniMaxCodeUserAgent, withOpenCodeGoHeaders, withOpenRouterAttributionHeaders, } from '@mavis/shared';
 const MESSAGES_VERSION_HEADER = 'anthropic-messages'.replace('-messages', '-version');
 export function buildProviderHeaders(input) {
     const defaults = input.api === 'anthropic-messages'
@@ -12,8 +12,8 @@ export function buildProviderHeaders(input) {
             Authorization: `Bearer ${input.apiKey}`,
         };
     const headers = new Headers(defaults);
-    const attributedHeaders = withOpenCodeGoHeaders(input.baseUrl, withOpenRouterAttributionHeaders(input.baseUrl, input.headers));
-    for (const [name, value] of Object.entries(attributedHeaders ?? {})) {
+    const attributedHeaders = withMiniMaxCodeUserAgent(withOpenCodeGoHeaders(input.baseUrl, withOpenRouterAttributionHeaders(input.baseUrl, input.headers)));
+    for (const [name, value] of Object.entries(attributedHeaders)) {
         headers.set(name, value);
     }
     return headers;

@@ -16,6 +16,7 @@ import { TelegramAttachmentDownloader } from '../../../transport/telegram/telegr
 import { TelegramSender } from '../../../transport/telegram/telegram-sender.js';
 import { LocalTelegramChannelClient, } from '../../../transport/telegram/telegram-outbound-client.js';
 import { json, readFirstString, readJsonBody } from '../http-helpers.js';
+import { collectTransportClients } from './connection-transport.js';
 export class LocalTelegramChannelApi {
     store;
     runner;
@@ -84,6 +85,17 @@ export class LocalTelegramChannelApi {
             clients[record.clientId] = serializeTelegramBinding(record);
         }
         return clients;
+    }
+    /**
+     * Live receive-channel state keyed by clientId, for the Connection list.
+     * Only records whose poller should be running right now are listed — the
+     * restore / winner start gate: enabled, `sdk` mode, a real (non-pending)
+     * token — and only when the provider reports for them. Disabled family
+     * shadows and quarantined startups stay absent, so the panel keeps its
+     * default.
+     */
+    async transportClients() {
+        return collectTransportClients(await this.store.list(), runsTelegramPoller, this.options.transportStatusProvider);
     }
     async configCheck(agentName) {
         const record = await this.store.get(agentName ?? this.defaultAgentName);
@@ -309,6 +321,16 @@ function validateTelegramBindMode(requestedMode) {
 /** Maps the v2 structured wire error back to the exact v1 400 JSON shape. */
 function wireValidationResponse(error) {
     return json({ error: error.message, code: error.code }, { status: error.status });
+}
+/**
+ * Whether this record's poller should be running: the gates of the restore
+ * pass (`visitTelegramRecord`) and the family winner start, in that order.
+ */
+function runsTelegramPoller(record) {
+    return (record.enabled &&
+        record.mode === 'sdk' &&
+        Boolean(record.botToken) &&
+        !record.botToken.startsWith('pending:'));
 }
 function serializeTelegramBinding(record) {
     return {

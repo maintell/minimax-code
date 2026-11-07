@@ -1,3 +1,4 @@
+import { currentHeapUsageBucket } from '../../../infra/observability/heap-usage-metrics.js';
 /** Compose product participants without weakening any participant's rollback contract. */
 export function composeTurnSubmissionPreparations(...candidates) {
     const preparations = candidates.filter((candidate) => candidate !== undefined);
@@ -64,6 +65,45 @@ export function composeTurnSubmissionPreparations(...candidates) {
             };
         },
     };
+}
+/** Sources the memory pressure design treats as automatic work; every other source is the user's. */
+const AUTOMATIC_SUBMISSION_SOURCES = new Set([
+    'task',
+    'background-task',
+    'thread-goal',
+    'cron',
+    'communication',
+    'greeting',
+    'team',
+]);
+/**
+ * Counts every admitted submission by origin and JS heap use, without changing admission. The
+ * counts show how much automatic work starts while the heap is already high.
+ */
+export function createSubmissionMemoryMetricsPreparation(metrics) {
+    if (!metrics)
+        return undefined;
+    return {
+        prepare: async (candidate) => {
+            try {
+                metrics.counter('turn_submission_total', 1, {
+                    origin: submissionOrigin(candidate),
+                    usage_bucket: currentHeapUsageBucket(),
+                    mode: 'off',
+                    platform: process.platform,
+                });
+            }
+            catch {
+                // Observation only; admission never depends on the metrics sink.
+            }
+            return undefined;
+        },
+    };
+}
+function submissionOrigin(candidate) {
+    if (candidate.genuineUserQueryText || candidate.userInputResume)
+        return 'user';
+    return AUTOMATIC_SUBMISSION_SOURCES.has(candidate.provenance.source) ? 'auto' : 'user';
 }
 /** Adapts the Goal admission participant to the shared Turn preparation contract. */
 export function createGoalTurnSubmissionPreparation(input) {

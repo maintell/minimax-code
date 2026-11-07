@@ -2,7 +2,7 @@ import { readPluginJsonObject } from '../plugin/package/filesystem.js';
 import { readerFail } from '../plugin/package/reader-errors.js';
 const APP_FIELDS = new Set(['$schema', 'schemaVersion', 'provider']);
 const CONNECTOR_PROVIDER = /^[a-z0-9_-]{1,64}$/u;
-export async function readOfficialAppReference(root, relativePath) {
+export async function readAppReference(root, relativePath) {
     const { value } = await readPluginJsonObject(root, relativePath, { portable: true });
     if (Object.keys(value).some((key) => !APP_FIELDS.has(key)) ||
         (value.$schema !== undefined && typeof value.$schema !== 'string') ||

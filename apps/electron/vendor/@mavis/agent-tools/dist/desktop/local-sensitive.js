@@ -1,4 +1,4 @@
-import { realpath } from 'node:fs/promises';
+import { realpath } from '../shared/physical-fs.js';
 import { minimatch } from 'minimatch';
 import { LOCAL_SENSITIVE_GLOB_EXCLUDES } from '../shared/rg-sensitive.js';
 export function sensitiveExcludeArgs() {

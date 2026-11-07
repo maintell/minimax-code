@@ -84,7 +84,7 @@ export function createMiniAppControlExtension(lifecycle) {
         id: 'miniapp-control',
         description: 'Host-owned Mini App bootstrap and runtime lifecycle control.',
         init(api) {
-            api.registerTool((context) => (isMiniAppTurn(context) ? tool : null));
+            api.registerTool((context) => (exposesMiniAppControl(context) ? tool : null));
         },
     };
 }
@@ -262,7 +262,11 @@ function readMiniAppAction(input) {
         ? action
         : 'unknown';
 }
-function isMiniAppTurn(context) {
+/** Interactive turns get the `miniapp` control tool, except inside a session a Mini App started. */
+function exposesMiniAppControl(context) {
+    // Such a session must not init / publish / open Mini Apps (including itself).
+    if (context.sessionOrigin?.miniApp)
+        return false;
     const config = readRecord(context.agentConfig);
     const profile = readRecord(config.agent_profile);
     return profile.surface === 'interactive';

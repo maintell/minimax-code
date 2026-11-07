@@ -4,13 +4,26 @@ import { migration as collisionMigration } from './migrations/session/migration-
 import { migration as cronMigration } from './migrations/cron/migration-0036-repair-cron-manual-request-index.js';
 import { migration as governanceMigration } from './migrations/memory/migration-0039-memory-governance-revision.js';
 import { migration as executionsMigration } from './migrations/memory/migration-0040-memory-executions.js';
+import { migration as sideChatsMigration } from './migrations/session/migration-0042-repair-session-sidechats-version-collision.js';
 import { assertDatabaseSchemaConsistent } from './schema-consistency.js';
+/** Canonical Memory versions whose markers the collision adoption records. */
+const MEMORY_COLLISION_ADOPTED_VERSIONS = [37, 38, 39, 40];
+/**
+ * True when the database carries the test-build Memory schema (33–36) that the
+ * canonical 37–40 chain would collide with. The adoption replays canonical
+ * 33–36 (m33 rewrites session rows), so callers treat this as a backup demand.
+ */
+export function isMemoryMigrationVersionCollisionPending(database) {
+    // Table checks first: the backup stage asks before any migration has run,
+    // when a fresh database has no version table yet.
+    return (tableExists(database, 'local_runtime_v2_memory_scopes') &&
+        tableExists(database, 'local_runtime_v2_schema_migrations') &&
+        !database.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = 38').get());
+}
 /** Test builds used 33–36 for Memory before preview_train assigned those numbers. */
 export function recoverMemoryMigrationVersionCollision(database) {
-    if (database.prepare('SELECT 1 FROM local_runtime_v2_schema_migrations WHERE version = 38').get() ||
-        !tableExists(database, 'local_runtime_v2_memory_scopes')) {
+    if (!isMemoryMigrationVersionCollisionPending(database))
         return;
-    }
     database
         .transaction(() => {
         removeEmptyLegacyMemoryTables(database);
@@ -40,8 +53,10 @@ export function recoverMemoryMigrationVersionCollision(database) {
       INSERT OR IGNORE INTO local_runtime_v2_schema_migrations (version, applied_at_ms)
       VALUES (?, ?)
     `);
-        for (const version of [37, 38, 39, 40])
+        applyMigration(database, sideChatsMigration);
+        for (const version of [...MEMORY_COLLISION_ADOPTED_VERSIONS, 41, 42]) {
             record.run(version, Date.now());
+        }
         assertDatabaseSchemaConsistent(database);
     })
         .immediate();

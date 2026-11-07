@@ -475,10 +475,15 @@ function reconcileMutation(lease, intent) {
                 id: `agent-host:${lease.turnId}:history:${reason.kind}`,
                 kind: 'output-recall',
                 variant: intent.variant,
+                ...(intent.slowNetworkRead ? { slowNetworkRead: true } : {}),
             },
         };
     }
-    const mode = intent.kind === 'abort-reconcile' ? 'abort' : 'network';
+    let mode = 'network';
+    if (intent.kind === 'abort-reconcile')
+        mode = 'abort';
+    if (intent.kind === 'safety-reconcile')
+        mode = 'safety';
     return {
         kind: 'settle-turn-tail',
         sessionId: lease.sessionId,
@@ -489,6 +494,9 @@ function reconcileMutation(lease, intent) {
             id: `agent-host:${lease.turnId}:history:${intent.kind}`,
             kind: intent.kind,
             ...(mode === 'network' ? { variant: 'network' } : {}),
+            ...(intent.kind === 'network-reconcile' && intent.slowNetworkRead
+                ? { slowNetworkRead: true }
+                : {}),
         },
     };
 }

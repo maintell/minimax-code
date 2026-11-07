@@ -8,7 +8,7 @@ const baseDefinitions = [
         labelKey: 'settings.shortcuts.actions.mini_chat.label',
         descriptionKey: 'settings.shortcuts.actions.mini_chat.description',
         searchKeywordsKey: 'settings.shortcuts.actions.mini_chat.keywords',
-        defaults: { mac: 'Alt+A', windows: 'Alt+A' },
+        defaults: { mac: null, windows: null },
         configurable: true,
         handledBy: 'electron-global',
     }),
@@ -75,6 +75,18 @@ const baseDefinitions = [
         configurable: true,
         handledBy: 'renderer',
         commandMenuGroup: 'recommended',
+    }),
+    definition({
+        id: 'sidechat.create',
+        category: 'panels',
+        scope: 'app',
+        labelKey: 'settings.shortcuts.actions.sidechat_create.label',
+        descriptionKey: 'settings.shortcuts.actions.sidechat_create.description',
+        searchKeywordsKey: 'settings.shortcuts.actions.sidechat_create.keywords',
+        defaults: { mac: 'Option+Command+S', windows: 'Ctrl+Alt+S' },
+        configurable: true,
+        handledBy: 'renderer',
+        commandMenuGroup: 'panels',
     }),
     definition({
         id: 'sidebar.toggle',
@@ -348,6 +360,17 @@ export const SHORTCUT_DEFINITIONS = [
     ...baseDefinitions,
     ...sessionSlotDefinitions,
 ];
+export function isStandardShortcutAction(id) {
+    return id === 'session.find' || id === 'workspacePanel.closeCurrentTab';
+}
+const disabledAppShortcutOverrides = Object.fromEntries(SHORTCUT_DEFINITIONS.filter(({ id }) => !isStandardShortcutAction(id)).map(({ id }) => [
+    id,
+    null,
+]));
+/** Suspend MCode bindings while retaining the platform's default Find and Close commands. */
+export function getActiveShortcutOverrides(overrides, enabled) {
+    return enabled ? overrides : disabledAppShortcutOverrides;
+}
 const definitionsById = new Map(SHORTCUT_DEFINITIONS.map((value) => [value.id, value]));
 export function getShortcutDefinition(id) {
     const value = definitionsById.get(id);

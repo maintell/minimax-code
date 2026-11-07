@@ -1,9 +1,10 @@
+import { normalizeWindowsShellBase } from '../../agent-shell/index.js';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isAgentBuiltinToolEnabled, parseAgentCapabilityConfig, } from '@mavis/config';
 import { PromptSnapshotInvalidError, } from '@mavis/agent-runtime';
-import { BUILTIN_ROSTER_FILE, FEATURE_FILES, PRIMARY_AGENT_NAME, canonicalBuiltinName, defaultLocale, legacyNamesFor, surfacePromptFiles, toSurfaceRenderInput, } from './definitions.js';
+import { BUILTIN_ROSTER_FILE, FEATURE_FILES, PRIMARY_AGENT_NAME, PTC_SECTION_FILE, canonicalBuiltinName, defaultLocale, legacyNamesFor, surfacePromptFiles, toSurfaceRenderInput, } from './definitions.js';
 import { createBuiltinPromptContext, parseFrontmatter, renderBuiltinTemplate, stripFrontmatter, } from './prompt-renderer.js';
 import { captureLocalPromptAssets } from './prompt-assets.js';
 export { canonicalBuiltinName, legacyNamesFor, resolveCanonicalCapabilities, } from './definitions.js';
@@ -118,6 +119,18 @@ export class BuiltinAgentCatalog {
             : undefined;
         return { persona, coreTemplate, agentPrompt, promptSnapshot };
     }
+    /**
+     * Renders the PTC section with the Turn's own context (tool switches) before
+     * the main templates insert it. Read from the bundled assets only, never from
+     * a remote Prompt version: it is exempt from desktop_agent delivery, so a
+     * remote bundle never has to carry it and no older client ever sees it.
+     */
+    async renderPtcSection(input) {
+        const template = await this.readPromptAssetFile(undefined, PTC_SECTION_FILE);
+        if (template === undefined)
+            throw new Error(`Mandatory V2 PTC prompt is missing: ${PTC_SECTION_FILE}.`);
+        return this.renderTemplate(template, this.context(input, {}), PTC_SECTION_FILE).trim();
+    }
     renderPromptSnapshot(input, snapshot) {
         return {
             ...snapshot,
@@ -186,7 +199,7 @@ export class BuiltinAgentCatalog {
             if (templates.core === undefined)
                 throw new Error(`Mandatory local-runtime-v2 base prompt is missing: ${file}.md.hbs.`);
             const parts = this.renderLayerParts(input, `${root}/${file}`, templates);
-            core.push(parts.core);
+            core.push(file === 'prompt-base-windows' ? normalizeWindowsShellBase(parts.core) : parts.core);
         }
         return {
             core: core

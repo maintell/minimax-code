@@ -1,0 +1,1 @@
+.questionnaire-others-row{container:questionnaire-others/inline-size}.questionnaire-others-action-group{align-items:center}@container questionnaire-others (max-width: 480px){.questionnaire-others-action-group{flex-direction:column;align-items:stretch}}

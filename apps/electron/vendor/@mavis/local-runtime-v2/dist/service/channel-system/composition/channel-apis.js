@@ -27,6 +27,7 @@ import { LocalWeChatChannelAdapter } from '../transport/wechat/wechat-adapter.js
 import { stubWeChatRuntimeSdk } from '../transport/wechat/wechat-sdk-stub.js';
 import { restoreInboundLoops } from './restore.js';
 import { detach } from '../settle.js';
+import { IDLE_CHANNEL_TRANSPORT, } from '../ingress/channel-transport-status.js';
 import { AgentContractHttpError } from '../delivery/legacy-http/agent-contract-error.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 /** WS dispatch surface shared by restore, bind-time and binding-changed starts. */
@@ -79,6 +80,10 @@ function buildFeishuArm(input) {
     const feishuSenderOptions = channelFetch ? { fetcher: channelFetch } : {};
     const feishuStore = input.stores.feishu ?? new LocalFeishuChannelStore(input.dataDir, input.nowMs);
     const feishuWsEnabled = input.feishuWsEnabled !== false;
+    // Adapters get a WS client factory only with the WS transport on and a
+    // registry; without one `startWebSocket` skips. Shared with the
+    // Connection-list gate below so the two can never disagree.
+    const feishuWsClientsEnabled = feishuWsEnabled && input.adapterRegistry !== undefined;
     const feishuPendingQuestionnaires = new Map();
     const feishuPendingPermissions = new Map();
     // Shared per-chat map of "🤔 思考中…" cards the WS dispatcher renders so
@@ -134,7 +139,7 @@ function buildFeishuArm(input) {
             return existing;
         }
         const adapter = new FeishuPlatformAdapter({ store: feishuStore, agentName }, {
-            wsClientFactory: feishuWsEnabled && input.adapterRegistry ? undefined : false,
+            wsClientFactory: feishuWsClientsEnabled ? undefined : false,
             pendingThinkingStore: feishuPendingThinkingCards,
             pendingReactionStore: feishuPendingReactions,
             senderOptions: feishuSenderOptions,
@@ -248,6 +253,13 @@ function buildFeishuArm(input) {
         // resolved per concrete agentName so status/list can report *this*
         // binding's in-memory `wsStatus` instead of only the persisted record.
         wsStatusProvider: (agentName) => getOrCreateFeishuAdapter(agentName).getWsStatus(),
+        // Runtime half of the Connection-list gate (the record half is
+        // `feishuBindingTransport`), like `liveTransportStatus` for WeChat /
+        // Telegram: a quarantined startup starts no long connection (restore
+        // pass and winner start), nor does a runtime without WS clients
+        // (`startFeishuWs`, `wsClientFactory`). Reads flags only, never an
+        // adapter, and leaves `statusClients()` untouched.
+        wsTransportGate: () => input.restoreInboundLoops !== false && feishuWsClientsEnabled,
         // Shared pending 👀 ack-reaction store so clients registered by the API
         // itself (bind-time re-registration) also revoke the ack on delivery.
         pendingReactionStore: feishuPendingReactions,
@@ -266,6 +278,22 @@ function buildFeishuArm(input) {
         startFeishuWs,
         feishu,
     };
+}
+/**
+ * Live receive-channel state of one WeChat / Telegram agent for the
+ * Connection list and the legacy status overlay. Read-only on purpose: a
+ * status read must never construct (and thereby register) an adapter.
+ *   - quarantined startup: copied bindings never start loops → report nothing;
+ *   - an adapter exists: its own answer (`undefined` when inbound is unwired);
+ *   - no adapter yet: nothing was started for this agent in this process →
+ *     `idle` (or nothing when this runtime cannot run the channel at all).
+ */
+function liveTransportStatus(scope) {
+    if (scope.quarantined)
+        return undefined;
+    if (scope.adapter)
+        return scope.adapter.inboundTransportStatus();
+    return scope.inboundWired ? IDLE_CHANNEL_TRANSPORT : undefined;
 }
 /**
  * Telegram arm: shared store, per-agent adapter factory and the legacy Api.
@@ -361,6 +389,13 @@ function buildTelegramArm(input) {
             adapter: telegramAdapter,
             adapterForAgent: getOrCreateTelegramAdapter,
             onUnbind: unregisterTelegramEdge,
+            // Every adapter built here gets `dispatchInbound`, so the channel is
+            // wired whenever startup is not quarantined.
+            transportStatusProvider: (agentName) => liveTransportStatus({
+                quarantined: input.restoreInboundLoops === false,
+                adapter: telegramAdapters.get(telegramClientId(agentName)),
+                inboundWired: true,
+            }),
             ...(input.telegramTokenVerifyFetcher || channelFetch
                 ? { tokenVerifyFetcher: input.telegramTokenVerifyFetcher ?? channelFetch }
                 : {}),
@@ -384,6 +419,7 @@ function buildTelegramArm(input) {
 function buildWeChatArm(input) {
     const channelFetch = input.fetchImpl;
     const wechatStore = input.stores.wechat ?? new LocalWeChatChannelStore(input.dataDir, input.nowMs);
+    const wechatSdk = input.wechatRuntimeSdk ?? stubWeChatRuntimeSdk;
     const wechatAdapters = new Map();
     const registerWeChatEdge = (adapter) => {
         input.adapterRegistry?.register(adapter);
@@ -403,7 +439,7 @@ function buildWeChatArm(input) {
             agentName,
             store: wechatStore,
             runner: input.runner,
-            sdk: input.wechatRuntimeSdk ?? stubWeChatRuntimeSdk,
+            sdk: wechatSdk,
         });
         wechatAdapters.set(clientName, adapter);
         if (register)
@@ -441,6 +477,11 @@ function buildWeChatArm(input) {
         },
         // Live health probe: status reflects iLink long-poll health, not just binding existence.
         monitorHealthProvider: (agentName) => wechatAdapters.get(wechatClientId(agentName))?.monitorHealth(),
+        transportStatusProvider: (agentName) => liveTransportStatus({
+            quarantined: input.restoreInboundLoops === false,
+            adapter: wechatAdapters.get(wechatClientId(agentName)),
+            inboundWired: Boolean(wechatSdk.createMonitor),
+        }),
         // Tear down the exact runtime edge before deleting its binding. Family
         // cleanup also unregisters its winner/legacy edge, but a regular exact
         // unbind does not go through that reconciler path. Leaving the client in

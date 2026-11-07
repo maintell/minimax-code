@@ -23,10 +23,12 @@
 import { getConfig } from "@mavis/config";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
 import logger from "../../../utils/logger";
+import { recordAuthRefreshExecutionGap } from "../../auth/refresh-environment";
 import { destroyAllManagedMiniAppTabs } from "../../browser/embedded-browser-manager";
 import { enqueueElectronObservabilityEvent, isElectronObservabilityShuttingDown, getElectronObservabilityAppInstanceId } from "../../observability/outbox";
 import { recordElectronStartupRuntimeReady } from "../../observability/startup-performance";
 import { resolveLocalRuntimeDataDir } from "../data-dir";
+import { notifyDataDirRuntimeReady, notifyDataDirRuntimeTerminalFailure, notifyDataDirRuntimeStartAttempt } from "../data-dir-relocation-guard";
 import { prepareLocalRuntimeNativeSqliteEnv } from "../native-sqlite-env";
 import { resolveLocalRuntimeLaunchPlan } from "../test-data-isolation";
 import { resetUtilityRuntimeStartBlockForTests, isUtilityRuntimeStartBlocked } from "../runtime-start-guard";
@@ -185,7 +187,12 @@ function getManager() {
         emit: enqueueElectronObservabilityEvent,
         isQuitInProgress: isElectronObservabilityShuttingDown,
     });
-    executionContinuityController ?? (executionContinuityController = createExecutionContinuity());
+    if (!executionContinuityController) {
+        executionContinuityController = createExecutionContinuity();
+        // Read-only breadcrumb for OAuth refresh summaries; listener errors are
+        // already isolated by the continuity controller.
+        executionContinuityController.continuity.onGap((observation) => recordAuthRefreshExecutionGap(observation.executionGapMs));
+    }
     manager = new LocalRuntimeUtilityProcessManager({
         bootstrapTimeoutMs: launchPlan.utilityBootstrapTimeoutMs,
         ...(isUtilityRuntimeHealthRecoveryDisabled() ? { runtimeHealthTimeoutMs: false } : {}),
@@ -215,6 +222,7 @@ function getManager() {
             connectRuntimeChannel: (channel) => manager?.connectComputerUseChannel(channel) ?? false,
         }),
         getRunawayGuardConfig: () => hooks?.getRunawayGuardConfig?.() ?? {},
+        getPromptSuggestionPolicy: () => hooks?.getPromptSuggestionPolicy?.() ?? {},
         getToolResultCompactionConfig: () => hooks?.getToolResultCompactionConfig?.() ?? {},
         getCollectionPolicy: () => hooks?.getCollectionPolicy?.() ?? DEFAULT_COLLECTION_POLICY,
         getStartupExecutionPolicy: () => hooks?.getStartupExecutionPolicy?.(),
@@ -225,6 +233,9 @@ function getManager() {
         getBrowserAdapter: () => hooks?.getBrowserAdapter(),
         ...(hooks?.openMiniAppSurface ? { openMiniAppSurface: hooks.openMiniAppSurface } : {}),
         ...(hooks?.closeMiniAppSurface ? { closeMiniAppSurface: hooks.closeMiniAppSurface } : {}),
+        ...(hooks?.requestMiniAppToolApproval
+            ? { requestMiniAppToolApproval: hooks.requestMiniAppToolApproval }
+            : {}),
         isMiniAppSurfaceEnabled: () => getConfig().beta.filePanelBrowser === true,
         onMiniAppGenerationLost: () => {
             destroyAllManagedMiniAppTabs();
@@ -247,6 +258,7 @@ function getManager() {
         },
         onRuntimeReady: () => {
             runtimeFailReason = null;
+            notifyDataDirRuntimeReady();
             // CUA may finish first while local-runtime is still starting. Reconcile
             // the pending transferred port as soon as the runtime publishes ready;
             // otherwise the CUA activation would report success but leave v2 on the
@@ -267,6 +279,7 @@ function getManager() {
             // A terminal verdict must reach windows that are already open; the
             // once-per-window startup push cannot see a mid-session latch.
             if (terminal) {
+                notifyDataDirRuntimeTerminalFailure(reasonCode);
                 broadcastRuntimeFailed({
                     type: failureTypeForReasonCode(reasonCode),
                     message,
@@ -291,6 +304,7 @@ export function isUtilityRuntimeHealthRecoveryDisabled(env = process.env) {
 export async function ensureUtilityRuntimeStarted(options = {}) {
     if (isUtilityRuntimeStartBlocked())
         return false;
+    notifyDataDirRuntimeStartAttempt();
     return getManager().ensureStarted(options);
 }
 /** Lazily starts the sibling CUA utility after a conversation explicitly opts
@@ -304,12 +318,75 @@ export async function ensureComputerUseUtilityStarted() {
     });
 }
 export async function requestUtilityMiniApp(method, pluginId, signal) {
+    assertMiniAppRuntimeStartable();
+    return getManager().requestMiniApp(method, pluginId, signal);
+}
+export async function setUtilityMiniAppPermission(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().setMiniAppPermission(input);
+}
+export async function runUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().runMiniAppAgent(input, options);
+}
+export async function replyUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().replyMiniAppAgent(input);
+}
+export async function openUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().openMiniAppAgent(input);
+}
+export async function modelsUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().modelsMiniAppAgent(input);
+}
+export async function agentsUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().agentsMiniAppAgent(input);
+}
+/** Page-path `tool.request`; `pluginId` was resolved by Main from the sending tab. */
+export async function requestUtilityMiniAppTools(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().requestMiniAppTools(input);
+}
+export async function createUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().createMiniAppAgent(input);
+}
+/** Host side panel now shows `sessionId`, so its asks can wait for an answer there. */
+export async function panelOpenedUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().reportMiniAppAgentPanel('agent.panelOpened', input);
+}
+/** Host side panel no longer shows `sessionId`. */
+export async function panelClosedUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().reportMiniAppAgentPanel('agent.panelClosed', input);
+}
+export async function answerUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().answerMiniAppAgent(input, options);
+}
+/** Page-path observer; settles when the subscription ends. */
+export async function observeUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().observeMiniAppAgent(input, options);
+}
+export async function listUtilityMiniAppAgentSessions(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().listMiniAppAgentSessions(input);
+}
+export async function getUtilityMiniAppAgentSession(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().getMiniAppAgentSession(input);
+}
+function assertMiniAppRuntimeStartable() {
     if (isUtilityRuntimeStartBlocked()) {
         throw Object.assign(new Error('Mini App runtime is unavailable'), {
             code: 'runtime_unavailable',
         });
     }
-    return getManager().requestMiniApp(method, pluginId, signal);
 }
 export function isUtilityRuntimeReady() {
     return manager?.isReady() ?? false;
@@ -402,6 +479,9 @@ export function setUtilityRuntimeContextWindowUsageEnabled(enabled) {
 export function setUtilityRuntimeRunawayGuardConfig(config) {
     manager?.setRunawayGuardConfig(config);
 }
+export function setUtilityRuntimePromptSuggestionPolicy(policy) {
+    manager?.setPromptSuggestionPolicy(policy);
+}
 export function setUtilityRuntimeToolResultCompactionConfig(config) {
     manager?.setToolResultCompactionConfig(config);
 }
@@ -427,7 +507,7 @@ export async function collectUtilityRuntimeSessionReport(sessionId) {
 }
 export async function stopUtilityRuntime() {
     if (!manager) {
-        stopComputerUseUtility();
+        await stopComputerUseUtility();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
         return { status: 'exited' };
@@ -436,7 +516,7 @@ export async function stopUtilityRuntime() {
         return await manager.stop();
     }
     finally {
-        stopComputerUseUtility();
+        await stopComputerUseUtility();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
     }

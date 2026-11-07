@@ -7,7 +7,8 @@
  *
  * Reference: permission_design.md §5.1
  */
-import { shellTokenize } from './shell-tokenize.js';
+import { shellTokenizeWithMetadata } from './shell-tokenize.js';
+import { isShellCommentStart, readBashExpansion } from './bash-expansion.js';
 /**
  * POSIX shell keywords that introduce control flow. When a split subcommand
  * has one of these as its leading token, the remainder of the segment is
@@ -88,74 +89,96 @@ export function stripLeadingShellKeyword(segment) {
     }
     return cur.length > 0 ? cur : undefined;
 }
-/**
- * POSIX shell line-continuation: a backslash immediately followed by an
- * actual newline (not the literal characters `\n`) joins the line to the
- * next. Fold to a single space outside single quotes so the rest of
- * splitCommand and the per-segment first-word checks see a normal one-line
- * command. Inside single quotes the backslash is literal — leave alone.
- *
- * Quote-aware so a `\<NL>` inside `"..."` is also folded (matches POSIX:
- * inside double quotes the only special chars are `$`, `` ` ``, `\` and
- * the newline is still joined). `<NL>` not preceded by `\` is left intact
- * so the main splitter can treat it as a subcommand separator.
- */
+/** Remove escaped newlines without creating a word/comment boundary. */
 function foldLineContinuationsWithSourceMap(input) {
     let out = '';
     const ranges = [];
     let inSingleQuote = false;
     let inDoubleQuote = false;
-    const append = (text, start, end) => {
-        out += text;
-        ranges.push({ start, end });
+    let inComment = false;
+    let previousExpansionEnd = -1;
+    const append = (index) => {
+        out += input[index];
+        ranges.push({ start: index, end: index + 1 });
     };
     for (let i = 0; i < input.length; i++) {
         const ch = input[i] ?? '';
-        if (ch === "'" && !inDoubleQuote) {
-            inSingleQuote = !inSingleQuote;
-            append(ch, i, i + 1);
+        if (inComment) {
+            append(i);
+            if (ch === '\n')
+                inComment = false;
             continue;
         }
-        if (ch === '"' && !inSingleQuote) {
-            inDoubleQuote = !inDoubleQuote;
-            append(ch, i, i + 1);
+        if (isShellCommentStart(input, i, inSingleQuote, inDoubleQuote, previousExpansionEnd)) {
+            inComment = true;
+            append(i);
             continue;
         }
         if (ch === '\\' && !inSingleQuote) {
-            const next = input[i + 1];
-            if (next === '\n') {
-                append(' ', i, i + 2);
-                i += 1;
+            if (input[i + 1] === '\n') {
+                i++;
                 continue;
             }
-            if (next === '\r' && input[i + 2] === '\n') {
-                append(' ', i, i + 3);
+            if (input[i + 1] === '\r' && input[i + 2] === '\n') {
                 i += 2;
                 continue;
             }
-            // Other escape — preserve as-is.
-            append(ch, i, i + 1);
+            append(i);
+            // Escaped quotes cannot alter the surrounding quote state.
+            if (i + 1 < input.length)
+                append(++i);
             continue;
         }
-        append(ch, i, i + 1);
+        const expansion = !inSingleQuote && readBashExpansion(input, i, !inDoubleQuote);
+        if (expansion) {
+            // Its own quotes/comments belong to the nested shell, not this one.
+            for (let j = i; j < expansion.end; j++)
+                append(j);
+            previousExpansionEnd = expansion.end;
+            i = expansion.end - 1;
+            continue;
+        }
+        if (ch === "'" && !inDoubleQuote)
+            inSingleQuote = !inSingleQuote;
+        if (ch === '"' && !inSingleQuote)
+            inDoubleQuote = !inDoubleQuote;
+        append(i);
     }
     return { text: out, ranges };
 }
 function foldLineContinuations(input) {
     return foldLineContinuationsWithSourceMap(input).text;
 }
-/**
- * Return true when every token of a segment looks like an environment-var
- * assignment (`K=V` / `K=`). Such segments are no-op env-only lines (e.g.
- * `VERIFIER_DATA_DIR=/tmp/xxx$$` standalone before a real command on the
- * next line) and carry no command to evaluate. Drop them at split time so
- * downstream layers don't trip on them.
- */
+/** Literal assignments are inert, but attached redirects still open files. */
 function isAssignmentOnlySegment(seg) {
-    const tokens = shellTokenize(seg.trim());
+    const input = seg.trim();
+    const tokens = shellTokenizeWithMetadata(input, true);
     if (tokens.length === 0)
         return false;
-    return tokens.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+    return tokens.every((token) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(token.value) &&
+        !token.pathSyntax?.dynamic &&
+        !hasUnquotedRedirect(input.slice(token.start, token.end)));
+}
+function hasUnquotedRedirect(input) {
+    let quote;
+    for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        if (ch === '\\' && quote !== "'") {
+            i++;
+            continue;
+        }
+        if (quote) {
+            if (ch === quote)
+                quote = undefined;
+            continue;
+        }
+        if (ch === "'" || ch === '"')
+            quote = ch;
+        else if (ch === '<' || ch === '>')
+            return true;
+    }
+    // An incomplete word must remain visible to fail-closed safety callers.
+    return quote !== undefined;
 }
 function findLineBreakStart(input, start) {
     const lf = input.indexOf('\n', start);
@@ -286,15 +309,14 @@ function parseHeredocMarkerAt(input, operatorIndex) {
     const parsedWord = parseHeredocWord(input, i);
     if (!parsedWord)
         return undefined;
-    return { marker: { marker: parsedWord.marker, stripTabs }, nextIndex: parsedWord.nextIndex };
+    const quoted = /['"\\]/.test(input.slice(i, parsedWord.nextIndex));
+    return {
+        marker: { marker: parsedWord.marker, stripTabs, quoted },
+        nextIndex: parsedWord.nextIndex,
+    };
 }
 function shellCommentStartsAt(input, index) {
-    if (input[index] !== '#')
-        return false;
-    if (index === 0)
-        return true;
-    // `{` is not a shell word separator here; `${#var}` is a parameter expansion.
-    return /[\s;&|()]/.test(input[index - 1] ?? '');
+    return isShellCommentStart(input, index, false, false);
 }
 function findLineEnd(input, start) {
     const lf = input.indexOf('\n', start);
@@ -427,7 +449,8 @@ function consumeHeredocBody(input, start, marker) {
     }
     return input.length;
 }
-function splitCommandWithoutHeredoc(input) {
+/** Preserve source text, including executable substitutions in shell headers. */
+export function splitShellSourceSegments(input, preservePipes = false) {
     // Fold POSIX line-continuations (`\<NL>` outside single quotes) so the
     // tokenizer sees a single logical line per segment. Heredoc bodies are
     // handled before this helper is called, so body text is never folded here.
@@ -437,6 +460,8 @@ function splitCommandWithoutHeredoc(input) {
     let inSingleQuote = false;
     let inDoubleQuote = false;
     let escaped = false;
+    let inComment = false;
+    let previousExpansionEnd = -1;
     const flushSegment = () => {
         const trimmed = current.trim();
         if (trimmed.length > 0) {
@@ -446,6 +471,13 @@ function splitCommandWithoutHeredoc(input) {
     };
     for (let i = 0; i < folded.length; i++) {
         const ch = folded[i] ?? '';
+        if (inComment) {
+            if (ch === '\n') {
+                inComment = false;
+                flushSegment();
+            }
+            continue;
+        }
         if (escaped) {
             current += ch;
             escaped = false;
@@ -454,6 +486,20 @@ function splitCommandWithoutHeredoc(input) {
         if (ch === '\\' && !inSingleQuote) {
             escaped = true;
             current += ch;
+            continue;
+        }
+        // Recognize an unquoted shell comment BEFORE the expansion/quote branches
+        // so a comment containing an unbalanced quote (e.g. `# don't`) can't leak
+        // its open state forward and merge the next line into the same segment.
+        if (isShellCommentStart(folded, i, inSingleQuote, inDoubleQuote, previousExpansionEnd)) {
+            inComment = true;
+            continue;
+        }
+        const expansion = !inSingleQuote && readBashExpansion(folded, i, !inDoubleQuote);
+        if (expansion) {
+            current += folded.slice(i, expansion.end);
+            previousExpansionEnd = expansion.end;
+            i = expansion.end - 1;
             continue;
         }
         if (ch === "'" && !inDoubleQuote) {
@@ -468,20 +514,41 @@ function splitCommandWithoutHeredoc(input) {
         }
         // Outside quotes: check for separators
         if (!inSingleQuote && !inDoubleQuote) {
+            const arithmeticEnd = skipArithmeticContext(folded, i);
+            if (arithmeticEnd !== undefined) {
+                current += folded.slice(i, arithmeticEnd);
+                i = arithmeticEnd - 1;
+                continue;
+            }
+            // Consume redirect operators before recognizing a background-list '&'.
+            // Looking only at the preceding character would mistake quoted/escaped
+            // literal '>' or '<' for a redirect operator.
+            if ((ch === '>' && (folded[i + 1] === '|' || folded[i + 1] === '&')) ||
+                (ch === '<' && folded[i + 1] === '&') ||
+                (ch === '&' && folded[i + 1] === '>')) {
+                current += folded.slice(i, i + 2);
+                i++;
+                continue;
+            }
             // Check for && or ||
             if ((ch === '&' && folded[i + 1] === '&') || (ch === '|' && folded[i + 1] === '|')) {
                 flushSegment();
                 i++; // skip second char of && or ||
                 continue;
             }
-            // Check for ;
-            if (ch === ';') {
+            // Both synchronous and asynchronous lists contain independent commands.
+            if (ch === ';' || ch === '&') {
                 flushSegment();
                 continue;
             }
-            // Check for pipe | (single pipe is a sub-command separator for permission)
-            if (ch === '|' && folded[i + 1] !== '|') {
-                flushSegment();
+            // Keep |& atomic: its ampersand is part of the pipeline, not a list.
+            if (ch === '|') {
+                const pipe = folded[i + 1] === '&' ? '|&' : '|';
+                if (preservePipes)
+                    current += pipe;
+                else
+                    flushSegment();
+                i += pipe.length - 1;
                 continue;
             }
             // Unquoted newline (or `\r\n`) — POSIX subcommand separator. Without
@@ -504,14 +571,14 @@ function splitCommandWithoutHeredoc(input) {
         current += ch;
     }
     flushSegment();
-    // Per-segment cleanup: drop comment-only and pure env-assignment segments
-    // (they carry no command), then strip leading shell control-flow keywords.
-    // Standalone keywords like `fi` / `done` evaluate to undefined here and
-    // are also skipped.
+    return rawSegments;
+}
+function splitCommandWithoutHeredoc(input) {
+    const rawSegments = splitShellSourceSegments(input);
+    // Comments were removed at their own shell level, without slicing expansions.
+    // Drop literal assignments and standalone control-flow keywords as no-ops.
     const commands = [];
     for (const seg of rawSegments) {
-        if (/^\s*#/.test(seg))
-            continue;
         if (isAssignmentOnlySegment(seg))
             continue;
         const stripped = stripLeadingShellKeyword(seg);
@@ -571,14 +638,14 @@ function collectHeredocBodyRanges(input, offset, ranges) {
     if (bodyStart === undefined)
         return;
     const header = rest.slice(0, bodyStart);
-    const segments = splitCommandWithoutHeredoc(header);
-    const markers = segments.flatMap((segment) => parseHeredocMarkers(segment));
+    const segments = splitShellSourceSegments(header, true);
+    const markers = segments.flatMap((segment) => parseHeredocMarkers(segment).map((marker) => ({ ...marker, header: segment })));
     if (markers.length === 0)
         return;
     let cursor = offset + bodyStart;
     for (const marker of markers) {
         const next = consumeHeredocBody(input, cursor, marker);
-        ranges.push({ start: cursor, end: next });
+        ranges.push({ start: cursor, end: next, quoted: marker.quoted, header: marker.header });
         cursor = next;
     }
     collectHeredocBodyRanges(input, cursor, ranges);
@@ -589,6 +656,10 @@ function collectHeredocBodyRanges(input, offset, ranges) {
  * because heredoc split segments can be logical, not contiguous source slices.
  */
 export function findHeredocBodyRanges(input) {
+    return findHeredocBodies(input).map(({ start, end }) => ({ start, end }));
+}
+/** Preserve each body's expansion mode and owning pipeline for safety callers. */
+export function findHeredocBodies(input) {
     const ranges = [];
     collectHeredocBodyRanges(input, 0, ranges);
     return ranges;
@@ -596,9 +667,9 @@ export function findHeredocBodyRanges(input) {
 /**
  * Split a compound command string into individual sub-commands.
  *
- * Handles `&&`, `||`, `;`, `|` AND unquoted newline separators while
+ * Handles `&&`, `||`, `;`, `&`, `|`, `|&` and unquoted newline separators while
  * respecting quoted strings and escaped characters. Line-continuations
- * (`\<NL>`) are folded to a space before splitting. After splitting,
+ * (`\<NL>`) are removed before splitting. After splitting,
  * leading shell control-flow keywords (`if`, `then`, `do`, ...) are
  * stripped so the actual command gets evaluated (e.g.
  * `if ps -p 1; then kill 1; fi` splits into `['ps -p 1', 'kill 1']`;

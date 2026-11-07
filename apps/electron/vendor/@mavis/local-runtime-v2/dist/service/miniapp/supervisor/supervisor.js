@@ -2,10 +2,12 @@ import { randomUUID } from 'node:crypto';
 import * as cleanup from './cleanup-settlement.js';
 import * as errors from '../errors.js';
 import { MiniAppError } from '../errors.js';
-import { activeStatusPhase, assertGenerationRunCurrent, assertReusableRuntimeCurrent, isReusableGeneration, persistedState, publishedView, scheduleTimeout, } from './supervisor-generation.js';
+import { assertGenerationRunCurrent, assertReusableRuntimeCurrent, isReusableGeneration, persistedState, publishedView, runtimeLoopbackToken, scheduleTimeout, } from './supervisor-generation.js';
 import { assertColdStartupAvailable, capturePublicationMemory, createSupervisorPreparation, disablePreparationCancellation, disableRolledBackError, explicitStartRequiredJson, persistedErrorDetail, persistExplicitStartFence, removeRetiringGeneration, restorePublicationMemory, restorePublicationPersistence, rollbackCommittedGeneration, } from './supervisor-transition.js';
 import { SupervisorCutoverCoordinator } from './supervisor-cutover.js';
 import { MiniAppSupervisorDiagnostics } from './supervisor-diagnostics.js';
+import { admitLease, admitRunningLease, requireActiveGeneration, } from './supervisor-lease.js';
+import { statusFor } from './supervisor-status.js';
 export class DefaultMiniAppSupervisor {
     options;
     active = new Map();
@@ -17,6 +19,7 @@ export class DefaultMiniAppSupervisor {
     quarantined = new Set();
     explicitlyStopped = new Set();
     quiescing = new Map();
+    pendingRuntimeOperations = new Map();
     publicationMemory = {
         disabled: this.disabled,
         cold: this.cold,
@@ -26,6 +29,7 @@ export class DefaultMiniAppSupervisor {
     };
     diagnostics;
     observations = new Set();
+    runtimeExitListeners = new Set();
     cutover;
     closed = false;
     closePromise;
@@ -34,6 +38,7 @@ export class DefaultMiniAppSupervisor {
         this.diagnostics = new MiniAppSupervisorDiagnostics({
             nodeRuntime: options.nodeRuntime,
             nowMs: () => this.nowMs(),
+            ...(options.logger ? { logger: options.logger } : {}),
             ...(options.logCapacity !== undefined ? { logCapacity: options.logCapacity } : {}),
         });
         this.cutover = new SupervisorCutoverCoordinator({
@@ -126,11 +131,13 @@ export class DefaultMiniAppSupervisor {
             this.assertCurrentPreparation(candidate.pluginId, preparation);
         }
         catch (error) {
-            this.clearPreparation(candidate.pluginId, preparation);
-            const reason = preparation.controller.signal.reason;
-            const cleanupFailed = this.quarantineCleanupFailure(candidate.pluginId, error);
-            const primary = cleanupFailed || !(reason instanceof Error) ? error : reason;
-            const failure = await cleanup.selectFailureAfterCleanup(primary, () => this.cleanupOrQuarantine(candidate.pluginId, ownsRuntime ? runtime : undefined));
+            const failure = await cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, candidate.pluginId, async () => {
+                this.clearPreparation(candidate.pluginId, preparation);
+                const reason = preparation.controller.signal.reason;
+                const cleanupFailed = this.quarantineCleanupFailure(candidate.pluginId, error);
+                const primary = cleanupFailed || !(reason instanceof Error) ? error : reason;
+                return cleanup.selectFailureAfterCleanup(primary, () => this.cleanupOrQuarantine(candidate.pluginId, ownsRuntime ? runtime : undefined));
+            });
             if (crossedPonr && !errors.isMiniAppExpectedCancellation(errors.miniAppErrorCode(failure))) {
                 this.recordFailure(candidate.pluginId, errors.miniAppErrorCode(failure));
             }
@@ -149,6 +156,7 @@ export class DefaultMiniAppSupervisor {
         return {
             candidate,
             target,
+            ...runtimeLoopbackToken(runtime),
             willPublishCold: !runtime,
             commit: async () => {
                 this.assertOpen();
@@ -193,7 +201,7 @@ export class DefaultMiniAppSupervisor {
                     return target;
                 });
             },
-            rollback: async () => {
+            rollback: () => cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, candidate.pluginId, async () => {
                 if (commitOwner.promise)
                     await commitOwner.promise;
                 if (state === 'prepared') {
@@ -228,7 +236,7 @@ export class DefaultMiniAppSupervisor {
                 finally {
                     state = 'rolled-back';
                 }
-            },
+            }),
             finalize: async () => {
                 if (state !== 'committed' || finalized)
                     return;
@@ -342,13 +350,20 @@ export class DefaultMiniAppSupervisor {
     }
     async acquire(input) {
         this.assertOpen();
-        let generation = this.admitLease(input);
+        const leaseState = {
+            disabled: this.disabled,
+            quarantined: this.quarantined,
+            quiescing: this.quiescing,
+            explicitlyStopped: this.explicitlyStopped,
+            active: this.active,
+        };
+        let generation = admitLease(leaseState, input);
         generation.idleTimer?.cancel();
         generation.idleTimer = undefined;
         const runtime = generation.accepting && generation.runtime
             ? generation.runtime
             : await this.ensureOnDemandRuntime(input.pluginId, generation);
-        generation = this.admitRunningLease(input, runtime);
+        generation = admitRunningLease(leaseState, input, runtime);
         const leaseId = this.options.makeLeaseId?.() ?? randomUUID();
         generation.leases.add(leaseId);
         let released = false;
@@ -371,6 +386,21 @@ export class DefaultMiniAppSupervisor {
             runId: input.runId,
             unavailable: this.closed || this.disabled.has(input.pluginId) || this.quarantined.has(input.pluginId),
         });
+    }
+    launchCredential(pluginId) {
+        if (this.closed || this.disabled.has(pluginId) || this.quarantined.has(pluginId)) {
+            return undefined;
+        }
+        const generation = this.active.get(pluginId);
+        const runtime = generation?.accepting ? generation.runtime : undefined;
+        if (!runtime || generation?.view.processGeneration !== runtime.processGeneration) {
+            return undefined;
+        }
+        return {
+            processGeneration: runtime.processGeneration,
+            origin: runtime.origin,
+            loopbackToken: runtime.loopbackToken,
+        };
     }
     prepareStop(pluginId, options = {}) {
         this.assertOpen();
@@ -407,7 +437,7 @@ export class DefaultMiniAppSupervisor {
             if (this.quarantined.has(pluginId)) {
                 throw new MiniAppError('QUARANTINED', 'Mini App cleanup ownership is unproven');
             }
-            generation = this.requireActiveGeneration(pluginId);
+            generation = requireActiveGeneration(this.active, pluginId);
             await this.cutover.settleStarting(pluginId, generation, preparation, () => {
                 crossedPonr = true;
             });
@@ -583,6 +613,15 @@ export class DefaultMiniAppSupervisor {
             state.nodeDigest === input.nodeDigest &&
             persistedErrorDetail(state.lastErrorJson).code !== 'PERSISTENCE_COMPENSATION_FAILED');
     }
+    hasRuntimeCustody(pluginId) {
+        return (this.closed ||
+            this.active.has(pluginId) ||
+            this.preparations.has(pluginId) ||
+            this.quiescing.has(pluginId) ||
+            (this.retiring.get(pluginId)?.length ?? 0) > 0 ||
+            this.quarantined.has(pluginId) ||
+            this.pendingRuntimeOperations.has(pluginId));
+    }
     inspect(pluginId) {
         const ids = pluginId
             ? [pluginId]
@@ -598,7 +637,22 @@ export class DefaultMiniAppSupervisor {
                     ...this.diagnostics.pluginIds(),
                 ]),
             ];
-        return ids.map((id) => this.statusFor(id));
+        const statusState = {
+            active: this.active,
+            retiring: this.retiring,
+            failures: this.failures,
+            quarantined: this.quarantined,
+            disabled: this.disabled,
+            preparations: this.preparations,
+            cold: this.cold,
+        };
+        return ids.map((id) => statusFor(statusState, this.diagnostics, id));
+    }
+    onRuntimeExit(listener) {
+        this.runtimeExitListeners.add(listener);
+        return () => {
+            this.runtimeExitListeners.delete(listener);
+        };
     }
     close() {
         this.closePromise ??= this.closeOwned();
@@ -646,77 +700,6 @@ export class DefaultMiniAppSupervisor {
         this.retiring.clear();
         errors.assertMiniAppCleanupsProven(settlement.results);
         cleanup.throwUnexpectedCleanupFailure(settlement.results);
-    }
-    admitLease(input) {
-        if (this.disabled.has(input.pluginId)) {
-            throw new MiniAppError('DISABLED', 'Mini App is disabled');
-        }
-        if (this.quarantined.has(input.pluginId)) {
-            throw new MiniAppError('QUARANTINED', 'Mini App cleanup ownership is unproven');
-        }
-        if (this.quiescing.has(input.pluginId) || this.explicitlyStopped.has(input.pluginId)) {
-            throw new MiniAppError('BUSY', 'Mini App requires an explicit start', {
-                busyReason: 'operation_busy',
-            });
-        }
-        const generation = this.requireActiveGeneration(input.pluginId);
-        if (input.expectedMiniAppGeneration &&
-            input.expectedMiniAppGeneration !== generation.view.miniAppGeneration) {
-            throw new MiniAppError('RETIRED_GENERATION', 'Mini App generation is retired');
-        }
-        if (input.expectedProcessGeneration &&
-            input.expectedProcessGeneration !== generation.view.processGeneration) {
-            throw new MiniAppError('RETIRED_GENERATION', 'Mini App process generation is retired');
-        }
-        return generation;
-    }
-    admitRunningLease(input, runtime) {
-        const generation = this.admitLease(input);
-        if (generation.accepting &&
-            generation.runtime === runtime &&
-            generation.view.processGeneration === runtime.processGeneration &&
-            generation.candidate.nodeDigest === runtime.nodeDigest) {
-            return generation;
-        }
-        throw new MiniAppError('SERVICE_RESTARTED', 'Mini App runtime changed before the generation lease could be admitted');
-    }
-    requireActiveGeneration(pluginId) {
-        const generation = this.active.get(pluginId);
-        if (!generation) {
-            throw new MiniAppError('NO_ACTIVE_GENERATION', 'Mini App has no active generation');
-        }
-        return generation;
-    }
-    statusFor(pluginId) {
-        const active = this.active.get(pluginId);
-        const retiring = this.retiring.get(pluginId) ?? [];
-        const failureCode = this.failures.get(pluginId);
-        return {
-            pluginId,
-            phase: this.statusPhase(pluginId, active),
-            ...(active ? { active: active.view } : {}),
-            retiringGenerationIds: retiring.map((generation) => generation.view.miniAppGeneration),
-            leaseCount: (active?.leases.size ?? 0) +
-                retiring.reduce((count, generation) => count + generation.leases.size, 0),
-            ...(failureCode ? { failureCode } : {}),
-            logs: this.diagnostics.logs(pluginId),
-            diagnostics: this.diagnostics.inspect(pluginId, active?.view.processGeneration, failureCode),
-        };
-    }
-    statusPhase(pluginId, active) {
-        if (this.quarantined.has(pluginId))
-            return 'quarantined';
-        if (this.disabled.has(pluginId))
-            return 'disabled';
-        if (active)
-            return activeStatusPhase(active, this.failures.has(pluginId));
-        if (this.preparations.has(pluginId))
-            return 'preparing';
-        if (this.failures.has(pluginId))
-            return 'failed';
-        if (this.cold.has(pluginId))
-            return 'cold';
-        return 'inactive';
     }
     addRetiring(generation, pendingFinalization = false) {
         generation.accepting = false;
@@ -768,7 +751,7 @@ export class DefaultMiniAppSupervisor {
         const candidate = generation.candidate;
         const controller = new AbortController();
         generation.startController = controller;
-        const operation = this.startOnDemandRuntime(pluginId, generation, candidate, controller);
+        const operation = cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, pluginId, () => this.startOnDemandRuntime(pluginId, generation, candidate, controller));
         generation.startPromise = operation;
         const clear = () => {
             if (generation.startPromise === operation) {
@@ -977,14 +960,24 @@ export class DefaultMiniAppSupervisor {
         this.recordFailure(pluginId, 'RUNTIME_EXITED');
         generation.runtime = undefined;
         generation.view = publishedView(generation.candidate, generation.view.miniAppGeneration, undefined);
-        await this.cleanupExitedRuntime(pluginId, runtime);
-    }
-    async cleanupExitedRuntime(pluginId, runtime, terminalFailure) {
-        for (const error of await cleanup.collectRuntimeCleanupFailures(runtime, terminalFailure)) {
-            if (!this.quarantineCleanupFailure(pluginId, error)) {
-                this.recordFailure(pluginId, errors.miniAppErrorCode(error));
+        for (const listener of this.runtimeExitListeners) {
+            try {
+                listener({ pluginId });
+            }
+            catch (error) {
+                this.options.logger?.error({ pluginId, error }, 'Mini App runtime exit listener failed');
             }
         }
+        await this.cleanupExitedRuntime(pluginId, runtime);
+    }
+    cleanupExitedRuntime(pluginId, runtime, terminalFailure) {
+        return cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, pluginId, async () => {
+            for (const error of await cleanup.collectRuntimeCleanupFailures(runtime, terminalFailure)) {
+                if (!this.quarantineCleanupFailure(pluginId, error)) {
+                    this.recordFailure(pluginId, errors.miniAppErrorCode(error));
+                }
+            }
+        });
     }
     assertCurrentPreparation(pluginId, preparation) {
         if (this.preparations.get(pluginId) === preparation && !preparation.controller.signal.aborted) {

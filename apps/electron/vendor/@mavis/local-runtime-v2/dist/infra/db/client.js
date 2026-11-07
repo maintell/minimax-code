@@ -20,6 +20,10 @@ export class DatabaseClient {
             throw new Error('Database connection was not initialized');
         return this.drizzleDb;
     }
+    /** 数据库主文件路径（备份 campaign identity 与磁盘预检需要读取源文件元数据）。 */
+    get databasePath() {
+        return this.dbPath;
+    }
     /** 获取底层 better-sqlite3 句柄（用于 raw SQL / migration） */
     get rawDb() {
         if (!this.rawDb_)
@@ -41,6 +45,10 @@ export class DatabaseClient {
             fileMustExist: true,
         });
         try {
+            // Connection-scoped 32 MiB page cache (negative = KiB): the full check
+            // over a multi-GiB backup thrashed the default cache. Not persisted and
+            // released with the connection; the check itself stays complete.
+            verificationDb.exec('PRAGMA cache_size = -32768');
             const rows = verificationDb.prepare('PRAGMA integrity_check').all();
             return rows.length === 1 && isIntegrityOkRow(rows[0]);
         }

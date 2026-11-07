@@ -94,6 +94,7 @@ export function collectEmbeddedBrowserResourceSnapshot(args) {
             sessionId: tab.sessionId,
             hidden: tab.hidden,
             operationCount: tab.operationCount,
+            rendererBackend: tab.rendererBackend ?? 'web-contents-view',
             webContentsId: contents?.id ?? null,
             rendererPid: contents && !destroyed ? safeRendererPid(contents) : null,
             destroyed,
@@ -144,7 +145,9 @@ export function collectEmbeddedBrowserResourceSnapshot(args) {
             ...args.counters,
             balance: args.counters.created - args.counters.destroyed,
             logicalTabBalance: args.counters.created - args.counters.destroyed,
-            webContentsBalance: args.counters.created - args.counters.webContentsDestroyed,
+            webContentsBalance: args.counters.created +
+                (args.counters.guestRebuilt ?? 0) -
+                args.counters.webContentsDestroyed,
         },
         manager: {
             trackedTabCount: args.tabs.length,
@@ -174,6 +177,7 @@ export class EmbeddedBrowserResourceDiagnostics {
     constructor(options) {
         this.options = options;
         this.sampleTimer = null;
+        this.compatibilityCalls = {};
         this.counters = {
             created: 0,
             destroyed: 0,
@@ -196,15 +200,25 @@ export class EmbeddedBrowserResourceDiagnostics {
     onWebContentsDestroyed() {
         this.counters.webContentsDestroyed += 1;
     }
+    onGuestRebuilt() {
+        this.counters.guestRebuilt = (this.counters.guestRebuilt ?? 0) + 1;
+    }
+    recordCompatibilityCall(backend, action) {
+        const key = `${backend}:${action}`;
+        this.compatibilityCalls[key] = (this.compatibilityCalls[key] ?? 0) + 1;
+    }
     onRenderProcessGone() {
         this.counters.renderProcessGone += 1;
     }
     sample(reason) {
-        this.options.log(collectEmbeddedBrowserResourceSnapshot({
-            reason,
-            counters: { ...this.counters },
-            tabs: this.options.getTabs(),
-        }));
+        this.options.log({
+            ...collectEmbeddedBrowserResourceSnapshot({
+                reason,
+                counters: { ...this.counters },
+                tabs: this.options.getTabs(),
+            }),
+            compatibilityCalls: { ...this.compatibilityCalls },
+        });
     }
     ensureSampleTimer() {
         if (this.options.periodicSamplingEnabled !== true ||

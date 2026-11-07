@@ -32,7 +32,6 @@ export class SupervisorCutoverCoordinator {
             markExplicitlyStopped: () => this.options.explicitlyStopped.add(input.pluginId),
             markCold: () => this.markCold(input.generation, runtime),
             quarantine: (error) => this.options.quarantineCleanupFailure(input.pluginId, error),
-            operationBusy: (message) => new MiniAppError('BUSY', message, { busyReason: 'operation_busy' }),
         });
     }
     runtimeOwners(pluginId) {
@@ -89,6 +88,7 @@ async function prepareDestructiveCutover(input) {
     input.generation.accepting = false;
     input.beginQuiescing();
     let connectorAttempt;
+    let forced = false;
     try {
         connectorAttempt = input.runtime.hostConnectorSession?.beginQuiesce({
             deadlineMs: input.deadlineMs,
@@ -97,7 +97,8 @@ async function prepareDestructiveCutover(input) {
         if ((await (connectorAttempt?.result ?? Promise.resolve('drained'))) === 'busy') {
             if (input.signal.aborted)
                 throw abortReason(input.signal);
-            throw input.operationBusy('Mini App Host Connector calls are still active');
+            // Polite first, then forced: calls still running at the drain deadline are aborted at commit.
+            forced = true;
         }
         input.assertCurrent();
         await input.validate();
@@ -109,7 +110,7 @@ async function prepareDestructiveCutover(input) {
     }
     input.markExplicitlyStopped();
     input.onPonr();
-    const connectorCommit = await cleanup.captureOperation(connectorAttempt ? () => connectorAttempt.commit() : () => undefined);
+    const connectorCommit = await cleanup.captureOperation(connectorAttempt ? () => connectorAttempt.commit({ force: forced }) : () => undefined);
     const rootCleanup = await cleanup.captureOperation(() => cleanup.cleanupRuntime(input.runtime));
     input.endQuiescing();
     if (rootCleanup.status === 'rejected' && errors.isMiniAppCleanupUnproven(rootCleanup.reason)) {

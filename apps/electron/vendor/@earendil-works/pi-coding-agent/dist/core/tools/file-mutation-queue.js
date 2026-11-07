@@ -1,4 +1,4 @@
-import { realpath } from "node:fs/promises";
+import { realpath as defaultRealpath } from "node:fs/promises";
 import { resolve } from "node:path";
 const fileMutationQueues = new Map();
 let registrationQueue = Promise.resolve();
@@ -8,7 +8,7 @@ function isMissingPathError(error) {
         "code" in error &&
         (error.code === "ENOENT" || error.code === "ENOTDIR"));
 }
-async function getMutationQueueKey(filePath) {
+async function getMutationQueueKey(filePath, realpath = defaultRealpath) {
     const resolvedPath = resolve(filePath);
     try {
         return await realpath(resolvedPath);
@@ -23,10 +23,13 @@ async function getMutationQueueKey(filePath) {
 /**
  * Serialize file mutation operations targeting the same file.
  * Operations for different files still run in parallel.
+ *
+ * An injected resolver maps aliases to the same canonical key. When omitted,
+ * the default `node:fs/promises.realpath` is used.
  */
-export async function withFileMutationQueue(filePath, fn) {
+export async function withFileMutationQueue(filePath, fn, realpath) {
     const registration = registrationQueue.then(async () => {
-        const key = await getMutationQueueKey(filePath);
+        const key = await getMutationQueueKey(filePath, realpath);
         const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
         let releaseNext;
         const nextQueue = new Promise((resolveQueue) => {

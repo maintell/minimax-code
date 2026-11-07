@@ -50,6 +50,12 @@ export class SessionHandoffApplication {
     options;
     backgroundUploads = new Map();
     finalizeRecoveries = new Map();
+    /**
+     * Dispatches this process proposed. Startup recovery runs after
+     * the runtime is ready, so it must not settle them as work a previous
+     * process left behind.
+     */
+    processDispatchIds = new Set();
     detachedTasks = new Map();
     closed = false;
     closePromise;
@@ -119,6 +125,7 @@ export class SessionHandoffApplication {
                 dispatchId,
                 commit: async () => {
                     assertExecution();
+                    this.processDispatchIds.add(dispatchId);
                     await stage('proposal_commit', () => this.options.handoff.createRecommendationOperation(proposal));
                     committed = true;
                 },
@@ -149,13 +156,16 @@ export class SessionHandoffApplication {
             ? { dispatchId: operation.dispatchId }
             : undefined;
     }
-    async recoverPendingUploads() {
-        if (this.closed)
+    async recoverPendingUploads(signal) {
+        const stopped = () => this.closed || signal?.aborted === true;
+        if (stopped())
             return;
         const operations = await this.options.handoff.listActiveUploadOperations();
         for (const operation of operations) {
-            if (this.closed)
+            if (stopped())
                 return;
+            if (this.processDispatchIds.has(operation.dispatchId))
+                continue;
             if (operation.state === 'recommending') {
                 await this.recoverRecommendingOperation(operation);
                 continue;

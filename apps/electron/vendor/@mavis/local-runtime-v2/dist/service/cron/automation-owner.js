@@ -3,7 +3,8 @@ const OWNER_PAGE_LIMIT = 200;
 /** True iff an enabled Cron definition targets the exact existing Session. */
 export function hasActiveCronSessionOwner(service, sessionId) {
     let cursor;
-    do {
+    let hasMore = true;
+    while (hasMore) {
         const page = service.listDefinitions({
             limit: OWNER_PAGE_LIMIT,
             ...(cursor ? { cursor } : {}),
@@ -14,11 +15,13 @@ export function hasActiveCronSessionOwner(service, sessionId) {
             definition.sessionTarget.sessionId === sessionId)) {
             return true;
         }
-        if (!page.hasMore)
+        hasMore = page.hasMore;
+        if (!hasMore)
             return false;
         if (!page.nextCursor)
             throw new Error('Cron owner lookup returned an incomplete page cursor');
         cursor = page.nextCursor;
-    } while (true);
+    }
+    return false;
 }
 //# sourceMappingURL=automation-owner.js.map

@@ -3,6 +3,45 @@ export const DESKTOP_READ_TEXT_MAX_BYTES = 24 * 1024;
 export const DESKTOP_BASH_MAX_BYTES = 24 * 1024;
 // Leave room for exit/timing receipts and the readable output reference.
 export const DESKTOP_BASH_PREVIEW_BYTES = DESKTOP_BASH_MAX_BYTES - 2048;
+export const DESKTOP_BASH_MAX_OUTPUT_BYTES = 5 * 1024 * 1024 * 1024;
+export const DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
+/**
+ * True for a tool call made from inside a run_code program (PTC). Agent Core
+ * puts `parentToolCallId` only on the context of such a child call
+ * (agent-core pi-turn-runner/ptc-tool-executor.ts); top-level calls never
+ * carry it.
+ *
+ * The Desktop output caps (this file, and the token caps of mavis, memory and
+ * web_fetch) exist to keep the model's context small. A child result goes to
+ * the program, not to the model: only run_code's return value reaches the
+ * model, and that is cut at 64 KiB (local-runtime-v2 runner/ptc
+ * run-code-tool.ts). So child calls skip these caps and the program gets the
+ * whole result; with a cut copy it had to page the same data in many small
+ * calls (MCT-202610-WU32LQU4: 92 reads of one session). The size of a child
+ * result is bounded by the PTC bridge instead (16 MiB per result,
+ * local-runtime-v2 execution/ptc/contracts.ts). Without `parentToolCallId`
+ * every tool keeps its caps, text and details unchanged.
+ */
+export function isPtcChildCall(ctx) {
+    return typeof ctx.parentToolCallId === 'string' && ctx.parentToolCallId.length > 0;
+}
+/**
+ * Largest Bash output or text-file read a run_code child gets in full (see
+ * isPtcChildCall). Above it the child gets what a direct call gets: the
+ * preview plus the way to continue (Bash: the full-output file path; read:
+ * the next line offset). Confirmed in the 2026-10-28 PTC proposal: half of
+ * the 16 MiB per-result PTC bridge limit (local-runtime-v2
+ * execution/ptc/contracts.ts), leaving room for JSON escaping.
+ *
+ * It also bounds the host's own work before the bridge sees the result: Pi
+ * read loads the whole file, and an uncapped child read would then number
+ * every line and serialize the text again, so a file of hundreds of MB could
+ * exhaust memory or hit V8's string length limit (a RangeError, which ends
+ * the whole program instead of failing one call). A read result carries the
+ * text twice (output and data.content), so a read just under the limit can
+ * still exceed the bridge; that fails only the call (PTC_RESULT_TOO_LARGE).
+ */
+export const PTC_CHILD_FULL_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
 export function limitDesktopPrefixLines(text, options) {
     const originalBytes = options.originalBytes ?? byteLength(text);
     const inputLines = splitBodyLines(text);
@@ -62,7 +101,7 @@ export function limitDesktopHeadTailLines(text, options) {
     return buildLimitedResult(limitedText, 'head_tail_lines', originalBytes, options.maxBytes, wholeHead.count + wholeTail.count + (oversizedHead ? 1 : 0) + (oversizedTail ? 1 : 0));
 }
 export function applyDesktopTextLimit(result, limited) {
-    if (!limited.truncation)
+    if (!limited.truncation && limited.text === result.text)
         return result;
     let replaced = false;
     const content = [];
@@ -78,7 +117,7 @@ export function applyDesktopTextLimit(result, limited) {
     }
     if (!replaced)
         content.unshift({ type: 'text', text: limited.text });
-    const continuation = limited.truncation.continuation_hint
+    const continuation = limited.truncation?.continuation_hint
         ? createDesktopOutputContinuation({
             ...(limited.truncation.next_offset === undefined
                 ? {}
@@ -95,7 +134,7 @@ export function applyDesktopTextLimit(result, limited) {
         content,
         details: {
             ...(result.details ?? {}),
-            desktop_output_truncation: limited.truncation,
+            ...(limited.truncation ? { desktop_output_truncation: limited.truncation } : {}),
             ...(continuation ? { desktop_output_continuation: continuation } : {}),
         },
     };

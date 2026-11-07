@@ -10,4 +10,18 @@ export const channelProjectPredicate = sql `${sessions.projectId} = ${projects.p
   AND ${sessions.sessionKind} = 'channel'`;
 export const projectActivityExpression = sql `MAX(${projects.latestActivityAtMs}, COALESCE(
   (SELECT MAX(${sessions.updatedAtMs}) FROM ${sessions} WHERE ${channelProjectPredicate}), 0))`;
+/**
+ * Project list sort key. A project the user created explicitly may have no
+ * conversation yet; it ranks by its creation time until it has activity.
+ */
+export const projectListActivityExpression = sql `MAX(${projectActivityExpression}, ${projects.createdAtMs})`;
+/**
+ * A visible workspace Project with stored folders stays listed without
+ * conversations. Rows created implicitly by a conversation still need one.
+ */
+export const explicitWorkspaceProjectPredicate = sql `(${projects.projectKind} = 'workspace'
+  AND ${projects.hidden} = 0
+  AND CASE WHEN json_valid(${projects.extraDataJson})
+    THEN json_type(${projects.extraDataJson}, '$.workspaceRoots') IS NOT NULL
+    ELSE 0 END)`;
 //# sourceMappingURL=activity.js.map

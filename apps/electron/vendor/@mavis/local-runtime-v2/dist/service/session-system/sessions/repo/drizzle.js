@@ -11,12 +11,12 @@ import { sessionAgentNamePredicate } from './agent-name-predicate.js';
 import { sessionListPredicate } from './drizzle/list-predicates.js';
 import { INTERNAL_TREE_SESSION_KINDS, projectTaskRootPredicate, sessionTreePredicate, } from './filters.js';
 import { applySessionUpdate, isTaskSession, normalizeSessionType, } from './drizzle/normalization.js';
-import { decodeCreationCursor, decodeRecencyCursor, normalizePageLimit, sessionCreationPageFromRows, sessionPageFromRows, sortByRecency, } from './pagination.js';
-import { deleteSessionSearchDocument, searchSessionIds, writeSessionSearchDocument, } from './search.js';
+import { decodeCreationCursor, decodeRecencyCursor, normalizePageLimit, recencyCursorPredicate, recencyOrder, sessionCreationPageFromRows, sessionPageFromRows, sortByRecency, } from './pagination.js';
+import { deleteSessionSearchDocument, searchSessionContentIds, searchSessionIds, sessionProjectKeys, writeSessionSearchDocument, } from './search.js';
 import { recordFromCreate } from './drizzle/record-create.js';
 import { projects } from '../../../../infra/db/schema/projects.js';
 import { eligible } from '../../projects/sidebar/predicate.js';
-import { recordProjectRemoval, sessionNotRemovedFromProject } from '../../shared/project-removal.js';
+import { recordProjectRemoval, sessionNotRemovedFromProject, } from '../../shared/project-removal.js';
 const DEFAULT_TREE_FILTER = {
     archived: false,
     includeHidden: false,
@@ -141,7 +141,15 @@ class DrizzleSessionRepository {
                         .run();
                 }
                 writeSessionSearchDocument(tx, record);
-                const project = tx.select({ project: projects }).from(projects)
+                const project = tx
+                    .select({
+                    project: {
+                        projectId: projects.projectId,
+                        extraDataJson: projects.extraDataJson,
+                        updatedAtMs: projects.updatedAtMs,
+                    },
+                })
+                    .from(projects)
                     .innerJoin(sessions, eq(sessions.projectId, projects.projectId))
                     .where(and(eq(sessions.sessionId, record.sessionId), eq(projects.hidden, 1)))
                     .get()?.project;
@@ -151,12 +159,17 @@ class DrizzleSessionRepository {
                     if (!JSON.parse(project.extraDataJson).sidebarRemoval) {
                         recordProjectRemoval(tx, project, project.updatedAtMs, record.sessionId);
                     }
-                    const visible = tx.select({ id: sessions.sessionId }).from(sessions)
+                    const visible = tx
+                        .select({ id: sessions.sessionId })
+                        .from(sessions)
                         .innerJoin(projects, eq(sessions.projectId, projects.projectId))
-                        .where(and(eq(sessions.sessionId, record.sessionId), eligible(true))).get();
+                        .where(and(eq(sessions.sessionId, record.sessionId), eligible(true)))
+                        .get();
                     if (visible)
-                        tx.update(projects).set({ hidden: 0, updatedAtMs: nowMs })
-                            .where(eq(projects.projectId, project.projectId)).run();
+                        tx.update(projects)
+                            .set({ hidden: 0, updatedAtMs: nowMs })
+                            .where(eq(projects.projectId, project.projectId))
+                            .run();
                 }
             });
         }
@@ -261,7 +274,9 @@ class DrizzleSessionRepository {
             if (!row)
                 return undefined;
             const current = decodeSessionRow(row);
-            if (expectedTitle !== undefined && (current.title ?? null) !== expectedTitle) {
+            if (expectedTitle &&
+                ((current.title ?? null) !== expectedTitle.title ||
+                    (expectedTitle.source !== undefined && current.titleSource !== expectedTitle.source))) {
                 throw new SessionTitleConflictError();
             }
             assertSessionModelSnapshot(current, expectedModel);
@@ -376,12 +391,19 @@ class DrizzleSessionRepository {
                     sessionType: 'branch',
                     archived: true,
                     title: input.archivedRootTitle,
+                    titleSource: 'auto',
                     ...(input.linkPreviousRootsToNext
                         ? { parentSessionId: input.nextRootSessionId }
                         : {}),
                 }, nowMs));
             }
-            const nextRoot = withoutRootAppMode(applySessionUpdate(next, { sessionType: 'root', parentSessionId: null, archived: false, title: 'Main' }, nowMs));
+            const nextRoot = withoutRootAppMode(applySessionUpdate(next, {
+                sessionType: 'root',
+                parentSessionId: null,
+                archived: false,
+                title: 'Main',
+                titleSource: 'auto',
+            }, nowMs));
             writeRow(tx, nextRow, nextRoot);
             return { previousRoots, nextRoot };
         }, { behavior: 'immediate' });
@@ -480,23 +502,34 @@ class DrizzleSessionRepository {
     }
     async searchPage(options = {}) {
         const keyword = options.keyword?.trim();
-        if (!keyword) {
-            return this.listPage({
-                agentName: options.agentName,
-                archived: false,
-                includeHidden: false,
-                excludeSessionKinds: ['peek', 'cron'],
-                parentSessionId: null,
-                limit: options.limit,
-                cursor: options.cursor,
-            });
-        }
-        const idPage = searchSessionIds(this.options.db, {
+        // 传了项目 key 就以它为准，工作目录只给还不认项目 key 的旧调用方用。
+        const workspaceDirs = options.projectKeys?.length ? undefined : options.workspaceDirs;
+        if (!keyword)
+            return this.recentSearchPage({ ...options, workspaceDirs });
+        const search = {
             keyword,
             agentName: options.agentName,
-            limit: normalizePageLimit(options.limit),
             cursor: options.cursor,
-        });
+            workspaceDirs,
+            projectKeys: options.projectKeys,
+            includeArchived: options.includeArchived,
+        };
+        const limit = normalizePageLimit(options.limit);
+        const titlePage = searchSessionIds(this.options.db, { ...search, limit });
+        // 标题匹配用完后，接着用消息内容匹配把同一页填满。
+        const contentPage = titlePage.hasMore
+            ? undefined
+            : searchSessionContentIds(this.options.db, {
+                ...search,
+                limit: limit - titlePage.sessionIds.length,
+            });
+        const idPage = contentPage
+            ? { ...contentPage, sessionIds: [...titlePage.sessionIds, ...contentPage.sessionIds] }
+            : titlePage;
+        const messageMatches = [
+            ...(titlePage.messageMatches ?? []),
+            ...(contentPage?.messageMatches ?? []),
+        ];
         const rows = idPage.sessionIds.length === 0
             ? []
             : this.options.db
@@ -515,7 +548,24 @@ class DrizzleSessionRepository {
             sessions: records,
             hasMore: idPage.hasMore,
             ...(idPage.nextCursor ? { nextCursor: idPage.nextCursor } : {}),
+            ...(messageMatches.length > 0 ? { messageMatches } : {}),
+            projectKeys: sessionProjectKeys(this.options.db, records),
         };
+    }
+    /** 没有关键词时就是会话列表的最近一页，同样按筛选条件收窄并带上项目 key。 */
+    async recentSearchPage(options) {
+        const page = await this.listPage({
+            agentName: options.agentName,
+            archived: options.includeArchived ? undefined : false,
+            workspaceDirs: options.workspaceDirs,
+            projectKeys: options.projectKeys,
+            includeHidden: false,
+            excludeSessionKinds: ['peek', 'cron'],
+            parentSessionId: null,
+            limit: options.limit,
+            cursor: options.cursor,
+        });
+        return { ...page, projectKeys: sessionProjectKeys(this.options.db, page.sessions) };
     }
     async listByCronOriginPage(options) {
         const originCronId = options.originCronId.trim();
@@ -680,6 +730,8 @@ class DrizzleSessionRepository {
                     sessionKind: current.sessionKind,
                     sessionOrigin: current.sessionOrigin,
                     originCronId: current.originCronId,
+                    miniAppOrigin: current.miniAppOrigin,
+                    createdBySessionId: current.createdBySessionId,
                     createdAtMs: current.createdAtMs,
                     historyRelativeDir: current.historyRelativeDir,
                 };
@@ -733,18 +785,10 @@ function listScopePredicate(db, options, internalRootFilter) {
         .limit(offset);
     return and(base, notInArray(sessions.sessionId, skippedSessionIds));
 }
-function recencyCursorPredicate(cursor) {
-    if (!cursor)
-        return undefined;
-    return or(lt(sessions.updatedAtMs, cursor.updatedAtMs), and(eq(sessions.updatedAtMs, cursor.updatedAtMs), lt(sessions.createdAtMs, cursor.createdAtMs)), and(eq(sessions.updatedAtMs, cursor.updatedAtMs), eq(sessions.createdAtMs, cursor.createdAtMs), gt(sessions.sessionId, cursor.sessionId)));
-}
 function creationCursorPredicate(cursor) {
     if (!cursor)
         return undefined;
     return or(lt(sessions.createdAtMs, cursor.createdAtMs), and(eq(sessions.createdAtMs, cursor.createdAtMs), gt(sessions.sessionId, cursor.sessionId)));
-}
-function recencyOrder() {
-    return [desc(sessions.updatedAtMs), desc(sessions.createdAtMs), asc(sessions.sessionId)];
 }
 function positiveInteger(value) {
     if (value === undefined || !Number.isFinite(value))

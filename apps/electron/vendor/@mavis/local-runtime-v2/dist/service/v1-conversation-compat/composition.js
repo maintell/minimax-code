@@ -28,12 +28,14 @@ export function composeV1Conversation(input) {
                 deleteSession: (sessionId) => input.deletion.deleteSessionById(sessionId),
             },
             root: input.root,
+            sideChats: input.sessions.sideChats,
         },
         submission,
         attachmentMaterializer,
         turns: input.turns,
         rootAgents: input.rootAgents,
         resolveAgentWriteTarget: input.resolveAgentWriteTarget,
+        ...(input.taskOccupancy ? { taskOccupancy: input.taskOccupancy } : {}),
         ...(input.onQueueWakeFailure ? { onQueueWakeFailure: input.onQueueWakeFailure } : {}),
     });
 }

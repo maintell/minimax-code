@@ -146,6 +146,20 @@ function minimaxContextUpdateSelection(source, modelId, input) {
         contextLimit: input.contextLimit,
     };
 }
+export async function deleteMinimaxApiKey(context) {
+    await context.deps.updateByokConfig((draft) => {
+        if (draft.minimax_api)
+            delete draft.minimax_api.apiKey;
+        if (draft.minimaxModelSource === 'minimax_api_key')
+            draft.minimaxModelSource = 'token_plan';
+    });
+    try {
+        await context.deps.cache.removeProvider(MINIMAX_API_PROVIDER_ID);
+    }
+    catch {
+        // The credential deletion is committed; this derived cache contains no secrets.
+    }
+}
 export async function upsertMinimaxApiKey(context, input) {
     const apiKey = assertValidRawApiKey(input.apiKey);
     await context.deps.updateByokConfig((draft) => {

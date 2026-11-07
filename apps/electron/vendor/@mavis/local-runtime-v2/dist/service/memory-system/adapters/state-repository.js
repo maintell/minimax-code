@@ -33,6 +33,15 @@ export class MemoryStateRepositoryImpl {
             .get();
         return row ? decodeScopeRow(row) : undefined;
     }
+    async hasSessionStates(scopeKey) {
+        const row = this.db
+            .select({ sessionId: memoryV2SessionStates.sessionId })
+            .from(memoryV2SessionStates)
+            .where(eq(memoryV2SessionStates.scopeKey, scopeKey))
+            .limit(1)
+            .get();
+        return row !== undefined;
+    }
     async getSessionState(scopeKey, sessionId) {
         const row = this.db
             .select()

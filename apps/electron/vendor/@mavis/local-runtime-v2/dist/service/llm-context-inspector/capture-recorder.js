@@ -39,6 +39,8 @@ export function createLlmCaptureRecorder(options) {
                     apiId,
                     response: createProviderResponseAssembler(apiId, MAX_PAYLOAD_BYTES),
                     acceptRequest(request) {
+                        active.attemptStartedAtMs = options.nowMs();
+                        active.firstEventAtMs = undefined;
                         candidate = {
                             startedAtMs,
                             captureEpoch: capture.epoch,
@@ -59,6 +61,8 @@ export function createLlmCaptureRecorder(options) {
                 const observedOptions = {
                     ...(streamOptions ?? {}),
                     onProviderStreamEvent: (event, eventModel) => {
+                        if (active.firstEventAtMs === undefined)
+                            active.firstEventAtMs = options.nowMs();
                         active.response.observe(event);
                         callProviderEventObserver(callerObserver, event, eventModel);
                     },
@@ -88,6 +92,7 @@ export function createLlmCaptureRecorder(options) {
                 startedAtMs: settled.startedAtMs,
                 durationMs: Math.max(0, options.nowMs() - settled.startedAtMs),
                 attemptCount: Math.max(1, event.requestAttempts),
+                ...attemptTiming(settled.active),
                 request: settled.request,
                 response: settled.active.response.snapshot(),
                 ...(event.usage ? { usage: event.usage } : {}),
@@ -116,6 +121,8 @@ export function createLlmCaptureRecorder(options) {
     function observeToolEvent(event) {
         if (event.type !== 'tool_execution_start' && event.type !== 'tool_execution_end')
             return;
+        if (event.type === 'tool_execution_start')
+            bindChildTool(event);
         const owner = toolOwners.get(event.toolCallId);
         if (!owner || owner.toolName !== event.toolName)
             return;
@@ -128,6 +135,9 @@ export function createLlmCaptureRecorder(options) {
                 callId: owner.callId,
                 toolCallId: event.toolCallId,
                 startedAtMs: observedAtMs,
+                ...(owner.parentToolCallId
+                    ? { child: { parentToolCallId: owner.parentToolCallId, toolName: owner.toolName } }
+                    : {}),
             }))
             : persistIgnoringFailure(() => options.sink.recordToolCompleted({
                 sessionId: options.sessionId,
@@ -137,6 +147,24 @@ export function createLlmCaptureRecorder(options) {
                 isError: event.isError,
             }));
         pending.add(persist);
+    }
+    /**
+     * A PTC child has a host-assigned ID that no Response declares. It belongs to
+     * the Call that owns its parent while that parent is still running; a child
+     * of an unknown parent stays unobserved like any other orphan event.
+     */
+    function bindChildTool(event) {
+        const parentToolCallId = event.parentToolCallId;
+        if (!parentToolCallId || toolOwners.has(event.toolCallId))
+            return;
+        const parent = toolOwners.get(parentToolCallId);
+        if (!parent || parent.parentToolCallId)
+            return;
+        toolOwners.set(event.toolCallId, {
+            callId: parent.callId,
+            toolName: event.toolName,
+            parentToolCallId,
+        });
     }
     function ensureToolEventSubscription() {
         if (unsubscribeAgent || !agentEventSource)
@@ -148,6 +176,14 @@ export function createLlmCaptureRecorder(options) {
             // Capture observation is best-effort and cannot change provider behavior.
         }
     }
+}
+function attemptTiming(active) {
+    return {
+        ...(active.attemptStartedAtMs === undefined
+            ? {}
+            : { attemptStartedAtMs: active.attemptStartedAtMs }),
+        ...(active.firstEventAtMs === undefined ? {} : { firstEventAtMs: active.firstEventAtMs }),
+    };
 }
 function withActiveContext(source, active) {
     return {

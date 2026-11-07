@@ -1,5 +1,6 @@
 import { convertToLlm } from '@earendil-works/pi-coding-agent/messages';
 import { imageDimensions } from './image-dimensions.js';
+import { keepsRequestImages, limitRequestImages, resolveMaxImagesPerRequest, } from './request-image-limit.js';
 const PRIOR_THINKING_OPEN = '<|prior-thinking|>';
 const PRIOR_THINKING_CLOSE = '<|/prior-thinking|>';
 const SIBLING_NATIVE_THINKING_APIS = new Set([
@@ -35,10 +36,18 @@ export function projectAgentMessagesForModel(messages, targetModel) {
     // video-derived image.
     const projected = normalized
         .map(projectVideoBlocks)
-        .map((message) => projectUndersizedImageBlocks(message, undetermined));
+        .map((message) => projectUndersizedImageBlocks(message, undetermined))
+        .map((message) => projectErrorToolResultImages(message, targetModel));
+    // Last, so the ceiling counts exactly the images that would be sent: video
+    // frames projected to images count, undersized placeholders do not. Models
+    // that cache by prefix keep every image; compaction removes them instead.
+    const limited = keepsRequestImages(targetModel)
+        ? { messages: projected, omittedCount: 0 }
+        : limitRequestImages(projected, resolveMaxImagesPerRequest(targetModel));
     return {
         removedCount: compatible.removedCount,
-        messages: projected,
+        messages: limited.messages,
+        omittedImageCount: limited.omittedCount,
         undeterminedImageMimeTypes: Object.fromEntries(undetermined),
     };
 }
@@ -248,5 +257,32 @@ function projectUndersizedImageBlocks(message, undetermined) {
         };
     });
     return changed ? { ...message, content } : message;
+}
+/**
+ * Anthropic Messages rejects the whole request when an `is_error` tool_result
+ * holds anything but text ("all content must be type `text` if `is_error` is
+ * true"), and the result is persisted history, so the session would fail on
+ * every later request. A failed run_code attaches its children's media
+ * (Browser and Computer Use screenshots), and other tools can return an image
+ * with an error. Keep the error and its text; replace each image on the
+ * request copy only, so a request that would have been accepted is unchanged.
+ */
+function projectErrorToolResultImages(message, targetModel) {
+    if (targetModel.api !== 'anthropic-messages')
+        return message;
+    if (message.role !== 'toolResult' || !message.isError || !Array.isArray(message.content)) {
+        return message;
+    }
+    if (!message.content.some((block) => block.type === 'image'))
+        return message;
+    return {
+        ...message,
+        content: message.content.map((block) => block.type === 'image'
+            ? {
+                type: 'text',
+                text: '[image omitted: the model provider accepts only text in a failed tool result]',
+            }
+            : block),
+    };
 }
 //# sourceMappingURL=outbound-message-normalizer.js.map

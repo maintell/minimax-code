@@ -45,7 +45,10 @@ export function setupAutoUpdaterEvents() {
     const sendStatusToRenderer = (event) => {
         // WindowManager's current window (single-tab 'archon' window)
         if (windowManager.isWindowValid()) {
-            logger.info(`[Updater] sendStatusToRenderer via window: status=${event.status}`);
+            // 下载中每个进度回调都会发一次，进度已由「下载进度」日志记录，这里不再逐条记录
+            if (event.status !== 'downloading') {
+                logger.info(`[Updater] sendStatusToRenderer via window: status=${event.status}`);
+            }
             windowManager.sendToWindow(IPC_CHANNELS.UPDATER_STATUS, event);
             return;
         }

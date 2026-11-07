@@ -1,4 +1,4 @@
-/** 只选择版本；总开关由能力入口判定。旧字段仅用于缺失新字段的配置兼容。 */
+/** 选择版本，也是 V2 的启用开关；`memory.enabled` 只约束 V1。旧字段仅用于缺失新字段的配置兼容。 */
 export function isMemoryV2Enabled(memory) {
     if (typeof memory !== 'object' || memory === null)
         return false;

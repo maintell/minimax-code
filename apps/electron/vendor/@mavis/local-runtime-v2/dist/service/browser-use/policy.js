@@ -1,4 +1,3 @@
-const ASK_USER_TOOL_NAME = 'ask_user';
 const SKILL_TOOL_NAME = 'skill';
 export function isBrowserUseToolingAvailable(filePanelBrowserEnabled, browserUseToolingEnabled, provider) {
     if (browserUseToolingEnabled !== true)
@@ -42,7 +41,12 @@ export function createBrowserUseExtension(options) {
     };
 }
 export function createBrowserUseTurnToolSafetyGuard(options) {
-    let requiredTool;
+    // run_code calls whose Browser children must stop: a program cannot be
+    // trusted to check r.isError, and a later dependent action on the shared
+    // page must not run after an earlier one failed.
+    const stoppedPrograms = new Set();
+    // An authentication takeover marker (`safety.requiredNextTool`) is only a
+    // prompt-level signal for the model; this guard never blocks tools on it.
     return {
         beforeToolCall(input) {
             if (options.rejectLegacyFeatureEnable && isLegacyBrowserFeatureEnable(input)) {
@@ -51,22 +55,21 @@ export function createBrowserUseTurnToolSafetyGuard(options) {
                     reason: 'BROWSER_PLUGIN_MANAGED: Desktop Browser control is managed by the Browser Use Plugin; the legacy request_feature_enable card is not accepted.',
                 };
             }
-            if (!requiredTool || input.toolCall.name === requiredTool)
-                return undefined;
-            return {
-                block: true,
-                reason: `REQUIRED_NEXT_TOOL: Browser requires an actual ${requiredTool} tool call before ` +
-                    `any other tool; blocked ${input.toolCall.name}.`,
-            };
+            if (input.parentToolCallId &&
+                stoppedPrograms.has(input.parentToolCallId) &&
+                isBrowserToolName(input.toolCall.name)) {
+                return {
+                    block: true,
+                    reason: 'BROWSER_PTC_STOPPED: an earlier Browser call in this run_code program failed, so later Browser calls of the program do not run. Return, read the failure, and decide the next step.',
+                };
+            }
+            return undefined;
         },
         afterToolCall(input) {
-            // A trusted Browser result can be marked as an error after compact
-            // result bounding while still carrying a binding takeover marker.
             if (!isTrustedBrowserToolCall(input.toolCall))
                 return;
-            if (readRequiredNextTool(input.result?.details) === ASK_USER_TOOL_NAME) {
-                requiredTool = ASK_USER_TOOL_NAME;
-            }
+            if (input.parentToolCallId && input.isError)
+                stoppedPrograms.add(input.parentToolCallId);
         },
     };
 }
@@ -78,6 +81,13 @@ function isLegacyBrowserFeatureEnable(input) {
         return false;
     return isRecord(input.args) && input.args.featureKey === 'browser-use';
 }
+/**
+ * Before admission the Plugin alias (`mcp_browser`) is still the public name;
+ * afterToolCall sees the admitted target. Blocking an imitation is harmless.
+ */
+function isBrowserToolName(name) {
+    return name === 'browser' || name === 'mcp_browser' || name.startsWith('browser_');
+}
 function isTrustedBrowserToolCall(toolCall) {
     const name = toolCall.name;
     if (name !== 'browser' && !name.startsWith('browser_'))
@@ -86,17 +96,6 @@ function isTrustedBrowserToolCall(toolCall) {
     // present, reject configured/MCP tools that merely imitate a Browser name.
     const source = toolCall.source;
     return source === undefined || source === 'builtin';
-}
-function readRequiredNextTool(details) {
-    if (!isRecord(details))
-        return undefined;
-    const result = details.result;
-    if (!isRecord(result))
-        return undefined;
-    const safety = result.safety;
-    if (!isRecord(safety))
-        return undefined;
-    return typeof safety.requiredNextTool === 'string' ? safety.requiredNextTool : undefined;
 }
 function readSkillName(value) {
     if (!isRecord(value))

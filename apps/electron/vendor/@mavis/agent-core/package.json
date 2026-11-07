@@ -59,12 +59,8 @@
     }
   },
   "dependencies": {
-    "@mavis/protocol": "file:../protocol",
-    "@mavis/shared": "file:../shared",
-    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
-    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
-    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
     "@sinclair/typebox": "^0.34.0",
+    "typebox": "1.1.38",
     "zod": "^3"
   }
 }

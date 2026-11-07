@@ -1,6 +1,7 @@
 import { createEvaluatorVerifierAdapter, EvaluatorModelCallError, VerificationDispatchError, } from '@mavis/goal';
 import { GOAL_CONFIG_DEFAULTS, resolveModelCallRoute } from '@mavis/config';
 import { isContextOverflow, streamSimple } from '@earendil-works/pi-ai';
+import { ThinkingLevel } from '@mavis/protocol';
 import { parseSourceQualifiedModelKey, resolveLegacyMinimaxModel, } from '../../service/model-system/index.js';
 import { isTaskSession, summarizeCommittedPiGoalUsage, } from '../../service/session-system/index.js';
 import { buildLocalTurnPayloadTransform, } from '../../service/turn-system/index.js';
@@ -88,9 +89,12 @@ async function callEvaluatorModel(input) {
     if (input.input.images?.length && !llm.model.input.includes('image')) {
         throw new EvaluatorModelCallError('api_error', 'The configured Goal evaluator model does not support screenshot input.', 0, false);
     }
-    const requestPayloadTransform = buildLocalTurnPayloadTransform(input.agentConfig, {
+    const requestPayloadTransform = buildLocalTurnPayloadTransform(withThinkingOff(input.agentConfig), {
         thinkingLevel: 'off',
         ...(llm.thinkingRequestPatch ? { thinkingRequestPatch: llm.thinkingRequestPatch } : {}),
+        // A managed route applies the model's declared thinking mode as worker requests do,
+        // so a forced-on model is sent without the thinking switch it would reject.
+        managedProvider: llm.managedProvider === true,
         signal: input.input.signal,
     });
     try {
@@ -100,6 +104,13 @@ async function callEvaluatorModel(input) {
     catch (error) {
         throw classifyEvaluatorCallError(input.input.signal, error);
     }
+}
+/** The evaluator asks for thinking off wherever the model allows turning it off. */
+function withThinkingOff(agentConfig) {
+    const model = agentConfig.model;
+    if (typeof model !== 'object' || model === null)
+        return agentConfig;
+    return { ...agentConfig, model: { ...model, thinking_level: ThinkingLevel.OFF } };
 }
 async function requestEvaluatorModel(input, requestPayloadTransform) {
     const response = await (input.llm.streamFn ?? streamSimple)(input.llm.model, {

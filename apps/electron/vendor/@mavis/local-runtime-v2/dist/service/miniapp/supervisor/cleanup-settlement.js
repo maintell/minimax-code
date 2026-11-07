@@ -34,6 +34,20 @@ export async function captureOperation(operation) {
         return { status: 'rejected', reason };
     }
 }
+/** Retains plugin custody while a detached startup or cleanup operation is still settling. */
+export async function withPendingRuntimeOperation(pendingByPlugin, pluginId, operation) {
+    pendingByPlugin.set(pluginId, (pendingByPlugin.get(pluginId) ?? 0) + 1);
+    try {
+        return await operation();
+    }
+    finally {
+        const remaining = (pendingByPlugin.get(pluginId) ?? 1) - 1;
+        if (remaining > 0)
+            pendingByPlugin.set(pluginId, remaining);
+        else
+            pendingByPlugin.delete(pluginId);
+    }
+}
 export function startOwnedOperation(owner, operation) {
     let resolveOwned = () => undefined;
     let rejectOwned = () => undefined;

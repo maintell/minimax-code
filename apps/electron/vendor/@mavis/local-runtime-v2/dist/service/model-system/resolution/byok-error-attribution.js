@@ -22,7 +22,7 @@ function formatByokErrorMessage(raw, providerId) {
     if (rawMessage.startsWith(BYOK_ERROR_PREFIX))
         return rawMessage;
     const classified = classifyLLMErrorToCode(raw);
-    const detail = redactByokErrorMessage((classified?.message ?? rawMessage) || 'LLM provider request failed');
+    const detail = redactByokErrorMessage(withHttpStatus(classified?.message ?? rawMessage, rawMessage) || 'LLM provider request failed');
     return `${BYOK_ERROR_PREFIX}: ${JSON.stringify({
         errorCode: classified?.status_code ?? LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
         message: `BYOK provider ${providerId} upstream error: ${detail}`,
@@ -30,6 +30,15 @@ function formatByokErrorMessage(raw, providerId) {
         errorDetail: detail,
         errorProviderId: providerId,
     })}`;
+}
+/**
+ * A JSON error body reduces to its inner `message`, which drops the HTTP status
+ * (`413 {"type":"error",…}` becomes the bare sentence). Request-size recovery and
+ * retry classification read this text and recognize the status, so keep it.
+ */
+function withHttpStatus(detail, rawMessage) {
+    const status = /^([1-5]\d\d) /u.exec(rawMessage)?.[1];
+    return status && detail && !detail.startsWith(`${status} `) ? `${status} ${detail}` : detail;
 }
 function redactByokErrorMessage(message) {
     return redactSecretText(message).slice(0, MAX_ERROR_MESSAGE_LENGTH);
@@ -83,5 +92,64 @@ function errorText(raw) {
     if (raw instanceof Error)
         return raw.message;
     return typeof raw === 'string' ? raw : '';
+}
+/** @internal Exported only for focused tests. */
+export const BYOK_UPSTREAM_ERROR_SOURCE = 'byok_upstream';
+export function parseByokErrorStatus(raw, fallbackErrorCode) {
+    const rawMessage = errorText(raw);
+    if (!rawMessage)
+        return undefined;
+    if (rawMessage.startsWith(BYOK_ERROR_PREFIX)) {
+        const payload = parseByokErrorPayload(rawMessage);
+        if (payload)
+            return normalizeByokErrorPayload(payload, fallbackErrorCode);
+    }
+    const legacyMatch = rawMessage.match(/^BYOK provider (?<providerId>.+?) upstream error: (?<detail>[\s\S]*)$/u);
+    const providerId = legacyMatch?.groups?.providerId?.trim();
+    const detail = legacyMatch?.groups?.detail?.trim();
+    if (!providerId || !detail)
+        return undefined;
+    const errorCode = fallbackErrorCode ?? LLM_ERROR_CODES.LLM_UPSTREAM_ERROR;
+    return {
+        errorCode,
+        message: rawMessage,
+        errorSource: BYOK_UPSTREAM_ERROR_SOURCE,
+        errorDetail: detail,
+        errorProviderId: providerId,
+    };
+}
+function parseByokErrorPayload(message) {
+    const start = message.indexOf('{');
+    if (start < 0)
+        return undefined;
+    try {
+        const parsed = JSON.parse(message.slice(start));
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed
+            : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function trimmedText(value) {
+    return typeof value === 'string' ? value.trim() || undefined : undefined;
+}
+function normalizeByokErrorPayload(payload, fallbackErrorCode) {
+    const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+    const legacy = parseByokErrorStatus(message, fallbackErrorCode);
+    const providerId = trimmedText(payload.errorProviderId) ?? legacy?.errorProviderId;
+    const detail = trimmedText(payload.errorDetail) ?? legacy?.errorDetail;
+    if (!providerId || !detail)
+        return undefined;
+    return {
+        errorCode: typeof payload.errorCode === 'number'
+            ? payload.errorCode
+            : (fallbackErrorCode ?? legacy?.errorCode ?? LLM_ERROR_CODES.LLM_UPSTREAM_ERROR),
+        message: message || `BYOK provider ${providerId} upstream error: ${detail}`,
+        errorSource: BYOK_UPSTREAM_ERROR_SOURCE,
+        errorDetail: detail,
+        errorProviderId: providerId,
+    };
 }
 //# sourceMappingURL=byok-error-attribution.js.map

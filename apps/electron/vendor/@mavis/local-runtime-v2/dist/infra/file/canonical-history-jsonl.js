@@ -1,10 +1,10 @@
-import { createHash } from 'node:crypto';
-import { appendJsonl, publishJsonlIfAbsent, readJsonl, writeJsonlAtomically, } from './jsonl.js';
+import { appendJsonl, createJsonlReadCache, publishJsonlIfAbsent, readJsonl, readJsonlIncrementally, writeJsonlAtomically, } from './jsonl.js';
 import { decodeCanonicalHistoryArtifact, } from './canonical-history-artifact.js';
-import { assertJsonCompatible, canonicalJson, isPlainRecord, } from './canonical-history-json-value.js';
+import { assertJsonCompatible, isPlainRecord } from './canonical-history-json-value.js';
+import { computeRevision, extendRevisionHash, revisionDigest, } from './canonical-history-revision.js';
 export { selectCanonicalHistorySource } from './canonical-history-source.js';
 // Only records decoded from file contents and recursively frozen here are trusted.
-const ownedEnvelopeJson = new WeakMap();
+const ownedEnvelopes = new WeakSet();
 const ownedRecordArrays = new WeakSet();
 const ownedRevisions = new WeakMap();
 const ownedSequences = new WeakMap();
@@ -215,7 +215,7 @@ const PUBLIC_CREDENTIAL_METADATA_SUFFIX_WORDS = new Set([
     'supported',
 ]);
 export function decodeCanonicalHistoryEnvelope(value) {
-    if (ownedEnvelopeJson.has(value)) {
+    if (ownedEnvelopes.has(value)) {
         return value;
     }
     const envelope = requirePlainRecord(value, 'envelope');
@@ -312,12 +312,15 @@ function copyInspection(value) {
  */
 export class CanonicalHistoryJsonlDataSource {
     options;
-    readCache = {
-        bytes: Buffer.alloc(0),
-        records: [],
-    };
+    readCache = createJsonlReadCache();
+    /** Hash state after the cached records, so a revision hashes only appended records. */
+    revisionState;
     constructor(options) {
         this.options = options;
+    }
+    /** File bytes covered by the decoded records this source keeps between reads. */
+    cachedBytes() {
+        return this.readCache.size;
     }
     async readActive() {
         return readJsonl(this.options.activePath, decodeCanonicalHistoryEnvelope, (line) => reportActiveMalformedLine(line, this.options.onMalformedLine));
@@ -331,10 +334,19 @@ export class CanonicalHistoryJsonlDataSource {
     async readEnvelopesStrict(filePath = this.options.activePath) {
         if (!this.options.reuseDecodedRecords)
             return readStrictEnvelopeFile(filePath);
-        const records = await readJsonl(filePath, decodeOwnedEnvelope, undefined, this.readCache);
-        Object.freeze(records);
-        ownedRecordArrays.add(records);
-        return records;
+        const read = await readJsonlIncrementally(filePath, decodeOwnedEnvelope, this.readCache);
+        ownedRecordArrays.add(read.records);
+        this.rememberRevision(read);
+        // Frozen by the reader; callers share these records instead of copying them.
+        return read.records;
+    }
+    rememberRevision(read) {
+        if (ownedRevisions.has(read.records))
+            return;
+        const prefix = this.revisionState?.count === read.reusedCount ? this.revisionState : undefined;
+        this.revisionState = extendRevisionHash(prefix, read.records, read.cachedCount);
+        const complete = extendRevisionHash(this.revisionState, read.records, read.records.length);
+        ownedRevisions.set(read.records, revisionDigest(complete.hash));
     }
     async readStrict(filePath = this.options.activePath) {
         return readStrictHistory(filePath);
@@ -457,20 +469,7 @@ function revisionOfNormalized(records) {
         return cached;
     // Preserve the canonical JSON array bytes without building a sorted copy and
     // serialized string of the entire history at once.
-    const hash = createHash('sha256').update('[');
-    for (let index = 0; index < records.length; index += 1) {
-        if (index > 0)
-            hash.update(',');
-        const record = records[index];
-        let serialized = ownedEnvelopeJson.get(record);
-        if (serialized === undefined) {
-            serialized = canonicalJson(record);
-            if (ownedEnvelopeJson.has(record))
-                ownedEnvelopeJson.set(record, serialized);
-        }
-        hash.update(serialized, 'utf8');
-    }
-    const revision = `sha256:${hash.update(']').digest('hex')}`;
+    const revision = computeRevision(records);
     if (ownedRecordArrays.has(records))
         ownedRevisions.set(records, revision);
     return revision;
@@ -478,7 +477,7 @@ function revisionOfNormalized(records) {
 function decodeOwnedEnvelope(value) {
     const record = decodeCanonicalHistoryEnvelope(value);
     freezeDecodedJson(record);
-    ownedEnvelopeJson.set(record, undefined);
+    ownedEnvelopes.add(record);
     return record;
 }
 function freezeDecodedJson(value) {

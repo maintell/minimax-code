@@ -53,6 +53,7 @@
  */
 import { LLM_ERROR_CODES, classifyLLMErrorToCode } from '@mavis/shared/llm-error-classifier';
 import { InstalledPluginSource, PluginCapabilityType, } from '@mavis/protocol';
+import { readPtcExecutionDetails } from '../tools/ptc.js';
 import { buildAbortedTerminalStatusEvent, buildCompletedAssistantMessage, buildCompletedTerminalStatusEvent, buildDebugTraceEvent, buildFailedTerminalStatusEvent, buildFinishChunk, buildTextDeltaChunk, buildThinkingDeltaChunk, buildToolCallChunk, extractAssistantErrorMessage, extractAssistantStopReason, extractAssistantText, extractAssistantThinking, extractAssistantToolCalls, extractAssistantUsage, extractDeltaUpdate, isAssistantError, } from './converters.js';
 const defaultNowMs = () => Date.now();
 /**
@@ -509,9 +510,9 @@ export class EventBridge {
         const typedErrorText = classified !== null && TYPED_TERMINAL_ERROR_CODES.has(classified.status_code)
             ? `${classified.status_code}:${classified.message}`
             : undefined;
-        const text = extractAssistantText(event.message) ||
-            typedErrorText ||
-            (errorMessage ? `[Error] ${errorMessage}` : '');
+        const assistantText = extractAssistantText(event.message);
+        const systemErrorContent = !assistantText && Boolean(errorMessage);
+        const text = assistantText || typedErrorText || (errorMessage ? `[Error] ${errorMessage}` : '');
         const thinking = extractAssistantThinking(event.message) || undefined;
         const toolCalls = extractAssistantToolCalls(event.message);
         const finishReason = isAssistantError(event.message) ? 'error' : stopReason;
@@ -563,6 +564,7 @@ export class EventBridge {
                 runtimeSeq: this.ctx.runtimeSeqGenerator(),
                 msgId: messageId,
                 text,
+                systemErrorContent,
                 ...(thinking !== undefined ? { thinking } : {}),
                 ...(thinkingDurationMs !== undefined ? { thinkingDurationMs } : {}),
                 ...(finishReason ? { finishReason } : {}),
@@ -585,6 +587,7 @@ export class EventBridge {
         this.pendingCompletedMessage = {
             msgId: messageId,
             text,
+            systemErrorContent,
             thinking,
             thinkingDurationMs,
             finishReason,
@@ -612,6 +615,7 @@ export class EventBridge {
         const toolCall = {
             tool_name: event.toolName,
             tool_call_id: event.toolCallId,
+            ...(event.parentToolCallId ? { parent_tool_call_id: event.parentToolCallId } : {}),
             status: 'started',
             ...(args !== undefined && typeof args === 'object' && args !== null
                 ? { args: args }
@@ -643,7 +647,11 @@ export class EventBridge {
                     eventId: this.ctx.eventIdGenerator('coding_trace_tool_call_started'),
                     phase: 'tool_call_started',
                     message: 'Host tool call started',
-                    attrs: { tool_name: event.toolName, tool_call_id: event.toolCallId },
+                    attrs: {
+                        tool_name: event.toolName,
+                        tool_call_id: event.toolCallId,
+                        ...(event.parentToolCallId ? { parent_tool_call_id: event.parentToolCallId } : {}),
+                    },
                 }),
                 buildToolCallChunk({
                     sessionId: this.ctx.sessionId,
@@ -659,6 +667,14 @@ export class EventBridge {
         };
     }
     async onToolEnd(event) {
+        const startedSnapshot = this.completedToolCalls.get(event.toolCallId);
+        if (event.parentToolCallId &&
+            (startedSnapshot?.parent_tool_call_id !== event.parentToolCallId ||
+                startedSnapshot.status !== 'started')) {
+            // A child belongs only to its registered parent. Bounded outer cleanup
+            // may have closed it as unknown before its real execution settles.
+            return { events: [] };
+        }
         if (!this.activeAssistantMessageId) {
             return {
                 events: [
@@ -680,7 +696,6 @@ export class EventBridge {
         // terminal status + result on top of that snapshot so the flushed
         // RespData has the full (args + status=completed/failed + result)
         // shape — not just (status + result).
-        const startedSnapshot = this.completedToolCalls.get(event.toolCallId);
         let durationMs;
         if (this.captureToolTiming) {
             const startMs = this.toolStartMs.get(event.toolCallId);
@@ -692,6 +707,11 @@ export class EventBridge {
         const toolCall = {
             tool_name: event.toolName,
             tool_call_id: event.toolCallId,
+            ...(event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id
+                ? {
+                    parent_tool_call_id: event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id,
+                }
+                : {}),
             ...(startedSnapshot?.args !== undefined ? { args: startedSnapshot.args } : {}),
             status: event.isError ? 'failed' : 'completed',
             ...(event.result !== undefined ? { result: event.result } : {}),
@@ -705,6 +725,7 @@ export class EventBridge {
             }, startedSnapshot?.plugin_provenances),
         };
         const events = [
+            ...this.closeUnknownPtcChildren(event),
             buildDebugTraceEvent({
                 sessionId: this.ctx.sessionId,
                 turnId: this.ctx.turnId,
@@ -714,6 +735,11 @@ export class EventBridge {
                 attrs: {
                     tool_name: event.toolName,
                     tool_call_id: event.toolCallId,
+                    ...(event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id
+                        ? {
+                            parent_tool_call_id: event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id,
+                        }
+                        : {}),
                     is_error: event.isError,
                     ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
                 },
@@ -733,7 +759,7 @@ export class EventBridge {
         // Last-write-wins per tool_call_id so re-emitted ends (defensive) collapse
         // to a single entry.
         this.completedToolCalls.set(event.toolCallId, toolCall);
-        if (this.pendingToolCount > 0) {
+        if (event.parentToolCallId === undefined && this.pendingToolCount > 0) {
             this.pendingToolCount--;
         }
         // Flush the deferred completed agent_message once every expected tool
@@ -748,6 +774,63 @@ export class EventBridge {
                 events.push(flushed);
         }
         return { events };
+    }
+    closeUnknownPtcChildren(event) {
+        if (event.toolName !== 'run_code' || event.parentToolCallId || !this.activeAssistantMessageId)
+            return [];
+        const ptc = readPtcExecutionDetails({
+            role: 'toolResult',
+            toolName: event.toolName,
+            details: event.result.details,
+        });
+        if (!ptc)
+            return [];
+        const events = [];
+        for (const record of ptc.child_calls) {
+            const started = this.completedToolCalls.get(record.child_tool_call_id);
+            if (record.status !== 'unknown' ||
+                record.parent_tool_call_id !== event.toolCallId ||
+                started?.parent_tool_call_id !== event.toolCallId ||
+                started.tool_name !== record.tool_name ||
+                started.status !== 'started') {
+                continue;
+            }
+            const text = 'PTC child outcome is unknown after bounded cleanup. The operation may still have side effects; do not replay it automatically.';
+            const retainedFacts = ptc.retained_facts.filter((fact) => 'child_tool_call_id' in fact && fact.child_tool_call_id === record.child_tool_call_id);
+            if (!retainedFacts.some((fact) => fact.kind === 'outcome_unknown')) {
+                retainedFacts.push({ kind: 'outcome_unknown', child_tool_call_id: record.child_tool_call_id });
+            }
+            const closed = {
+                ...started,
+                status: 'failed',
+                result: {
+                    content: [{ type: 'text', text }],
+                    details: {
+                        ptc_child: {
+                            version: 1,
+                            record: { ...record, is_error: true, outcome_unknown: true },
+                            retained_facts: retainedFacts,
+                        },
+                    },
+                },
+            };
+            const startedAtMs = this.toolStartMs.get(record.child_tool_call_id);
+            if (startedAtMs !== undefined)
+                closed.duration_ms = this.now() - startedAtMs;
+            this.toolStartMs.delete(record.child_tool_call_id);
+            this.completedToolCalls.set(record.child_tool_call_id, closed);
+            events.push(buildToolCallChunk({
+                sessionId: this.ctx.sessionId,
+                turnId: this.ctx.turnId,
+                eventId: this.ctx.eventIdGenerator('coding_ptc_unknown_child'),
+                runtimeSeq: this.ctx.runtimeSeqGenerator(),
+                msgId: this.activeAssistantMessageId,
+                chunkIndex: this.nextChunkIndex(),
+                toolCall: closed,
+                nowMs: this.now(),
+            }));
+        }
+        return events;
     }
     resolveToolCallProvenance(input, fallback) {
         const resolver = this.ctx.toolCallProvenanceResolver;
@@ -792,6 +875,7 @@ export class EventBridge {
             runtimeSeq: this.ctx.runtimeSeqGenerator(),
             msgId: pending.msgId,
             text: pending.text,
+            systemErrorContent: pending.systemErrorContent,
             ...(pending.thinking !== undefined ? { thinking: pending.thinking } : {}),
             ...(toolCalls.length ? { toolCalls } : {}),
             ...(pending.thinkingDurationMs !== undefined

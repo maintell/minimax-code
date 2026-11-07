@@ -1,15 +1,8 @@
-/**
- * 主窗口位置/尺寸持久化。
- *
- * 关闭按钮默认走 hide-to-tray（见 windows/archonChatWindow.ts 的 close
- * handler），close 事件不是可靠的落盘时机，所以这里以 resize/move 的
- * debounce 写盘为主，close 时再补一次 flush。
- */
-import { screen } from "electron";
 import { MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT } from "../../config/constants";
 import { getStoredMainWindowState, setStoredMainWindowState } from "../../ipc/storage.ipc";
 import logger from "../../utils/logger";
 import { resolveStartupWindowState } from "./bounds";
+import { currentWorkAreas } from "./displays";
 const PERSIST_DEBOUNCE_MS = 400;
 const MAIN_WINDOW_DEFAULTS = {
     width: MAIN_WINDOW_WIDTH,
@@ -17,16 +10,6 @@ const MAIN_WINDOW_DEFAULTS = {
     minWidth: MAIN_WINDOW_MIN_WIDTH,
     minHeight: MAIN_WINDOW_MIN_HEIGHT,
 };
-function currentWorkAreas() {
-    try {
-        return screen.getAllDisplays().map((display) => display.workArea);
-    }
-    catch (error) {
-        // screen 仅在 app ready 之后可用；拿不到显示器信息时回落到默认尺寸。
-        logger.warn(`[WindowState] Failed to read displays: ${String(error)}`);
-        return [];
-    }
-}
 /**
  * 读取上次退出时的窗口状态。读不到、数据损坏或屏幕布局已变化时，
  * bounds 返回 null，调用方沿用默认尺寸。

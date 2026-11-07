@@ -75,6 +75,7 @@ export function createNativeSessionRecordService(options) {
             : {}),
         ...(options.makeSessionId ? { makeSessionId: options.makeSessionId } : {}),
         ...(options.backfillDiagnostics ? { backfillDiagnostics: options.backfillDiagnostics } : {}),
+        ...(options.toolCallMode ? { toolCallMode: options.toolCallMode } : {}),
     });
 }
 //# sourceMappingURL=native-record-factory.js.map

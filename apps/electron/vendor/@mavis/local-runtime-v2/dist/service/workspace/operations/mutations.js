@@ -2,7 +2,7 @@ import { rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, posix, resolve } from 'node:path';
 import { isGitRepo, parsePorcelainStatus } from './changes.js';
 import { git } from './git-process.js';
-import { isPathInside, resolveWorkspaceWritePath } from './workspace-path.js';
+import { isPathInside, resolveWorkspaceWritePath } from './filesystem/workspace-path.js';
 export async function saveWorkspaceFile(manager, workspace, filePath, content) {
     await manager.runMutation(workspace, 'workspace', async () => {
         const absolute = await resolveWorkspaceWritePath(workspace, filePath);

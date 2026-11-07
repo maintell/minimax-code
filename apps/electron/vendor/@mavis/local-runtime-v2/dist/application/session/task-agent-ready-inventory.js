@@ -46,10 +46,7 @@ async function capture(input, session, profile) {
             computerUseActive: false,
             ...(lease.capabilities ? { desktopCapabilities: lease.capabilities } : {}),
         });
-        const runtimeSkills = await input.product.preparation.configBuilder.skills.listRuntimeSkills({
-            agentName: profile.resourceReadRef,
-            workspaceDir: session.workspaceDir,
-        });
+        const runtimeSkills = await input.product.preparation.configBuilder.skills.listRuntimeSkills(skillReadScope(session, profile));
         return {
             sources,
             ...(lease.capabilities ? { desktopCapabilities: lease.capabilities } : {}),
@@ -62,5 +59,14 @@ async function capture(input, session, profile) {
     finally {
         lease.release();
     }
+}
+/** A frozen owner without an Agent row (Plugin Agent) must not resolve Agent resources. */
+function skillReadScope(session, profile) {
+    return {
+        agentName: profile.resourceReadRef,
+        workspaceDir: session.workspaceDir,
+        ...(profile.excludeAgentResources ? { excludeAgentResources: true } : {}),
+        ...(profile.skipAgentResolution ? { skipAgentResolution: true } : {}),
+    };
 }
 //# sourceMappingURL=task-agent-ready-inventory.js.map

@@ -1,3 +1,4 @@
+import { MINIMAX_CODE_USER_AGENT } from './minimax-code-user-agent.js';
 /** Go routes inference by conversation, independently of prompt cache settings. */
 export function withOpenCodeGoHeaders(baseUrl, headers, sessionId) {
     if (!isOpenCodeGoUrl(baseUrl))
@@ -11,7 +12,7 @@ export function withOpenCodeGoHeaders(baseUrl, headers, sessionId) {
     // Runtime identity wins case-insensitively over stale, static config headers.
     // Connectivity requests have no conversation and receive their own identity.
     merged['x-opencode-session'] = sessionId || crypto.randomUUID();
-    merged['user-agent'] = 'MiniMaxCode';
+    merged['user-agent'] = MINIMAX_CODE_USER_AGENT;
     return merged;
 }
 function isOpenCodeGoUrl(value) {

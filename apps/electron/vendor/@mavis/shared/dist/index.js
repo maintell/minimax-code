@@ -3,6 +3,7 @@ export { createMemoryContextBudget, memoryContextCharsUsed } from './memory-cont
 export { loadBetterSqlite3 } from './sqlite-driver.js';
 export { normalizeProductBuildEnvironment, resolveProductBuildIdentity, } from './product-build-identity.js';
 export { buildPluginSkillRuntimeName } from './plugin-skill-name.js';
+export { formatPluginId, isBuiltInPluginMarketplace, isValidPluginMarketplaceName, LOCAL_PLUGIN_MARKETPLACE, OFFICIAL_PLUGIN_MARKETPLACE, parsePluginSelector, pluginIdKey, samePluginId, } from './plugin-id.js';
 export { toNavigationPlainText } from './navigation-text.js';
 export { collectFetchedWebSources } from './fetched-web-sources.js';
 export { collectUsedWebEvidenceIds } from './web-source-evidence.js';
@@ -30,7 +31,7 @@ export { isChannelSource, aggregateQueuedSource } from './queued-message-source.
 export { CRON_SESSION_PURPOSE_PREFIX, MEMORY_CLEANUP_CRON_NAME, createCronSessionPurpose, formatCronRunTitle, isLegacyMemoryCleanupTitle, parseCronSessionPurpose, } from './cron-purpose.js';
 export { DESKTOP_METRICS_BATCH_PATH, MetricsClient, MetricsReporter, MetricsReportError, buildMetricKey, createDesktopReporter, createMetricsClient, } from './metrics-proxy.js';
 export { createStructuredLogger, wrapTraceContextLogger, createDiskLogTransport, formatHourKey, } from './logging/index.js';
-export { channelRoutingModeForStrategy, normalizeSessionStrategy } from './channel-route.js';
+export { CHANNEL_STEER_PRODUCER_ID, channelRoutingModeForStrategy, normalizeSessionStrategy, } from './channel-route.js';
 export { AGENT_REQUEST_REF_DESCRIPTION, CANONICAL_SUBAGENT_ROLES, LOCAL_MAVIS_AGENT_NAME_DESCRIPTION, RESERVED_SUBAGENT_NAMES, SUBAGENT_ROLES, agentNameDescription, isCanonicalSubagentRole, isTrustedBuiltinCreationSource, resolveCanonicalSubagentRole, roleDirectoryText, toAgentRequestRef, } from './subagent-roles.js';
 export { createTraceContext, childSpan, createChannelContext, toRequestContext, traceToRequestContext, } from './channel-context.js';
 export { getResponseFormatHint } from './channel-format-hints.js';
@@ -53,4 +54,5 @@ export { parseMediaTags } from './outbound-media.js';
 export { placeholderMediaTags } from './im-text-sanitize.js';
 export { ASK_OTHER_PLACEHOLDER, ASK_USER_TOOL_NAME } from './questionnaire.js';
 export { withOpenCodeGoHeaders } from './opencode-go-headers.js';
+export { MINIMAX_CODE_USER_AGENT, withMiniMaxCodeUserAgent } from './minimax-code-user-agent.js';
 //# sourceMappingURL=index.js.map

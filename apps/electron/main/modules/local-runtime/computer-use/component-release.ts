@@ -1,0 +1,2 @@
+export const packagedComponentRelease = "minimax-cu-release-v1.eyJ3aW4zMi1hcm02NCI6ImMwNmM0MDU2MzkxYmNjZTFhYjNjMzE1NWE2MWRjODcwYTc4MmUwM2FlZTIxZGE3MThkNjk5YjA2NDVlOWExMzgiLCJ3aW4zMi14NjQiOiI0MmRkNWNhNDAzMTIzYzllYTU1ZTUyMmIxZGNmODk0ZDY2YTZjMjJlZTUzODBjOTIxMGQ3ZGJjY2U4NTc1YTc0In0";
+export const readDesktopDevelopmentComponent = () => null;

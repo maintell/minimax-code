@@ -9,21 +9,30 @@ a locally installed client.
 
 | | |
 | --- | --- |
-| Installed client | `MiniMax Code` 3.1.1 (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
-| Application | `@mmx-agent/electron` 3.1.1, Electron 42.8.0, `buildEnv=prod`, locale `zh` |
+| Installed client | `MiniMax Code` 3.1.10, taken from the updater's pending installer (`%LOCALAPPDATA%\@mmx-agentelectron-updater\pending\MiniMax Code Setup 3.1.10.exe` → `app-64.7z`) because the installed client was still 3.1.6 |
+| Application | `@mmx-agent/electron` 3.1.10, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
 | Identity | appId `com.minimax.agent.cn`, runtime app name `MiniMax`, user data `%APPDATA%\MiniMax` |
-| Package | `resources/app.asar` (377 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+| Package | `resources/app.asar` (356 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+
+Version history of this recovery:
+
+| App | Date | Notes |
+| --- | --- | --- |
+| 3.1.10 | 2026-11-03 | Current. The v1 local runtime is gone: the shipped tree no longer carries `@mavis/local-runtime` (57 packages remain vendored), and `@mavis/local-runtime-v2` grows by ~700 files. Embedded browser rework in the main process — `native-browser-view`, `webview-browser-view`, guest registry/input, backend policy store, telemetry runtime plus a sanitizer, full-page capture and downloads (`main/modules/browser/**`, `main/ipc/browser*.ipc.ts`). New `main/modules/file-open-with/**` (Windows "打开方式" enhancement, with a generated text-type list), `main/modules/deeplink/workspace-open.ts`, `main/utils/default-project-dir.ts`, auth refresh diagnostics/environment, `data-dir-relocation-guard` and `cua-overlay-target`. `resources/file-associations.nsh` stops writing `OpenWithProgids` (it lists `SupportedTypes` instead), `pptx-core` moved to new content hashes, the session-transfer client was rebuilt, and the QuickJS wasm runtime (`quickjs-emscripten`, `quickjs-emscripten-core`, `@jitl/*`) joins the unpacked set. The new PTC worker resolves its own module URL against `app.asar.unpacked` (`.../runner/ptc/worker-path.js`), so `@mavis/local-runtime-v2`'s PTC modules and its `package.json` must be unpacked as well — leaving them in the archive fails at runtime with `Cannot find module ... quickjs-worker.js`. `@opentelemetry/*` is no longer a direct dependency (transitive only). Main process: 388 files (was 357). |
+| 3.1.6 | 2026-10-27 | Renderer assets moved out of `public/`: the shipped `public/` keeps only the six files the main process and the plugin pages load, and `out/assets/**` carries the images. New packaged Computer Use component (`resources/computer-use/0.34.1/win32-x64/**`) and the vendored `@mavis/computer-use` package it is driven by; mini-app speech/tool IPC, browser device-preview and permission-panel modules are new. `pptx-core` moved to a new content hash. Main process: 357 files (was 346). |
+| 3.1.4 | 2026-10-20 | New `@minimax/mcode-app-server-protocol` dependency, an SSH runtime (`main/modules/ssh-runtime/**`), mini-app agent IPC and detached windows; the Word/Excel editor IPC modules are gone. Renderer grew ~14 MB. |
+| 3.1.1 | 2026-10-17 | Initial recovery. |
 
 ## What was recovered
 
 | Part | Method | Fidelity |
 | --- | --- | --- |
-| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **285 of 290 files byte-identically**; the remaining 4 files differ only in the *order* of adjacent export-assignment statements (5 lines total, semantically inert). See "Verification" below. |
+| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **382 of 388 files byte-identically**; the remaining 6 files differ only in the *order* of adjacent export-assignment statements, and one of them additionally inlines an arrow function into its export assignment (10 lines total, semantically inert). See "Verification" below. |
 | Renderer (`out/**`) | Committed as the prebuilt static Next.js export. | Byte-identical to the shipped `out/`. The upstream UI sources are not part of this distribution and the build carries no source maps, so a source recovery is not possible. |
-| `public/**` | Committed as-is from the shipped app root. | Byte-identical. The main process reads the prompt-config key carriers from `public/assets/img/*.png` at runtime (`main/config/prompt-config-key.ts`), so this directory is part of the application, not only of the renderer build. |
+| `public/**` | Committed as-is from the shipped app root. | Byte-identical. 3.1.6 moved the renderer images into `out/assets/**`, so only six files remain: the prompt-config key carriers the main process reads (`public/assets/img/breakDown.png`, `computer_use.png`, see `main/config/prompt-config-key.ts`) and four plugin/permission images the renderer loads. The directory stays a runtime dependency, not only renderer input. |
 | Model menu (`model-menu/**`) | Committed as the prebuilt Vite build output. | Byte-identical. |
 | Prebuilt preload bundle (`main/modules/browser/miniapp-preload.bundle.js`) | Copied verbatim (esbuild output; banner references `main/modules/browser/preload.ts`). | Byte-identical. |
-| Runtime resources (`resources/mcode-tools`, `pptx-core`, `session-transfer`) | Copied from `<install>/resources/resources/`. | Byte-identical. |
+| Runtime resources (`resources/mcode-tools`, `pptx-core`, `session-transfer`, `computer-use`) | Copied from `<install>/resources/resources/`. | Byte-identical. `computer-use/` is the packaged Computer Use component (v0.34.1, `win32-x64`), which the main process locates at `process.resourcesPath/resources/computer-use`. |
 | Build resources (`resources/icon.ico`, `installer-*.nsh`, DMG assets, entitlements, tray icons) | Copied from `<install>/resources/resources/`; the electron-builder configuration was reconstructed around them (`directories.buildResources: resources`, `extraResources: resources -> resources`). | Files byte-identical; the packaging configuration is reconstructed (see deviations). |
 | Dependency snapshots (`vendor/**`) | Runtime files of every first-party and native package the client actually loads, extracted from the shipped `node_modules` (+ `app.asar.unpacked` overlays). Manifests are rewritten for local `file:` resolution. | Code byte-identical; manifests rewritten (see "Vendor manifest rewrites"). |
 | Environment file (`env/prod-zh.env`) | The shipped `.env.local` (prod/zh lane), mapped to `.env.local` inside the app package at build time. | Byte-identical content. |
@@ -32,13 +41,16 @@ a locally installed client.
 
 1. **Emit equivalence.** `tools/restore/verify-main.mjs` compiles `main/**` with
    the app `tsconfig.json` and diffs every emitted file against the shipped
-   `dist/main`. Result: 285/290 identical, 4 files with export-order-only
+   `dist/main`. Result: 382/388 identical, 6 files with export-order-only
    differences (`config/env.js`, `ipc/documentPreview.ipc.js`,
-   `modules/desktop-appearance.js`, `modules/document-preview/artifact-protocol.js`),
+   `modules/desktop-appearance.js`, `modules/document-preview/artifact-protocol.js`,
+   `modules/local-runtime/computer-use/component-release.js`,
+   `modules/observability/browser-telemetry-sanitizer.js`),
    1 prebuilt bundle copied verbatim. The differences are caused by information
    the CommonJS build erases (the position of bare `export {}` re-export
-   statements, and the hoisting order of exported function assignments); they do
-   not change any runtime behaviour.
+   statements, the hoisting order of exported function assignments, and whether
+   an exported arrow function is inlined into its `exports.x = …` assignment);
+   they do not change any runtime behaviour.
 2. **Packaged-run verification.** `pnpm package` produces
    `dist/installers/win-unpacked/` and the NSIS installer. Launching the packaged
    executable with an isolated profile (`--user-data-dir`, and a desktop-store
@@ -47,7 +59,11 @@ a locally installed client.
    the renderer from `out/`, the local-runtime utility process reaches the
    `modules-loaded` bootstrap stage, and mcode-tools initializes its launchers
    and auth-lease endpoint in the isolated data directory.
-   Two defects were found and fixed during this verification:
+   This run was performed for 3.1.6. For 3.1.10 the same check is deferred to
+   the packaging run of the `Desktop release` workflow: the update was verified
+   by compile equivalence and the contract checks below, not by booting a
+   packaged build locally.
+   Two defects were found and fixed during the 3.1.6 verification:
    - `public/**` must ship at the app root: the main process reads the
      prompt-config key carriers from `public/assets/img/*.png`
      (`main/config/prompt-config-key.ts`), so the directory is a runtime
@@ -62,7 +78,7 @@ a locally installed client.
 
 ## Known deviations
 
-1. **Export-order-only diffs** — the 4 files listed above; 5 lines total.
+1. **Export-order-only diffs** — the 6 files listed above; 10 lines total.
 2. **Erased type annotations.** The shipped build erased all TypeScript types.
    The recovered sources compile to the same JavaScript but do not satisfy a
    full type check (`pnpm typecheck:strict` reports ≈5.3k diagnostics, dominated
@@ -80,8 +96,13 @@ a locally installed client.
 5. **Packaging configuration is reconstructed.** electron-builder options
    (NSIS script wiring, `asarUnpack` list, `extraResources` mapping, updater
    publish URL) were rebuilt from the installed layout and the shipped NSIS
-   scripts. The `asarUnpack` list mirrors `app.asar.unpacked` exactly; the
-   installer artifact name uses electron-builder's default.
+   scripts. The `asarUnpack` list covers the shipped `app.asar.unpacked` set
+   and is a superset of it: whole packages are unpacked rather than the
+   per-file subset the installation ships, and the one place where the choice
+   is load-bearing is repeated on its own (`@mavis/local-runtime-v2`'s PTC
+   worker, which resolves itself against `app.asar.unpacked` and therefore
+   cannot stay inside the archive). The installer artifact name uses
+   electron-builder's default.
 6. **Vendor manifest rewrites** — see below.
 7. **One vendored runtime file carries a deliberate local patch** — the fixed
    three-second retry cadence in `@mavis/agent-core`'s `llm-retry.js`; see
@@ -111,17 +132,32 @@ exception documented below.
 
 | File | Change | Reason |
 | --- | --- | --- |
-| `vendor/@mavis/agent-core/dist/pi-turn-runner/llm-retry.js` | Provider errors retry without a practical limit (one million attempts) on the fixed `baseDelayMs` cadence (3 s), with no backoff, no jitter and no wall-clock budget. A server-directed `Retry-After` header still wins. BYOK retry-all additionally treats deterministic request rejections (413 / oversized body, context overflow, image limit, HTTP 400 `invalid_request_error`) as terminal. | Unstable upstreams must recover without user intervention; mirrors the same change in `packages/agent-core/src/pi-turn-runner/llm-retry.ts` so the desktop runtime and the CLI behave identically. The terminal carve-out matters more under the unbounded budget: without it a deterministic rejection would be re-sent roughly forever. |
-| `vendor/@mavis/shared/dist/llm-error-classifier.js` | `ERR_INCOMPLETE_CHUNKED_ENCODING` and `ERR_EMPTY_RESPONSE` join the transient-network marker set, and 5xx responses plus empty provider responses classify as retryable (`server_error` / `empty_response`). Deterministic-rejection signals (`image_limit`, `invalid_request`, `request_too_large`, `context_overflow`) and the exported `isLLMDeterministicRequestRejection` are backported. | A dropped or truncated response body is the classic flaky-upstream shape; mirrors `packages/shared/src/llm-error-classifier.ts`. |
+| `vendor/@mavis/agent-core/dist/pi-turn-runner/llm-retry.js` | Provider errors retry without a practical limit (`2_147_483_647` attempts — the largest serialisable integer, since the retry-event contract requires a non-negative integer) on the fixed `baseDelayMs` cadence (3 s), with no backoff, no jitter and no wall-clock budget. A server-directed `Retry-After` header still wins, but never below the 3 s cadence: a gateway answering `Retry-After: 0` used to turn the loop into a busy spin. The retry decision is the same for every provider, not only BYOK: the strict classification keeps its precise transient reason (timeout, network, 429, overload, 5xx, empty response), and a failure it would fail closed on — an upstream fault no signal matched — is retried too. Task-level outcomes stay terminal: a wrong credential (`auth`), an exhausted usage plan (`usage_limit`), exhausted credits (`credits_exhausted`), deterministic request rejections (413 / oversized body, context overflow, image limit, HTTP 400 `invalid_request_error`) and provider safety refusals. The `done`-event commit shortcut is dropped so a stream that ends without visible output is still validated through `stream.result()`. Reasoning deltas are no longer a commit boundary either: the caller discards them when an attempt is retried, so counting them as committed pushed a failed request out of the retry loop and into the resume path with an empty prefix. A response that dies *after* output was already streamed is resumed instead of failing: the wrapper re-issues the call with the truncated text plus a continue directive and appends the continuation in a single delta (a second `start`/`textStart` would collide with the open content block); a continuation that produces a tool call aborts the resume (re-surfacing the provider's original error, not the wrapper's own reason), and a failure with no visible text yet is simply retried with the unchanged request instead of being "continued". Every retry decision is appended to `~/.minimax/v2/observability/llm-retry-trace.jsonl` (one line per logical call and per attempt) because the shipped runtime records none of it. | Unstable upstreams must recover without user intervention; mirrors the same change in `packages/agent-core/src/pi-turn-runner/llm-retry.ts` so the desktop runtime and the CLI behave identically. The terminal carve-outs matter more under the unbounded budget: retrying a bad key or an empty account can never succeed, it only hides the actionable error. |
+| `vendor/@mavis/shared/dist/llm-error-classifier.js` | `ERR_INCOMPLETE_CHUNKED_ENCODING`, `ERR_EMPTY_RESPONSE` and `ERR_QUIC_PROTOCOL_ERROR` join the transient-network marker set, and 5xx responses plus empty provider responses classify as retryable (`server_error` / `empty_response`). Deterministic-rejection signals (`image_limit`, `invalid_request`, `request_too_large`, `context_overflow`) and the exported `isLLMDeterministicRequestRejection` are backported. | A dropped or truncated response body is the classic flaky-upstream shape, and an HTTP/3 failure below the request layer (a proxy or middlebox mangling QUIC) is the same transient transport shape — the resend renegotiates over TCP; mirrors `packages/shared/src/llm-error-classifier.ts`. |
+| `out/_next/static/chunks/*.js` (renderer string table) | The retry banner copy shows a finite nominal cap: `({{attempt}}/{{total}})` becomes `({{attempt}}/10000000)`, in both the English and the Chinese tables. | The renderer is a prebuilt artifact, so the budget is presented by rewriting its plain strings. This is **copy only**: the retry policy stays unbounded (`2_147_483_647` attempts), and the banner never stops at 10,000,000 — the number is a human-readable display cap chosen over the raw `2147483647`. Re-vendoring ships `{{total}}`, an older patched tree may carry `∞`, and a converged tree carries the number; the patch accepts all three input forms. The TUI uses `formatRetryBudget()` from `@mavis/shared/llm-retry-event` and still reads `∞`. |
 
-Both snapshots are otherwise byte-identical to the shipped build; each patch is
-a few lines and is marked with a `Local patch:` comment in the file.
+The two vendored snapshots are otherwise byte-identical to the shipped build,
+and the renderer differs only in those four retry strings (the `llm_retry`
+banner copy in the English and Chinese string tables). Each code patch is a
+few lines marked with a `Local patch:` comment. None of this is hand-edited:
+`tools/restore/apply-local-patches.mjs` re-applies everything after every
+re-vendoring, works on an already-patched tree, and asserts each anchor — a
+shipped refactor of the retry loop, the classifier or the retry copy fails
+loudly instead of silently restoring the shipped behaviour.
 
 ## Dependency closure
 
 Third-party dependencies are installed from npm at the exact versions the
 shipped client resolved for its direct dependencies, and `package.json`
-(`pnpm.overrides`) pins the rest of the closure:
+(`pnpm.overrides`) pins the rest of the closure. 3.1.10 declares no direct
+`@opentelemetry/*` dependency any more; the two packages stay in the closure
+(and in `pnpm.overrides`, `api` 1.9.0 / `semantic-conventions` 1.44.0) because
+`@mistralai/mistralai`, `drizzle-orm` and the nested `@earendil-works/pi-ai`
+copy require them. The v1 local runtime is gone as well: `@mavis/local-runtime`
+no longer exists in the shipped `node_modules`, so `vendor/**` carries only
+`@mavis/local-runtime-v2`.
+
+The policy for that pinning:
 
 - Single-version packages are pinned to the shipped version.
 - Packages missing from a fresh resolution are added back at the shipped
@@ -148,9 +184,10 @@ Both trees satisfy every dependency range.
   packaging run (from `env/prod-zh.env`) and removed afterwards: the
   repository never stores a `.env*` file, and the packaged app still finds its
   environment file at the app root.
-- `asarUnpack` mirrors the installed `app.asar.unpacked` set exactly;
-  `npmRebuild` is disabled because the native modules are the shipped Electron
-  42 binaries.
+- `asarUnpack` covers the installed `app.asar.unpacked` set (whole packages, a
+  superset of the shipped per-file selection, plus the PTC worker files whose
+  module URL is rewritten to the unpacked path); `npmRebuild` is disabled
+  because the native modules are the shipped Electron 42 binaries.
 - `resources/` is used both as electron-builder's `buildResources` directory
   and as the `extraResources` source, which reproduces the installed
   `resources/resources/**` layout.

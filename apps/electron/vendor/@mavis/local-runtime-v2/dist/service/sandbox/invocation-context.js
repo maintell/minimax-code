@@ -21,6 +21,8 @@ export async function resolveSandboxInvocationContext(input) {
     // default workspace `<dataDir>/sessions/<id>/workspace` — no bash at all could
     // start there, in any mode, because this runs before the mode is consulted.
     const workspaceRealPath = await existingDirectory(input.workspaceRoot, 'workspaceRoot');
+    const additionalRoots = await existingAdditionalRoots(input.workspaceRoots, input.workspaceRoot, workspaceRealPath);
+    const workspaceRoots = [workspaceRealPath, ...additionalRoots];
     const cwdRealPath = await existingDirectory(input.cwd, 'cwd');
     const sandboxTempRootRealPath = await existingDirectory(input.sandboxTempRoot, 'sandboxTempRoot');
     const runtimeTempInstanceRealPath = await existingDirectory(input.runtimeTempInstanceDir, 'runtimeTempInstanceDir');
@@ -28,9 +30,9 @@ export async function resolveSandboxInvocationContext(input) {
     const sessionTempRealPath = await existingDirectory(input.sessionTempDir, 'sessionTempDir');
     assertDirectChild(sessionTempRealPath, runtimeTempInstanceRealPath, 'sessionTempDir');
     const git = await resolveGitMetadata(workspaceRealPath);
-    const linked = await discoverLinkedGitMetadata(workspaceRealPath, cwdRealPath);
+    const linked = await linkedGitMetadataForRoots(workspaceRealPath, additionalRoots, cwdRealPath);
     const surface = dedupe([
-        workspaceRealPath,
+        ...workspaceRoots,
         git.gitDirRealPath,
         git.commonDirRealPath,
         ...linked.gitDirs,
@@ -40,7 +42,7 @@ export async function resolveSandboxInvocationContext(input) {
     const scopePaths = (scopes) => dedupe(scopes.flatMap((scope) => {
         switch (scope) {
             case 'workspace':
-                return [workspaceRealPath];
+                return workspaceRoots;
             case 'git-dir':
                 return [...(git.gitDirRealPath ? [git.gitDirRealPath] : []), ...linked.gitDirs];
             case 'common-dir':
@@ -81,7 +83,7 @@ export async function resolveSandboxInvocationContext(input) {
         // still refuses the repository unless those are listed as well.
         git: {
             safeDirectories: dedupe([
-                workspaceRealPath,
+                ...workspaceRoots,
                 ...(git.gitDirRealPath ? [git.gitDirRealPath] : []),
                 ...(git.commonDirRealPath ? [git.commonDirRealPath] : []),
                 ...linked.worktreeRoots,
@@ -92,8 +94,90 @@ export async function resolveSandboxInvocationContext(input) {
     };
 }
 /**
+ * Additional folders are best-effort: one removed while the Turn runs is
+ * skipped so the primary workspace keeps working; invalid input still fails.
+ *
+ * A folder that sits inside or contains the primary workspace or another
+ * folder is skipped, both by its stored path and by its real path. Otherwise
+ * the agent could replace a nested folder with a symlink from inside its
+ * writable parent and have the next Turn grant the link target.
+ */
+async function existingAdditionalRoots(roots, workspaceRoot, workspaceRealPath) {
+    const accepted = [workspaceRoot, workspaceRealPath];
+    const resolved = [workspaceRealPath];
+    const result = [];
+    for (const root of roots ?? []) {
+        assertValidAdditionalRoot(root);
+        if (accepted.some((other) => pathsOverlap(root, other)))
+            continue;
+        try {
+            const canonical = await realpath(root);
+            if (!(await stat(canonical)).isDirectory())
+                continue;
+            if (resolved.some((other) => pathsOverlap(canonical, other)))
+                continue;
+            accepted.push(root);
+            resolved.push(canonical);
+            result.push(canonical);
+        }
+        catch {
+            // Missing or unreadable folder: not exposed for this invocation.
+        }
+    }
+    return result;
+}
+function assertValidAdditionalRoot(root) {
+    if (!isAbsolute(root) || root.includes('\0') || root.includes('\n') || root.includes('\r')) {
+        throw workspaceError(`Invalid workspaceRoots: ${root}`, 'workspaceRoots');
+    }
+}
+/** Same path, or one path is an ancestor of the other. */
+function pathsOverlap(left, right) {
+    const comparable = (path) => {
+        const absolute = resolve(path);
+        return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+    };
+    const a = comparable(left);
+    const b = comparable(right);
+    const within = (child, parent) => child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+    return a === b || within(a, b) || within(b, a);
+}
+/** Git metadata of every additional root joins the linked set of the primary workspace. */
+async function linkedGitMetadataForRoots(workspaceRealPath, additionalRoots, cwdRealPath) {
+    const primary = await discoverLinkedGitMetadata(workspaceRealPath, cwdRealPath);
+    if (additionalRoots.length === 0)
+        return primary;
+    // An additional folder's own gitfile goes through the same `.git`-segment
+    // constraint as nested worktrees: the folder is user-chosen but its gitfile is
+    // agent-writable, so it must not point the git scopes at an arbitrary directory.
+    // Broken or offline metadata only skips that folder.
+    const own = await Promise.all(additionalRoots.map(async (root) => {
+        const resolved = await resolveLinkedGitMetadataAt(root, root);
+        return {
+            ...(resolved?.gitDir ? { gitDirRealPath: resolved.gitDir } : {}),
+            ...(resolved?.commonDir ? { commonDirRealPath: resolved.commonDir } : {}),
+        };
+    }));
+    const linked = await Promise.all(additionalRoots.map((root) => discoverLinkedGitMetadata(root, cwdRealPath)));
+    const present = (values) => values.filter((value) => value !== undefined);
+    return {
+        ...primary,
+        gitDirs: dedupe([
+            ...primary.gitDirs,
+            ...present(own.map((metadata) => metadata.gitDirRealPath)),
+            ...linked.flatMap((metadata) => metadata.gitDirs),
+        ]),
+        commonDirs: dedupe([
+            ...primary.commonDirs,
+            ...present(own.map((metadata) => metadata.commonDirRealPath)),
+            ...linked.flatMap((metadata) => metadata.commonDirs),
+        ]),
+        worktreeRoots: dedupe([...primary.worktreeRoots, ...linked.flatMap((m) => m.worktreeRoots)]),
+    };
+}
+/**
  * Platform recoverable-delete destinations, mirroring the `mavis-trash` script
- * exactly (see `packages/local-runtime/src/infra/trash-script.ts`):
+ * exactly (see `packages/local-runtime-v2/src/infra/process/trash-script.ts`):
  * macOS moves into `~/.Trash`, POSIX/XDG into `$XDG_DATA_HOME/Trash` with
  * `$HOME/.local/share` as the spec default.
  *

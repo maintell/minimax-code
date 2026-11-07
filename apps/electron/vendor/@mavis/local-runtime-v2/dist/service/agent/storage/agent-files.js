@@ -6,7 +6,7 @@ import yaml from 'yaml';
 import { publishFileIfAbsent, replaceFileAtomically } from '../../../infra/file/jsonl.js';
 import { PRIMARY_AGENT_NAME, validateLookupName } from '../domain/names.js';
 import { isPrimaryFamilyName } from '../domain/primary-identity.js';
-import { AgentConfigError, assertSafeAgentAvatarDirectory, decodeAgentAvatarDataUrl, parseBuiltinCanonicalAgentMarkdown, parseCanonicalAgentMarkdown, readBuiltinCanonicalAgentConfig, readCanonicalAgentConfig, readSafeAgentAvatar, readStableAgentMarkdown, serializeBuiltinCanonicalAgentConfig, serializeCanonicalAgentConfig, validateAgentAvatar, } from './canonical-agent-config.js';
+import { AgentConfigError, assertSafeAgentAvatarDirectory, decodeAgentAvatarDataUrl, parseCanonicalAgentMarkdown, readBuiltinCanonicalAgentConfig, readCanonicalAgentConfig, readSafeAgentAvatar, readStableAgentMarkdown, serializeCanonicalAgentConfig, validateAgentAvatar, } from './canonical-agent-config.js';
 import { assertBuiltinConfigModelOnlyUpdate, hasCanonicalPatch, isPerAgentReadAccessError, patchCanonicalMarkdown, rewriteMovedCanonicalCustomName, } from './canonical-agent-patch.js';
 export { BuiltinAgentConfigModelOnlyError } from './canonical-agent-patch.js';
 const CONFIG_FILE = 'config.yaml';
@@ -162,12 +162,6 @@ export class AgentFiles {
         await this.parseAndValidateCanonicalDocument(agentDir, input.name, input.content);
         if (builtin)
             assertBuiltinConfigModelOnlyUpdate(current.content, input.content);
-        if (builtin && input.archiveCurrentBuiltin === true) {
-            await this.archiveLegacyBuiltinTemplate(agentDir, Buffer.from(current.content, 'utf8'), current.revision);
-            if ((await this.readCanonicalDocument(input.name, true)).revision !== current.revision) {
-                throw new AgentConfigRevisionConflictError();
-            }
-        }
         const filePath = join(agentDir, SYSTEM_PROMPT_FILE);
         await replaceFileAtomically(filePath, input.content, async (temporaryPath) => {
             await this.parseAndValidateCanonicalDocument(agentDir, input.name, await readFile(temporaryPath, 'utf8'));
@@ -512,21 +506,6 @@ export class AgentFiles {
         // resolution always starts from the shipped definition, never this file.
         return parsed.config;
     }
-    /** Seeds a Builtin source only when its canonical file is absent. */
-    async writeBuiltinCanonicalConfig(name, config, locked = false) {
-        if (!locked) {
-            return this.withLock(`.builtin:${name}`, () => this.writeBuiltinCanonicalConfig(name, config, true));
-        }
-        await this.ensureSafeAgentDirectory(this.builtinAgentDir(name));
-        await this.validateBuiltinCanonicalConfigForWrite(this.builtinAgentDir(name), name, config);
-        const filePath = join(this.builtinAgentDir(name), SYSTEM_PROMPT_FILE);
-        const serialized = serializeBuiltinCanonicalAgentConfig({ config });
-        await publishFileIfAbsent(filePath, serialized, async (temporaryPath) => {
-            parseBuiltinCanonicalAgentMarkdown(await readFile(temporaryPath, 'utf8'), name, {
-                requireFeaturePolicy: true,
-            });
-        });
-    }
     /** Removes only a stale primary canonical file; legacy primary assets remain untouched. */
     removeBuiltinCanonicalConfig(name) {
         return this.withLock(`.builtin:${name}`, async () => {
@@ -551,12 +530,7 @@ export class AgentFiles {
             await validateAgentAvatar(agentDir, config.xMavis.avatar, this.dataDir);
         }
     }
-    async validateBuiltinCanonicalConfigForWrite(agentDir, routeName, config) {
-        parseBuiltinCanonicalAgentMarkdown(serializeBuiltinCanonicalAgentConfig({ config }), routeName, { requireFeaturePolicy: true });
-        if (config.xMavis?.avatar) {
-            await validateAgentAvatar(agentDir, config.xMavis.avatar, this.dataDir);
-        }
-    }
+    /** Creates the Agent directory under dataDir without following a link out of it. */
     async ensureSafeAgentDirectory(agentDir) {
         await mkdir(this.dataDir, { recursive: true });
         const root = resolve(this.dataDir);
@@ -791,19 +765,6 @@ export class AgentFiles {
             throw new Error('Legacy blank profile archive does not match the current raw asset.');
         }
     }
-    async archiveLegacyBuiltinTemplate(agentDir, raw, revision) {
-        const archivePath = join(agentDir, `.${SYSTEM_PROMPT_FILE}.legacy-bundled.${revision}.raw`);
-        const outcome = await publishFileIfAbsent(archivePath, raw);
-        if (outcome === 'published')
-            return;
-        const metadata = await lstat(archivePath);
-        if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size !== raw.length) {
-            throw new Error('Legacy Builtin prompt archive is not the expected regular file.');
-        }
-        if (!(await readFile(archivePath)).equals(raw)) {
-            throw new Error('Legacy Builtin prompt archive does not match the current source.');
-        }
-    }
     async deleteMarkdown(name, fileName) {
         try {
             await rm(join(this.agentDir(name), fileName));
@@ -851,10 +812,10 @@ function stripFrontmatter(raw) {
 function hasSemanticMarkdownBody(raw) {
     return stripFrontmatter(raw.toString('utf8')).trim().length > 0;
 }
-function rawDigest(raw) {
+export function rawDigest(raw) {
     return createHash('sha256').update(raw).digest('hex');
 }
-function documentRevision(content) {
+export function documentRevision(content) {
     return createHash('sha256').update(content, 'utf8').digest('hex');
 }
 function isAgentInstanceId(value) {

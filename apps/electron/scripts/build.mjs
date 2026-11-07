@@ -21,6 +21,43 @@ function copyTree(from, to, filter = () => true) {
   }
 }
 
+// `dist/` survives an upgrade, and tsc only emits the files that still have a
+// source. A module the shipped build dropped would otherwise stay in
+// `dist/main` and be packaged into the installer, so every output file without
+// a source counterpart is removed after the emit (the directory branch is
+// pruned too, for outputs whose whole subtree is gone).
+function pruneStaleOutput(outputRoot, sourceFor) {
+  const staleDirectories = [];
+  const visit = (relative) => {
+    const outputDirectory = path.join(outputRoot, relative);
+    let kept = 0;
+    for (const entry of fs.readdirSync(outputDirectory, { withFileTypes: true })) {
+      const child = relative ? path.join(relative, entry.name) : entry.name;
+      if (entry.isDirectory()) {
+        if (visit(child)) kept += 1;
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (fs.existsSync(sourceFor(child))) {
+        kept += 1;
+        continue;
+      }
+      fs.unlinkSync(path.join(outputRoot, child));
+      console.log(`[build] removed stale output ${path.join(outputRoot, child)}`);
+    }
+    if (kept === 0 && relative) staleDirectories.push(relative);
+    return kept;
+  };
+  visit("");
+  for (const relative of staleDirectories.sort((a, b) => b.length - a.length)) {
+    try {
+      fs.rmdirSync(path.join(outputRoot, relative));
+    } catch {
+      // A concurrently written file keeps the directory; the next build retries.
+    }
+  }
+}
+
 export function build() {
   const tsc = path.join(appDir, "node_modules", "typescript", "bin", "tsc");
   if (!fs.existsSync(tsc)) {
@@ -37,6 +74,20 @@ export function build() {
     (file) => file.endsWith(".js"),
   );
   copyTree(path.join(appDir, "model-menu"), path.join(appDir, "dist", "model-menu"));
+  // The emit is per-file: `main/foo.ts` becomes `dist/main/foo.js`, while the
+  // prebuilt bundle is copied verbatim, so the source path is the `.ts` file or
+  // the `.js` file itself.
+  pruneStaleOutput(
+    path.join(appDir, "dist", "main"),
+    (relative) => [
+      path.join(appDir, "main", relative.replace(/\.js$/u, ".ts")),
+      path.join(appDir, "main", relative),
+    ].find((candidate) => fs.existsSync(candidate)),
+  );
+  pruneStaleOutput(
+    path.join(appDir, "dist", "model-menu"),
+    (relative) => path.join(appDir, "model-menu", relative),
+  );
   console.log("[build] dist/main and dist/model-menu are up to date");
 }
 

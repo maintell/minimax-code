@@ -8,7 +8,7 @@ const SESSION_KIND_TO_DESKTOP = {
     channel: DesktopSessionKind.Channel,
     cron: DesktopSessionKind.Cron,
 };
-export function toSessionInfoView(session) {
+export function toSessionInfoView(session, relation) {
     const model = toSessionModelInfoView(session);
     return {
         sessionId: session.sessionId,
@@ -39,6 +39,10 @@ export function toSessionInfoView(session) {
         ...(session.runLocation ? { runLocation: toRunLocationView(session.runLocation) } : {}),
         interactionMode: toSessionInteractionModeView(session.interactionMode),
         memoryPolicy: toSessionMemoryPolicyView(session),
+        ...(relation
+            ? { sideChat: { mainSessionId: relation.mainSessionId, createdAtMs: relation.createdAtMs } }
+            : {}),
+        sideChatOrigin: session.sideChatOrigin,
     };
 }
 function toSessionMemoryPolicyView(session) {
@@ -140,6 +144,7 @@ export function toSessionTreeChildView(session) {
         compressed: session.archived,
         status: toSessionStatusInfoView(session),
         sessionKind: SESSION_KIND_TO_DESKTOP[session.sessionKind],
+        ...(session.purpose ? { purpose: session.purpose } : {}),
     };
 }
 function toSessionStatusInfoView(session) {

@@ -24,8 +24,10 @@ export class DesktopMatrixClient {
     baseUrl;
     explicitAccessToken;
     managedEndpoint;
+    /** True when requests carry the managed-login token rather than an explicit one. */
     useManagedAuth;
     authContext;
+    authContextGetter;
     timeoutMs;
     fetchImpl;
     dispatcherFactory;
@@ -38,6 +40,7 @@ export class DesktopMatrixClient {
         this.managedEndpoint = endpoint.managed;
         this.useManagedAuth = endpoint.managed && !explicitAccessToken;
         this.authContext = options.authContext;
+        this.authContextGetter = options.authContextGetter;
         this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
         // Keep Matrix on this package's fetch when Node bundles a different Undici version.
         this.fetchImpl = options.fetchImpl ?? undiciFetch;
@@ -137,7 +140,10 @@ export class DesktopMatrixClient {
     getManagedAccessToken() {
         if (!this.useManagedAuth)
             return undefined;
-        return this.authContext?.accessToken?.trim() || undefined;
+        // With a live getter, never fall back to the static snapshot: its token may
+        // already be replaced, or belong to a login the host has since signed out.
+        const authContext = this.authContextGetter ? this.authContextGetter() : this.authContext;
+        return authContext?.accessToken?.trim() || undefined;
     }
 }
 function readGatewayErrorCode(text) {

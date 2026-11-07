@@ -73,7 +73,8 @@ function resolveManifestArtifactPath(root, artifactName) {
 function isSensitiveCredentialArtifact(artifactName) {
     return artifactName
         .split('/')
-        .some((segment) => SENSITIVE_CREDENTIAL_FILENAMES.has(segment.toLowerCase()));
+        .some((segment) => SENSITIVE_CREDENTIAL_FILENAMES.has(segment.toLowerCase()) ||
+        /^auth\.json\..+\.tmp$/iu.test(segment));
 }
 function diagnosticArchiveName(bundlePath, artifactName) {
     return `diagnostic-bundle/${path.basename(bundlePath)}/${artifactName}`;

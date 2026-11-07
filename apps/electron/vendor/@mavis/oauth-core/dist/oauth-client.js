@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { MCODE_OAUTH_AUDIENCE, MCODE_OAUTH_CLIENT_ID, MCODE_OAUTH_SCOPES } from './contracts.js';
+import { recordAuthRefreshBodyFailure, recordAuthRefreshBodyParsed, recordAuthRefreshGrantFields, recordAuthRefreshResponse, } from './refresh-diagnostics.js';
 const DEVICE_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code';
 export class OAuthProtocolError extends Error {
     code;
@@ -120,6 +121,8 @@ export class HttpOAuthClient {
             scope: MCODE_OAUTH_SCOPES.join(' '),
             audience: MCODE_OAUTH_AUDIENCE,
         });
+        // Presence only; no-op outside a traced refresh.
+        recordAuthRefreshGrantFields(body, refreshToken);
         return parseTokenGrant(body, refreshToken);
     }
     async revokeToken(refreshToken) {
@@ -148,7 +151,16 @@ export class HttpOAuthClient {
             body: new URLSearchParams(values),
             signal: options.signal,
         });
-        const body = asRecord(await response.json().catch(() => undefined));
+        // Refresh diagnostics read status/metadata headers only and never the body;
+        // each call is a no-op outside a traced refresh and swallows its own errors.
+        recordAuthRefreshResponse(response);
+        const json = await response.json().catch((error) => {
+            recordAuthRefreshBodyFailure(error);
+            return undefined;
+        });
+        if (json !== undefined)
+            recordAuthRefreshBodyParsed();
+        const body = asRecord(json);
         if (!body && response.ok && options.allowEmptySuccess)
             return { ok: true, status: response.status, body: {} };
         if (!body)

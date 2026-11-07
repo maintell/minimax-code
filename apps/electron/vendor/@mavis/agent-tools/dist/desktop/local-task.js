@@ -94,7 +94,7 @@ let LocalTaskTool = (() => {
                         isError: true,
                     };
                 }
-                const text = `<task_background task_id="${escapeXmlAttribute(started.taskId)}"${sessionIdAttribute(started.subSessionId)}>\nStarted background task ${started.taskId}. The owning conversation will automatically resume when it finishes; use task_query/task_output to inspect it early and task_stop to cancel it.\n</task_background>`;
+                const text = `<task_background task_id="${escapeXmlAttribute(started.taskId)}"${sessionIdAttribute(started.subSessionId)}${concurrencyAttributes(started.concurrency)}>\nStarted background task ${started.taskId}. The owning conversation will automatically resume when it finishes; use task_query/task_output to inspect it early and task_stop to cancel it.\n</task_background>`;
                 const result = {
                     tool_name: LocalTaskToolDef.name,
                     text,
@@ -105,6 +105,12 @@ let LocalTaskTool = (() => {
                         task_id: started.taskId,
                         ...(started.subSessionId ? { sub_session_id: started.subSessionId } : {}),
                         ...(started.subTurnId ? { sub_turn_id: started.subTurnId } : {}),
+                        ...(started.concurrency
+                            ? {
+                                active_child_tasks: started.concurrency.active,
+                                child_task_limit: started.concurrency.limit,
+                            }
+                            : {}),
                     },
                 };
                 return started.subSessionId
@@ -183,6 +189,11 @@ function taskIdAttribute(taskId) {
 }
 function sessionIdAttribute(sessionId) {
     return sessionId ? ` session_id="${escapeXmlAttribute(sessionId)}"` : '';
+}
+function concurrencyAttributes(concurrency) {
+    return concurrency
+        ? ` active_child_tasks="${String(concurrency.active)}" child_task_limit="${String(concurrency.limit)}"`
+        : '';
 }
 function errorCodeAttribute(errorCode) {
     return errorCode ? ` code="${escapeXmlAttribute(errorCode)}"` : '';

@@ -13,12 +13,12 @@
  *   1. 每 turn 拿 `SkillRegistry.getSnapshot()` 用 `renderAvailableSkillsCatalog`
  *      渲染 catalog 文本，通过 `pi.contributeSystemPrompt` 注入到 system prompt。
  *      这跟 host 现在的 catalog 拼接 (`<available_skills>` 段)行为一致——默认 wrapper
- *      跟 `packages/local-runtime/src/skills/builtin.ts` 产出格式逐字节对齐。
+ *      跟 `packages/agent-modules/context-manager/src/skill-catalog.ts` 产出格式逐字节对齐。
  *   2. 可选 `registerReminderProvider`：当 host 传入 `matcher(userInput, snapshot)
  *      => Reminder | null` 时，per-turn 计算是否触发 skill-match reminder（现有
  *      host 侧 `skillMatchReminderProvider` 的等价接线）。
  *
- * `skill` tool 本身由 host 定义（`packages/local-runtime/src/tools/skill-tool.ts`）
+ * `skill` 的文件读取由 host 承接（`packages/local-runtime-v2/src/service/skill/runtime/native-reader.ts`）
  * 因为它涉及 IO（读文件系统 SKILL.md）；本 extension 不注册 tool——只做 catalog +
  * reminder 的 declarative 部分。将来 host 迁移到 SPI 时会把 skill tool 通过
  * `pi.registerTool` 挂进来（这也符合设计文档 §4.3 表里 skills 用 `registerTool`

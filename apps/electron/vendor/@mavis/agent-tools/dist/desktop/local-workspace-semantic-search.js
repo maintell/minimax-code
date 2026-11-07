@@ -34,6 +34,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 };
 import { Type } from '@sinclair/typebox';
 import { bindTool, } from '@mavis/agent-core/tools';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 export const LocalWorkspaceSemanticSearchToolDef = {
     name: 'workspace_semantic_search',
     executionMode: 'parallel',
@@ -90,7 +91,8 @@ let LocalWorkspaceSemanticSearchTool = (() => {
                     match.snippet,
                 ]);
             const text = lines.join('\n');
-            return {
+            // Every match is shown in text, never cut; data adds the unrounded score and revision.
+            return withDesktopCompletenessReport(LocalWorkspaceSemanticSearchToolDef.name, {
                 tool_name: LocalWorkspaceSemanticSearchToolDef.name,
                 text,
                 content: [{ type: 'text', text }],
@@ -99,7 +101,18 @@ let LocalWorkspaceSemanticSearchTool = (() => {
                     match_count: result.results.length,
                     matches: result.results,
                 },
-            };
+            }, {
+                data: {
+                    revisionId: result.revisionId,
+                    matches: result.results.map(({ path, startLine, endLine, score, snippet }) => ({
+                        path,
+                        startLine,
+                        endLine,
+                        score,
+                        snippet,
+                    })),
+                },
+            });
         }
     };
     return LocalWorkspaceSemanticSearchTool = _classThis;

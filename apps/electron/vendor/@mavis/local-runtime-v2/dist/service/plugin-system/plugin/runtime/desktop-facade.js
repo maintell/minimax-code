@@ -1,18 +1,22 @@
+import { formatPluginId, isBuiltInPluginMarketplace, LOCAL_PLUGIN_MARKETPLACE, OFFICIAL_PLUGIN_MARKETPLACE, pluginIdKey, } from '@mavis/shared';
 import { InstalledPluginSource, MarketplaceCategory, PluginInstallationPolicy, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { withConnectorCatalog } from '../../app/plugin-apps.js';
+import { findInstalledLocalPlugin, findLocalPlugin } from '../../plugin-system-helpers.js';
+import { installedLocalPlugin } from '../local/local-plugin-lifecycle.js';
 import { PluginRegistryClient } from './registry-client.js';
 import { effectiveInstallationPolicy } from './repository.js';
+import { builtInMarketplaces, catalogEntryDetail, catalogEntrySummary, installedIdentityFields, installedSummaryFields, marketplaceInfo, nameHolder, nameOwnerField, } from './wire/marketplace-views.js';
+import { categoryId, categoryName, declaredTransport, optionalPluginIcon, pluginPackageSummary, } from './wire/package-views.js';
+import { PluginDesktopFacadeError, readUserMarketplaceName, resolveCatalogTarget, resolvePluginTarget, userMarketplaceOf, } from './wire/plugin-selector.js';
+export { PluginDesktopFacadeError } from './wire/plugin-selector.js';
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
-const BUILTIN_AGENT_PLUGIN_ICON_URL = 'minimax-builtin://plugin-icons/github';
-export class PluginDesktopFacadeError extends Error {
-    code;
-    constructor(code) {
-        super(code);
-        this.code = code;
-        this.name = 'PluginDesktopFacadeError';
-    }
-}
-/** Desktop projection over the Cloud registry plus the accepted local snapshot. */
+const NO_MARKETPLACE_STATES = new Map();
+/**
+ * Desktop projection over the Cloud registry, user-added marketplaces, and the
+ * accepted local snapshot. Requests address Plugins as `<name>@<marketplace>`;
+ * a request without a marketplace keeps the legacy `source` semantics.
+ */
 export class PluginDesktopFacade {
     options;
     constructor(options) {
@@ -22,16 +26,18 @@ export class PluginDesktopFacade {
         return this.options.system.refresh();
     }
     setLocalPluginEnabled(name, enabled) {
-        return this.options.system.setLocalPluginEnabled(name, enabled);
+        return this.options.system.setLocalPluginEnabled({ name }, enabled);
     }
     uninstallLocalPlugin(name) {
-        return this.options.system.uninstallLocalPlugin(name);
+        return this.options.system.uninstallLocalPlugin({ name });
     }
     async listMarketplacePlugins(req) {
-        const source = readSource(req.source);
-        if (source === InstalledPluginSource.OFFICIAL) {
+        const target = resolveCatalogTarget(req);
+        if (target.kind === 'official') {
             return this.projectStandaloneSkillAdded(await this.overlayOfficialMarketplaceState(await this.options.registryClient.listMarketplace(req)));
         }
+        if (target.kind === 'user')
+            return this.listUserMarketplace(target.marketplace, req);
         const skillLimit = pageLimit(req.skillLimit ?? req.limit);
         const [standaloneSkills, localSnapshot] = await Promise.all([
             this.options.listStandaloneSkills({
@@ -45,7 +51,7 @@ export class PluginDesktopFacade {
                 reuseCached: true,
             }),
         ]);
-        const local = localMarketplacePage(localSnapshot, req);
+        const local = localMarketplacePage(localSnapshot, req, await this.describeInstalled(localSnapshot));
         return {
             plugins: local.plugins,
             nextCursor: local.nextCursor,
@@ -57,8 +63,8 @@ export class PluginDesktopFacade {
         };
     }
     async getMarketplacePlugin(req) {
-        const source = readSource(req.source);
-        if (source === InstalledPluginSource.OFFICIAL) {
+        const target = resolvePluginTarget(req);
+        if (target.lifecycle === 'official') {
             const response = await this.options.registryClient.getMarketplace(req);
             if (!response.plugin)
                 return response;
@@ -67,17 +73,32 @@ export class PluginDesktopFacade {
                 ...response,
                 plugin: {
                     ...response.plugin,
-                    summary: overlayOfficialSummary(response.plugin.summary, installations),
+                    summary: overlayOfficialSummary(response.plugin.summary, installations, this.options.system.currentSnapshot),
                 },
             };
         }
         const localSnapshot = await this.options.system.refreshLocalPluginsForMarketplace({
             reuseCached: true,
         });
-        const plugin = localPluginDetail(localSnapshot, req.pluginName);
+        const marketplace = userMarketplaceOf(target.selector);
+        if (marketplace) {
+            return this.getUserMarketplacePlugin(localSnapshot, {
+                name: target.selector.name,
+                marketplace,
+            });
+        }
+        const local = findLocalPlugin(localSnapshot, target.selector);
+        if (!local)
+            throw new PluginDesktopFacadeError('PLUGIN_NOT_FOUND');
+        const states = await this.describeInstalled(localSnapshot);
+        const plugin = catalogEntryDetail(undefined, {
+            id: local.id,
+            installed: local,
+            ...stateOf(states, local.id),
+        });
         if (!plugin)
             throw new PluginDesktopFacadeError('PLUGIN_NOT_FOUND');
-        return { plugin };
+        return { plugin: await this.withConnectorApps(plugin) };
     }
     async listInstalledPlugins(req) {
         const filter = normalizedKeyword(req.keyword);
@@ -91,8 +112,8 @@ export class PluginDesktopFacade {
                 reuseCached: true,
             }),
         ]);
-        const official = await officialInstalledItems(officialStates, filter);
-        const local = localInstalledItems(localSnapshot, filter, official);
+        const official = officialInstalledItems(officialStates, filter, localSnapshot);
+        const local = localInstalledItems(localSnapshot, filter, await this.describeInstalled(localSnapshot));
         return installedSnapshotPage([...official, ...local], filter, limit, cursor?.stage === 'snapshot' ? cursor.offset : 0);
     }
     async listEnabledPlugins(_req) {
@@ -153,6 +174,44 @@ export class PluginDesktopFacade {
     disablePlugin(req) {
         return this.mutate(req, 'disable');
     }
+    /** Updates a Plugin installed from a user-added Git marketplace, overwriting local edits. */
+    updatePlugin(req) {
+        return this.mutate(req, 'update');
+    }
+    async listPluginMarketplaces(_req) {
+        const views = this.options.marketplaces ? await this.options.marketplaces.list() : [];
+        return { marketplaces: [...builtInMarketplaces(), ...views.map(marketplaceInfo)] };
+    }
+    async addPluginMarketplace(req) {
+        const result = await this.requireMarketplaces().add({
+            source: req.source,
+            ...(req.ref?.trim() ? { ref: req.ref.trim() } : {}),
+            ...(req.sparsePaths?.length ? { sparsePaths: [...req.sparsePaths] } : {}),
+        });
+        return { marketplace: marketplaceInfo(result.marketplace), alreadyAdded: result.alreadyAdded };
+    }
+    async refreshPluginMarketplaces(req) {
+        const name = req.marketplaceName?.trim()
+            ? readUserMarketplaceName(req.marketplaceName)
+            : undefined;
+        const views = await this.requireMarketplaces().refresh(name);
+        return { marketplaces: views.map(marketplaceInfo) };
+    }
+    async setPluginMarketplaceAutoUpdate(req) {
+        const view = await this.requireMarketplaces().setAutoUpdate(readUserMarketplaceName(req.marketplaceName), req.autoUpdate);
+        return { marketplace: marketplaceInfo(view) };
+    }
+    async removePluginMarketplace(req) {
+        const result = await this.requireMarketplaces().remove(readUserMarketplaceName(req.marketplaceName));
+        return {
+            removed: result.removed,
+            uninstalledPlugins: result.uninstalled.map(formatPluginId),
+            failedPlugins: result.failed.map((failure) => ({
+                pluginId: formatPluginId(failure.id),
+                errorCode: failure.code,
+            })),
+        };
+    }
     async previewGithubPlugin(req, signal) {
         if (!this.options.githubImporter) {
             throw new PluginDesktopFacadeError('PLUGIN_IMPORT_UNAVAILABLE');
@@ -164,7 +223,10 @@ export class PluginDesktopFacade {
             return {
                 source: preview.source,
                 plugin: {
-                    summary: pluginPackageSummary(preview.plugin, false, false),
+                    summary: {
+                        ...pluginPackageSummary(preview.plugin, false, false),
+                        marketplace: LOCAL_PLUGIN_MARKETPLACE,
+                    },
                     skillCount: preview.plugin.skills.length,
                     mcpServerCount: preview.plugin.mcpServers.length,
                     hasStdioMcp: preview.plugin.mcpServers.some((server) => declaredTransport(server.configJson) === 'stdio'),
@@ -189,7 +251,12 @@ export class PluginDesktopFacade {
         let status = 'success';
         try {
             const plugin = await this.options.system.importGithubPlugin(req.source);
-            return { plugin: pluginPackageSummary(plugin, true, true) };
+            return {
+                plugin: {
+                    ...pluginPackageSummary(plugin, true, true),
+                    marketplace: LOCAL_PLUGIN_MARKETPLACE,
+                },
+            };
         }
         catch (error) {
             status = 'error';
@@ -202,15 +269,18 @@ export class PluginDesktopFacade {
         }
     }
     async mutate(req, action) {
-        const source = readSource(req.source);
-        const sourceLabel = source === InstalledPluginSource.OFFICIAL ? 'official' : 'local';
+        const target = resolvePluginTarget(req);
+        const sourceLabel = target.lifecycle;
         const startedAt = Date.now();
         let status = 'success';
         try {
-            if (source === InstalledPluginSource.OFFICIAL) {
+            if (target.lifecycle === 'official') {
+                // Official packages update through the Registry, never on request.
+                if (action === 'update')
+                    throw new PluginDesktopFacadeError('PLUGIN_UPDATE_UNSUPPORTED');
                 return await this.mutateOfficial(req, action);
             }
-            return await this.mutateLocal(req, action);
+            return await this.mutateLocal(target.selector, action);
         }
         catch (error) {
             status = 'error';
@@ -237,7 +307,7 @@ export class PluginDesktopFacade {
         try {
             // Persist explicit withdrawal before dispatch: a committed response can be lost.
             if (action === 'disable' || action === 'uninstall') {
-                await this.options.system.revokeOfficialSelection(requestedName, scope);
+                await this.options.system.revokeOfficialSelection(requestedName, scope, action === 'uninstall' ? 'uninstalled' : 'disabled');
             }
             const response = await this.options.registryClient.mutate(requestedName, action);
             assertOfficialMutationResponse(response, requestedName);
@@ -248,6 +318,7 @@ export class PluginDesktopFacade {
                 installationPolicy: response.installationPolicy ?? PluginInstallationPolicy.USER_MANAGED,
                 ...(response.package ? { package: response.package } : {}),
             }, scope);
+            this.forgetMiniAppPermissions(action, response.installExists, requestedName, 'official');
             return response;
         }
         catch (error) {
@@ -258,24 +329,155 @@ export class PluginDesktopFacade {
             throw error;
         }
     }
-    async mutateLocal(req, action) {
+    /** A confirmed uninstall drops the Mini App switches; a reinstall starts fully enabled. */
+    forgetMiniAppPermissions(action, installExists, pluginName, source) {
+        if (action !== 'uninstall' || installExists)
+            return;
+        this.options.system.miniAppPublication.forgetPermissions(pluginName, source);
+    }
+    async mutateLocal(selector, action) {
+        const marketplace = userMarketplaceOf(selector);
         if (action === 'install') {
-            throw new PluginDesktopFacadeError('LOCAL_PLUGIN_INSTALL_UNSUPPORTED');
+            // LOCAL packages arrive through files, Git import, or a user-added marketplace.
+            if (!marketplace)
+                throw new PluginDesktopFacadeError('LOCAL_PLUGIN_INSTALL_UNSUPPORTED');
+            const installed = await this.requireMarketplaces().install({
+                name: selector.name,
+                marketplace,
+            });
+            return {
+                source: InstalledPluginSource.LOCAL,
+                installExists: true,
+                enabled: installed.enabled,
+            };
         }
+        if (action === 'update')
+            return this.updateLocal(selector);
         const result = action === 'uninstall'
-            ? await this.options.system.uninstallLocalPlugin(req.pluginName)
-            : await this.options.system.setLocalPluginEnabled(req.pluginName, action === 'enable');
+            ? await this.options.system.uninstallLocalPlugin(selector)
+            : await this.options.system.setLocalPluginEnabled(selector, action === 'enable');
+        this.forgetMiniAppPermissions(action, result.installExists, selector.name, 'local');
         return {
             source: InstalledPluginSource.LOCAL,
             installExists: result.installExists,
             enabled: result.enabled,
         };
     }
+    /** Only Plugins installed from a user-added marketplace can update on request. */
+    async updateLocal(selector) {
+        let id;
+        const marketplace = userMarketplaceOf(selector);
+        if (marketplace) {
+            id = { name: selector.name, marketplace };
+        }
+        else {
+            const snapshot = await this.options.system.refreshLocalPluginsForMarketplace({
+                reuseCached: true,
+            });
+            const installed = findLocalPlugin(snapshot, selector);
+            if (!installed)
+                throw new PluginDesktopFacadeError('PLUGIN_NOT_FOUND');
+            id = installed.id;
+        }
+        if (isBuiltInPluginMarketplace(id.marketplace)) {
+            throw new PluginDesktopFacadeError('PLUGIN_UPDATE_UNSUPPORTED');
+        }
+        const result = await this.requireMarketplaces().update(id);
+        return {
+            source: InstalledPluginSource.LOCAL,
+            installExists: true,
+            enabled: result.plugin.enabled,
+            discardedLocalChanges: [...result.discardedLocalChanges],
+        };
+    }
+    async listUserMarketplace(marketplace, req) {
+        const service = this.requireMarketplaces();
+        const category = categoryName(req.category);
+        const limit = pageLimit(req.limit);
+        if (req.category !== undefined && !category) {
+            return { plugins: [], hasMore: false, pluginTotal: 0, marketplaceSkills: [] };
+        }
+        const keyword = req.keyword?.trim();
+        const [page, localSnapshot] = await Promise.all([
+            service.listEntries(marketplace, {
+                ...(keyword ? { keyword } : {}),
+                ...(category ? { category } : {}),
+                ...(req.cursor ? { cursor: req.cursor } : {}),
+                limit,
+            }),
+            this.options.system.refreshLocalPluginsForMarketplace({ reuseCached: true }),
+        ]);
+        const states = await this.describeInstalled(localSnapshot);
+        return {
+            plugins: page.entries.map((entry) => {
+                const installed = findInstalledLocalPlugin(localSnapshot, entry.id);
+                return catalogEntrySummary(entry, {
+                    ...(installed ? { installed } : {}),
+                    ...stateOf(states, entry.id),
+                    ...holderOf(localSnapshot, entry.preview?.name ?? entry.id.name),
+                });
+            }),
+            hasMore: page.hasMore,
+            pluginTotal: page.total,
+            ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+            marketplaceSkills: [],
+            skillHasMore: false,
+        };
+    }
+    async getUserMarketplacePlugin(localSnapshot, id) {
+        const installed = findInstalledLocalPlugin(localSnapshot, id);
+        const states = installed ? await this.describeInstalled(localSnapshot) : NO_MARKETPLACE_STATES;
+        const entry = installed ? undefined : await this.requireMarketplaces().getEntry(id);
+        const plugin = catalogEntryDetail(entry, {
+            id,
+            ...(installed ? { installed } : {}),
+            ...stateOf(states, id),
+            ...holderOf(localSnapshot, entry?.preview?.name ?? id.name),
+        });
+        if (!plugin)
+            throw new PluginDesktopFacadeError('PLUGIN_NOT_FOUND');
+        return { plugin: await this.withConnectorApps(plugin) };
+    }
+    /**
+     * Local detail must work offline and signed out: the Connector catalog only decorates declared
+     * providers, and any Cloud failure keeps the bare declaration.
+     */
+    async withConnectorApps(detail) {
+        const catalog = this.options.connectorCatalog;
+        if (!catalog || detail.apps.length === 0)
+            return detail;
+        try {
+            return { ...detail, apps: withConnectorCatalog(detail.apps, await catalog.listConnectors()) };
+        }
+        catch {
+            return detail;
+        }
+    }
+    /** Marketplace facts are hints: listing never fails because they are unavailable. */
+    async describeInstalled(snapshot) {
+        const service = this.options.marketplaces;
+        const plugins = snapshot.localPlugins.filter((plugin) => !isBuiltInPluginMarketplace(plugin.id.marketplace));
+        if (!service || plugins.length === 0)
+            return NO_MARKETPLACE_STATES;
+        try {
+            return await service.describeInstalled(plugins.map(installedLocalPlugin));
+        }
+        catch {
+            return NO_MARKETPLACE_STATES;
+        }
+    }
+    requireMarketplaces() {
+        if (!this.options.marketplaces) {
+            throw new PluginDesktopFacadeError('PLUGIN_MARKETPLACE_UNAVAILABLE');
+        }
+        return this.options.marketplaces;
+    }
     async overlayOfficialMarketplaceState(response) {
         const installations = await this.options.system.listOfficialPluginInstallations();
+        const snapshot = this.options.system.currentSnapshot;
         return {
             ...response,
-            plugins: response.plugins.map((plugin) => overlayOfficialSummary(plugin, installations)),
+            plugins: response.plugins.map((plugin) => overlayOfficialSummary(plugin, installations, snapshot)),
         };
     }
     async projectStandaloneSkillAdded(response) {
@@ -332,16 +534,16 @@ function stableLocalSkillId(skill) {
     const value = 4_294_967_296 * (low & 0x1fffff) + (high >>> 0);
     return -(value || 1);
 }
-function localMarketplacePage(snapshot, req) {
+function localMarketplacePage(snapshot, req, states) {
     const filter = normalizedKeyword(req.keyword);
     const category = req.category;
     const categoryKey = category ?? -1;
     const cursor = decodeLocalCursor(req.cursor, filter, categoryKey);
     const limit = pageLimit(req.limit);
     const items = snapshot.localPlugins
-        .filter((plugin) => pluginMatchesKeyword(plugin.name, plugin.displayName, filter))
+        .filter((plugin) => localPluginMatchesKeyword(plugin, filter))
         .filter((plugin) => category === undefined || category === categoryId(plugin.plugin.category))
-        .map(localMarketplaceSummary);
+        .map((plugin) => localMarketplaceSummary(plugin, states.get(pluginIdKey(plugin.id))));
     const offset = cursor?.offset ?? 0;
     const plugins = items.slice(offset, offset + limit);
     const nextOffset = offset + plugins.length;
@@ -383,15 +585,15 @@ function installedSnapshotPage(items, filter, limit, offset) {
             : {}),
     };
 }
-async function officialInstalledItems(states, filter) {
-    return states.flatMap((state) => officialInstalledItem(state, filter));
+function officialInstalledItems(states, filter, snapshot) {
+    return states.flatMap((state) => officialInstalledItem(state, filter, snapshot));
 }
-function officialInstalledItem({ installation, plugin }, filter) {
+function officialInstalledItem({ installation, plugin }, filter, snapshot) {
     if (!pluginMatchesKeyword(installation.name, plugin?.displayName, filter))
         return [];
-    return [toOfficialInstalledSummary(installation, plugin)];
+    return [toOfficialInstalledSummary(installation, plugin, snapshot)];
 }
-function toOfficialInstalledSummary(installation, plugin) {
+function toOfficialInstalledSummary(installation, plugin, snapshot) {
     return {
         name: installation.name,
         ...officialInstalledMetadata(installation, plugin),
@@ -400,6 +602,7 @@ function toOfficialInstalledSummary(installation, plugin) {
         enabled: installation.enabled,
         installationPolicy: effectiveInstallationPolicy(installation),
         category: plugin ? categoryId(plugin.category) : MarketplaceCategory.OTHER,
+        ...officialIdentityFields(installation.name, snapshot),
     };
 }
 function officialInstalledMetadata(installation, plugin) {
@@ -418,9 +621,10 @@ function officialInstalledCapabilities(plugin) {
         mcpServerCount: plugin?.mcpServers.length ?? 0,
         skillCount: plugin?.skills.length ?? 0,
         hookCount: plugin?.hooks?.length ?? 0,
+        agentCount: plugin?.agents?.length ?? 0,
     };
 }
-function overlayOfficialSummary(summary, installations) {
+function overlayOfficialSummary(summary, installations, snapshot) {
     const installation = installations.find((item) => normalizedName(item.name) === normalizedName(summary.name));
     return {
         ...summary,
@@ -429,17 +633,22 @@ function overlayOfficialSummary(summary, installations) {
         installationPolicy: installation
             ? effectiveInstallationPolicy(installation)
             : (summary.installationPolicy ?? PluginInstallationPolicy.USER_MANAGED),
+        ...officialIdentityFields(summary.name, snapshot),
     };
 }
-function localInstalledItems(snapshot, filter, official) {
-    const reserved = new Set(official.map((item) => normalizedName(item.name)));
+/** An official Plugin always wins its name when enabled; otherwise it names the holder. */
+function officialIdentityFields(name, snapshot) {
+    return {
+        marketplace: OFFICIAL_PLUGIN_MARKETPLACE,
+        ...nameOwnerField({ name, marketplace: OFFICIAL_PLUGIN_MARKETPLACE }, nameHolder(snapshot, name)),
+    };
+}
+function localInstalledItems(snapshot, filter, states) {
     return snapshot.localPlugins.flatMap((plugin) => {
-        const key = normalizedName(plugin.name);
-        if (!pluginMatchesKeyword(plugin.name, plugin.displayName, filter) || reserved.has(key)) {
+        if (!localPluginMatchesKeyword(plugin, filter))
             return [];
-        }
-        reserved.add(key);
-        const summary = localMarketplaceSummary(plugin);
+        const state = states.get(pluginIdKey(plugin.id));
+        const summary = localMarketplaceSummary(plugin, state);
         return [
             {
                 name: summary.name,
@@ -454,107 +663,45 @@ function localInstalledItems(snapshot, filter, official) {
                 enabled: summary.enabled,
                 installationPolicy: PluginInstallationPolicy.USER_MANAGED,
                 category: summary.category,
+                ...installedIdentityFields(plugin, state),
             },
         ];
     });
 }
-function localMarketplaceSummary(plugin) {
+/** Every installed PluginId is listed, including copies whose name another Plugin holds. */
+function localMarketplaceSummary(plugin, state) {
     return {
-        name: plugin.name,
+        name: plugin.id.name,
         ...(plugin.version ? { version: plugin.version } : {}),
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
         ...(plugin.description ? { description: plugin.description } : {}),
         ...(plugin.author ? { author: plugin.author } : {}),
         ...optionalPluginIcon(plugin),
         capabilities: {
-            appCount: 0,
+            appCount: plugin.plugin.apps.length,
             mcpServerCount: plugin.plugin.mcpServers.length,
             skillCount: plugin.plugin.skills.length,
             hookCount: plugin.plugin.hooks?.length ?? 0,
+            agentCount: plugin.plugin.agents?.length ?? 0,
         },
         installExists: true,
         enabled: plugin.enabled,
         installationPolicy: PluginInstallationPolicy.USER_MANAGED,
         category: categoryId(plugin.plugin.category),
+        ...installedSummaryFields(plugin, state),
     };
 }
-function localPluginDetail(snapshot, pluginName) {
-    const key = normalizedName(pluginName);
-    const local = snapshot.localPlugins.find((plugin) => normalizedName(plugin.name) === key);
-    if (!local)
-        return undefined;
-    return pluginPackageDetail(local.plugin, true, local.enabled);
+function stateOf(states, id) {
+    const state = states.get(pluginIdKey(id));
+    return state ? { state } : {};
 }
-function pluginPackageDetail(plugin, installExists, enabled) {
-    return {
-        summary: pluginPackageSummary(plugin, installExists, enabled),
-        apps: [],
-        mcpServers: plugin.mcpServers.map((server) => ({
-            name: server.name,
-            transport: declaredTransport(server.configJson),
-            ...(server.description ? { description: server.description } : {}),
-            configJson: server.configJson,
-        })),
-        skills: plugin.skills.map((skill) => ({
-            name: skill.name,
-            description: skill.description,
-            content: skill.content,
-        })),
-        exampleQueries: [...plugin.exampleQueries],
-    };
+function holderOf(snapshot, manifestName) {
+    const holder = nameHolder(snapshot, manifestName);
+    return holder ? { holder } : {};
 }
-function pluginPackageSummary(plugin, installExists, enabled) {
-    return {
-        name: plugin.name,
-        ...(plugin.version ? { version: plugin.version } : {}),
-        ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
-        ...(plugin.description ? { description: plugin.description } : {}),
-        ...(plugin.author ? { author: plugin.author } : {}),
-        ...optionalPluginIcon(plugin),
-        capabilities: {
-            appCount: 0,
-            mcpServerCount: plugin.mcpServers.length,
-            skillCount: plugin.skills.length,
-            hookCount: plugin.hooks?.length ?? 0,
-        },
-        installExists,
-        enabled,
-        installationPolicy: PluginInstallationPolicy.USER_MANAGED,
-        category: categoryId(plugin.category),
-    };
-}
-function declaredTransport(configJson) {
-    try {
-        const parsed = JSON.parse(configJson);
-        if (typeof parsed.type === 'string')
-            return parsed.type;
-        if (typeof parsed.command === 'string')
-            return 'stdio';
-        if (typeof parsed.url === 'string')
-            return 'http';
-    }
-    catch {
-        // The package reader already validated this object; retain a safe label if
-        // an in-memory test double supplies an invalid value.
-    }
-    return 'unknown';
-}
-function localIconUrl(iconPath) {
-    if (iconPath.startsWith('minimax-builtin://'))
-        return iconPath;
-    return `/mavis/api/file/preview?path=${encodeURIComponent(iconPath)}`;
-}
-function optionalPluginIcon(plugin) {
-    if (plugin.iconPath) {
-        return {
-            iconUrl: localIconUrl(plugin.iconPath),
-            ...(plugin.darkIconPath ? { darkIconUrl: localIconUrl(plugin.darkIconPath) } : {}),
-        };
-    }
-    if (plugin.source === 'LOCAL_AGENT_PLUGIN') {
-        return { iconUrl: BUILTIN_AGENT_PLUGIN_ICON_URL };
-    }
-    return {};
+function localPluginMatchesKeyword(plugin, keyword) {
+    return (pluginMatchesKeyword(plugin.id.name, plugin.displayName, keyword) ||
+        normalizedName(plugin.name).includes(keyword));
 }
 function optionalPluginSkillIcon(plugin) {
     const icon = optionalPluginIcon(plugin);
@@ -568,29 +715,6 @@ function isStandaloneSkillAdded(item, installed) {
     if (sourceUrl && installed.sourceUrls.has(sourceUrl))
         return true;
     return installed.names.has(normalizedName(item.name));
-}
-function categoryId(value) {
-    const mapping = {
-        Other: MarketplaceCategory.OTHER,
-        Office: MarketplaceCategory.OFFICE,
-        Studio: MarketplaceCategory.STUDIO,
-        'Design & Sites': MarketplaceCategory.DESIGN_AND_SITES,
-        Code: MarketplaceCategory.CODE,
-        Business: MarketplaceCategory.BUSINESS,
-        Sales: MarketplaceCategory.SALES,
-        Productivity: MarketplaceCategory.PRODUCTIVITY,
-        'Science & Healthcare': MarketplaceCategory.SCIENCE_AND_HEALTHCARE,
-        Education: MarketplaceCategory.EDUCATION,
-    };
-    return mapping[value];
-}
-function readSource(value) {
-    if (value === undefined || value === InstalledPluginSource.OFFICIAL || value === '1') {
-        return InstalledPluginSource.OFFICIAL;
-    }
-    if (value === InstalledPluginSource.LOCAL || value === '2')
-        return InstalledPluginSource.LOCAL;
-    throw new PluginDesktopFacadeError('INVALID_PLUGIN_SOURCE');
 }
 function decodeInstalledCursor(value, filter) {
     if (!value)

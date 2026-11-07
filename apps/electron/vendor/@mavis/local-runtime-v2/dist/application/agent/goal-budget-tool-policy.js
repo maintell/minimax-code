@@ -1,6 +1,12 @@
 import { resolveUpdateGoalMode } from '@mavis/goal';
-/** Restricts only update_goal's budget mode; all other tool paths pass through. */
-export function createGoalBudgetToolPolicyGuard() {
+/**
+ * Restricts only update_goal's budget mode; all other tool paths pass through.
+ * A Turn carrying an explicit user request may adjust the limits. A Goal Turn
+ * may set the limits its objective states, which the Goal only takes where it
+ * has none yet (a kickoff, or the Turn after an objective edit reset them), so
+ * it can tighten but never lift a limit.
+ */
+export function createGoalBudgetToolPolicyGuard(options) {
     return {
         async beforeToolCall(input) {
             if (input.toolContext.toolCall.name !== 'update_goal')
@@ -10,9 +16,11 @@ export function createGoalBudgetToolPolicyGuard() {
                 return undefined;
             if (input.genuineUserQueryText.length > 0)
                 return undefined;
+            if (options.worksForGoal(input.turn))
+                return undefined;
             return {
                 block: true,
-                reason: 'Goal token-budget updates require an explicit user request in the current turn; autonomous continuations, scheduled work, subagents, and background work cannot change the budget.',
+                reason: 'Goal token-budget updates require an explicit user request in the current turn; scheduled work, subagents, and background work cannot change the budget.',
             };
         },
     };

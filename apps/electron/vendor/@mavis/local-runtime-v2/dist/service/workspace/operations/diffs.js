@@ -1,7 +1,7 @@
 import { WorkspaceGitSnapshotChangedError } from '../contracts.js';
 import { gitDiffArgs, gitDiffScopes } from './changes.js';
 import { git, requireGitSuccess } from './git-process.js';
-import { isKnownBinaryExtension, readWorkspaceFile } from './workspace-path.js';
+import { isKnownBinaryExtension, readWorkspaceFile } from './filesystem/workspace-path.js';
 export async function getWorkspaceFileDiff(manager, workspace, filePath, options = {}) {
     const scope = options.scope ?? 'all';
     const snapshot = await readExpectedSnapshot(manager, workspace, options.snapshotId);
@@ -244,9 +244,12 @@ function parseRawDiffPaths(raw) {
 }
 function normalizeGitPath(filePath) {
     const normalized = filePath.trim().replace(/\\/gu, '/');
+    // Git emits repo-relative paths; reject POSIX ("/x") and Windows drive
+    // ("C:/x") absolute forms plus parent escapes before they reach callers.
     if (!normalized ||
         normalized.includes('\0') ||
         normalized.startsWith('/') ||
+        /^[A-Za-z]:/u.test(normalized) ||
         normalized.startsWith('../')) {
         throw new Error(`Invalid git path: ${filePath}`);
     }

@@ -38,9 +38,11 @@ import { z } from 'zod';
 import { normalizeMavisCommand } from '../shared/mavis-operation-classifier.js';
 import { CRON_CREATE_ME_REJECTED_MESSAGE, isCronDedicatedSessionTarget, isCronFixedSessionId, isMeSessionSentinel, } from '../shared/cron-schedule-input.js';
 import { LocalMavisToolDef } from './builtin-defs.js';
-import { LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, } from './local-mavis-commands.js';
+import { LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, localMavisArchiveCall, mavisRecoveryInstruction, ptcMavisHelpOutput, ptcMavisRunCodeTool, } from './local-mavis-commands.js';
 import { LocalMavisCronUnsupportedError, LocalMavisCronValidationError, } from './local-mavis-cron-adapter.js';
-import { createDesktopOutputContinuation } from './output-limit.js';
+import { projectSessionMessagesPage, sessionMessagesView } from './local-mavis-session-messages.js';
+import { createDesktopOutputContinuation, isPtcChildCall } from './output-limit.js';
+import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 import { toAgentRequestRef } from './subagent-roles.js';
 export const DESKTOP_MANAGEMENT_MAX_TOKENS = 16_000;
 const MAVIS_TOKEN_ESTIMATOR = createDefaultTokenEstimator();
@@ -98,9 +100,14 @@ const cronListSchema = z.object({
     limit: optionalNumber,
 });
 const cronGetSchema = z.object({ cron_id: idString });
+const cronExecutionFields = {
+    project: z.string().optional(),
+    model: z.string().optional(),
+};
 const cronResolveModelSchema = z.object({ model: z.string().trim().min(1) }).strict();
 const cronCreateSchema = z
     .object({
+    ...cronExecutionFields,
     agent_name: optionalString,
     cron_name: z.string().min(1),
     schedule: z.string().min(1),
@@ -109,23 +116,21 @@ const cronCreateSchema = z
     active_hours: activeHoursSchema.optional(),
     session: cronCreationSessionSchema,
     enabled: optionalBoolean,
-    project: optionalString,
-    model: optionalString,
 })
     .strict()
     .superRefine(validateCronCreationOwnerInput);
 const cronSelfSchema = z.object({
+    ...cronExecutionFields,
     cron_name: optionalString,
     every: z.string().min(1),
     prompt: z.string().min(1),
     timezone: optionalString,
     quiet_on_skip: optionalBoolean,
     session_id: optionalString,
-    project: optionalString,
-    model: optionalString,
 });
 const cronOnceSchema = z
     .object({
+    ...cronExecutionFields,
     agent_name: optionalString,
     cron_name: optionalString,
     after: optionalString,
@@ -133,13 +138,13 @@ const cronOnceSchema = z
     prompt: z.string().min(1),
     timezone: optionalString,
     session: cronCreationSessionSchema,
-    project: optionalString,
-    model: optionalString,
 })
     .strict()
     .superRefine(validateCronCreationOwnerInput);
 const cronUpdateSchema = z
     .object({
+    ...cronExecutionFields,
+    cron_name: z.string().trim().min(1).optional(),
     cron_id: idString,
     schedule: optionalString,
     prompt: optionalString,
@@ -198,13 +203,21 @@ const sessionUpdateSchema = z.object({
     session_id: idString,
     title: optionalString,
     archived: optionalBoolean,
+    model: optionalString,
 });
-const sessionDeleteSchema = z.object({ session_id: idString });
+const sessionInterruptSchema = z.object({
+    session_id: idString,
+    turn_id: idString.optional(),
+});
 const sessionMessagesSchema = z.object({
     session_id: idString,
     source: sessionReadSource,
     limit: optionalNumber,
     before: optionalString,
+    include_tool_outputs: optionalBoolean,
+    // Values above SESSION_MESSAGES_MAX_OUTPUT_CHARS use the maximum.
+    max_output_chars: z.number().int().positive().optional(),
+    include_thinking: optionalBoolean,
 });
 const mcpTransportSchema = z.enum(['stdio', 'http', 'streamable-http', 'sse']);
 const mcpStringMapSchema = z.record(z.string(), z.string());
@@ -275,8 +288,8 @@ const mcpUpdateSchema = z
 });
 const mcpDeleteSchema = z.object({ name: z.string().min(1) }).strict();
 // `Record<LocalMavisCommandName, ...>` 让本表和 `LOCAL_MAVIS_COMMANDS` 词表
-// 保持强同步：少一条或多一条命令都会直接编译失败。
-const COMMAND_SCHEMAS = {
+// 保持强同步：少一条或多一条命令都会直接编译失败。PTC 的 mavis_* 子工具从这里转出参数 schema。
+export const LOCAL_MAVIS_COMMAND_SCHEMAS = {
     'agent list': pageParamSchema,
     'agent get': agentGetSchema,
     'agent create': agentCreateSchema,
@@ -298,7 +311,7 @@ const COMMAND_SCHEMAS = {
     'session get': sessionGetSchema,
     'session send': sessionSendSchema,
     'session update': sessionUpdateSchema,
-    'session delete': sessionDeleteSchema,
+    'session interrupt': sessionInterruptSchema,
     'session messages': sessionMessagesSchema,
     'session help': helpSchema,
     'mcp list': mcpListSchema,
@@ -331,7 +344,7 @@ const HANDLERS = {
     'session get': handleSessionGet,
     'session send': handleSessionSend,
     'session update': handleSessionUpdate,
-    'session delete': handleSessionDelete,
+    'session interrupt': handleSessionInterrupt,
     'session messages': handleSessionMessages,
     'session help': handleSessionHelp,
     'mcp list': handleMcpList,
@@ -366,15 +379,46 @@ let LocalMavisTool = (() => {
             this.mcpAdapter = mcpAdapter;
         }
         async execute(ctx, input, signal) {
+            if (normalizeCommand(input.command) === 'session create') {
+                const text = JSON.stringify({
+                    ok: false,
+                    command: 'session create',
+                    error: {
+                        kind: 'validation',
+                        code: 'SESSION_CREATE_MOVED',
+                        message: isCallableInRunCode(ctx, 'session_create')
+                            ? 'Search for session_create with tool_search, then call it inside run_code, e.g. await tools.session_create(args).'
+                            : 'Search for session_create with tool_search, then call mcp_invoke.',
+                    },
+                });
+                return mavisRefusal(text);
+            }
+            if (normalizeCommand(input.command) === 'session delete') {
+                // Deletion stays a user action. Answering here, before the unknown-command
+                // branch, keeps the command out of the advertised vocabulary while still
+                // telling the model what to do instead.
+                const text = JSON.stringify({
+                    ok: false,
+                    command: 'session delete',
+                    error: {
+                        kind: 'validation',
+                        code: 'SESSION_DELETE_NOT_ALLOWED',
+                        message: `Deleting a session is reserved for the user. Ask the user to delete it in the app, or archive it with ${localMavisArchiveCall(ctx)}.`,
+                    },
+                });
+                return mavisRefusal(text);
+            }
             if (normalizeCommand(input.command).startsWith('cron ')) {
                 const text = JSON.stringify({
                     ok: false,
                     error: {
                         code: 'CRON_TOOL_MOVED',
-                        message: 'Use self_reminder for task follow-up. Search for cron_create, cron_read, cron_update or cron_delete with tool_search, then call mcp_invoke.',
+                        message: isCronCallableInRunCode(ctx)
+                            ? 'Use self_reminder for task follow-up. Search for cron_create, cron_read, cron_update or cron_delete with tool_search, then call the chosen tool inside run_code, e.g. await tools.cron_read(args).'
+                            : 'Use self_reminder for task follow-up. Search for cron_create, cron_read, cron_update or cron_delete with tool_search, then call mcp_invoke.',
                     },
                 });
-                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+                return mavisRefusal(text);
             }
             const command = normalizeCommand(input.command);
             if (!LOCAL_MAVIS_COMMANDS.includes(command)) {
@@ -387,7 +431,7 @@ let LocalMavisTool = (() => {
                         known_commands: LOCAL_MAVIS_COMMANDS,
                     },
                 });
-                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+                return mavisRefusal(text);
             }
             const output = await dispatchLocalMavis({
                 agentAdapter: this.agentAdapter,
@@ -396,9 +440,10 @@ let LocalMavisTool = (() => {
                 ...(this.mcpAdapter ? { mcpAdapter: this.mcpAdapter } : {}),
                 currentAgentName: ctx.agentName,
                 currentSessionId: ctx.sessionId,
+                currentTurnId: ctx.turnId,
                 currentModel: currentLocalCronModel(ctx),
             }, input.command, input.args, signal);
-            const text = JSON.stringify(output, null, 2);
+            const text = JSON.stringify(ptcMavisHelpOutput(ctx, output), null, 2);
             const historyOutput = JSON.parse(text);
             const result = {
                 tool_name: LocalMavisToolDef.name,
@@ -407,17 +452,32 @@ let LocalMavisTool = (() => {
                 details: { command: output.command, output: historyOutput },
                 ...(output.ok ? {} : { isError: true }),
             };
-            const limited = limitLocalManagementOutput(ctx, text, output);
-            if (!limited.truncated)
-                return result;
+            if (isPtcChildCall(ctx)) {
+                // A run_code child gets the whole response in output and data; only the
+                // program's return value reaches the model (see isPtcChildCall).
+                const uncappedOutput = estimateMavisResultTokens(ctx, text, !output.ok) > DESKTOP_MANAGEMENT_MAX_TOKENS;
+                return withDesktopCompletenessReport(LocalMavisToolDef.name, result, {
+                    data: historyOutput,
+                    ...(uncappedOutput ? { uncappedOutput } : {}),
+                });
+            }
+            const recovery = mavisRecoveryInstruction(output.command, ptcMavisRunCodeTool(ctx, output.command));
+            const limited = limitLocalManagementOutput(ctx, text, output, 'mavis', recovery);
+            // PTC data is the object the text serializes; a head+tail preview cannot
+            // be matched by a partial object, so a cut keeps only ok and command.
+            if (!limited.truncated) {
+                return withDesktopCompletenessReport(LocalMavisToolDef.name, result, {
+                    data: historyOutput,
+                });
+            }
             const continuation = createDesktopOutputContinuation({
                 continuation_hint: {
                     tool: 'mavis',
                     preserve_args: ['command', 'args'],
-                    instruction: mavisRecoveryInstruction(output.command),
+                    instruction: recovery,
                 },
             });
-            return {
+            return withDesktopCompletenessReport(LocalMavisToolDef.name, {
                 ...result,
                 text: limited.text,
                 content: [{ type: 'text', text: limited.text }],
@@ -433,12 +493,22 @@ let LocalMavisTool = (() => {
                     },
                     desktop_output_continuation: continuation,
                 },
-            };
+            }, { data: { ok: output.ok, command: output.command } });
         }
     };
     return LocalMavisTool = _classThis;
 })();
 export { LocalMavisTool };
+/** A command answered before dispatch; PTC data is the same object as the text. */
+function mavisRefusal(text) {
+    return {
+        tool_name: 'mavis',
+        text,
+        content: [{ type: 'text', text }],
+        isError: true,
+        programmatic: { data: JSON.parse(text) },
+    };
+}
 export function limitLocalManagementOutput(ctx, text, output, toolName = 'mavis', recoveryInstruction = mavisRecoveryInstruction(output.command)) {
     const originalTokens = estimateMavisResultTokens(ctx, text, !output.ok);
     if (originalTokens <= DESKTOP_MANAGEMENT_MAX_TOKENS) {
@@ -521,32 +591,6 @@ function isHighSurrogate(code) {
 function isLowSurrogate(code) {
     return code >= 0xdc00 && code <= 0xdfff;
 }
-const LOCAL_MAVIS_MUTATION_COMMANDS = new Set([
-    'agent create',
-    'agent update',
-    'agent delete',
-    'cron create',
-    'cron self',
-    'cron once',
-    'cron update',
-    'cron delete',
-    'cron trigger',
-    'session update',
-    'session delete',
-    'session send',
-    'mcp create',
-    'mcp update',
-    'mcp delete',
-]);
-function mavisRecoveryInstruction(command) {
-    if (LOCAL_MAVIS_MUTATION_COMMANDS.has(command)) {
-        return (`do not repeat the mutation command ${JSON.stringify(command)} automatically; ` +
-            'inspect current state with the corresponding get/list command');
-    }
-    return (`call mavis again with command=${JSON.stringify(command)} and narrower args ` +
-        '(prefer a smaller limit, tighter search/filter, pagination cursor, or a specific get command); ' +
-        'preserve the same logical query');
-}
 export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
     const command = normalizeCommand(rawCommand);
     if (rawArgs?.source !== undefined) {
@@ -579,7 +623,7 @@ export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
             code: 'CRON_CREATE_ME_REJECTED',
         });
     }
-    const schema = COMMAND_SCHEMAS[command];
+    const schema = LOCAL_MAVIS_COMMAND_SCHEMAS[command];
     let substitutedArgs;
     try {
         substitutedArgs = substituteMe(rawArgs ?? {}, ctx.currentAgentName, ctx.currentSessionId);
@@ -743,6 +787,7 @@ async function handleCronCreate(ctx, args, signal) {
         agentName,
         cronName: args.cron_name,
         schedule: args.schedule,
+        ...cronExecutionConfig(args),
         prompt: args.prompt,
         ...(args.timezone ? { timezone: args.timezone } : {}),
         ...(args.active_hours ? { activeHours: args.active_hours } : {}),
@@ -776,6 +821,7 @@ async function handleCronSelf(ctx, args, signal) {
         agentName,
         sessionId,
         every: args.every,
+        ...cronExecutionConfig(args),
         prompt: args.prompt,
         ...(args.cron_name ? { cronName: args.cron_name } : {}),
         ...(args.timezone ? { timezone: args.timezone } : {}),
@@ -787,16 +833,18 @@ async function handleCronSelf(ctx, args, signal) {
 async function handleCronOnce(ctx, args, signal) {
     const session = toAdapterCronCreationSession(ctx, args.session);
     const agentName = await resolveCronCreationAgentName(ctx, args.agent_name, session, signal);
+    const project = await resolveCronCreationProject(ctx, args.project, signal);
     const model = args.model ?? ctx.currentModel;
     return success(ctx.command, await requireCronAdapter(ctx).createOnceCron({
         agentName,
         ...(args.cron_name ? { cronName: args.cron_name } : {}),
         ...(args.after ? { after: args.after } : {}),
+        ...cronExecutionConfig(args),
         ...(args.at !== undefined ? { at: args.at } : {}),
         prompt: args.prompt,
         ...(args.timezone ? { timezone: args.timezone } : {}),
         session,
-        ...(args.project === undefined ? {} : { project: args.project }),
+        ...(project === undefined ? {} : { project }),
         ...(model === undefined ? {} : { model }),
     }, signal));
 }
@@ -807,6 +855,20 @@ export function currentLocalCronModel(ctx) {
         return undefined;
     return `${provider}/${modelId}`;
 }
+/**
+ * True when this Turn runs with programmatic tool calling (PTC) and the
+ * on-demand cron tools are run_code children. There mcp_invoke does not route
+ * them, so recovery text that says "call mcp_invoke" would send the model into
+ * a failed call. The PTC executor answers only for this Turn's run_code
+ * children, so ordinary Turns keep their original wording.
+ */
+export function isCronCallableInRunCode(ctx) {
+    return isCallableInRunCode(ctx, 'cron_read');
+}
+/** Same check for one on-demand tool, such as session_create. */
+function isCallableInRunCode(ctx, toolName) {
+    return ctx.ptcExecutor?.getToolExecutionMode(toolName) !== undefined;
+}
 async function handleCronUpdate(ctx, args, signal) {
     const adapter = requireCronAdapter(ctx);
     const session = args.session ? toAdapterCronSession(ctx, args.session) : undefined;
@@ -816,12 +878,20 @@ async function handleCronUpdate(ctx, args, signal) {
     return success(ctx.command, await adapter.updateCron({
         cronId: args.cron_id,
         ...(args.schedule !== undefined ? { schedule: args.schedule } : {}),
+        ...(args.cron_name === undefined ? {} : { cronName: args.cron_name }),
+        ...cronExecutionConfig(args),
         ...(args.prompt !== undefined ? { prompt: args.prompt } : {}),
         ...(args.timezone !== undefined ? { timezone: args.timezone } : {}),
         ...(args.active_hours ? { activeHours: args.active_hours } : {}),
         ...(session ? { session } : {}),
         ...(args.enabled !== undefined ? { enabled: args.enabled } : {}),
     }, signal));
+}
+function cronExecutionConfig(args) {
+    return {
+        ...(args.project === undefined ? {} : { project: args.project }),
+        ...(args.model === undefined ? {} : { model: args.model }),
+    };
 }
 async function handleCronDelete(ctx, args, signal) {
     return success(ctx.command, await requireCronAdapter(ctx).deleteCron({ cronId: args.cron_id }, signal));
@@ -961,6 +1031,9 @@ async function handleSessionSend(ctx, args, signal) {
     const sessionId = resolveSessionId(ctx, args.session_id);
     return success(ctx.command, await requireSessionAdapter(ctx).sendSession({
         callerSessionId: ctx.currentSessionId,
+        // The caller Turn lets the runtime attribute a new round it starts in a
+        // sub-session to that Turn (Goal token accounting).
+        ...(ctx.currentTurnId ? { callerTurnId: ctx.currentTurnId } : {}),
         sessionId,
         content: args.content,
         // Both switches are passed only when the caller set them, so the
@@ -975,20 +1048,37 @@ async function handleSessionUpdate(ctx, args, signal) {
         sessionId,
         ...(Object.hasOwn(args, 'title') ? { title: args.title } : {}),
         ...(Object.hasOwn(args, 'archived') ? { archived: args.archived } : {}),
+        ...(Object.hasOwn(args, 'model') ? { model: args.model } : {}),
     }, signal));
 }
-async function handleSessionDelete(ctx, args, signal) {
-    const sessionId = resolveSessionId(ctx, args.session_id);
-    return success(ctx.command, await requireSessionAdapter(ctx).deleteSession({ sessionId }, signal));
+async function handleSessionInterrupt(ctx, args, signal) {
+    if (!ctx.currentSessionId) {
+        return failure(ctx.command, 'validation', 'session interrupt requires a caller session', {
+            code: 'SESSION_INTERRUPT_NO_CALLER',
+        });
+    }
+    // The Turn making this call cannot stop itself through a tool: the result
+    // would land in the Turn being torn down. The user stops it from the UI.
+    if (isMeSentinel(args.session_id) || args.session_id === ctx.currentSessionId) {
+        return failure(ctx.command, 'validation', 'A session cannot interrupt itself. Ask the user to stop it from the app.', { code: 'SESSION_INTERRUPT_SELF', session_id: ctx.currentSessionId });
+    }
+    return success(ctx.command, await requireSessionAdapter(ctx).interruptSession({
+        callerSessionId: ctx.currentSessionId,
+        sessionId: args.session_id,
+        ...(args.turn_id ? { turnId: args.turn_id } : {}),
+    }, signal));
 }
 async function handleSessionMessages(ctx, args, signal) {
     const sessionId = resolveSessionId(ctx, args.session_id);
-    return success(ctx.command, await requireSessionAdapter(ctx).listMessages({
+    const page = await requireSessionAdapter(ctx).listMessages({
         sessionId,
         ...(args.source ? { source: args.source } : {}),
         ...(args.limit !== undefined ? { limit: args.limit } : {}),
         ...(args.before ? { before: args.before } : {}),
-    }, signal));
+    }, signal);
+    // Projected here, before the caller serializes and token-counts the response,
+    // so a stored multi-megabyte tool result is never copied whole.
+    return success(ctx.command, projectSessionMessagesPage(page, sessionMessagesView(args)));
 }
 async function handleSessionHelp(ctx) {
     return success(ctx.command, {
@@ -1010,8 +1100,16 @@ async function handleSessionHelp(ctx) {
                     'mavis({ command: "session send", args: { session_id: "mvs_target", content: "Also cover the rollback path.", force_steer: true } })',
                 ],
             },
-            { command: 'session update', args: ['session_id', 'title?', 'archived?'] },
-            { command: 'session delete', args: ['session_id'] },
+            {
+                command: 'session update',
+                args: ['session_id', 'title?', 'archived?', 'model?'],
+            },
+            {
+                command: 'session interrupt',
+                args: ['session_id', 'turn_id?'],
+                summary: "Stop the target session's current turn and keep the session. Queued messages still run afterwards; background work and the goal are untouched. Returns outcome aborted or not_running. Cannot target the calling session.",
+                examples: ['mavis({ command: "session interrupt", args: { session_id: "mvs_target" } })'],
+            },
             {
                 command: 'session messages',
                 args: [
@@ -1019,7 +1117,11 @@ async function handleSessionHelp(ctx) {
                     'source? (local|cloud; default local)',
                     'limit? (cloud default 20, max 100)',
                     'before?',
+                    'include_tool_outputs? (default false)',
+                    'max_output_chars? (default 2000, max 20000)',
+                    'include_thinking? (default false)',
                 ],
+                summary: 'Message text is returned in full. Each tool call is summarized as tool_name, tool_call_id, status, parent_tool_call_id (the run_code that made a child call), args_preview (first 200 characters), args_chars and result_chars, without its result; thinking and usage statistics are omitted. include_tool_outputs: true returns args and result instead, include_thinking: true adds thinking_content, each cut to max_output_chars with *_truncated: true when cut.',
             },
         ],
     });
@@ -1378,6 +1480,28 @@ class LocalMavisRuntimeError extends Error {
         this.code = details.code;
     }
 }
+const INPUT_CONDITION_ERROR_CODES = new Set([
+    'SESSION_UPDATE_INVALID_FIELD',
+    'SESSION_INTERRUPT_SELF',
+    'SESSION_INTERRUPT_TURN_MISMATCH',
+    'SESSION_CREATE_NO_CALLER',
+    'SESSION_CREATE_INVALID_CONTENT',
+    'SESSION_CREATE_UNKNOWN_AGENT',
+    'SESSION_CREATE_INVALID_WORKSPACE',
+    'SESSION_CREATE_INVALID_LOCATION',
+    'SESSION_CREATE_MODEL_UNRESOLVED',
+]);
+/**
+ * Kind for a session error code. Input and precondition codes are validation;
+ * an admission failure is validation only when the same input would fail again.
+ * Everything else is a runtime failure. Status is not consulted.
+ */
+export function sessionCommandErrorKind(code, reason) {
+    if (code === 'SESSION_CREATE_ADMISSION_FAILED') {
+        return reason === 'invalid-input' ? 'validation' : 'local_runtime';
+    }
+    return INPUT_CONDITION_ERROR_CODES.has(code) ? 'validation' : 'local_runtime';
+}
 function errorToFailure(command, error) {
     if (error instanceof LocalMavisValidationError) {
         return failure(command, 'validation', error.message, error.details);
@@ -1398,11 +1522,17 @@ function errorToFailure(command, error) {
         });
     }
     if (isLocalRuntimeError(error)) {
-        return failure(command, 'local_runtime', error.message, {
+        // These codes name bad input or a precondition, even though the runtime
+        // reports them with a status. Everything else with a status stays a runtime failure.
+        const kind = sessionCommandErrorKind(error.code ?? '', error.reason);
+        return failure(command, kind, error.message, {
             status: error.status,
             code: error.code,
             ...(error.sessionId ? { session_id: error.sessionId } : {}),
             ...(error.turnId ? { turn_id: error.turnId } : {}),
+            ...(error.requestedTurnId ? { requested_turn_id: error.requestedTurnId } : {}),
+            ...(error.reason ? { reason: error.reason } : {}),
+            ...(error.field ? { field: error.field } : {}),
         });
     }
     if (error instanceof Error) {

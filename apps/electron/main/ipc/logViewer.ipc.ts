@@ -28,6 +28,8 @@ function getRuntimeEventsDirectory() {
 function isRuntimeLogFile(name) {
     return (/^local-runtime-\d{10}(?:\.\d+)?\.log$/.test(name) ||
         /^runtime-\d{10}(?:\.\d+)?\.log$/.test(name) ||
+        // Per-Session files, listed as `sessions/<sessionId>/runtime-MM-DD[.N].log`.
+        /^runtime-\d{2}-\d{2}(?:\.\d+)?\.log$/.test(name) ||
         /^im-runtime-\d{10}(?:\.\d+)?\.log$/.test(name) ||
         /^local-proxy-\d{10}(?:\.\d+)?\.jsonl$/.test(name));
 }

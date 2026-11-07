@@ -1,3 +1,5 @@
+import { and, asc, desc, eq, gt, lt, or } from 'drizzle-orm';
+import { sessions as s } from '../../../../infra/db/schema/sessions.js';
 export function sessionPageFromRows(records, limit) {
     const sessions = records.slice(0, limit);
     const hasMore = records.length > limit;
@@ -22,6 +24,14 @@ export function sessionCreationPageFromRows(records, limit, originCronId) {
         hasMore,
         ...(hasMore && last ? { nextCursor: encodeCreationCursor(last, originCronId) } : {}),
     };
+}
+export function recencyCursorPredicate(cursor) {
+    if (!cursor)
+        return undefined;
+    return or(lt(s.updatedAtMs, cursor.updatedAtMs), and(eq(s.updatedAtMs, cursor.updatedAtMs), lt(s.createdAtMs, cursor.createdAtMs)), and(eq(s.updatedAtMs, cursor.updatedAtMs), eq(s.createdAtMs, cursor.createdAtMs), gt(s.sessionId, cursor.sessionId)));
+}
+export function recencyOrder() {
+    return [desc(s.updatedAtMs), desc(s.createdAtMs), asc(s.sessionId)];
 }
 export function normalizePageLimit(value, maximum = 200) {
     if (value === undefined || !Number.isFinite(value))

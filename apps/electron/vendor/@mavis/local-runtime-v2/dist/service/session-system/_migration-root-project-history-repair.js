@@ -217,8 +217,7 @@ function readDefinitionRepair(tx, current, agent) {
 }
 function writeCandidateRepair(tx, current, nextDefinition) {
     const projection = encodeSessionRow({ ...current.record, isDefaultWorkspace: false }, { preservedRecordJson: current.row.recordJson, projectId: current.row.projectId });
-    tx
-        .update(sessions)
+    tx.update(sessions)
         .set({
         projectWorkspaceDir: projection.projectWorkspaceDir,
         isDefaultWorkspace: projection.isDefaultWorkspace,
@@ -230,8 +229,7 @@ function writeCandidateRepair(tx, current, nextDefinition) {
 function writeDefinitionRepair(tx, sessionId, nextDefinition) {
     if (!nextDefinition)
         return;
-    tx
-        .update(sessionAgentDefinitions)
+    tx.update(sessionAgentDefinitions)
         .set({ definitionJson: nextDefinition.definitionJson })
         .where(eq(sessionAgentDefinitions.sessionId, sessionId))
         .run();
@@ -261,7 +259,9 @@ function repairDefinition(input) {
 function samePath(left, right) {
     const normalizedLeft = normalizeAbsolutePath(left);
     const normalizedRight = normalizeAbsolutePath(right);
-    if (!normalizedLeft || !normalizedRight || pathFlavor(normalizedLeft) !== pathFlavor(normalizedRight)) {
+    if (!normalizedLeft ||
+        !normalizedRight ||
+        pathFlavor(normalizedLeft) !== pathFlavor(normalizedRight)) {
         return false;
     }
     return pathFlavor(normalizedLeft) === pathFlavor('C:\\')

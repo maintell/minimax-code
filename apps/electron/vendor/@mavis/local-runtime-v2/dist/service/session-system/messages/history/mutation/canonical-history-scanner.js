@@ -1,4 +1,4 @@
-import { lstat, readdir, readFile } from 'node:fs/promises';
+import { lstat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { canonicalActiveHistoryRevision, canonicalHistoryRevision, } from '../../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../../sessions/representation/canonical-history.js';
@@ -22,7 +22,7 @@ export async function scanCanonicalHistoryArtifacts(paths, files = createCanonic
     const reachable = [...chain.artifacts];
     const activeScanned = { ...active, generation: active.generation, fileName: 'messages.jsonl' };
     reachable.push(activeScanned);
-    const locators = await collectUserMessageLocators(reachable);
+    validateExternalUserLineage(reachable);
     return {
         catalog: {
             schemaVersion: 1,
@@ -31,7 +31,6 @@ export async function scanCanonicalHistoryArtifacts(paths, files = createCanonic
             activeRevision: active.revision,
             artifacts: reachable.map(({ path: _path, records: _records, ...artifact }) => artifact),
         },
-        locators,
         orphans: names
             .filter((entry) => !chain.reachedNames.has(entry.fileName))
             .map((entry) => entry.fileName),
@@ -93,51 +92,30 @@ async function readReachableParent(input) {
         marker: readV2Marker(scanned.records, snapshot.generation),
     };
 }
-async function collectUserMessageLocators(artifacts) {
+/**
+ * A user message keeps its `msg-user-v1-` identity across compaction generations.
+ * Every occurrence must be a user message, and a repeated occurrence must carry the
+ * same payload in the next generation; otherwise the reachable chain is corrupt.
+ */
+function validateExternalUserLineage(artifacts) {
     const lineage = new Map();
-    const locators = [];
     for (const artifact of artifacts) {
-        const raw = await readFile(artifact.path, 'utf8');
-        collectArtifactLocators(artifact, raw, lineage, locators);
-    }
-    return locators;
-}
-function collectArtifactLocators(artifact, raw, lineage, locators) {
-    let offset = 0;
-    let recordIndex = 0;
-    raw.split('\n').forEach((line, index) => {
-        if (line.length > 0) {
-            const parsed = artifact.records[recordIndex];
-            recordIndex += 1;
-            if (parsed && isExternalUserId(parsed.message_id)) {
-                if (parsed.message.role !== 'user') {
-                    throw new HistoryScannerError('external-user-lineage-conflict');
-                }
-                const fingerprint = externalUserFingerprint(parsed);
-                const previous = lineage.get(parsed.message_id);
-                if (previous &&
-                    (previous.fingerprint !== fingerprint ||
-                        previous.lastGeneration + 1 !== artifact.generation)) {
-                    throw new HistoryScannerError('external-user-lineage-conflict');
-                }
-                lineage.set(parsed.message_id, {
-                    fingerprint,
-                    lastGeneration: artifact.generation,
-                });
-                if (!previous) {
-                    locators.push({
-                        schemaVersion: 1,
-                        messageId: parsed.message_id,
-                        generation: artifact.generation,
-                        lineNumber: index + 1,
-                        byteOffset: offset,
-                        artifactRevision: artifact.revision,
-                    });
-                }
+        for (const record of artifact.records) {
+            if (!isExternalUserId(record.message_id))
+                continue;
+            if (record.message.role !== 'user') {
+                throw new HistoryScannerError('external-user-lineage-conflict');
             }
+            const fingerprint = externalUserFingerprint(record);
+            const previous = lineage.get(record.message_id);
+            if (previous &&
+                (previous.fingerprint !== fingerprint ||
+                    previous.lastGeneration + 1 !== artifact.generation)) {
+                throw new HistoryScannerError('external-user-lineage-conflict');
+            }
+            lineage.set(record.message_id, { fingerprint, lastGeneration: artifact.generation });
         }
-        offset += Buffer.byteLength(line, 'utf8') + 1;
-    });
+    }
 }
 function externalUserFingerprint(envelope) {
     const semanticEnvelope = {

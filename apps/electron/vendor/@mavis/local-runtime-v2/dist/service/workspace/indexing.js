@@ -19,45 +19,4 @@ export class WorkspaceIndexingPolicy {
         return (await this.get()).enabled;
     }
 }
-export class WorkspaceIndexing {
-    policy;
-    executor;
-    mutationTail = Promise.resolve();
-    constructor(policy, executor) {
-        this.policy = policy;
-        this.executor = executor;
-    }
-    get() {
-        return this.policy.get();
-    }
-    async put(enabled) {
-        const previous = this.mutationTail;
-        let release;
-        this.mutationTail = new Promise((resolve) => {
-            release = resolve;
-        });
-        await previous;
-        try {
-            const state = await this.policy.put(enabled);
-            if (!state.forced && !state.enabled)
-                this.executor.closeWorkspacePrewarm();
-            return state;
-        }
-        finally {
-            release();
-        }
-    }
-    prepareSessionStart(sessionId) {
-        return this.executor.prepareSessionStart(sessionId);
-    }
-    captureRevisionAfterTurn(sessionId) {
-        return this.executor.captureRevisionAfterTurn(sessionId);
-    }
-    runSessionDeletion(sessionId, deletion) {
-        return this.executor.runSessionDeletion(sessionId, deletion);
-    }
-    prewarm(workspaceDir) {
-        this.executor.prewarmWorkspace(workspaceDir);
-    }
-}
 //# sourceMappingURL=indexing.js.map

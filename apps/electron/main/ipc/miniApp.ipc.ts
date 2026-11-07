@@ -1,8 +1,9 @@
 import { ipcMain } from "electron";
+import { parseMiniAppPermissionId, parseMiniAppPermissionList, parseMiniAppWindowPatch } from "@mavis/shared/miniapp-surface";
 import { IPC_CHANNELS } from "../config/constants";
-import { getEmbeddedBrowserManager } from "../modules/browser/embedded-browser-manager";
-import { openManagedMiniAppSurface } from "../modules/browser/miniapp-surface";
-import { requestUtilityMiniApp } from "../modules/local-runtime/utility";
+import { getEmbeddedBrowserManager, syncManagedMiniAppLoopbackCredential } from "../modules/browser/embedded-browser-manager";
+import { readRunningMiniAppCredential, openManagedMiniAppSurface } from "../modules/browser/miniapp-surface";
+import { requestUtilityMiniApp, setUtilityMiniAppPermission } from "../modules/local-runtime/utility";
 import { readMiniAppBrokerFailureDiagnostic } from "../modules/local-runtime/utility/miniapp-broker.js";
 import { getCategoryLogger } from "../utils/logger.js";
 const miniAppOpenLogger = getCategoryLogger('archon', 'miniapp-open');
@@ -24,7 +25,114 @@ export function setupMiniAppIPC() {
     ipcMain.handle(IPC_CHANNELS.MINIAPP_OPEN, (_event, params) => openMiniApp(params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_REFRESH, (_event, params) => controlMiniApp('refresh', params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_STOP, (_event, params) => controlMiniApp('stop', params));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_DETACH, (_event, params) => controlMiniApp('detach', params));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_ATTACH, (_event, params) => controlMiniApp('attach', params));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_APPLY_UPDATE, (_event, params) => applyMiniAppUpdate(params));
+    setupMiniAppPermissionsIPC();
+    setupMiniAppWindowHandleIPC();
 }
+/**
+ * Plugin-detail switches; the Host renderer passes plain ids, Main re-validates them. A switch
+ * only changes what the Host admits from the next call on, so open pages need nothing here.
+ */
+function setupMiniAppPermissionsIPC() {
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_PERMISSIONS_LIST, async (_event, params) => {
+        if (!isRecordWithOnlyKeys(params, ['pluginId'])) {
+            return { success: false, code: 'invalid_request' };
+        }
+        const pluginId = normalizeIdentifier(params.pluginId);
+        if (!pluginId)
+            return { success: false, code: 'invalid_request' };
+        return permissionsResponse(() => requestUtilityMiniApp('permissions.list', pluginId));
+    });
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_PERMISSIONS_SET, async (_event, params) => {
+        if (!isRecordWithOnlyKeys(params, ['pluginId', 'permission', 'enabled'])) {
+            return { success: false, code: 'invalid_request' };
+        }
+        const pluginId = normalizeIdentifier(params.pluginId);
+        const permission = parseMiniAppPermissionId(params.permission);
+        if (!pluginId || !permission || typeof params.enabled !== 'boolean') {
+            return { success: false, code: 'invalid_request' };
+        }
+        const enabled = params.enabled;
+        const response = await permissionsResponse(() => setUtilityMiniAppPermission({ pluginId, permission: permission.id, enabled }));
+        if (response.success) {
+            getEmbeddedBrowserManager().onMiniAppPermissionChanged(pluginId, permission.id, enabled);
+        }
+        return response;
+    });
+}
+async function permissionsResponse(request) {
+    try {
+        const result = await request();
+        const permissions = result && typeof result === 'object' && 'permissions' in result
+            ? parseMiniAppPermissionList(result.permissions)
+            : null;
+        return permissions
+            ? { success: true, permissions }
+            : { success: false, code: 'permission_failed' };
+    }
+    catch (error) {
+        return { success: false, code: normalizeErrorCode(error, 'permission_failed') };
+    }
+}
+/**
+ * Page-facing `window.mcode.miniapp.window`. The calling tab is resolved from
+ * Electron's `event.sender` / `event.senderFrame` only; nothing the page sends
+ * identifies a target. Requests are re-parsed here even though the preload
+ * already validated them.
+ */
+function setupMiniAppWindowHandleIPC() {
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_WINDOW_GET_STATE, (event) => {
+        try {
+            return getEmbeddedBrowserManager().getMiniAppWindowState(event.sender, event.senderFrame);
+        }
+        catch {
+            return { success: false, code: 'result_unknown' };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_WINDOW_UPDATE, async (event, request) => {
+        if (!isRecordWithOnlyKeys(request, ['patch', 'userActivated'])) {
+            return { success: false, code: 'invalid_request' };
+        }
+        if (typeof request.userActivated !== 'boolean') {
+            return { success: false, code: 'invalid_request' };
+        }
+        const parsed = parseMiniAppWindowPatch(request.patch);
+        if (!parsed.ok)
+            return { success: false, code: parsed.code };
+        try {
+            return await getEmbeddedBrowserManager().updateMiniAppWindow(event.sender, event.senderFrame, parsed.patch, request.userActivated);
+        }
+        catch {
+            return { success: false, code: 'result_unknown' };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_WINDOW_FOCUS, (event, request) => {
+        if (!isRecordWithOnlyKeys(request, ['userActivated']) ||
+            typeof request.userActivated !== 'boolean') {
+            return { success: false, code: 'invalid_request' };
+        }
+        try {
+            return getEmbeddedBrowserManager().focusMiniAppWindow(event.sender, event.senderFrame, request.userActivated);
+        }
+        catch {
+            return { success: false, code: 'result_unknown' };
+        }
+    });
+}
+function isRecordWithOnlyKeys(value, keys) {
+    return (!!value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Object.keys(value).every((key) => keys.includes(key)));
+}
+const CONTROL_FAILURE_CODES = {
+    refresh: 'refresh_failed',
+    stop: 'stop_failed',
+    detach: 'detach_failed',
+    attach: 'attach_failed',
+};
 async function controlMiniApp(method, params) {
     const sessionId = normalizeIdentifier(params?.sessionId);
     const pluginId = normalizeIdentifier(params?.pluginId);
@@ -53,7 +161,19 @@ async function controlMiniApp(method, params) {
     try {
         const manager = getEmbeddedBrowserManager();
         if (method === 'refresh') {
-            await manager.refreshMiniAppTab({ sessionId, pluginId });
+            await manager.refreshMiniAppTab({
+                sessionId,
+                pluginId,
+                readCredential: () => readRunningMiniAppCredential(pluginId),
+            });
+            return { success: true };
+        }
+        if (method === 'detach') {
+            await manager.detachMiniAppTab({ sessionId, pluginId });
+            return { success: true };
+        }
+        if (method === 'attach') {
+            await manager.attachMiniAppTab({ sessionId, pluginId });
             return { success: true };
         }
         stage = 'utility_stop';
@@ -71,7 +191,7 @@ async function controlMiniApp(method, params) {
         return { success: true };
     }
     catch (error) {
-        const code = normalizeErrorCode(error, method === 'refresh' ? 'refresh_failed' : 'stop_failed');
+        const code = normalizeErrorCode(error, CONTROL_FAILURE_CODES[method]);
         if (method === 'stop')
             recordStopResult(code, error);
         return { success: false, code };
@@ -112,6 +232,44 @@ function recordStopDiagnostic(input) {
         // Diagnostics are best-effort and must never replace the renderer-safe result.
     }
 }
+/**
+ * Behaves like the user pressing stop then start: the Utility restarts the Node, and only the
+ * requesting session (if any) reopens its page through the regular open path.
+ */
+async function applyMiniAppUpdate(params) {
+    const pluginId = normalizeIdentifier(params?.pluginId);
+    const sessionId = params?.sessionId === undefined ? undefined : normalizeIdentifier(params.sessionId);
+    if (!pluginId || sessionId === null)
+        return { success: false, code: 'invalid_request' };
+    let result;
+    try {
+        result = await requestUtilityMiniApp('applyUpdate', pluginId);
+    }
+    catch (error) {
+        return { success: false, code: normalizeErrorCode(error, 'update_failed') };
+    }
+    if (!('launch' in result))
+        return { success: false, code: 'update_failed' };
+    // The service is updated from here on; a page that does not reopen is left to the user's start.
+    try {
+        syncManagedMiniAppLoopbackCredential(pluginId, {
+            origin: result.launch.origin,
+            loopbackToken: result.launch.loopbackToken,
+        });
+        if (sessionId)
+            await openManagedMiniAppSurface({ sessionId, pluginId });
+    }
+    catch (error) {
+        miniAppControlLogger.warn({
+            msg: '[MiniAppControl] reopen after update failed',
+            event: 'miniapp_update_reopen_failed',
+            ...(isSafeDiagnosticPluginId(pluginId) ? { pluginId } : {}),
+            surfaceCode: normalizeErrorCode(error),
+            errorName: error instanceof Error ? error.name : typeof error,
+        });
+    }
+    return { success: true };
+}
 async function startMiniApp(pluginId) {
     try {
         // Utility launch coordinates stay private in Main. The process-local open
@@ -120,9 +278,14 @@ async function startMiniApp(pluginId) {
         // declared MCP endpoint is available. It projects only the renderer-safe
         // runtime summary and creates no tab.
         const result = await requestUtilityMiniApp('open', pluginId);
-        return 'launch' in result
-            ? { success: true, miniApp: result.miniApp }
-            : { success: false, code: 'start_failed' };
+        if (!('launch' in result))
+            return { success: false, code: 'start_failed' };
+        // Pages of this plugin already open in any session follow the run just started.
+        syncManagedMiniAppLoopbackCredential(pluginId, {
+            origin: result.launch.origin,
+            loopbackToken: result.launch.loopbackToken,
+        });
+        return { success: true, miniApp: result.miniApp };
     }
     catch (error) {
         const code = normalizeErrorCode(error);
@@ -146,10 +309,7 @@ async function openMiniApp(params) {
         return { success: false, code: 'invalid_request' };
     const startedAt = Date.now();
     try {
-        const tab = await openManagedMiniAppSurface({
-            sessionId,
-            pluginId,
-        });
+        const tab = await openManagedMiniAppSurface({ sessionId, pluginId });
         return { success: true, tab };
     }
     catch (error) {
@@ -211,7 +371,13 @@ function normalizeErrorCode(error, fallback = 'start_failed') {
         code === 'busy' ||
         code === 'refresh_failed' ||
         code === 'stop_failed' ||
-        code === 'start_failed'
+        code === 'start_failed' ||
+        code === 'detach_failed' ||
+        code === 'attach_failed' ||
+        code === 'no_update' ||
+        code === 'update_failed' ||
+        code === 'permission_unknown' ||
+        code === 'permission_failed'
         ? code
         : fallback;
 }

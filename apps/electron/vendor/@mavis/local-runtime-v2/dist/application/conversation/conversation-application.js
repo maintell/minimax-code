@@ -6,9 +6,11 @@ import { isSameSessionAgentName, QueueServiceError, } from '../../service/sessio
 import { DEFAULT_RETRY_CONTINUATION_PROMPT } from '../../service/turn-system/index.js';
 import { AttachmentRegistrationError, attachmentRegistrationResponse, materializeLocalAttachmentInputs, } from './attachment-registration.js';
 import { ApplicationError, turnAdmissionError } from './errors.js';
+import { outputContractField } from './output-contract.js';
 import { queueServiceApplicationError } from './queue-service-error.js';
 import { countApplicationMetric } from '../session/metrics.js';
 import { mapV2TurnStreamResult, openV2SessionStream } from './session-stream-delivery.js';
+import { openUndeliveredSideMessageAction } from './undelivered-side-message-send.js';
 import { WorkspaceInitialSnapshotGateError, WORKSPACE_INITIAL_SNAPSHOT_FAILED, WORKSPACE_INITIAL_SNAPSHOT_FAILED_MESSAGE, } from './workspace-snapshot-gate.js';
 /** Owns the conversation use cases migrated from SessionController. */
 export class ConversationApplication {
@@ -33,6 +35,10 @@ export class ConversationApplication {
         const gateError = await this.sendMessageGateError(req, options);
         if (gateError)
             return gateError;
+        const { undeliveredMessages, directSend } = this.options;
+        const action = await openUndeliveredSideMessageAction(req, undeliveredMessages, directSend);
+        if (action)
+            return action;
         let prepared;
         try {
             prepared = await toDirectSendInput(req, this.options.attachmentRegistration);
@@ -54,7 +60,7 @@ export class ConversationApplication {
                 ...submission,
                 ...(options.pausedQueueAction ? { resumePausedQueue: true } : {}),
             });
-            if (!result.accepted)
+            if (!keepsCreatedAttachments(result))
                 await prepared.discardCreated();
             return mapV2TurnStreamResult(result);
         }
@@ -98,28 +104,35 @@ export class ConversationApplication {
         return error ? streamOpenError(error.status, error.key, error.message) : undefined;
     }
     async reviewAdmissionError(req) {
-        if (!req.reviewRequest)
-            return undefined;
-        if (req.reviewRequest.scope !== 'local_changes') {
-            return new ApplicationError(400, 'local_review_scope_unsupported', 'Only reviewRequest.scope="local_changes" is supported.');
-        }
-        const session = await this.options.sessionReader.find(req.id);
-        if (session && (session.appMode ?? 'coding') !== 'coding') {
-            return new ApplicationError(400, 'local_review_coding_mode_required', 'Built-in code review is only available in coding mode.');
-        }
-        return undefined;
+        return reviewAdmissionError(req, (id) => this.options.sessionReader.find(id));
     }
     async resumeSession(_ctx, req) {
         return this.withSessionLifecycle('resume', async () => {
+            const activeSide = this.options.sideChats.relation(req.id) !== undefined;
             const session = await this.options.sessionReader.find(req.id);
             if (!session) {
                 return streamOpenError(404, 'local_session_not_found', `Session not found: ${req.id}`);
             }
             const frames = this.options.stream.resume({
                 sessionId: req.id,
-                ...(req.afterMsgId ? { afterMsgId: req.afterMsgId } : {}),
-                ...(req.afterCursor ? { afterCursor: req.afterCursor } : {}),
-                waitForTerminal: shouldWaitForTerminal(req.drainQueued === true || req.continuePausedQueue === true, session.status),
+                ...resumeAnchors(req, activeSide),
+                waitForTerminal: activeSide
+                    ? async (lastTerminalTurnId) => {
+                        const pending = await this.options.queue.snapshot(req.id);
+                        const current = await this.options.sessionReader.find(req.id);
+                        if (!current)
+                            return false;
+                        if (shouldWaitForTerminal(req.drainQueued === true ||
+                            req.continuePausedQueue === true ||
+                            (pending.pendingCount > 0 && !pending.pause), current.status))
+                            return true;
+                        // Admission precedes Session started, but terminal projection also
+                        // precedes lease release. Only wait for a Turn whose terminal was
+                        // not already captured at the subscription's replay boundary.
+                        const activeTurn = await this.getActiveTurn(req.id);
+                        return activeTurn !== undefined && activeTurn.turnId !== lastTerminalTurnId;
+                    }
+                    : shouldWaitForTerminal(req.drainQueued === true || req.continuePausedQueue === true, session.status),
             });
             try {
                 if (req.continuePausedQueue) {
@@ -150,11 +163,65 @@ export class ConversationApplication {
         }
         return mapV2TurnStreamResult(await this.options.continuation.open(req.id));
     }
+    /**
+     * Cancels the optional next-message suggestion for one exact settled Turn.
+     * It never aborts the main agent Turn, and a stale Turn id cannot cancel a
+     * newer Turn of the same Session.
+     */
+    async cancelPromptSuggestion(_ctx, req) {
+        const turnId = req.turnId.trim();
+        if (!turnId)
+            throw new ApplicationError(400, 'local_prompt_suggestion_turn_required', `turn_id is required to cancel a prompt suggestion: ${req.id}`);
+        // The tombstone is recorded even when nothing is in flight, so a cancel that
+        // beats its own schedule still blocks that late schedule.
+        return { cancelled: this.options.turn.promptSuggestion?.cancel(req.id, turnId) === true };
+    }
+    /**
+     * Restores the optional next-message suggestion for one exact settled Turn.
+     * This is a pure read of an existing result: it issues no model request and
+     * spends no quota. An empty suggestion is a normal response, not an error, so
+     * the status explains every case where nothing is returned.
+     */
+    async getPromptSuggestion(_ctx, req) {
+        const turnId = req.turnId.trim();
+        if (!turnId)
+            throw new ApplicationError(400, 'local_prompt_suggestion_turn_required', `turn_id is required to read a prompt suggestion: ${req.id}`);
+        if (!(await this.options.sessionReader.find(req.id)))
+            throw sessionNotFound(req.id);
+        const result = this.options.turn.promptSuggestion?.read(req.id, turnId);
+        // Absent suggestion is expressed by omission, so the wire shape never
+        // implies an available suggestion the runtime refused to return.
+        return {
+            status: result?.status ?? 'absent',
+            ...(result?.suggestion
+                ? {
+                    suggestion: result.suggestion,
+                    promptVersion: result.promptVersion,
+                    generatedAt: result.generatedAt,
+                    elapsedMs: result.elapsedMs,
+                    usage: result.usage
+                        ? {
+                            inputTokens: result.usage.inputTokens,
+                            outputTokens: result.usage.outputTokens,
+                        }
+                        : undefined,
+                }
+                : {}),
+        };
+    }
     async abortSession(_ctx, req) {
         const abortSource = normalizeAbortSource(req.reason);
         const result = await this.withSessionLifecycle('abort', async () => {
             if (!(await this.options.sessionReader.find(req.id)))
                 throw sessionNotFound(req.id);
+            if ((await this.getActiveTurn(req.id))?.ownedByOtherRuntime) {
+                // Only the Runtime holding the lease can stop this Turn. Leaving the
+                // Session is a no-op here; an explicit stop must not report success or
+                // pause a Goal that the other Runtime is still driving.
+                if (abortSource === 'session_leave')
+                    return { status: 'not-running' };
+                throw turnOwnedByOtherRuntimeError();
+            }
             return this.options.turn.abort({
                 sessionId: req.id,
                 ...(req.turnId ? { turnId: req.turnId } : {}),
@@ -185,9 +252,9 @@ export class ConversationApplication {
         }
     }
     async enqueueMessage(_ctx, req) {
-        const reviewAdmissionError = await this.reviewAdmissionError(req);
-        if (reviewAdmissionError)
-            throw reviewAdmissionError;
+        const reviewError = await this.reviewAdmissionError(req);
+        if (reviewError)
+            throw reviewError;
         let result;
         let discardCreated = async () => undefined;
         try {
@@ -273,6 +340,13 @@ function queueContinueApplicationError(result, sessionId) {
     }
     return new ApplicationError(409, 'local_queue_continue_not_ready', 'The paused Queue head could not be started');
 }
+function resumeAnchors(req, activeSide) {
+    return {
+        ...(req.afterMsgId ? { afterMsgId: req.afterMsgId } : {}),
+        ...(req.afterCursor ? { afterCursor: req.afterCursor } : {}),
+        ...(activeSide && !req.afterMsgId && !req.afterCursor ? { replayFromStart: true } : {}),
+    };
+}
 function shouldWaitForTerminal(drainQueued, status) {
     return drainQueued === true || status === 'started';
 }
@@ -296,7 +370,13 @@ function requireNonEmpty(value) {
         return undefined;
     return value.trim().length === 0 ? undefined : value;
 }
-async function toDirectSendInput(req, registration) {
+/** Admissions and recorded undelivered rows keep attachments; a duplicate reuses the original's. */
+function keepsCreatedAttachments(result) {
+    if (!result.accepted)
+        return 'undelivered' in result && result.undelivered !== undefined;
+    return !('outcome' in result && result.outcome === 'duplicate');
+}
+export async function toDirectSendInput(req, registration) {
     const executionOptions = directExecutionOptions(req);
     const materialized = await materializeLocalAttachmentInputs(registration, {
         sessionId: req.id,
@@ -351,128 +431,6 @@ function executionDeadlineAdmissionError(req, options = {}) {
     }
     return undefined;
 }
-function outputContractField(req) {
-    if (req.outputFormat !== undefined && req.outputSchema !== undefined) {
-        throw new ApplicationError(400, 'local_output_format_conflict', 'outputFormat and outputSchema cannot be used together.');
-    }
-    if (req.outputSchema !== undefined) {
-        return {
-            outputContract: {
-                type: 'json_schema',
-                schema: snapshotLegacyOutputSchema(req.outputSchema),
-            },
-        };
-    }
-    if (req.outputFormat === undefined)
-        return {};
-    if (!isPlainRecord(req.outputFormat)) {
-        throw invalidOutputFormat('outputFormat must be an object with a supported type.');
-    }
-    if (req.outputFormat.type === 'json_object') {
-        assertExactKeys(req.outputFormat, ['type'], 'json_object outputFormat');
-        return { outputContract: { type: 'json_object' } };
-    }
-    if (req.outputFormat.type === 'json_schema') {
-        assertExactKeys(req.outputFormat, ['type', 'schema'], 'json_schema outputFormat');
-        return {
-            outputContract: {
-                type: 'json_schema',
-                schema: snapshotJsonSchemaObject(req.outputFormat.schema, 'outputFormat.schema'),
-            },
-        };
-    }
-    throw invalidOutputFormat('outputFormat.type must be json_object or json_schema.');
-}
-function snapshotLegacyOutputSchema(value) {
-    if (!isPlainRecord(value)) {
-        throw invalidOutputFormat('outputSchema must be a JSON Schema object.');
-    }
-    // Keep the legacy Host snapshot semantics, including optional undefined values.
-    // Detach before attachment registration; Host validation still runs downstream.
-    try {
-        return structuredClone(value);
-    }
-    catch {
-        throw invalidOutputFormat('outputSchema must support structured cloning.');
-    }
-}
-function snapshotJsonSchemaObject(value, field) {
-    if (!isPlainRecord(value)) {
-        throw invalidOutputFormat(`${field} must be a JSON Schema object.`);
-    }
-    return snapshotJsonValue(value, field, new Set());
-}
-function snapshotJsonValue(value, path, ancestors) {
-    if (value === null || typeof value === 'string' || typeof value === 'boolean')
-        return value;
-    if (typeof value === 'number') {
-        if (Number.isFinite(value))
-            return value;
-        throw invalidOutputFormat(`${path} must contain only finite JSON numbers.`);
-    }
-    if (typeof value !== 'object') {
-        throw invalidOutputFormat(`${path} must contain only JSON-compatible values.`);
-    }
-    return snapshotJsonComposite(value, path, ancestors);
-}
-function snapshotJsonComposite(value, path, ancestors) {
-    if (ancestors.has(value)) {
-        throw invalidOutputFormat(`${path} must not contain circular references.`);
-    }
-    ancestors.add(value);
-    try {
-        return Array.isArray(value)
-            ? snapshotJsonArray(value, path, ancestors)
-            : snapshotJsonRecord(value, path, ancestors);
-    }
-    finally {
-        ancestors.delete(value);
-    }
-}
-function snapshotJsonArray(value, path, ancestors) {
-    if (Object.getOwnPropertySymbols(value).length > 0) {
-        throw invalidOutputFormat(`${path} must not contain symbol properties.`);
-    }
-    const snapshot = Array.from({ length: value.length }, (_, index) => {
-        if (!Object.prototype.hasOwnProperty.call(value, index)) {
-            throw invalidOutputFormat(`${path}[${String(index)}] must not be an array hole.`);
-        }
-        return snapshotJsonValue(value[index], `${path}[${String(index)}]`, ancestors);
-    });
-    return Object.freeze(snapshot);
-}
-function snapshotJsonRecord(value, path, ancestors) {
-    if (!isPlainRecord(value)) {
-        throw invalidOutputFormat(`${path} must contain only plain JSON objects.`);
-    }
-    if (Object.getOwnPropertySymbols(value).length > 0) {
-        throw invalidOutputFormat(`${path} must not contain symbol properties.`);
-    }
-    const snapshot = {};
-    for (const [key, child] of Object.entries(value)) {
-        Object.defineProperty(snapshot, key, {
-            value: snapshotJsonValue(child, `${path}.${key}`, ancestors),
-            enumerable: true,
-            configurable: false,
-            writable: false,
-        });
-    }
-    return Object.freeze(snapshot);
-}
-function assertExactKeys(value, allowedKeys, field) {
-    if (Object.keys(value).some((key) => !allowedKeys.includes(key))) {
-        throw invalidOutputFormat(`${field} contains unsupported fields.`);
-    }
-}
-function isPlainRecord(value) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value))
-        return false;
-    const prototype = Object.getPrototypeOf(value);
-    return prototype === Object.prototype || prototype === null;
-}
-function invalidOutputFormat(message) {
-    return new ApplicationError(400, 'local_output_format_invalid', message);
-}
 function messageProvenance(req) {
     if (req.clientIntent === 'cloud-handoff') {
         return {
@@ -524,6 +482,7 @@ function normalizedRetryClientIntent(clientIntent, content, hasAttachments) {
 function toAgentHostUserInput(req, text, attachments) {
     return {
         text,
+        ...(req.computerUse ? { computerUse: structuredClone(req.computerUse) } : {}),
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(req.model ? { model: toUserModelSelection(req.model) } : {}),
         ...(req.computerUse ? { computerUse: { enable: req.computerUse.enable } } : {}),
@@ -624,6 +583,10 @@ function lifecycleSucceeded(result) {
 function sessionNotFound(sessionId) {
     return new ApplicationError(404, 'local_session_not_found', `Session not found: ${sessionId}`);
 }
+/** Reuses the existing busy key so every client already recognizes it. */
+function turnOwnedByOtherRuntimeError() {
+    return new ApplicationError(409, 'local_session_busy', 'Session is running in another MCode process. Stop it from that process.');
+}
 function enqueueApplicationError(error) {
     if (error instanceof QueueServiceError)
         return queueServiceApplicationError(error);
@@ -668,9 +631,9 @@ function genericRejectionError(reason, sessionId) {
     if (reason === 'ingress-conflict') {
         return new ApplicationError(409, 'local_turn_ingress_conflict', 'Turn ingress conflicts');
     }
-    const planError = planRejectionError(reason);
-    if (planError)
-        return planError;
+    const policyError = policyRejectionError(reason);
+    if (policyError)
+        return policyError;
     if (reason === 'duplicate') {
         return new ApplicationError(409, 'local_turn_duplicate', 'Turn was already accepted');
     }
@@ -685,7 +648,10 @@ function genericRejectionError(reason, sessionId) {
     }
     return new ApplicationError(409, 'local_session_busy', 'Session already has an active Turn. Retry with queueing enabled to deliver it later.');
 }
-function planRejectionError(reason) {
+function policyRejectionError(reason) {
+    if (reason === 'policy:runtime:draining') {
+        return new ApplicationError(503, 'local_runtime_draining', 'MCode is preparing to restart. Retry after reconnecting.');
+    }
     if (reason === 'policy:plan:lifecycle-active') {
         return new ApplicationError(409, 'local_plan_lifecycle_active', 'Plan review processing must finish before this request can run');
     }
@@ -697,6 +663,18 @@ function planRejectionError(reason) {
     }
     if (reason === 'policy:plan:mode-conflict') {
         return new ApplicationError(409, 'local_plan_mode_conflict', 'Session mode changed before Plan Mode entry');
+    }
+    return undefined;
+}
+export async function reviewAdmissionError(req, findSession) {
+    if (!req.reviewRequest)
+        return undefined;
+    if (req.reviewRequest.scope !== 'local_changes') {
+        return new ApplicationError(400, 'local_review_scope_unsupported', 'Only reviewRequest.scope="local_changes" is supported.');
+    }
+    const session = await findSession(req.id);
+    if (session && (session.appMode ?? 'coding') !== 'coding') {
+        return new ApplicationError(400, 'local_review_coding_mode_required', 'Built-in code review is only available in coding mode.');
     }
     return undefined;
 }

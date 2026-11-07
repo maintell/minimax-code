@@ -20,11 +20,11 @@
  *      `detectEncodingForResolvedPath` semantics).
  *
  * Local-FS assumption: like read-video.ts / read-guards.ts, this module
- * talks to `node:fs/promises` directly — both hosts (desktop process, cloud
- * sandbox executor) run on a local FS. Remote-FS hosts keep pi's default
- * operations and none of this engages.
+ * uses physical-fs so Electron cannot treat user archives as directories.
+ * Both hosts (desktop process, cloud sandbox executor) run on a local FS.
+ * Remote-FS hosts keep pi's default operations and none of this engages.
  */
-import { readFile as fsReadFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, mkdir as fsMkdir, } from 'node:fs/promises';
+import { readFile as fsReadFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, realpath as fsRealpath, mkdir as fsMkdir, } from './physical-fs.js';
 import { formatPatch, structuredPatch } from 'diff';
 import { withPluginHookCompatibleToolResponse } from '../plugin-hooks/vendor-tool-response.js';
 /** Old files above this size still get BOM/encoding preservation and the
@@ -142,6 +142,7 @@ async function probeOldFile(absolutePath) {
 export function createCapturingWriteOperations() {
     const captures = new Map();
     const operations = {
+        realpath: fsRealpath,
         mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => { }),
         async writeFile(absolutePath, content) {
             let probe;

@@ -11,5 +11,10 @@ export const questionnaireRequests = sqliteTable('questionnaire_requests', {
     status: text('status').notNull(),
     createdAt: integer('created_at').notNull(),
     injectedAt: integer('injected_at'),
+    /**
+     * v1 migration 36 (AskUser v2). NULL = legacy questionnaire; 'sync'/'async'
+     * rows never gate Plan entry or Plan cards, so v2 read models filter on it.
+     */
+    responseMode: text('response_mode'),
 });
 //# sourceMappingURL=questionnaire.js.map

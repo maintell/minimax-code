@@ -109,6 +109,13 @@ regexes = [
   '''^iKey==FTS5_AVERAGES_ROWID $''',
 ]
 
+[[rules.allowlists]]
+description = "Shipped renderer bundle: minified ANTLR property aliases, no key material"
+condition = "AND"
+paths = ['''(^|/)apps/electron/out/_next/static/chunks/5120\.[^/]+\.js$''']
+regexTarget = "match"
+regexes = ['''^e\.keys=e\.isEmpty=void $''', '''^e\.MismatchedTokenException=e\.isRecognitionException=void $''']
+
 [[rules]]
 id = "sourcegraph-access-token"
 

@@ -1,12 +1,82 @@
+import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
+import { isSideChatSendOrigin } from '@mavis/shared/sidechat-send-origin';
 import { sanitizeDisplayAttachment, } from '../../service/session-system/index.js';
+import { isUndeliveredRetryCopy } from './undelivered-side-messages.js';
 import { turnAdmissionError } from './errors.js';
 import { queryCollapseSteeringProjection } from './query-collapse-identity.js';
+import { projectPeerMessageOrigin } from './peer-message-origin.js';
 export function mapV2TurnStreamResult(result) {
     if (!result.accepted) {
+        if (result.reason === 'side-message-undelivered') {
+            return streamError(undeliveredSideMessageError(result));
+        }
         const error = directSendAdmissionError(result.reason);
         return streamError(error);
     }
+    if ('outcome' in result)
+        return { ok: true, source: sideMessageOutcomeFrames(result) };
     return { ok: true, source: mapV2SessionFrames(result.frames) };
+}
+/**
+ * A composer side message settled without a stream of its own: a successful
+ * SSE with one outcome frame, then `[DONE]`. A queued fallback carries the
+ * Queue item so the client shows it without enqueueing again; it is the first
+ * frame (no open marker) so a client can tell it apart before any acceptance.
+ */
+function sideMessageOutcomeFrames(result) {
+    const frame = result.outcome === 'queued'
+        ? {
+            type: 'queue_fallback',
+            queue_fallback: {
+                session_id: result.sessionId,
+                item_id: result.queue.itemId,
+                item_ids: [result.queue.itemId],
+                position: result.queue.position,
+                ahead: result.queue.ahead,
+                turn_id: result.turnId,
+                reason: result.race,
+            },
+        }
+        : {
+            type: 'steer_duplicate',
+            steer_duplicate: { session_id: result.sessionId, turn_id: result.turnId },
+        };
+    const frames = [
+        ...(result.outcome === 'duplicate' ? [{ dataJson: '{"type":10}' }] : []),
+        jsonFrame(frame),
+        { dataJson: '[DONE]' },
+    ];
+    return staticFrames(frames);
+}
+/**
+ * A side message the runtime received but could neither steer nor queue. The
+ * Queue fallback already ran, so neither key is one a client should fall back
+ * on again. `detail` is JSON: recorded `{ message_id, goal_id?, reason }`, plain
+ * `{ reason }`.
+ */
+export function undeliveredSideMessageError(result) {
+    const record = result.undelivered;
+    if (!record) {
+        return {
+            status: 409,
+            key: 'local_side_message_delivery_failed',
+            message: 'The message could not be delivered to the running Turn or the Queue.',
+            detail: JSON.stringify({ reason: result.race }),
+        };
+    }
+    return {
+        status: 409,
+        key: 'local_side_message_undelivered',
+        message: 'The message could not be delivered; it was kept in the conversation and the Goal paused.',
+        detail: JSON.stringify({
+            message_id: record.messageId,
+            ...(record.goalId ? { goal_id: record.goalId } : {}),
+            reason: result.race,
+        }),
+    };
+}
+export async function* staticFrames(frames) {
+    yield* frames;
 }
 export function openV2SessionStream(frames) {
     return { ok: true, source: mapV2SessionFrames(frames) };
@@ -92,7 +162,11 @@ function mapStandardV2Frame(frame) {
     if (frame.kind === 'resync-required')
         return [{ type: 'resume_overflow' }];
     if (frame.kind === 'message-committed' || frame.kind === 'durable-message') {
-        return frameMessages(frame.data).map((message) => ({
+        // A retried undelivered message stays visible as its own row; the copy the
+        // retry delivered is never shown a second time.
+        return frameMessages(frame.data)
+            .filter((message) => !isUndeliveredRetryCopy(message))
+            .map((message) => ({
             type: 2,
             agent_message: toSseMessage(message),
         }));
@@ -165,7 +239,7 @@ function frameMessages(data) {
     return messages.filter(isRecord);
 }
 function toSseMessage(message) {
-    const withSteering = toSseSteeringFields(toSseCronOrigin(message));
+    const withSteering = toSseSteeringFields(toSseSideChatOrigin(toSseMessageOrigin(message)));
     if (!Array.isArray(withSteering.attachments))
         return withSteering;
     return { ...withSteering, attachments: withSteering.attachments.map(toSseAttachment) };
@@ -174,10 +248,19 @@ function toSseSteeringFields(message) {
     const queryKey = typeof message.query_key === 'string' ? message.query_key : undefined;
     return { ...message, ...queryCollapseSteeringProjection(queryKey) };
 }
-function toSseCronOrigin(message) {
-    if (message.source !== 'cron' ||
-        message.origin !== undefined ||
-        !isRecord(message.sourceContext)) {
+function toSseMessageOrigin(message) {
+    if (message.origin !== undefined)
+        return message;
+    const questionnaireOrigin = projectQuestionnaireResponseOrigin(message);
+    if (questionnaireOrigin)
+        return questionnaireOrigin;
+    const backgroundOrigin = projectBackgroundTaskOrigin(message);
+    if (backgroundOrigin)
+        return backgroundOrigin;
+    const peerOrigin = projectPeerMessageOrigin(message);
+    if (peerOrigin)
+        return { ...message, origin: peerOrigin };
+    if (message.source !== 'cron' || !isRecord(message.sourceContext)) {
         return message;
     }
     const cronId = firstString([message.sourceContext.cronId]);
@@ -188,6 +271,25 @@ function toSseCronOrigin(message) {
         ...message,
         origin: { rawMeta: { cronId, ...(runId ? { runId } : {}) } },
     };
+}
+function projectQuestionnaireResponseOrigin(message) {
+    if (message.source !== 'questionnaire' || !isRecord(message.sourceContext))
+        return undefined;
+    const origin = message.sourceContext.origin;
+    return isOrdinaryQuestionnaireResponseOrigin(origin) ? { ...message, origin } : undefined;
+}
+function projectBackgroundTaskOrigin(message) {
+    if (message.source !== 'background-task' || !isRecord(message.sourceContext))
+        return undefined;
+    const origin = message.sourceContext.origin;
+    return isRecord(origin) ? { ...message, origin } : undefined;
+}
+/** Mirrors the history projection so a live SideChat hand-back gets its label too. */
+function toSseSideChatOrigin(message) {
+    if (message.origin !== undefined || !isRecord(message.sourceContext))
+        return message;
+    const origin = message.sourceContext.origin;
+    return isSideChatSendOrigin(origin) ? { ...message, origin } : message;
 }
 function toSseAttachment(value) {
     const sanitized = sanitizeDisplayAttachment(value);
@@ -341,6 +443,11 @@ const DIRECT_SEND_ADMISSION_ERRORS = {
         key: 'local_session_deleting',
         message: 'Session is being deleted',
     },
+    'computer-use-requires-new-turn': {
+        status: 409,
+        key: 'local_computer_use_requires_new_turn',
+        message: 'Computer Use requires a new Turn. Keep the message queued until the current Turn ends.',
+    },
     'compaction-active': {
         status: 409,
         key: 'local_session_compacting',
@@ -354,7 +461,7 @@ function directSendAdmissionError(reason) {
     if (isTurnContinuationAdmissionReason(reason)) {
         return turnContinuationAdmissionError(reason);
     }
-    const policyError = planAdmissionError(reason);
+    const policyError = runtimeAdmissionError(reason) ?? planAdmissionError(reason);
     if (policyError)
         return policyError;
     return (DIRECT_SEND_ADMISSION_ERRORS[reason] ?? {
@@ -364,10 +471,12 @@ function directSendAdmissionError(reason) {
     });
 }
 function isTurnContinuationAdmissionReason(reason) {
-    return reason === 'unavailable' || reason === 'waiting-for-user';
+    return (reason === 'unavailable' ||
+        reason === 'waiting-for-user' ||
+        reason === 'continuation-unavailable');
 }
 function turnContinuationAdmissionError(reason) {
-    if (reason === 'unavailable') {
+    if (reason === 'unavailable' || reason === 'continuation-unavailable') {
         return {
             status: 409,
             key: 'local_turn_continuation_unavailable',
@@ -379,6 +488,23 @@ function turnContinuationAdmissionError(reason) {
         key: 'local_turn_waiting_for_user',
         message: 'The current Turn is waiting for user input',
     };
+}
+function runtimeAdmissionError(reason) {
+    if (reason === 'policy:runtime:draining') {
+        return {
+            status: 503,
+            key: 'local_runtime_draining',
+            message: 'MCode is preparing to restart. Retry after reconnecting.',
+        };
+    }
+    if (reason === 'policy:runtime:auth-pending') {
+        return {
+            status: 503,
+            key: 'local_runtime_auth_pending',
+            message: 'MCode is waiting for Desktop authentication. Reconnect the development machine from Desktop.',
+        };
+    }
+    return undefined;
 }
 function planAdmissionError(reason) {
     if (reason === 'policy:plan:lifecycle-active') {

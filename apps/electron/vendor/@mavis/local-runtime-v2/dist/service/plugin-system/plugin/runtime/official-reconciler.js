@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { PluginInstallationPolicy, } from '@mavis/thrift-gen/generated/desktop-service/types';
 import { materializeOfficialPluginArchive } from '../package/archive-cache.js';
 import { pluginDigestCacheKey } from '../package/package-contract.js';
 import { readMiniMaxPlugin } from '../package/package-readers.js';
 import { effectiveInstallationPolicy } from './repository.js';
+const CACHE_KEY_PATTERN = /^sha256-tree-v1-[0-9a-f]{64}$/u;
 /** Owns full and target-only reconciliation of the persisted official state. */
 export class OfficialPluginReconciler {
     options;
@@ -13,6 +14,7 @@ export class OfficialPluginReconciler {
     activeCacheClaims = new Map();
     pendingCacheCleanup = new Set();
     cacheCoordinationTail = Promise.resolve();
+    resolvedCacheRoot;
     constructor(options) {
         this.options = options;
         this.nowMs = options.nowMs ?? Date.now;
@@ -191,6 +193,68 @@ export class OfficialPluginReconciler {
             await rm(tempRoot, { recursive: true, force: true });
         }
     }
+    /**
+     * Keeps one official cache directory on disk while a published Mini App still reads it, even
+     * after the repository stops referencing that version. Returns the release; releasing prunes
+     * the directory when nothing else references or retains it.
+     */
+    retainPackageRoot(packageRoot) {
+        // Queued synchronously so a claim taken at publication commit is applied before a later
+        // reconcile finalize releases the same key.
+        const claimed = this.coordinateCacheCleanup(async () => {
+            const cacheKey = await this.cacheKeyOf(packageRoot);
+            if (cacheKey) {
+                this.activeCacheClaims.set(cacheKey, (this.activeCacheClaims.get(cacheKey) ?? 0) + 1);
+            }
+            return cacheKey;
+        });
+        let released = false;
+        return async () => {
+            if (released)
+                return;
+            released = true;
+            const cacheKey = await claimed;
+            if (!cacheKey)
+                return;
+            await this.releaseCacheClaims(new Set([cacheKey]), new Set([cacheKey]));
+        };
+    }
+    /** Startup sweep: removes cache directories nothing references and no runtime retains. */
+    pruneUnreferencedCaches() {
+        return this.coordinateCacheCleanup(async () => {
+            let entries;
+            try {
+                entries = await readdir(this.options.cacheRoot);
+            }
+            catch {
+                return;
+            }
+            const candidates = new Set(entries.filter((name) => name.startsWith('sha256-tree-v1-') && !this.activeCacheClaims.has(name)));
+            await pruneUnreferencedPluginCaches(this.options.cacheRoot, this.options.repository, candidates);
+        });
+    }
+    async cacheKeyOf(packageRoot) {
+        const cacheKey = path.basename(packageRoot);
+        if (!CACHE_KEY_PATTERN.test(cacheKey))
+            return undefined;
+        const parent = path.dirname(packageRoot);
+        if (isSameDirectory(this.options.cacheRoot, parent))
+            return cacheKey;
+        // Accepted package roots are canonical (realpath'd) while the configured cache root may sit
+        // under a symlinked or junctioned data directory.
+        return isSameDirectory(await this.canonicalCacheRoot(), parent) ? cacheKey : undefined;
+    }
+    async canonicalCacheRoot() {
+        if (this.resolvedCacheRoot !== undefined)
+            return this.resolvedCacheRoot;
+        try {
+            this.resolvedCacheRoot = await realpath(this.options.cacheRoot);
+            return this.resolvedCacheRoot;
+        }
+        catch {
+            return this.options.cacheRoot;
+        }
+    }
     claimCache(cacheKey) {
         return this.coordinateCacheCleanup(() => {
             this.activeCacheClaims.set(cacheKey, (this.activeCacheClaims.get(cacheKey) ?? 0) + 1);
@@ -218,6 +282,9 @@ export class OfficialPluginReconciler {
         this.cacheCoordinationTail = settleCacheCoordination(result);
         return result;
     }
+}
+function isSameDirectory(left, right) {
+    return path.relative(left, right) === '';
 }
 async function runAfterCacheCoordination(prior, operation) {
     try {

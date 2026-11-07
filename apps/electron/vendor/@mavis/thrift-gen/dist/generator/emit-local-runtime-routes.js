@@ -28,7 +28,7 @@ function emitServiceRoutes(sourcePath, service, options) {
         `  type ${mountTypeName},`,
         `} from '${generatedImport}';`,
         `import { ${serviceName} } from '${serverImport}';`,
-        `import { runWithDesktopServiceRequestContext } from './biz-context.js';`,
+        `import { runWithDesktopServiceRequestContext } from '../../infra/transport/biz-context.js';`,
         '',
         `export type ${handlerTypeName} = (request: Request) => Promise<Response | null>;`,
         '',

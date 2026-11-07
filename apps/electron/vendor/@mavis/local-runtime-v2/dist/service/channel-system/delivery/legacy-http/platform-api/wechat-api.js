@@ -19,6 +19,7 @@ import { resolveWeChatAttachments } from '../../../transport/wechat/inbound/wech
 import { pollBindStatusReal, startBindReal } from '../../../transport/wechat/wechat-onboard.js';
 import { LocalWeChatChannelClient } from '../../../transport/wechat/wechat-outbound-client.js';
 import { json, readFirstString, readJsonBody } from '../http-helpers.js';
+import { collectTransportClients } from './connection-transport.js';
 export class LocalWeChatChannelApi {
     store;
     runner;
@@ -28,6 +29,7 @@ export class LocalWeChatChannelApi {
     onboardFetch;
     onBindFinalised;
     monitorHealthProvider;
+    transportStatusProvider;
     onUnbind;
     constructor(input) {
         this.store = input.store;
@@ -38,6 +40,7 @@ export class LocalWeChatChannelApi {
         this.onboardFetch = input.onboardFetch;
         this.onBindFinalised = input.onBindFinalised;
         this.monitorHealthProvider = input.monitorHealthProvider;
+        this.transportStatusProvider = input.transportStatusProvider;
         this.onUnbind = input.onUnbind;
     }
     registerClient(adapter) {
@@ -47,10 +50,21 @@ export class LocalWeChatChannelApi {
         const clients = {};
         for (const record of await this.store.list()) {
             const serialized = serializeWeChatBinding(record);
-            applyMonitorHealthOverlay(serialized, record, this.monitorHealthProvider?.(record.agentName));
+            applyMonitorHealthOverlay(serialized, record, this.monitorHealthProvider?.(record.agentName), this.transportStatusProvider?.(record.agentName));
             clients[record.clientId] = serialized;
         }
         return clients;
+    }
+    /**
+     * Live receive-channel state keyed by clientId, for the Connection list.
+     * Only records whose monitor should be running right now are listed —
+     * `isUsableWeChatBinding`, the gate the restore / winner start applies
+     * (enabled, polling, connected, a real token) — and only when the
+     * provider reports for them. Disabled family shadows, pending QR rows
+     * and quarantined startups stay absent, so the panel keeps its default.
+     */
+    async transportClients() {
+        return collectTransportClients(await this.store.list(), isUsableWeChatBinding, this.transportStatusProvider);
     }
     async configCheck(agentName) {
         const record = await this.store.get(agentName ?? this.defaultAgentName);

@@ -76,6 +76,21 @@ export function getConfiguredLocalRuntimeDataParentDir() {
     return configuredLocalRuntimeDataParentDir;
 }
 /**
+ * Whether a Runtime started now would use `parentDir` from the desktop config. A data-dir
+ * env var wins over the config; app.relaunch() inherits the one this app injected for the
+ * configured directory, so the check compares directories instead of trusting the source.
+ */
+export function isConfiguredLocalRuntimeDataParentDirEffective(parentDir, platform = process.platform, envFlag = process.env.MAVIS_DEV_USE_GIT_PROFILE, repoRoot = process.cwd(), detectBranch = (root) => detectWorktreeBranchProfile(root)) {
+    const envDataDir = process.env.MINIMAX_DATA_DIR?.trim() || process.env.MAVIS_DATA_DIR?.trim();
+    if (!envDataDir)
+        return true;
+    const configured = path.resolve(resolveLocalRuntimeDataDirFromParent(parentDir.trim(), resolveLocalRuntimeDataDirName(envFlag, repoRoot, detectBranch)));
+    const effective = path.resolve(envDataDir);
+    return platform === 'win32'
+        ? configured.toLowerCase() === effective.toLowerCase()
+        : configured === effective;
+}
+/**
  * Pins @mavis/config to Electron's resolved runtime data directory before
  * either process reads config.yaml. The utility process receives the same
  * values again at its fork boundary, which also protects against login-shell

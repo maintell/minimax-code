@@ -21,10 +21,11 @@ export class ProjectController extends ProjectControllerBase {
     async listProjects(ctx, req) {
         return this.requireApplication().listProjects(ctx, req);
     }
+    async createProject(ctx, req) {
+        return this.requireApplication().createProject(ctx, req);
+    }
     async updateProject(ctx, req) {
-        void ctx;
-        void req;
-        throw new NotImplementedError('updateProject');
+        return this.requireApplication().updateProject(ctx, req);
     }
     async listProjectSessions(ctx, req) {
         return this.requireApplication().listProjectSessions(ctx, req);

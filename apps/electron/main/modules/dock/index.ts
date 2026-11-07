@@ -5,21 +5,49 @@
  * The listener must be registered before `ready`; file paths are queued until a
  * primary renderer window can receive them.
  */
-import { app } from "electron";
+import { ipcMain, app } from "electron";
 import path from "path";
 import { IPC_CHANNELS } from "../../config/constants";
 import { logger } from "../../utils";
+import { getWindowsOpenFilePathsFromAdditionalData, getWindowsOpenFilePaths } from "./windows-file-arguments";
+import { captureSelectedFileIssuer } from "../document-preview/selected-file-authority";
 let pendingFilePaths = [];
 let pendingFilePathSet = new Set();
 let getTargetWindow = null;
 let registered = false;
+let readyReceivers = new WeakSet();
+let observedReceivers = new WeakSet();
 let flushScheduledForWindowId = null;
 let flushTimer = null;
+function onReceiverStateChanged(event, ready) {
+    const window = getReceivableWindow();
+    // Login windows, other renderers and subframes cannot consume the file queue.
+    if (!window ||
+        event.sender !== window.webContents ||
+        event.senderFrame !== event.sender.mainFrame) {
+        return;
+    }
+    const receiver = event.sender;
+    if (ready !== true) {
+        readyReceivers.delete(receiver);
+        return;
+    }
+    if (!observedReceivers.has(receiver)) {
+        observedReceivers.add(receiver);
+        receiver.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+            // Subframe loads and same-document navigation keep the main renderer's subscription.
+            if (isMainFrame && !isInPlace)
+                readyReceivers.delete(receiver);
+        });
+    }
+    readyReceivers.add(receiver);
+    logger.info(`[Dock] File receiver ready in window ${window.id}`);
+    scheduleDeferredFlush();
+}
 function normalizeFilePath(filePath) {
-    const trimmed = filePath.trim();
-    if (!trimmed)
+    if (!filePath.trim())
         return null;
-    return path.resolve(trimmed);
+    return (process.platform === 'win32' ? path.win32 : path).resolve(filePath);
 }
 function enqueueFilePath(filePath) {
     const normalized = normalizeFilePath(filePath);
@@ -87,9 +115,30 @@ function scheduleFlushWhenReady(window) {
  */
 export function setupDockFileOpenHandler(targetWindowProvider) {
     getTargetWindow = targetWindowProvider;
+    setupFileOpenEventHandlers();
+}
+/** Register directly after acquiring the instance lock, before async startup. */
+export function setupFileOpenEventHandlers() {
     if (registered)
         return;
     registered = true;
+    ipcMain.on(IPC_CHANNELS.DOCK_FILE_RECEIVER_READY, onReceiverStateChanged);
+    if (process.platform === 'win32') {
+        const receive = (argv, source, additionalData) => {
+            const filePaths = getWindowsOpenFilePathsFromAdditionalData(additionalData) ??
+                getWindowsOpenFilePaths(argv);
+            logger.info(`[Dock] ${source} received ${filePaths.length} file(s)`);
+            let queued = false;
+            for (const filePath of filePaths) {
+                queued = enqueueFilePath(filePath) || queued;
+            }
+            if (queued)
+                scheduleDeferredFlush();
+        };
+        app.on('second-instance', (_event, argv, _workingDirectory, additionalData) => receive(argv, 'second-instance', additionalData));
+        receive(process.argv, 'launch');
+        return;
+    }
     if (process.platform !== 'darwin') {
         logger.info('[Dock] Non-macOS platform; open-file listener not registered');
         return;
@@ -119,11 +168,19 @@ export function flushDockFileQueue(explicitWindow) {
         scheduleFlushWhenReady(window);
         return false;
     }
+    if (!readyReceivers.has(window.webContents)) {
+        logger.info(`[Dock] Waiting for file receiver in window ${window.id}`);
+        return false;
+    }
     const filePaths = pendingFilePaths;
     pendingFilePaths = [];
     pendingFilePathSet = new Set();
     logger.info(`[Dock] Flushing ${filePaths.length} Dock file(s) to renderer window ${window.id}`);
-    window.webContents.send(IPC_CHANNELS.DOCK_FILE_OPENED, { filePaths });
+    const selectedFileTokens = captureSelectedFileIssuer(window.webContents)(filePaths);
+    window.webContents.send(IPC_CHANNELS.DOCK_FILE_OPENED, {
+        filePaths,
+        ...(Object.keys(selectedFileTokens).length ? { selectedFileTokens } : {}),
+    });
     return true;
 }
 export function getPendingDockFileCount() {
@@ -134,6 +191,9 @@ export function resetDockFileQueueForTest() {
     pendingFilePathSet = new Set();
     getTargetWindow = null;
     registered = false;
+    readyReceivers = new WeakSet();
+    observedReceivers = new WeakSet();
+    ipcMain.removeListener(IPC_CHANNELS.DOCK_FILE_RECEIVER_READY, onReceiverStateChanged);
     flushScheduledForWindowId = null;
     clearDeferredFlush();
 }

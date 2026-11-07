@@ -1,4 +1,6 @@
-import { CheckpointCandidateTooLargeError, ContextCompactionError, } from '../contracts.js';
+import { listRequestImages, replaceRequestImages, } from '@mavis/agent-core/pi-turn-runner';
+import { checkpointImageText } from '@mavis/context-manager';
+import { CheckpointCandidateMediaRejectedError, CheckpointCandidateTooLargeError, ContextCompactionError, } from '../contracts.js';
 import { buildCheckpointMessage, validateCheckpointGeneration, } from './checkpoint-format.js';
 import { buildAllToolResultsCandidate, buildAttachmentFreeCandidate, buildMiddleDeletionCandidate, buildMinimalGenuineQueryCandidate, buildProtectedSkeletonCandidate, buildToolTrimCandidate, } from './history-reduction.js';
 import { evaluateToolResultCompactionAdmission, evaluateToolTrimAdmission, } from './tool-trim-admission.js';
@@ -6,17 +8,7 @@ export async function compactContext(input) {
     validateInput(input);
     input.signal?.throwIfAborted();
     const instructions = input.instructions?.trim() || undefined;
-    let planning;
-    if (input.allowLegacyToolTrim === false) {
-        planning = instructions
-            ? { candidate: input.toolResultCompactionCandidate }
-            : await planDirectToolResultCompaction(input, input.toolResultCompactionCandidate);
-    }
-    else {
-        planning = instructions
-            ? { candidate: captureToolTrimCandidate(input.history) }
-            : await planDirectTrim(input);
-    }
+    const planning = await planCompaction(input, instructions);
     input.signal?.throwIfAborted();
     if (planning.decision)
         return planning.decision;
@@ -25,12 +17,14 @@ export async function compactContext(input) {
     const validated = validateCheckpointGeneration(generated.generation, generated.maxOutputTokens);
     const subagents = await captureSubagents(input);
     input.signal?.throwIfAborted();
-    let replacementMessages = [
-        buildCheckpointMessage(input.history, validated.summary, input.checkpoint.tokensBefore, {
-            timestamp: input.checkpoint.timestamp,
-            ...(subagents ? { subagents } : {}),
-        }),
-    ];
+    const earlierFiles = await resolveEarlierFiles(input);
+    input.signal?.throwIfAborted();
+    const reminder = input.checkpointReminder?.(input.checkpoint.timestamp);
+    let replacementMessages = buildCheckpointReplacement(input, validated.summary, {
+        reminder,
+        ...earlierFiles,
+        ...(subagents ? { subagents } : {}),
+    });
     let measurement = await input.measurePair({
         beforeMessages: input.history,
         afterMessages: replacementMessages,
@@ -38,11 +32,10 @@ export async function compactContext(input) {
     input.signal?.throwIfAborted();
     assertValidMeasurement(measurement);
     if (subagents && !fitsFinalRequest(measurement, input.limits)) {
-        replacementMessages = [
-            buildCheckpointMessage(input.history, validated.summary, input.checkpoint.tokensBefore, {
-                timestamp: input.checkpoint.timestamp,
-            }),
-        ];
+        replacementMessages = buildCheckpointReplacement(input, validated.summary, {
+            reminder,
+            ...earlierFiles,
+        });
         measurement = await input.measurePair({
             beforeMessages: input.history,
             afterMessages: replacementMessages,
@@ -64,6 +57,32 @@ export async function compactContext(input) {
         measurement,
     };
 }
+function buildCheckpointReplacement(input, summary, { reminder, subagents, earlierFiles, }) {
+    return [
+        buildCheckpointMessage(input.history, summary, input.checkpoint.tokensBefore, {
+            timestamp: input.checkpoint.timestamp,
+            ...(subagents ? { subagents } : {}),
+            ...(earlierFiles ? { earlierFiles } : {}),
+        }),
+        ...(reminder ? [reminder] : []),
+    ];
+}
+/**
+ * Tool-result admission may decide the compaction without a checkpoint, unless
+ * the user gave instructions or the caller requires a checkpoint; the
+ * candidate then only serves as smaller checkpoint input.
+ */
+async function planCompaction(input, instructions) {
+    const directAllowed = !instructions && input.checkpointRequired !== true;
+    if (input.allowLegacyToolTrim === false) {
+        return directAllowed
+            ? await planDirectToolResultCompaction(input, input.toolResultCompactionCandidate)
+            : { candidate: input.toolResultCompactionCandidate };
+    }
+    return directAllowed
+        ? await planDirectTrim(input)
+        : { candidate: captureToolTrimCandidate(input.history) };
+}
 async function captureSubagents(input) {
     if (!input.captureSubagents)
         return undefined;
@@ -79,6 +98,15 @@ async function captureSubagents(input) {
             // Diagnostics are best effort and cannot change compaction.
         }
         return undefined;
+    }
+}
+async function resolveEarlierFiles(input) {
+    try {
+        const earlierFiles = await input.resolveEarlierFiles?.();
+        return earlierFiles ? { earlierFiles } : {};
+    }
+    catch {
+        return {};
     }
 }
 async function planDirectToolResultCompaction(input, candidate) {
@@ -171,14 +199,12 @@ async function generateCandidateWithProviderRetry({ input, session, candidate, c
 async function generateCheckpoint(input, candidate, instructions) {
     const session = await input.checkpoint.open();
     validateNonNegativeSafeInteger(session.maxOutputTokens, 'maxOutputTokens');
-    const checkpointCandidates = [{ candidate: 'h0', messages: input.history }];
-    if (candidate && toolResultReplacementCount(candidate) > 0) {
-        checkpointCandidates.push({ candidate: 'htrim', messages: candidate.messages });
-    }
-    const hall = buildAllToolResultsCandidate(checkpointCandidates.at(-1)?.messages ?? input.history);
-    if (hall.trimmedResultCount > 0) {
-        checkpointCandidates.push({ candidate: 'hall', messages: hall.messages });
-    }
+    const describeImages = checkpointImageDescriber(input);
+    const history = await describeImages(input.history);
+    const described = candidate
+        ? { ...candidate, messages: await describeImages(candidate.messages) }
+        : undefined;
+    const { checkpointCandidates, hall } = buildCheckpointCandidates(history, described);
     const counter = { value: 0 };
     let overflow;
     for (const checkpointCandidate of checkpointCandidates) {
@@ -203,6 +229,21 @@ async function generateCheckpoint(input, candidate, instructions) {
             };
         }
         catch (cause) {
+            if (cause instanceof CheckpointCandidateMediaRejectedError) {
+                return recoverAfterMediaRejection({
+                    input,
+                    session,
+                    rejectedMessages: checkpointCandidate.messages,
+                    hallMessages: hall.messages,
+                    // Hall differs from the rejected candidate only when it cleared tool
+                    // results and was not itself the rejected candidate.
+                    hallIsDistinct: hall.trimmedResultCount > 0 && checkpointCandidate.messages !== hall.messages,
+                    instructions,
+                    counter,
+                    priorOverflow: overflow,
+                    cause,
+                });
+            }
             if (!(cause instanceof CheckpointCandidateTooLargeError))
                 throw cause;
             overflow = cause;
@@ -217,16 +258,131 @@ async function generateCheckpoint(input, candidate, instructions) {
         priorOverflow: overflow,
     });
 }
+/**
+ * The summary request carries every image as a line naming its file, saving
+ * the ones history names no file for; an image's file is saved once even when
+ * several candidates carry it.
+ */
+function checkpointImageDescriber(input) {
+    const files = new Map();
+    const fileOf = (messages, image) => {
+        if (image.path || !input.writeImageFile)
+            return Promise.resolve(image.path);
+        const block = messages[image.messageIndex].content?.[image.blockIndex];
+        const data = block?.data;
+        let file = files.get(data);
+        if (!file) {
+            file = input.writeImageFile(messages, image);
+            files.set(data, file);
+        }
+        return file;
+    };
+    return async (messages) => {
+        const images = listRequestImages(messages).filter((image) => !image.mimeType?.toLowerCase().startsWith('video/'));
+        if (images.length === 0)
+            return messages;
+        const texts = new Map();
+        for (const image of images) {
+            texts.set(image.key, checkpointImageText(await fileOf(messages, image)));
+        }
+        return replaceRequestImages(messages, (image) => texts.get(image.key));
+    };
+}
+function buildCheckpointCandidates(history, candidate) {
+    const checkpointCandidates = [{ candidate: 'h0', messages: history }];
+    if (candidate && toolResultReplacementCount(candidate) > 0) {
+        checkpointCandidates.push({ candidate: 'htrim', messages: candidate.messages });
+    }
+    const hall = buildAllToolResultsCandidate(checkpointCandidates.at(-1)?.messages ?? history);
+    if (hall.trimmedResultCount > 0) {
+        checkpointCandidates.push({ candidate: 'hall', messages: hall.messages });
+    }
+    return { checkpointCandidates, hall };
+}
+/**
+ * The Provider refused a candidate for the images it carries. Every candidate
+ * before the attachment-free one keeps those images, so skip straight to the
+ * same history with media replaced by text; if that still overflows, continue
+ * down the regular attachment-free ladder (Hvideo, Hmid, Hmin) from Hall.
+ * Without this, /compact on a session over the provider's image limit failed
+ * with the same rejection the session itself was stuck on (#425).
+ */
+async function recoverAfterMediaRejection({ input, session, rejectedMessages, hallMessages, hallIsDistinct, instructions, counter, priorOverflow, cause, }) {
+    input.signal?.throwIfAborted();
+    const attachmentFree = buildAttachmentFreeCandidate(rejectedMessages);
+    if (attachmentFree.replacedBlockCount === 0)
+        throw mediaRejectedProviderFailure(cause);
+    let overflow = priorOverflow;
+    let attachmentFreeAttempted = false;
+    try {
+        if (session.fits(checkpointRequest(input, attachmentFree.messages, instructions))) {
+            attachmentFreeAttempted = true;
+            const attempt = await tryAttachmentFreeCheckpoint({
+                input,
+                session,
+                messages: attachmentFree.messages,
+                instructions,
+                counter,
+            });
+            if ('generation' in attempt)
+                return attempt;
+            overflow = attempt.overflow;
+        }
+        return await recoverAfterHall({
+            input,
+            session,
+            hallMessages,
+            instructions,
+            counter,
+            priorOverflow: overflow,
+            // Do not send the same attachment-free history twice.
+            skipHvideo: attachmentFreeAttempted && !hallIsDistinct,
+        });
+    }
+    catch (next) {
+        if (next instanceof CheckpointCandidateMediaRejectedError) {
+            throw mediaRejectedProviderFailure(next);
+        }
+        throw next;
+    }
+}
+async function tryAttachmentFreeCheckpoint({ input, session, messages, instructions, counter, }) {
+    try {
+        const settled = await generateCandidateWithProviderRetry({
+            input,
+            session,
+            candidate: 'hvideo',
+            counter,
+            messages,
+            instructions,
+        });
+        return {
+            generation: settled.generation,
+            attempts: settled.attemptNumber,
+            maxOutputTokens: session.maxOutputTokens,
+            ...tokenUsageMetadata(input.checkpoint.getTokenUsage?.()),
+        };
+    }
+    catch (next) {
+        if (!(next instanceof CheckpointCandidateTooLargeError))
+            throw next;
+        return { overflow: next };
+    }
+}
+function mediaRejectedProviderFailure(cause) {
+    return new ContextCompactionError('CHECKPOINT_PROVIDER_FAILED', 'llm_checkpoint', 'Checkpoint Provider rejected the request for carrying too many images.', { cause });
+}
 function toolResultReplacementCount(candidate) {
     return 'archivedResultCount' in candidate
         ? candidate.archivedResultCount
         : candidate.trimmedResultCount;
 }
-async function recoverAfterHall({ input, session, hallMessages, instructions, counter, priorOverflow, }) {
+async function recoverAfterHall({ input, session, hallMessages, instructions, counter, priorOverflow, skipHvideo = false, }) {
     input.signal?.throwIfAborted();
     const hvideo = buildAttachmentFreeCandidate(hallMessages);
     let overflow = priorOverflow;
-    if (hvideo.replacedBlockCount > 0 &&
+    if (!skipHvideo &&
+        hvideo.replacedBlockCount > 0 &&
         session.fits(checkpointRequest(input, hvideo.messages, instructions))) {
         input.signal?.throwIfAborted();
         try {

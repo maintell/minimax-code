@@ -25,6 +25,7 @@ export function createSteeringTeardownCommit(options) {
                     return false;
                 }
                 reportCommitted(onCommitted, message);
+                await reportDurable(options, { sessionId, turnId, message });
             }
             return true;
         },
@@ -37,6 +38,22 @@ function reportCommitted(onCommitted, message) {
     }
     catch {
         // The message is durable either way; the observer only trims fallbacks.
+    }
+}
+async function reportDurable(options, input) {
+    try {
+        await options.onMessageDurable?.(input);
+    }
+    catch (error) {
+        // Both rows are already durable; an owner bookkeeping failure must not
+        // turn a successful commit into a retry that duplicates the message.
+        options.logger?.warn({
+            sessionId: input.sessionId,
+            turnId: input.turnId,
+            producerId: input.message.producerId,
+            idempotencyKey: input.message.idempotencyKey,
+            error: `${error}`,
+        }, 'Steering teardown durable-commit observer failed');
     }
 }
 async function readIdentityVector(options, sessionId) {

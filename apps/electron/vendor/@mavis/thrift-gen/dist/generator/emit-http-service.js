@@ -40,6 +40,7 @@ function emitRoutesFile(definition, routeMetadataStyle, runtimeImportPrefix) {
             routeSections.push(emitSseContractTypes(service));
             routeSections.push(emitSseContractMetadata(service, sharedConstants));
         }
+        routeSections.push(emitRouteMatcher(service));
     }
     const sections = [header(definition.sourcePath)];
     sections.push(emitTypeImports(definition, {
@@ -390,6 +391,39 @@ function emitSseContractMetadata(service, sharedConstants) {
     }
     lines.push('} as const;');
     return lines.join('\n');
+}
+function emitRouteMatcher(service) {
+    const routeMatchers = `${toScreamingSnake(service.name)}_ROUTE_MATCHERS`;
+    const pathMatcher = `matches${service.name}RoutePath`;
+    const routeSources = [
+        `...Object.values(${routeConstant(service.name)})`,
+        ...(service.sseContracts.length > 0
+            ? [`...Object.values(${sseContractConstant(service.name)})`]
+            : []),
+    ];
+    return [
+        `const ${routeMatchers} = [`,
+        ...routeSources.map((source) => `  ${source},`),
+        '] as const;',
+        '',
+        `export function is${service.name}Route(method: string, pathname: string): boolean {`,
+        `  return ${routeMatchers}.some(`,
+        `    (route) => route.method === method && ${pathMatcher}(route.path, pathname),`,
+        '  );',
+        '}',
+        '',
+        `function ${pathMatcher}(template: string, pathname: string): boolean {`,
+        "  const expected = template.split('/');",
+        "  const actual = pathname.split('/');",
+        '  return (',
+        '    expected.length === actual.length &&',
+        '    expected.every(',
+        '      (segment, index) =>',
+        "        (segment.startsWith(':') && Boolean(actual[index])) || segment === actual[index],",
+        '    )',
+        '  );',
+        '}',
+    ].join('\n');
 }
 function emitServiceMountInterface() {
     return [

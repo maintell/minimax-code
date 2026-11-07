@@ -21,13 +21,6 @@
     }
   },
   "dependencies": {
-    "@mavis/session-report": "file:../session-report",
-    "@mavis/agent-runtime": "file:../agent-runtime",
-    "@mavis/context-manager": "file:../context-manager",
-    "@mavis/permission": "file:../permission",
-    "@mavis/runaway-guard": "file:../runaway-guard",
-    "@mavis/skills": "file:../skills",
-    "@mavis/system-reminder": "file:../system-reminder",
     "@sinclair/typebox": "^0.34.0"
   }
 }

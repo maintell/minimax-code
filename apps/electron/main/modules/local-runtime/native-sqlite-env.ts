@@ -19,7 +19,7 @@ export function prepareLocalRuntimeNativeSqliteEnv(electronApp = getElectronApp(
 export function resolveLocalRuntimeRepoRoot(electronApp) {
     const packageJsonPath = firstExisting(resolveLocalRuntimePackageJsonCandidates(electronApp));
     if (!packageJsonPath) {
-        logger.error('[LocalRuntime] @mavis/local-runtime package not found for native sqlite');
+        logger.error('[LocalRuntime] @mavis/local-runtime-v2 package not found for native sqlite');
         return undefined;
     }
     return resolveRuntimeRoot(path.dirname(realpathSync(packageJsonPath)));
@@ -42,11 +42,11 @@ function firstExisting(candidates) {
 function resolveLocalRuntimePackageJsonCandidates(electronApp) {
     const appPath = electronApp?.getAppPath();
     return uniqueNonEmpty([
-        appPath ? path.join(appPath, 'node_modules', '@mavis', 'local-runtime', 'package.json') : '',
-        appPath ? path.join(appPath, '..', '..', 'packages', 'local-runtime', 'package.json') : '',
-        path.join(process.cwd(), 'node_modules', '@mavis', 'local-runtime', 'package.json'),
-        path.join(process.cwd(), 'packages', 'local-runtime', 'package.json'),
-        path.join(process.cwd(), '..', '..', 'packages', 'local-runtime', 'package.json'),
+        appPath ? path.join(appPath, 'node_modules', '@mavis', 'local-runtime-v2', 'package.json') : '',
+        appPath ? path.join(appPath, '..', '..', 'packages', 'local-runtime-v2', 'package.json') : '',
+        path.join(process.cwd(), 'node_modules', '@mavis', 'local-runtime-v2', 'package.json'),
+        path.join(process.cwd(), 'packages', 'local-runtime-v2', 'package.json'),
+        path.join(process.cwd(), '..', '..', 'packages', 'local-runtime-v2', 'package.json'),
     ]);
 }
 function uniqueNonEmpty(values) {

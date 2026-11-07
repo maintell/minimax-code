@@ -1,5 +1,6 @@
 import { matchesMcpServerRuntimeName } from './mcp-runtime-name.js';
-import { getContentRulesForTool, hasWholeToolRule, isBypassMode, isInteractiveTool, } from './context.js';
+import { hasWholeToolRule, isBypassMode, isInteractiveTool, } from './context.js';
+import { extractToolInputContent, matchesContentAskRule } from './content-ask-rule.js';
 /**
  * Production policy reducer used when Core owns the final decision. Existing
  * tool checkers keep their local ToolCheckResult interface; this reducer owns
@@ -36,10 +37,13 @@ export function reducePermissionDecision(input) {
             ruleContents: resolveRuleContents(toolName, input.input),
         };
     }
-    if (input.checkerError) {
+    if (input.checkerError !== undefined) {
         return {
             behavior: 'ask',
-            reason: { type: 'safetyCheck', description: `Tool checker error: ${input.checkerError}` },
+            reason: {
+                type: 'safetyCheck',
+                description: `Tool checker error: ${input.checkerError || 'Unknown tool permission checker failure'}`,
+            },
             ruleContents: resolveRuleContents(toolName, input.input),
         };
     }
@@ -63,6 +67,7 @@ export function reducePermissionDecision(input) {
             ruleMatchers: resolveRuleMatchers(checkerResult),
             candidateScopes: resolveCandidateScopes(checkerResult),
             bypassImmune: true,
+            rewrittenInput: checkerResult.rewrittenInput,
             skipAutoClassifier: checkerResult.skipAutoClassifier,
         };
     }
@@ -157,29 +162,6 @@ function findMcpServerRule(toolName, context, behavior) {
     return context.rules.find((rule) => rule.ruleBehavior === behavior &&
         !rule.ruleValue.ruleContent &&
         matchesMcpServerRuntimeName(toolName, rule.ruleValue.toolName));
-}
-function matchesContentAskRule(toolName, input, context) {
-    const inputContent = extractToolInputContent(toolName, input);
-    if (!inputContent)
-        return undefined;
-    return getContentRulesForTool(context, toolName, 'ask').find((rule) => {
-        const ruleContent = rule.ruleValue.ruleContent;
-        return Boolean(ruleContent && inputContent.includes(ruleContent));
-    });
-}
-function extractToolInputContent(toolName, input) {
-    if (toolName === 'bash')
-        return typeof input.command === 'string' ? input.command : undefined;
-    if (['edit', 'write', 'read', 'glob'].includes(toolName)) {
-        if (typeof input.filePath === 'string')
-            return input.filePath;
-        if (typeof input.path === 'string')
-            return input.path;
-        return typeof input.pattern === 'string' ? input.pattern : undefined;
-    }
-    if (typeof input.command === 'string')
-        return input.command;
-    return typeof input.url === 'string' ? input.url : undefined;
 }
 function resolveRuleContents(toolName, input, checkerResult) {
     if (checkerResult?.ruleContents?.length)

@@ -1,19 +1,36 @@
 import { app } from "electron";
 import os from "node:os";
+/**
+ * Memory the OS can hand out without swapping. Plain `free` is misleading on
+ * macOS, which keeps it near zero and parks reclaimable memory in the file
+ * cache, so free + file-backed + purgeable is used there; Linux reports
+ * MemAvailable directly and Windows `free` already counts the standby list.
+ */
+export function availableSystemMemoryBytes(info, platform = process.platform) {
+    const kib = (value) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
+    let available = kib(info.free);
+    if (platform === 'darwin')
+        available += kib(info.fileBacked) + kib(info.purgeable);
+    else if (platform === 'linux' && typeof info.available === 'number')
+        available = kib(info.available);
+    return Math.min(available, kib(info.total)) * 1024;
+}
 function readSystemMemory() {
     try {
-        const getter = app.getSystemMemoryInfo;
+        // `process.getSystemMemoryInfo` is the Electron API; `app` has no such method.
+        const getter = process
+            .getSystemMemoryInfo;
         if (typeof getter !== 'function')
             throw new Error('system memory metrics unavailable');
-        const memory = getter.call(app);
+        const memory = getter.call(process);
         const totalBytes = Math.max(0, memory.total) * 1024;
-        const availableBytes = Math.max(0, memory.available ?? memory.free) * 1024;
         if (totalBytes > 0)
-            return { totalBytes, availableBytes };
+            return { totalBytes, availableBytes: availableSystemMemoryBytes(memory) };
     }
     catch {
         // Fall through to Node's cross-platform memory sample.
     }
+    // Outside Electron only Node's view is available; it reports free pages only.
     return { totalBytes: os.totalmem(), availableBytes: os.freemem() };
 }
 export function deviceHiddenTabCap(totalBytes) {

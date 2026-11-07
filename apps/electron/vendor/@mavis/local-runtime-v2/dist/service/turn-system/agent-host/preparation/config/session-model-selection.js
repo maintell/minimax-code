@@ -1,20 +1,25 @@
 // Single route-aware model selection for one Turn.
 //
 // The priority stays `explicit request > Session effectiveModel >
-// config.defaultModel`, but it is resolved exactly once here and handed to the
-// rest of preparation together with its source: the source decides what an
-// unavailable model means. A historical managed Session pinned to a model its
-// backend retired must be repaired locally and never reach the upstream.
-// Retired managed minimax-legacy aliases resolve to an available official model.
-// Other BYOK Session overrides stay intact and are delegated to the BYOK resolver, which
-// owns transient config-switch races and dangling-provider fallback like v1.
-// An explicit request or a broken default still fails locally instead of
-// silently running on a different model.
+// config.defaultModel`, resolved exactly once here and handed to the rest of
+// preparation together with its source.
+//
+// A reference the official catalog no longer lists is replaced, never refused:
+// the next callable tier wins, ending at the delivered default (see
+// `resolveModelReplacement`). A replaced Session model is written back so the
+// Session and UI converge. Retired managed minimax-legacy aliases resolve the
+// same way. Frozen official selections are never replaced and never blocked
+// locally: they are sent unchanged and the upstream decides.
+//
+// Non-official routes (custom providers, configured providers) keep their own
+// contract: an unlisted Session pin is left to the BYOK resolver, while an
+// explicit, default or frozen reference is refused here, because past this gate
+// that resolver silently swaps an unresolvable provider for a builtin model.
 //
 // Persistence is injected: this module (and the config builder) must not import
 // a repository or write SQL. Composition supplies `repairSessionModel` once the
 // SessionSystem is ready, backed by the existing record-service mutation.
-import { getRuntimePresetKey, resolveModelAvailability, } from '@mavis/config';
+import { getRuntimePresetKey, resolveModelAvailability, resolveModelReplacement, } from '@mavis/config';
 import { resolveLegacyMinimaxModel, } from '../../../../model-system/index.js';
 /** Stable local failure; never produced after an upstream request was started. */
 export class ModelRouteAvailabilityError extends Error {
@@ -26,68 +31,130 @@ export class ModelRouteAvailabilityError extends Error {
     }
 }
 export async function resolveTurnModelSelection(input) {
-    let selection = selectRequestedModel(input);
-    const replacement = selection.frozen
-        ? undefined
-        : resolveLegacyMinimaxModel(input.config, selection);
-    if (replacement) {
-        // Repair only the current Session selection. An explicit queued override
-        // must not overwrite a newer model the user selected for the Session.
-        if (selection.source === 'session_override' && input.repair) {
-            await input.repair.repairSessionModel({
-                sessionId: input.session.sessionId,
-                expectedModel: {
-                    effectiveModel: input.session.effectiveModel,
-                    effectiveModelVariant: input.session.effectiveModelVariant,
-                    effectiveModelThinking: input.session.effectiveModelThinking,
-                    effectiveModelContextWindow: input.session.effectiveModelContextWindow,
-                    effectiveModelMaxOutputTokens: input.session.effectiveModelMaxOutputTokens,
-                },
-                effectiveModel: `${replacement.providerId}/${replacement.modelId}`,
-                effectiveModelVariant: null,
-                effectiveModelThinking: null,
-            });
-        }
-        selection = { ...replacement, source: selection.source };
-    }
+    const selection = await resolveLegacySelection(input, selectRequestedModel(input));
     const preset = getRuntimePresetKey();
-    const availability = resolveModelAvailability({
+    const outcome = resolveModelReplacement({
         config: input.config,
         providerId: selection.providerId,
         modelId: selection.modelId,
         preset,
-        source: selection.source,
+        fallbacks: fallbackTiers(input, selection.source),
     });
-    if (availability.available || shouldDeferUnavailableByokSession(selection, availability.route)) {
+    if (outcome.kind === 'available')
+        return selection;
+    const log = {
+        session_id: input.session.sessionId,
+        source: selection.source,
+        preset,
+        route: outcome.route,
+    };
+    const from = `${selection.providerId}/${selection.modelId}`;
+    if (outcome.kind === 'passthrough' && outcome.reason === 'unmanaged_route') {
+        return gateUnmanagedRoute(input, selection, log, from);
+    }
+    if (outcome.kind === 'passthrough' || !isReplaceable(input, selection)) {
+        // Not ours to decide: a frozen official selection, or an official route
+        // that lists nothing. Send it unchanged; record why.
+        const reason = outcome.kind === 'passthrough' ? outcome.reason : 'frozen';
+        logModelGateOutcome(input.logger, { outcome: 'passthrough', reason, ...log, model: from });
         return selection;
     }
-    if (selection.source !== 'session_override') {
-        // Refusal branch. Logged before throwing because "the upstream was never
-        // called" is otherwise only visible as an ABSENCE of a request log: the
-        // route / preset / model triple here is what tells apart "the backend
-        // retired this model" from "the user picked a model nobody configured".
-        logModelGateOutcome(input.logger, {
-            outcome: 'rejected',
-            session_id: input.session.sessionId,
-            source: selection.source,
-            preset,
-            route: availability.route,
-            model: `${selection.providerId}/${selection.modelId}`,
-            code: availability.code,
-        });
-        throw new ModelRouteAvailabilityError(availability.code, availability.message);
-    }
-    return repairSessionOverride({ input, preset, stale: selection });
+    if (repairsSession(input, selection))
+        await repairSession(input, selection, outcome.model);
+    const to = `${outcome.model.providerId}/${outcome.model.modelId}`;
+    input.logger?.info?.({ ...log, tier: outcome.tier, from_model: from, to_model: to }, 'turn_model_replaced');
+    // The retired model's variant/effort/context do not carry over.
+    return { ...outcome.model, source: selection.source };
 }
 /**
- * V1 lets its source-specific resolver own unavailable BYOK Session refs. Keep
- * that behavior so a config/model switch observed between writes cannot
- * permanently rewrite the Session to the managed default. Explicit requests
- * and managed Session refs remain protected by the route gate above.
+ * Retirement only concerns official catalogs, so a non-official route keeps
+ * its pre-retirement contract. An unlisted Session pin is left to the BYOK
+ * resolver (its config can change between writes). Any other unlisted
+ * reference is refused: past this gate the resolver would silently swap an
+ * unresolvable provider for a builtin model the user did not choose.
  */
-function shouldDeferUnavailableByokSession(selection, route) {
-    return (selection.source === 'session_override' &&
-        (route === 'minimax_api_key' || route === 'custom_provider'));
+function gateUnmanagedRoute(input, selection, log, from) {
+    if (selection.source === 'session_override') {
+        logModelGateOutcome(input.logger, {
+            outcome: 'passthrough',
+            reason: 'unmanaged_route',
+            ...log,
+            model: from,
+        });
+        return selection;
+    }
+    const availability = resolveModelAvailability({
+        config: input.config,
+        providerId: selection.providerId,
+        modelId: selection.modelId,
+        preset: getRuntimePresetKey(),
+        source: selection.source,
+    });
+    if (availability.available)
+        return selection;
+    logModelGateOutcome(input.logger, {
+        outcome: 'rejected',
+        ...log,
+        model: from,
+        code: availability.code,
+    });
+    throw new ModelRouteAvailabilityError(availability.code, availability.message);
+}
+/** Maps a retired managed alias to its official model; only a Session pin is repaired. */
+async function resolveLegacySelection(input, selection) {
+    const legacy = selection.frozen ? undefined : resolveLegacyMinimaxModel(input.config, selection);
+    if (!legacy)
+        return selection;
+    // An explicit queued override must not overwrite a newer Session model.
+    if (selection.source === 'session_override')
+        await repairSession(input, selection, legacy);
+    return { ...legacy, source: selection.source };
+}
+/**
+ * Frozen selections are never replaced. A Session pin without a repair
+ * capability is a frozen Task definition, so it is left alone too.
+ */
+function isReplaceable(input, selection) {
+    return !selection.frozen && (selection.source !== 'session_override' || !!input.repair);
+}
+/**
+ * The Session pin is rewritten when it is the stale model: either it was the
+ * selected tier, or an explicit request repeated it (the UI re-sends its
+ * pending choice). A different explicit model never overwrites the Session.
+ */
+function repairsSession(input, stale) {
+    if (stale.source === 'session_override')
+        return true;
+    return (stale.source === 'explicit_request' &&
+        input.session.effectiveModel?.trim() === `${stale.providerId}/${stale.modelId}`);
+}
+/** Lower-priority tiers tried before the delivered default. */
+function fallbackTiers(input, source) {
+    const configDefault = parseModelReference(input.config.defaultModel);
+    if (source === 'explicit_request') {
+        return [parseModelReference(input.session.effectiveModel), configDefault];
+    }
+    return source === 'session_override' ? [configDefault] : [];
+}
+async function repairSession(input, stale, replacement) {
+    if (!input.repair)
+        return;
+    await input.repair.repairSessionModel({
+        sessionId: input.session.sessionId,
+        expectedModel: {
+            effectiveModel: input.session.effectiveModel,
+            effectiveModelVariant: input.session.effectiveModelVariant,
+            effectiveModelThinking: input.session.effectiveModelThinking,
+            effectiveModelContextWindow: input.session.effectiveModelContextWindow,
+            effectiveModelMaxOutputTokens: input.session.effectiveModelMaxOutputTokens,
+        },
+        effectiveModel: `${replacement.providerId}/${replacement.modelId}`,
+        effectiveModelVariant: null,
+        effectiveModelThinking: null,
+        ...(stale.modelId === replacement.modelId
+            ? {}
+            : { replacedFrom: { providerId: stale.providerId, modelId: stale.modelId } }),
+    });
 }
 /**
  * One bounded event for every non-happy model gate decision. Model ids and
@@ -188,79 +255,18 @@ function selectionSource(input, overrideProvider, overrideModelId) {
         return 'config_default';
     return input.requested ? 'explicit_request' : 'session_override';
 }
-async function repairSessionOverride(scope) {
-    const { input, preset, stale } = scope;
-    const fallback = parseModelKey(input.config.defaultModel);
-    const availability = resolveModelAvailability({
-        config: input.config,
-        providerId: fallback.provider,
-        modelId: fallback.modelId,
-        preset,
-        source: 'config_default',
-    });
-    if (!availability.available) {
-        // Both tiers are unusable: the Session pin is retired AND the configured
-        // default cannot be called on this route. Logged separately from the
-        // branch above so "repair was attempted but had nowhere to land" is not
-        // mistaken for "the Session model was simply invalid".
-        logModelGateOutcome(input.logger, {
-            outcome: 'repair_unavailable',
-            session_id: input.session.sessionId,
-            source: stale.source,
-            preset,
-            route: availability.route,
-            from_model: `${stale.providerId}/${stale.modelId}`,
-            fallback_model: `${fallback.provider}/${fallback.modelId}`,
-            code: availability.code,
-        });
-        throw new ModelRouteAvailabilityError(availability.code, availability.message);
-    }
-    const repaired = `${fallback.provider}/${fallback.modelId}`;
-    // Variant belongs to the retired model; carrying it to another model would
-    // re-pin a thinking mode the user never chose for it.
-    if (!input.repair) {
-        // Reached by a Task Session whose frozen model was retired: the frozen
-        // selection is deliberately not repairable (`canRepair === false` in
-        // `resolveTurnModel`), so there is no capability to rewrite it to the
-        // default. Preparation must still fail here — before any provider request
-        // — but the previous bare "repair is unavailable" message named the missing
-        // capability instead of the cause, and this branch emitted no log at all,
-        // so the retired model could not be identified from runtime logs.
-        logModelGateOutcome(input.logger, {
-            outcome: 'frozen_model_unavailable',
-            session_id: input.session.sessionId,
-            source: stale.source,
-            preset,
-            model: `${stale.providerId}/${stale.modelId}`,
-            fallback_model: repaired,
-            repairable: false,
-        });
-        throw new ModelRouteAvailabilityError('MODEL_NOT_AVAILABLE_FOR_ROUTE', `The model pinned to this Session (${stale.providerId}/${stale.modelId}) is no longer available and this Session's model is frozen, so it cannot be repaired automatically.`);
-    }
-    await input.repair.repairSessionModel({
-        sessionId: input.session.sessionId,
-        effectiveModel: repaired,
-        effectiveModelVariant: null,
-        effectiveModelThinking: null,
-    });
-    input.logger?.info?.({
-        session_id: input.session.sessionId,
-        source: stale.source,
-        preset,
-        from_model: `${stale.providerId}/${stale.modelId}`,
-        to_model: repaired,
-    }, 'session_model_repaired');
-    return { providerId: fallback.provider, modelId: fallback.modelId, source: 'config_default' };
-}
 /**
  * Wires the repair to the existing Session record service. A failed mutation
- * fails the Turn before an unavailable Session model can reach the upstream.
+ * fails the Turn before the stale Session model can reach the upstream.
+ * `onRepaired` publishes the committed change so the UI can show a notice;
+ * the low-level record mutation emits no model fact by itself.
  */
-export function createSessionModelRepair(records, logger) {
+export function createSessionModelRepair(records, logger, onRepaired) {
     return {
         repairSessionModel: async (input) => {
+            let session;
             try {
-                await records.mutateSession(input.sessionId, {
+                session = await records.mutateSession(input.sessionId, {
                     effectiveModel: input.effectiveModel,
                     effectiveModelVariant: input.effectiveModelVariant,
                     effectiveModelThinking: input.effectiveModelThinking,
@@ -274,18 +280,33 @@ export function createSessionModelRepair(records, logger) {
                 }, 'session_model_repair_persist_failed');
                 throw error;
             }
+            logger?.info?.({
+                session_id: input.sessionId,
+                ...(input.replacedFrom
+                    ? { from_model: `${input.replacedFrom.providerId}/${input.replacedFrom.modelId}` }
+                    : {}),
+                to_model: input.effectiveModel,
+            }, 'session_model_repaired');
+            onRepaired?.(session, input.replacedFrom);
         },
     };
 }
 function parseModelKey(value) {
-    const raw = value?.trim();
-    const slash = raw?.indexOf('/') ?? -1;
-    if (!raw || slash <= 0 || slash === raw.length - 1) {
+    const parsed = parseModelReference(value);
+    if (!parsed) {
+        const raw = value?.trim();
         throw new Error(raw
             ? `Invalid model key "${raw}". Expected provider/model.`
             : 'defaultModel is not configured');
     }
-    return { provider: raw.slice(0, slash), modelId: raw.slice(slash + 1) };
+    return { provider: parsed.providerId, modelId: parsed.modelId };
+}
+function parseModelReference(value) {
+    const raw = value?.trim();
+    const slash = raw?.indexOf('/') ?? -1;
+    if (!raw || slash <= 0 || slash === raw.length - 1)
+        return undefined;
+    return { providerId: raw.slice(0, slash), modelId: raw.slice(slash + 1) };
 }
 function modelOverrideFromSession(session) {
     const effective = session.effectiveModel?.trim();

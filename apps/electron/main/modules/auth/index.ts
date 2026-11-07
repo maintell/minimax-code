@@ -1,6 +1,8 @@
-import { resolveMCodeOAuthEndpointConfig, createMCodeAuthManager } from "@mavis/oauth-core";
+import { resolveMCodeOAuthEndpointConfig, createMCodeAuthManager, captureAuthTransportObserver } from "@mavis/oauth-core";
 import { DesktopAuthSession } from "./desktop-auth-session.js";
 import { resolveElectronNetFetch } from "../local-runtime/electron-net-fetch.js";
+import { createAuthRefreshDiagnosticsSink } from "./refresh-diagnostics.js";
+import logger from "../../utils/logger.js";
 export function createDesktopAuthSession(options, createSession = createDesktopAuthSessionFromCore) {
     return createSession({
         ...options,
@@ -20,7 +22,19 @@ function createDesktopAuthSessionFromCore(options) {
         buildEnv: options.buildEnv,
         region: options.region,
         endpoints,
-        fetchImpl: resolveElectronNetFetch(),
+        // The observer only reports lifecycle metadata of OAuth refresh requests;
+        // requests outside a refresh capture nothing and keep the same transport.
+        fetchImpl: resolveElectronNetFetch(undefined, {
+            captureTransportObserver: captureAuthTransportObserver,
+        }),
+        onDiagnostic: (event) => {
+            const message = `[OAuth] ${JSON.stringify(event)}`;
+            if (event.outcome === 'success')
+                logger.info(message);
+            else
+                logger.warn(message);
+        },
+        onRefreshDiagnostic: createAuthRefreshDiagnosticsSink(),
     });
     return new DesktopAuthSession(core, options.legacySource, undefined, options.identitySource);
 }

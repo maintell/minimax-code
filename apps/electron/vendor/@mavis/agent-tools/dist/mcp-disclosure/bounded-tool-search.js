@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { Type } from '@sinclair/typebox';
 import { defineRuntimeTool } from '@mavis/agent-core/tools';
+import { TOOL_SEARCH_PTC_CALL_SENTENCE } from './tool-search.js';
 export function createBoundedToolSearchTool(index, opts) {
     const maxResults = Number.isFinite(opts.topKMax)
         ? Math.max(1, Math.min(20, Math.trunc(opts.topKMax)))
@@ -31,9 +32,13 @@ export function createBoundedToolSearchTool(index, opts) {
     });
     return defineRuntimeTool({
         name: 'tool_search',
-        description: 'Discover on-demand tools, including scheduled-task management and configured integrations, that are absent from your default tool list. ' +
-            'Search by keyword `query` and/or `regex`; returns the full definitions (name, description, input_schema) of the top matches. ' +
-            'Then call `mcp_invoke` with the chosen tool_name and arguments to use one.',
+        description: [
+            'Discover on-demand tools, including scheduled-task management and configured integrations, that are absent from your default tool list.',
+            'Search by keyword `query` and/or `regex`; returns the full definitions (name, description, input_schema) of the top matches.',
+            opts.ptc
+                ? TOOL_SEARCH_PTC_CALL_SENTENCE
+                : 'Then call `mcp_invoke` with the chosen tool_name and arguments to use one.',
+        ].join(' '),
         schema,
         execute: async (_ctx, input) => {
             if (!input.query?.trim() && !input.regex?.trim())

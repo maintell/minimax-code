@@ -1,5 +1,3 @@
-import { handleExcelEditorBrokerMessage } from "../../../ipc/excel-editor.ipc";
-import { handleWordEditorBrokerMessage } from "../../../ipc/word-editor.ipc";
 /**
  * Local-runtime utility process lifecycle manager (Electron main side).
  *
@@ -30,6 +28,7 @@ import { handleWordEditorBrokerMessage } from "../../../ipc/word-editor.ipc";
  * quarantined `actualExit`) that make every fork wait for the previous
  * process's real exit (§2.8 single-writer ordering).
  */
+
 import path from "path";
 import { randomUUID } from "crypto";
 import { boundFailureDetail } from "../../observability/failure-detail";
@@ -39,6 +38,7 @@ import { MainOwnedDiagnosticsBroker } from "./diagnostics-broker";
 import { MainOwnedAuthRecoveryBroker } from "./auth-recovery-broker";
 import { MainMiniAppBrokerClient } from "./miniapp-broker";
 import { MainOwnedMiniAppSurfaceBroker } from "./miniapp-surface-broker";
+import { MainMiniAppToolBroker } from "./miniapp-tool-broker";
 import { describeRuntimeOwnerConflict } from "./runtime-owner-conflict";
 import { DEFAULT_RUNTIME_MEMORY_MONITOR_INTERVAL_MS, DEFAULT_HEAP_SAMPLING_INTERVAL_BYTES, DEFAULT_HEAP_SAMPLING_STACK_DEPTH, isRuntimeMemorySampleMessage, isRuntimeMemoryMonitorResponse } from "./runtime-memory-monitor-contract";
 import { isRuntimeComputerUseRequiredMessage } from "./computer-use-broker";
@@ -275,6 +275,9 @@ export class LocalRuntimeUtilityProcessManager {
         this.rendererGenerations = new Map();
         this.activeAppVersion = 'unknown';
         this.miniAppBroker = new MainMiniAppBrokerClient();
+        this.miniAppToolBroker = new MainMiniAppToolBroker({
+            requestApproval: async (input) => (await this.options.requestMiniAppToolApproval?.(input)) ?? 'unavailable',
+        });
         this.revokedMiniAppGenerations = new WeakSet();
         this.routingContext = options.getRoutingContext?.();
         this.browserBroker = new MainOwnedBrowserBroker({
@@ -533,6 +536,63 @@ export class LocalRuntimeUtilityProcessManager {
     }
     /** Main-owned UI request over the utility control plane. */
     async requestMiniApp(method, pluginId, signal) {
+        return this.miniAppBroker.request(await this.readyMiniAppTarget(), method, pluginId, signal);
+    }
+    /** Plugin-detail permission switch; resolves with the stored list. */
+    async setMiniAppPermission(input) {
+        return this.miniAppBroker.setPermission(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path Agent run; `input.caller` was resolved by Main from the sending tab. */
+    async runMiniAppAgent(input, options) {
+        return this.miniAppBroker.runAgent(await this.readyMiniAppTarget(), input, options);
+    }
+    /** Page-path permission decision; `input.caller` was resolved by Main from the sending tab. */
+    async replyMiniAppAgent(input) {
+        return this.miniAppBroker.replyAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path side-panel check; `input.caller` was resolved by Main from the sending tab. */
+    async openMiniAppAgent(input) {
+        return this.miniAppBroker.openAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path model catalog; `input.caller` was resolved by Main from the sending tab. */
+    async modelsMiniAppAgent(input) {
+        return this.miniAppBroker.modelsAgent(await this.readyMiniAppTarget(), input);
+    }
+    async agentsMiniAppAgent(input) {
+        return this.miniAppBroker.agentsAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path session creation without a turn. */
+    async createMiniAppAgent(input) {
+        return this.miniAppBroker.createAgent(await this.readyMiniAppTarget(), input);
+    }
+    /** Host-reported side panel change for a Mini App session; no tab caller. */
+    async reportMiniAppAgentPanel(method, input) {
+        // A panel report describes in-memory runtime state. `panelOpened` follows a successful
+        // `open`, so the runtime is up; `panelClosed` must not start a runtime that is not
+        // running, since a stopped runtime has nothing left to forget.
+        if (method === 'agent.panelClosed' && this.state.phase !== 'ready')
+            return;
+        return this.miniAppBroker.reportAgentPanel(await this.readyMiniAppTarget(), method, input);
+    }
+    /** Page-path observer; no deadline, ends on cancel or when the runtime ends it. */
+    async observeMiniAppAgent(input, options) {
+        return this.miniAppBroker.observeAgent(await this.readyMiniAppTarget(), input, options);
+    }
+    async listMiniAppAgentSessions(input) {
+        return this.miniAppBroker.listAgentSessions(await this.readyMiniAppTarget(), input);
+    }
+    async getMiniAppAgentSession(input) {
+        return this.miniAppBroker.getAgentSession(await this.readyMiniAppTarget(), input);
+    }
+    /** Page-path questionnaire answer; the continuation turn is followed like `runMiniAppAgent`. */
+    async answerMiniAppAgent(input, options) {
+        return this.miniAppBroker.answerAgent(await this.readyMiniAppTarget(), input, options);
+    }
+    /** Page-path `tool.request`; `pluginId` was resolved by Main from the sending tab. */
+    async requestMiniAppTools(input) {
+        return this.miniAppToolBroker.requestFromPage(await this.readyMiniAppTarget(), input);
+    }
+    async readyMiniAppTarget() {
         const ready = await this.ensureStarted();
         const state = this.state;
         if (!ready || state.phase !== 'ready') {
@@ -540,7 +600,7 @@ export class LocalRuntimeUtilityProcessManager {
                 code: 'runtime_unavailable',
             });
         }
-        return this.miniAppBroker.request(state.child, method, pluginId, signal);
+        return state.child;
     }
     disconnectRenderer(rendererId) {
         this.rendererGenerations.set(rendererId, (this.rendererGenerations.get(rendererId) ?? 0) + 1);
@@ -646,6 +706,17 @@ export class LocalRuntimeUtilityProcessManager {
         }
         catch {
             (this.options.logger ?? noopLogger).warn('[UtilityRuntime] Runaway Guard config post failed');
+        }
+    }
+    setPromptSuggestionPolicy(policy) {
+        const state = this.state;
+        if (state.phase !== 'starting' && state.phase !== 'ready')
+            return;
+        try {
+            state.child.postMessage({ type: 'runtime-prompt-suggestion-policy', policy });
+        }
+        catch {
+            (this.options.logger ?? noopLogger).warn('[UtilityRuntime] Prompt suggestion policy post failed');
         }
     }
     setToolResultCompactionConfig(config) {
@@ -911,8 +982,23 @@ export class LocalRuntimeUtilityProcessManager {
         return this.stopPromise;
     }
     async doStop() {
+        const startedAtMs = Date.now();
+        const runtimePid = this.getProcessId();
         try {
-            return await this.performStop();
+            const result = await this.performStop();
+            try {
+                (this.options.logger ?? noopLogger).info(`[UtilityRuntime] stop completed ${JSON.stringify({
+                    ts_ms: Date.now(),
+                    runtime_pid: runtimePid,
+                    remaining_runtime_pid: this.getProcessId(),
+                    duration_ms: Date.now() - startedAtMs,
+                    ...result,
+                })}`);
+            }
+            catch {
+                // Diagnostics must not change the stop result or lifecycle cleanup.
+            }
+            return result;
         }
         finally {
             // A deliberate stop ends the supervision session: exits separated by
@@ -1341,6 +1427,7 @@ export class LocalRuntimeUtilityProcessManager {
                 const startupExecutionPolicy = this.options.getStartupExecutionPolicy?.();
                 const miniAppSurfaceEnabled = this.isMiniAppSurfaceEnabled();
                 const runawayGuardConfig = this.options.getRunawayGuardConfig?.();
+                const promptSuggestionPolicy = this.options.getPromptSuggestionPolicy?.();
                 const toolResultCompactionConfig = this.options.getToolResultCompactionConfig?.();
                 const collectionPolicy = this.options.getCollectionPolicy?.();
                 const promptConfigKey = this.options.getPromptConfigKey?.();
@@ -1359,6 +1446,7 @@ export class LocalRuntimeUtilityProcessManager {
                     ...(promptConfigKey ? { promptConfigKey: [...promptConfigKey] } : {}),
                     contextWindowUsageEnabled: this.options.getContextWindowUsageEnabled?.() === true,
                     ...(runawayGuardConfig ? { runawayGuardConfig } : {}),
+                    ...(promptSuggestionPolicy ? { promptSuggestionPolicy } : {}),
                     ...(toolResultCompactionConfig &&
                         (toolResultCompactionConfig.enabled !== undefined ||
                             toolResultCompactionConfig.maxInlineBytes !== undefined ||
@@ -1366,7 +1454,8 @@ export class LocalRuntimeUtilityProcessManager {
                             toolResultCompactionConfig.watermarkBytes !== undefined ||
                             toolResultCompactionConfig.minSavingsBytes !== undefined ||
                             toolResultCompactionConfig.minCandidateBytes !== undefined ||
-                            toolResultCompactionConfig.keepRecentRounds !== undefined)
+                            toolResultCompactionConfig.keepRecentRounds !== undefined ||
+                            toolResultCompactionConfig.checkpointSharedPrefix !== undefined)
                         ? { toolResultCompactionConfig }
                         : {}),
                     ...(collectionPolicy ? { collectionPolicy } : {}),
@@ -1408,8 +1497,6 @@ export class LocalRuntimeUtilityProcessManager {
             if ((state.phase !== 'starting' && state.phase !== 'ready') || state.child !== child) {
                 return;
             }
-            if (handleWordEditorBrokerMessage(child, raw) || handleExcelEditorBrokerMessage(child, raw))
-                return;
             if (this.browserBroker.handleMessage(child, raw))
                 return;
             if (this.diagnosticsBroker.handleMessage(child, raw))
@@ -1421,6 +1508,8 @@ export class LocalRuntimeUtilityProcessManager {
             if (this.authRecoveryBroker.handleMessage(child, raw))
                 return;
             if (this.miniAppSurfaceBroker.handleMessage(child, raw))
+                return;
+            if (this.miniAppToolBroker.handleMessage(child, raw))
                 return;
             if (this.miniAppBroker.handleMessage(child, raw))
                 return;
@@ -1952,6 +2041,7 @@ export class LocalRuntimeUtilityProcessManager {
         this.browserBroker.releaseTarget(child);
         this.diagnosticsBroker.releaseTarget(child);
         this.miniAppSurfaceBroker.releaseTarget(child);
+        this.miniAppToolBroker.releaseTarget(child);
         this.miniAppBroker.releaseTarget(child);
         this.activeBrowserAdapter = undefined;
         this.activeHostDiagnosticsProvider = undefined;

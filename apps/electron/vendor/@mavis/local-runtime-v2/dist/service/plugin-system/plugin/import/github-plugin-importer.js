@@ -1,4 +1,4 @@
-import { readImportedPluginPackage } from '../package/package-readers.js';
+import { hasSupportedCapability, readImportedPluginPackage } from '../package/package-readers.js';
 import { PluginPackageContractError } from '../package/package-contract.js';
 import { PluginReaderError } from '../package/reader-errors.js';
 import { PluginSystemError } from '../../errors.js';
@@ -56,7 +56,7 @@ export class GithubPluginImporter {
             source,
             plugin,
             packageSizeBytes: extracted.packageSizeBytes,
-            canImport: plugin.skills.length + plugin.mcpServers.length + (plugin.hooks?.length ?? 0) > 0,
+            canImport: hasSupportedCapability(plugin),
         };
     }
 }
