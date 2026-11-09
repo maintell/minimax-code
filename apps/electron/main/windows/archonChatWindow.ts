@@ -58,6 +58,24 @@ export async function createArchonChatWindow(context) {
         show: false,
     });
     recordElectronStartupMainMilestone('browser_window_created');
+    // Renderer console is invisible to the main log, but the offline-mode
+    // diagnosis needs the exact exception useInitFetch.d() throws (its catch
+    // only console.errors). Mirror error-level messages and the bootstrap
+    // diagnostics into the main log so an offline machine can be diagnosed
+    // from api-*/main-*.log alone, without opening DevTools.
+    window.webContents.on('console-message', (details) => {
+        try {
+            const message = String(details && details.message ? details.message : '');
+            const level = details && details.level;
+            const isBootstrap = /useInitFetch|getCurrentUser|cloudReachable|offline stub|account_unavailable/iu.test(message);
+            if (level !== 'error' && !isBootstrap)
+                return;
+            logger.info(`[Renderer:${String(level)}] ${message.slice(0, 900)}`);
+        }
+        catch {
+            // Diagnostics must never affect window creation.
+        }
+    });
     browserGuestRegistry.install(window, (value) => {
         try {
             const url = new URL(value);

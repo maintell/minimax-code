@@ -6,6 +6,7 @@ import { classifyDesktopLoginError } from "@mavis/shared/desktop-login-diagnosti
 import { IPC_CHANNELS } from "../config/constants";
 import { windowManager } from "../windows";
 import { resolveSharedOAuthAuthState } from "../windows/initial-auth";
+import { isOffline } from "../modules/connectivity/offline-mode";
 import { logger } from "../utils";
 import { stopLocalRuntime, prepareLocalRuntime } from "../modules/local-runtime";
 import { clearSharedRuntimeProjection, refreshSharedRuntimeProjection } from "../modules/auth/runtime-projection";
@@ -34,8 +35,14 @@ export function setupAuthIPC(options) {
     // 检查登录状态
     ipcMain.handle(IPC_CHANNELS.AUTH_CHECK_STATUS, async () => {
         const status = await options.sharedAuthSession.getStatus();
+        const isLoggedIn = await resolveSharedOAuthAuthState(options.sharedAuthSession);
+        // Offline diagnosis: a second check within a second of startup means
+        // useInitFetch.d() failed and called ensureLoggedIn; this line plus the
+        // absence of '[Auth] navigateToLogin suppressed' pinpoints it from logs
+        // alone, without the user having to look at the window.
+        logger.info(`[Auth] checkAuthStatus offline=${await isOffline()} isLoggedIn=${isLoggedIn}`);
         return {
-            isLoggedIn: await resolveSharedOAuthAuthState(options.sharedAuthSession),
+            isLoggedIn,
             mode: status.mode === 'legacy-compatible' ? 'legacy-compatible' : 'shared-local',
         };
     });
@@ -74,6 +81,14 @@ export function setupAuthIPC(options) {
         try {
             // 记录退出来源日志，便于排查异常退出问题
             logger.info(`[Auth] navigateToLogin triggered, source: ${source || 'unknown'}`);
+            // All renderer login-navigation paths (startup init, 401 interceptor,
+            // sign-in-again, background re-checks) converge on this handler.
+            // Offline the login window can never succeed, so stay on the main
+            // surface instead of bouncing the user out after a few seconds.
+            if (await isOffline()) {
+                logger.info('[Auth] navigateToLogin suppressed: cloud unreachable');
+                return { success: true };
+            }
             await windowManager.switchToLoginWindow();
             return { success: true };
         }

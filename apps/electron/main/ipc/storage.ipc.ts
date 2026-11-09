@@ -14,6 +14,7 @@ import { scheduleMcodeToolsAuthorization, clearMcodeToolsAuthorization } from ".
 import { resolveAccountOnboardingInstallCohort, resolveDesktopOnboardingMode } from "../windows/accountOnboardingEligibility";
 import { DEFAULT_DESKTOP_TYPOGRAPHY, getDesktopTypographySnapshot, desktopTypographyEquals } from "../modules/desktop-typography";
 import { DEFAULT_DESKTOP_APPEARANCE_STATE, getDesktopAppearanceState, desktopAppearanceStatesEqual, mergeDesktopAppearancePatch, emitDesktopAppearanceCommitted } from "../modules/desktop-appearance";
+import { OFFLINE_USER_ID, buildOfflineUser, isOffline } from "../modules/connectivity/offline-mode";
 /**
  * 根据国内/海外版本和环境区分存储配置名称
  * 这样不同版本和环境可以共存而不互相影响
@@ -703,22 +704,51 @@ export function setupStorageIPC(options = {}) {
         return { success: true };
     });
     // 用户信息相关
-    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_USER, () => {
+    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_USER, async () => {
         const user = getUserInfo();
+        // Offline: the account backend cannot be reached, so a real user is
+        // never populated. Return a COMPLETE synthetic user at read time (never
+        // written to the store) so useInitFetch can finish and the main UI
+        // renders instead of dereferencing missing identity fields (white
+        // screen). Online, or when a real user already exists, behave as before.
+        if (await isOffline()) {
+            const hasIdentity = Boolean(user && (user.userID || user.realUserID));
+            if (!hasIdentity) {
+                return options.sharedAuthEnabled ? withoutCredentialFields(buildOfflineUser()) : buildOfflineUser();
+            }
+        }
         return options.sharedAuthEnabled ? withoutCredentialFields(user) : user;
     });
     ipcMain.handle(IPC_CHANNELS.STORAGE_SET_USER, async (_, user) => {
         if (options.sharedAuthEnabled && hasCredentialFields(user))
             return sharedCredentialError;
-        const currentAccount = getUserInfo().realUserID;
-        if (options.sharedAuthEnabled &&
-            currentAccount &&
-            user.realUserID &&
-            user.realUserID !== currentAccount) {
-            return { success: false, error: 'Desktop account changed. Refresh account information.' };
+        const offline = await isOffline();
+        if (!offline) {
+            const currentAccount = getUserInfo().realUserID;
+            // An offline session leaves the OFFLINE_USER_ID sentinel in the store.
+            // It is not a real account, so it must never block a later real login
+            // ("Desktop account changed" would otherwise reject it).
+            const currentIsOfflineSentinel = currentAccount === OFFLINE_USER_ID;
+            if (options.sharedAuthEnabled &&
+                currentAccount &&
+                !currentIsOfflineSentinel &&
+                user.realUserID &&
+                user.realUserID !== currentAccount) {
+                return { success: false, error: 'Desktop account changed. Refresh account information.' };
+            }
         }
+        logger.info(`[Storage] setUser offline=${offline} realUserID=${user.realUserID ?? ""}`);
         setUserInfo(user);
-        if (options.sharedAuthEnabled) {
+        if (offline) {
+            // The shared identity projection calls refreshSharedRuntimeProjection
+            // WITHOUT allowAnonymous; offline its getAccessToken throws
+            // AuthRequiredError, which would reject this IPC and make
+            // useInitFetch.d() set authInitFailed (the account-unavailable card).
+            // Skip all cloud projection while offline; the local runtime was
+            // already warmed up anonymously at startup.
+            logger.info('[Storage] setUser: offline, skipping shared identity projection');
+        }
+        else if (options.sharedAuthEnabled) {
             await options.onSharedIdentityChanged?.(getUserInfo());
         }
         else {
@@ -757,7 +787,15 @@ export function setupStorageIPC(options = {}) {
     ipcMain.handle(IPC_CHANNELS.STORAGE_GET_LOCAL_STORAGE_CONFIG, () => {
         return getLocalStorageConfig();
     });
-    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_DESKTOP_ONBOARDING_MODE, () => {
+    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_DESKTOP_ONBOARDING_MODE, async () => {
+        // Offline the account-onboarding flow cannot complete: it fetches
+        // agent_desktop_onboarding_config from the cloud and throws
+        // "Invalid desktop onboarding config" when the offline stub has no such
+        // key (observed on a fresh no-network install). Skip the flow entirely.
+        if (await isOffline()) {
+            logger.info('[Storage] onboarding mode: offline, using main');
+            return 'main';
+        }
         return resolveDesktopOnboardingMode({
             installCohort: getAccountOnboardingInstallCohort(),
         });
