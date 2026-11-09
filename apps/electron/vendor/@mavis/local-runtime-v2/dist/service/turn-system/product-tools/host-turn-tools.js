@@ -18,10 +18,12 @@ export async function buildLocalTurnToolSourcesForHost(input) {
             : {}),
         ...(input.skipAgentResolution ? { skipAgentResolution: true } : {}),
         sessionId: input.session.sessionId,
+        turnId: input.turnId,
         authContext: input.host.authContextGetter?.(),
         ...liveAuthSources(input.host),
         routingContextGetter: input.host.routingContextGetter,
         fetchImpl: input.host.fetchImpl,
+        matrixLogger: input.host.matrixLogger,
         nativeWebSearchEnabled: ['electron', 'tui', 'cli'].includes(input.host.getRuntimeOwnerKind()),
         mcpService: input.host.mcpService,
         questionnaireContext: input.host.supportsInteraction('questionnaireReply')
@@ -40,6 +42,7 @@ export async function buildLocalTurnToolSourcesForHost(input) {
         memoryWriteEnabled: input.memoryWriteEnabled,
         ...optionalResourceSelectors(input, memoryAgentScopeEnabled),
         metrics: input.host.metrics,
+        ...optionalHostMetrics(input.host),
         mavisAgentAdapter: input.mavisAgentAdapter,
         ...(input.cronEnabled !== false && input.mavisCronAdapter
             ? { mavisCronAdapter: input.mavisCronAdapter }
@@ -61,23 +64,22 @@ function liveAuthSources(host) {
         ...(host.authContextInvalidator ? { authContextInvalidator: host.authContextInvalidator } : {}),
     };
 }
+/** Native tool behaviour counters, omitted entirely when the host wires no metrics sink. */
+function optionalHostMetrics(host) {
+    return host.metricsClient ? { metricsClient: host.metricsClient } : {};
+}
 function optionalResourceSelectors(input, memoryAgentScopeEnabled) {
     return {
         ...(memoryAgentScopeEnabled === undefined ? {} : { memoryAgentScopeEnabled }),
         ...(input.memoryReadAgentNames === undefined
             ? {}
             : { memoryReadAgentNames: input.memoryReadAgentNames }),
-        ...(input.allowedSkillNames === undefined
-            ? {}
-            : { allowedSkillNames: input.allowedSkillNames }),
-        ...(input.allowedExtensionSkillNames === undefined
-            ? {}
-            : { allowedExtensionSkillNames: input.allowedExtensionSkillNames }),
     };
 }
 function optionalToolCapabilities(input) {
     return {
         ...(input.miniappAvailable === true ? { miniappAvailable: true } : {}),
+        ...(input.pptPreviewAvailable === true ? { pptPreviewAvailable: true } : {}),
         ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
         computerUseActive: input.computerUseActive === true,
         ...(input.builtinCapabilities ? { builtinCapabilities: input.builtinCapabilities } : {}),

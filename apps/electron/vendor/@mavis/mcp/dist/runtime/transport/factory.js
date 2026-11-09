@@ -9,6 +9,8 @@ export function createTransport(config, options) {
             return createHttpTransport(config, {
                 headers: options?.headers,
                 fetchImpl: options?.fetchImpl,
+                authorizer: options?.authorizer,
+                onAuthRequired: options?.onAuthRequired,
             });
     }
 }

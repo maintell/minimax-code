@@ -1,6 +1,13 @@
 import { DEFAULT_VIEW_BACKGROUND } from "./controller";
-import { OFFSCREEN_BOUNDS } from "./embedded-browser-manager-helpers";
+import { OFFSCREEN_BOUNDS, nowMs } from "./embedded-browser-manager-helpers";
 import { resolveDetachedWindowMinSize } from "./miniapp-window-handle";
+/**
+ * Whether a pop-out window is on screen: shown and not minimized. A minimized or hidden one
+ * counts as hidden for memory management, like a hidden panel page.
+ */
+export function isDetachedWindowInView(window) {
+    return !window.isDestroyed() && window.isVisible() && !window.isMinimized();
+}
 export async function openDetachedWindow(host, tab, signal, initialSize,
 /**
  * Whether a user gesture drove this detach. Mirrors the userActivated/
@@ -67,76 +74,18 @@ userActivated = true) {
         // decides whether this pop-out is allowed to take it (Bug 2 / P2).
         show: false,
     });
-    const contentBounds = () => {
-        const { width, height } = window.getContentBounds();
-        return { x: 0, y: 0, width, height };
-    };
     // Listeners first: the window must never own the page without a close path.
     tab.detachedWindow = window;
     tab.detachedPanelVisible = wasVisibleInPanel;
     if (pluginId) {
         tab.detachedWindowBoundsPersistence = attachMiniAppWindowBoundsPersistence(pluginId, window);
     }
-    window.on('resize', () => {
-        if (tab.detachedWindow !== window || window.isDestroyed())
-            return;
-        tab.bounds = contentBounds();
-        void tab.controller.setBounds(tab.bounds);
-    });
-    window.on('close', (event) => {
-        if (tab.detachedWindow !== window || host.isAppQuitting())
-            return;
-        event.preventDefault();
-        if (host.requestAttach)
-            host.requestAttach(tab);
-        else
-            attachDetachedTab(host, tab);
-    });
-    // Cmd/Ctrl+W inside the pop-out is equivalent to the close button: return
-    // to the panel instead of falling through to the app menu's `role:
-    // 'close'`. See BrowserController's before-input-event handler.
-    const requestAttach = () => {
-        if (host.requestAttach)
-            host.requestAttach(tab);
-        else
-            attachDetachedTab(host, tab);
-    };
-    tab.controller.setOnRequestCloseDetached(requestAttach);
-    window.on('closed', () => {
-        if (tab.detachedWindow !== window)
-            return;
-        // Closed without an attach (app quit or owner teardown): the view has no
-        // live parent anymore, so only the bookkeeping needs to follow.
-        clearDetachedWindowState(tab);
-        tab.controller.setBackgroundColor(DEFAULT_VIEW_BACKGROUND);
-        tab.bounds = OFFSCREEN_BOUNDS;
-        host.markTabHidden(tab);
-    });
-    // Cmd/Ctrl+W only reached the page once (Bug 2); later activation
-    // (Cmd+Shift+`, a title-bar click or alt-tab) never did (P2).
-    // A `BaseWindow` becoming key hands the OS focus to itself, not to a
-    // child `WebContentsView` — pull it in on every real focus, not just the
-    // first one.
-    window.on('focus', () => {
-        if (tab.detachedWindow !== window || window.isDestroyed())
-            return;
-        tab.controller.focusPage();
-    });
+    bindDetachedWindow(host, tab, window);
     try {
         // Not a constructor option: Electron only exposes click-through as a method.
         if (declaredWindow?.clickThrough)
             window.setIgnoreMouseEvents(true, { forward: true });
-        tab.bounds = contentBounds();
-        if (host.transferPage)
-            await host.transferPage(tab, window, tab.bounds, signal);
-        else
-            tab.controller.attachToParent(window, tab.bounds);
-        tab.controller.setOnRequestCloseDetached(requestAttach);
-        // BaseWindow transparency alone leaves the WebContentsView's own
-        // background opaque; a `frame:false, transparent:true` Mini App needs
-        // both cleared to an alpha-channel color.
-        if (declaredWindow?.transparent)
-            tab.controller.setBackgroundColor('#00000000');
+        await attachPageToWindow(host, tab, window, signal);
     }
     catch (error) {
         if (tab.backendSelection?.rendererBackend === 'webview') {
@@ -166,10 +115,179 @@ userActivated = true) {
         window.show();
     else
         window.showInactive();
+    // Shown, so in view; the window's minimize/hide/restore/show listeners track it from here.
+    host.onVisibilityChanged(tab);
     // The panel may never observe an intermediate `detached: true` if a fast
     // detach->attach round trip completes between two state polls; bump the
     // revision so a same-value `detached` read still forces a fresh show().
     tab.presentationRevision += 1;
+}
+/**
+ * Hands a page's pop-out window over before the page is destroyed to sleep: the window stays as
+ * it is (minimized or hidden) and keeps its position memory, the tab drops every detached-window
+ * field and its listeners. Undefined when the tab has no live window.
+ */
+export function releaseDetachedWindow(tab) {
+    const window = tab.detachedWindow;
+    if (!window || window.isDestroyed())
+        return undefined;
+    const boundsPersistence = tab.detachedWindowBoundsPersistence;
+    // Moves to the kept window instead of being disposed with the tab's state.
+    delete tab.detachedWindowBoundsPersistence;
+    clearDetachedWindowState(tab);
+    return { window, ...(boundsPersistence ? { boundsPersistence } : {}) };
+}
+/**
+ * Moves a freshly reopened page into the window its previous page slept in. The page is in view
+ * only if that window is on screen. Throws (after returning the page to the panel and closing the
+ * window) when the page cannot be placed in it.
+ */
+export async function adoptDetachedWindow(host, tab, kept, signal) {
+    const { window } = kept;
+    tab.detachedWindow = window;
+    // The panel shows the placeholder again on its next layout sync.
+    tab.detachedPanelVisible = false;
+    if (kept.boundsPersistence)
+        tab.detachedWindowBoundsPersistence = kept.boundsPersistence;
+    bindDetachedWindow(host, tab, window);
+    try {
+        await attachPageToWindow(host, tab, window, signal);
+    }
+    catch (error) {
+        await attachDetachedTab(host, tab);
+        throw error;
+    }
+    tab.controller.setAudioMuted(false);
+    tab.hiddenAt = isDetachedWindowInView(window) ? null : (tab.hiddenAt ?? nowMs());
+}
+/** Closes a kept window for good, persisting its final position first. */
+export function closeKeptDetachedWindow(kept) {
+    if (!kept.window.isDestroyed())
+        kept.boundsPersistence?.flush();
+    kept.boundsPersistence?.dispose();
+    if (!kept.window.isDestroyed())
+        kept.window.destroy();
+}
+/**
+ * Listens on a kept window for a sleeping tab: `onShown` once it is restored or shown again,
+ * `onClose` when the user closes it (prevented, the owner decides), `onClosed` when it is gone
+ * anyway (app quit). Returns the disposer that removes these listeners.
+ */
+export function bindKeptDetachedWindow(window, handlers) {
+    const onShown = () => {
+        if (isDetachedWindowInView(window))
+            handlers.onShown();
+    };
+    return listen(window, {
+        restore: onShown,
+        show: onShown,
+        close: (event) => {
+            if (handlers.isAppQuitting())
+                return;
+            event.preventDefault();
+            handlers.onClose();
+        },
+        closed: () => handlers.onClosed(),
+    });
+}
+/** Wires a pop-out window to its live tab; `tab.detachedWindowListeners` removes it again. */
+function bindDetachedWindow(host, tab, window) {
+    // Every native show/hide is reported: `hiddenAt` records when the page left view, but it is
+    // not proof that the runtime's last snapshot matched the window, so it never gates a report.
+    // The snapshot reads the window's real state; a stale `hiddenAt` only skews ranking.
+    const onHidden = () => {
+        if (tab.detachedWindow !== window)
+            return;
+        tab.hiddenAt ?? (tab.hiddenAt = nowMs());
+        host.onVisibilityChanged(tab);
+    };
+    const onShown = () => {
+        if (tab.detachedWindow !== window || !isDetachedWindowInView(window))
+            return;
+        tab.hiddenAt = null;
+        host.onVisibilityChanged(tab);
+    };
+    tab.detachedWindowListeners = listen(window, {
+        resize: () => {
+            if (tab.detachedWindow !== window || window.isDestroyed())
+                return;
+            tab.bounds = detachedContentBounds(window);
+            void tab.controller.setBounds(tab.bounds);
+        },
+        close: (event) => {
+            if (tab.detachedWindow !== window || host.isAppQuitting())
+                return;
+            event.preventDefault();
+            requestAttach(host, tab);
+        },
+        closed: () => {
+            if (tab.detachedWindow !== window)
+                return;
+            // Closed without an attach (app quit or owner teardown): the view has no
+            // live parent anymore, so only the bookkeeping needs to follow.
+            clearDetachedWindowState(tab);
+            tab.controller.setBackgroundColor(DEFAULT_VIEW_BACKGROUND);
+            tab.bounds = OFFSCREEN_BOUNDS;
+            host.markTabHidden(tab);
+        },
+        // Cmd/Ctrl+W only reached the page once (Bug 2); later activation
+        // (Cmd+Shift+`, a title-bar click or alt-tab) never did (P2).
+        // A `BaseWindow` becoming key hands the OS focus to itself, not to a
+        // child `WebContentsView` — pull it in on every real focus, not just the
+        // first one.
+        focus: () => {
+            if (tab.detachedWindow !== window || window.isDestroyed())
+                return;
+            tab.controller.focusPage();
+        },
+        // Minimized or hidden counts as hidden for memory management; the main window's state never does.
+        minimize: onHidden,
+        hide: onHidden,
+        restore: onShown,
+        show: onShown,
+    });
+    // Cmd/Ctrl+W inside the pop-out is equivalent to the close button: return
+    // to the panel instead of falling through to the app menu's `role:
+    // 'close'`. See BrowserController's before-input-event handler.
+    tab.controller.setOnRequestCloseDetached(() => requestAttach(host, tab));
+}
+/** Returns the page to the panel: the host's own attach when it has one, else the plain path. */
+function requestAttach(host, tab) {
+    if (host.requestAttach)
+        host.requestAttach(tab);
+    else
+        void attachDetachedTab(host, tab);
+}
+/** Adds `listeners` to `window`; the returned disposer removes exactly these again. */
+function listen(window, listeners) {
+    // Electron types each BaseWindow event separately; these are registered by name.
+    const emitter = window;
+    for (const [event, listener] of Object.entries(listeners))
+        emitter.on(event, listener);
+    return () => {
+        for (const [event, listener] of Object.entries(listeners)) {
+            emitter.removeListener(event, listener);
+        }
+    };
+}
+function detachedContentBounds(window) {
+    const { width, height } = window.getContentBounds();
+    return { x: 0, y: 0, width, height };
+}
+/** Fills the window's content area with the tab's page. */
+async function attachPageToWindow(host, tab, window, signal) {
+    tab.bounds = detachedContentBounds(window);
+    if (host.transferPage)
+        await host.transferPage(tab, window, tab.bounds, signal);
+    else
+        tab.controller.attachToParent(window, tab.bounds);
+    // A transfer may hand the tab a new controller; the close path must follow it.
+    tab.controller.setOnRequestCloseDetached(() => requestAttach(host, tab));
+    // BaseWindow transparency alone leaves the WebContentsView's own
+    // background opaque; a `frame:false, transparent:true` Mini App needs
+    // both cleared to an alpha-channel color.
+    if (tab.miniApp?.window?.transparent)
+        tab.controller.setBackgroundColor('#00000000');
 }
 /** Returns a detached page to the File Panel host, parked offscreen; a no-op when inline. */
 export function attachDetachedTab(host, tab, signal) {
@@ -224,8 +342,10 @@ export function closeDetachedWindow(tab) {
     if (!window.isDestroyed())
         window.destroy();
 }
-/** Drops every detached-window field; afterwards the window's own handlers are no-ops. */
+/** Drops every detached-window field and listener; the window itself is left as it is. */
 function clearDetachedWindowState(tab) {
+    tab.detachedWindowListeners?.();
+    delete tab.detachedWindowListeners;
     tab.detachedWindowBoundsPersistence?.dispose();
     delete tab.detachedWindowBoundsPersistence;
     delete tab.detachedWindow;

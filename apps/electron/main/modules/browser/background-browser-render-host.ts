@@ -4,9 +4,9 @@ import { OFFSCREEN_BOUNDS } from "./embedded-browser-manager-helpers";
 const browserInputDiagnosticLogger = getCategoryLogger('archon', 'browser-input');
 /**
  * Abort reason used when a foreground reveal takes over a target from a hidden
- * background action. The reveal only needs the shared render slot back; page
- * work the user is about to see (for example an in-flight navigation) must
- * keep running in the foreground instead of being stopped.
+ * background action. The reveal only needs the shared render slot back: the
+ * render request ends, while the page action it carried keeps running in the
+ * foreground (EmbeddedBrowserManager.withTabOperation hands it over).
  */
 export let BACKGROUND_RENDER_FOREGROUND_CLAIM_REASON = 'background-render-target-claimed-by-foreground';
 export function isBackgroundRenderForegroundClaim(signal) {

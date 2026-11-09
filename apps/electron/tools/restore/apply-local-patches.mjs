@@ -109,52 +109,50 @@ patchFile("@mavis/agent-core/dist/pi-turn-runner/llm-retry.js", [
         : { retryable: true, reason: 'network' };`,
   },
   {
-    label: "commit boundary without a done shortcut",
-    find: `        if (commitsOutput(next.value) || (!retryAllErrors && next.value.type === 'done')) {`,
-    replace: `        if (commitsOutput(next.value)) {`,
-  },
-  {
-    // Reasoning deltas are dropped by the caller when an attempt is discarded, so
-    // they must not end the retry window. Treating them as committed pushed a
-    // failed request into the resume path with an empty prefix (measured as
-    // `resume_start chars=0`, after which the model answered with a tool call).
+    // 3.1.12 replaced the `done`-shortcut check with an explicit empty-reply
+    // guard (`guard.emptyRetry` / `emptyFailure`), so a reply that ends without
+    // visible output is retried before the commit boundary is reached. The old
+    // "drop the done shortcut" patch has nothing left to remove.
     label: "commit boundary ignores reasoning deltas",
-    find: `function commitsOutput(event) {
-    if (event.type === 'text_delta' ||
-        event.type === 'thinking_delta' ||
-        event.type === 'toolcall_delta') {
+    find: `function commitsOutput(event, holdReasoning = false) {
+    if (event.type === 'text_delta' || event.type === 'toolcall_delta')
         return event.delta.length > 0;
-    }
-    if (event.type === 'text_end' || event.type === 'thinking_end')
+    if (event.type === 'thinking_delta')
+        return !holdReasoning && event.delta.length > 0;
+    if (event.type === 'text_end')
         return event.content.length > 0;
+    if (event.type === 'thinking_end')
+        return !holdReasoning && event.content.length > 0;
     if (event.type === 'toolcall_end')
         return true;
-    return 'partial' in event && hasCommittedContent(event.partial);
+    return 'partial' in event && hasCommittedContent(event.partial, holdReasoning);
 }
-function hasCommittedContent(message) {
+function hasCommittedContent(message, holdReasoning) {
     return message.content.some((block) => {
         if (block.type === 'text')
             return block.text.length > 0;
         if (block.type === 'thinking')
-            return block.thinking.length > 0;
+            return !holdReasoning && block.thinking.length > 0;
         return block.type === 'toolCall';
     });
 }`,
-    replace: `function commitsOutput(event) {
+    replace: `function commitsOutput(event, holdReasoning = false) {
     // Local patch: only answer text and a COMPLETED tool call end the retry
     // window. Reasoning deltas are discarded when an attempt is retried, and a
     // tool call that is still streaming its arguments was never executed — the
     // caller only receives it once the block ends — so counting either as
     // committed pushed a retryable failure into the resume path with an empty
-    // prefix (measured: resume_start chars=0, then the model answered with a
-    // tool call and the whole call was lost).
-    if (event.type === 'text_delta') {
+    // prefix (measured: resume_start chars=0). The parameter stays in the
+    // signature because the reply guard passes it in.
+    void holdReasoning;
+    if (event.type === 'text_delta' || event.type === 'toolcall_delta')
         return event.delta.length > 0;
-    }
     if (event.type === 'text_end')
         return event.content.length > 0;
     if (event.type === 'toolcall_end')
         return true;
+    if (event.type === 'thinking_delta' || event.type === 'thinking_end')
+        return false;
     return 'partial' in event && hasCommittedContent(event.partial);
 }
 function hasCommittedContent(message) {
@@ -164,10 +162,10 @@ function hasCommittedContent(message) {
   {
     label: "retry trace: call start",
     find: `        const callId = input.generateCallId?.() ?? defaultCallId();
-        const callIdentity = {};`,
+        const identity = {};`,
     replace: `        const callId = input.generateCallId?.() ?? defaultCallId();
         __mavisRetryTrace({ event: 'call_start', scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, provider: String(model.provider), model: String(model.id), callId });
-        const callIdentity = {};`,
+        const identity = {};`,
   },
   {
     label: "resume after a post-commit transport failure",
@@ -389,42 +387,51 @@ export function withLLMRetry(inner, input) {`,
   },
   {
     label: "resume wiring at the commit boundary",
-    find: `        if (commitsOutput(next.value)) {
-            return {
-                kind: 'committed',
-                stream: observeRequestSettlement(replayStream(stream, iterator, buffered), requestAttempt, onRequestSettled, options?.signal),
-            };
-        }`,
-    replace: `        if (commitsOutput(next.value)) {
-            return {
-                kind: 'committed',
-                stream: __mavisResumeStream({
-                    inner,
-                    model,
-                    context,
-                    options,
-                    source: observeRequestSettlement(replayStream(stream, iterator, buffered), requestAttempt, onRequestSettled, options?.signal),
-                }),
-            };
-        }`,
+    find: `    const commit = (pending) => {
+        budget?.stop();
+        return {
+            kind: 'committed',
+            stream: observeRequestSettlement(replayStream(stream, iterator, buffered, {`,
+    replace: `    const commit = (pending) => {
+        budget?.stop();
+        return {
+            kind: 'committed',
+            stream: __mavisResumeStream({
+                inner,
+                model,
+                context,
+                options,
+                source: observeRequestSettlement(replayStream(stream, iterator, buffered, {`,
+  },
+  {
+    label: "resume wiring: close the wrapper",
+    find: `            }), requestAttempt, onRequestSettled, options?.signal),
+        };
+    };
+    const emptyFailure = (final) => ownedFailure({`,
+    replace: `            }), requestAttempt, onRequestSettled, options?.signal),
+            }),
+        };
+    };
+    const emptyFailure = (final) => ownedFailure({`,
   },
   {
     label: "retry trace: attempt result",
-    find: `            callState.requestAttempts = requestAttempt;
-            if (preflight.kind === 'committed') {`,
-    replace: `            callState.requestAttempts = requestAttempt;
-            __mavisRetryTrace({
-                event: 'attempt_result',
-                scope: input.scope,
-                provider: String(model.provider),
-                callId,
-                attempt: requestAttempt,
-                kind: preflight.kind,
-                reason: preflight.kind === 'committed' ? undefined : preflight.failure?.error?.reason,
-                buffered: preflight.kind === 'committed' ? 0 : (preflight.failure?.buffered?.length ?? 0),
-                message: String((preflight.kind === 'committed' ? '' : preflight.failure?.error?.message) ?? '').slice(0, 200),
-            });
-            if (preflight.kind === 'committed') {`,
+    find: `                if (preflight.kind === 'committed') {
+                    budget?.stop();`,
+    replace: `                __mavisRetryTrace({
+                    event: 'attempt_result',
+                    scope: input.scope,
+                    provider: String(model.provider),
+                    callId,
+                    attempt: requestAttempt,
+                    kind: preflight.kind,
+                    reason: preflight.kind === 'committed' ? undefined : preflight.failure?.error?.reason,
+                    buffered: preflight.kind === 'committed' ? 0 : (preflight.failure?.buffered?.length ?? 0),
+                    message: String((preflight.kind === 'committed' ? '' : preflight.failure?.error?.message) ?? '').slice(0, 200),
+                });
+                if (preflight.kind === 'committed') {
+                    budget?.stop();`,
   },
 ]);
 

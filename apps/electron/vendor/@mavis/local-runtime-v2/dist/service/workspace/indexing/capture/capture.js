@@ -25,18 +25,15 @@ export async function createWorkspaceCapture(input) {
     await mkdir(temporaryDir, { recursive: false, mode: 0o700 });
     const temporaryArchivePath = path.join(temporaryDir, 'workspace.zip');
     const temporaryManifestPath = path.join(temporaryDir, 'manifest.json');
-    const sourceStagingDir = path.join(temporaryDir, '.source-staging');
     let published = false;
     try {
         input.signal?.throwIfAborted();
         const archive = await (input.archiveWriter ?? writeWorkspaceArchive)({
             targetPath: temporaryArchivePath,
-            stagingDir: sourceStagingDir,
             scan: input.scan,
             includedPaths,
             ...(input.signal ? { signal: input.signal } : {}),
         });
-        await rm(sourceStagingDir, { recursive: true, force: true });
         const manifest = {
             schemaVersion: WORKSPACE_MANIFEST_SCHEMA_VERSION,
             workspaceId: input.scan.workspaceId,

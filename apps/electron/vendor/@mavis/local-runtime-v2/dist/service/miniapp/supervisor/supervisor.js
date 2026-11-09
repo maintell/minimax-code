@@ -2,11 +2,10 @@ import { randomUUID } from 'node:crypto';
 import * as cleanup from './cleanup-settlement.js';
 import * as errors from '../errors.js';
 import { MiniAppError } from '../errors.js';
-import { assertGenerationRunCurrent, assertReusableRuntimeCurrent, isReusableGeneration, persistedState, publishedView, runtimeLoopbackToken, scheduleTimeout, } from './supervisor-generation.js';
+import { assertGenerationRunCurrent, assertReusableRuntimeCurrent, isReusableGeneration, persistedState, publishedView, requireActiveGeneration, runtimeLoopbackToken, } from './supervisor-generation.js';
 import { assertColdStartupAvailable, capturePublicationMemory, createSupervisorPreparation, disablePreparationCancellation, disableRolledBackError, explicitStartRequiredJson, persistedErrorDetail, persistExplicitStartFence, removeRetiringGeneration, restorePublicationMemory, restorePublicationPersistence, rollbackCommittedGeneration, } from './supervisor-transition.js';
 import { SupervisorCutoverCoordinator } from './supervisor-cutover.js';
 import { MiniAppSupervisorDiagnostics } from './supervisor-diagnostics.js';
-import { admitLease, admitRunningLease, requireActiveGeneration, } from './supervisor-lease.js';
 import { statusFor } from './supervisor-status.js';
 export class DefaultMiniAppSupervisor {
     options;
@@ -33,6 +32,7 @@ export class DefaultMiniAppSupervisor {
     cutover;
     closed = false;
     closePromise;
+    capacity = () => this.options.nodeRuntime.capacity();
     constructor(options) {
         this.options = options;
         this.diagnostics = new MiniAppSupervisorDiagnostics({
@@ -49,7 +49,6 @@ export class DefaultMiniAppSupervisor {
             stateStore: options.stateStore,
             nowMs: () => this.nowMs(),
             isClosed: () => this.closed,
-            isQuarantined: (pluginId) => this.quarantined.has(pluginId),
             assertCurrentPreparation: (pluginId, preparation) => this.assertCurrentPreparation(pluginId, preparation),
             quarantineCleanupFailure: (pluginId, error) => this.quarantineCleanupFailure(pluginId, error),
         });
@@ -255,11 +254,7 @@ export class DefaultMiniAppSupervisor {
             return undefined;
         const pluginId = candidate.pluginId;
         if (options.startIfCold) {
-            assertColdStartupAvailable(this.active.get(pluginId), this.cutover.runtimeOwners(pluginId));
-        }
-        const current = this.active.get(candidate.pluginId);
-        if (current && !options.startIfCold) {
-            await this.cutover.settleStarting(candidate.pluginId, current, preparation, options.onPonr);
+            assertColdStartupAvailable(this.cutover.runtimeOwners(pluginId));
         }
         for (const generation of this.cutover.runtimeOwners(candidate.pluginId)) {
             await this.cutover.prepare({
@@ -326,7 +321,6 @@ export class DefaultMiniAppSupervisor {
         this.active.set(candidate.pluginId, {
             candidate,
             view: target,
-            leases: new Set(),
             accepting: Boolean(runtime),
             ...(runtime ? { runtime } : {}),
         });
@@ -348,36 +342,8 @@ export class DefaultMiniAppSupervisor {
             return undefined;
         return { generation, runtime: generation.runtime };
     }
-    async acquire(input) {
-        this.assertOpen();
-        const leaseState = {
-            disabled: this.disabled,
-            quarantined: this.quarantined,
-            quiescing: this.quiescing,
-            explicitlyStopped: this.explicitlyStopped,
-            active: this.active,
-        };
-        let generation = admitLease(leaseState, input);
-        generation.idleTimer?.cancel();
-        generation.idleTimer = undefined;
-        const runtime = generation.accepting && generation.runtime
-            ? generation.runtime
-            : await this.ensureOnDemandRuntime(input.pluginId, generation);
-        generation = admitRunningLease(leaseState, input, runtime);
-        const leaseId = this.options.makeLeaseId?.() ?? randomUUID();
-        generation.leases.add(leaseId);
-        let released = false;
-        return {
-            release: async () => {
-                if (released)
-                    return false;
-                released = true;
-                generation.leases.delete(leaseId);
-                await this.removeRetiredIfDrained(input.pluginId, generation);
-                this.scheduleIdleDrain(input.pluginId, generation);
-                return true;
-            },
-        };
+    recordMemoryEvent(pluginId, code) {
+        this.diagnostics.recordMemoryEvent(pluginId, code);
     }
     assertCurrentRun(input) {
         return assertGenerationRunCurrent({
@@ -438,9 +404,6 @@ export class DefaultMiniAppSupervisor {
                 throw new MiniAppError('QUARANTINED', 'Mini App cleanup ownership is unproven');
             }
             generation = requireActiveGeneration(this.active, pluginId);
-            await this.cutover.settleStarting(pluginId, generation, preparation, () => {
-                crossedPonr = true;
-            });
             if (generation.runtime) {
                 await this.cutover.prepare({
                     pluginId,
@@ -579,10 +542,8 @@ export class DefaultMiniAppSupervisor {
         const generation = this.active.get(pluginId);
         if (generation)
             generation.accepting = false;
-        generation?.startController?.abort(disableReason);
         const settlement = await cleanup.settleDisableCleanup({
             preparation: this.cancelPreparation(pluginId, disableReason),
-            startup: generation?.startPromise,
             cleanupGeneration: async () => {
                 const current = this.active.get(pluginId) ?? generation;
                 if (!current)
@@ -669,10 +630,6 @@ export class DefaultMiniAppSupervisor {
             ...this.active.values(),
             ...[...this.retiring.values()].flatMap((entries) => entries),
         ]);
-        for (const generation of knownGenerations) {
-            generation.idleTimer?.cancel();
-            generation.startController?.abort(closeReason);
-        }
         const settlement = await cleanup.settleSupervisorClose({
             preparations: pendingPreparations.map(([pluginId, preparation]) => ({
                 pluginId,
@@ -704,15 +661,11 @@ export class DefaultMiniAppSupervisor {
     addRetiring(generation, pendingFinalization = false) {
         generation.accepting = false;
         generation.retirementPendingFinalization ||= pendingFinalization;
-        generation.idleTimer?.cancel();
-        generation.idleTimer = undefined;
         const entries = this.retiring.get(generation.candidate.pluginId) ?? [];
         entries.push(generation);
         this.retiring.set(generation.candidate.pluginId, entries);
     }
     removeRetiredIfDrained(pluginId, generation) {
-        if (generation.leases.size !== 0)
-            return Promise.resolve();
         if (generation.retirementPendingFinalization)
             return Promise.resolve();
         if (!(this.retiring.get(pluginId) ?? []).includes(generation))
@@ -722,7 +675,6 @@ export class DefaultMiniAppSupervisor {
     }
     async cleanupRetiredGeneration(pluginId, generation) {
         try {
-            await generation.idleStopPromise;
             await cleanup.cleanupRuntime(generation.runtime);
         }
         catch (error) {
@@ -738,128 +690,8 @@ export class DefaultMiniAppSupervisor {
         }
         removeRetiringGeneration(this.retiring, pluginId, generation);
     }
-    async ensureOnDemandRuntime(pluginId, generation) {
-        if (generation.idleStopPromise)
-            await generation.idleStopPromise;
-        if (this.quarantined.has(pluginId)) {
-            throw new MiniAppError('QUARANTINED', 'Mini App cleanup ownership is unproven');
-        }
-        if (generation.runtime)
-            return generation.runtime;
-        if (generation.startPromise)
-            return generation.startPromise;
-        const candidate = generation.candidate;
-        const controller = new AbortController();
-        generation.startController = controller;
-        const operation = cleanup.withPendingRuntimeOperation(this.pendingRuntimeOperations, pluginId, () => this.startOnDemandRuntime(pluginId, generation, candidate, controller));
-        generation.startPromise = operation;
-        const clear = () => {
-            if (generation.startPromise === operation) {
-                generation.startPromise = undefined;
-                generation.startController = undefined;
-            }
-        };
-        this.trackSettlement(operation, clear);
-        return operation;
-    }
-    async startOnDemandRuntime(pluginId, generation, candidate, controller) {
-        let runtime;
-        let acceptanceAttempted = false;
-        try {
-            if (!(await this.options.verifyCandidate(candidate))) {
-                throw new MiniAppError('CANDIDATE_CHANGED', 'Mini App candidate changed before start');
-            }
-            runtime = await this.diagnostics.prepare({
-                candidate,
-                processGeneration: this.makeProcessGeneration(),
-                preferredPort: this.options.stateStore.read(pluginId)?.preferredPort,
-                signal: controller.signal,
-            }, generation.view.miniAppGeneration);
-            this.assertGenerationCurrent(pluginId, generation, controller);
-            if (!(await this.options.verifyCandidate(candidate))) {
-                throw new MiniAppError('CANDIDATE_CHANGED', 'Mini App candidate changed during start');
-            }
-            this.assertGenerationCurrent(pluginId, generation, controller);
-            acceptanceAttempted = true;
-            await cleanup.acceptAndAdmitRuntime({
-                accept: () => this.acceptPreparedRuntime(candidate, runtime, true),
-                retirementOwners: () => this.retiring.get(pluginId) ?? [],
-                isQuarantined: () => this.quarantined.has(pluginId),
-                assertCurrent: () => this.assertGenerationCurrent(pluginId, generation, controller),
-                admit: () => {
-                    generation.runtime = runtime;
-                    generation.view = publishedView(candidate, generation.view.miniAppGeneration, runtime);
-                    generation.accepting = true;
-                },
-                shouldCompensate: () => this.active.get(pluginId) === generation,
-                cleanup: () => this.cleanupOrQuarantine(pluginId, runtime),
-            });
-            this.failures.delete(pluginId);
-            this.observeRuntime(pluginId, runtime);
-            return runtime;
-        }
-        catch (error) {
-            const failure = acceptanceAttempted
-                ? error
-                : await cleanup.selectFailureAfterCleanup(error, () => this.cleanupOrQuarantine(pluginId, runtime));
-            const quarantined = this.quarantineCleanupFailure(pluginId, failure);
-            const code = errors.miniAppErrorCode(failure);
-            if (!quarantined && !errors.isMiniAppExpectedCancellation(code)) {
-                this.recordFailure(pluginId, code, !acceptanceAttempted);
-            }
-            throw errors.normalizeMiniAppRuntimeError(failure, 'Mini App startup failed');
-        }
-    }
-    scheduleIdleDrain(pluginId, generation) {
-        if (this.active.get(pluginId) !== generation ||
-            generation.leases.size !== 0 ||
-            !generation.runtime ||
-            generation.idleTimer ||
-            generation.idleStopPromise) {
-            return;
-        }
-        const schedule = this.options.scheduleIdle ?? scheduleTimeout;
-        generation.idleTimer = schedule(this.options.idleTimeoutMs ?? 30_000, () => {
-            generation.idleTimer = undefined;
-            const operation = this.drainIdleRuntime(pluginId, generation);
-            generation.idleStopPromise = operation;
-            const clear = () => {
-                if (generation.idleStopPromise === operation)
-                    generation.idleStopPromise = undefined;
-            };
-            this.trackSettlement(operation, clear);
-        });
-    }
-    async drainIdleRuntime(pluginId, generation) {
-        const runtime = generation.runtime;
-        if (!runtime || this.active.get(pluginId) !== generation || generation.leases.size !== 0) {
-            return;
-        }
-        const clearProvenRuntime = () => {
-            if (generation.runtime !== runtime)
-                return;
-            generation.runtime = undefined;
-            generation.view = publishedView(generation.candidate, generation.view.miniAppGeneration, undefined);
-        };
-        generation.accepting = false;
-        try {
-            await cleanup.cleanupRuntime(runtime);
-            clearProvenRuntime();
-        }
-        catch (error) {
-            if (!errors.isMiniAppCleanupUnproven(error) && errors.isMiniAppRootTerminationProven(error)) {
-                clearProvenRuntime();
-            }
-            if (!this.quarantineCleanupFailure(pluginId, error)) {
-                this.recordFailure(pluginId, errors.miniAppErrorCode(error));
-            }
-            throw error;
-        }
-    }
-    recordFailure(pluginId, code, persist = true) {
+    recordFailure(pluginId, code) {
         this.failures.set(pluginId, code);
-        if (!persist)
-            return;
         try {
             const state = this.options.stateStore.read(pluginId);
             if (!state)
@@ -910,17 +742,8 @@ export class DefaultMiniAppSupervisor {
             throw error;
         }
     }
-    assertGenerationCurrent(pluginId, generation, controller) {
-        if (!controller.signal.aborted && !this.closed && this.active.get(pluginId) === generation) {
-            return;
-        }
-        throw errors.cancellationOrSupersededError(controller.signal, 'Mini App runtime operation was superseded');
-    }
-    trackSettlement(operation, clear) {
-        const observed = cleanup.clearAfterSettlement(operation, () => {
-            clear();
-            this.observations.delete(observed);
-        });
+    observeRuntime(pluginId, runtime) {
+        const observed = cleanup.clearAfterSettlement(this.handleRuntimeExit(pluginId, runtime), () => this.observations.delete(observed));
         this.observations.add(observed);
     }
     async verifyCandidate(candidate, message) {
@@ -936,9 +759,6 @@ export class DefaultMiniAppSupervisor {
     }
     makeProcessGeneration() {
         return this.options.makeProcessGeneration?.() ?? randomUUID();
-    }
-    observeRuntime(pluginId, runtime) {
-        this.trackSettlement(this.handleRuntimeExit(pluginId, runtime), () => undefined);
     }
     async handleRuntimeExit(pluginId, runtime) {
         const terminal = await cleanup.captureOperation(() => runtime.closed);

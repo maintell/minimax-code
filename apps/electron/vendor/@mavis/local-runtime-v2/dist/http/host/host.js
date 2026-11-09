@@ -42,7 +42,7 @@ import { createHostedCapabilities, isCliRestrictedRuntime, } from '../../service
 import { createLocalMemorySubsystem, handleMemoryBusEvent, } from '../../service/memory-system/index.js';
 import { settleInBackground } from '../../service/plugin-system/index.js';
 import { createGlobalEventSource, } from '../../infra/events/global-events.js';
-import { createWorkspaceIndexingHostSubsystem, hostCaptureWorkspaceRevisionAfterTurn, hostLogWorkspaceSemanticSearchUnavailable, hostPrewarmWorkspaceIndexingForWorkspace, hostPrepareWorkspaceIndexingForSessionStart, } from '../../service/workspace/index.js';
+import { createWorkspaceIndexingHostSubsystem, hostCaptureWorkspaceFeedbackSnapshot, hostCaptureWorkspaceRevisionAfterTurn, hostLogWorkspaceSemanticSearchUnavailable, hostPrewarmWorkspaceIndexingForWorkspace, hostPrepareWorkspaceIndexingForSessionStart, } from '../../service/workspace/index.js';
 export class LocalRuntimeApiHost {
     controller;
     runtimeConversation;
@@ -96,6 +96,7 @@ export class LocalRuntimeApiHost {
     sessionSendWaitGraph = createSessionSendWaitGraph();
     /** V2-owned desktop composer send preference; absent means the `queue` default. */
     composerSendBehavior;
+    remoteSessionHost;
     llmRequestFailureHook;
     recordSessionBashCompletion;
     observeLLMRequest;
@@ -335,6 +336,7 @@ export class LocalRuntimeApiHost {
         this.pluginHookPermissionStore = capabilityOptions.pluginHookPermissionStore;
         this.channelRuntime = new HostChannelRuntime(options);
         this.hostDiagnosticsProvider = options.hostDiagnosticsProvider;
+        this.remoteSessionHost = options.remoteSessionHost;
         this.permissionRules = new LocalPermissionRuleStore(() => this.configGetter().dataDir, this.metricsClient, () => this.configGetter().permission?.storageWriteVersion ?? 2);
         this.permissionApprovalService = this.createPermissionApprovalService();
         this.runtimeStartupToken = options.runtimeStartupToken;
@@ -770,6 +772,10 @@ export class LocalRuntimeApiHost {
      */
     async captureWorkspaceRevisionAfterTurn(sessionId) {
         return hostCaptureWorkspaceRevisionAfterTurn(this, sessionId);
+    }
+    /** Internal-build feedback attachment; see `hostCaptureWorkspaceFeedbackSnapshot`. */
+    async captureWorkspaceFeedbackSnapshot(sessionId, outputDir) {
+        return hostCaptureWorkspaceFeedbackSnapshot(this, sessionId, outputDir);
     }
     logWorkspaceSemanticSearchUnavailable(sessionId, error) {
         hostLogWorkspaceSemanticSearchUnavailable(sessionId, error);

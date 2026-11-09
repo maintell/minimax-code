@@ -122,11 +122,16 @@ export class LocalPluginLifecycle {
             const target = findLocalPlugin(this.host.project(inputs), selector);
             if (target) {
                 await this.publishRemoval(inputs, target);
+                this.host.pluginRemoved(target.id);
                 return true;
             }
-            return selector.marketplace === undefined
-                ? false
-                : this.forgetLink({ name: selector.name, marketplace: selector.marketplace });
+            if (selector.marketplace === undefined)
+                return false;
+            const id = { name: selector.name, marketplace: selector.marketplace };
+            const forgotten = await this.forgetLink(id);
+            if (forgotten)
+                this.host.pluginRemoved(id);
+            return forgotten;
         });
     }
     async publishRemoval(inputs, target) {

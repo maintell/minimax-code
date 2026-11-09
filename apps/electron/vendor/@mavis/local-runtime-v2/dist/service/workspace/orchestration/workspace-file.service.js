@@ -1,10 +1,15 @@
 import { WorkspaceFileSearchService } from './workspace-file-search.service.js';
 import { DEFAULT_MAX_INLINE_FILE_BYTES, getFileSystemGitInfo, listFileSystemDirectories, listWorkspaceFileTree, previewWorkspaceFile, readWorkspaceFile, resolveWorkspaceFileWritePath, saveWorkspaceFile, searchWorkspaceFiles, } from '../operations/filesystem/files.js';
+import { WorkspaceFileWatcher } from '../operations/filesystem/file-watch.js';
 export class WorkspaceFileServiceImpl {
     options;
     searches = new WorkspaceFileSearchService();
     maxInlineFileBytes;
     pendingSaves = new Map();
+    watcher = new WorkspaceFileWatcher();
+    watchFiles(targets) {
+        return this.watcher.open(targets);
+    }
     constructor(options = {}) {
         this.options = options;
         const maxInlineFileBytes = options.maxInlineFileBytes;
@@ -66,7 +71,7 @@ export class WorkspaceFileServiceImpl {
     }
     close() {
         this.searches.close();
-        // Pending writes release their own entries. Workspace Git owns watchers.
+        this.watcher.close();
     }
 }
 //# sourceMappingURL=workspace-file.service.js.map

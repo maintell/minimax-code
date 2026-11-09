@@ -13,6 +13,9 @@ export function newTurn(input, deps) {
         const callerOnCallSettled = input.llmRetry?.onCallSettled;
         const retryingStreamFn = withLLMRetry(metricsStreamFn, {
             ...input.llmRetry,
+            // A required lifecycle must also run when retries are disabled by the host.
+            ...(!input.llmRetry && resolved.callLifecycle ? { policy: { maxRetries: 0 } } : {}),
+            lifecycle: resolved.callLifecycle ?? input.llmRetry?.lifecycle,
             sessionId: input.sessionId,
             turnId: input.turnId,
             scope,
@@ -41,12 +44,12 @@ export function newTurn(input, deps) {
             })
             : capturedStreamFn;
     };
-    const mainStreamFn = input.llmRetry || deps.llmCapture
+    const mainStreamFn = input.llmRetry || deps.llmCapture || resolved.callLifecycle
         ? retryStream('agent')
         : deps.metrics
             ? deps.metrics.wrapStreamFn(composedStreamFn)
             : composedStreamFn;
-    const auxiliaryStreamFn = input.llmRetry ? retryStream('compaction') : undefined;
+    const auxiliaryStreamFn = input.llmRetry || resolved.callLifecycle ? retryStream('compaction') : undefined;
     const syntheticResponse = {};
     let eventSeq = 0;
     let runtimeSeq = 0;

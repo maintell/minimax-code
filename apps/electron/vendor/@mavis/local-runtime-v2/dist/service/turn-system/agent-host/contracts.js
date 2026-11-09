@@ -67,16 +67,24 @@ export function parsePeerSessionOrigin(value) {
         return undefined;
     const fromAgent = optionalProtocolString(value, 'fromAgent');
     const fromTitle = optionalProtocolString(value, 'fromTitle');
-    if (fromAgent === null || fromTitle === null)
+    const fromDevice = optionalProtocolString(value, 'fromDevice');
+    if (fromAgent === null || fromTitle === null || fromDevice === null)
         return undefined;
     return {
         fromSession: value['fromSession'],
         command: 'session send',
         ...(fromAgent !== undefined ? { fromAgent } : {}),
         ...(fromTitle !== undefined ? { fromTitle } : {}),
+        ...(fromDevice !== undefined ? { fromDevice } : {}),
+        ...(value['remote'] === true ? { remote: true } : {}),
     };
 }
-const PEER_SESSION_ORIGIN_OPTIONAL_KEYS = ['fromAgent', 'fromTitle'];
+const PEER_SESSION_ORIGIN_OPTIONAL_KEYS = [
+    'fromAgent',
+    'fromTitle',
+    'fromDevice',
+    'remote',
+];
 function isPeerSessionOriginShape(value) {
     if (!isProtocolRecord(value))
         return false;
@@ -89,7 +97,9 @@ function isPeerSessionOriginShape(value) {
     return (hasExactProtocolKeys(value, keys) &&
         value['command'] === 'session send' &&
         typeof fromSession === 'string' &&
-        fromSession.trim().length > 0);
+        fromSession.trim().length > 0 &&
+        // Only `remote: true` is accepted, so a sender on this runtime cannot mark itself remote by accident.
+        (!Object.hasOwn(value, 'remote') || value['remote'] === true));
 }
 /** `undefined` when absent, `null` when present with the wrong type. */
 function optionalProtocolString(value, key) {

@@ -1,7 +1,7 @@
 import { LocalModelProviderError, readPersistedLocalModelThinkingSelection, } from '../../service/model-system/index.js';
 import { AppError } from '../errors.js';
 import { ModelProviderControllerBase } from '../generated/model-provider-controller-base.gen.js';
-import { toByokPresetModelInput, toCandidateView, toModelInfo, toModelInputView, toModelStatus, toProviderInfo, } from './model-provider-mappers.js';
+import { toApiKeyInfo, toApiKeyProbe, toByokPresetModelInput, toCandidateView, toModelInfo, toModelInputView, toModelStatus, toProviderInfo, } from './model-provider-mappers.js';
 export class ModelProviderController extends ModelProviderControllerBase {
     facade;
     constructor(facade) {
@@ -47,7 +47,7 @@ export class ModelProviderController extends ModelProviderControllerBase {
     }
     listUserModelProviders(_ctx, _req) {
         return this.mapErrors(async () => ({
-            providers: this.require().providers.listUserProviders().map(toProviderInfo),
+            providers: this.require().providers.listVisibleUserProviders().map(toProviderInfo),
         }));
     }
     listByokProviderPresets(_ctx, _req) {
@@ -129,21 +129,27 @@ export class ModelProviderController extends ModelProviderControllerBase {
     }
     revealModelProviderApiKey(_ctx, req) {
         return this.mapErrors(async () => ({
-            apiKey: this.require().providers.revealModelProviderApiKey({ providerId: req.providerId }),
+            apiKey: this.require().providers.revealModelProviderApiKey({
+                providerId: req.providerId,
+                ...(req.keyId ? { keyId: req.keyId } : {}),
+            }),
         }));
     }
-    testUserModelProvider(_ctx, req) {
+    testUserModelProvider(ctx, req) {
         return this.mapErrors(async () => {
             const outcome = await this.require().providers.testProvider(req.providerId, {
                 apiKeyOverride: req.apiKey,
+                modelAccess: { signal: ctx.signal },
             });
-            return { success: outcome.ok, status: toModelStatus(outcome.status) };
+            return toTestResp(outcome);
         });
     }
-    testUserModel(_ctx, req) {
+    testUserModel(ctx, req) {
         return this.mapErrors(async () => {
-            const outcome = await this.require().providers.testModel(req.providerId, req.modelId);
-            return { success: outcome.ok, status: toModelStatus(outcome.status) };
+            const outcome = await this.require().providers.testModel(req.providerId, req.modelId, {
+                modelAccess: { signal: ctx.signal },
+            });
+            return toTestResp(outcome);
         });
     }
     updateUserModelParameters(_ctx, req) {
@@ -162,8 +168,25 @@ export class ModelProviderController extends ModelProviderControllerBase {
     testUserModelCandidate(_ctx, req) {
         return this.mapErrors(async () => {
             const outcome = await this.require().providers.testUserModelCandidate(toCandidateView(req.candidate), req.modelId);
-            return { success: outcome.ok, status: toModelStatus(outcome.status) };
+            return toTestResp(outcome);
         });
+    }
+    testUserModelApiKey(_ctx, req) {
+        return this.mapErrors(async () => ({
+            probe: toApiKeyProbe(await this.require().providers.testUserModelApiKey({
+                candidate: toCandidateView(req.candidate),
+                keyIndex: req.keyIndex,
+                ...(req.modelId !== undefined ? { modelId: req.modelId } : {}),
+            })),
+        }));
+    }
+    unrestUserModelApiKey(_ctx, req) {
+        return this.mapErrors(async () => ({
+            key: toApiKeyInfo(this.require().providers.unrestUserModelApiKey({
+                providerId: req.providerId,
+                keyId: req.keyId,
+            })),
+        }));
     }
     discoverUserModelsCandidate(_ctx, req) {
         return this.mapErrors(async () => ({
@@ -188,9 +211,11 @@ export class ModelProviderController extends ModelProviderControllerBase {
             };
         });
     }
-    discoverUserModels(_ctx, req) {
+    discoverUserModels(ctx, req) {
         return this.mapErrors(async () => ({
-            models: (await this.require().providers.discoverModels(req.providerId)).map(toDiscoveredModel),
+            models: (await this.require().providers.discoverModels(req.providerId, {
+                modelAccess: { signal: ctx.signal },
+            })).map(toDiscoveredModel),
         }));
     }
     updateMinimaxModelContext(_ctx, req) {
@@ -241,6 +266,13 @@ export function createModelProviderController(facade) {
     return new ModelProviderController(facade);
 }
 export const modelProviderController = createModelProviderController();
+function toTestResp(outcome) {
+    return {
+        success: outcome.ok,
+        status: toModelStatus(outcome.status),
+        ...(outcome.keyLabel ? { keyLabel: outcome.keyLabel } : {}),
+    };
+}
 function toDiscoveredModel(model) {
     return {
         modelId: model.modelId,

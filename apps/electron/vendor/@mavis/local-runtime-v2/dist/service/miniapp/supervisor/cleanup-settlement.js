@@ -14,16 +14,13 @@ export async function settleDisableCleanup(input) {
         ...(input.restart ? [input.restart] : []),
         ...(input.delegation ? [input.delegation] : []),
     ], input.timeoutMs, 'Mini App lifecycle cleanup did not settle before disable');
-    const startup = input.startup
-        ? await settleCleanupOperations([input.startup], input.timeoutMs, 'Mini App startup cleanup did not settle before disable')
-        : { results: [] };
     const generationResults = input.cleanupGeneration
         ? await Promise.allSettled([input.cleanupGeneration()])
         : [];
     return {
-        proofResults: [...lifecycle.results, ...startup.results],
+        proofResults: lifecycle.results,
         generationResults,
-        timeouts: [lifecycle.timeout, startup.timeout].filter((error) => Boolean(error)),
+        timeouts: lifecycle.timeout ? [lifecycle.timeout] : [],
     };
 }
 export async function captureOperation(operation) {
@@ -192,7 +189,7 @@ async function cleanupClosePreparation(pluginId, preparation, onFailure) {
     }
 }
 async function cleanupCloseGeneration(generation) {
-    const lifecycleResults = await Promise.allSettled([generation.startPromise, generation.retirementPromise, generation.idleStopPromise].filter((operation) => Boolean(operation)));
+    const lifecycleResults = await Promise.allSettled(generation.retirementPromise ? [generation.retirementPromise] : []);
     const runtimeCleanup = await captureOperation(() => cleanupRuntime(generation.runtime));
     const results = [...lifecycleResults, runtimeCleanup];
     assertMiniAppCleanupsProven(results);
@@ -213,16 +210,6 @@ export function throwPrioritizedCleanupFailure(proofResults, ordinaryResults, tr
     throwFirstRejected(ordinaryResults);
     throwUnexpectedCleanupFailure(proofResults);
     throwFirstRejected(trailingResults);
-}
-export async function ignoreRejected(operation) {
-    if (!operation)
-        return;
-    try {
-        await operation;
-    }
-    catch {
-        // The operation owner records its typed failure.
-    }
 }
 export async function clearAfterSettlement(operation, clear) {
     try {

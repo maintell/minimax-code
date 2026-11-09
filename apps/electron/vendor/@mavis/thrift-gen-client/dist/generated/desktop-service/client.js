@@ -20,6 +20,105 @@ export function createDesktopServiceClient(options) {
         deleteBackgroundTask(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deleteBackgroundTask, req, callOptions);
         },
+        listModelAccess(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listModelAccess, req, callOptions);
+        },
+        previewModelAccessPackage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.previewModelAccessPackage, req, callOptions);
+        },
+        importModelAccessPackage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.importModelAccessPackage, req, callOptions);
+        },
+        enableModelAccessPackage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.enableModelAccessPackage, req, callOptions);
+        },
+        disableModelAccessPackage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.disableModelAccessPackage, req, callOptions);
+        },
+        rollbackModelAccessPackage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.rollbackModelAccessPackage, req, callOptions);
+        },
+        uninstallModelAccessPackage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.uninstallModelAccessPackage, req, callOptions);
+        },
+        startModelAccessDevSession(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.startModelAccessDevSession, req, callOptions);
+        },
+        approveModelAccessDevRequest(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.approveModelAccessDevRequest, req, callOptions);
+        },
+        dismissModelAccessDevRequest(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.dismissModelAccessDevRequest, req, callOptions);
+        },
+        reloadModelAccessDevSession(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.reloadModelAccessDevSession, req, callOptions);
+        },
+        stopModelAccessDevSession(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.stopModelAccessDevSession, req, callOptions);
+        },
+        promoteModelAccessDevSession(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.promoteModelAccessDevSession, req, callOptions);
+        },
+        getModelAccessExtensionStatus(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getModelAccessExtensionStatus, req, callOptions);
+        },
+        exportModelAccessPackage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.exportModelAccessPackage, req, callOptions);
+        },
+        setModelAccessGlobal(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setModelAccessGlobal, req, callOptions);
+        },
+        setModelAccessTarget(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setModelAccessTarget, req, callOptions);
+        },
+        syncModelAccessDelivery(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.syncModelAccessDelivery, req, callOptions);
+        },
+        setModelAccessDeliveryOptIn(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setModelAccessDeliveryOptIn, req, callOptions);
+        },
+        beginModelAccessLogin(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.beginModelAccessLogin, req, callOptions);
+        },
+        getModelAccessLoginStatus(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getModelAccessLoginStatus, req, callOptions);
+        },
+        submitModelAccessLogin(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.submitModelAccessLogin, req, callOptions);
+        },
+        cancelModelAccessLogin(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.cancelModelAccessLogin, req, callOptions);
+        },
+        discoverModelAccessBorrow(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.discoverModelAccessBorrow, req, callOptions);
+        },
+        useModelAccessBorrow(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.useModelAccessBorrow, req, callOptions);
+        },
+        scanModelAccessApi(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.scanModelAccessApi, req, callOptions);
+        },
+        listModelAccessApiCandidates(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listModelAccessApiCandidates, req, callOptions);
+        },
+        importModelAccessApi(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.importModelAccessApi, req, callOptions);
+        },
+        queryModelAccessUsage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.queryModelAccessUsage, req, callOptions);
+        },
+        enableModelAccessPublicProvider(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.enableModelAccessPublicProvider, req, callOptions);
+        },
+        disableModelAccessPublicProvider(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.disableModelAccessPublicProvider, req, callOptions);
+        },
+        getModelAccessFailover(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getModelAccessFailover, req, callOptions);
+        },
+        setModelAccessFailover(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setModelAccessFailover, req, callOptions);
+        },
         ping(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ping, req, callOptions);
         },
@@ -164,6 +263,27 @@ export function createDesktopServiceClient(options) {
         testLocalMcpServer(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.testLocalMcpServer, req, callOptions);
         },
+        setLocalMcpServerOAuthClientSecret(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setLocalMcpServerOAuthClientSecret, req, callOptions);
+        },
+        listLocalMcpAuthStates(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listLocalMcpAuthStates, req, callOptions);
+        },
+        testLocalMcpAuthTarget(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.testLocalMcpAuthTarget, req, callOptions);
+        },
+        startLocalMcpAuth(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.startLocalMcpAuth, req, callOptions);
+        },
+        cancelLocalMcpAuth(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.cancelLocalMcpAuth, req, callOptions);
+        },
+        completeLocalMcpAuth(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.completeLocalMcpAuth, req, callOptions);
+        },
+        clearLocalMcpAuth(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.clearLocalMcpAuth, req, callOptions);
+        },
         listLocalHooks(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listLocalHooks, req, callOptions);
         },
@@ -224,6 +344,9 @@ export function createDesktopServiceClient(options) {
         selectModel(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.selectModel, req, callOptions);
         },
+        selectAdvisorModel(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.selectAdvisorModel, req, callOptions);
+        },
         listModelProviders(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listModelProviders, req, callOptions);
         },
@@ -274,6 +397,12 @@ export function createDesktopServiceClient(options) {
         },
         discoverUserModels(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.discoverUserModels, req, callOptions);
+        },
+        testUserModelApiKey(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.testUserModelApiKey, req, callOptions);
+        },
+        unrestUserModelApiKey(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.unrestUserModelApiKey, req, callOptions);
         },
         updateMinimaxModelContext(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.updateMinimaxModelContext, req, callOptions);
@@ -701,6 +830,9 @@ export function createDesktopServiceClient(options) {
         steerSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.steerSession, req, callOptions);
         },
+        sendRemoteMessage(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.sendRemoteMessage, req, callOptions);
+        },
         listQueueMessages(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listQueueMessages, req, callOptions);
         },
@@ -1103,6 +1235,27 @@ export function createDesktopServiceClient(options) {
         getSidebarSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSidebarSession, req, callOptions);
         },
+        suggestMiniAppCreationIdeas(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.suggestMiniAppCreationIdeas, req, callOptions);
+        },
+        startMiniAppCreation(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.startMiniAppCreation, req, callOptions);
+        },
+        stopMiniAppCreation(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.stopMiniAppCreation, req, callOptions);
+        },
+        removeMiniAppCreation(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.removeMiniAppCreation, req, callOptions);
+        },
+        maintainMiniAppCreation(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.maintainMiniAppCreation, req, callOptions);
+        },
+        getMiniAppCreation(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMiniAppCreation, req, callOptions);
+        },
+        listMiniAppLaunchpad(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listMiniAppLaunchpad, req, callOptions);
+        },
         streamEcho(req, callOptions) {
             return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.streamEcho, req, callOptions);
         },
@@ -1117,6 +1270,9 @@ export function createDesktopServiceClient(options) {
         },
         continueTurn(req, callOptions) {
             return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.continueTurn, req, callOptions);
+        },
+        watchWorkspaceFiles(req, callOptions) {
+            return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.watchWorkspaceFiles, req, callOptions);
         },
         streamWorkspaceFileSearch(req, callOptions) {
             return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.streamWorkspaceFileSearch, req, callOptions);

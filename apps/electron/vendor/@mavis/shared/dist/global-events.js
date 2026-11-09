@@ -42,6 +42,9 @@ export const GLOBAL_EVENT_TYPES = [
     'thread_goal.cleared',
     'thread_goal.objective_updated_steering',
     'workspace.git.changed',
+    'model_access.dev_requests_updated',
+    'mcp.auth_updated',
+    'mcp.auth_required',
 ];
 const GLOBAL_EVENT_TYPE_SET = new Set(GLOBAL_EVENT_TYPES);
 export function isGlobalEventType(value) {

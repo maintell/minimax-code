@@ -126,9 +126,23 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
         await session.cdpHelper.startDOMListener(session.commandSignal);
         const beforeTimeOrigin = await this.evaluateMainDocument(session, 'performance.timeOrigin');
         const navigation = await this.sendMainDocumentCommand(session, 'Page.navigate', { url });
-        if (navigation.errorText)
+        const movedToNewDocument = (state) => state.url !== before.url || state.timeOrigin !== beforeTimeOrigin;
+        // Chromium answers ERR_ABORTED when a redirect or a cross-process swap
+        // replaces the requested load while the tab still commits the target
+        // document (typically the first cross-site navigate from about:blank).
+        // Only a tab that never reaches a new document has failed.
+        if (navigation.errorText &&
+            (navigation.errorText !== 'net::ERR_ABORTED' || navigation.isDownload === true)) {
             throw new Error(`NAVIGATION_FAILED: ${navigation.errorText}`);
-        await this.waitForDocumentReady(session, (state) => state.url !== before.url || state.timeOrigin !== beforeTimeOrigin, NAVIGATION_READY_TIMEOUT_MS);
+        }
+        await this.waitForDocumentReady(session, movedToNewDocument, NAVIGATION_READY_TIMEOUT_MS).catch((error) => {
+            // Transport interruptions carry a code and keep their recovery path.
+            const transportInterruption = error instanceof Error && 'code' in error;
+            if (!navigation.errorText || session.commandSignal?.aborted || transportInterruption) {
+                throw error;
+            }
+            throw new Error(`NAVIGATION_FAILED: ${navigation.errorText}`);
+        });
         await delay(ACTION_SETTLE_DELAY_MS, session.commandSignal);
         this.invalidate(session);
         const page = await this.readPageSummary(session);

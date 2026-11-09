@@ -19,21 +19,20 @@ export function sessionMessagesView(args) {
         maxOutputChars: Math.min(args.max_output_chars ?? SESSION_MESSAGES_DEFAULT_OUTPUT_CHARS, SESSION_MESSAGES_MAX_OUTPUT_CHARS),
     };
 }
-/** Copied as stored: local display rows use snake_case, the cloud reader camelCase. */
+/**
+ * Copied as stored. Every source reaches this projection in the local display
+ * shape: a local read returns its own rows and a remote one is mapped by the
+ * runtime's wire mapping first, so one snake_case spelling covers all of them.
+ */
 const MESSAGE_FIELDS = [
     'msg_id',
-    'msgId',
     'parent_msg_id',
-    'parentMsgId',
     'turn_id',
-    'turnId',
     'role',
     'msg_type',
-    'msgType',
     'kind',
     'timestamp',
     'msg_content',
-    'msgContent',
     'msg_content_source',
     'finish_reason',
     'source',

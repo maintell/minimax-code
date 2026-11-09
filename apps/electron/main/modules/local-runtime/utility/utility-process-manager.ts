@@ -1,3 +1,5 @@
+import { MainPptPreviewQueryClient } from "./ppt-preview-query-broker";
+import { handlePptPreviewBrokerMessage } from "../../document-preview/generation-preview/render-host";
 /**
  * Local-runtime utility process lifecycle manager (Electron main side).
  *
@@ -28,7 +30,6 @@
  * quarantined `actualExit`) that make every fork wait for the previous
  * process's real exit (§2.8 single-writer ordering).
  */
-
 import path from "path";
 import { randomUUID } from "crypto";
 import { boundFailureDetail } from "../../observability/failure-detail";
@@ -36,6 +37,7 @@ import { utilityBootstrapStageRank, UTILITY_MODULE_SUBSTAGES, RUNTIME_TRANSPORT_
 import { MainOwnedBrowserBroker } from "./browser-broker";
 import { MainOwnedDiagnosticsBroker } from "./diagnostics-broker";
 import { MainOwnedAuthRecoveryBroker } from "./auth-recovery-broker";
+import { MainOwnedRemoteSessionBroker } from "./remote-session-broker";
 import { MainMiniAppBrokerClient } from "./miniapp-broker";
 import { MainOwnedMiniAppSurfaceBroker } from "./miniapp-surface-broker";
 import { MainMiniAppToolBroker } from "./miniapp-tool-broker";
@@ -69,6 +71,13 @@ const DEFAULT_PROACTIVE_RECOVERY_COOLDOWN_MS = 60000;
 const MAX_PROACTIVE_RECOVERY_COOLDOWN_MS = 10 * 60000;
 const RUNTIME_MEMORY_MONITOR_REQUEST_TIMEOUT_MS = 10000;
 const SESSION_REPORT_REQUEST_TIMEOUT_MS = 30000;
+/**
+ * A feedback Workspace snapshot scans, hashes and zips up to 100k files / 1GB:
+ * 93.6k files / 710MB took 72s on an M-series Mac, and slower disks or
+ * on-access antivirus scanning multiply that. Expiry only drops the snapshot,
+ * so leave several times that headroom rather than lose minutes of work.
+ */
+const WORKSPACE_SNAPSHOT_REQUEST_TIMEOUT_MS = 10 * 60000;
 const BACKOFF_BASE_MS = 250;
 /** Consecutive runtime-init failures before the manager stops retrying. */
 const MAX_INIT_FAILURES = 3;
@@ -269,11 +278,12 @@ export class LocalRuntimeUtilityProcessManager {
         this.proactiveRecoveryAttempts = 0;
         this.pendingAuthRotations = new Map();
         this.pendingLogFlushes = new Map();
-        this.pendingSessionReports = new Map();
+        this.pendingRuntimeReports = new Map();
         this.pendingRuntimeMemoryMonitorRequests = new Map();
         this.rendererConnectionIds = new Map();
         this.rendererGenerations = new Map();
         this.activeAppVersion = 'unknown';
+        this.pptQueries = new MainPptPreviewQueryClient();
         this.miniAppBroker = new MainMiniAppBrokerClient();
         this.miniAppToolBroker = new MainMiniAppToolBroker({
             requestApproval: async (input) => (await this.options.requestMiniAppToolApproval?.(input)) ?? 'unavailable',
@@ -285,6 +295,12 @@ export class LocalRuntimeUtilityProcessManager {
             onDeliveryFailure: ({ requestId, messageType, error }) => {
                 (this.options.logger ?? noopLogger).error(`[UtilityRuntime] Browser broker ${messageType} delivery failed requestId=${requestId}: ${error}`);
             },
+            onActionFailure: ({ requestId, sessionId, action, code, detail }) => {
+                (this.options.logger ?? noopLogger).warn(`[UtilityRuntime] Browser action failed sessionId=${sessionId} action=${action} code=${code} requestId=${requestId}${detail ? `: ${detail}` : ''}`);
+            },
+        });
+        this.remoteSessionBroker = new MainOwnedRemoteSessionBroker({
+            logger: { warn: (message) => (this.options.logger ?? noopLogger).warn(message) },
         });
         this.diagnosticsBroker = new MainOwnedDiagnosticsBroker({
             getProvider: () => this.activeHostDiagnosticsProvider,
@@ -298,6 +314,7 @@ export class LocalRuntimeUtilityProcessManager {
             },
         });
         this.miniAppSurfaceBroker = new MainOwnedMiniAppSurfaceBroker({
+            ...(this.options.logger ? { logger: this.options.logger } : {}),
             open: (input) => {
                 const open = this.options.openMiniAppSurface;
                 if (!open) {
@@ -315,6 +332,15 @@ export class LocalRuntimeUtilityProcessManager {
                     });
                 }
                 return close(input);
+            },
+            sleep: (input) => {
+                const sleep = this.options.sleepMiniAppSurface;
+                if (!sleep) {
+                    throw Object.assign(new Error('Mini App surface sleep is unavailable'), {
+                        code: 'runtime_unavailable',
+                    });
+                }
+                return sleep(input);
             },
         });
         options.executionContinuity.onGap((observation) => {
@@ -534,36 +560,51 @@ export class LocalRuntimeUtilityProcessManager {
             return false;
         }
     }
+    async proposePptEdits(input, signal) {
+        return this.pptQueries.proposeEdits(await this.readyApplicationTarget(), input, signal);
+    }
+    async listPptArtifacts(sessionId) {
+        return this.pptQueries.listArtifacts(await this.readyApplicationTarget(), sessionId);
+    }
     /** Main-owned UI request over the utility control plane. */
     async requestMiniApp(method, pluginId, signal) {
-        return this.miniAppBroker.request(await this.readyMiniAppTarget(), method, pluginId, signal);
+        return this.miniAppBroker.request(await this.readyApplicationTarget(), method, pluginId, signal);
     }
     /** Plugin-detail permission switch; resolves with the stored list. */
     async setMiniAppPermission(input) {
-        return this.miniAppBroker.setPermission(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.setPermission(await this.readyApplicationTarget(), input);
+    }
+    /**
+     * Main's Mini App tab report. Describes in-memory runtime state only, so it never waits for
+     * or starts a runtime: skipped unless ready; the full snapshot is resent on every ready.
+     */
+    async reportMiniAppAttention(snapshot) {
+        if (this.state.phase !== 'ready')
+            return;
+        await this.miniAppBroker.reportAttention(await this.readyApplicationTarget(), snapshot);
     }
     /** Page-path Agent run; `input.caller` was resolved by Main from the sending tab. */
     async runMiniAppAgent(input, options) {
-        return this.miniAppBroker.runAgent(await this.readyMiniAppTarget(), input, options);
+        return this.miniAppBroker.runAgent(await this.readyApplicationTarget(), input, options);
     }
     /** Page-path permission decision; `input.caller` was resolved by Main from the sending tab. */
     async replyMiniAppAgent(input) {
-        return this.miniAppBroker.replyAgent(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.replyAgent(await this.readyApplicationTarget(), input);
     }
     /** Page-path side-panel check; `input.caller` was resolved by Main from the sending tab. */
     async openMiniAppAgent(input) {
-        return this.miniAppBroker.openAgent(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.openAgent(await this.readyApplicationTarget(), input);
     }
     /** Page-path model catalog; `input.caller` was resolved by Main from the sending tab. */
     async modelsMiniAppAgent(input) {
-        return this.miniAppBroker.modelsAgent(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.modelsAgent(await this.readyApplicationTarget(), input);
     }
     async agentsMiniAppAgent(input) {
-        return this.miniAppBroker.agentsAgent(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.agentsAgent(await this.readyApplicationTarget(), input);
     }
     /** Page-path session creation without a turn. */
     async createMiniAppAgent(input) {
-        return this.miniAppBroker.createAgent(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.createAgent(await this.readyApplicationTarget(), input);
     }
     /** Host-reported side panel change for a Mini App session; no tab caller. */
     async reportMiniAppAgentPanel(method, input) {
@@ -572,31 +613,31 @@ export class LocalRuntimeUtilityProcessManager {
         // running, since a stopped runtime has nothing left to forget.
         if (method === 'agent.panelClosed' && this.state.phase !== 'ready')
             return;
-        return this.miniAppBroker.reportAgentPanel(await this.readyMiniAppTarget(), method, input);
+        return this.miniAppBroker.reportAgentPanel(await this.readyApplicationTarget(), method, input);
     }
     /** Page-path observer; no deadline, ends on cancel or when the runtime ends it. */
     async observeMiniAppAgent(input, options) {
-        return this.miniAppBroker.observeAgent(await this.readyMiniAppTarget(), input, options);
+        return this.miniAppBroker.observeAgent(await this.readyApplicationTarget(), input, options);
     }
     async listMiniAppAgentSessions(input) {
-        return this.miniAppBroker.listAgentSessions(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.listAgentSessions(await this.readyApplicationTarget(), input);
     }
     async getMiniAppAgentSession(input) {
-        return this.miniAppBroker.getAgentSession(await this.readyMiniAppTarget(), input);
+        return this.miniAppBroker.getAgentSession(await this.readyApplicationTarget(), input);
     }
     /** Page-path questionnaire answer; the continuation turn is followed like `runMiniAppAgent`. */
     async answerMiniAppAgent(input, options) {
-        return this.miniAppBroker.answerAgent(await this.readyMiniAppTarget(), input, options);
+        return this.miniAppBroker.answerAgent(await this.readyApplicationTarget(), input, options);
     }
     /** Page-path `tool.request`; `pluginId` was resolved by Main from the sending tab. */
     async requestMiniAppTools(input) {
-        return this.miniAppToolBroker.requestFromPage(await this.readyMiniAppTarget(), input);
+        return this.miniAppToolBroker.requestFromPage(await this.readyApplicationTarget(), input);
     }
-    async readyMiniAppTarget() {
+    async readyApplicationTarget() {
         const ready = await this.ensureStarted();
         const state = this.state;
         if (!ready || state.phase !== 'ready') {
-            throw Object.assign(new Error('Mini App runtime is unavailable'), {
+            throw Object.assign(new Error('Local runtime is unavailable'), {
                 code: 'runtime_unavailable',
             });
         }
@@ -795,53 +836,67 @@ export class LocalRuntimeUtilityProcessManager {
         });
     }
     collectSessionReport(sessionId) {
-        const state = this.state;
-        if (state.phase !== 'ready') {
-            return Promise.reject(new Error('session_report_runtime_unavailable'));
-        }
-        const requestId = randomUUID();
-        const message = {
-            type: 'runtime-session-report-request',
+        return this.requestRuntimeReport((requestId) => ({ type: 'runtime-session-report-request', requestId, sessionId }), 'session_report', SESSION_REPORT_REQUEST_TIMEOUT_MS);
+    }
+    captureWorkspaceSnapshot(sessionId, outputDir) {
+        return this.requestRuntimeReport((requestId) => ({
+            type: 'runtime-workspace-snapshot-request',
             requestId,
             sessionId,
-        };
+            outputDir,
+        }), 'workspace_snapshot', WORKSPACE_SNAPSHOT_REQUEST_TIMEOUT_MS);
+    }
+    /** Errors are `<errorPrefix>_runtime_unavailable|_request_timeout|_request_failed|_runtime_stopped`. */
+    requestRuntimeReport(buildMessage, errorPrefix, timeoutMs) {
+        const state = this.state;
+        if (state.phase !== 'ready') {
+            return Promise.reject(new Error(`${errorPrefix}_runtime_unavailable`));
+        }
+        const requestId = randomUUID();
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
-                this.rejectSessionReport(requestId, new Error('session_report_request_timeout'));
-            }, SESSION_REPORT_REQUEST_TIMEOUT_MS);
-            this.pendingSessionReports.set(requestId, { child: state.child, resolve, reject, timeout });
+                this.rejectRuntimeReport(requestId, new Error(`${errorPrefix}_request_timeout`));
+            }, timeoutMs);
+            this.pendingRuntimeReports.set(requestId, {
+                child: state.child,
+                resolve,
+                reject,
+                timeout,
+                stoppedMessage: `${errorPrefix}_runtime_stopped`,
+            });
             try {
-                state.child.postMessage(message);
+                state.child.postMessage(buildMessage(requestId));
             }
             catch {
-                this.rejectSessionReport(requestId, new Error('session_report_request_failed'));
+                this.rejectRuntimeReport(requestId, new Error(`${errorPrefix}_request_failed`));
             }
         });
     }
-    settleSessionReport(response, child) {
-        const pending = this.pendingSessionReports.get(response.requestId);
+    settleRuntimeReport(response, child) {
+        const pending = this.pendingRuntimeReports.get(response.requestId);
         if (!pending || pending.child !== child)
             return;
         clearTimeout(pending.timeout);
-        this.pendingSessionReports.delete(response.requestId);
-        if (response.type === 'runtime-session-report-error') {
+        this.pendingRuntimeReports.delete(response.requestId);
+        if ('message' in response) {
             pending.reject(new Error(response.message));
             return;
         }
-        pending.resolve(response.report);
+        pending.resolve('report' in response ? response.report : response.snapshot);
     }
-    rejectSessionReport(requestId, error) {
-        const pending = this.pendingSessionReports.get(requestId);
+    rejectRuntimeReport(requestId, error) {
+        const pending = this.pendingRuntimeReports.get(requestId);
         if (!pending)
             return;
         clearTimeout(pending.timeout);
-        this.pendingSessionReports.delete(requestId);
+        this.pendingRuntimeReports.delete(requestId);
         pending.reject(error);
     }
-    rejectSessionReportsForChild(child, message) {
-        for (const [requestId, pending] of this.pendingSessionReports) {
-            if (pending.child === child)
-                this.rejectSessionReport(requestId, new Error(message));
+    rejectRuntimeReportsForChild(child) {
+        for (const [requestId, pending] of this.pendingRuntimeReports) {
+            if (pending.child === child) {
+                this.rejectRuntimeReport(requestId, new Error(pending.stoppedMessage));
+            }
         }
     }
     async configureRuntimeMemoryMonitoring(enabled, intervalMs = DEFAULT_RUNTIME_MEMORY_MONITOR_INTERVAL_MS) {
@@ -1448,13 +1503,8 @@ export class LocalRuntimeUtilityProcessManager {
                     ...(runawayGuardConfig ? { runawayGuardConfig } : {}),
                     ...(promptSuggestionPolicy ? { promptSuggestionPolicy } : {}),
                     ...(toolResultCompactionConfig &&
-                        (toolResultCompactionConfig.enabled !== undefined ||
-                            toolResultCompactionConfig.maxInlineBytes !== undefined ||
+                        (toolResultCompactionConfig.maxInlineBytes !== undefined ||
                             toolResultCompactionConfig.mcpDetailsMaxInlineBytes !== undefined ||
-                            toolResultCompactionConfig.watermarkBytes !== undefined ||
-                            toolResultCompactionConfig.minSavingsBytes !== undefined ||
-                            toolResultCompactionConfig.minCandidateBytes !== undefined ||
-                            toolResultCompactionConfig.keepRecentRounds !== undefined ||
                             toolResultCompactionConfig.checkpointSharedPrefix !== undefined)
                         ? { toolResultCompactionConfig }
                         : {}),
@@ -1497,6 +1547,8 @@ export class LocalRuntimeUtilityProcessManager {
             if ((state.phase !== 'starting' && state.phase !== 'ready') || state.child !== child) {
                 return;
             }
+            if (handlePptPreviewBrokerMessage(child, raw, this.options.resolveDataDir()))
+                return;
             if (this.browserBroker.handleMessage(child, raw))
                 return;
             if (this.diagnosticsBroker.handleMessage(child, raw))
@@ -1507,11 +1559,15 @@ export class LocalRuntimeUtilityProcessManager {
             }
             if (this.authRecoveryBroker.handleMessage(child, raw))
                 return;
+            if (this.remoteSessionBroker.handleMessage(child, raw))
+                return;
             if (this.miniAppSurfaceBroker.handleMessage(child, raw))
                 return;
             if (this.miniAppToolBroker.handleMessage(child, raw))
                 return;
             if (this.miniAppBroker.handleMessage(child, raw))
+                return;
+            if (this.pptQueries.handleMessage(child, raw))
                 return;
             if (isRuntimeMemorySampleMessage(raw)) {
                 this.notifyHost('onRuntimeMemorySample', () => this.options.onRuntimeMemorySample?.({
@@ -1530,8 +1586,10 @@ export class LocalRuntimeUtilityProcessManager {
             if (!isUtilityStatusMessage(raw))
                 return;
             if (raw.type === 'runtime-session-report-result' ||
-                raw.type === 'runtime-session-report-error') {
-                this.settleSessionReport(raw, child);
+                raw.type === 'runtime-session-report-error' ||
+                raw.type === 'runtime-workspace-snapshot-result' ||
+                raw.type === 'runtime-workspace-snapshot-error') {
+                this.settleRuntimeReport(raw, child);
                 return;
             }
             if (raw.type === 'runtime-auth-context-applied') {
@@ -2036,13 +2094,15 @@ export class LocalRuntimeUtilityProcessManager {
     releaseChildCapabilities(child) {
         this.revokeMiniAppGeneration(child);
         this.clearRuntimeHealthWatchdog(child);
-        this.rejectSessionReportsForChild(child, 'session_report_runtime_stopped');
+        this.rejectRuntimeReportsForChild(child);
         this.rejectRuntimeMemoryMonitorRequestsForChild(child, 'utility stopped before memory monitor request completed');
         this.browserBroker.releaseTarget(child);
         this.diagnosticsBroker.releaseTarget(child);
+        this.remoteSessionBroker.releaseTarget(child);
         this.miniAppSurfaceBroker.releaseTarget(child);
         this.miniAppToolBroker.releaseTarget(child);
         this.miniAppBroker.releaseTarget(child);
+        this.pptQueries.releaseTarget(child);
         this.activeBrowserAdapter = undefined;
         this.activeHostDiagnosticsProvider = undefined;
         this.activeAppVersion = 'unknown';

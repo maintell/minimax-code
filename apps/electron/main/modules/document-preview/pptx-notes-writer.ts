@@ -98,7 +98,7 @@ async function rels(zip, part) {
     return { xml, root, rows };
 }
 /** Validate central-directory budgets before JSZip is allowed to inflate anything. */
-function validateArchive(bytes) {
+export function validatePptxWriteArchive(bytes) {
     if (bytes.length > PPTX_PREVIEW_LIMITS_V1.maxInputBytes)
         return Promise.reject(invalid());
     return new Promise((resolve, reject) => {
@@ -161,7 +161,7 @@ export async function updatePptxNotes(bytes, edits) {
             edit.text.split('\n').some((line) => Buffer.byteLength(line) > 256 * 1024))
             throw invalid();
     }
-    await validateArchive(bytes);
+    await validatePptxWriteArchive(bytes);
     const zip = await jszip.loadAsync(bytes);
     const presentation = parse(await xmlPart(zip, 'ppt/presentation.xml'));
     const p = presentation.uri;
@@ -264,6 +264,6 @@ export async function updatePptxNotes(bytes, edits) {
         parse(await xmlPart(zip, notesPart));
     }
     const output = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-    await validateArchive(output);
+    await validatePptxWriteArchive(output);
     return output;
 }

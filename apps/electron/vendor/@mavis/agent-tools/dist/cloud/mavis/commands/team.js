@@ -81,8 +81,21 @@ const TEAM_COMMAND_SCHEMAS = {
     'plan cancel': teamCancelSchema,
 };
 export const TEAM_KNOWN_COMMANDS = Object.keys(TEAM_COMMAND_SCHEMAS);
+export const TEAM_DISABLED_ERROR_CODE = 'TEAM_DISABLED';
+export function teamDisabledFailure(command) {
+    return failure(command, 'validation', 'Team is disabled for this session.', {
+        error_code: TEAM_DISABLED_ERROR_CODE,
+    });
+}
+/** True for the `team ...` group reached through the `mavis` compatibility entry. */
+export function isMavisTeamCommand(normalizedCommand) {
+    const command = normalizedCommand.toLowerCase();
+    return command === 'team' || command.startsWith('team ');
+}
 export async function dispatchTeamTool(deps, rawCommand, rawArgs, signal) {
     const command = normalizeTeamCommand(rawCommand);
+    if (deps.teamDisabled === true)
+        return teamDisabledFailure(command);
     if (!isTeamCommand(command)) {
         return failure(command, 'validation', `unknown team command: ${JSON.stringify(rawCommand)}. Did you mean one of: ${suggestTeamCommands(command).join(', ')}?`, { known_commands: TEAM_KNOWN_COMMANDS });
     }

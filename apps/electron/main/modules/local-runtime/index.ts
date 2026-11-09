@@ -16,7 +16,7 @@ import logger from "../../utils/logger";
 import { DOMAIN_URL, IPC_CHANNELS } from "../../config/constants";
 import { resolveDesktopPromptConfigKey } from "../../config/prompt-config-key";
 import { buildEmbeddedBrowserToolAdapter } from "../browser/browser-tool-adapter";
-import { openManagedMiniAppSurface, closeManagedMiniAppSurface } from "../browser/miniapp-surface";
+import { openManagedMiniAppSurface, closeManagedMiniAppSurface, sleepManagedMiniAppSurface } from "../browser/miniapp-surface";
 import { requestMiniAppToolPermission } from "../browser/miniapp-tool-permission";
 import { resolveLocalRuntimeDataDir, LOCAL_RUNTIME_DATA_DIR_SOURCE_ENV } from "./data-dir";
 import { bootstrapLoginShellEnv } from "./login-shell-env";
@@ -1039,28 +1039,14 @@ function normalizeToolResultCompactionConfig(value) {
     if (typeof value !== 'object' || value === null || Array.isArray(value))
         return {};
     const record = value;
-    const enabled = typeof record.enabled === 'boolean' ? record.enabled : undefined;
     const maxInlineBytes = kibToPositiveSafeBytes(record.max_inline_kib);
     const mcpDetailsMaxInlineBytes = kibToPositiveSafeBytes(record.mcp_details_max_inline_kib);
-    const watermarkBytes = kibToPositiveSafeBytes(record.watermark_kib);
-    const minSavingsBytes = kibToPositiveSafeBytes(record.min_savings_kib);
-    const minCandidateBytes = kibToPositiveSafeBytes(record.min_candidate_kib);
-    const keepRecentRounds = typeof record.keep_recent_rounds === 'number' &&
-        Number.isSafeInteger(record.keep_recent_rounds) &&
-        record.keep_recent_rounds > 0
-        ? record.keep_recent_rounds
-        : undefined;
     const checkpointSharedPrefix = typeof record.checkpoint_shared_prefix === 'boolean'
         ? record.checkpoint_shared_prefix
         : undefined;
     return {
-        ...(enabled !== undefined ? { enabled } : {}),
         ...(maxInlineBytes !== undefined ? { maxInlineBytes } : {}),
         ...(mcpDetailsMaxInlineBytes !== undefined ? { mcpDetailsMaxInlineBytes } : {}),
-        ...(watermarkBytes !== undefined ? { watermarkBytes } : {}),
-        ...(minSavingsBytes !== undefined ? { minSavingsBytes } : {}),
-        ...(minCandidateBytes !== undefined ? { minCandidateBytes } : {}),
-        ...(keepRecentRounds !== undefined ? { keepRecentRounds } : {}),
         ...(checkpointSharedPrefix !== undefined ? { checkpointSharedPrefix } : {}),
     };
 }
@@ -1208,6 +1194,19 @@ function broadcastEmbeddedBrowserAgentAction(event) {
         window.webContents.send(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_ACTION, event);
     }
 }
+function broadcastMiniAppSlept(event) {
+    for (const window of BrowserWindow.getAllWindows()) {
+        try {
+            if (window.isDestroyed?.() || window.webContents.isDestroyed?.())
+                continue;
+            window.webContents.send(IPC_CHANNELS.MINIAPP_SLEPT, event);
+        }
+        catch (error) {
+            // One closing window must not keep the notice from the others.
+            logger.warn(`[LocalRuntime] Mini App slept notice failed for window ${window.id}: ${String(error)}`);
+        }
+    }
+}
 registerUtilityRuntimeMainHooks({
     getAuthContext: () => authContext,
     recoverAuthContext: (rejectedAccessToken, loginEpoch) => {
@@ -1270,6 +1269,7 @@ registerUtilityRuntimeMainHooks({
         broadcastEmbeddedBrowserAgentAction({ sessionId, action: 'open_miniapp' });
     },
     closeMiniAppSurface: ({ pluginId, isGenerationCurrent }) => closeManagedMiniAppSurface({ pluginId, isGenerationCurrent }),
+    sleepMiniAppSurface: (input) => sleepManagedMiniAppSurface(input, { notifySlept: broadcastMiniAppSlept }),
     requestMiniAppToolApproval: (input) => requestMiniAppToolPermission(input),
     getHostDiagnosticsProvider: () => maybeCreateElectronDiagnosticsProvider(),
     prepareForkEnv: async () => {

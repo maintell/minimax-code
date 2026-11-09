@@ -1,4 +1,4 @@
-import { InstalledPluginSource, PluginInstallationPolicy, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { InstalledPluginSource, PluginInstallationPolicy, PluginShowcaseMediaType, } from '@mavis/thrift-gen/generated/desktop-service/types';
 import { PluginSystemCloudTransport, PluginSystemCloudTransportError, } from '../../cloud-transport.js';
 const CLOUD_BASE = '/minimax-cloud/api/v1';
 const ARCHIVE_SHA = /^[0-9a-f]{64}$/u;
@@ -149,7 +149,82 @@ function readMarketplaceDetail(value) {
             };
         }),
         ...optionalArrayProjection(record, ['example_queries', 'exampleQueries'], 'exampleQueries', requireStringValue),
+        ...showcaseProjection(record),
         ...optionalArrayProjection(record, ['agents', 'agents'], 'agents', readPluginAgent),
+    };
+}
+function showcaseProjection(record) {
+    const raw = record.showcase_config === undefined ? record.showcaseConfig : record.showcase_config;
+    if (raw === undefined)
+        return {};
+    if (!isRecord(raw) || !Array.isArray(raw.items))
+        return { showcaseConfig: { items: [] } };
+    return { showcaseConfig: { items: raw.items.flatMap(readShowcase) } };
+}
+function readShowcase(value) {
+    if (!isRecord(value) || typeof value.id !== 'string' || typeof value.query !== 'string')
+        return [];
+    const media = readShowcaseMedia(value.media);
+    return [
+        {
+            id: value.id,
+            text: typeof value.text === 'string' && value.text.trim() ? value.text : value.query,
+            query: value.query,
+            ...(media ? { media } : {}),
+            ...showcaseReferenceProjection(value),
+        },
+    ];
+}
+function showcaseReferenceProjection(value) {
+    const hasImages = 'reference_images' in value || 'referenceImages' in value;
+    const hasFiles = 'reference_files' in value || 'referenceFiles' in value;
+    const referenceImages = hasFiles
+        ? undefined
+        : readShowcaseReferences(field(value, 'reference_images', 'referenceImages'));
+    const referenceFiles = hasImages
+        ? undefined
+        : readShowcaseReferences(field(value, 'reference_files', 'referenceFiles'));
+    return {
+        ...(referenceImages ? { referenceImages } : {}),
+        ...(referenceFiles ? { referenceFiles } : {}),
+    };
+}
+// Preserve the complete input set across the cloud/local wire boundary. UI
+// normalization applies the MIME, URL and size policy before creating attachments.
+function readShowcaseReferences(value) {
+    if (!Array.isArray(value) || value.length > 8)
+        return;
+    const files = [];
+    for (const file of value) {
+        if (!isRecord(file))
+            return;
+        const fileName = field(file, 'file_name', 'fileName');
+        const mimeType = field(file, 'mime_type', 'mimeType');
+        const sizeBytes = field(file, 'size_bytes', 'sizeBytes');
+        if (typeof file.url !== 'string' ||
+            typeof fileName !== 'string' ||
+            typeof mimeType !== 'string' ||
+            typeof sizeBytes !== 'number')
+            return;
+        files.push({ url: file.url, fileName, mimeType, sizeBytes });
+    }
+    return files;
+}
+const SHOWCASE_MEDIA_TYPES = new Set(Object.values(PluginShowcaseMediaType));
+function readShowcaseMedia(value) {
+    if (!isRecord(value) || !SHOWCASE_MEDIA_TYPES.has(value.type) || typeof value.url !== 'string')
+        return;
+    const pageUrls = field(value, 'page_urls', 'pageUrls');
+    return {
+        type: value.type,
+        url: value.url,
+        ...optionalStringProjection(value, 'poster_url', 'posterUrl', 'posterUrl'),
+        ...optionalStringProjection(value, 'alt', 'alt', 'alt'),
+        ...(Array.isArray(pageUrls)
+            ? { pageUrls: pageUrls.filter((page) => typeof page === 'string') }
+            : {}),
+        ...optionalStringProjection(value, 'file_url', 'fileUrl', 'fileUrl'),
+        ...optionalStringProjection(value, 'file_name', 'fileName', 'fileName'),
     };
 }
 function readPluginAgent(value) {

@@ -149,6 +149,18 @@ const baseDefinitions = [
         commandMenuGroup: 'panels',
     }),
     definition({
+        id: 'workspacePanel.toggleOverview',
+        category: 'panels',
+        scope: 'app',
+        labelKey: 'settings.shortcuts.actions.workspace_panel_toggle_overview.label',
+        descriptionKey: 'settings.shortcuts.actions.workspace_panel_toggle_overview.description',
+        searchKeywordsKey: 'settings.shortcuts.actions.workspace_panel_toggle_overview.keywords',
+        defaults: { mac: 'Command+Alt+W', windows: 'Ctrl+Alt+W' },
+        configurable: true,
+        handledBy: 'renderer',
+        commandMenuGroup: 'panels',
+    }),
+    definition({
         id: 'workspacePanel.closeCurrentTab',
         category: 'panels',
         scope: 'session',
@@ -243,8 +255,9 @@ const baseDefinitions = [
         labelKey: 'settings.shortcuts.actions.asr_toggle.label',
         descriptionKey: 'settings.shortcuts.actions.asr_toggle.description',
         searchKeywordsKey: 'settings.shortcuts.actions.asr_toggle.keywords',
-        // Ctrl (not Command) on macOS as well, matching ChatGPT's voice toggle.
-        defaults: { mac: 'Ctrl+Shift+D', windows: 'Ctrl+Shift+D' },
+        // Ctrl (not Command) on macOS as well: one key starts dictation and the
+        // same key finishes it (the ✓ tooltip shows it as ⌃D).
+        defaults: { mac: 'Ctrl+D', windows: 'Ctrl+D' },
         configurable: true,
         handledBy: 'renderer',
     }),

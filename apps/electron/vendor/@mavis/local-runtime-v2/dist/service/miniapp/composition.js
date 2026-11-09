@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { createMiniAppHostRequestActivityTracker, createMiniAppMemoryCoordinator, } from './memory/index.js';
 import { createMiniAppToolGateway } from './tool-gateway.js';
 import { initializeMiniAppSupervisor, } from './initialize.js';
 export function resolveRuntimeMiniAppOptions(input) {
@@ -30,15 +31,19 @@ export function createDeferredRuntimeOwnersLifecycle() {
 export async function composeMiniAppRuntimeCapability(input) {
     let miniApp;
     let miniAppTools;
+    let miniAppMemory;
     try {
         if (input.options) {
             miniAppTools = composeMiniAppToolGateway(input);
+            // One tracker: the Host connector sessions report into it, the memory manager reads it.
+            const activity = createMiniAppHostRequestActivityTracker();
             const supervisor = initializeMiniAppSupervisor({
                 ...input.options,
                 db: input.db,
                 connectorGateway: input.plugin.hostConnectorGateway,
                 permissionSwitches: input.plugin.miniAppPermissionSwitches,
                 toolGateway: miniAppTools,
+                hostRequestActivity: activity,
                 ...(input.agentGateway ? { agentGateway: input.agentGateway } : {}),
                 ...(input.logger ? { logger: input.logger } : {}),
                 verifyCandidate: (candidate) => input.plugin.verifyMiniAppCandidate(candidate),
@@ -52,17 +57,37 @@ export async function composeMiniAppRuntimeCapability(input) {
                 supervisor,
                 onRuntimeExit: (listener) => supervisor.onRuntimeExit(listener),
             });
+            miniAppMemory = composeMiniAppMemory(input, supervisor, activity);
+            input.plugin.bindMiniAppMemory(miniAppMemory);
         }
     }
     catch (error) {
+        miniAppMemory?.close();
         await closeAfterInitializationFailure(miniApp, input.closeOwners);
         throw error;
     }
     return {
-        services: miniApp ? { miniApp, ...(miniAppTools ? { miniAppTools } : {}) } : {},
+        services: miniApp
+            ? {
+                miniApp,
+                ...(miniAppTools ? { miniAppTools } : {}),
+                ...(miniAppMemory ? { miniAppMemory } : {}),
+            }
+            : {},
         ready: createCombinedReady(miniApp, input.readyOwners),
-        close: createCombinedClose(input.closeOwners, miniApp),
+        close: createCombinedClose(input.closeOwners, miniApp, miniAppMemory),
     };
+}
+function composeMiniAppMemory(input, supervisor, activity) {
+    const { plugin, logger } = input;
+    const sleep = input.surface?.sleep;
+    return createMiniAppMemoryCoordinator({
+        supervisor,
+        stopMiniApp: (stop) => plugin.stopMiniApp(stop),
+        ...(sleep ? { surface: { sleep } } : {}),
+        activity,
+        ...(logger ? { logger } : {}),
+    });
 }
 function composeMiniAppToolGateway(input) {
     const { tools, logger } = input;
@@ -104,20 +129,27 @@ async function closeAfterInitializationFailure(miniApp, closeOwners) {
         }
     }
 }
-function createCombinedClose(closeOwners, miniApp) {
+function createCombinedClose(closeOwners, miniApp, miniAppMemory) {
     let closePromise;
     return () => {
-        closePromise ??= closeOwnersAndMiniApp(closeOwners, miniApp);
+        closePromise ??= closeOwnersAndMiniApp(closeOwners, miniApp, miniAppMemory);
         return closePromise;
     };
 }
-async function closeOwnersAndMiniApp(closeOwners, miniApp) {
+async function closeOwnersAndMiniApp(closeOwners, miniApp, miniAppMemory) {
     let firstError;
+    try {
+        // First: no pressure sleep or admission may stop a backend while the owners shut down.
+        miniAppMemory?.close();
+    }
+    catch (error) {
+        firstError = error;
+    }
     try {
         await closeOwners();
     }
     catch (error) {
-        firstError = error;
+        firstError ??= error;
     }
     try {
         await miniApp?.close();

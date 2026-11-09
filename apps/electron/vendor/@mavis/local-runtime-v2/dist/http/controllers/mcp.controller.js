@@ -1,16 +1,18 @@
 import { LocalMcpTransport } from '@mavis/thrift-gen/generated/desktop-service/types';
 import { AppError } from '../errors.js';
 import { McpControllerBase } from '../generated/mcp-controller-base.gen.js';
-export function createMcpController(service, runtime) {
-    return new McpController(service, runtime);
+export function createMcpController(service, runtime, auth) {
+    return new McpController(service, runtime, auth);
 }
 class McpController extends McpControllerBase {
     service;
     runtime;
-    constructor(service, runtime) {
+    auth;
+    constructor(service, runtime, auth) {
         super();
         this.service = service;
         this.runtime = runtime;
+        this.auth = auth;
     }
     async listLocalMcpServers(_ctx, req) {
         return this.map(async () => ({
@@ -45,6 +47,67 @@ class McpController extends McpControllerBase {
     }
     async testLocalMcpServer(_ctx, req) {
         return this.map(async () => ({ result: await this.requireService().test(req.serverName) }));
+    }
+    async setLocalMcpServerOAuthClientSecret(_ctx, req) {
+        return this.map(async () => {
+            if (typeof req.serverName !== 'string' || !req.serverName.trim())
+                invalidAuthRequest();
+            if (req.clientSecret !== undefined && typeof req.clientSecret !== 'string') {
+                invalidAuthRequest();
+            }
+            return {
+                configured: await this.requireAuth().setUserClientSecret(req.serverName, req.clientSecret),
+            };
+        });
+    }
+    async listLocalMcpAuthStates(_ctx, req) {
+        return this.map(async () => {
+            const states = await this.requireAuth().listStates({
+                ...(req.sessionId?.trim() ? { sessionId: req.sessionId } : {}),
+                ...(req.workspaceRoot?.trim() ? { workspaceRoot: req.workspaceRoot } : {}),
+            });
+            return { states: states.map(toWireAuthState) };
+        });
+    }
+    async testLocalMcpAuthTarget(_ctx, req) {
+        return this.map(async () => {
+            const result = await this.requireAuth().test(fromWireAuthTarget(req.target));
+            return {
+                state: toWireAuthState(result.state),
+                ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+            };
+        });
+    }
+    async startLocalMcpAuth(_ctx, req) {
+        return this.map(async () => {
+            if (req.force !== undefined && typeof req.force !== 'boolean')
+                invalidAuthRequest();
+            const target = fromWireAuthTarget(req.target);
+            return toWireStartResult(await this.requireAuth().start(target, req.force ? { force: true } : undefined));
+        });
+    }
+    async cancelLocalMcpAuth(_ctx, req) {
+        return this.map(async () => ({
+            cancelled: await this.requireAuth().cancel(requiredText(req.attemptId)),
+        }));
+    }
+    async completeLocalMcpAuth(_ctx, req) {
+        return this.map(async () => {
+            const attemptId = requiredText(req.attemptId);
+            if (typeof req.callbackUrl !== 'string' || !req.callbackUrl.trim())
+                invalidAuthRequest();
+            const result = await this.requireAuth().complete(attemptId, req.callbackUrl);
+            return {
+                state: toWireAuthState(result.state),
+                ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+            };
+        });
+    }
+    async clearLocalMcpAuth(_ctx, req) {
+        return this.map(async () => {
+            const result = await this.requireAuth().clear(fromWireAuthTarget(req.target));
+            return { state: toWireAuthState(result.state), revoked: result.revoked };
+        });
     }
     async listLocalMcpRuntimeServers(_ctx, _req) {
         return this.map(async () => {
@@ -125,6 +188,11 @@ class McpController extends McpControllerBase {
             throw new AppError(503, 'MCP_UNAVAILABLE', 'MCP runtime unavailable');
         return this.runtime;
     }
+    requireAuth() {
+        if (!this.auth)
+            throw new AppError(503, 'MCP_AUTH_UNAVAILABLE', 'MCP authorization unavailable');
+        return this.auth;
+    }
     requireService() {
         if (!this.service)
             throw new AppError(503, 'MCP_UNAVAILABLE', 'MCP settings unavailable');
@@ -142,6 +210,9 @@ class McpController extends McpControllerBase {
             if (typeof code === 'string' && typeof status === 'number') {
                 throw new AppError(status, code, 'MCP operation failed');
             }
+            if (error instanceof Error && error.name === 'McpOAuthError' && typeof code === 'string') {
+                throw new AppError(code.endsWith('_NOT_FOUND') ? 404 : 400, code, 'MCP authorization failed');
+            }
             throw new AppError(500, 'INTERNAL_ERROR', 'internal error');
         }
     }
@@ -154,10 +225,21 @@ function toSummary(server) {
         ...(server.description ? { description: server.description } : {}),
         ...(server.endpoint ? { endpoint: server.endpoint } : {}),
         configJson: '{}',
+        ...(server.authState ? { authState: server.authState } : {}),
     };
 }
+/** `clientSecretConfigured` reflects the stored secret; absent OAuth settings stay absent. */
 function toDetail(server) {
-    return { name: server.name, enabled: server.enabled, config: toWireConfig(server.config) };
+    const config = toWireConfig(server.config);
+    const secretConfigured = server.oauthClientSecretConfigured === true;
+    if (config.transport === LocalMcpTransport.Stdio || (!config.oauth && !secretConfigured)) {
+        return { name: server.name, enabled: server.enabled, config };
+    }
+    return {
+        name: server.name,
+        enabled: server.enabled,
+        config: { ...config, oauth: { ...config.oauth, clientSecretConfigured: secretConfigured } },
+    };
 }
 function fromWireConfig(config) {
     assertWireConfig(config);
@@ -183,7 +265,24 @@ function fromWireConfig(config) {
         transport,
         url: config.url ?? '',
         ...(config.headers ? { headers: fromWireKeyValues(config.headers, true) } : {}),
+        ...(config.oauth ? { oauth: fromWireOAuth(config.oauth) } : {}),
         ...common,
+    };
+}
+/** `clientSecretConfigured` is read-only; secrets travel only through the secret method. */
+function fromWireOAuth(oauth) {
+    const callbackHost = oauth.callbackHost;
+    if (callbackHost !== undefined && callbackHost !== 'localhost' && callbackHost !== '127.0.0.1') {
+        invalidWireConfig();
+    }
+    return {
+        ...(oauth.clientId === undefined ? {} : { clientId: oauth.clientId }),
+        ...(oauth.scopes === undefined ? {} : { scopes: [...oauth.scopes] }),
+        ...(oauth.callbackPort === undefined ? {} : { callbackPort: oauth.callbackPort }),
+        ...(callbackHost === undefined ? {} : { callbackHost }),
+        ...(oauth.authServerMetadataUrl === undefined
+            ? {}
+            : { authServerMetadataUrl: oauth.authServerMetadataUrl }),
     };
 }
 function toWireConfig(config) {
@@ -204,6 +303,7 @@ function toWireConfig(config) {
         transport: toWireTransport(config.transport),
         url: config.url,
         ...(config.headers ? { headers: toKeyValues(config.headers) } : {}),
+        ...(config.oauth ? { oauth: { ...config.oauth } } : {}),
         ...common,
     };
 }
@@ -235,8 +335,11 @@ function assertWireConfig(config) {
     if (config['transport'] === LocalMcpTransport.Stdio) {
         if (typeof config['command'] !== 'string' || !config['command'].trim())
             invalidWireConfig();
+        if (config['oauth'] !== undefined)
+            invalidWireConfig();
         return;
     }
+    assertOptionalOAuth(config['oauth']);
     if (typeof config['url'] !== 'string' || !config['url'].trim())
         invalidWireConfig();
 }
@@ -268,6 +371,22 @@ function assertOptionalKeyValues(config, key) {
             invalidWireConfig();
         }
     }
+}
+function assertOptionalOAuth(value) {
+    if (value === undefined)
+        return;
+    if (!isRecord(value))
+        invalidWireConfig();
+    assertOptionalString(value, 'clientId');
+    assertOptionalStringArray(value, 'scopes');
+    assertOptionalString(value, 'callbackHost');
+    assertOptionalString(value, 'authServerMetadataUrl');
+    const port = value['callbackPort'];
+    if (port !== undefined && !Number.isSafeInteger(port))
+        invalidWireConfig();
+    const secretConfigured = value['clientSecretConfigured'];
+    if (secretConfigured !== undefined && typeof secretConfigured !== 'boolean')
+        invalidWireConfig();
 }
 function assertOptionalTimeout(value) {
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -306,5 +425,86 @@ function toRuntimeWireTool(tool) {
         ...(tool.description === undefined ? {} : { description: tool.description }),
         inputSchemaJson: JSON.stringify(tool.inputSchema),
     };
+}
+function fromWireAuthTarget(target) {
+    if (!isRecord(target))
+        invalidAuthRequest();
+    const serverName = requiredText(target['serverName']);
+    if (target['kind'] === 'user')
+        return { kind: 'user', serverName };
+    if (target['kind'] === 'project') {
+        return {
+            kind: 'project',
+            serverName,
+            sessionId: requiredText(target['sessionId']),
+            workspaceRoot: requiredText(target['workspaceRoot']),
+        };
+    }
+    if (target['kind'] === 'plugin') {
+        return {
+            kind: 'plugin',
+            serverName,
+            pluginName: requiredText(target['pluginName']),
+            pluginMarketplace: requiredText(target['pluginMarketplace']),
+            pluginSource: requiredText(target['pluginSource']),
+        };
+    }
+    invalidAuthRequest();
+}
+function toWireAuthTarget(target) {
+    if (target.kind === 'user')
+        return { kind: 'user', serverName: target.serverName };
+    if (target.kind === 'project') {
+        return {
+            kind: 'project',
+            serverName: target.serverName,
+            sessionId: target.sessionId,
+            workspaceRoot: target.workspaceRoot,
+        };
+    }
+    return {
+        kind: 'plugin',
+        serverName: target.serverName,
+        pluginName: target.pluginName,
+        pluginMarketplace: target.pluginMarketplace,
+        pluginSource: target.pluginSource,
+    };
+}
+function toWireAuthState(view) {
+    return {
+        target: toWireAuthTarget(view.target),
+        authState: view.authState,
+        ...(view.reason ? { reason: view.reason } : {}),
+        ...(view.missingScopes?.length ? { missingScopes: [...view.missingScopes] } : {}),
+        ...(view.expiresAt === undefined ? {} : { expiresAt: view.expiresAt }),
+        ...(view.serverOrigin ? { serverOrigin: view.serverOrigin } : {}),
+        ...(view.issuer ? { issuer: view.issuer } : {}),
+        ...(view.attemptId ? { attemptId: view.attemptId } : {}),
+        ...(view.lastAttemptId ? { lastAttemptId: view.lastAttemptId } : {}),
+        ...(view.lastAttemptOutcome ? { lastAttemptOutcome: view.lastAttemptOutcome } : {}),
+        ...(view.lastAttemptErrorCode ? { lastAttemptErrorCode: view.lastAttemptErrorCode } : {}),
+    };
+}
+function toWireStartResult(result) {
+    if (result.status === 'pending') {
+        return {
+            status: result.status,
+            attemptId: result.attemptId,
+            authUrl: result.authUrl,
+            requiresConfirmation: result.requiresConfirmation,
+            ...(result.confirmation ? { confirmation: { ...result.confirmation } } : {}),
+        };
+    }
+    if (result.status === 'already_authorized')
+        return { status: result.status };
+    return { status: result.status, errorCode: result.errorCode };
+}
+function requiredText(value) {
+    if (typeof value !== 'string' || !value.trim())
+        invalidAuthRequest();
+    return value;
+}
+function invalidAuthRequest() {
+    throw new AppError(400, 'MCP_AUTH_REQUEST_INVALID', 'MCP authorization request is invalid');
 }
 //# sourceMappingURL=mcp.controller.js.map

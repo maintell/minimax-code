@@ -20,11 +20,13 @@
  *   streams and re-request ports.
  */
 
+import { pathToFileURL } from "node:url";
 import { getConfig } from "@mavis/config";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
 import logger from "../../../utils/logger";
 import { recordAuthRefreshExecutionGap } from "../../auth/refresh-environment";
-import { destroyAllManagedMiniAppTabs } from "../../browser/embedded-browser-manager";
+import { managedMiniAppAttentionSnapshot, subscribeManagedMiniAppAttention, destroyAllManagedMiniAppTabs } from "../../browser/embedded-browser-manager";
+import { MiniAppAttentionReporter } from "../../browser/miniapp-attention";
 import { enqueueElectronObservabilityEvent, isElectronObservabilityShuttingDown, getElectronObservabilityAppInstanceId } from "../../observability/outbox";
 import { recordElectronStartupRuntimeReady } from "../../observability/startup-performance";
 import { resolveLocalRuntimeDataDir } from "../data-dir";
@@ -47,6 +49,10 @@ import { DEFAULT_RUNTIME_MEMORY_MONITOR_INTERVAL_MS, MIN_RUNTIME_MEMORY_MONITOR_
 let hooks = null;
 let routingContext;
 configureUtilityRuntimeDiagnosticsLogger(logger);
+// Main's Mini App tab report, coalesced over bursts of changes. A runtime that is not ready skips
+// it and receives the full snapshot when it becomes ready.
+const miniAppAttentionReporter = new MiniAppAttentionReporter(managedMiniAppAttentionSnapshot, reportMiniAppAttention);
+subscribeManagedMiniAppAttention(() => miniAppAttentionReporter.changed());
 export function registerUtilityRuntimeMainHooks(next) {
     hooks = next;
 }
@@ -109,7 +115,8 @@ function importEsm(specifier) {
     }
     // eslint-disable-next-line no-new-func -- Preserve native dynamic import in Electron's CJS main process.
     const dynamicImport = new Function('specifier', 'return import(specifier)');
-    return dynamicImport(specifier);
+    // Resolve from Electron main even if V8 reuses an import callback from another package.
+    return dynamicImport(pathToFileURL(require.resolve(specifier)).href);
 }
 /**
  * Lazy dynamic import for `@mavis/shared/runtime-transport`: `@mavis/shared`
@@ -233,6 +240,7 @@ function getManager() {
         getBrowserAdapter: () => hooks?.getBrowserAdapter(),
         ...(hooks?.openMiniAppSurface ? { openMiniAppSurface: hooks.openMiniAppSurface } : {}),
         ...(hooks?.closeMiniAppSurface ? { closeMiniAppSurface: hooks.closeMiniAppSurface } : {}),
+        ...(hooks?.sleepMiniAppSurface ? { sleepMiniAppSurface: hooks.sleepMiniAppSurface } : {}),
         ...(hooks?.requestMiniAppToolApproval
             ? { requestMiniAppToolApproval: hooks.requestMiniAppToolApproval }
             : {}),
@@ -273,6 +281,8 @@ function getManager() {
                     .catch(() => logger.warn('[UtilityRuntime] memory monitor resume failed'));
             }
             recordElectronStartupRuntimeReady();
+            // A new runtime knows nothing about the tabs Main holds; give it the full picture.
+            miniAppAttentionReporter.flush();
         },
         onRuntimeFailed: ({ message, terminal, reasonCode }) => {
             runtimeFailReason = message;
@@ -317,6 +327,16 @@ export async function ensureComputerUseUtilityStarted() {
         connectRuntimeChannel: (channel) => getManager().connectComputerUseChannel(channel),
     });
 }
+export async function proposeUtilityPptEdits(input, signal) {
+    if (isUtilityRuntimeStartBlocked())
+        throw new Error('proposal_failed');
+    return getManager().proposePptEdits(input, signal);
+}
+export async function listUtilityPptArtifacts(sessionId) {
+    if (isUtilityRuntimeStartBlocked())
+        throw new Error('PPT preview runtime unavailable');
+    return getManager().listPptArtifacts(sessionId);
+}
 export async function requestUtilityMiniApp(method, pluginId, signal) {
     assertMiniAppRuntimeStartable();
     return getManager().requestMiniApp(method, pluginId, signal);
@@ -324,6 +344,15 @@ export async function requestUtilityMiniApp(method, pluginId, signal) {
 export async function setUtilityMiniAppPermission(input) {
     assertMiniAppRuntimeStartable();
     return getManager().setMiniAppPermission(input);
+}
+/**
+ * Fire-and-forget: never starts the runtime. A report lost to a restart is replaced by the full
+ * snapshot sent on the next ready.
+ */
+function reportMiniAppAttention(snapshot) {
+    void manager?.reportMiniAppAttention(snapshot).catch(() => {
+        logger.warn('[UtilityRuntime] Mini App attention report failed');
+    });
 }
 export async function runUtilityMiniAppAgent(input, options) {
     assertMiniAppRuntimeStartable();
@@ -505,21 +534,38 @@ export async function collectUtilityRuntimeSessionReport(sessionId) {
         throw new Error('session_report_runtime_unavailable');
     return manager.collectSessionReport(sessionId);
 }
+/** Internal-build feedback: the utility writes the Session's Workspace snapshot into `outputDir`. */
+export async function captureUtilityRuntimeWorkspaceSnapshot(sessionId, outputDir) {
+    if (!manager)
+        throw new Error('workspace_snapshot_runtime_unavailable');
+    return manager.captureWorkspaceSnapshot(sessionId, outputDir);
+}
 export async function stopUtilityRuntime() {
     if (!manager) {
-        await stopComputerUseUtility();
+        await stopComputerUseUtilitySafely();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
         return { status: 'exited' };
     }
+    // Computer Use drains alongside the runtime so a slow runtime stop does not consume the
+    // quit budget the bridge needs to stop its native daemon.
+    const computerUseStopped = stopComputerUseUtilitySafely();
     try {
         return await manager.stop();
     }
     finally {
-        await stopComputerUseUtility();
+        await computerUseStopped;
+        // The draining runtime may have requested Computer Use again; stop that generation too.
+        await stopComputerUseUtilitySafely();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
     }
+}
+/** A Computer Use stop failure is logged and never changes the runtime stop result. */
+function stopComputerUseUtilitySafely() {
+    return stopComputerUseUtility().catch((error) => {
+        logger.warn(`[UtilityRuntime] computer use stop failed: ${error instanceof Error ? error.name : 'unknown'}`);
+    });
 }
 /**
  * Renderer port hand-off: returns whether a MessagePort pair was delivered.

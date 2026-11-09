@@ -43,8 +43,12 @@ export async function resolvePluginDirectory(root, relativePath) {
     }
 }
 export async function readPluginTextFile(root, relativePath, options = {}) {
+    const maxBytes = options.maxBytes ?? PLUGIN_PACKAGE_V1_LIMITS.maxFileBytes;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+        throw new RangeError('maxBytes must be a non-negative safe integer');
+    }
     const filePath = await resolvePluginFile(root, relativePath, options);
-    const bytes = await readStablePluginFile(filePath, relativePath);
+    const bytes = await readStablePluginFile(filePath, relativePath, Math.min(maxBytes, PLUGIN_PACKAGE_V1_LIMITS.maxFileBytes));
     let content;
     try {
         content = UTF8_DECODER.decode(bytes);
@@ -57,7 +61,7 @@ export async function readPluginTextFile(root, relativePath, options = {}) {
     }
     return { path: filePath, content };
 }
-async function readStablePluginFile(filePath, relativePath) {
+async function readStablePluginFile(filePath, relativePath, maxBytes) {
     const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
     let handle;
     try {
@@ -68,7 +72,7 @@ async function readStablePluginFile(filePath, relativePath) {
     }
     try {
         const before = await handle.stat();
-        assertReadableFileSnapshot(before, relativePath);
+        assertReadableFileSnapshot(before, relativePath, maxBytes);
         const bytes = await readExactFile(handle, before.size, relativePath);
         const after = await handle.stat();
         if (!sameFileSnapshot(before, after)) {
@@ -80,14 +84,14 @@ async function readStablePluginFile(filePath, relativePath) {
         await handle.close();
     }
 }
-function assertReadableFileSnapshot(snapshot, relativePath) {
+function assertReadableFileSnapshot(snapshot, relativePath, maxBytes) {
     if (!snapshot.isFile()) {
         readerFail('PLUGIN_FILE_INVALID', `${relativePath} is not a regular file`);
     }
     if (!Number.isSafeInteger(snapshot.size) || snapshot.size < 0) {
         readerFail('PLUGIN_FILE_INVALID', `${relativePath} has an invalid size`);
     }
-    if (snapshot.size > PLUGIN_PACKAGE_V1_LIMITS.maxFileBytes) {
+    if (snapshot.size > maxBytes) {
         readerFail('PLUGIN_FILE_TOO_LARGE', `${relativePath} exceeds the file limit`);
     }
 }

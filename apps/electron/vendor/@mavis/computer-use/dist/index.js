@@ -3,4 +3,5 @@ export { ComputerUseError, } from './contracts.js';
 export { CUA_VERSION, CUA_BUNDLE_ID, componentInstallRoot, discoverComponent, } from './component.js';
 export { mapRequestToCuaTool, normalizeCuaResult, callCuaToolWithDeliveryMode, validateClickAction, } from './mapping.js';
 export { prepareInstalledPackagedComponent } from './packaged-component.js';
+export { reclaimProfileDaemons } from './daemon.js';
 //# sourceMappingURL=index.js.map

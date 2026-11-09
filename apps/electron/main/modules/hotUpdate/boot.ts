@@ -86,11 +86,13 @@ export function resolveBootRenderer(input) {
         !input.channel ||
         state.channel !== input.channel ||
         state.locale !== input.locale ||
+        state.branchKey !== (input.branchKey ?? null) ||
         state.appVersion !== input.baseAppVersion ||
         state.shellFingerprint !== input.shellFingerprint) {
         resetVersions(state);
         state.channel = input.channel;
         state.locale = input.locale;
+        state.branchKey = input.branchKey ?? null;
         state.appVersion = input.baseAppVersion;
         state.shellFingerprint = input.shellFingerprint;
         state.lastCheckTime = 0;

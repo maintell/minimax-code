@@ -2,6 +2,7 @@
  * 更新模块配置
  */
 import { autoUpdater } from "electron-updater";
+import { getTestBuildInfo, testBranchFeedUrl, readTestBuild, isNewerTestBuild } from "./test-branch";
 import { isInsideBuild, isInternalBuild, isProd, isZh, isStaging, isTest, isDev } from "../../config/env";
 import { getCategoryLogger } from "../../utils/logger";
 const logger = getCategoryLogger('update');
@@ -31,6 +32,10 @@ export function getUpdateServerUrl() {
             ? 'https://filecdn.minimax.chat/public/minimax-agent-staging/release'
             : 'https://file.cdn.minimax.io/public/minimax-agent-staging/release';
     }
+    // 普通 test 的 feat 包读取安装包所在分支的指针，其余 test 包保留共享 feed。
+    const testBuild = getTestBuildInfo();
+    if (testBuild)
+        return testBranchFeedUrl(testBuild.locale, testBuild.branchKey);
     // 测试环境更新服务器
     return isZh
         ? `https://filecdn.minimax.chat/public/minimax-agent-test/release`
@@ -92,5 +97,44 @@ export function configureAutoUpdater() {
     autoUpdater.allowDowngrade = false;
     // 允许预发布版本：test/staging 环境以及 internal/inside 车道的版本号都带预发布标识
     autoUpdater.allowPrerelease = isTest || isStaging || isInternalBuild || isInsideBuild;
+    if (defaultUpdateSupported)
+        autoUpdater.isUpdateSupported = defaultUpdateSupported;
+    if (getTestBuildInfo())
+        followTestBranch();
     logger.info('[Updater] autoUpdater 配置完成');
+}
+let defaultUpdateSupported;
+/**
+ * 普通 test 包只接受目标分支（默认是安装包分支）里开始得更晚的构建。两台 Jenkins 和个人任务的
+ * 构建号互不可比，最新构建的版本号可能更小，因此允许“降级”。切换分支时接受目标分支的最新构建。
+ * 非 feat 分支或没有有效分支身份的 test 包继续使用原有共享 feed 和版本比较规则。
+ */
+export function followTestBranch(switchToBranchKey) {
+    const installed = getTestBuildInfo();
+    if (!installed)
+        return;
+    defaultUpdateSupported ?? (defaultUpdateSupported = autoUpdater.isUpdateSupported);
+    const supported = defaultUpdateSupported;
+    autoUpdater.allowDowngrade = true;
+    autoUpdater.isUpdateSupported = (info) => {
+        const candidate = readTestBuild(info);
+        if (!installed || !candidate || candidate.locale !== installed.locale)
+            return false;
+        const accepted = switchToBranchKey
+            ? candidate.branchKey === switchToBranchKey
+            : candidate.branchKey === installed.branchKey && isNewerTestBuild(candidate, installed);
+        return accepted && supported(info);
+    };
+}
+/** Developer Tools 切换分支：临时读取目标分支的指针；取消或失败后由 configureAutoUpdater 恢复。 */
+export function switchTestBranchFeed(branchKey) {
+    const installed = getTestBuildInfo();
+    if (!installed)
+        throw new Error('TEST_BRANCH_UNAVAILABLE');
+    autoUpdater.setFeedURL({
+        provider: 'generic',
+        url: testBranchFeedUrl(installed.locale, branchKey),
+        useMultipleRangeRequest: false,
+    });
+    followTestBranch(branchKey);
 }

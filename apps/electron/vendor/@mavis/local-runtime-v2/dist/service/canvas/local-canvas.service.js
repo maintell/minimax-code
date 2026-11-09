@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { copyFile, lstat, mkdir, realpath, rename, rm, stat } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { copyFile, lstat, mkdir, mkdtemp, realpath, rename, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { decodeSessionDeliverableCanvasReference, getCanvasAssetRelativePath, } from '@mavis/shared/asset-markup';
 import { supportsCanvasImageAnnotation } from '@mavis/shared/media-asset-meta';
 import { and, eq } from 'drizzle-orm';
 import { canvasAssetReferences, canvasDocuments, canvasOperations, } from '../../infra/db/schema/canvas.js';
 import { CanvasServiceError, } from './contracts.js';
+import { canvasImageBackgroundOutputName, canvasImageEnhanceOutputName, canvasImageEnhanceResultMimeType, requireSupportedCanvasImage, } from './image-tools.js';
 export class LocalCanvasService {
     options;
     nowMs;
@@ -56,6 +58,81 @@ export class LocalCanvasService {
             const operation = await validateFileReferences(context, input.operation, this.options.assets);
             return this.applySerialized(context, operation, fingerprint);
         });
+    }
+    async removeImageBackground(input) {
+        return this.runImageTool(input, {
+            tool: 'removeBackground',
+            generatedBy: 'canvas-remove-background',
+            saveFailedMessage: 'Background removal result could not be saved',
+            output: ({ node }) => ({
+                fileName: canvasImageBackgroundOutputName(node),
+                mimeType: 'image/png',
+            }),
+        });
+    }
+    async enhanceImage(input) {
+        return this.runImageTool(input, {
+            tool: 'enhance',
+            generatedBy: 'canvas-enhance-image',
+            saveFailedMessage: 'Enhanced image could not be saved',
+            output: ({ node, mimeType: sourceMimeType }, result) => {
+                const mimeType = canvasImageEnhanceResultMimeType(result.mimeType, sourceMimeType);
+                return { fileName: canvasImageEnhanceOutputName(node, mimeType), mimeType };
+            },
+        });
+    }
+    /**
+     * Shared flow of the Canvas cloud image tools: resolve the node's file under the Session
+     * queue, run the slow cloud call outside it (asset bytes are immutable, so a concurrent
+     * remove_node cannot corrupt it), then register the result as a new Session asset back
+     * under the queue. The original node and file stay untouched.
+     */
+    async runImageTool(input, spec) {
+        const context = await this.resolveContext(input.sessionId);
+        const source = await this.enqueue(context.sessionId, () => resolveImageSource(context, this.options, input.nodeId, spec.tool));
+        const workDir = await mkdtemp(join(tmpdir(), 'mavis-canvas-image-'));
+        try {
+            const outputPath = join(workDir, 'result');
+            const result = await this.options.imageTools[spec.tool]({
+                sourcePath: source.path,
+                fileName: source.fileName,
+                mimeType: source.mimeType,
+                outputPath,
+                ...(input.signal ? { signal: input.signal } : {}),
+            });
+            const output = spec.output(source, result);
+            const file = await this.enqueue(context.sessionId, async () => {
+                let asset;
+                try {
+                    asset = await this.options.assets.importGenerated({
+                        sessionId: context.sessionId,
+                        path: outputPath,
+                        fileName: output.fileName,
+                        mimeType: output.mimeType,
+                        generatedBy: spec.generatedBy,
+                    });
+                }
+                catch (error) {
+                    throw new CanvasServiceError('PERSISTENCE_FAILED', spec.saveFailedMessage, {
+                        cause: errorMessage(error),
+                    });
+                }
+                return materializePreparedCanvasFile(context.workspaceDir, asset.assetId, asset.assetId, asset);
+            });
+            return {
+                file,
+                ...(result.width !== undefined ? { width: result.width } : {}),
+                ...(result.height !== undefined ? { height: result.height } : {}),
+            };
+        }
+        finally {
+            try {
+                await rm(workDir, { recursive: true, force: true });
+            }
+            catch {
+                // Temp cleanup is best-effort; the OS reclaims tmpdir on its own.
+            }
+        }
     }
     async deleteSession(sessionId) {
         await this.enqueue(sessionId, () => {
@@ -149,6 +226,34 @@ export class LocalCanvasService {
                 this.sessionQueues.delete(sessionId);
         }
     }
+}
+async function resolveImageSource(context, { db, assets }, nodeId, tool) {
+    const node = readDocument(db, context)?.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node)
+        throw new CanvasServiceError('NODE_NOT_FOUND', 'Canvas node not found');
+    let path;
+    if (node.file.assetId) {
+        const asset = await assets.resolve({
+            sessionId: context.sessionId,
+            assetId: node.file.assetId,
+        });
+        if (!asset)
+            throw invalidFileReference(node.file.assetId);
+        path = await resolveCanonicalFile(asset.absolutePath, node.file.assetId);
+    }
+    else {
+        const reference = node.file.relativePath;
+        path = await resolveCanonicalFile(resolve(context.workspaceDir, reference), reference);
+        if (!workspaceRelativePath(context.workspaceDir, path))
+            throw invalidFileReference(reference);
+    }
+    const mimeType = requireSupportedCanvasImage(tool, node, (await stat(path)).size);
+    return {
+        node,
+        path,
+        fileName: node.file.fileName ?? basename(node.file.relativePath),
+        mimeType,
+    };
 }
 async function prepareCanvasFile(context, target, assets) {
     requireCanvasFileTargetId(target.id);

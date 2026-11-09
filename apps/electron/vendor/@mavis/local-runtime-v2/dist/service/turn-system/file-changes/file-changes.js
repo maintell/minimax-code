@@ -4,6 +4,7 @@ import path from 'node:path';
 import { TextDecoder } from 'node:util';
 import { structuredPatch } from 'diff';
 import { BRAND } from '@mavis/config';
+import { collectMediaOutputPaths } from './media-output-paths.js';
 const MAX_TEXT_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 const MAX_CAPTURE_PATHS_PER_TOOL = 64;
 const MAX_CAPTURE_TOTAL_TEXT_BYTES = MAX_TEXT_SNAPSHOT_BYTES * 2;
@@ -335,6 +336,12 @@ function toCaptureToolUseInput(hookInput, toolArgs) {
 function extractToolWritePaths(workspaceDir, toolName, toolArgs) {
     const normalizedToolName = toolName.toLowerCase().replaceAll('-', '_');
     const paths = new Set();
+    // Media generators write through their declared output paths rather than the
+    // Write/Shell tools. Capture both sides so new downloads and overwrites remain
+    // distinguishable in the ordinary Turn diff, including asynchronous video queries.
+    if (/(?:^|__)(?:image_synthesize|gen_videos|query_video_generation|batch_text_to_video|batch_image_to_video)$/u.test(normalizedToolName)) {
+        return extractMediaOutputPaths(workspaceDir, toolArgs);
+    }
     if (STRUCTURED_WRITE_TOOLS.has(normalizedToolName)) {
         const primaryPath = getStringArg(toolArgs, ['file_path', 'filePath', 'path']);
         const patch = getStringArg(toolArgs, ['patch', 'input', '_raw']);
@@ -361,6 +368,14 @@ function extractToolWritePaths(workspaceDir, toolName, toolArgs) {
         };
     }
     return ambiguous ? { kind: 'ambiguous', reason: 'shell_target_ambiguous' } : { kind: 'ignore' };
+}
+function extractMediaOutputPaths(workspaceDir, toolArgs) {
+    const paths = new Set();
+    collectCapturePaths(workspaceDir, collectMediaOutputPaths(toolArgs, MAX_CAPTURE_PATHS_PER_TOOL), paths);
+    // Matrix output admission is workspace-scoped. Do not inspect outside paths
+    // which the generator itself would reject before downloading anything.
+    const scoped = [...paths].filter((file) => !path.isAbsolute(file) && !path.win32.isAbsolute(file));
+    return scoped.length > 0 ? { kind: 'paths', paths: scoped.sort() } : { kind: 'ignore' };
 }
 function extractFinishedCapturePaths(workspaceDir, input) {
     const extracted = extractToolWritePaths(workspaceDir, input.toolName, input.toolArgs);

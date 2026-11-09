@@ -189,7 +189,7 @@ async function modelBeforeDispatch(options, sessionId) {
         }));
 }
 /** Walks delegated child sessions up to the Mini App session that owns them (bounded, cycle-safe). */
-async function resolveMiniAppRoot(options, sessionId) {
+export async function resolveMiniAppRoot(options, sessionId) {
     const seen = new Set();
     let current = sessionId;
     while (current) {

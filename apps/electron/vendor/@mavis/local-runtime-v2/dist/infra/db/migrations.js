@@ -50,6 +50,7 @@ import { migration as m0048 } from './migrations/goal/migration-0048-add-goal-to
 import { migration as m0052 } from './migrations/goal/migration-0052-add-goal-request-and-time-limits.js';
 import { migration as m0049 } from './migrations/background-task/migration-0049-adopt-background-tasks.js';
 import { migration as m0053 } from './migrations/session/migration-0053-add-project-display-name.js';
+import { migration as m0054 } from './migrations/runtime/migration-0054-create-ppt-preview.js';
 export const ALL_MIGRATIONS = [
     m0001,
     m0002,
@@ -103,5 +104,6 @@ export const ALL_MIGRATIONS = [
     m0051,
     m0052,
     m0053,
+    m0054,
 ];
 //# sourceMappingURL=migrations.js.map

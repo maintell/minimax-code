@@ -4,6 +4,13 @@ import { DesktopModelProviderServiceBase } from './desktop-model-provider-servic
 const LOCAL_RUNTIME_ORIGIN = 'http://local-runtime.test';
 /** Thin DesktopService adapter over the existing /mavis/api/file and /fs facades. */
 export class DesktopWorkspaceFileServiceBase extends DesktopModelProviderServiceBase {
+    async watchWorkspaceFiles(_ctx, _req) {
+        return {
+            ok: false,
+            status: 501,
+            body: { code: 501, key: 'NOT_IMPLEMENTED', message: 'File watching requires Runtime V2.' },
+        };
+    }
     async getWorkspaceFileMetadata(_ctx, _req) {
         throw new HTTPException(501, { message: 'Workspace file metadata requires Runtime V2.' });
     }

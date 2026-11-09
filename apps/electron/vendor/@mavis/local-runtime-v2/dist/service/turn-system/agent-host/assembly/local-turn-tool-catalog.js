@@ -157,13 +157,12 @@ export function buildLocalTurnToolCatalog(input) {
         });
     }
     const desktopCapabilities = inventory.desktopCapabilities;
-    const effectivePluginSkills = filterExtensionSkills(input.effectivePluginSkills ?? [], inventory.selector);
     const merged = mergeAgentHostTurnCapabilities({
         tools,
         mcpEntries,
         model,
         options,
-        effectivePluginSkills,
+        effectivePluginSkills: input.effectivePluginSkills ?? [],
         surface: input.agentProfile?.surface ?? 'interactive',
         ...(input.hostCapabilityRegistry
             ? { hostCapabilityRegistry: input.hostCapabilityRegistry }
@@ -513,8 +512,6 @@ export function createLocalAgentCapabilitySelector(selection, toolsAllowlistScop
         (allowlistIsNative && (options?.pluginTool === true || isAgentSelectorMcpToolName(name)));
     const blockedTools = normalizeSelector(selection?.disallowedTools) ?? new Set();
     const allowedMcpServers = normalizeSelector(selection?.mcpServers);
-    const allowedSkills = normalizeSelector(selection?.skills);
-    const allowedExtensionSkills = normalizeSelector(selection?.extensionSkills);
     return {
         allowsTool(name, hostAlias, options) {
             const names = [
@@ -531,16 +528,6 @@ export function createLocalAgentCapabilitySelector(selection, toolsAllowlistScop
             if (!allowedMcpServers)
                 return true;
             return serverName ? allowedMcpServers.has(normalizedSelectorName(serverName)) : false;
-        },
-        allowsSkill(name) {
-            return !allowedSkills || allowedSkills.has(normalizedSelectorName(name));
-        },
-        allowsExtensionSkill(pluginName, name) {
-            if (!allowedExtensionSkills)
-                return true;
-            const normalizedName = normalizedSelectorName(name);
-            return (allowedExtensionSkills.has(normalizedName) ||
-                allowedExtensionSkills.has(`${normalizedSelectorName(pluginName)}:${normalizedName}`));
         },
     };
 }
@@ -578,9 +565,6 @@ function filterDesktopCapabilities(capabilities, keep) {
             return keep(tool, 'configured', { pluginTool: true });
         }),
     };
-}
-function filterExtensionSkills(skills, selector) {
-    return skills.filter((skill) => selector.allowsExtensionSkill(skill.pluginName, skill.name));
 }
 /**
  * SessionSend is a sub-command of the composite `mavis` Tool, so it cannot be

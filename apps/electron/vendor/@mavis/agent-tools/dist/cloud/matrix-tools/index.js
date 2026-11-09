@@ -37,7 +37,7 @@ import { MatrixWebSearchTool } from './tools/web-search.js';
 export { callMatrixTool, callMatrixToolRaw, } from './client.js';
 export * from './tool-defs.js';
 export { inferAigcMimeType, registerAigcIfPresent } from './aigc-helpers.js';
-export { MatrixMediaError, readMatrixMediaErrorKind } from './types.js';
+export { MatrixAuthRequiredError, MatrixMediaError, readMatrixAuthRequiredReason, readMatrixGatewayBackend, readMatrixMediaErrorKind, } from './types.js';
 export { workspaceRootOf } from './path-guard.js';
 export { FileTransferError, fileTransferFailureResult, uploadInputFile, uploadInputFiles, uploadedInputFileToMediaInfo, requireUploadedInputFileUrl, downloadOutputFile, writeOutputText, } from './file-transfer.js';
 export { MatrixAudiosUnderstandTool } from './tools/audios-understand.js';

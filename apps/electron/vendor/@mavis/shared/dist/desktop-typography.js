@@ -47,6 +47,13 @@ const DESKTOP_PAGE_HERO_PRESET_DEFINITIONS = {
     large: [30, 37.5],
     extraLarge: [32, 40],
 };
+/** Figma 1027:7013 text insertion previews; product controls still use UI roles. */
+const DESKTOP_PPT_TEXT_PREVIEW_SIZES = {
+    small: [10, 24, 14, 17, 14, 11],
+    standard: [11, 28, 16, 20, 16, 13],
+    large: [12, 30, 17, 21, 17, 14],
+    extraLarge: [13, 32, 18, 22, 18, 15],
+};
 /** Exact values published by the MCode Desktop typography variable collection. */
 export const DESKTOP_TYPOGRAPHY_UI_PRESET_DEFINITIONS = {
     small: {
@@ -223,7 +230,16 @@ export function getDesktopTypographyTextStyles(value) {
         ...base,
         fontWeight,
     });
+    const pptTextSizes = DESKTOP_PPT_TEXT_PREVIEW_SIZES[scene.preset.ui];
     return {
+        'ppt-insert-menu-item': style(pptTextSizes[0], pptTextSizes[0] * 1.5, scene.weights.normal),
+        'ppt-insert-menu-heading': style(scene.ui.assist.fontSize, scene.ui.assist.fontSize * 1.25, scene.weights.normal),
+        'ppt-text-body': style(pptTextSizes[0], pptTextSizes[0] * 1.5, scene.weights.normal),
+        'ppt-text-title': style(pptTextSizes[1], pptTextSizes[1] * 1.2, scene.weights.normal),
+        'ppt-text-subtitle': style(pptTextSizes[2], pptTextSizes[2] * 1.3, scene.weights.normal),
+        'ppt-text-heading-1': style(pptTextSizes[3], pptTextSizes[3] * 1.3, scene.weights.medium),
+        'ppt-text-heading-2': style(pptTextSizes[4], pptTextSizes[4] * 1.3, scene.weights.medium),
+        'ppt-text-heading-3': style(pptTextSizes[5], pptTextSizes[5] * 1.3, scene.weights.medium),
         'brand-slogan': DESKTOP_BRAND_SLOGAN_STYLE,
         'composer-disclaimer': DESKTOP_COMPOSER_DISCLAIMER_STYLE,
         'page-hero': scene.ui.heroTitle,

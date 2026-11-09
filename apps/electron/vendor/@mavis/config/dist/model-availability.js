@@ -61,7 +61,7 @@ export function listRouteModelIds(config, providerId, _preset) {
         }
         case 'custom_provider': {
             const provider = config.custom_provider?.[providerId.slice(CUSTOM_PROVIDER_ID_PREFIX.length)];
-            if (!provider || provider.enabled === false)
+            if (!provider || provider.enabled === false || provider.withdrawn === true)
                 return [];
             return configuredModelIds(provider);
         }
@@ -112,6 +112,9 @@ export function deliveredDefaultModelId(provider) {
  * - Official route, no longer listed → the first callable `fallbacks` entry
  *   (caller priority, e.g. Session model then Runtime default), else the
  *   delivered default on the same provider id → `replaced`.
+ * - Withdrawn agent model access provider → the first callable `fallbacks`
+ *   entry, else the delivered default of the built-in MiniMax provider →
+ *   `replaced` with cause `unavailable`.
  * - Any other route, or an official route that lists nothing → `passthrough`:
  *   the reference is sent unchanged and the upstream decides.
  *
@@ -123,8 +126,10 @@ export function resolveModelReplacement(input) {
     if (listRouteModelIds(input.config, input.providerId, input.preset).includes(modelId)) {
         return { kind: 'available', route };
     }
-    if (!isOfficialCatalogRoute(route))
+    const withdrawn = isWithdrawnProvider(input.config, input.providerId);
+    if (!withdrawn && !isOfficialCatalogRoute(route))
         return { kind: 'passthrough', route, reason: 'unmanaged_route' };
+    const cause = withdrawn ? 'unavailable' : 'retired';
     const fallback = input.fallbacks?.find((candidate) => candidate !== undefined &&
         !(candidate.providerId === input.providerId && candidate.modelId.trim() === modelId) &&
         listRouteModelIds(input.config, candidate.providerId, input.preset).includes(candidate.modelId.trim()));
@@ -133,18 +138,27 @@ export function resolveModelReplacement(input) {
             kind: 'replaced',
             route,
             tier: 'fallback',
+            cause,
             model: { providerId: fallback.providerId, modelId: fallback.modelId.trim() },
         };
     }
-    const deliveredDefault = deliveredDefaultModelId(officialCatalogView(input.config, input.providerId));
+    // A withdrawn provider has no official catalog of its own: use the built-in one.
+    const officialProviderId = withdrawn ? MANAGED_MINIMAX_PROVIDER_ID : input.providerId;
+    const deliveredDefault = deliveredDefaultModelId(officialCatalogView(input.config, officialProviderId));
     if (!deliveredDefault)
         return { kind: 'passthrough', route, reason: 'no_official_model' };
     return {
         kind: 'replaced',
         route,
         tier: 'delivered_default',
-        model: { providerId: input.providerId, modelId: deliveredDefault },
+        cause,
+        model: { providerId: officialProviderId, modelId: deliveredDefault },
     };
+}
+function isWithdrawnProvider(config, providerId) {
+    if (!providerId.startsWith(CUSTOM_PROVIDER_ID_PREFIX))
+        return false;
+    return (config.custom_provider?.[providerId.slice(CUSTOM_PROVIDER_ID_PREFIX.length)]?.withdrawn === true);
 }
 /** The provider view whose models/order define an official route's catalog. */
 function officialCatalogView(config, providerId) {

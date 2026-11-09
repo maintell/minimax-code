@@ -87,7 +87,10 @@ export class ComputerUsePermissionGuide {
                 ? { screenRecording: getScreenPermissionStatus(), accessibility: 'granted' }
                 : await getComputerUsePermissionStatus();
             const value = kind === 'accessibility' ? status.accessibility : status.screenRecording;
-            return value === 'granted' || value === 'not-required' || value === 'restricted';
+            return (value === 'granted' ||
+                value === 'not-required' ||
+                value === 'restricted' ||
+                value === 'unavailable');
         };
         if ((await granted()) || revision !== this.revision)
             return;

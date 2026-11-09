@@ -114,6 +114,31 @@ export async function stopComputerUseUtility() {
     if (!exited)
         logger.warn(`[CuaUtility] shutdown still draining after ${CUA_SHUTDOWN_WAIT_MS}ms; continuing host stop`);
 }
+/** Keeps startup reclaim off the first-window critical path. */
+const CUA_STARTUP_RECLAIM_DELAY_MS = 5000;
+let cuaStartupReclaimScheduled = false;
+/**
+ * Reclaims profile daemons left by hosts that exited without stopping them, so a user who
+ * never opens Computer Use again still gets them cleaned up. Runs once, in the background.
+ */
+export function scheduleComputerUseDaemonReclaim() {
+    if (cuaStartupReclaimScheduled)
+        return;
+    cuaStartupReclaimScheduled = true;
+    const dataDir = process.env.MINIMAX_DATA_DIR;
+    if (!dataDir || !path.isAbsolute(dataDir))
+        return;
+    setTimeout(() => {
+        void import('@mavis/computer-use').then(({ reclaimProfileDaemons }) => reclaimProfileDaemons(dataDir))
+            .then((summary) => {
+            if (summary.stopped || summary.removed || summary.failed)
+                logger.info('[CuaUtility] startup daemon reclaim', { ...summary });
+        })
+            .catch((error) => logger.warn('[CuaUtility] startup daemon reclaim failed', {
+            errorCode: error.code ?? 'unknown',
+        }));
+    }, CUA_STARTUP_RECLAIM_DELAY_MS).unref();
+}
 function clearCuaUtilityState() {
     windowHandoff.clear();
     clearCuaPreviewTargets();

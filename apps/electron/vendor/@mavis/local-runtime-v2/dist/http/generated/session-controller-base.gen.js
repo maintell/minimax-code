@@ -165,6 +165,11 @@ export class SessionControllerBase {
         void req;
         throw new NotImplementedError('steerSession');
     }
+    async sendRemoteMessage(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('sendRemoteMessage');
+    }
     async listQueueMessages(ctx, req) {
         void ctx;
         void req;

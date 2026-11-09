@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TextDecoder } from "node:util";
+import { createShellOutputDecoder } from "./shell-encoding.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead, truncateTail } from "./truncate.js";
 function defaultTempFilePath(prefix) {
     const id = randomBytes(8).toString("hex");
@@ -14,7 +14,8 @@ function byteLength(text) {
 /**
  * Incrementally tracks streaming output with bounded memory.
  *
- * Appends decode chunks with a streaming UTF-8 decoder, keeps only a decoded
+ * Appends decode chunks with a streaming shell output decoder (UTF-8, with the
+ * Windows ANSI code page as fallback for non-UTF-8 lines), keeps only a decoded
  * tail for display snapshots, and opens a temp file when the full output needs
  * to be preserved.
  */
@@ -29,6 +30,7 @@ export class OutputAccumulator {
     strategy;
     persistOutput;
     decoders = new Map();
+    fallbackEncoding;
     decodedChunks = [];
     tailText = "";
     headText = "";
@@ -55,6 +57,7 @@ export class OutputAccumulator {
         this.persistOutput = options.persistOutput !== false;
         this.maxTotalBytes = options.maxTotalBytes ?? Number.POSITIVE_INFINITY;
         this.maxPendingBytes = options.maxPendingBytes ?? Number.POSITIVE_INFINITY;
+        this.fallbackEncoding = options.fallbackEncoding;
     }
     append(data, stream = "combined") {
         if (this.finished) {
@@ -65,10 +68,26 @@ export class OutputAccumulator {
             return;
         let decoder = this.decoders.get(stream);
         if (!decoder) {
-            decoder = new TextDecoder();
+            decoder = createShellOutputDecoder({ fallbackEncoding: this.fallbackEncoding });
             this.decoders.set(stream, decoder);
         }
-        this.appendDecodedChunk(decoder.decode(data, { stream: true }));
+        let text = decoder.write(data);
+        // Decoders may hold an unfinished line until they can tell UTF-8 from the
+        // code page. A held byte never decodes to fewer output bytes, so once the
+        // held bytes would exceed the limits, flush them (earlier streams first) to
+        // stop the command instead of buffering an unterminated line.
+        let held = 0;
+        for (const other of this.decoders.values())
+            held += other.pendingBytes;
+        if (held > 0 && byteLength(text) + held > this.availableBytes()) {
+            for (const [key, other] of this.decoders) {
+                if (key !== stream && other.pendingBytes > 0)
+                    this.appendDecodedChunk(other.end());
+            }
+            if (decoder.pendingBytes > 0)
+                text += decoder.end();
+        }
+        this.appendDecodedChunk(text);
     }
     finish() {
         if (this.finished) {
@@ -76,7 +95,7 @@ export class OutputAccumulator {
         }
         this.finished = true;
         for (const decoder of this.decoders.values()) {
-            this.appendDecodedChunk(decoder.decode());
+            this.appendDecodedChunk(decoder.end());
         }
         if (this.shouldUseTempFile()) {
             this.ensureTempFile();
@@ -179,14 +198,18 @@ export class OutputAccumulator {
         }
         this.totalLines = this.completedLines + (this.hasOpenLine ? 1 : 0);
     }
+    availableBytes() {
+        const remaining = Math.max(0, this.maxTotalBytes - this.totalDecodedBytes);
+        const pending = this.tempFileStream?.writableLength ?? this.decodedChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        return this.persistOutput && !this.tempFileError
+            ? Math.min(remaining, Math.max(0, this.maxPendingBytes - pending))
+            : remaining;
+    }
     appendDecodedChunk(text) {
         if (this.limitExceeded)
             return;
         const remaining = Math.max(0, this.maxTotalBytes - this.totalDecodedBytes);
-        const pending = this.tempFileStream?.writableLength ?? this.decodedChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-        const available = this.persistOutput && !this.tempFileError
-            ? Math.min(remaining, Math.max(0, this.maxPendingBytes - pending))
-            : remaining;
+        const available = this.availableBytes();
         if (byteLength(text) > available) {
             this.limitExceeded = available < remaining
                 ? { kind: "buffer", limitBytes: this.maxPendingBytes }

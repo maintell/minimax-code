@@ -4,6 +4,7 @@ import { SkillEvolveController, } from './skill-evolve.controller.js';
 import { SandboxControllerBase } from '../generated/sandbox-controller-base.gen.js';
 import { ShareControllerBase } from '../generated/share-controller-base.gen.js';
 import { AgentShellControllerBase } from '../generated/agent-shell-controller-base.gen.js';
+import { MiniAppLaunchpadControllerBase } from '../generated/mini-app-launchpad-controller-base.gen.js';
 import { WebsiteControllerBase } from '../generated/website-controller-base.gen.js';
 import { LlmContextInspectorController } from './llm-context-inspector.controller.js';
 import { agentController, createAgentController } from './agent.controller.js';
@@ -30,6 +31,7 @@ import { SessionDispatchController } from './session-dispatch.controller.js';
 import { SkillController, skillController, } from './skill.controller.js';
 import { createWorkspaceFileController, workspaceFileController, } from './workspace-file.controller.js';
 import { WorkspaceIndexingController } from './workspace-indexing.controller.js';
+import { ModelAccessController } from './model-access.controller.js';
 const CLOSED_GLOBAL_EVENTS = {
     subscribe: (subscriber) => {
         subscriber.complete?.();
@@ -47,6 +49,9 @@ const shareController = new ShareControllerBase();
 export function createControllers(services) {
     return {
         demo: demoController,
+        modelAccess: new ModelAccessController(services.modelAccessApplication),
+        // Contract only: v2 does not mount these routes, so v1 answers 501 until Mini App Pad lands.
+        miniAppLaunchpad: new MiniAppLaunchpadControllerBase(),
         agentShell: services.agentShell
             ? new AgentShellController(services.agentShell)
             : new AgentShellControllerBase(),
@@ -54,7 +59,7 @@ export function createControllers(services) {
         events: createEventsController(services.globalEvents ?? CLOSED_GLOBAL_EVENTS),
         plugin: createPluginAdapter(services),
         share: shareController,
-        mcp: createMcpController(services.mcp, services.mcpRuntime),
+        mcp: createMcpController(services.mcp, services.mcpRuntime, services.mcpAuth),
         hook: createHookController(services.hookConfig),
         modelProvider: createModelProviderAdapter(services),
         agent: createAgentAdapter(services),
@@ -170,6 +175,7 @@ function createSessionAdapter(services) {
         ...(services.cronDelivery ? { cronDelivery: services.cronDelivery } : {}),
         ...(services.conversation ? { conversation: services.conversation } : {}),
         ...(services.sessionActivity ? { sessionActivity: services.sessionActivity } : {}),
+        ...(services.remoteMessage ? { remoteMessage: services.remoteMessage } : {}),
     });
 }
 //# sourceMappingURL=create.js.map

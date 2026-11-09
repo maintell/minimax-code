@@ -2,6 +2,7 @@ import { Agent } from '@earendil-works/pi-agent-core';
 import { projectAgentMessagesForModel } from './outbound-message-normalizer.js';
 import { resolveMaxImagesPerRequest } from './request-image-limit.js';
 import { failureReason } from './terminal.js';
+import { stripVideoAudioForModel } from './video-audio-strip.js';
 import { newRuntimeTool } from './tools.js';
 export function toPiUserMessage(input) {
     const message = {
@@ -32,7 +33,7 @@ export function newAgent(turn) {
             tools: turn.tools,
             messages: turn.initialMessages,
         },
-        convertToLlm: (messages) => {
+        convertToLlm: async (messages) => {
             const outbound = projectAgentMessagesForModel(messages, turn.llm.model);
             if (outbound.removedCount > 0) {
                 turn.logger.warn({
@@ -69,7 +70,20 @@ export function newAgent(turn) {
                     max_images_per_request: resolveMaxImagesPerRequest(turn.llm.model),
                 }, '[pi-turn-runner] replaced older provider-bound images with placeholders');
             }
-            return outbound.messages;
+            const stripped = await stripVideoAudioForModel(outbound.messages, turn.llm.model);
+            if (stripped.strippedCount > 0 || Object.keys(stripped.keptMimeTypes).length > 0) {
+                // The model cannot hear audio, so only this request copy drops the
+                // soundtrack; history keeps the original video.
+                turn.logger.info({
+                    event: 'outbound_video_audio_stripped',
+                    session_id: turn.input.sessionId,
+                    turn_id: turn.input.turnId,
+                    provider: turn.llm.model.provider,
+                    stripped_video_count: stripped.strippedCount,
+                    kept_video_mime_types: stripped.keptMimeTypes,
+                }, '[pi-turn-runner] removed audio tracks from provider-bound videos');
+            }
+            return stripped.messages;
         },
         streamFn: turn.streamFn,
         getApiKey: (provider) => (provider === turn.llm.model.provider ? turn.llm.apiKey : undefined),

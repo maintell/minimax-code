@@ -1,5 +1,26 @@
 import { MINIAPP_STATE_TABLE_METADATA } from './schema/miniapp.js';
 export const EXPECTED_TABLES = {
+    local_runtime_ppt_preview_artifacts: [
+        'artifact_id',
+        'session_id',
+        'artifact_key',
+        'state_json',
+        'updated_at_ms',
+    ],
+    local_runtime_ppt_preview_requests: [
+        'session_id',
+        'request_id',
+        'fingerprint',
+        'result_json',
+        'created_at_ms',
+    ],
+    local_runtime_ppt_preview_events: [
+        'cursor',
+        'session_id',
+        'artifact_id',
+        'event_json',
+        'created_at_ms',
+    ],
     local_runtime_background_tasks: [
         'task_id',
         'owner_session_id',

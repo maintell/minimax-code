@@ -18,6 +18,7 @@ export function createLocalTurnToolCatalogInput(context, desktopCapabilities) {
         ...(modelCapabilities ? { modelCapabilities } : {}),
         ...(agentProfile ? { agentProfile } : {}),
         ...(desktopCapabilities ? { desktopCapabilities } : {}),
+        ...(context.history.length === 0 ? { sessionFirstTurn: true } : {}),
     };
 }
 function readEffectivePluginSkills(agentConfig) {
@@ -90,7 +91,6 @@ function readConfigSelection(profile) {
         ...optionalStringArray(source, 'disallowedTools'),
         ...optionalStringArray(source, 'mcpServers'),
         ...optionalStringArray(source, 'skills'),
-        ...optionalStringArray(source, 'extensionSkills'),
         ...frozenSelectorVersion(source.frozenSelectorVersion),
     };
     return Object.keys(selection).length > 0 ? selection : undefined;

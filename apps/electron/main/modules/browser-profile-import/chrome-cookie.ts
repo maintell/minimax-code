@@ -75,26 +75,45 @@ export function decryptMacChromeCookie(options) {
     const plaintext = Buffer.concat([decipher.update(encryptedValue.subarray(3)), decipher.final()]);
     return stripHostDigest(plaintext, hostKey, databaseVersion).toString('utf8');
 }
+/**
+ * 打开 Windows 侧 Chrome Cookie 的 AES-256-GCM 记录层。
+ *
+ * v10 / v11 / v20 的记录层布局完全相同：`prefix[3] + nonce[12] + ciphertext + tag[16]`。
+ * 唯一差别是 Key 的来源，因此三种版本共用本函数。
+ */
+function openAesGcmCookie(encryptedValue, key, hostKey, databaseVersion) {
+    if (key.length !== 32)
+        throw new Error('Chrome AES-GCM key is invalid');
+    if (encryptedValue.length < 3 + 12 + 16)
+        throw new Error('Invalid Chrome AES-GCM cookie');
+    const nonce = encryptedValue.subarray(3, 15);
+    const ciphertextAndTag = encryptedValue.subarray(15);
+    const ciphertext = ciphertextAndTag.subarray(0, -16);
+    const authTag = ciphertextAndTag.subarray(-16);
+    const decipher = createDecipheriv('aes-256-gcm', key, nonce);
+    decipher.setAuthTag(authTag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return stripHostDigest(plaintext, hostKey, databaseVersion).toString('utf8');
+}
 export async function decryptWindowsChromeCookie(options) {
-    const { encryptedValue, masterKey, hostKey, databaseVersion, dpapiUnprotect } = options;
+    const { encryptedValue, masterKey, appBoundKey, hostKey, databaseVersion, dpapiUnprotect } = options;
     const prefix = encryptedValue.subarray(0, 3).toString('ascii');
-    if (prefix === 'v20')
-        return { value: null, unsupported: true };
+    if (prefix === 'v20') {
+        // v20 与 v10/v11 的记录层格式一致（nonce[12] + ciphertext + tag[16]），
+        // 差别只在 Key 的来源：v10/v11 来自用户态 DPAPI，v20 来自 App-Bound Envelope。
+        if (!appBoundKey)
+            return { value: null, unsupported: true };
+        return {
+            value: openAesGcmCookie(encryptedValue, appBoundKey, hostKey, databaseVersion),
+            unsupported: false,
+        };
+    }
     if (prefix === 'v10' || prefix === 'v11') {
         if (!masterKey || masterKey.length !== 32) {
             throw new Error('Chrome AES-GCM master key is unavailable');
         }
-        if (encryptedValue.length < 3 + 12 + 16)
-            throw new Error('Invalid Chrome AES-GCM cookie');
-        const nonce = encryptedValue.subarray(3, 15);
-        const ciphertextAndTag = encryptedValue.subarray(15);
-        const ciphertext = ciphertextAndTag.subarray(0, -16);
-        const authTag = ciphertextAndTag.subarray(-16);
-        const decipher = createDecipheriv('aes-256-gcm', masterKey, nonce);
-        decipher.setAuthTag(authTag);
-        const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
         return {
-            value: stripHostDigest(plaintext, hostKey, databaseVersion).toString('utf8'),
+            value: openAesGcmCookie(encryptedValue, masterKey, hostKey, databaseVersion),
             unsupported: false,
         };
     }

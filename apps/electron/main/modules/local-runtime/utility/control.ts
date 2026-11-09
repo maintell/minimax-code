@@ -72,6 +72,7 @@ export function utilityBootstrapStageRank(stage) {
  * failure into a slower bootstrap-timeout recovery).
  */
 export let MAX_RUNTIME_INIT_FAILURE_DETAIL_LENGTH = 2048;
+export let BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH = 600;
 export let DIAGNOSTICS_BROKER_METHODS = ['uploadDiagnosticBundle'];
 function isRecord(value) {
     return typeof value === 'object' && value !== null;
@@ -216,26 +217,12 @@ function isUtilityToolResultCompactionConfig(value) {
     if (value === undefined)
         return true;
     if (!isRecord(value) ||
-        !hasOnlyKeys(value, [
-            'enabled',
-            'maxInlineBytes',
-            'mcpDetailsMaxInlineBytes',
-            'watermarkBytes',
-            'minSavingsBytes',
-            'minCandidateBytes',
-            'keepRecentRounds',
-            'checkpointSharedPrefix',
-        ])) {
+        !hasOnlyKeys(value, ['maxInlineBytes', 'mcpDetailsMaxInlineBytes', 'checkpointSharedPrefix'])) {
         return false;
     }
-    return ((value.enabled === undefined || typeof value.enabled === 'boolean') &&
-        (value.maxInlineBytes === undefined || isPositiveSafeInteger(value.maxInlineBytes)) &&
+    return ((value.maxInlineBytes === undefined || isPositiveSafeInteger(value.maxInlineBytes)) &&
         (value.mcpDetailsMaxInlineBytes === undefined ||
             isPositiveSafeInteger(value.mcpDetailsMaxInlineBytes)) &&
-        (value.watermarkBytes === undefined || isPositiveSafeInteger(value.watermarkBytes)) &&
-        (value.minSavingsBytes === undefined || isPositiveSafeInteger(value.minSavingsBytes)) &&
-        (value.minCandidateBytes === undefined || isPositiveSafeInteger(value.minCandidateBytes)) &&
-        (value.keepRecentRounds === undefined || isPositiveSafeInteger(value.keepRecentRounds)) &&
         (value.checkpointSharedPrefix === undefined ||
             typeof value.checkpointSharedPrefix === 'boolean'));
 }
@@ -323,6 +310,15 @@ export function isUtilityControlMessage(value) {
                 typeof value.sessionId === 'string' &&
                 value.sessionId.length > 0 &&
                 value.sessionId.length <= 512);
+        case 'runtime-workspace-snapshot-request':
+            return (hasMessageKeys(value, ['type', 'requestId', 'sessionId', 'outputDir']) &&
+                isSafeBrokerRequestId(value.requestId) &&
+                typeof value.sessionId === 'string' &&
+                value.sessionId.length > 0 &&
+                value.sessionId.length <= 512 &&
+                typeof value.outputDir === 'string' &&
+                value.outputDir.length > 0 &&
+                value.outputDir.length <= 4096);
         case 'runtime-port-connect':
         case 'runtime-port-disconnect':
             return (hasMessageKeys(value, ['type', 'connectionId']) && isSafeBrokerRequestId(value.connectionId));
@@ -395,7 +391,12 @@ export function isUtilityStatusMessage(value) {
             return (hasMessageKeys(value, ['type', 'requestId', 'report']) &&
                 isSafeBrokerRequestId(value.requestId) &&
                 isStrictStructuredCloneRecord(value.report));
+        case 'runtime-workspace-snapshot-result':
+            return (hasMessageKeys(value, ['type', 'requestId', 'snapshot']) &&
+                isSafeBrokerRequestId(value.requestId) &&
+                isStrictStructuredCloneRecord(value.snapshot));
         case 'runtime-session-report-error':
+        case 'runtime-workspace-snapshot-error':
             return (hasMessageKeys(value, ['type', 'requestId', 'message']) &&
                 isSafeBrokerRequestId(value.requestId) &&
                 typeof value.message === 'string' &&
@@ -524,6 +525,7 @@ const BROWSER_ERROR_CODES = new Set([
     'frame_coordinates_unavailable',
     'invalid_request',
     'invalid_result',
+    'miniapp_tab_asleep',
     'snapshot_continuation_mismatch',
     'snapshot_kind_mismatch',
     'stale_element_ref',
@@ -545,6 +547,7 @@ const BROWSER_ERROR_MESSAGES = {
     frame_coordinates_unavailable: 'FRAME_COORDINATES_UNAVAILABLE: Browser cannot safely address this frame by viewport coordinates; inspect the current page and choose a main-frame target',
     invalid_request: 'Invalid Browser broker request',
     invalid_result: 'Invalid Browser broker result',
+    miniapp_tab_asleep: 'MINIAPP_TAB_ASLEEP: The selected Mini App tab is asleep to save memory; reopen it with the miniapp tool before using Browser on it',
     snapshot_continuation_mismatch: 'SNAPSHOT_CONTINUATION_MISMATCH: Continue with the exact nextOffset returned by Browser',
     snapshot_kind_mismatch: 'SNAPSHOT_KIND_MISMATCH: Continue the observation with its original Browser action',
     stale_element_ref: 'STALE_ELEMENT_REF: Browser target expired; inspect the current page again',
@@ -553,11 +556,15 @@ const BROWSER_ERROR_MESSAGES = {
 export function isBrowserBrokerErrorMessage(value) {
     return (isRecord(value) &&
         value.type === 'browser-error' &&
-        hasMessageKeys(value, ['type', 'requestId', 'code', 'message'], ['label', 'timeoutMs']) &&
+        hasMessageKeys(value, ['type', 'requestId', 'code', 'message'], ['label', 'timeoutMs', 'detail']) &&
         isSafeBrokerRequestId(value.requestId) &&
         typeof value.code === 'string' &&
         BROWSER_ERROR_CODES.has(value.code) &&
         value.message === BROWSER_ERROR_MESSAGES[value.code] &&
+        (value.detail === undefined ||
+            (typeof value.detail === 'string' &&
+                value.detail.length > 0 &&
+                value.detail.length <= BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH)) &&
         (value.label === undefined ||
             (typeof value.label === 'string' && value.label.length > 0 && value.label.length <= 200)) &&
         (value.timeoutMs === undefined ||

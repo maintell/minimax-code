@@ -45,6 +45,32 @@ export class CanvasController extends CanvasControllerBase {
             throw mapCanvasError(error);
         }
     }
+    async removeCanvasImageBackground(ctx, req) {
+        return this.runImageTool(ctx, req, (service, input) => service.removeImageBackground(input));
+    }
+    async enhanceCanvasImage(ctx, req) {
+        return this.runImageTool(ctx, req, (service, input) => service.enhanceImage(input));
+    }
+    async runImageTool(ctx, req, invoke) {
+        if (!req.sessionId.trim() || !req.nodeId.trim()) {
+            throw invalidOperation('Canvas session id and node id are required');
+        }
+        try {
+            const result = await invoke(this.requireService(), {
+                sessionId: req.sessionId,
+                nodeId: req.nodeId,
+                ...(ctx.signal ? { signal: ctx.signal } : {}),
+            });
+            return {
+                file: { ...result.file },
+                ...(result.width !== undefined ? { width: result.width } : {}),
+                ...(result.height !== undefined ? { height: result.height } : {}),
+            };
+        }
+        catch (error) {
+            throw mapCanvasError(error);
+        }
+    }
     requireService() {
         if (!this.service)
             throw new NotImplementedError('canvas service');
@@ -251,5 +277,9 @@ const CANVAS_ERROR_STATUSES = {
     NODE_NOT_FOUND: 404,
     OPERATION_ID_REUSED: 409,
     PERSISTENCE_FAILED: 500,
+    UNSUPPORTED_MEDIA: 400,
+    AUTH_REQUIRED: 401,
+    PAYMENT_REQUIRED: 402,
+    UPSTREAM_FAILED: 502,
 };
 //# sourceMappingURL=canvas.controller.js.map

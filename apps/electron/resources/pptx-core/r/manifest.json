@@ -32,20 +32,20 @@
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.Importer.Wasm.73xzi6k66x.wasm",
-      "sha256": "sha256:437c13c08143da0f7f1085fee8f4e1d3d10ee932e655a31151c9c1038fb36f51",
+      "path": "_framework/Mavis.Pptx.Importer.Wasm.iafahvxj5x.wasm",
+      "sha256": "sha256:163792445c8cf45bb54c24a55513c6f7f68cf57730fd612c0e8dc6dee4b86d9a",
       "sizeBytes": 22805,
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.Importer.tedze088wg.wasm",
-      "sha256": "sha256:5b8395e4185a17a4e0f5da12afbc7fe53718d30230f532ad26669d778ef981c2",
-      "sizeBytes": 468757,
+      "path": "_framework/Mavis.Pptx.Importer.unuidrry0i.wasm",
+      "sha256": "sha256:ba145d04bea919ec6afa70b08dd611e5501459b2b6e8ac7255e193cc8711754d",
+      "sizeBytes": 469269,
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.SafeOpc.d0uyzqg6c1.wasm",
-      "sha256": "sha256:6df7b4261661002d55876e73a659dbf62026a91a6867d64daa633b90bda9fe74",
+      "path": "_framework/Mavis.Pptx.SafeOpc.ylxo34zdoy.wasm",
+      "sha256": "sha256:da5c1e78df867805b17540957b3c71e87d7a7fa021bed88f46da8576b7acf90f",
       "sizeBytes": 72981,
       "mimeType": "application/wasm"
     },
@@ -1089,7 +1089,7 @@
     },
     {
       "path": "_framework/dotnet.js",
-      "sha256": "sha256:979561b0f5719535d538358b5c7d1d2181fe1dc9b9b46c8623ba9e65eaac60d6",
+      "sha256": "sha256:9c786af969125cf61962d7c4273609734c3efbb4358d8d90003ce41fb0674396",
       "sizeBytes": 82393,
       "mimeType": "text/javascript"
     },
@@ -1125,8 +1125,8 @@
     },
     {
       "path": "font-pack.json",
-      "sha256": "sha256:0517d288f9407e02aff783d07b84868878a88694f00cb5b6f1a1a80669804a48",
-      "sizeBytes": 12788,
+      "sha256": "sha256:3cefab5e9a156871b4c26b13c3cd04a8c8c03f1d096ea653671438ee68c71eaa",
+      "sizeBytes": 16049,
       "mimeType": "application/json"
     },
     {
@@ -1256,6 +1256,18 @@
       "mimeType": "application/octet-stream"
     },
     {
+      "path": "fonts/NotoSerifCJK-OFL.txt",
+      "sha256": "sha256:6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "sizeBytes": 4301,
+      "mimeType": "application/octet-stream"
+    },
+    {
+      "path": "fonts/NotoSerifSC-VF.otf",
+      "sha256": "sha256:71b4d3ded2d90ff43bb75a4e48cdbe170f0b8d5486dc89ff87f2a1728b56da64",
+      "sizeBytes": 22613272,
+      "mimeType": "application/octet-stream"
+    },
+    {
       "path": "fonts/OFL.txt",
       "sha256": "sha256:1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9",
       "sizeBytes": 4388,
@@ -1292,6 +1304,36 @@
       "mimeType": "application/octet-stream"
     },
     {
+      "path": "fonts/Tinos-Bold.ttf",
+      "sha256": "sha256:393269dbab8899f938db19783eca5eac92eb431f7ae0ab45b8349ca895f1a06b",
+      "sizeBytes": 597880,
+      "mimeType": "application/octet-stream"
+    },
+    {
+      "path": "fonts/Tinos-BoldItalic.ttf",
+      "sha256": "sha256:a5de79f0fe863ea0954757acb3d47b3ccd0a930ce3dd5b97230cd3866790a06e",
+      "sizeBytes": 578976,
+      "mimeType": "application/octet-stream"
+    },
+    {
+      "path": "fonts/Tinos-Italic.ttf",
+      "sha256": "sha256:5942266ed398b155d7dc23e36833e7ec6be988f2439bdbeb8ef1bede808eaa91",
+      "sizeBytes": 565016,
+      "mimeType": "application/octet-stream"
+    },
+    {
+      "path": "fonts/Tinos-OFL.txt",
+      "sha256": "sha256:cb3382d4643e8b02c12e322c220a3c76a5020d667e4fd4e7c75e744cca6caa6b",
+      "sizeBytes": 4383,
+      "mimeType": "application/octet-stream"
+    },
+    {
+      "path": "fonts/Tinos-Regular.ttf",
+      "sha256": "sha256:60a0e8ef0c04dd5dd69ffe91025fa2ae5836cbd35600a82ba031977557e2cb61",
+      "sizeBytes": 521588,
+      "mimeType": "application/octet-stream"
+    },
+    {
       "path": "harfbuzz.wasm",
       "sha256": "sha256:66f25d50cdf9942366498d0504d13096d567946cb1f6b5af6cdd87f392be99da",
       "sizeBytes": 421964,
@@ -1299,16 +1341,16 @@
     },
     {
       "path": "pptx-core-host.js",
-      "sha256": "sha256:e784b463114c6a41a7980dc8803b474de5545f030539839c016f12af1a2cbdd8",
-      "sizeBytes": 1239492,
+      "sha256": "sha256:f0c72cb320279b2d3f1c50c930551951b850579574a3edce673b928e353260f5",
+      "sizeBytes": 1871893,
       "mimeType": "text/javascript"
     },
     {
       "path": "worker.js",
-      "sha256": "sha256:9c54526003dded022b55c47847fbc786533401e4d6be619e2b291244b44b7624",
-      "sizeBytes": 24933,
+      "sha256": "sha256:7e2e458c9ed8c4a03092861eb43063a311b04c151ce68eb2752901a55f859fb5",
+      "sizeBytes": 29751,
       "mimeType": "text/javascript"
     }
   ],
-  "runtimeHash": "sha256:bc78fa3f230ef88f04b4a189a557c7791f3ff4337d4b404d8ff4c7a5d445aa70"
+  "runtimeHash": "sha256:09c96900e144ea29daeda08e93896daabb1b2bb03233ab93871ee5431d7812bf"
 }

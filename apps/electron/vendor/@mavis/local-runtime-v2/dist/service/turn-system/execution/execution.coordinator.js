@@ -83,7 +83,13 @@ async function prepareTurnStart(options, turn, request) {
     });
     try {
         const guard = await Promise.race([
-            options.beforeStart({ input: request.input, sessionId: turn.sessionId, signal: turn.signal }),
+            options.beforeStart({
+                input: request.input,
+                sessionId: turn.sessionId,
+                turnId: turn.turnId,
+                source: request.provenance.source,
+                signal: turn.signal,
+            }),
             cancelled,
         ]);
         return guard ?? undefined;
@@ -109,17 +115,21 @@ async function runHost(options, turn, request, beforeCapabilityCapture) {
 }
 async function settleAgentTurn(options, turn, request, pending) {
     let outcome;
+    let settlementStarted = false;
     try {
         outcome = await pending;
     }
     catch (error) {
         outcome = { status: 'failed', error };
-        // Close admission cancellation before this terminal write; settleAndRelease
-        // repeats the idempotent call.
+        // Close admission cancellation before the failure projection.
         options.onBeginSettlement?.(turn.sessionId, turn.turnId);
+        settlementStarted = true;
         await projectPostHostFailure(options, turn, error);
     }
-    const settlementError = await settleAndRelease(options, {
+    const settlementOptions = settlementStarted
+        ? { ...options, onBeginSettlement: undefined }
+        : options;
+    const settlementError = await settleAndRelease(settlementOptions, {
         turn,
         outcome: outcome.status,
         controllerTurn: turn,

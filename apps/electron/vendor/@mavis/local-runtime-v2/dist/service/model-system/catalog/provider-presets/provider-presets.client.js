@@ -71,10 +71,14 @@ async function fetchModelsDevDescriptor(options) {
     }
     return { catalogUrl: catalogLocation.url, iconBaseUrl: iconLocation.url };
 }
-export async function fetchPinnedProviderIdsConfig(options) {
+/**
+ * Reads one Desktop `common_config` key (Apollo) and returns its raw value.
+ * Throws on HTTP or business failure; callers own parsing and fallback.
+ */
+export async function fetchCommonConfig(key, options = {}) {
     const origin = (options.originGetter ?? resolveCommonConfigOrigin)();
     const url = new URL(COMMON_CONFIG_PATH, origin);
-    url.searchParams.set('filter', PINNED_PROVIDER_IDS_CONFIG_KEY);
+    url.searchParams.set('filter', key);
     url.searchParams.set('client', 'desktop');
     const response = await (options.fetchImpl ?? fetch)(url, {
         headers: commonConfigRequestHeaders(options.previewSecret, options.lane),
@@ -85,7 +89,10 @@ export async function fetchPinnedProviderIdsConfig(options) {
     const body = await response.json();
     assertCommonConfigBusinessSuccess(body);
     const data = isRecord(body) && isRecord(body.data) ? body.data : undefined;
-    return data?.[PINNED_PROVIDER_IDS_CONFIG_KEY];
+    return data?.[key];
+}
+export async function fetchPinnedProviderIdsConfig(options) {
+    return fetchCommonConfig(PINNED_PROVIDER_IDS_CONFIG_KEY, options);
 }
 function resolveCommonConfigOrigin() {
     const minimax = DEFAULT_MODEL_PRESETS[getRuntimePresetKey()].provider.minimax;

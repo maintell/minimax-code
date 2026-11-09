@@ -65,4 +65,18 @@ function findPromptHeadings(lines) {
     }
     return headings;
 }
+export function runtimeFeatureScope(runtimeFacts, profile, hostFeatures) {
+    return {
+        ...(runtimeFacts.exposeComputerUseActive
+            ? { computerUseActive: runtimeFacts.computerUseActive }
+            : {}),
+        ...(hostFeatures.pptPreviewAvailable && profile?.surface === 'interactive'
+            ? { pptPreviewAvailable: true }
+            : {}),
+        ...(hostFeatures.miniappAvailable && profile?.surface === 'interactive'
+            ? { miniappAvailable: true }
+            : {}),
+        ...(profile?.surface ? { surface: profile.surface } : {}),
+    };
+}
 //# sourceMappingURL=runtime-prompt-rules.js.map

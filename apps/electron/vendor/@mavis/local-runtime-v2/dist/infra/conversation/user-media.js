@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { isSupportedNativeVideoMime, normaliseMultimodalMimeType, inferReadVideoMimeType, selectMultimodalAttachments, } from '@mavis/agent-tools';
+import { nativeAudioMimeForExtension, nativeMultimodalKindForMime, normaliseMultimodalMimeType, inferReadVideoMimeType, selectMultimodalAttachments, } from '@mavis/agent-tools';
 import { buildCompressedModelImageFromBuffer, buildPassthroughModelJpegFilePart, MODEL_IMAGE_MAX_BYTES, } from '../util/model-image-preprocess.js';
 import { normalizeSupportedNativeImageMime, resolveNativeImageMime } from './native-image-mime.js';
 const LOCAL_USER_IMAGE_MAX_BASE64_BODY_BYTES = 512 * 1024;
@@ -32,9 +32,9 @@ export async function loadUserMediaCandidatesForMessages(rawMessages, registered
                 media.push(image);
                 continue;
             }
-            const video = await loadUserVideo(attachment);
-            if (video)
-                media.push(video);
+            const fileMedia = await loadUserFileMedia(attachment);
+            if (fileMedia)
+                media.push(fileMedia);
         }
     }
     return media.length > 0 ? media : undefined;
@@ -178,9 +178,14 @@ function passthroughImageBytes(input) {
         ...(filePath ? { filePath } : {}),
     };
 }
-async function loadUserVideo(attachment) {
-    const mime = resolveNativeVideoMime(attachment);
-    if (!isSupportedNativeVideoMime(mime))
+/**
+ * Video, audio and PDF attachments are read from disk only when the selected
+ * model inlines them; here they are described by path and size.
+ */
+async function loadUserFileMedia(attachment) {
+    const mime = resolveNativeFileMediaMime(attachment);
+    const kind = nativeMultimodalKindForMime(mime);
+    if (kind !== 'video' && kind !== 'audio' && kind !== 'pdf')
         return undefined;
     if (!attachment.filePath)
         return undefined;
@@ -190,7 +195,7 @@ async function loadUserVideo(attachment) {
             return undefined;
         return {
             id: attachment.assetId ?? attachment.filePath,
-            kind: 'video',
+            kind,
             mime,
             sizeBytes: info.size,
             fileName: attachment.fileName || basename(attachment.filePath),
@@ -202,11 +207,31 @@ async function loadUserVideo(attachment) {
         return undefined;
     }
 }
-function resolveNativeVideoMime(attachment) {
+/** Explicit media MIME first; clients often send `application/octet-stream`, so fall back to the extension. */
+function resolveNativeFileMediaMime(attachment) {
     const explicitMime = normaliseMultimodalMimeType(attachment.mimeType);
-    if (isSupportedNativeVideoMime(explicitMime))
+    if (nativeMultimodalKindForMime(explicitMime))
         return explicitMime;
-    return normaliseMultimodalMimeType(inferReadVideoMimeType(attachment.fileName) || inferReadVideoMimeType(attachment.filePath));
+    for (const name of [attachment.fileName, attachment.filePath]) {
+        const mime = inferFileMediaMime(name);
+        if (mime)
+            return mime;
+    }
+    return explicitMime;
+}
+function inferFileMediaMime(name) {
+    if (!name)
+        return undefined;
+    const video = inferReadVideoMimeType(name);
+    if (video)
+        return normaliseMultimodalMimeType(video);
+    const dot = name.lastIndexOf('.');
+    if (dot < 0)
+        return undefined;
+    const extension = name.slice(dot + 1).toLowerCase();
+    if (extension === 'pdf')
+        return 'application/pdf';
+    return nativeAudioMimeForExtension(extension);
 }
 function mergeTransientImageAttachments(rawMessages, registeredMessages) {
     return registeredMessages.map((message, messageIndex) => {

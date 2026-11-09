@@ -125,6 +125,26 @@
 !macroend
 
 !macro customUnInstall
+  ; An auto-update runs the previous uninstaller before installing the new
+  ; version. Keep the broker service and protected files intact in that path.
+  ${IfNot} ${isUpdated}
+    ; extraResources copies the source resources directory under resources\resources.
+    ; APP_ARM64 only means the installer contains an ARM64 payload; a universal
+    ; installer also defines it on x64. afterPack keeps only the installed app
+    ; architecture, so select the helper that is actually present. This also
+    ; handles an x64-only package running under emulation on ARM64 Windows.
+    StrCpy $R8 "$INSTDIR\resources\resources\abe-broker\win32-x64\MiniMax Code.exe"
+    IfFileExists "$R8" abeBrokerCleanupRun 0
+    StrCpy $R8 "$INSTDIR\resources\resources\abe-broker\win32-arm64\MiniMax Code.exe"
+    IfFileExists "$R8" 0 abeBrokerCleanupDone
+    abeBrokerCleanupRun:
+    nsExec::ExecToLog '"$R8" --uninstall'
+    Pop $R9
+    StrCmp $R9 "0" abeBrokerCleanupDone
+    !insertmacro customInstallerLog "ABE broker cleanup pending (result: $R9); continuing desktop app uninstall."
+    abeBrokerCleanupDone:
+  ${EndIf}
+
   !insertmacro MCodeUnregisterFileTypes
   ; Remove sentinel files (current .minimax plus legacy compatibility path)
   Delete "$PROFILE\.minimax\.electron-installed"

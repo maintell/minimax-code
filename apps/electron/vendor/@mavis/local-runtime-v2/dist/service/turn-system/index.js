@@ -48,4 +48,5 @@ export { deriveLocalRuntimeTurnOutcome } from './runtime/host.js';
 export { loadCliSunsetCandidates } from '../memory-system/index.js';
 export { createPromptSuggestionService, } from './agent-host/runner/prompt-suggestion/prompt-suggestion-service.js';
 export { evaluatePromptSuggestionPolicy, PROMPT_SUGGESTION_VERSION, promptSuggestionInstruction, } from './agent-host/runner/prompt-suggestion/prompt-suggestion-policy.js';
+export { createProductionModelTextCompletion } from './execution/model-text-completion.js';
 //# sourceMappingURL=index.js.map

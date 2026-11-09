@@ -125,7 +125,7 @@ const IPC_CHANNELS = {
     SYSTEM_OPEN_LOG_FILE: 'system:open-log-file',
     SYSTEM_GET_LOG_FILE_PATH: 'system:get-log-file-path',
     SYSTEM_UPLOAD_LOG: 'system:upload-log',
-    SYSTEM_UPLOAD_FEEDBACK_LOG: 'system:upload-feedback-log',
+    SYSTEM_ENQUEUE_FEEDBACK_LOG: 'system:enqueue-feedback-log',
     SYSTEM_RELAUNCH: 'system:relaunch',
     // 桌面设置
     DESKTOP_RELAUNCH: 'desktop:relaunch',
@@ -165,6 +165,7 @@ const IPC_CHANNELS = {
     EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION: 'embedded-browser:set-native-overlay-occlusion',
     EMBEDDED_BROWSER_HIDE: 'embedded-browser:hide',
     EMBEDDED_BROWSER_DESTROY: 'embedded-browser:destroy',
+    EMBEDDED_BROWSER_ADOPT_SESSION: 'embedded-browser:adopt-session',
     EMBEDDED_BROWSER_GET_STATE: 'embedded-browser:get-state',
     EMBEDDED_BROWSER_EXECUTE_TOOL: 'embedded-browser:execute-tool',
     EMBEDDED_BROWSER_NAVIGATE: 'embedded-browser:navigate',
@@ -184,6 +185,7 @@ const IPC_CHANNELS = {
     EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST: 'embedded-browser:comment-voice-request',
     /** renderer → main: ASR state/transcript for the page composer. */
     EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE: 'embedded-browser:comment-voice-update',
+    EMBEDDED_BROWSER_COMMENT_HOST_OBSTACLE: 'embedded-browser:comment-host-obstacle',
     EMBEDDED_BROWSER_ACK_COMMENT_EVENTS: 'embedded-browser:ack-comment-events',
     EMBEDDED_BROWSER_OPEN_EXTERNAL: 'embedded-browser:open-external',
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
@@ -202,11 +204,18 @@ const IPC_CHANNELS = {
     MINIAPP_OPEN: 'miniapp:open',
     MINIAPP_REFRESH: 'miniapp:refresh',
     MINIAPP_STOP: 'miniapp:stop',
+    MINIAPP_CLOSE: 'miniapp:close',
     MINIAPP_DETACH: 'miniapp:detach',
     MINIAPP_ATTACH: 'miniapp:attach',
     MINIAPP_APPLY_UPDATE: 'miniapp:apply-update',
     MINIAPP_PERMISSIONS_LIST: 'miniapp:permissions-list',
     MINIAPP_PERMISSIONS_SET: 'miniapp:permissions-set',
+    MINIAPP_HOST_HANDSHAKE: 'miniapp:host-handshake',
+    MINIAPP_HOST_PUBLISH: 'miniapp:host-publish',
+    MINIAPP_HOST_OPEN_REQUEST: 'miniapp:host-open-request',
+    MINIAPP_HOST_OPEN_REPLY: 'miniapp:host-open-reply',
+    MINIAPP_HOST_OPEN_CANCEL: 'miniapp:host-open-cancel',
+    MINIAPP_SLEPT: 'miniapp:slept',
     MINIAPP_COMPOSER_REQUEST: 'miniapp:composer-request',
     MINIAPP_COMPOSER_REPLY: 'miniapp:composer-reply',
     MINIAPP_TOOL_PERMISSION_REQUEST: 'miniapp:tool-permission-request',
@@ -221,6 +230,9 @@ const IPC_CHANNELS = {
     BROWSER_PROFILE_IMPORT_PROGRESS: 'browser-profile-import:progress',
     // 更新器
     UPDATER_CHECK: 'updater:check',
+    UPDATER_BRANCH_INFO: 'updater:branch-info',
+    UPDATER_BRANCH_QUERY: 'updater:branch-query',
+    UPDATER_BRANCH_SWITCH: 'updater:branch-switch',
     UPDATER_DOWNLOAD: 'updater:download',
     UPDATER_INSTALL: 'updater:install',
     UPDATER_GET_VERSION: 'updater:get-version',
@@ -256,6 +268,7 @@ const IPC_CHANNELS = {
     TERMINAL_INPUT: 'terminal:input',
     TERMINAL_RESIZE: 'terminal:resize',
     TERMINAL_DISPOSE: 'terminal:dispose',
+    TERMINAL_REASSIGN: 'terminal:reassign',
     TERMINAL_OUTPUT: 'terminal:output',
     TERMINAL_EXIT: 'terminal:exit',
     TERMINAL_TITLE: 'terminal:title',
@@ -288,6 +301,7 @@ const IPC_CHANNELS = {
     DOCUMENT_PREVIEW_PPTX_CORE_CANCEL: 'document-preview:pptx-core-cancel',
     DOCUMENT_PREVIEW_PPTX_CORE_PORT: 'document-preview:pptx-core-port',
     PREVIEW_CLIPBOARD_WRITE: 'preview-clipboard:write',
+    PREVIEW_CLIPBOARD_WRITE_FILES: 'preview-clipboard:write-files',
     // PPT Preview WebContentsView
     PPT_PREVIEW_CREATE: 'ppt-preview:create',
     PPT_PREVIEW_LOAD: 'ppt-preview:load',
@@ -610,6 +624,7 @@ const terminalAPI = {
     input: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_INPUT, params),
     resize: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_RESIZE, params),
     dispose: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_DISPOSE, params),
+    reassign: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_REASSIGN, params),
     onOutput: (cb) => {
         const handler = (_, e) => cb(e);
         ipcRenderer.on(IPC_CHANNELS.TERMINAL_OUTPUT, handler);
@@ -858,7 +873,7 @@ const electronAPI = {
     openLogFile: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_OPEN_LOG_FILE),
     getLogFilePath: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_LOG_FILE_PATH),
     uploadLog: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_UPLOAD_LOG),
-    uploadFeedbackLog: (data) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_UPLOAD_FEEDBACK_LOG, data),
+    enqueueFeedbackLogUpload: (task) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_ENQUEUE_FEEDBACK_LOG, task),
     // 重启应用（支持指定启动后跳转的页面）
     relaunch: (options) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_RELAUNCH, options),
     // ============================================
@@ -1668,6 +1683,7 @@ const embeddedBrowserAPI = {
     setNativeOverlayOcclusion: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION, params),
     hide: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_HIDE, params),
     destroy: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_DESTROY, params),
+    adoptSession: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_ADOPT_SESSION, params),
     getState: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_GET_STATE, params),
     executeTool: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_EXECUTE_TOOL, params),
     navigate: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_NAVIGATE, params),
@@ -1685,6 +1701,7 @@ const embeddedBrowserAPI = {
     resolveSentComments: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_RESOLVE_SENT_COMMENTS, params),
     removeComment: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_REMOVE_COMMENT, params),
     updateCommentVoice: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE, params),
+    setCommentHostObstacle: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_HOST_OBSTACLE, params),
     onCommentVoiceRequest: (callback) => {
         const handler = (_event, payload) => {
             if (!payload || typeof payload !== 'object')
@@ -1773,6 +1790,89 @@ const embeddedBrowserAPI = {
 };
 contextBridge.exposeInMainWorld('embeddedBrowserAPI', embeddedBrowserAPI);
 const openMiniApp = (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_OPEN, params);
+// Host-only bridge. This file is an unbundled sandbox preload: keep imports type-only.
+let miniAppHostEpoch = null;
+let miniAppHostHandshakeSequence = 0;
+let miniAppHostOpenHandler = null;
+let miniAppHostCancelHandler = null;
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_HOST_OPEN_REQUEST, async (_event, request) => {
+    if (!request || typeof request.epoch !== 'string' || typeof request.requestId !== 'string')
+        return;
+    const epoch = request.epoch;
+    let result = { success: false, code: 'host_unavailable' };
+    try {
+        if (epoch === miniAppHostEpoch && miniAppHostOpenHandler) {
+            result = await miniAppHostOpenHandler({
+                requestId: request.requestId,
+                target: request.target,
+            });
+        }
+    }
+    catch {
+        result = { success: false, code: 'result_unknown' };
+    }
+    try {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_HOST_OPEN_REPLY, {
+            epoch,
+            requestId: request.requestId,
+            result,
+        });
+    }
+    catch {
+        // Main settles the original call when this document ends.
+    }
+});
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_HOST_OPEN_CANCEL, (_event, request) => {
+    if (request?.epoch !== miniAppHostEpoch || typeof request?.requestId !== 'string')
+        return;
+    try {
+        miniAppHostCancelHandler?.(request.requestId);
+    }
+    catch {
+        /* cancellation is best-effort */
+    }
+});
+const miniAppHost = {
+    async handshake() {
+        const sequence = ++miniAppHostHandshakeSequence;
+        miniAppHostEpoch = null;
+        let response;
+        try {
+            response = await ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_HOST_HANDSHAKE);
+        }
+        catch {
+            return { success: false, code: 'host_unavailable' };
+        }
+        if (sequence !== miniAppHostHandshakeSequence) {
+            return { success: false, code: 'host_unavailable' };
+        }
+        if (response?.success === true && typeof response.epoch === 'string') {
+            miniAppHostEpoch = response.epoch;
+            return { success: true, epoch: response.epoch };
+        }
+        miniAppHostEpoch = null;
+        return { success: false, code: 'host_unavailable' };
+    },
+    publish(epoch, state) {
+        if (epoch !== miniAppHostEpoch)
+            return;
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_HOST_PUBLISH, { epoch, state });
+    },
+    onOpenRequest(handler) {
+        miniAppHostOpenHandler = handler;
+        return () => {
+            if (miniAppHostOpenHandler === handler)
+                miniAppHostOpenHandler = null;
+        };
+    },
+    onCancelOpen(handler) {
+        miniAppHostCancelHandler = handler;
+        return () => {
+            if (miniAppHostCancelHandler === handler)
+                miniAppHostCancelHandler = null;
+        };
+    },
+};
 let miniAppAppendHandler = null;
 // Install before React mounts so an unavailable receiver returns a result instead of losing a request.
 ipcRenderer.on(IPC_CHANNELS.MINIAPP_COMPOSER_REQUEST, async (_event, request) => {
@@ -1891,7 +1991,42 @@ const miniAppAgentSessions = {
         ipcRenderer.send(IPC_CHANNELS.MINIAPP_AGENT_PANEL_CLOSED, { hostSessionId, sessionId });
     },
 };
+// Hand-written mirror of `MiniAppSleptEvent` (see the sandbox note above); only contract fields
+// reach the Host UI. `satisfies` keeps the reason set in step with `MiniAppSleepReason`.
+const MINIAPP_SLEEP_REASON_SET = {
+    'count-cap': true,
+    'pressure-moderate': true,
+    'pressure-critical': true,
+};
+const isMiniAppSleepReasonValue = (value) => typeof value === 'string' &&
+    Object.prototype.hasOwnProperty.call(MINIAPP_SLEEP_REASON_SET, value);
+const readMiniAppSleptEvent = (value) => {
+    if (!value || typeof value !== 'object')
+        return null;
+    const { pluginId, displayName, reason, unit, notify } = value;
+    if (!isNonEmptyString(pluginId))
+        return null;
+    if (displayName !== undefined && typeof displayName !== 'string')
+        return null;
+    if (!isMiniAppSleepReasonValue(reason))
+        return null;
+    if ((unit !== 'page' && unit !== 'app') || typeof notify !== 'boolean')
+        return null;
+    return { pluginId, ...(displayName !== undefined ? { displayName } : {}), reason, unit, notify };
+};
+const onMiniAppSlept = (listener) => {
+    const forward = (_event, message) => {
+        const event = readMiniAppSleptEvent(message);
+        if (event)
+            listener(event);
+    };
+    ipcRenderer.on(IPC_CHANNELS.MINIAPP_SLEPT, forward);
+    return () => {
+        ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_SLEPT, forward);
+    };
+};
 const miniAppAPI = {
+    host: miniAppHost,
     agentSessions: miniAppAgentSessions,
     composer: miniAppComposer,
     toolPermission: miniAppToolPermission,
@@ -1899,11 +2034,13 @@ const miniAppAPI = {
     open: openMiniApp,
     refresh: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_REFRESH, params),
     stop: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_STOP, params),
+    close: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_CLOSE, params),
     detach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_DETACH, params),
     attach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_ATTACH, params),
     applyUpdate: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_APPLY_UPDATE, params),
     listPermissions: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PERMISSIONS_LIST, params),
     setPermission: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PERMISSIONS_SET, params),
+    onSlept: onMiniAppSlept,
 };
 contextBridge.exposeInMainWorld('miniAppAPI', miniAppAPI);
 const browserProfileImportAPI = {
@@ -1934,6 +2071,9 @@ ipcRenderer.on(IPC_CHANNELS.UPDATER_OPEN_MODAL, () => {
         callback();
 });
 const updaterAPI = {
+    getTestBranchInfo: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_BRANCH_INFO),
+    queryTestBranch: (branch) => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_BRANCH_QUERY, branch),
+    switchTestBranch: (branch) => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_BRANCH_SWITCH, branch),
     // 检查更新
     checkForUpdates: (options) => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_CHECK, options),
     // 用户确认后下载更新
@@ -2106,6 +2246,23 @@ ipcRenderer.on(IPC_CHANNELS.DOCUMENT_PREVIEW_PPTX_CORE_PORT, (event, payload) =>
     };
 });
 const documentPreviewAPI = {
+    pptxEditing: {
+        request: (input) => ipcRenderer.invoke('pptx-edit:request', input),
+        onStatus: (callback) => {
+            const handler = (_event, input) => callback(input);
+            ipcRenderer.on('pptx-edit:status', handler);
+            return () => ipcRenderer.removeListener('pptx-edit:status', handler);
+        },
+    },
+    pptxEditingHost: {
+        ready: () => ipcRenderer.invoke('pptx-edit-host:ready'),
+        onRequest: (callback) => {
+            const handler = (_event, input) => callback(input);
+            ipcRenderer.on('pptx-edit-host:request', handler);
+            return () => ipcRenderer.removeListener('pptx-edit-host:request', handler);
+        },
+        reply: (input) => ipcRenderer.send('pptx-edit-host:reply', input),
+    },
     openSource: (input) => ipcRenderer.invoke(IPC_CHANNELS.DOCUMENT_PREVIEW_OPEN_SOURCE, input),
     savePptxNotes: (input) => ipcRenderer.invoke(IPC_CHANNELS.DOCUMENT_PREVIEW_SAVE_PPTX_NOTES, input),
     openInSystem: (claim) => ipcRenderer.invoke(IPC_CHANNELS.DOCUMENT_PREVIEW_OPEN_IN_SYSTEM, claim),
@@ -2156,6 +2313,7 @@ const documentPreviewAPI = {
 };
 contextBridge.exposeInMainWorld('documentPreviewAPI', documentPreviewAPI);
 const previewClipboardAPI = {
+    writeFiles: (sessionId, paths) => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CLIPBOARD_WRITE_FILES, sessionId, paths),
     write: (payload) => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CLIPBOARD_WRITE, payload),
 };
 contextBridge.exposeInMainWorld('previewClipboardAPI', previewClipboardAPI);
@@ -2357,4 +2515,20 @@ contextBridge.exposeInMainWorld('cuPreviewAPI', {
     inspect: (sessionId, capture) => ipcRenderer.invoke('cu:preview:inspect', sessionId, capture),
     desktopPermission: () => ipcRenderer.invoke('cu:preview:desktopPermission'),
     openDesktopPermissionSettings: () => ipcRenderer.invoke('cu:preview:openDesktopPermissionSettings'),
+});
+contextBridge.exposeInMainWorld('pptPreviewAPI', {
+    listArtifacts: (sessionId) => ipcRenderer.invoke('ppt-preview:list-artifacts', sessionId),
+    ready: () => ipcRenderer.invoke('ppt-preview-render:ready'),
+    onPrepare: (callback) => {
+        const handler = (_event, request) => callback(request);
+        ipcRenderer.on('ppt-preview-render:prepare', handler);
+        return () => ipcRenderer.removeListener('ppt-preview-render:prepare', handler);
+    },
+    onCancel: (callback) => {
+        const handler = (_event, requestId) => callback(requestId);
+        ipcRenderer.on('ppt-preview-render:cancel', handler);
+        return () => ipcRenderer.removeListener('ppt-preview-render:cancel', handler);
+    },
+    reply: (result) => ipcRenderer.send('ppt-preview-render:result', result),
+    openVersion: (input) => ipcRenderer.invoke('ppt-preview:open-version', input),
 });

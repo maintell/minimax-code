@@ -1,6 +1,10 @@
 import { convertToLlm } from '@earendil-works/pi-coding-agent/messages';
-import { removeOrphanToolResults } from '@mavis/agent-core/pi-turn-runner';
-import { NON_VISION_TOOL_IMAGE_PLACEHOLDER, NON_VISION_USER_IMAGE_PLACEHOLDER, PRIOR_THINKING_CLOSE, PRIOR_THINKING_OPEN, SIBLING_NATIVE_THINKING_APIS, normalizeToolCallId, sanitizeSurrogates, toReferenceToolName, } from './messages-count-tokens-wire.js';
+import { normalizeOutboundMessagesForModel, removeOrphanToolResults, } from '@mavis/agent-core/pi-turn-runner';
+import { NON_VISION_TOOL_IMAGE_PLACEHOLDER, NON_VISION_USER_IMAGE_PLACEHOLDER, normalizeToolCallId, sanitizeSurrogates, toReferenceToolName, } from './messages-count-tokens-wire.js';
+/**
+ * Provider messages counted for `model`. Cross-model thinking follows the same
+ * replay rule the main request uses (agent-core `normalizeOutboundMessagesForModel`).
+ */
 export function toProviderMessages(messages, model) {
     const compatible = removeOrphanToolResults(convertToLlm(messages));
     return normalizeOutboundMessagesForModel(compatible.messages, model).map((message) => {
@@ -22,44 +26,6 @@ export function toProviderMessages(messages, model) {
         });
         return mutated ? { ...message, content } : message;
     });
-}
-function normalizeOutboundMessagesForModel(messages, targetModel) {
-    return messages.map((message) => {
-        if (message.role !== 'assistant')
-            return message;
-        return normalizeAssistantMessage(message, targetModel);
-    });
-}
-function normalizeAssistantMessage(message, targetModel) {
-    const sameProviderAndApi = message.provider === targetModel.provider && message.api === targetModel.api;
-    const sameModel = sameProviderAndApi && message.model === targetModel.id;
-    if (sameModel)
-        return message;
-    const canReplayNativeSibling = sameProviderAndApi && SIBLING_NATIVE_THINKING_APIS.has(targetModel.api);
-    const content = message.content.flatMap((block) => {
-        if (block.type !== 'thinking')
-            return block;
-        if (canReplayNativeSibling)
-            return block;
-        return thinkingToPortableText(block);
-    });
-    if (!canReplayNativeSibling)
-        return { ...message, content };
-    return {
-        ...message,
-        model: targetModel.id,
-        content,
-    };
-}
-export function thinkingToPortableText(block) {
-    if (block.redacted || !block.thinking || block.thinking.trim().length === 0)
-        return [];
-    return [
-        {
-            type: 'text',
-            text: `${PRIOR_THINKING_OPEN}\n${block.thinking}\n${PRIOR_THINKING_CLOSE}`,
-        },
-    ];
 }
 export function convertMessages(input) {
     const params = [];

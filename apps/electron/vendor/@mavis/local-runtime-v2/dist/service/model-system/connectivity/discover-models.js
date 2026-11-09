@@ -6,6 +6,13 @@ const MISSING_MODELS_ENDPOINT = {
     errorCode: 'models_endpoint_missing',
     errorMessage: 'Model list endpoint not found',
 };
+const INVALID_DISCOVERY_RESPONSE = {
+    ok: false,
+    errorCode: 'invalid_response',
+    errorMessage: 'Invalid model discovery response',
+};
+/** Bounds `nextPageToken` pagination against a gateway that never stops paging. */
+const GEMINI_MAX_MODEL_PAGES = 20;
 export class ModelDiscoveryClient {
     fetchImpl;
     timeoutMs;
@@ -28,6 +35,34 @@ export class ModelDiscoveryClient {
         return MISSING_MODELS_ENDPOINT;
     }
     async discoverAt(url, target) {
+        const page = await this.fetchPage(url, target);
+        if (!page.ok)
+            return page;
+        if (target.api === 'google-generative-ai') {
+            return this.collectGeminiPages(url, target, page.payload);
+        }
+        const models = readModels(page.payload);
+        return models ? { ok: true, models } : INVALID_DISCOVERY_RESPONSE;
+    }
+    async collectGeminiPages(url, target, firstPayload) {
+        const models = [];
+        let payload = firstPayload;
+        for (let pageCount = 1;; pageCount += 1) {
+            const page = readGeminiModelsPage(payload);
+            if (!page)
+                return INVALID_DISCOVERY_RESPONSE;
+            models.push(...page.models);
+            if (!page.nextPageToken || pageCount >= GEMINI_MAX_MODEL_PAGES)
+                return { ok: true, models };
+            const nextUrl = new URL(url);
+            nextUrl.searchParams.set('pageToken', page.nextPageToken);
+            const next = await this.fetchPage(nextUrl.toString(), target);
+            if (!next.ok)
+                return next;
+            payload = next.payload;
+        }
+    }
+    async fetchPage(url, target) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
         try {
@@ -50,16 +85,7 @@ export class ModelDiscoveryClient {
                     errorMessage: `HTTP ${response.status}`,
                 };
             }
-            const payload = await readJson(response);
-            const models = readModels(payload);
-            if (!models) {
-                return {
-                    ok: false,
-                    errorCode: 'invalid_response',
-                    errorMessage: 'Invalid model discovery response',
-                };
-            }
-            return { ok: true, models };
+            return { ok: true, payload: await readJson(response) };
         }
         catch (error) {
             if (isAbortError(error)) {
@@ -110,6 +136,41 @@ function readModels(payload) {
         ];
     });
     return models;
+}
+/**
+ * Gemini `models.list`: `{models: [{name: "models/<id>", displayName,
+ * supportedGenerationMethods}], nextPageToken}`. Embedding and other
+ * non-chat models do not support `generateContent` and are skipped.
+ */
+function readGeminiModelsPage(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+        return undefined;
+    const { models, nextPageToken } = payload;
+    // An account without models returns `{}`.
+    if (models !== undefined && !Array.isArray(models))
+        return undefined;
+    return {
+        models: (models ?? []).flatMap((item) => {
+            if (!item || typeof item !== 'object' || Array.isArray(item))
+                return [];
+            const record = item;
+            if (typeof record.name !== 'string')
+                return [];
+            const modelId = record.name.replace(/^models\//u, '').trim();
+            if (!modelId)
+                return [];
+            const methods = record.supportedGenerationMethods;
+            if (Array.isArray(methods) && !methods.includes('generateContent'))
+                return [];
+            return [
+                {
+                    modelId,
+                    ...(typeof record.displayName === 'string' ? { displayName: record.displayName } : {}),
+                },
+            ];
+        }),
+        ...(typeof nextPageToken === 'string' && nextPageToken ? { nextPageToken } : {}),
+    };
 }
 function readDisplayName(record) {
     if (typeof record.display_name === 'string')

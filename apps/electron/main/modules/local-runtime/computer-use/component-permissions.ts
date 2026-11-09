@@ -3,11 +3,27 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { shell } from "electron";
 import { prepareDesktopComputerUseComponent } from "./packaged-component";
-const blocked = () => ({
-    accessibility: 'restricted',
-    screenRecording: 'restricted',
+import { getCategoryLogger } from "../../../utils/logger";
+const logger = getCategoryLogger('main', 'computer-use');
+/** The component cannot report system permissions; this is not an OS policy restriction. */
+const unavailable = () => ({
+    accessibility: 'unavailable',
+    screenRecording: 'unavailable',
     captureReady: false,
 });
+/** Error codes and names only; arbitrary messages may contain private profile paths. */
+function failureCode(error) {
+    const code = error?.code;
+    if (typeof code === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(code))
+        return code;
+    if (error instanceof Error) {
+        return /^[a-z][a-z0-9_]{0,63}$/.test(error.message) ? error.message : error.name;
+    }
+    return 'unknown';
+}
+function logUnavailable(operation, errorCode) {
+    logger.warn('computer_use_permission_unavailable', { operation, errorCode });
+}
 function dataDir() {
     // Electron freezes this profile selection before registering the IPC bridge.
     const value = process.env.MINIMAX_DATA_DIR;
@@ -20,20 +36,29 @@ function validateKind(kind) {
         throw new Error('computer_permission_kind_invalid');
     }
 }
-function snapshot(status) {
+function snapshot(status, operation) {
     if (!status.supported ||
         !status.componentVersion ||
         (status.code &&
             status.code !== 'computer_permission_required' &&
-            status.code !== 'computer_capture_verification_required'))
-        return blocked();
-    if (process.platform === 'win32') {
-        return status.granted
-            ? { accessibility: 'not-required', screenRecording: 'not-required', captureReady: true }
-            : blocked();
+            status.code !== 'computer_capture_verification_required')) {
+        const fallback = status.supported
+            ? 'computer_component_version_missing'
+            : 'computer_unsupported';
+        logUnavailable(operation, failureCode({ code: status.code ?? fallback }));
+        return unavailable();
     }
-    if (process.platform !== 'darwin')
-        return blocked();
+    if (process.platform === 'win32') {
+        if (status.granted) {
+            return { accessibility: 'not-required', screenRecording: 'not-required', captureReady: true };
+        }
+        logUnavailable(operation, 'computer_not_granted');
+        return unavailable();
+    }
+    if (process.platform !== 'darwin') {
+        logUnavailable(operation, 'computer_platform_unsupported');
+        return unavailable();
+    }
     return {
         accessibility: status.accessibility ? 'granted' : 'denied',
         screenRecording: status.screenRecording ? 'granted' : 'denied',
@@ -59,17 +84,18 @@ async function inspect(request) {
 }
 export async function getComputerUsePermissionStatus() {
     try {
-        return snapshot(await inspect(false));
+        return snapshot(await inspect(false), 'status');
     }
-    catch {
-        return blocked();
+    catch (error) {
+        logUnavailable('status', failureCode(error));
+        return unavailable();
     }
 }
 export async function requestComputerUsePermission(kind) {
     validateKind(kind);
     try {
         const result = await inspect(true);
-        const status = snapshot(result)[kind === 'accessibility' ? 'accessibility' : 'screenRecording'];
+        const status = snapshot(result, 'request')[kind === 'accessibility' ? 'accessibility' : 'screenRecording'];
         return {
             status,
             message: result.message ??
@@ -78,9 +104,10 @@ export async function requestComputerUsePermission(kind) {
                     : 'Grant permissions to MiniMax Computer Use in System Settings.'),
         };
     }
-    catch {
+    catch (error) {
+        logUnavailable('request', failureCode(error));
         return {
-            status: 'restricted',
+            status: 'unavailable',
             message: 'MiniMax Computer Use is unavailable. Install a trusted matching component and try again.',
         };
     }

@@ -1,5 +1,6 @@
 import { createAssistantMessageEventStream, streamSimple, } from '@earendil-works/pi-ai';
 import { LLM_FIRST_EVENT_TIMEOUT_MS, LLM_FIRST_EVENT_TIMEOUT_ENV, LLM_STREAM_IDLE_TIMEOUT_ENV, LLM_STREAM_IDLE_TIMEOUT_MS, } from './defaults.js';
+import { withLLMStreamFailure } from './llm-stream-failure.js';
 /** Marker included in every synthesized timeout message; matches the shared timeout classifier. */
 export const LLM_STREAM_TIMEOUT_MESSAGE_PREFIX = 'LLM request timed out';
 /**
@@ -156,14 +157,15 @@ class StreamWatchdog {
         if (this.settled || this.callerSignal?.aborted)
             return;
         const message = timeoutMessage(phase, ms);
-        this.timeoutMessage = {
-            ...snapshot(this.lastPartial, this.model),
-            stopReason: 'error',
-            errorMessage: message,
-        };
+        const kind = timeoutKind(phase);
+        // The marker lets a host lease tell a watchdog timeout from a provider failure
+        // (see llm-stream-failure.ts); the words stay as before for the shared classifier.
+        this.timeoutMessage = withLLMStreamFailure(snapshot(this.lastPartial, this.model), kind, message, {
+            timeoutMs: ms,
+        });
         this.settle();
         this.resolveTimedOut(TIMED_OUT);
-        this.controller.abort(new LLMStreamTimeoutError(message));
+        this.controller.abort(new LLMStreamTimeoutError(message, kind));
     }
     clearTimer() {
         if (this.timer !== undefined)
@@ -180,8 +182,25 @@ function releaseIterator(iterator) {
         .then(() => iterator.return?.())
         .catch(() => undefined);
 }
+/**
+ * The abort reason of a timed-out attempt. `code` is the stable stream-failure
+ * kind (`llm_first_event_timeout` / `llm_stream_idle_timeout`) and `llmStreamFailure` marks it
+ * as decided by this layer, not by the provider.
+ */
 export class LLMStreamTimeoutError extends Error {
+    code;
     name = 'TimeoutError';
+    llmStreamFailure = true;
+    errorKind = 'timeout';
+    timeoutPhase;
+    constructor(message, code) {
+        super(message);
+        this.code = code;
+        this.timeoutPhase = code === 'llm_first_event_timeout' ? 'first' : 'idle';
+    }
+}
+function timeoutKind(phase) {
+    return phase === 'first' ? 'llm_first_event_timeout' : 'llm_stream_idle_timeout';
 }
 function timeoutMessage(phase, ms) {
     return phase === 'first'

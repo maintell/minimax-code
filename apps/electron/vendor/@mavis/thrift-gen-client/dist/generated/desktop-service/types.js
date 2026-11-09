@@ -270,6 +270,7 @@ export const FeedbackStatus = {
     FEEDBACK_STATUS_UNSPECIFIED: 0,
     PROCESSING: 1,
     RESOLVED: 2,
+    SUBMITTED: 3,
 };
 export const FeedbackClientType = {
     FEEDBACK_CLIENT_UNSPECIFIED: 0,
@@ -284,6 +285,7 @@ export const FeedbackCategory = {
     SESSION_ISSUE: 4,
     APP_ISSUE: 5,
     SUGGESTION: 6,
+    MESSAGE_DISLIKE: 7,
 };
 export const FeedbackDiagnosticLogStatus = {
     FEEDBACK_DIAGNOSTIC_LOG_STATUS_UNSPECIFIED: 0,

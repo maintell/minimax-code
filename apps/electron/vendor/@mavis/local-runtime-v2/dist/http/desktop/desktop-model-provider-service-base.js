@@ -1,5 +1,5 @@
 import { HTTPException } from 'hono/http-exception';
-import { DesktopQuestionnaireServiceBase } from './desktop-questionnaire-service.js';
+import { DesktopModelAccessServiceBase } from './desktop-model-access-service-base.js';
 /**
  * Fail-closed stubs for the model provider / BYOK DesktopService contract.
  *
@@ -10,7 +10,7 @@ import { DesktopQuestionnaireServiceBase } from './desktop-questionnaire-service
  * lands the real desktop implementation — replace the stubs there, not by
  * inventing partial semantics here.
  */
-export class DesktopModelProviderServiceBase extends DesktopQuestionnaireServiceBase {
+export class DesktopModelProviderServiceBase extends DesktopModelAccessServiceBase {
     notImplemented(method) {
         throw new HTTPException(501, {
             message: `DesktopService.${method} is not implemented on desktop yet (BYOK contract is ahead of the local-runtime implementation).`,
@@ -69,6 +69,13 @@ export class DesktopModelProviderServiceBase extends DesktopQuestionnaireService
     }
     discoverUserModels(_ctx, _req) {
         return this.notImplemented('DiscoverUserModels');
+    }
+    // Multi-key BYOK is served by the v2 model-provider controller only.
+    testUserModelApiKey(_ctx, _req) {
+        return this.notImplemented('TestUserModelApiKey');
+    }
+    unrestUserModelApiKey(_ctx, _req) {
+        return this.notImplemented('UnrestUserModelApiKey');
     }
     updateMinimaxModelContext(_ctx, _req) {
         return this.notImplemented('UpdateMinimaxModelContext');

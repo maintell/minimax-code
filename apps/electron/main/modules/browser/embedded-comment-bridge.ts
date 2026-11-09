@@ -1856,6 +1856,54 @@ export function buildEmbeddedCommentBridgeScript(options) {
   const rectsOverlap = (a, b) =>
     a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
 
+  // Host UI layered over this page (the app's floating chat), in this page's
+  // viewport coordinates. The page cannot draw above it, so the composer moves
+  // to its nearest side instead of opening underneath.
+  let hostObstacle = null;
+  // Clear of the host obstacle without covering the commented element: try
+  // spots hugging each edge of the obstacle and of the element, keep those that
+  // fit the viewport and overlap neither, and take the one that moves least.
+  const clearOfHostObstacle = (left, top, width, height, anchor) => {
+    if (!hostObstacle) return { left, top };
+    const inset = composerSpec.width.viewportInset;
+    const gap = composerSpec.placement.anchorGap;
+    const grow = (rect, by) => ({
+      x: rect.x - by,
+      y: rect.y - by,
+      width: rect.width + by * 2,
+      height: rect.height + by * 2,
+    });
+    const blocked = grow(hostObstacle, gap);
+    if (!rectsOverlap({ x: left, y: top, width, height }, blocked)) return { left, top };
+    const blockers = [blocked];
+    if (anchor && anchor.width > 0 && anchor.height > 0) blockers.push(grow(anchor, 4));
+    const maxLeft = Math.max(inset, window.innerWidth - width - inset);
+    const maxTop = Math.max(inset, window.innerHeight - height - inset);
+    const tops = [top];
+    const lefts = [left];
+    blockers.forEach((item) => {
+      tops.push(item.y - height, item.y + item.height);
+      lefts.push(item.x - width, item.x + item.width);
+    });
+    let best = null;
+    let bestDistance = Infinity;
+    tops.forEach((rawTop) => {
+      lefts.forEach((rawLeft) => {
+        const candidate = { left: clamp(rawLeft, inset, maxLeft), top: clamp(rawTop, inset, maxTop) };
+        if (candidate.left + width > window.innerWidth - inset + 0.5) return;
+        if (candidate.top + height > window.innerHeight - inset + 0.5) return;
+        const box = { x: candidate.left, y: candidate.top, width, height };
+        if (blockers.some((item) => rectsOverlap(box, item))) return;
+        const distance = Math.hypot(candidate.left - left, candidate.top - top);
+        if (distance < bestDistance) {
+          best = candidate;
+          bestDistance = distance;
+        }
+      });
+    });
+    return best || { left, top };
+  };
+
   const positionComposer = () => {
     if (!composer) return;
     const rect = activeElement
@@ -1922,10 +1970,15 @@ export function buildEmbeddedCommentBridgeScript(options) {
     } else if (placement.side === 'bottom') {
       top = window.innerHeight - height - inset;
     }
-    composer.style.left =
-      clamp(left, inset, Math.max(inset, window.innerWidth - width - inset)) + 'px';
-    composer.style.top =
-      clamp(top, inset, Math.max(inset, window.innerHeight - height - inset)) + 'px';
+    const placed = clearOfHostObstacle(
+      clamp(left, inset, Math.max(inset, window.innerWidth - width - inset)),
+      clamp(top, inset, Math.max(inset, window.innerHeight - height - inset)),
+      width,
+      height,
+      rect,
+    );
+    composer.style.left = placed.left + 'px';
+    composer.style.top = placed.top + 'px';
   };
 
   function openComposer(target, existingComment, seed) {
@@ -3393,6 +3446,25 @@ export function buildEmbeddedCommentBridgeScript(options) {
       else resolveSentBubbles(data.status === 'done' ? 'done' : 'cancelled', keys, revisions);
     }
     if (data.type === 'remove-comment') removeCommentFromHost(data);
+    if (data.type === 'set-host-obstacle') {
+      // The host measures in its own pixels over the box this page fills; a
+      // device preview can show the page scaled, so convert to page pixels.
+      const rect = data.rect && typeof data.rect === 'object' ? normalizeRect(data.rect) : null;
+      const hostWidth = data.viewport && Number(data.viewport.width);
+      const hostHeight = data.viewport && Number(data.viewport.height);
+      const scaleX = hostWidth > 0 ? window.innerWidth / hostWidth : 1;
+      const scaleY = hostHeight > 0 ? window.innerHeight / hostHeight : 1;
+      hostObstacle =
+        rect && rect.width > 0 && rect.height > 0
+          ? {
+              x: rect.x * scaleX,
+              y: rect.y * scaleY,
+              width: rect.width * scaleX,
+              height: rect.height * scaleY,
+            }
+          : null;
+      if (composer) positionComposer();
+    }
     if (data.type === 'voice-update') {
       const nextState =
         data.state === 'listening' || data.state === 'transcribing' ? data.state : 'idle';

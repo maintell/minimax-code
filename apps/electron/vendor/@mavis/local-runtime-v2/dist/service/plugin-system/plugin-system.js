@@ -132,6 +132,7 @@ export class PluginSystem {
                 this.marketplacePreview.invalidate();
             },
             linksChanged: () => settleInBackground(this.localDirectoryWatcher.refreshRoots?.() ?? Promise.resolve()),
+            pluginRemoved: (id) => options.mcpCredentials?.deleteLocalPlugin(id),
         });
         this.mcpRuntime = options.mcpRuntime ?? new PluginMcpRuntime();
         this.capabilityGenerations = new PluginCapabilityGenerationRegistry(this.snapshot.revision, this.mcpRuntime);
@@ -212,6 +213,23 @@ export class PluginSystem {
         this.marketplacePreview.invalidate();
         if (this.initializeStarted)
             this.scheduleCachedRebuild();
+    }
+    /** One tools/list on the published generation with credentials attached; never authorizes. */
+    async probeMcpServer(serverName) {
+        this.assertUsable();
+        return ((await this.mcpRuntime.probe?.(serverName)) ?? new Error('Plugin MCP probe is unavailable'));
+    }
+    /**
+     * Lists these servers again after their credentials changed. The rebuilt generation keeps every
+     * other inventory, so only the forgotten servers are warming and discovered immediately.
+     */
+    async rediscoverMcpServers(serverNames) {
+        await this.initialization.promise;
+        this.assertUsable();
+        await this.runExclusive(async () => {
+            this.mcpRuntime.forgetInventories?.(serverNames);
+            await this.rebuildForCurrentScope(false);
+        });
     }
     async refresh() {
         await this.initialization.promise;

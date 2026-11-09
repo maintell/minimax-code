@@ -1,5 +1,7 @@
 import { BrowserWindow, ipcMain, clipboard } from "electron";
 import { isDev } from "../config";
+import { fetchSessionWorkspaceFromRuntime } from "../modules/document-preview/workspace-authority";
+import { copyWorkspaceFilesToClipboard } from "../modules/file/copy-files-to-clipboard";
 import { DEV_SERVER_URL, IPC_CHANNELS } from "../config/constants";
 /** Allows a 100MiB plain-text document plus bounded UTF-8 expansion overhead. */
 export let PREVIEW_CLIPBOARD_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
@@ -36,6 +38,32 @@ function trustedHostRenderer(event) {
     }
 }
 export function setupPreviewClipboardIPC() {
+    ipcMain.handle(IPC_CHANNELS.PREVIEW_CLIPBOARD_WRITE_FILES, async (event, sessionId, paths) => {
+        if (!trustedHostRenderer(event))
+            return { ok: false, code: 'untrusted_sender' };
+        if (typeof sessionId !== 'string' ||
+            !sessionId ||
+            !Array.isArray(paths) ||
+            !paths.length ||
+            paths.length > 1024 ||
+            !paths.every((entry) => typeof entry === 'string' &&
+                entry.length > 0 &&
+                entry.length <= 32767 &&
+                !entry.includes('\0'))) {
+            return { ok: false, code: 'invalid_payload' };
+        }
+        const startedAt = performance.now();
+        try {
+            const root = await fetchSessionWorkspaceFromRuntime(sessionId);
+            if (!root)
+                return { ok: false, code: 'invalid_payload' };
+            await copyWorkspaceFilesToClipboard(root, paths);
+            return { ok: true, writeMs: Math.round(performance.now() - startedAt) };
+        }
+        catch {
+            return { ok: false, code: 'write_failed' };
+        }
+    });
     ipcMain.handle(IPC_CHANNELS.PREVIEW_CLIPBOARD_WRITE, (event, value) => {
         if (!trustedHostRenderer(event))
             return { ok: false, code: 'untrusted_sender' };

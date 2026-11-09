@@ -1111,8 +1111,8 @@ export class BrowserController {
     // ============================================
     // 导航操作（委托给 BrowserActions）
     // ============================================
-    async loadForPresentation(params) {
-        return this.browserActions.loadForPresentation(params);
+    async loadForPresentation(params, options) {
+        return this.browserActions.loadForPresentation(params, options);
     }
     async navigate(params, options) {
         return this.browserActions.navigate(params, options);

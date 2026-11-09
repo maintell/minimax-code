@@ -5,7 +5,7 @@ import { createCuaDriverRuntime, CuaLocalAbortError, } from './cua-driver-runtim
 import { createCuaStructuredLogger } from './cua-logging.js';
 import { callCuaToolWithDeliveryMode, mapRequestToCuaTool, normalizeCuaResult } from './mapping.js';
 import { observeLaunchedWindows } from './cua-launch-observation.js';
-import { startOwnedDaemon, stopOrphanDaemon, requestComponentPermissions, } from './daemon.js';
+import { reclaimProfileDaemons, startOwnedDaemon, stopOrphanDaemon, requestComponentPermissions, } from './daemon.js';
 import { acquireDesktopLock, desktopLockRoot } from './desktop-lock.js';
 import { ComputerUseError, record, structured, } from './contracts.js';
 /** Call only after Runtime checks plugin, Skill, explicit selection and tool policy. */
@@ -26,6 +26,7 @@ export function createComputerUseClient(options) {
     let operation;
     let cleaning;
     let generation = 0;
+    let reclaimed = false;
     // Set after reclaiming a lock from an exited owner whose last native action is unknown.
     let observationRequired = false;
     let admissionRevision = 0;
@@ -51,6 +52,22 @@ export function createComputerUseClient(options) {
         poisoned = false;
         observedSessions.clear();
     }
+    async function reclaimOrphanDaemons() {
+        // Best effort: a daemon left by an exited host must not block this host's own start.
+        try {
+            const summary = await reclaimProfileDaemons(options.dataDir);
+            if (summary.stopped || summary.removed || summary.failed)
+                logger.emit(summary.stopped || summary.failed ? 'warn' : 'info', 'daemon_reclaim', {
+                    ...summary,
+                });
+        }
+        catch (error) {
+            logger.warn('daemon_reclaim', {
+                outcome: 'scan_failed',
+                errorCode: error.code ?? 'unknown',
+            });
+        }
+    }
     async function prepareRuntime() {
         open();
         if (!starting) {
@@ -66,6 +83,11 @@ export function createComputerUseClient(options) {
                 }
                 if (daemon)
                     await retireRuntime();
+                open();
+                if (!reclaimed) {
+                    reclaimed = true;
+                    await reclaimOrphanDaemons();
+                }
                 open();
                 component = await resolveComponent();
                 open();

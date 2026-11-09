@@ -6,6 +6,7 @@ import { isCanonicalSubagentRole } from './subagent-roles.js';
 export const DELEGATION_TOOL_NAMES = new Set(['task', 'task_append']);
 const READ_ONLY_CANONICAL_BLOCKED_TOOL_NAMES = new Set([
     'write',
+    'ppt_preview',
     'edit',
     'website_deploy',
     'todowrite',

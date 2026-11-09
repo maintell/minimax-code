@@ -1,5 +1,6 @@
+import { settleInBackground } from '../../service/plugin-system/index.js';
 import { isLocalSourceProvenanceEnabled } from '@mavis/config';
-import { initializeModelSystem, freezeManagedQueueModel, resolveRequestedSessionModel, LocalModelProviderError, resolveBuiltinAgentModelGroup, previewAgentModelSelection, resolveEffectiveAgentModelSelection, AgentModelSelectionError, } from '../../service/model-system/index.js';
+import { CUSTOM_PROVIDER_ID_PREFIX, ModelAccessRelist, initializeModelSystem, freezeManagedQueueModel, resolveRequestedSessionModel, LocalModelProviderError, resolveBuiltinAgentModelGroup, previewAgentModelSelection, resolveEffectiveAgentModelSelection, AgentModelSelectionError, } from '../../service/model-system/index.js';
 import { createSessionSystemPinBridge, initializePinService, } from '../../service/pin/index.js';
 import { createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, readSessionAdditionalWorkspaceRoots, } from '../../service/session-system/index.js';
 import { createProductionAgentPreparation, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionModelRepair, agentHostModelFromQueue, } from '../../service/turn-system/index.js';
@@ -17,6 +18,8 @@ import { createSessionTitlePolicy } from './session-title-policy.js';
 import { describeError } from './turn-message-delivery.js';
 import { createQueueSubmissionRejectionDelivery, queryCollapseSteeringProjection, } from '../conversation/index.js';
 export function createProductionSessionComposition(input) {
+    const visible = createVisibleModelConfig(input.modelConfig);
+    const visibleInput = { ...input, modelConfig: visible.port };
     const tuiProductPolicy = input.runtimeOwnerKind === 'tui';
     let executionSessionSystem;
     const baseProduct = createRuntimeAgentProduct({
@@ -28,12 +31,13 @@ export function createProductionSessionComposition(input) {
                 throw new Error('Session Agent definition reader is unavailable during runtime composition.');
             return await sessionSystem.sessions.records.ensureSessionAgentDefinition(sessionId);
         },
-        modelConfig: input.modelConfig,
+        modelConfig: visible.port,
         logger: input.logger,
         nowMs: input.nowMs,
         runtimeOwnerKind: input.runtimeOwnerKind,
         capabilityProfile: input.capabilityProfile,
         miniappAvailable: input.miniappAvailable,
+        pptPreviewAvailable: input.pptPreviewAvailable,
         browserUse: input.browserUse,
         implicitCustomProviderThinking: tuiProductPolicy,
         ...(input.systemPromptOverrides ? { systemPromptOverrides: input.systemPromptOverrides } : {}),
@@ -42,19 +46,16 @@ export function createProductionSessionComposition(input) {
         internalTurnPromptReads: input.internalTurnPromptReads,
         globalInstructions: input.globalInstructions,
         ...(input.promptSnapshots ? { promptSnapshots: input.promptSnapshots } : {}),
+        modelAccessExtensionTool: input.modelAccess?.extensionTool,
     });
     const { goal, goalPort, bindGoalCronOwnerReader } = composeGoalOwner(input, baseProduct, () => executionSessionSystem?.queue.committed);
     const product = withGoalAgentProduct(baseProduct, goal);
-    const modelSystem = initializeModelSystem({
-        config: input.modelConfig,
-        resolverOptions: product.preparation.modelResolver,
-        ...(product.fileApi?.fetchImpl ? { fetchImpl: product.fileApi.fetchImpl } : {}),
-        ...(tuiProductPolicy ? { implicitCustomProviderThinking: true } : {}),
-    });
-    input.agentService.bindBuiltinModelGroupResolver(async ({ previous, bundled }) => resolveBuiltinAgentModelGroup({ config: input.modelConfig.read(), previous, bundled }));
+    const modelSystem = createSessionModelSystem(input, product);
+    visible.bind(() => modelSystem.providers.modelCatalogConfig?.());
+    input.agentService.bindBuiltinModelGroupResolver(async ({ previous, bundled }) => resolveBuiltinAgentModelGroup({ config: visible.read(), previous, bundled }));
     bindAgentConfigModelPorts({
         agentService: input.agentService,
-        modelConfig: input.modelConfig,
+        modelConfig: visible.port,
         logger: input.logger,
     });
     const preparation = createProductionAgentPreparation({
@@ -72,11 +73,11 @@ export function createProductionSessionComposition(input) {
         rootAgents: input.agentSessionPorts.roots,
         defaultWorkspaceDir: input.compatibility.workspace.defaultDirectory,
         titlePolicy: createSessionTitlePolicy({
-            config: input.modelConfig.read,
+            config: visible.read,
             safety: input.safety,
             readDefinition: (sessionId) => sessionSystem.repositories.sessions.getSessionAgentDefinition(sessionId),
         }),
-        resolveRequestedModel: (model) => resolveRequestedSessionModel(input.modelConfig.read(), model),
+        resolveRequestedModel: (model) => resolveRequestedSessionModel(visible.read(), model),
         toolCallMode: createSessionToolCallModePolicy(input.modelConfig.read, input.logger),
         backfillDiagnostics: createSessionBackfillDiagnostics({
             logger: input.logger,
@@ -98,7 +99,7 @@ export function createProductionSessionComposition(input) {
         facts: facts.session,
         conversationFacts: facts.conversation,
         queueFacts: facts.queue,
-        resolveQueueModel: createQueueModelResolver(input, () => executionSessionSystem),
+        resolveQueueModel: createQueueModelResolver(visibleInput, () => executionSessionSystem),
         compactionFacts: createRuntimeCompactionFactSink(input.inspector, input.publishGlobalEvent),
         ...(input.metrics ? { compactionMetrics: input.metrics } : {}),
         title: {
@@ -115,7 +116,7 @@ export function createProductionSessionComposition(input) {
         runtimeOwnerIdentity: input.runtimeOwnerIdentity,
     });
     executionSessionSystem = sessionSystem;
-    const channelTurnAdmission = createChannelTurnAdmission(input, sessionSystem);
+    const channelTurnAdmission = createChannelTurnAdmission(input, visibleInput, sessionSystem);
     const pinService = createRuntimePinService(input, sessionSystem);
     sessionPin.bind(pinService);
     input.compatibility.bindSessionPinReader((sessionId) => pinService.isSessionPinned(sessionId));
@@ -125,7 +126,7 @@ export function createProductionSessionComposition(input) {
     const modelProviderApplication = new ModelProviderApplication({
         publish: input.publishGlobalEvent,
         tuiProductPolicy,
-        config: input.modelConfig.read,
+        config: visible.read,
         providers: modelSystem.providers,
         sessions: createCommittedModelProviderSessionPort({
             get: async (sessionId) => {
@@ -143,7 +144,7 @@ export function createProductionSessionComposition(input) {
         refreshOfficialModels: input.refreshOfficialModels,
         resolveChannelSelection: async ({ agentName }) => {
             const selection = await previewChannelAgentModelSelection({
-                config: input.modelConfig.read(),
+                config: visible.read(),
                 agents: input.agentService,
                 agentName,
             });
@@ -160,7 +161,7 @@ export function createProductionSessionComposition(input) {
                 : undefined;
         },
         selectChannelModel: async ({ agentName, selection }) => await selectChannelAgentModel({
-            config: input.modelConfig.read(),
+            config: visible.read(),
             agents: input.agentService,
             agentName,
             selection,
@@ -171,6 +172,7 @@ export function createProductionSessionComposition(input) {
         product,
         preparation,
         modelSystem,
+        modelAccessRelistLifecycle: createModelAccessRelistLifecycle(input, modelSystem),
         modelProviderApplication,
         sessionSystem,
         pinService,
@@ -228,6 +230,69 @@ function composeGoalOwner(input, baseProduct, committedQueue) {
         },
     };
 }
+/** The model config with extension catalogs merged in, once `bind` names their source. */
+function createVisibleModelConfig(config) {
+    let catalog;
+    const read = () => catalog?.() ?? config.read();
+    return {
+        read,
+        port: { ...config, read },
+        bind: (source) => {
+            catalog = source;
+        },
+    };
+}
+function createSessionModelSystem(input, product) {
+    return initializeModelSystem({
+        config: input.modelConfig,
+        resolverOptions: {
+            ...product.preparation.modelResolver,
+            ...(input.modelAccess ? { modelAccess: input.modelAccess } : {}),
+        },
+        ...(product.fileApi?.fetchImpl ? { fetchImpl: product.fileApi.fetchImpl } : {}),
+        ...(input.runtimeOwnerKind === 'tui' ? { implicitCustomProviderThinking: true } : {}),
+    });
+}
+/**
+ * The product owners (Electron, TUI) re-read their model-access providers' model lists hourly
+ * (ModelAccessRelist); other owners have none.
+ */
+function createModelAccessRelistLifecycle(input, modelSystem) {
+    if (!input.modelAccess ||
+        (input.runtimeOwnerKind !== 'electron' && input.runtimeOwnerKind !== 'tui'))
+        return undefined;
+    const relist = new ModelAccessRelist({
+        config: input.modelConfig.read,
+        refresh: (providerKey, signal) => modelSystem.providers.discoverModels(`${CUSTOM_PROVIDER_ID_PREFIX}${providerKey}`, {
+            modelAccess: { signal },
+        }),
+        usable: (providerKey) => input.modelAccess?.requests.owns(providerKey) !== false,
+        warn: (fields, message) => input.logger.warn({ ...fields }, message),
+    });
+    let stopMigrations;
+    const adoptMigratedEntries = async (providerKeys) => {
+        try {
+            await modelSystem.providers.adoptModelAccessInstallations(providerKeys);
+        }
+        catch (error) {
+            input.logger.warn({ event: 'model_access_migration_adopt_failed', error: String(error) }, 'model access provider entries were not re-pointed');
+        }
+    };
+    return {
+        start: () => {
+            relist.start();
+            // A package split moved bindings: point their provider entries at the new installation.
+            stopMigrations ??= input.modelAccess?.onCredentialsMigrated?.((providerKeys) => {
+                settleInBackground(adoptMigratedEntries(providerKeys));
+            });
+        },
+        close: () => {
+            stopMigrations?.();
+            stopMigrations = undefined;
+            return relist.close();
+        },
+    };
+}
 /** Publishes a committed Session model write; `replacedFrom` marks a retired-model replacement. */
 function modelUpdatedFactSink(facts) {
     return (session, replacedFrom) => facts.session.handle({
@@ -236,10 +301,11 @@ function modelUpdatedFactSink(facts) {
         ...(replacedFrom ? { replacedFrom } : {}),
     });
 }
-function createChannelTurnAdmission(input, sessionSystem) {
+function createChannelTurnAdmission(input, visibleInput, sessionSystem) {
     return {
         queueSubmissionRejections: createQueueSubmissionRejections(input, sessionSystem),
-        resolveChannelInputModel: createChannelInputModelResolver(input, sessionSystem),
+        // Channel input resolves against the visible model catalog (extension catalogs included).
+        resolveChannelInputModel: createChannelInputModelResolver(visibleInput, sessionSystem),
     };
 }
 function createQueueModelResolver(input, getSessionSystem) {

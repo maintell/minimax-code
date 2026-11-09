@@ -3,7 +3,7 @@ import { buildLocalSessionCreateTool } from './local-session-create-tool.js';
 import { toRuntimeTool } from '@mavis/agent-core/tools';
 import { LocalAskUserTool } from './local-ask-user.js';
 import { LocalFeatureEnableTool } from './local-feature-enable.js';
-import { LocalBashTool, LocalEditTool, LocalReadTool, LocalWriteTool } from './local-pi-tools.js';
+import { LocalBashTool, LocalEditTool, LocalReadTool, LocalWriteTool, } from './local-pi-tools.js';
 import { LocalGlobTool } from './local-glob.js';
 import { LocalGrepTool } from './local-grep.js';
 import { LocalSkillTool } from './local-skill.js';
@@ -60,11 +60,11 @@ export * from './types.js';
 export * from './subagent-roles.js';
 export * from '../shared/web-search.js';
 export { DEFAULT_BROAD_FILE_EXCLUDES, DEFAULT_SCAN_DIRECTORY_NAMES, isDefaultBroadFileExcluded, isDefaultScanNoisePath, } from '../shared/rg-scan-policy.js';
-export { isSensitiveSearchPath } from './local-sensitive.js';
+export { isSensitiveSearchPath, isSensitiveSearchRoot } from './local-sensitive.js';
 export function buildLocalToolRegistry(deps) {
     const tools = [
         toRuntimeTool(new LocalReadTool(deps.workspaceRoot)),
-        toRuntimeTool(new LocalWriteTool(deps.workspaceRoot)),
+        toRuntimeTool(new LocalWriteTool(deps.workspaceRoot, deps.writeGuardCheckObserver)),
         toRuntimeTool(new LocalEditTool(deps.workspaceRoot)),
         toRuntimeTool(new LocalBashTool(deps.workspaceRoot, deps.bashAdapter, deps.bashEnvPolicy, deps.hostTrashRuntime, deps.sandboxOperationsFactory)),
         toRuntimeTool(new LocalGrepTool(deps.workspaceRoot)),
@@ -131,7 +131,8 @@ export function buildLocalToolRegistry(deps) {
     }
     return map;
 }
-export { CloudSessionReader, CloudSessionReadError, } from './cloud-session-reader.js';
+export { CloudSessionReader, CloudSessionReadError, readRemoteMessageResult, remoteMessageBody, } from './cloud-session-reader.js';
+export { RcSessionReader } from './rc-session-reader.js';
 export { buildLocalCronTools } from './local-cron-tools.js';
 export { CRON_TOOL_NAMES, MAVIS_CAPABILITY_TOOL_NAMES, LocalSelfReminderToolDef, LocalSelfReminderToolDef as SelfReminderToolDef, cronToolDefinitions, selfReminderIntervalMinutes, } from '../cron/tool-defs.js';
 export { DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, PTC_CHILD_FULL_OUTPUT_MAX_BYTES, } from './output-limit.js';

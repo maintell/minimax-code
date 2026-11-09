@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { lstat, readFile, mkdtemp, open, unlink, realpath } from 'node:fs/promises';
+import { lstat, readFile, readdir, mkdtemp, open, rm, unlink, realpath, writeFile, } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -22,6 +22,11 @@ export async function startOwnedDaemon(component, dataDir, ownerId) {
         throw new ComputerUseError('computer_endpoint_path_too_long', 'Profile path is too long for a private Unix socket; choose a shorter explicit profile path.');
     }
     const pidFile = path.join(directory, 'pid');
+    // Lets a later host in this profile stop the daemon if this host exits without stopping it.
+    await writeFile(path.join(directory, HOST_FILE), JSON.stringify({ pid: process.pid, endpoint }), {
+        flag: 'wx',
+        mode: 0o600,
+    });
     const args = [
         'serve',
         '--socket',
@@ -84,6 +89,7 @@ export async function startOwnedDaemon(component, dataDir, ownerId) {
                     },
                     async stop() {
                         await stopVerifiedDaemon(endpoint, pid, 35_000);
+                        await rm(directory, { recursive: true, force: true }).catch(() => undefined);
                     },
                 };
                 await owned.check();
@@ -172,6 +178,83 @@ export async function stopOrphanDaemon(daemon) {
         if (code === 'ENOENT' || code === 'ECONNREFUSED')
             return;
         throw error;
+    }
+}
+const HOST_FILE = 'host.json';
+/** `<ownerHash>-<mkdtemp suffix>` directories created by startOwnedDaemon. */
+const DAEMON_DIRECTORY = /^[0-9a-f]{8}-[A-Za-z0-9]{6}$/;
+/** A directory touched this recently may belong to a launch that is still publishing its PID. */
+const LAUNCH_GRACE_MS = 60_000;
+/**
+ * Daemons are launched through LaunchServices and outlive a host that exits without stopping
+ * them. Stops profile daemons whose recorded host process has exited and removes directories
+ * whose daemon already exited. Daemons with a live or unrecorded host are left running.
+ */
+export async function reclaimProfileDaemons(dataDir) {
+    const root = path.join(await resolveProfileDataDir(dataDir), 'cu');
+    const summary = { stopped: 0, removed: 0, kept: 0, failed: 0 };
+    let names;
+    try {
+        names = await readdir(root);
+    }
+    catch (error) {
+        if (error.code === 'ENOENT')
+            return summary;
+        throw error;
+    }
+    await Promise.all(names
+        .filter((name) => DAEMON_DIRECTORY.test(name))
+        .map(async (name) => {
+        const outcome = await reclaimDaemonDirectory(path.join(root, name)).catch(() => 'failed');
+        summary[outcome]++;
+    }));
+    return summary;
+}
+async function reclaimDaemonDirectory(directory) {
+    const info = await lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink())
+        return 'kept';
+    const pid = await readPositiveInteger(path.join(directory, 'pid'));
+    if (pid === undefined || !alive(pid)) {
+        if (Date.now() - info.mtimeMs < LAUNCH_GRACE_MS)
+            return 'kept';
+        await rm(directory, { recursive: true, force: true });
+        return 'removed';
+    }
+    const host = await readHost(directory);
+    if (!host || alive(host.hostPid))
+        return 'kept';
+    // Identity is verified over the private endpoint; an unreachable endpoint never kills by PID.
+    await stopOrphanDaemon({ pid, endpoint: host.endpoint });
+    if (alive(pid))
+        return 'kept';
+    await rm(directory, { recursive: true, force: true });
+    return 'stopped';
+}
+async function readPositiveInteger(file) {
+    try {
+        const value = Number((await readFile(file, 'utf8')).trim());
+        return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+async function readHost(directory) {
+    try {
+        const value = JSON.parse(await readFile(path.join(directory, HOST_FILE), 'utf8'));
+        const { pid, endpoint } = value;
+        if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid < 1)
+            return undefined;
+        if (typeof endpoint !== 'string')
+            return undefined;
+        const expected = process.platform === 'win32'
+            ? endpoint.startsWith('\\\\.\\pipe\\minimax-cu-')
+            : endpoint === path.join(directory, 'd.sock');
+        return expected ? { hostPid: pid, endpoint } : undefined;
+    }
+    catch {
+        return undefined;
     }
 }
 async function stopVerifiedDaemon(endpoint, pid, timeoutMs) {

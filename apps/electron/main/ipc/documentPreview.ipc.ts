@@ -1,3 +1,4 @@
+import { savedPptFileAuthority } from "../modules/document-preview/saved-file-authority";
 import { sshProjectIdFromRuntimeId } from "@mavis/shared/desktop-runtime";
 import { shell, ipcMain, MessageChannelMain, BrowserWindow } from "electron";
 import { realpath, mkdir, mkdtemp, copyFile, rm } from "node:fs/promises";
@@ -438,6 +439,30 @@ export function setupDocumentPreviewIPC(options = {}) {
             return failure('cancelled', 'Document preview source opening was cancelled');
         if (input &&
             typeof input === 'object' &&
+            Object.prototype.hasOwnProperty.call(input, 'savedFileToken')) {
+            const claim = input;
+            if (legacy || event.senderFrame !== event.sender.mainFrame || Object.keys(claim).length !== 1)
+                return failure('invalid_request', 'Saved file authority must be exclusive');
+            const capability = await savedPptFileAuthority().resolve(claim.savedFileToken);
+            if (!capability?.file || !isCurrent())
+                return failure('source_outside_workspace', 'Saved file is not authorized');
+            const fileName = path.basename(capability.file.canonicalPath);
+            const opened = await orchestrator.openSource(event.sender.id, {
+                workspaceDir: capability.canonicalPath,
+                filePath: fileName,
+                fileName,
+                mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                workspaceCapability: capability,
+            }, event.sender);
+            if (!isCurrent()) {
+                if (opened.ok)
+                    await orchestrator.releaseSource(event.sender.id, opened.value.sourceId, event.sender);
+                return failure('cancelled', 'Saved file opening was cancelled');
+            }
+            return opened;
+        }
+        if (input &&
+            typeof input === 'object' &&
             Object.prototype.hasOwnProperty.call(input, 'selectedFileToken')) {
             const claim = input;
             if (legacy ||
@@ -455,6 +480,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                 fileName,
                 mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
                 workspaceCapability: capability,
+                readOnly: true,
             }, event.sender);
             if (!isCurrent() ||
                 resolveSelectedFile(event.sender, claim.selectedFileToken) !== capability) {
@@ -517,7 +543,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                         : {}),
                 ...(typeof sessionId === 'string' ? { sessionId } : {}),
             };
-        const opened = await openMethod(event.sender.id, mainOwnedInput, event.sender);
+        const opened = await openMethod(event.sender.id, { ...mainOwnedInput, pptEditingAllowed: !remote }, event.sender);
         if (!isCurrent()) {
             // A new renderer may already have opened other sources on this window.
             // Release only the stale request, not the current renderer's sources.

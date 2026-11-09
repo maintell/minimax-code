@@ -44,7 +44,13 @@ async function listedServerConfig(service, { server, toolName }) {
         throw new LocalMcpCallRefusedError('MCP_SERVER_UNAVAILABLE', `MCP server "${server}" is off`);
     }
     const lists = (tools) => tools.some((tool) => tool.name === toolName);
-    if (!lists(readConfiguredTools(config)) && !lists(await service.listToolsLive(server))) {
+    if (lists(readConfiguredTools(config)))
+        return config;
+    const live = await service.serverAuth.listToolsLive(server);
+    if (live.authError) {
+        throw new LocalMcpCallRefusedError('MCP_SERVER_UNAVAILABLE', `MCP server "${server}" requires authorization`, { cause: live.authError });
+    }
+    if (!lists(live.tools)) {
         throw new LocalMcpCallRefusedError('TOOL_REF_STALE', `MCP tool "${toolName}" is not listed`);
     }
     return config;

@@ -1,5 +1,5 @@
 import { HTTPException } from 'hono/http-exception';
-import { DesktopHookServiceBase } from './desktop-hook-service-base.js';
+import { DesktopMiniAppServiceBase } from './desktop-miniapp-service-base.js';
 import { CronContractError } from '../../service/cron/index.js'; // desktop-service-boundary-skip: anchor=server-cron-contract owner=cron reason=legacy-cron-rpc-glue-before-facade; followup=desktop-service-domain-facades
 import { jsonError } from './desktop-service-support.js';
 /**
@@ -29,7 +29,7 @@ function sandboxUnsupported(method) {
     };
 }
 /** Preserves stable unavailable responses for methods owned by the V2 front door. */
-export class DesktopUnavailableServiceBase extends DesktopHookServiceBase {
+export class DesktopUnavailableServiceBase extends DesktopMiniAppServiceBase {
     // 后台任务、Session 活动、下一句建议、权限模式与 Goal 都由 local-runtime-v2
     // 前门持有；旧链路保持 fail closed，不再长出第二个 owner。
     async listBackgroundTasks() {
@@ -82,6 +82,10 @@ export class DesktopUnavailableServiceBase extends DesktopHookServiceBase {
     }
     async recordPluginRecommendationDecline(_ctx, _req) {
         return this.unimplementedGeneratedMethod('recordPluginRecommendationDecline');
+    }
+    // The advisor selection belongs to the v2 ModelProviderController; v1 never serves it.
+    async selectAdvisorModel(_ctx, _req) {
+        return this.unimplementedGeneratedMethod('selectAdvisorModel');
     }
     // Session handoff state, cloud transport, and native file transfer are owned by
     // Local Runtime v2. Legacy hosts fail closed instead of creating a second owner.
@@ -309,6 +313,27 @@ export class DesktopUnavailableServiceBase extends DesktopHookServiceBase {
     testLocalMcpServer(..._args) {
         return this.unimplementedGeneratedMethod('testLocalMcpServer');
     }
+    setLocalMcpServerOAuthClientSecret(..._args) {
+        return this.unimplementedGeneratedMethod('setLocalMcpServerOAuthClientSecret');
+    }
+    listLocalMcpAuthStates(..._args) {
+        return this.unimplementedGeneratedMethod('listLocalMcpAuthStates');
+    }
+    testLocalMcpAuthTarget(..._args) {
+        return this.unimplementedGeneratedMethod('testLocalMcpAuthTarget');
+    }
+    startLocalMcpAuth(..._args) {
+        return this.unimplementedGeneratedMethod('startLocalMcpAuth');
+    }
+    cancelLocalMcpAuth(..._args) {
+        return this.unimplementedGeneratedMethod('cancelLocalMcpAuth');
+    }
+    completeLocalMcpAuth(..._args) {
+        return this.unimplementedGeneratedMethod('completeLocalMcpAuth');
+    }
+    clearLocalMcpAuth(..._args) {
+        return this.unimplementedGeneratedMethod('clearLocalMcpAuth');
+    }
     setSkillEnabled(..._args) {
         return this.unimplementedGeneratedMethod('SetSkillEnabled');
     }
@@ -399,6 +424,10 @@ export class DesktopUnavailableServiceBase extends DesktopHookServiceBase {
     }
     steerSession(..._args) {
         return this.unimplementedGeneratedMethod('SteerSession');
+    }
+    // Messages from sessions on other devices are admitted by the session controller.
+    sendRemoteMessage(..._args) {
+        return this.unimplementedGeneratedMethod('SendRemoteMessage');
     }
     // Composer send behavior and session source history are owned by Local
     // Runtime v2; legacy-only hosts expose the generated routes fail closed.

@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { buildGlobArgs, isDefaultBroadFileExcluded, isDefaultScanNoisePath, isSensitiveSearchPath, runRg, } from '@mavis/agent-tools/desktop';
 import { resolveWorkspaceCollectionPolicy, } from '../capture/collection-policy.js';
-import { appendGitWorkspacePaths } from './git-inventory.js';
+import { appendGitWorkspacePaths, INVENTORY_FILTER_SLICE_MS } from './git-inventory.js';
 import { fingerprintWorkspaceFiles, scanWorkspaceFiles, } from './workspace-scan-files.js';
 const DEFAULT_WORKSPACE_MAX_FILES = 10_000;
 const DEFAULT_WORKSPACE_MAX_TOTAL_BYTES = 100 * 1024 * 1024;
@@ -218,10 +219,18 @@ async function collectWorkspacePaths(input, isIncludedPath, policy, onWarning) {
         }
         return true;
     };
-    const rgPaths = result.stdout
-        .split('\0')
-        .map((value) => value.replaceAll('\\', '/'))
-        .filter(acceptPath);
+    const rgPaths = [];
+    let sliceStartedMs = performance.now();
+    for (const record of result.stdout.split('\0')) {
+        const value = record.replaceAll('\\', '/');
+        if (acceptPath(value))
+            rgPaths.push(value);
+        if (performance.now() - sliceStartedMs >= INVENTORY_FILTER_SLICE_MS) {
+            await yieldToEventLoop();
+            signal?.throwIfAborted();
+            sliceStartedMs = performance.now();
+        }
+    }
     if (result.stdoutLimitReached) {
         return {
             paths: rgPaths.slice(0, maxFiles + 1),

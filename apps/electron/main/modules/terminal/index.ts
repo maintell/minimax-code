@@ -99,7 +99,8 @@ export class TerminalManager {
         // Use login + interactive flags on Unix so user dotfiles run; on Windows
         // PowerShell we suppress the profile to keep startup deterministic.
         const args = computeShellArgs(shellInfo.isWindows, shellType);
-        const result = await this.createProgram(params.sessionId, {
+        // A reassignment while the cwd resolves moves this terminal along with the others.
+        const result = await this.createProgram(pending.sessionId, {
             command: shellPath,
             args,
             cwd,
@@ -185,6 +186,7 @@ export class TerminalManager {
             terminalId: id,
             title: record.title,
             shellType: record.shellType,
+            cwd: spawnCwd,
         };
     }
     /** Return metadata for every terminal owned by `sessionId`. */
@@ -198,6 +200,7 @@ export class TerminalManager {
                     title: t.title,
                     shellType: t.shellType,
                     exited: t.exited,
+                    cwd: t.cwd,
                 });
             }
         }
@@ -355,6 +358,18 @@ export class TerminalManager {
             else
                 this.runtimeSuspensions.set(runtimeId, remaining);
         };
+    }
+    /** Move live PTYs to a new owner, e.g. when a Home draft becomes a session. */
+    reassignSession(fromSessionId, toSessionId, runtimeId = LOCAL_DESKTOP_RUNTIME_ID) {
+        for (const t of this.terminals.values()) {
+            if (t.sessionId === fromSessionId && t.runtimeId === runtimeId)
+                t.sessionId = toSessionId;
+        }
+        for (const pending of this.pendingCreations) {
+            if (pending.sessionId === fromSessionId && pending.runtimeId === runtimeId) {
+                pending.sessionId = toSessionId;
+            }
+        }
     }
     /** Dispose every PTY belonging to `sessionId`. */
     disposeBySession(sessionId) {

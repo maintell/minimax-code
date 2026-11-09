@@ -14,11 +14,15 @@ export class ModelProviderApplication {
         const session = input.sessionId ? await this.deps.sessions.get(input.sessionId) : undefined;
         const config = this.deps.config();
         const state = await this.resolveListState(input.sessionId, session, config);
-        const models = listLocalRuntimeModels(config, state.catalogSelection, {
+        const models = listLocalRuntimeModels(this.deps.providers.modelCatalogConfig?.() ?? config, state.catalogSelection, {
             cache: this.deps.providers.loadCacheData(),
-            ...(this.deps.implicitCustomProviderThinking ? { implicitCustomProviderThinking: true } : {}),
+            ...(this.deps.implicitCustomProviderThinking
+                ? { implicitCustomProviderThinking: true }
+                : {}),
         });
-        const catalog = models.filter((model) => !isLegacyMinimaxProvider(config, model.providerId));
+        // Stale extension catalogs (account changed/signed out) must not offer the old subject's models.
+        const unavailable = this.deps.providers.unavailableModelAccessProviderIds?.() ?? new Set();
+        const catalog = models.filter((model) => !isLegacyMinimaxProvider(config, model.providerId) && !unavailable.has(model.providerId));
         return state.bypassStoredProjection ? catalog : projectStoredParameters(catalog, state.stored);
     }
     async resolveListState(sessionId, session, config) {
@@ -99,10 +103,10 @@ export class ModelProviderApplication {
         }
         this.assertModelAvailable(providerId, modelId);
         this.deps.providers.assertModelSelectable(providerId, modelId);
-        const catalogEntry = listLocalRuntimeModels(this.deps.config(), undefined, {
+        const catalogEntry = listLocalRuntimeModels(this.catalogConfig(), undefined, {
             cache: this.deps.providers.loadCacheData(),
         }).find((entry) => entry.providerId === providerId && entry.modelId === modelId);
-        selection = normalizeRequestedParameters(this.deps.config(), { ...selection, providerId, modelId }, catalogEntry);
+        selection = normalizeRequestedParameters(this.catalogConfig(), { ...selection, providerId, modelId }, catalogEntry);
         const modelKey = formatModelKey(providerId, modelId);
         if (selection.sessionId) {
             if (session?.sessionKind === 'channel') {
@@ -140,13 +144,19 @@ export class ModelProviderApplication {
     replaceStaleSelection(input) {
         const replacement = resolveLegacyMinimaxModel(this.deps.config(), input);
         const retired = replacement ? undefined : this.retiredModelReplacement(input);
-        const model = replacement ?? retired;
+        const model = replacement ?? retired?.model;
         if (!model)
             return { selection: input };
         return {
             ...(replacement ? { replacement } : {}),
             ...(retired
-                ? { replacedFrom: { providerId: input.providerId.trim(), modelId: input.modelId.trim() } }
+                ? {
+                    replacedFrom: {
+                        providerId: input.providerId.trim(),
+                        modelId: input.modelId.trim(),
+                        ...(retired.cause === 'unavailable' ? { reason: 'unavailable' } : {}),
+                    },
+                }
                 : {}),
             selection: { ...model, sessionId: input.sessionId, thinking: null },
         };
@@ -164,7 +174,38 @@ export class ModelProviderApplication {
             preset: getRuntimePresetKey(),
             fallbacks: [parseSourceQualifiedModelKey(config.defaultModel)],
         });
-        return outcome.kind === 'replaced' ? outcome.model : undefined;
+        return outcome.kind === 'replaced' ? { model: outcome.model, cause: outcome.cause } : undefined;
+    }
+    /**
+     * Rewrites a saved default model whose agent model access provider is withdrawn (this
+     * build does not ship model access, or the server turned it off), like a retired official
+     * default: written back once and announced with `reason: 'unavailable'`. Best effort; the
+     * Turn gate replaces it on use either way.
+     */
+    async replaceUnavailableDefaultModel() {
+        const config = this.deps.config();
+        const saved = parseSourceQualifiedModelKey(config.defaultModel);
+        if (!saved)
+            return;
+        const outcome = resolveModelReplacement({
+            config,
+            providerId: saved.providerId,
+            modelId: saved.modelId,
+            preset: getRuntimePresetKey(),
+        });
+        if (outcome.kind !== 'replaced' || outcome.cause !== 'unavailable')
+            return;
+        try {
+            // No variant/effort/context: they belonged to the withdrawn model.
+            await this.deps.setDefaultModel(formatModelKey(outcome.model.providerId, outcome.model.modelId));
+        }
+        catch {
+            return;
+        }
+        this.publishDefaultModelChanged({ ...saved, reason: 'unavailable' });
+    }
+    catalogConfig() {
+        return this.deps.providers.modelCatalogConfig?.() ?? this.deps.config();
     }
     publishDefaultModelChanged(replacedFrom) {
         const saved = this.deps.config();
@@ -261,7 +302,7 @@ export class ModelProviderApplication {
     }
     assertModelAvailable(providerId, modelId) {
         const availability = resolveModelAvailability({
-            config: this.deps.config(),
+            config: this.catalogConfig(),
             providerId,
             modelId,
             preset: getRuntimePresetKey(),

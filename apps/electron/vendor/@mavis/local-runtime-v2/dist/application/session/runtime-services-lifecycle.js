@@ -1,13 +1,160 @@
+import { createModelAccessExtensionTool } from '../../service/model-access-extension/index.js';
 import { settleInBackground, } from '../../service/plugin-system/index.js';
 import { abortLocalPluginHookSessionTurn, endLocalPluginHookSession, } from '../../service/turn-system/index.js';
 import { createRuntimeGlobalEventWriter, } from '../events.js';
 import { resolvePluginServiceLogger } from './plugin-service-logger.js';
 import { createStartupRecoveryRunner, } from './startup-recovery.js';
 import { describeError } from './turn-message-delivery.js';
+import { ModelAccessApplication } from './model-access-application.js';
+export function createModelAccessComposition(modelAccess, delivery) {
+    const admission = { ready: false };
+    let revoked = false;
+    return {
+        resolution: {
+            requests: modelAccess.requests,
+            subscriptionAllowed: (providerKey) => modelAccess.subscriptionAllowed?.(providerKey) !== false,
+            withdrawn: (extensionProviderId, installationId) => modelAccess.withdrawn?.(extensionProviderId, installationId) === true,
+            dependenciesReady: () => admission.ready,
+            bindings: modelAccess.bindingFacts,
+            installationActive: (installationId) => modelAccess.registry.get(installationId) !== undefined,
+            // Withheld while the server switch is off: no tool, no authoring Skill in the catalog.
+            extensionTool: () => modelAccess.remotePolicy.serviceDisabled()
+                ? undefined
+                : createModelAccessExtensionTool(modelAccess),
+            onCredentialsMigrated: (listener) => modelAccess.onCredentialsMigrated(listener),
+        },
+        markReady: () => {
+            if (!revoked)
+                admission.ready = true;
+        },
+        revoke: () => {
+            revoked = true;
+            admission.ready = false;
+        },
+        lifecycle: (deps) => composeModelAccessRuntimeLifecycle({
+            ...deps,
+            admission,
+            modelAccess,
+            delivery,
+            onRemoteRulesChanged: (listener) => modelAccess.remotePolicy?.onChange?.(listener),
+            onDevRequestsChanged: (listener) => modelAccess.userPackages.onChange(listener),
+        }),
+        /** Remote delivery re-checks on identity changes; inert for owners without delivery. */
+        authContextChanged: () => delivery?.authContextChanged(),
+        /** The client's swim lane changed: remote delivery asks the new lane. */
+        laneChanged: () => delivery?.laneChanged(),
+        services: (providers) => ({
+            modelAccess,
+            modelAccessApplication: new ModelAccessApplication({
+                packages: modelAccess,
+                providers,
+                ready: () => admission.ready,
+                ...(delivery?.control ? { delivery: delivery.control } : {}),
+            }),
+        }),
+    };
+}
+/**
+ * `beta.modelAccess` is off: no owner, no delivery and no resolver port. The
+ * remaining runtime owners keep the same lifecycle.
+ */
+export function createDisabledModelAccessComposition() {
+    return {
+        markReady: () => { },
+        revoke: () => { },
+        lifecycle: (deps) => composeModelAccessRuntimeLifecycle({
+            ...deps,
+            admission: { ready: false },
+            modelAccess: { close: async () => { } },
+        }),
+        authContextChanged: () => { },
+        laneChanged: () => { },
+        services: () => ({}),
+    };
+}
+/** Cancel both title owners before awaiting either one's non-cooperative work. */
+export async function closeRuntimeTitles(titles, archiveTitle) {
+    const results = await Promise.allSettled([titles.close(), archiveTitle?.close()]);
+    for (const result of results) {
+        if (result.status === 'rejected')
+            throw result.reason;
+    }
+}
+export function composeModelAccessRuntimeLifecycle(input) {
+    let closed = false;
+    let unsubscribe;
+    let unsubscribeRequests;
+    const replaceDefault = () => {
+        if (closed || !input.replaceUnavailableDefaultModel)
+            return;
+        settleInBackground(input.replaceUnavailableDefaultModel());
+    };
+    return {
+        ready: async () => {
+            if (closed)
+                return;
+            try {
+                await input.promptLifecycle.ready();
+                if (!closed)
+                    input.modelAccessRelistLifecycle?.start();
+                // Background only: delivery failures never block runtime readiness.
+                if (!closed)
+                    input.delivery?.start();
+                if (!closed) {
+                    replaceDefault();
+                    unsubscribe ??= input.onRemoteRulesChanged?.(replaceDefault);
+                    const publish = input.writeGlobalEvent;
+                    if (publish)
+                        unsubscribeRequests ??= input.onDevRequestsChanged?.((sessionId) => publish({
+                            type: 'model_access.dev_requests_updated',
+                            payload: sessionId ? { sessionId } : {},
+                        }));
+                }
+            }
+            catch (error) {
+                input.admission.ready = false;
+                throw error;
+            }
+        },
+        close: async () => {
+            closed = true;
+            unsubscribe?.();
+            unsubscribeRequests?.();
+            input.admission.ready = false;
+            // Stop delivery first so no sync mutates packages while the owner drains.
+            try {
+                await input.delivery?.close();
+            }
+            catch {
+                /* Delivery bookkeeping is best effort. */
+            }
+            // Cancel native requests concurrently with session drain, before awaiting consumers.
+            const drains = [input.promptLifecycle.close(), input.modelAccess.close()];
+            const results = await Promise.allSettled([
+                ...drains,
+                (async () => {
+                    await input.modelAccessRelistLifecycle?.close();
+                })(),
+            ]);
+            const failures = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+            for (const close of [() => input.hookPermissions.close(), () => input.safety.close()]) {
+                try {
+                    await close();
+                }
+                catch (error) {
+                    failures.push(error);
+                }
+            }
+            if (failures.length > 0)
+                throw failures[0];
+        },
+    };
+}
 export async function closeRuntimeServiceOwnersAfterFailure(input) {
     for (const close of [
         () => input.cron?.close(),
         () => input.memory?.close(),
+        () => closeRuntimeTitles(input.sessionSystem.titles, input.archiveTitle),
         () => input.turnSystem?.close(),
         () => input.plugin?.close(),
         () => input.skillSystem?.close(),
@@ -79,7 +226,7 @@ export function startupRecoveryInputs(goal, options, runtimeConversation) {
  * The RuntimeServices startup recovery surface. Recovery steps use the Goal and
  * Turn owners, so close stops recovery before `closeOwners` releases them.
  */
-export function startupRecoveryControls(lifecycle, closeOwners) {
+export function startupRecoveryControls(lifecycle, closeOwners, beginClose) {
     let closePromise;
     const close = async () => {
         await lifecycle.stopStartupRecovery();
@@ -89,6 +236,8 @@ export function startupRecoveryControls(lifecycle, closeOwners) {
         startStartupRecovery: lifecycle.startStartupRecovery,
         stopStartupRecovery: () => settleInBackground(lifecycle.stopStartupRecovery()),
         close: () => {
+            if (!closePromise)
+                beginClose?.();
             closePromise ??= close();
             return closePromise;
         },
@@ -206,6 +355,7 @@ export function createRuntimeServicesLifecycle(input) {
             unbindV1GlobalEventPublisher,
             () => Promise.resolve(input.cron?.close()),
             () => Promise.resolve(input.memory?.close()),
+            () => Promise.resolve(input.closeTitles?.()),
             () => Promise.resolve(input.turnSystem.close()),
             () => Promise.resolve(input.closeBrowserUse?.()),
             () => Promise.resolve(input.disposePluginHookSessions?.()),
@@ -253,6 +403,7 @@ function createRuntimeReadySteps(input, recoverPersistedState, bindGlobalEventPu
         () => input.mcp.ready(),
         () => input.skillSystem.ready(),
         () => input.plugin.ready(),
+        () => input.readyModelAccess?.(),
         () => input.memory?.ready(),
         () => recoverPendingForksFailSoft(input),
         () => initializeSandboxWithoutBlockingStartup(input),
@@ -419,5 +570,12 @@ export async function closeRuntimeServiceResources(promptLifecycle, hookPermissi
             await safety.close();
         }
     }
+}
+/** Closes owners in order; every owner is closed even when an earlier one fails. */
+export function closeRuntimeOwners(sessionClio, miniApp, goal) {
+    sessionClio?.close();
+    // Stop Goal account-quota recovery timers; the durable rows keep each schedule.
+    goal.close();
+    return miniApp.close();
 }
 //# sourceMappingURL=runtime-services-lifecycle.js.map

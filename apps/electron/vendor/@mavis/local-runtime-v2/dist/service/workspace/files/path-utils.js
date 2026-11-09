@@ -4,19 +4,31 @@ import { join, resolve } from 'node:path';
 export function toPortableRelativePath(input) {
     return input.replace(/\\/gu, '/');
 }
-export function resolvePath(input) {
-    let path = input.startsWith('~') ? join(homedir(), input.slice(1)) : input;
-    // Convert MSYS-style paths (/c/Users/...) to Windows paths (C:\Users\...) on win32.
-    // Git Bash translates Windows paths to this format, and models may include them in
-    // tool results. Node's path.resolve() would otherwise produce C:\c\Users\....
-    if (process.platform === 'win32') {
-        const msysMatch = path.match(/^\/([a-zA-Z])(\/.*)?$/);
-        if (msysMatch) {
-            const drive = (msysMatch[1] ?? '').toUpperCase();
-            const rest = msysMatch[2]?.replace(/\//g, '\\') ?? '\\';
-            path = `${drive}:${rest}`;
-        }
+/**
+ * Convert Windows drive spellings that Node cannot resolve into native paths on win32:
+ * - MSYS paths (/c/Users/...) from Git Bash output;
+ * - file-URI style drive paths (/D:/work/...) that models write in Markdown links.
+ * Node's path.resolve() would otherwise produce C:\c\Users\... or C:\D:\work\....
+ * Other platforms keep the input unchanged.
+ */
+export function toNativeWindowsDrivePath(input) {
+    if (process.platform !== 'win32')
+        return input;
+    const slashDriveMatch = input.match(/^\/([a-zA-Z]):([\\/].*)$/u);
+    if (slashDriveMatch) {
+        const drive = (slashDriveMatch[1] ?? '').toUpperCase();
+        return `${drive}:${(slashDriveMatch[2] ?? '\\').replace(/\//gu, '\\')}`;
     }
-    return resolve(path);
+    const msysMatch = input.match(/^\/([a-zA-Z])(\/.*)?$/u);
+    if (msysMatch) {
+        const drive = (msysMatch[1] ?? '').toUpperCase();
+        const rest = msysMatch[2]?.replace(/\//gu, '\\') ?? '\\';
+        return `${drive}:${rest}`;
+    }
+    return input;
+}
+export function resolvePath(input) {
+    const path = input.startsWith('~') ? join(homedir(), input.slice(1)) : input;
+    return resolve(toNativeWindowsDrivePath(path));
 }
 //# sourceMappingURL=path-utils.js.map

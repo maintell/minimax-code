@@ -15,6 +15,12 @@ export function withOpenCodeGoHeaders(baseUrl, headers, sessionId) {
     merged['user-agent'] = MINIMAX_CODE_USER_AGENT;
     return merged;
 }
+/**
+ * Official Go roots. models.dev moved Go from `/zen/go` to per-protocol
+ * `/inference/go/*` endpoints; both still require a session header, and
+ * saved providers may keep either root.
+ */
+const OPENCODE_GO_PATH_ROOTS = ['/zen/go', '/inference/go'];
 function isOpenCodeGoUrl(value) {
     if (!value)
         return false;
@@ -22,7 +28,7 @@ function isOpenCodeGoUrl(value) {
         const url = new URL(value);
         return (url.protocol === 'https:' &&
             url.hostname === 'opencode.ai' &&
-            (url.pathname === '/zen/go' || url.pathname.startsWith('/zen/go/')));
+            OPENCODE_GO_PATH_ROOTS.some((root) => url.pathname === root || url.pathname.startsWith(`${root}/`)));
     }
     catch {
         return false;

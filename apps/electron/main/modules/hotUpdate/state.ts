@@ -12,6 +12,7 @@ export function createDefaultState() {
         enabled: true,
         channel: null,
         locale: null,
+        branchKey: null,
         appVersion: null,
         shellFingerprint: null,
         latestManifestVersion: null,
@@ -53,6 +54,7 @@ export function readState(hotUpdateDir) {
         return state;
     state.channel = stringOrNull(record.channel);
     state.locale = stringOrNull(record.locale);
+    state.branchKey = stringOrNull(record.branchKey);
     state.appVersion = stringOrNull(record.appVersion);
     state.shellFingerprint = stringOrNull(record.shellFingerprint);
     state.active = stringOrNull(record.active);

@@ -8,6 +8,9 @@
     ".": {
       "import": "./dist/index.js"
     },
+    "./oauth": {
+      "import": "./dist/oauth.js"
+    },
     "./runtime/connection-pool": {
       "import": "./dist/runtime/connection-pool.js"
     },

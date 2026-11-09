@@ -20,11 +20,14 @@ let documentSession;
 const cancelledRequestIds = new Set();
 
 function logPerformanceStage(stage, startedAt, counts = {}) {
-  console.info('[PPTX Core][performance]', JSON.stringify({
-    stage,
-    durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
-    ...counts,
-  }));
+  console.info(
+    '[PPTX Core][performance]',
+    JSON.stringify({
+      stage,
+      durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+      ...counts,
+    }),
+  );
 }
 
 try {
@@ -452,9 +455,13 @@ self.addEventListener('message', async (event) => {
   }
   if (input.kind === 'get-slide-animation') {
     if (
-      terminal || !documentSession || input.revision !== documentSession.summary.revision ||
-      typeof input.requestId !== 'string' || !Number.isSafeInteger(input.slideIndex) ||
-      input.slideIndex < 0 || input.slideIndex >= documentSession.summary.slideCount
+      terminal ||
+      !documentSession ||
+      input.revision !== documentSession.summary.revision ||
+      typeof input.requestId !== 'string' ||
+      !Number.isSafeInteger(input.slideIndex) ||
+      input.slideIndex < 0 ||
+      input.slideIndex >= documentSession.summary.slideCount
     ) {
       fail('invalid_source_archive', 'The slide animation request is invalid', 'request_invalid');
       return;
@@ -463,17 +470,27 @@ self.addEventListener('message', async (event) => {
       const animation = await documentSession.getSlideAnimation(input.slideIndex);
       self.postMessage({ kind: 'slide-animation', requestId: input.requestId, animation });
     } catch (error) {
-      self.postMessage({ kind: 'render-failed', requestId: input.requestId, error: {
-        schema: 'mavis.preview_error.v1', code: 'invalid_source_archive',
-        message: error instanceof Error ? error.message : 'Slide animation compilation failed', retryable: false, ...errorTrace(error),
-      } });
+      self.postMessage({
+        kind: 'render-failed',
+        requestId: input.requestId,
+        error: {
+          schema: 'mavis.preview_error.v1',
+          code: 'invalid_source_archive',
+          message: error instanceof Error ? error.message : 'Slide animation compilation failed',
+          retryable: false,
+          ...errorTrace(error),
+        },
+      });
     }
     return;
   }
   if (input.kind === 'get-slide-notes') {
     if (
-      terminal || !documentSession || input.revision !== documentSession.summary.revision ||
-      typeof input.requestId !== 'string' || typeof input.slideId !== 'string' ||
+      terminal ||
+      !documentSession ||
+      input.revision !== documentSession.summary.revision ||
+      typeof input.requestId !== 'string' ||
+      typeof input.slideId !== 'string' ||
       !documentSession.summary.slides.some((slide) => slide.nodeId === input.slideId)
     ) {
       fail('invalid_source_archive', 'The slide notes request is invalid', 'request_invalid');
@@ -486,18 +503,28 @@ self.addEventListener('message', async (event) => {
       }
     } catch (error) {
       if (!cancelledRequestIds.delete(input.requestId)) {
-        self.postMessage({ kind: 'render-failed', requestId: input.requestId, error: {
-          schema: 'mavis.preview_error.v1', code: 'render_failed',
-          message: error instanceof Error ? error.message : 'Slide notes read failed', retryable: false, ...errorTrace(error),
-        } });
+        self.postMessage({
+          kind: 'render-failed',
+          requestId: input.requestId,
+          error: {
+            schema: 'mavis.preview_error.v1',
+            code: 'render_failed',
+            message: error instanceof Error ? error.message : 'Slide notes read failed',
+            retryable: false,
+            ...errorTrace(error),
+          },
+        });
       }
     }
     return;
   }
   if (input.kind === 'search-text') {
     if (
-      terminal || !documentSession || input.revision !== documentSession.summary.revision ||
-      typeof input.requestId !== 'string' || typeof input.query !== 'string'
+      terminal ||
+      !documentSession ||
+      input.revision !== documentSession.summary.revision ||
+      typeof input.requestId !== 'string' ||
+      typeof input.query !== 'string'
     ) {
       fail('invalid_source_archive', 'The text search request is invalid', 'request_invalid');
       return;
@@ -509,19 +536,30 @@ self.addEventListener('message', async (event) => {
       }
     } catch (error) {
       if (!cancelledRequestIds.delete(input.requestId)) {
-        self.postMessage({ kind: 'render-failed', requestId: input.requestId, error: {
-          schema: 'mavis.preview_error.v1', code: 'render_failed',
-          message: error instanceof Error ? error.message : 'Text search failed', retryable: false, ...errorTrace(error),
-        } });
+        self.postMessage({
+          kind: 'render-failed',
+          requestId: input.requestId,
+          error: {
+            schema: 'mavis.preview_error.v1',
+            code: 'render_failed',
+            message: error instanceof Error ? error.message : 'Text search failed',
+            retryable: false,
+            ...errorTrace(error),
+          },
+        });
       }
     }
     return;
   }
   if (input.kind === 'get-slide-selection-model') {
     if (
-      terminal || !documentSession || input.revision !== documentSession.summary.revision ||
-      typeof input.requestId !== 'string' || !Number.isSafeInteger(input.slideIndex) ||
-      input.slideIndex < 0 || input.slideIndex >= documentSession.summary.slideCount
+      terminal ||
+      !documentSession ||
+      input.revision !== documentSession.summary.revision ||
+      typeof input.requestId !== 'string' ||
+      !Number.isSafeInteger(input.slideIndex) ||
+      input.slideIndex < 0 ||
+      input.slideIndex >= documentSession.summary.slideCount
     ) {
       fail('invalid_source_archive', 'The slide selection request is invalid', 'request_invalid');
       return;
@@ -533,24 +571,151 @@ self.addEventListener('message', async (event) => {
       }
     } catch (error) {
       if (!cancelledRequestIds.delete(input.requestId)) {
-        self.postMessage({ kind: 'render-failed', requestId: input.requestId, error: {
-          schema: 'mavis.preview_error.v1', code: 'render_failed',
-          message: error instanceof Error ? error.message : 'Slide selection model failed', retryable: false, ...errorTrace(error),
-        } });
+        self.postMessage({
+          kind: 'render-failed',
+          requestId: input.requestId,
+          error: {
+            schema: 'mavis.preview_error.v1',
+            code: 'render_failed',
+            message: error instanceof Error ? error.message : 'Slide selection model failed',
+            retryable: false,
+            ...errorTrace(error),
+          },
+        });
       }
+    }
+    return;
+  }
+  if (input.kind === 'editing-action') {
+    if (terminal || !documentSession || typeof input.requestId !== 'string') return;
+    try {
+      let result;
+      const action = input.action;
+      switch (action?.action) {
+        case 'picture-data':
+          result = await documentSession.readEditingPicture(
+            action.objectId,
+            action.expectedVersion,
+          );
+          break;
+        case 'clipboard-export':
+          result = await documentSession.exportEditingClipboard(
+            action.kind,
+            action.targetIds,
+            action.expectedRevision,
+          );
+          break;
+        case 'clipboard-paste':
+          result = await documentSession.pasteEditingClipboard(
+            action.snapshot,
+            action.targetId,
+            action.expectedRevision,
+            action.position,
+            action.anchor,
+          );
+          break;
+        case 'register-resource':
+          result = await documentSession.registerEditingResource(
+            action.contentType,
+            action.bytes,
+            action.sha256,
+          );
+          break;
+        case 'animation-preview':
+          result = action.evaluation
+            ? await documentSession.evaluateSlideAnimation(
+                action.slideIndex,
+                action.evaluation.baseRenderHash,
+                action.evaluation.eventLog,
+                action.evaluation.logicalTimeMs,
+                action.evaluation.generation,
+                action.timingId,
+              )
+            : await documentSession.getSlideAnimation(action.slideIndex, action.timingId);
+          break;
+        case 'prepare-editing':
+          if (action.mode !== 'basic' && action.mode !== 'full')
+            throw new Error('invalid_transaction');
+          result = await documentSession.prepareEditing(action.mode);
+          break;
+        case 'chart-capability':
+          result = await documentSession.ensureChartCapability(
+            action.objectId,
+            action.expectedVersion,
+          );
+          break;
+        case 'state':
+          result = await documentSession.getEditingState(action.slideIndex);
+          break;
+        case 'execute':
+          documentSession.executeEditingTransaction(action.transaction, action.slideIndex);
+          result = await documentSession.fitEditedTableRows(action.slideIndex);
+          break;
+        case 'undo':
+          result = documentSession.undoEditing(action.expectedRevision, action.slideIndex);
+          break;
+        case 'redo':
+          result = documentSession.redoEditing(action.expectedRevision, action.slideIndex);
+          break;
+        case 'discard':
+          result = documentSession.discardEditing(action.expectedRevision);
+          break;
+        case 'prepare-save':
+          result = await documentSession.prepareEditingSave();
+          break;
+        case 'commit-save':
+          documentSession.commitEditingSave(action.revision, action.sourceSha256);
+          result = await documentSession.getEditingState();
+          break;
+        default:
+          throw new Error('invalid_transaction');
+      }
+      self.postMessage({
+        kind: 'editing-result',
+        requestId: input.requestId,
+        result,
+        summary: documentSession.summary,
+      });
+    } catch (error) {
+      const code =
+        error instanceof Error &&
+        [
+          'invalid_transaction',
+          'conflict',
+          'scope_violation',
+          'unsupported_edit',
+          'capability_pending',
+          'unsupported_formula',
+          'history_empty',
+          'source_mutated',
+          'resource_limit_exceeded',
+        ].includes(error.message)
+          ? error.message
+          : 'unsupported_edit';
+      self.postMessage({ kind: 'editing-error', requestId: input.requestId, errorCode: code });
     }
     return;
   }
   if (input.kind === 'selection-resource') {
     if (
-      terminal || !documentSession || input.revision !== documentSession.summary.revision ||
-      typeof input.requestId !== 'string' || typeof input.resourceId !== 'string'
+      terminal ||
+      !documentSession ||
+      input.revision !== documentSession.summary.revision ||
+      typeof input.requestId !== 'string' ||
+      typeof input.resourceId !== 'string'
     ) {
-      fail('invalid_source_archive', 'The selection resource request is invalid', 'request_invalid');
+      fail(
+        'invalid_source_archive',
+        'The selection resource request is invalid',
+        'request_invalid',
+      );
       return;
     }
     try {
-      const resource = await documentSession.readSelectionResource(input.resourceId, input.revision);
+      const resource = await documentSession.readSelectionResource(
+        input.resourceId,
+        input.revision,
+      );
       if (!cancelledRequestIds.delete(input.requestId)) {
         self.postMessage({ kind: 'selection-resource', requestId: input.requestId, resource }, [
           resource.bytes,
@@ -558,10 +723,17 @@ self.addEventListener('message', async (event) => {
       }
     } catch (error) {
       if (!cancelledRequestIds.delete(input.requestId)) {
-        self.postMessage({ kind: 'render-failed', requestId: input.requestId, error: {
-          schema: 'mavis.preview_error.v1', code: 'render_failed',
-          message: error instanceof Error ? error.message : 'Selection resource failed', retryable: false, ...errorTrace(error),
-        } });
+        self.postMessage({
+          kind: 'render-failed',
+          requestId: input.requestId,
+          error: {
+            schema: 'mavis.preview_error.v1',
+            code: 'render_failed',
+            message: error instanceof Error ? error.message : 'Selection resource failed',
+            retryable: false,
+            ...errorTrace(error),
+          },
+        });
       }
     }
     return;
@@ -569,50 +741,99 @@ self.addEventListener('message', async (event) => {
   if (input.kind === 'evaluate-animation') {
     const eventLog = input.eventLog;
     if (
-      terminal || !documentSession || input.revision !== documentSession.summary.revision ||
-      typeof input.requestId !== 'string' || !Number.isSafeInteger(input.slideIndex) ||
-      input.slideIndex < 0 || input.slideIndex >= documentSession.summary.slideCount ||
-      typeof input.baseRenderHash !== 'string' || !Number.isSafeInteger(input.logicalTimeMs) ||
-      input.logicalTimeMs < 0 || !Number.isSafeInteger(input.generation) || input.generation < 0 ||
-      !eventLog || eventLog.schema !== 'mavis.pptx_playback_event_log.v1' ||
-      eventLog.slideEnteredAtMs !== 0 || !Array.isArray(eventLog.events) || eventLog.events.length > 100000
+      terminal ||
+      !documentSession ||
+      input.revision !== documentSession.summary.revision ||
+      typeof input.requestId !== 'string' ||
+      !Number.isSafeInteger(input.slideIndex) ||
+      input.slideIndex < 0 ||
+      input.slideIndex >= documentSession.summary.slideCount ||
+      typeof input.baseRenderHash !== 'string' ||
+      !Number.isSafeInteger(input.logicalTimeMs) ||
+      input.logicalTimeMs < 0 ||
+      !Number.isSafeInteger(input.generation) ||
+      input.generation < 0 ||
+      !eventLog ||
+      eventLog.schema !== 'mavis.pptx_playback_event_log.v1' ||
+      eventLog.slideEnteredAtMs !== 0 ||
+      !Array.isArray(eventLog.events) ||
+      eventLog.events.length > 100000
     ) {
-      fail('invalid_source_archive', 'The animation evaluation request is invalid', 'request_invalid');
+      fail(
+        'invalid_source_archive',
+        'The animation evaluation request is invalid',
+        'request_invalid',
+      );
       return;
     }
     try {
       const evaluation = await documentSession.evaluateSlideAnimation(
-        input.slideIndex, input.baseRenderHash, eventLog, input.logicalTimeMs, input.generation,
+        input.slideIndex,
+        input.baseRenderHash,
+        eventLog,
+        input.logicalTimeMs,
+        input.generation,
       );
       self.postMessage({ kind: 'animation-evaluation', requestId: input.requestId, evaluation });
     } catch (error) {
-      self.postMessage({ kind: 'render-failed', requestId: input.requestId, error: {
-        schema: 'mavis.preview_error.v1', code: 'render_failed',
-        message: error instanceof Error ? error.message : 'Animation evaluation failed', retryable: false, ...errorTrace(error),
-      } });
+      self.postMessage({
+        kind: 'render-failed',
+        requestId: input.requestId,
+        error: {
+          schema: 'mavis.preview_error.v1',
+          code: 'render_failed',
+          message: error instanceof Error ? error.message : 'Animation evaluation failed',
+          retryable: false,
+          ...errorTrace(error),
+        },
+      });
     }
     return;
   }
   if (input.kind === 'evaluate-transition') {
     if (
-      terminal || !documentSession || input.revision !== documentSession.summary.revision ||
-      typeof input.requestId !== 'string' || !Number.isSafeInteger(input.fromSlideIndex) ||
-      !Number.isSafeInteger(input.toSlideIndex) || !Number.isSafeInteger(input.logicalTimeMs) ||
-      input.logicalTimeMs < 0 || !input.surfaces || typeof input.surfaces !== 'object'
+      terminal ||
+      !documentSession ||
+      input.revision !== documentSession.summary.revision ||
+      typeof input.requestId !== 'string' ||
+      !Number.isSafeInteger(input.fromSlideIndex) ||
+      !Number.isSafeInteger(input.toSlideIndex) ||
+      !Number.isSafeInteger(input.logicalTimeMs) ||
+      input.logicalTimeMs < 0 ||
+      !input.surfaces ||
+      typeof input.surfaces !== 'object'
     ) {
-      fail('invalid_source_archive', 'The transition evaluation request is invalid', 'request_invalid');
+      fail(
+        'invalid_source_archive',
+        'The transition evaluation request is invalid',
+        'request_invalid',
+      );
       return;
     }
     try {
       const evaluation = await documentSession.evaluateSlideTransition(
-        input.fromSlideIndex, input.toSlideIndex, input.logicalTimeMs, input.surfaces,
+        input.fromSlideIndex,
+        input.toSlideIndex,
+        input.logicalTimeMs,
+        input.surfaces,
       );
-      self.postMessage({ kind: evaluation ? 'transition-evaluation' : 'transition-none', requestId: input.requestId, evaluation });
+      self.postMessage({
+        kind: evaluation ? 'transition-evaluation' : 'transition-none',
+        requestId: input.requestId,
+        evaluation,
+      });
     } catch (error) {
-      self.postMessage({ kind: 'render-failed', requestId: input.requestId, error: {
-        schema: 'mavis.preview_error.v1', code: 'render_failed',
-        message: error instanceof Error ? error.message : 'Transition evaluation failed', retryable: false, ...errorTrace(error),
-      } });
+      self.postMessage({
+        kind: 'render-failed',
+        requestId: input.requestId,
+        error: {
+          schema: 'mavis.preview_error.v1',
+          code: 'render_failed',
+          message: error instanceof Error ? error.message : 'Transition evaluation failed',
+          retryable: false,
+          ...errorTrace(error),
+        },
+      });
     }
     return;
   }

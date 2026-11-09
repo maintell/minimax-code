@@ -82,12 +82,11 @@ export function isRequestMediaRejection(message) {
             isLLMRequestTooLargeMessage(message.errorMessage)));
 }
 /**
- * Thinking signatures of prefix-cached models are bound to the exact system
- * prompt, tools and history they were produced on. A compaction changes them
- * (its summary request has its own system prompt and no tools; an archive
- * rewrites earlier messages), so every thinking block (redacted ones included)
- * is removed while the other blocks of each turn stay. Messages without
- * thinking keep their identity.
+ * Thinking signatures of prefix-bound models are tied to the exact system
+ * prompt, tools and history they were produced on. The isolated summary request
+ * has its own system prompt and no tools, so every thinking block (redacted
+ * ones included) is removed from that request copy while the other blocks of
+ * each turn stay. Messages without thinking keep their identity.
  */
 export function withoutThinking(messages) {
     return messages.map((message) => {
@@ -104,12 +103,6 @@ export function omittedRequestImageText(path) {
     return path
         ? `[Earlier image omitted ${scope}. Original file: ${path}]`
         : `[Earlier image omitted ${scope}. Capture it again if the current visual state is needed.]`;
-}
-/** Receipt for an image compaction moved out of history. */
-export function archivedImageText(path) {
-    return path
-        ? `[Earlier image removed by context compaction. File: ${path}]`
-        : '[Earlier image removed by context compaction. Capture it again if the current visual state is needed.]';
 }
 /** Stands in for an image a checkpoint summary request does not carry. */
 export function checkpointImageText(path) {

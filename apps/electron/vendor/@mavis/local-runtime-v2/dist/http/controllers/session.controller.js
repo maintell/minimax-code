@@ -6,6 +6,7 @@ export class SessionController extends SessionControllerBase {
     cronDelivery;
     conversation;
     sessionActivity;
+    remoteMessage;
     constructor(options = {}) {
         super();
         if (options.applications)
@@ -16,6 +17,8 @@ export class SessionController extends SessionControllerBase {
             this.conversation = options.conversation;
         if (options.sessionActivity)
             this.sessionActivity = options.sessionActivity;
+        if (options.remoteMessage)
+            this.remoteMessage = options.remoteMessage;
     }
     async getSessionActivity(ctx, req) {
         if (!this.sessionActivity)
@@ -111,6 +114,11 @@ export class SessionController extends SessionControllerBase {
     }
     async getPromptSuggestion(ctx, req) {
         return this.requireConversation().getPromptSuggestion(ctx, req);
+    }
+    async sendRemoteMessage(_ctx, req) {
+        if (!this.remoteMessage)
+            throw new NotImplementedError('remote message delivery');
+        return this.remoteMessage.deliver(req);
     }
     async steerSession(ctx, req) {
         return this.requireConversation().steerSession(ctx, req);

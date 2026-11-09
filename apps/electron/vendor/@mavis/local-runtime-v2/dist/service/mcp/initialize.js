@@ -3,6 +3,8 @@ import { McpConnectionPool } from '@mavis/mcp/runtime/connection-pool';
 import { LocalMcpService } from './runtime/local-mcp.service.js';
 import { resolveMatrixMcpStdioEntrypoint } from './runtime/builtin-matrix.js';
 import { LocalMcpPublicFacade } from './tools/public-facade.js';
+import { McpAuthService } from './auth/mcp-auth.service.js';
+import { publicAuthTarget } from './auth/bindings.js';
 export function initializeMcpService(options) {
     let runtime;
     const metrics = options.metrics;
@@ -26,6 +28,7 @@ export function initializeMcpService(options) {
     runtime = new LocalMcpService(() => options.dataDir, {
         ...(options.nowMs ? { nowMs: options.nowMs } : {}),
         ...(pool ? { connectionPool: pool } : {}),
+        ...authOptions(options, logger),
         builtinMatrix: {
             enabled: options.builtinMatrix && Boolean(resolveMatrixMcpStdioEntrypoint()),
             webSearchOnly: options.matrixWebSearchOnly,
@@ -33,13 +36,19 @@ export function initializeMcpService(options) {
     });
     const service = {
         list: (keyword) => runtime.listConfiguredServers(keyword),
-        get: (name) => runtime.getConfiguredServer(name),
-        create: (name, config, enabled) => runtime.createConfiguredServer(name, mutableConfig(config), enabled),
-        update: (name, config) => runtime.updateConfiguredServer(name, mutableConfig(config)),
+        // Details report whether a confidential client secret is stored, never the secret.
+        get: async (name) => {
+            const detail = await runtime.getConfiguredServer(name);
+            return detail && runtime.serverAuth.withClientSecretState(detail);
+        },
+        create: async (name, config, enabled) => runtime.serverAuth.withClientSecretState(await runtime.createConfiguredServer(name, mutableConfig(config), enabled)),
+        update: async (name, config) => runtime.serverAuth.withClientSecretState(await runtime.updateConfiguredServer(name, mutableConfig(config))),
         delete: (name) => runtime.deleteConfiguredServer(name),
         setEnabled: (name, enabled) => runtime.setConfiguredServerEnabled(name, enabled),
         test: (name) => runtime.testConfiguredServer(name),
     };
+    const { oauth, publishGlobalEvent: publish } = options;
+    const auth = createAuthService(options, runtime, logger);
     const capability = runtime;
     const unbind = options.bindRuntime?.(capability);
     let closePromise;
@@ -48,6 +57,12 @@ export function initializeMcpService(options) {
         runtime,
         public: new LocalMcpPublicFacade(runtime),
         capability,
+        ...(auth && oauth ? { auth, oauth } : {}),
+        announcePluginAuthRequired: ({ target, reason }) => publish?.({
+            type: 'mcp.auth_required',
+            payload: { target: publicAuthTarget(target), reason },
+        }),
+        bindPluginAuthPort: (port) => auth?.bindPluginPort(port) ?? (() => undefined),
         // Reservations are built from the local configuration. Remote discovery remains lazy and bounded.
         ready: async () => {
             await runtime.listServers();
@@ -55,7 +70,9 @@ export function initializeMcpService(options) {
         close: () => {
             closePromise ??= (async () => {
                 unbind?.();
+                await auth?.close();
                 await runtime.close();
+                await oauth?.close();
             })();
             return closePromise;
         },
@@ -78,7 +95,33 @@ function mutableConfig(config) {
             transport: config.transport,
             url: config.url,
             ...(config.headers === undefined ? {} : { headers: { ...config.headers } }),
+            ...(config.oauth === undefined
+                ? {}
+                : {
+                    oauth: {
+                        ...config.oauth,
+                        ...(config.oauth.scopes ? { scopes: [...config.oauth.scopes] } : {}),
+                    },
+                }),
             ...common,
         };
+}
+function authOptions(options, logger) {
+    return {
+        ...(options.oauth ? { oauth: options.oauth } : {}),
+        ...(options.publishGlobalEvent ? { publishGlobalEvent: options.publishGlobalEvent } : {}),
+        ...(logger ? { logger } : {}),
+    };
+}
+function createAuthService(options, runtime, logger) {
+    const { oauth, publishGlobalEvent: publish } = options;
+    if (!oauth)
+        return undefined;
+    return new McpAuthService({
+        oauth,
+        runtime: runtime.serverAuth,
+        ...(publish ? { publish } : {}),
+        ...(logger ? { logger } : {}),
+    });
 }
 //# sourceMappingURL=initialize.js.map

@@ -1,6 +1,7 @@
 import { appendCompactionState, readCompactionCompatibility, } from '../compat.js';
 import { ContextCompactionError, } from '../contracts.js';
 import { CHECKPOINT_SYSTEM_PROMPT, parseCheckpointHeadings } from './checkpoint-protocol.js';
+import { readGenuineUserQueryText } from './genuine-user-query.js';
 import { projectTodoHistory } from './todo-cadence.js';
 import { projectBackgroundHistory } from './background-cadence.js';
 /** Derived from the prompt's own heading list so the protocol cannot drift. */
@@ -89,6 +90,9 @@ function buildVerifiedCheckpointState(h0, inheritedQueries, subagents) {
         recentUserQueries: collectRecentUserQueries(h0, inheritedQueries),
         ...(todo.todoState === undefined ? {} : { todoState: todo.todoState }),
         ...(todo.todoCadence === undefined ? {} : { todoCadence: todo.todoCadence }),
+        ...(todo.userMessagesSinceTodoWrite === undefined
+            ? {}
+            : { todoUserMessagesSinceWrite: todo.userMessagesSinceTodoWrite }),
         ...(background.hasBackgroundState
             ? {
                 backgroundCadence: {
@@ -114,42 +118,6 @@ function collectRecentUserQueries(messages, inherited) {
         collected.push({ text, ...(timestampMs === undefined ? {} : { timestampMs }) });
     });
     return collected.slice(-2);
-}
-export function readGenuineUserQueryText(message) {
-    if (Object.hasOwn(message, 'genuineUserQueryText')) {
-        const text = Reflect.get(message, 'genuineUserQueryText');
-        return typeof text === 'string' ? text : undefined;
-    }
-    if (!Object.hasOwn(message, 'canonicalTextRange'))
-        return undefined;
-    return readCanonicalRangeText(message);
-}
-function readCanonicalRangeText(message) {
-    const content = readSingleText(message);
-    const range = Reflect.get(message, 'canonicalTextRange');
-    if (!content || !range || typeof range !== 'object')
-        return undefined;
-    const startOffset = Reflect.get(range, 'startOffset');
-    const endOffset = Reflect.get(range, 'endOffset');
-    if (!Number.isSafeInteger(startOffset) ||
-        !Number.isSafeInteger(endOffset) ||
-        startOffset < 0 ||
-        endOffset < startOffset ||
-        endOffset > content.length) {
-        return undefined;
-    }
-    return content.slice(startOffset, endOffset);
-}
-function readSingleText(message) {
-    const content = Reflect.get(message, 'content');
-    if (typeof content === 'string')
-        return content;
-    if (!Array.isArray(content))
-        return undefined;
-    const texts = content.flatMap((block) => block && typeof block === 'object' && Reflect.get(block, 'type') === 'text'
-        ? [Reflect.get(block, 'text')]
-        : []);
-    return texts.length === 1 && typeof texts[0] === 'string' ? texts[0] : undefined;
 }
 function readFiniteNumber(value, key) {
     const field = Reflect.get(value, key);

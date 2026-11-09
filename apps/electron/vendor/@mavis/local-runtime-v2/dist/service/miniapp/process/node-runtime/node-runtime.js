@@ -5,7 +5,8 @@ import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MAX_RUNNING_MINIAPP_SERVICES, MINIAPP_LOOPBACK_HEALTH_PATH, MINIAPP_LOOPBACK_TOKEN_HEADER, } from '../../contracts.js';
+import { MINIAPP_LOOPBACK_HEALTH_PATH, MINIAPP_LOOPBACK_TOKEN_HEADER } from '../../contracts.js';
+import { deviceMiniAppCapacity } from '../../memory/capacity.js';
 import { selectFailureAfterCleanup } from '../../supervisor/cleanup-settlement.js';
 import { MiniAppCleanupUnprovenError, markMiniAppRootTerminationProven } from '../../errors.js';
 import { sanitizeMiniAppRuntimeLogEvent } from '../../runtime-log.js';
@@ -26,7 +27,7 @@ const PORT_STRIDE = 6_007;
 const runtimeObservations = new Set();
 export function createMiniAppNodeRuntimeAdapter(options) {
     const resolved = resolveOptions(options);
-    const physicalRoots = createPhysicalRootCapacity(MAX_RUNNING_MINIAPP_SERVICES);
+    const physicalRoots = createPhysicalRootCapacity(deviceMiniAppCapacity(options.totalMemoryBytes ?? os.totalmem()));
     return {
         async prepare(input) {
             assertCapabilities(resolved, input.candidate);
@@ -57,6 +58,7 @@ export function createMiniAppNodeRuntimeAdapter(options) {
                 throw failure;
             }
         },
+        capacity: () => physicalRoots.snapshot(),
     };
 }
 async function materializeProcessCandidate(input) {
@@ -86,11 +88,14 @@ function artifactRootError() {
     return new MiniAppNodeRuntimeError('CANDIDATE_CHANGED', 'Mini App process artifact root is not an owned physical directory');
 }
 async function prepareRuntime(input) {
-    // One credential per process generation; port retries reuse it with a fresh startupToken.
-    const loopbackToken = input.options.makeLoopbackToken();
+    // Each spawned process gets its own generation and loopbackToken.
+    let processGeneration = input.processGeneration;
+    let loopbackToken = input.options.makeLoopbackToken();
     let lastError;
     const candidates = candidatePortSequence(input);
     for (let index = 0; index < input.options.maxPortAttempts; index += 1) {
+        throwIfAborted(input.signal);
+        const attemptInput = { ...input, processGeneration, loopbackToken };
         const port = candidates.next();
         if (port === undefined) {
             throw new MiniAppNodeRuntimeError('NO_CANDIDATE_PORT', 'No Host-approved port is available');
@@ -98,14 +103,17 @@ async function prepareRuntime(input) {
         const reservation = input.options.reservePort?.({
             pluginId: input.candidate.pluginId,
             port,
-            processGeneration: input.processGeneration,
+            processGeneration: attemptInput.processGeneration,
         });
         if (input.options.reservePort && !reservation)
             continue;
         const deadline = input.options.nowMs() + input.options.runnerStartTimeoutMs;
         let attempt;
         try {
-            attempt = await spawnAttempt(input, port, loopbackToken);
+            if (attemptInput.processGeneration !== input.processGeneration) {
+                input.onProcessGeneration?.(attemptInput.processGeneration);
+            }
+            attempt = await spawnAttempt(attemptInput, port, attemptInput.loopbackToken);
             const readinessSignal = AbortSignal.any([input.signal, attempt.fatal.signal]);
             await waitForStarted(attempt, readinessSignal, {
                 deadline,
@@ -115,13 +123,13 @@ async function prepareRuntime(input) {
             await waitForLoopbackReadiness({
                 options: input.options,
                 port,
-                loopbackToken,
+                loopbackToken: attemptInput.loopbackToken,
                 signal: readinessSignal,
                 deadline,
             });
             attempt.startupErrorCapture.complete();
             return preparedRuntime({
-                ...input,
+                ...attemptInput,
                 attempt,
                 port,
                 reservation,
@@ -134,6 +142,8 @@ async function prepareRuntime(input) {
             lastError = failure;
             if (!retryablePortError(failure) || index + 1 >= input.options.maxPortAttempts)
                 throw failure;
+            processGeneration = input.options.makeProcessGeneration();
+            loopbackToken = input.options.makeLoopbackToken();
         }
     }
     throw (lastError ??
@@ -279,7 +289,7 @@ function createPhysicalRootCapacity(maxPluginServices) {
                 throw new MiniAppNodeRuntimeError('BUSY', 'Mini App plugin service already owns a direct root', { busyReason: 'operation_busy' });
             }
             if (occupants.size >= maxPluginServices) {
-                throw new MiniAppNodeRuntimeError('BUSY', 'At most three distinct MiniApp plugin services may run concurrently', { busyReason: 'capacity_busy' });
+                throw new MiniAppNodeRuntimeError('BUSY', `At most ${maxPluginServices} distinct MiniApp plugin services may run concurrently`, { busyReason: 'capacity_busy' });
             }
             const identity = Symbol(pluginId);
             occupants.set(pluginId, identity);
@@ -294,6 +304,7 @@ function createPhysicalRootCapacity(maxPluginServices) {
                 },
             };
         },
+        snapshot: () => ({ limit: maxPluginServices, occupiedPluginIds: [...occupants.keys()] }),
     };
 }
 function observePhysicalRoot(child, ownership) {
@@ -606,6 +617,7 @@ function resolveOptions(options) {
         resolveRealPath: realpath,
         makeStartupToken: randomUUID,
         makeLoopbackToken: () => randomBytes(32).toString('base64url'),
+        makeProcessGeneration: randomUUID,
         nowMs: Date.now,
         wait: defaultWait,
         runnerStartTimeoutMs: 10_000,

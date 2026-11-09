@@ -1,4 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
+/** Callers wait for the refresh, so an unreachable gateway is retried at most once a minute. */
+const FETCH_FAILURE_RETRY_MS = 60_000;
 export class OfficialModelConfigFetchError extends Error {
     reason;
     status;
@@ -83,6 +85,9 @@ export class OfficialModelConfigSync {
             this.observe('success');
         }
         catch (error) {
+            if (error instanceof OfficialModelConfigFetchError) {
+                this.expiresAt = this.nowMs() + FETCH_FAILURE_RETRY_MS;
+            }
             const reason = refreshReason(error);
             this.observe('failure', reason);
             this.deps.logger?.warn({

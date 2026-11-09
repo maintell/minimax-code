@@ -1,7 +1,8 @@
 import { mutableTitleContext } from './agent-host/preparation/config/title-context.js';
 import { createProductionRunawayGuardExtension } from './runaway-guard/extension.js';
 import { streamSimple } from '@earendil-works/pi-ai';
-import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExtension, toolOutputBudgetExtension, } from '@mavis/agent-extension';
+import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExtension, toolOutputBudgetExtension, webSearchContentBudgetExtension, } from '@mavis/agent-extension';
+import { withLLMRetry } from '@mavis/agent-core/pi-turn-runner';
 import { describeLocalBrowserToolInput } from '@mavis/agent-tools/desktop';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
 import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
@@ -10,9 +11,9 @@ import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPrep
 import { validateCanonicalHistoryMessages } from './agent-host/history/canonical-history-validation.js';
 import { readCompactionCommitMetadata } from './agent-host/compaction/compaction-commit-metadata.js';
 import { createContextCompactors } from './compaction/execution/production-context-compactors.js';
-import { createAutomaticContextRequestFilterHook, createRequestMediaGuardHook, } from './compaction/automatic-context-compactor.js';
+import { createMainRequestProjection } from './compaction/execution/request-projection.js';
 import { ContextUsageAnchorState } from './compaction/execution/usage-anchor.js';
-import { ToolResultArchiver } from './compaction/algorithm/tool-result-archiver.js';
+import { CheckpointImageFileWriter } from './compaction/algorithm/checkpoint-image-file-writer.js';
 import { createFileApiUploadStoreSource } from './persistence/file-api-upload.repository.js';
 import { ToolOutputArtifactRepository } from './persistence/tool-output-artifact.repository.js';
 import { compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './agent-host/runner/policy/session-readable-grants.js';
@@ -20,6 +21,7 @@ import { isProductionRuntimeErrorRetryable } from './runtime-error-retry-policy.
 import { createTodoCadenceReminderHook } from './execution/reminder/todo-cadence-reminder.js';
 import { createHostTurnReminders } from './execution/reminder/host-turn-reminders.js';
 import { createSessionIdentityReminderHook } from './execution/reminder/session-identity-reminder.js';
+import { hasPtcTurnChildTodoWrite } from './agent-host/execution/ptc/catalog.js';
 import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/session-agent-execution-snapshot.js';
 import { McpToolResultHistoryExternalizer } from './agent-host/execution/mcp-tool-result-history-externalizer.js';
 import { createBrowserHostCapabilityAdapter } from './agent-host/assembly/host-capability/browser.js';
@@ -46,11 +48,19 @@ export function createProductionSessionTitleModel(product, nowMs) {
         },
         resolveModel: async (input) => {
             const resolved = await preparation.resolveModel(input);
-            const resolvedStream = resolved.streamFn;
+            const resolvedStream = resolved.callLifecycle
+                ? withLLMRetry(resolved.streamFn ?? streamSimple, {
+                    sessionId: input.sessionId,
+                    turnId: input.turnId,
+                    scope: 'title',
+                    lifecycle: resolved.callLifecycle,
+                })
+                : resolved.streamFn;
             return {
                 model: resolved.model,
                 ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
                 ...(resolved.headers ? { headers: resolved.headers } : {}),
+                ...(resolved.fetch ? { fetch: resolved.fetch } : {}),
                 ...(resolved.thinkingLevel ? { thinkingLevel: resolved.thinkingLevel } : {}),
                 ...(resolvedStream
                     ? {
@@ -79,11 +89,19 @@ export function createProductionRootArchiveTitleModel(product, nowMs) {
         },
         resolveModel: async (input) => {
             const resolved = await preparation.resolveModel(input);
-            const resolvedStream = resolved.streamFn;
+            const resolvedStream = resolved.callLifecycle
+                ? withLLMRetry(resolved.streamFn ?? streamSimple, {
+                    sessionId: input.sessionId,
+                    turnId: input.turnId,
+                    scope: 'archive-title',
+                    lifecycle: resolved.callLifecycle,
+                })
+                : resolved.streamFn;
             return {
                 model: resolved.model,
                 ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
                 ...(resolved.headers ? { headers: resolved.headers } : {}),
+                ...(resolved.fetch ? { fetch: resolved.fetch } : {}),
                 ...(resolved.thinkingLevel ? { thinkingLevel: resolved.thinkingLevel } : {}),
                 ...(resolvedStream
                     ? {
@@ -139,6 +157,11 @@ export async function createLocalAgentHost(options) {
     const isSideChat = (sessionId) => options.sessions.sideChats.relation(sessionId) !== undefined;
     const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
     const contextUsageAnchor = new ContextUsageAnchorState();
+    // One request-only projection: installed in the main request's hook chain and
+    // repeated by the shared-prefix checkpoint request, so both send the same messages.
+    const mainRequest = createMainRequestProjection((sessionId, messages) => isSideChat(sessionId)
+        ? messages
+        : messages.filter((message) => !isSideChatModeMessage(message)));
     const toolOutputArtifacts = new ToolOutputArtifactRepository({
         resolveSessionReportsDirectory: (id) => options.sessions.artifacts.ensureReportsDirectory(id),
         inspectSessionReportsDirectory: (id) => options.sessions.artifacts.inspectReportsDirectory(id),
@@ -146,11 +169,9 @@ export async function createLocalAgentHost(options) {
     const getToolResultCompactionConfig = createToolResultCompactionConfigGetter(options);
     const getRequestMediaConfig = createRequestMediaConfigGetter(options);
     const getImageEncoding = () => requestImageEncoding(getRequestMediaConfig().image);
-    const toolResultArchiver = new ToolResultArchiver({
-        writeArtifact: (input) => toolOutputArtifacts.write(input),
+    const imageFileWriter = new CheckpointImageFileWriter({
         writeImageArtifact: (input) => toolOutputArtifacts.writeImage(input),
         logger: options.product.runner.logger,
-        getConfig: getToolResultCompactionConfig,
     });
     const mcpToolResultHistoryExternalizer = createMcpToolResultHistoryExternalizer(options, toolOutputArtifacts, getToolResultCompactionConfig);
     const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding);
@@ -185,12 +206,6 @@ export async function createLocalAgentHost(options) {
                     ...(input.agentMemoryReadNames === undefined
                         ? {}
                         : { agentMemoryReadNames: input.agentMemoryReadNames }),
-                    ...(input.allowedSkillNames === undefined
-                        ? {}
-                        : { allowedSkillNames: input.allowedSkillNames }),
-                    ...(input.allowedExtensionSkillNames === undefined
-                        ? {}
-                        : { allowedExtensionSkillNames: input.allowedExtensionSkillNames }),
                     ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
                 });
             },
@@ -239,12 +254,9 @@ export async function createLocalAgentHost(options) {
             preparePluginHookSessionOwnership: options.pluginHookSessionOwnership.prepare,
             activatePluginHookSessionOwnership: options.pluginHookSessionOwnership.activate,
             afterCompactionBeforeLlmCallHooks: [
-                createAutomaticContextRequestFilterHook((sessionId, messages) => isSideChat(sessionId)
-                    ? messages
-                    : messages.filter((message) => !isSideChatModeMessage(message))),
-                createRequestMediaGuardHook(),
+                ...mainRequest.hooks,
                 createSessionIdentityReminderHook(contextUsageAnchor),
-                createTodoCadenceReminderHook(contextUsageAnchor),
+                createTodoCadenceReminderHook(contextUsageAnchor, hasPtcTurnChildTodoWrite),
             ],
             onSteeringConsumed: options.onSteeringConsumed,
             onInputReviewResolved: options.onInputReviewResolved,
@@ -258,12 +270,15 @@ export async function createLocalAgentHost(options) {
         canonicalHistory: adaptCanonicalHistory(options.sessions.canonicalHistory, options.sessions.sessions.historyMutation),
         compaction: {
             ...createContextCompactors({
+                // The isolated summary request drops every mode message; the replacement
+                // carries a fresh one from `checkpointReminder`.
                 checkpointRequestMessages: (messages) => messages.filter((message) => !isSideChatModeMessage(message)),
+                mainRequestMessages: mainRequest.project,
                 checkpointReminder: (sessionId, timestamp) => isSideChat(sessionId) ? createSideChatModeMessage(timestamp) : undefined,
                 contextUsageAnchor,
                 checkpointState: options.product.checkpointState,
                 logger: options.product.runner.logger,
-                toolResultArchiver,
+                imageFileWriter,
                 promptSnapshots: options.product.promptSnapshots,
                 readConfig: () => options.product.preparation.configBuilder.config(),
                 resolveEarlierFiles: createEarlierFilesResolver(options, toolOutputArtifacts),
@@ -310,6 +325,17 @@ function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultC
         createHostRunawayGuardExtension(options),
         createHostOutputLimitRecoveryExtension(options),
         requestMediaExtension({ getImageEncoding }),
+        // Before the output budget: each page is bounded first, so the whole result rarely needs a receipt.
+        webSearchContentBudgetExtension({
+            writeArtifact: (input) => toolOutputArtifacts.write(input),
+            // The extension swallows observer errors, so a throwing logger cannot change the result.
+            onArtifactError: (error, input) => options.product.runner.logger?.error?.({
+                event: 'web_search_content_budget_failed',
+                session_id: input.sessionId,
+                turn_id: input.turnId,
+                reason: safeErrorReason(error),
+            }, '[local-runtime-v2] web_search content kept whole: artifact write failed'),
+        }),
         toolOutputBudgetExtension({
             maxInlineBytes: TOOL_RESULT_COMPACTION_DEFAULTS.maxInlineKiB * 1_024,
             getMaxInlineBytes: () => getToolResultCompactionConfig().maxInlineBytes,
@@ -449,24 +475,14 @@ function createCheckpointSharedPrefixSwitch(options) {
 function createToolResultCompactionConfigGetter(options) {
     const fileConfig = parseToolResultCompactionConfig(readToolResultCompactionFileConfig(options));
     const base = {
-        enabled: fileConfig.enabled,
         maxInlineBytes: fileConfig.maxInlineKiB * 1_024,
         mcpDetailsMaxInlineBytes: fileConfig.mcpDetailsMaxInlineKiB * 1_024,
-        watermarkBytes: fileConfig.watermarkKiB * 1_024,
-        minSavingsBytes: fileConfig.minSavingsKiB * 1_024,
-        minCandidateBytes: fileConfig.minCandidateKiB * 1_024,
-        keepRecentRounds: fileConfig.keepRecentRounds,
     };
     return () => {
         const override = readToolResultCompactionOverride(options.getToolResultCompactionConfig);
         return {
-            enabled: typeof override?.enabled === 'boolean' ? override.enabled : base.enabled,
             maxInlineBytes: positiveSafeInteger(override?.maxInlineBytes) ?? base.maxInlineBytes,
             mcpDetailsMaxInlineBytes: positiveSafeInteger(override?.mcpDetailsMaxInlineBytes) ?? base.mcpDetailsMaxInlineBytes,
-            watermarkBytes: positiveSafeInteger(override?.watermarkBytes) ?? base.watermarkBytes,
-            minSavingsBytes: positiveSafeInteger(override?.minSavingsBytes) ?? base.minSavingsBytes,
-            minCandidateBytes: positiveSafeInteger(override?.minCandidateBytes) ?? base.minCandidateBytes,
-            keepRecentRounds: positiveSafeInteger(override?.keepRecentRounds) ?? base.keepRecentRounds,
         };
     };
 }
@@ -598,11 +614,12 @@ export function combineAgentEventObservers(...observers) {
 /** Projects transient provider retry state from Turn execution onto the product event stream. */
 export function createSessionLLMRetryEventObserver(publish) {
     return (event) => {
-        if (event.scope === 'title')
+        // Only foreground/compaction retries belong to the Session retry UI wire contract.
+        if (event.scope !== 'agent' && event.scope !== 'compaction')
             return;
         publish({
             type: 'session.llm_retry',
-            payload: { schemaVersion: 1, ...event },
+            payload: { schemaVersion: 1, ...event, scope: event.scope },
         });
     };
 }
@@ -665,10 +682,11 @@ function adaptCanonicalHistory(provider, mutation) {
             const metadata = readCompactionCommitMetadata(operation.metadata);
             if (!metadata)
                 throw new TypeError('Canonical compaction metadata is invalid.');
-            const baseChange = {
+            const committed = await provider.compact({
                 ...operation,
                 reason: 'replaceMessages',
                 operation: { id: operation.operation.id, kind: 'compaction' },
+                method: metadata.method,
                 compactionId: metadata.compactionId,
                 summary: metadata.summary,
                 ...(metadata.currentUserSourceIndex === undefined
@@ -679,19 +697,6 @@ function adaptCanonicalHistory(provider, mutation) {
                             ? {}
                             : { placedMarkerCount: metadata.placedMarkerCount }),
                     }),
-            };
-            if (metadata.method !== 'llm_checkpoint') {
-                const committed = await provider.compact({
-                    ...baseChange,
-                    method: metadata.method,
-                    replacementSourceIndexes: metadata.replacementSourceIndexes,
-                });
-                validateCanonicalHistoryMessages(committed.messages);
-                return { ...committed, messages: committed.messages };
-            }
-            const committed = await provider.compact({
-                ...baseChange,
-                method: metadata.method,
             });
             validateCanonicalHistoryMessages(committed.messages);
             return { ...committed, messages: committed.messages };

@@ -133,7 +133,7 @@ function invalidTargetError() {
     return new PluginSystemError('MINIAPP_TARGET_DEFINITION_MISSING', 'Mini App publication preparation failed');
 }
 /** Supervisor phases in which a Mini App counts as "in use" for marketplace updates. */
-const RUNNING_PHASES = new Set(['active', 'starting', 'preparing']);
+const RUNNING_PHASES = new Set(['active', 'preparing']);
 /**
  * A running official Mini App whose new package needs a process restart keeps its accepted
  * package in this publication (Node, client, managed MCP and Skills together). The user applies

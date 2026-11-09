@@ -1,3 +1,5 @@
+import { setupPptPreviewQueryIPC } from "./pptPreviewQuery.ipc";
+import { setupPptxEditingIPC } from "./pptxEditing.ipc";
 /**
  * IPC 处理模块入口
  */
@@ -40,6 +42,7 @@ import { setupBrowserTelemetryIPC } from "./browserTelemetry.ipc.js";
 import { setupMiniAppIPC } from "./miniApp.ipc";
 import { setupMiniAppComposerIPC } from "./miniAppComposer.ipc";
 import { setupMiniAppAgentIPC } from "./miniAppAgent.ipc";
+import { setupMiniAppHostIPC } from "./miniAppHost.ipc.js";
 import { setupMiniAppToolIPC } from "./miniAppTool.ipc";
 import { setupMiniAppSpeechIPC } from "./miniAppSpeech.ipc";
 import { setupBrowserProfileImportIPC } from "./browserProfileImport.ipc";
@@ -47,6 +50,7 @@ import { setupFileIPC } from "./file.ipc";
 import { setupDevToolsIPC } from "./devtools.ipc";
 import { setupRemoteControlBridgeIPC } from "../modules/remote-control-bridge/ipc";
 import { configureOSSSharedAuthSession } from "../modules/oss";
+import { setupFeedbackLogQueue } from "../modules/diagnostics/feedback-log-queue";
 import { refreshSharedRuntimeProjection, projectSharedAccessTokenLeaseToRuntime } from "../modules/auth/runtime-projection";
 import { getDeveloperOptions } from "../modules/developer-options";
 import { setupModelMenuPopupIPC } from "../windows/model-menu-popup";
@@ -177,9 +181,16 @@ export async function setupAllIPC(options) {
     const disposeOSSSharedAuth = configureOSSSharedAuthSession(options.sharedAuthSession, {
         onAccessTokenInvalidated: resyncSharedRuntimeProjection,
     });
+    // 回填接口复用上面配置的 Shared OAuth，必须在它之后启动。
+    const disposeFeedbackLogQueue = setupFeedbackLogQueue({
+        authSession: options.sharedAuthSession,
+    });
     let documentPreview;
+    let disposePptQueries;
+    let disposePptEditing;
     let disposeMiniAppComposer;
     let disposeMiniAppTool;
+    let disposeMiniAppHost;
     let disposeMiniAppAgent;
     let disposeMiniAppSpeech;
     let disposeBrowserBackend;
@@ -206,9 +217,12 @@ export async function setupAllIPC(options) {
         disposeBrowserBackend = setupBrowserBackendIPC();
         disposeBrowserWebview = setupBrowserWebviewIPC();
         disposeBrowserTelemetry = setupBrowserTelemetryIPC();
+        disposePptQueries = setupPptPreviewQueryIPC();
+        disposePptEditing = setupPptxEditingIPC();
         setupMiniAppIPC();
         disposeMiniAppComposer = setupMiniAppComposerIPC();
         disposeMiniAppAgent = setupMiniAppAgentIPC();
+        disposeMiniAppHost = setupMiniAppHostIPC();
         disposeMiniAppTool = setupMiniAppToolIPC();
         disposeMiniAppSpeech = setupMiniAppSpeechIPC();
         setupBrowserProfileImportIPC();
@@ -216,14 +230,18 @@ export async function setupAllIPC(options) {
     }
     catch (setupError) {
         shutdownCuPermission();
+        disposePptQueries?.();
+        await disposePptEditing?.();
         disposeMiniAppComposer?.();
         disposeMiniAppAgent?.();
+        disposeMiniAppHost?.();
         disposeMiniAppTool?.();
         disposeMiniAppSpeech?.();
         disposeBrowserBackend?.();
         disposeBrowserWebview?.();
         disposeBrowserTelemetry?.();
         disposeModelMenuPopup();
+        disposeFeedbackLogQueue();
         disposeOSSSharedAuth();
         try {
             await Promise.all([
@@ -239,15 +257,19 @@ export async function setupAllIPC(options) {
         }
         throw setupError;
     }
-    return createLifecycleIPCHandle(documentPreview, sshProjects, () => {
+    return createLifecycleIPCHandle(documentPreview, sshProjects, async () => {
+        disposePptQueries?.();
+        await disposePptEditing?.();
         disposeMiniAppComposer?.();
         disposeMiniAppAgent?.();
+        disposeMiniAppHost?.();
         disposeMiniAppTool?.();
         disposeMiniAppSpeech?.();
         disposeBrowserBackend?.();
         disposeBrowserWebview?.();
         disposeBrowserTelemetry?.();
         disposeModelMenuPopup();
+        disposeFeedbackLogQueue();
         disposeOSSSharedAuth();
     }, shutdownCuPermission);
 }
@@ -255,7 +277,7 @@ function createLifecycleIPCHandle(documentPreview, sshProjects, disposeIPCResour
     return Object.freeze({
         shutdown: async () => {
             shutdownCuPermission();
-            disposeIPCResources();
+            await disposeIPCResources();
             await Promise.all([documentPreview.shutdown(), sshProjects.shutdown()]);
         },
     });

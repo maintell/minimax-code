@@ -1,14 +1,5 @@
-import { miniAppPermissionId, } from '@mavis/shared/miniapp-surface';
+import { declaredMiniAppPermissions } from '../../package/miniapp/permissions.js';
 import { listEnabledMiniAppDefinitions } from './candidate.js';
-/** Switchable permissions the manifest declares, in manifest order. */
-function declaredMiniAppPermissions(miniapp) {
-    return [
-        ...(miniapp.hostConnectorAccess?.providers ?? []).map((provider) => miniAppPermissionId('connector', provider)),
-        ...(miniapp.agentAccess ?? []).map((item) => miniAppPermissionId('agent', item)),
-        ...(miniapp.toolAccess?.includes('call') ? [miniAppPermissionId('tool', 'call')] : []),
-        ...(miniapp.deviceAccess ?? []).map((item) => miniAppPermissionId('device', item)),
-    ];
-}
 /** Declared items of an enabled Mini App, or undefined when the snapshot has no such Mini App. */
 export function findMiniAppPermissionTarget(snapshot, pluginId) {
     const definition = listEnabledMiniAppDefinitions(snapshot).find(({ candidate }) => candidate.pluginId === pluginId);

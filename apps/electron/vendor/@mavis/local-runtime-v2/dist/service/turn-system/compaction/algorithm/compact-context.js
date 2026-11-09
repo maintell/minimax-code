@@ -2,17 +2,13 @@ import { listRequestImages, replaceRequestImages, } from '@mavis/agent-core/pi-t
 import { checkpointImageText } from '@mavis/context-manager';
 import { CheckpointCandidateMediaRejectedError, CheckpointCandidateTooLargeError, ContextCompactionError, } from '../contracts.js';
 import { buildCheckpointMessage, validateCheckpointGeneration, } from './checkpoint-format.js';
-import { buildAllToolResultsCandidate, buildAttachmentFreeCandidate, buildMiddleDeletionCandidate, buildMinimalGenuineQueryCandidate, buildProtectedSkeletonCandidate, buildToolTrimCandidate, } from './history-reduction.js';
-import { evaluateToolResultCompactionAdmission, evaluateToolTrimAdmission, } from './tool-trim-admission.js';
+import { buildAllToolResultsCandidate, buildAttachmentFreeCandidate, buildMiddleDeletionCandidate, buildMinimalGenuineQueryCandidate, buildProtectedSkeletonCandidate, parseToolRounds, } from './history-reduction.js';
 export async function compactContext(input) {
     validateInput(input);
+    validateToolRounds(input.history);
     input.signal?.throwIfAborted();
     const instructions = input.instructions?.trim() || undefined;
-    const planning = await planCompaction(input, instructions);
-    input.signal?.throwIfAborted();
-    if (planning.decision)
-        return planning.decision;
-    const generated = await generateCheckpoint(input, planning.candidate, instructions);
+    const generated = await generateCheckpoint(input, instructions);
     input.signal?.throwIfAborted();
     const validated = validateCheckpointGeneration(generated.generation, generated.maxOutputTokens);
     const subagents = await captureSubagents(input);
@@ -67,22 +63,6 @@ function buildCheckpointReplacement(input, summary, { reminder, subagents, earli
         ...(reminder ? [reminder] : []),
     ];
 }
-/**
- * Tool-result admission may decide the compaction without a checkpoint, unless
- * the user gave instructions or the caller requires a checkpoint; the
- * candidate then only serves as smaller checkpoint input.
- */
-async function planCompaction(input, instructions) {
-    const directAllowed = !instructions && input.checkpointRequired !== true;
-    if (input.allowLegacyToolTrim === false) {
-        return directAllowed
-            ? await planDirectToolResultCompaction(input, input.toolResultCompactionCandidate)
-            : { candidate: input.toolResultCompactionCandidate };
-    }
-    return directAllowed
-        ? await planDirectTrim(input)
-        : { candidate: captureToolTrimCandidate(input.history) };
-}
 async function captureSubagents(input) {
     if (!input.captureSubagents)
         return undefined;
@@ -108,58 +88,6 @@ async function resolveEarlierFiles(input) {
     catch {
         return {};
     }
-}
-async function planDirectToolResultCompaction(input, candidate) {
-    if (!candidate)
-        return {};
-    const admission = await evaluateToolResultCompactionAdmission({
-        h0: input.history,
-        candidate,
-        limits: input.limits,
-        measurePair: input.measurePair,
-    });
-    if (!admission.admitted)
-        return { candidate };
-    if ('archivedResultCount' in candidate) {
-        return {
-            candidate,
-            decision: {
-                method: 'tool_archive',
-                replacementMessages: candidate.messages,
-                archivedResultCount: candidate.archivedResultCount,
-                measurement: admission.measurement,
-            },
-        };
-    }
-    return {
-        candidate,
-        decision: {
-            method: 'tool_trim',
-            replacementMessages: candidate.messages,
-            trimmedResultCount: candidate.trimmedResultCount,
-            measurement: admission.measurement,
-        },
-    };
-}
-async function planDirectTrim(input) {
-    const candidate = captureToolTrimCandidate(input.history);
-    const admission = await evaluateToolTrimAdmission({
-        h0: input.history,
-        candidate,
-        limits: input.limits,
-        measurePair: input.measurePair,
-    });
-    if (!admission.admitted)
-        return { candidate };
-    return {
-        candidate,
-        decision: {
-            method: 'tool_trim',
-            replacementMessages: candidate.messages,
-            trimmedResultCount: candidate.trimmedResultCount,
-            measurement: admission.measurement,
-        },
-    };
 }
 /**
  * Provider-level checkpoint failures (`stopReason === "error"`) get exactly one
@@ -196,15 +124,11 @@ async function generateCandidateWithProviderRetry({ input, session, candidate, c
         return { generation: second, attemptNumber: counter.value };
     throw new ContextCompactionError('CHECKPOINT_PROVIDER_FAILED', 'llm_checkpoint', 'Checkpoint Provider request failed after one retry.');
 }
-async function generateCheckpoint(input, candidate, instructions) {
+async function generateCheckpoint(input, instructions) {
     const session = await input.checkpoint.open();
     validateNonNegativeSafeInteger(session.maxOutputTokens, 'maxOutputTokens');
-    const describeImages = checkpointImageDescriber(input);
-    const history = await describeImages(input.history);
-    const described = candidate
-        ? { ...candidate, messages: await describeImages(candidate.messages) }
-        : undefined;
-    const { checkpointCandidates, hall } = buildCheckpointCandidates(history, described);
+    const history = await checkpointImageDescriber(input)(input.history);
+    const { checkpointCandidates, hall } = buildCheckpointCandidates(history);
     const counter = { value: 0 };
     let overflow;
     for (const checkpointCandidate of checkpointCandidates) {
@@ -288,12 +212,9 @@ function checkpointImageDescriber(input) {
         return replaceRequestImages(messages, (image) => texts.get(image.key));
     };
 }
-function buildCheckpointCandidates(history, candidate) {
+function buildCheckpointCandidates(history) {
     const checkpointCandidates = [{ candidate: 'h0', messages: history }];
-    if (candidate && toolResultReplacementCount(candidate) > 0) {
-        checkpointCandidates.push({ candidate: 'htrim', messages: candidate.messages });
-    }
-    const hall = buildAllToolResultsCandidate(checkpointCandidates.at(-1)?.messages ?? history);
+    const hall = buildAllToolResultsCandidate(history);
     if (hall.trimmedResultCount > 0) {
         checkpointCandidates.push({ candidate: 'hall', messages: hall.messages });
     }
@@ -371,11 +292,6 @@ async function tryAttachmentFreeCheckpoint({ input, session, messages, instructi
 }
 function mediaRejectedProviderFailure(cause) {
     return new ContextCompactionError('CHECKPOINT_PROVIDER_FAILED', 'llm_checkpoint', 'Checkpoint Provider rejected the request for carrying too many images.', { cause });
-}
-function toolResultReplacementCount(candidate) {
-    return 'archivedResultCount' in candidate
-        ? candidate.archivedResultCount
-        : candidate.trimmedResultCount;
 }
 async function recoverAfterHall({ input, session, hallMessages, instructions, counter, priorOverflow, skipHvideo = false, }) {
     input.signal?.throwIfAborted();
@@ -552,9 +468,10 @@ function checkpointRequest(input, messages, instructions) {
         ...(input.signal ? { signal: input.signal } : {}),
     };
 }
-function captureToolTrimCandidate(history) {
+/** Malformed ToolRound history fails before the checkpoint session opens. */
+function validateToolRounds(history) {
     try {
-        return buildToolTrimCandidate(history);
+        parseToolRounds(history);
     }
     catch (cause) {
         throw invalidHistory(cause);
@@ -612,7 +529,7 @@ function postAdmissionDiagnostics(input, measurement) {
     };
 }
 function invalidHistory(cause) {
-    return new ContextCompactionError('INVALID_HISTORY', 'tool_trim', 'Context compaction requires a settled canonical ToolRound sequence.', { cause });
+    return new ContextCompactionError('INVALID_HISTORY', 'history', 'Context compaction requires a settled canonical ToolRound sequence.', { cause });
 }
 function inputTooLarge(cause, diagnostics) {
     return new ContextCompactionError('COMPACTION_INPUT_TOO_LARGE', 'llm_checkpoint', 'Context is too large for bounded checkpoint generation.', { cause, ...(diagnostics === undefined ? {} : { diagnostics }) });

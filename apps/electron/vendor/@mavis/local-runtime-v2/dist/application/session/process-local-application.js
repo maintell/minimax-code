@@ -20,6 +20,7 @@ export function createProcessLocalApplication(options) {
             listRuntimeSkills: (input) => options.skills.listRuntimeSkills(input),
         },
         plugins: options.plugins,
+        ...(options.modelAccess ? { modelAccess: options.modelAccess } : {}),
         ...(options.miniApps ? { miniApps: options.miniApps } : {}),
         mcp: options.peripherals.mcp,
         goals: options.peripherals.goals,
@@ -72,7 +73,7 @@ export function createProcessLocalApplication(options) {
             getCodexOAuthStatus: async () => options.modelProvider.oauth.getStatus(),
             startCodexOAuthLogin: (input) => options.modelProvider.oauth.startLogin(input),
             cancelCodexOAuthLogin: async (loginId) => options.modelProvider.oauth.cancelLogin(loginId),
-            listUser: async () => options.modelProvider.providers.listUserProviders().map(toProviderRecord),
+            listUser: async () => options.modelProvider.providers.listVisibleUserProviders().map(toProviderRecord),
             getMiniMaxApiKeyStatus: async () => options.modelProvider.providers.getMinimaxApiKeyStatus(),
             getMiniMaxModelSource: async () => options.modelProvider.providers.getMinimaxModelSource(),
             setMiniMaxModelSource: async ({ source }) => {

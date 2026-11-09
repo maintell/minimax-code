@@ -93,6 +93,7 @@ export function ownerCapabilitiesForServices(services) {
         interaction: Boolean(services?.application?.questionnaires && services.application.permissions),
         workspaceIndexing: Boolean(services?.workspace?.indexing),
         modelProvider: Boolean(services?.modelSystem && services.modelProviderApplication),
+        modelAccess: Boolean(services?.modelAccessApplication),
         sessionApplications: Boolean(services?.applications),
         // Mount the Inspector only where it was actually composed; other hosts keep
         // falling through to the v1 fail-closed stubs.
@@ -216,6 +217,32 @@ function mountComputerUseRoutes(app, client) {
             ok: true,
             ...snapshotComputerUseState(),
         });
+    });
+    // Read-only host permission status for remote (SSH) Desktop clients. The
+    // user grants permissions on the host itself; this route never prompts.
+    app.get('/mavis/api/computer-use/status', async (c) => {
+        if (!client.getStatus)
+            return c.json({ ok: true, supported: false });
+        try {
+            const status = await client.getStatus();
+            return c.json({
+                ok: true,
+                supported: status.supported,
+                ready: status.ready,
+                granted: status.granted,
+                accessibility: status.accessibility,
+                screenRecording: status.screenRecording,
+                ...(status.code ? { code: status.code } : {}),
+                ...(status.message ? { message: status.message } : {}),
+            });
+        }
+        catch (error) {
+            return c.json({
+                ok: false,
+                error: 'computer_use_status_unavailable',
+                message: error instanceof Error ? error.message : String(error),
+            }, 503);
+        }
     });
     app.put('/mavis/api/computer-use/enabled', (c) => c.json({ ok: false, error: 'computer_use_managed_by_plugin' }, 410));
     app.post('/mavis/api/computer-use/abort', (c) => {

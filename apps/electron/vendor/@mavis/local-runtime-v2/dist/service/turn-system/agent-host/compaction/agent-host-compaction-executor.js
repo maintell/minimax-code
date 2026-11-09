@@ -273,6 +273,7 @@ export class AgentHostCompactionExecutor {
                 sessionId: input.lease.sessionId,
                 turnId: input.lease.turnId,
                 scope: 'compaction',
+                lifecycle: preparation.llm.callLifecycle,
                 onCallSettled: (event) => recordPiLLMCallMetrics(compactionDependencies.metricsClient, 'compact', event),
             });
             const payloadTransform = this.dependencies.buildRequestPayloadTransform?.({

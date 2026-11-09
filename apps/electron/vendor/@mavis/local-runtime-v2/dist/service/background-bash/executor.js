@@ -1,5 +1,4 @@
-import { StringDecoder } from 'node:string_decoder';
-import { createBashTool } from '@earendil-works/pi-coding-agent/tools';
+import { createBashTool, createShellOutputDecoder, } from '@earendil-works/pi-coding-agent/tools';
 import { createBashEnvSpawnHook } from '@mavis/agent-core/bash-subprocess-env';
 import { localBashResultFromError, localBashResultFromPi, DESKTOP_BASH_PREVIEW_BYTES, resolvePermissionBashEnvPolicy, } from '@mavis/agent-tools/desktop';
 export function createLocalBackgroundBashExecutor(operationsFactory, 
@@ -28,9 +27,9 @@ envPolicy) {
                 ...(input.onPreflightComplete ? { onPreflightComplete: input.onPreflightComplete } : {}),
             });
             const decoders = {
-                stdout: new StringDecoder('utf8'),
-                stderr: new StringDecoder('utf8'),
-                combined: new StringDecoder('utf8'),
+                stdout: createShellOutputDecoder(),
+                stderr: createShellOutputDecoder(),
+                combined: createShellOutputDecoder(),
             };
             const operations = {
                 separatesOutputStreams: localOperations.separatesOutputStreams,

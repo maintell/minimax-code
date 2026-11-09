@@ -2,11 +2,13 @@ import { createV2AgentExecutionSource } from './execution-source.js';
 import { createV2AgentProfileSource } from './profile-source.js';
 import { createComputerUseTurnToolSafetyGuard, } from '../../service/computer-use/index.js';
 import { isGitRepo } from '../../service/workspace/index.js';
+import { createModelAccessAuthoring, withCapabilityOwnedSkills, } from './capability-owned-skills.js';
 import { resolveAgentPromptSurface, createLocalStaticPromptReader, } from '../../service/turn-system/index.js';
 /** Decorates product-owned AgentHost capabilities with process-local runtime adapters. */
 export function createRuntimeAgentProduct(options) {
-    const { baseProduct, agentService, modelConfig, logger, nowMs, runtimeOwnerKind, capabilityProfile, miniappAvailable, implicitCustomProviderThinking, systemPromptOverrides, agentReferenceProjection, inspector, promptSnapshots, internalTurnPromptReads, browserUse, globalInstructions, } = options;
+    const { baseProduct, agentService, modelConfig, logger, nowMs, runtimeOwnerKind, capabilityProfile, miniappAvailable, pptPreviewAvailable, implicitCustomProviderThinking, systemPromptOverrides, agentReferenceProjection, inspector, promptSnapshots, internalTurnPromptReads, browserUse, globalInstructions, } = options;
     const baseSkills = baseProduct.preparation.configBuilder.skills;
+    const authoring = createModelAccessAuthoring(options.modelAccessExtensionTool, runtimeOwnerKind);
     return {
         ...baseProduct,
         toolSources: {
@@ -14,6 +16,7 @@ export function createRuntimeAgentProduct(options) {
                 const base = await baseProduct.toolSources.resolve({
                     ...turnInput,
                     miniappAvailable,
+                    pptPreviewAvailable,
                 });
                 if (turnInput.toolsDisabled)
                     return base;
@@ -23,14 +26,11 @@ export function createRuntimeAgentProduct(options) {
                     surface: resolveAgentPromptSurface(turnInput.session, runtimeOwnerKind),
                     workspaceRoot: turnInput.session.workspaceDir,
                     baseTools: base.nativeTools,
-                    ...(turnInput.allowedExtensionSkillNames === undefined
-                        ? {}
-                        : { allowedExtensionSkillNames: turnInput.allowedExtensionSkillNames }),
                     ...(turnInput.desktopCapabilities
                         ? { desktopCapabilities: turnInput.desktopCapabilities }
                         : {}),
                 });
-                return { ...base, nativeTools: capability.tools };
+                return { ...base, nativeTools: authoring.tools(capability.tools, turnInput.session) };
             },
         },
         inputPreparation: {
@@ -45,7 +45,6 @@ export function createRuntimeAgentProduct(options) {
                         turnId: input.turnId,
                         surface: resolveAgentPromptSurface(input.session, runtimeOwnerKind),
                         userPrompt: input.promptText,
-                        ...allowedExtensionSkillNames(input.agentConfig),
                         ...(input.desktopCapabilities
                             ? { desktopCapabilities: input.desktopCapabilities }
                             : {}),
@@ -71,39 +70,10 @@ export function createRuntimeAgentProduct(options) {
                 config: modelConfig.read,
                 isGitRepository: baseProduct.preparation.configBuilder.isGitRepository ??
                     ((workspaceDir) => isGitRepo(workspaceDir, AbortSignal.timeout(2_000))),
-                skills: {
-                    listRuntimeSkills: async (scope) => {
-                        const base = await baseSkills.listRuntimeSkills(scope);
-                        const skill = browserUse.builtinSkillDescriptor();
-                        if (!skill)
-                            return base;
-                        return {
-                            ...base,
-                            skills: [
-                                ...base.skills.filter((candidate) => normalizedSkillName(candidate.name) !== normalizedSkillName(skill.name)),
-                                {
-                                    name: skill.name,
-                                    description: skill.description,
-                                    selectionScope: 'capability-owned',
-                                },
-                            ],
-                        };
-                    },
-                    renderCatalog: (scope) => {
-                        const skill = browserUse.builtinSkillDescriptor();
-                        if (!skill)
-                            return baseSkills.renderCatalog(scope);
-                        return baseSkills.renderCatalog({
-                            ...scope,
-                            additionalSkills: [
-                                ...(scope.additionalSkills ?? []).filter((candidate) => normalizedSkillName(candidate.name) !== normalizedSkillName(skill.name)),
-                                { name: skill.name, description: skill.description, builtin: true },
-                            ],
-                        });
-                    },
-                },
+                skills: withCapabilityOwnedSkills(baseSkills, (surface) => [browserUse.builtinSkillDescriptor(), authoring.skillFor(surface)].filter((skill) => skill !== undefined)),
                 nowMs,
                 miniappAvailable,
+                pptPreviewAvailable,
                 modelRepairLogger: logger,
                 staticPrompts: createLocalStaticPromptReader({ logger, globalInstructions }),
                 tuiProductPolicy: runtimeOwnerKind === 'tui',
@@ -174,9 +144,6 @@ function combineTurnToolSafetyGuards(guards) {
         },
     };
 }
-function normalizedSkillName(value) {
-    return value.trim().normalize('NFKC').toLocaleLowerCase('en-US');
-}
 function combineSystemReminderContent(baseContent, browserContent) {
     const browser = browserContent.trim();
     if (!browser)
@@ -231,13 +198,5 @@ function browserReminderEventAttributes(diagnostic) {
 }
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-function allowedExtensionSkillNames(agentConfig) {
-    const profile = isRecord(agentConfig.agent_profile) ? agentConfig.agent_profile : undefined;
-    const selection = isRecord(profile?.config_selection) ? profile.config_selection : undefined;
-    const value = selection?.extensionSkills;
-    return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
-        ? { allowedExtensionSkillNames: value }
-        : {};
 }
 //# sourceMappingURL=runtime-agent-product.js.map

@@ -1,3 +1,4 @@
+import { LocalMatrixClient } from '../../service/matrix/index.js';
 import { createHookExtension } from '@mavis/agent-runtime';
 /** Exposes only durable local attachment registration to v2 ingress owners. */
 export function createV1AttachmentRegistration(source) {
@@ -261,6 +262,15 @@ export function createV1CommerceCompatibility(options) {
             const { accessToken, loginEpoch } = options.authContextGetter?.() ?? {};
             return { accessToken, loginEpoch };
         },
+    };
+}
+export function createV1CanvasCompatibility(options) {
+    return {
+        createMatrixClient: () => new LocalMatrixClient({
+            authContext: options.authContextGetter?.(),
+            routingContextGetter: options.routingContextGetter,
+            ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        }),
     };
 }
 export function createV1MiniAppToolRules(routeContext) {

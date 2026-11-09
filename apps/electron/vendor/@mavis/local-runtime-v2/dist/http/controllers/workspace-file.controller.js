@@ -11,6 +11,27 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
         super();
         this.services = services;
     }
+    async watchWorkspaceFiles(_ctx, req) {
+        if (!Array.isArray(req.targets) ||
+            req.targets.some((target) => !target ||
+                typeof target.workspace !== 'string' ||
+                typeof target.path !== 'string' ||
+                !target.workspace.trim() ||
+                !target.path ||
+                target.workspace.includes('\0') ||
+                target.path.includes('\0'))) {
+            return {
+                ok: false,
+                status: 400,
+                body: {
+                    code: 400,
+                    key: 'INVALID_FILE_WATCH_TARGET',
+                    message: 'File watch targets require workspace and path.',
+                },
+            };
+        }
+        return { ok: true, source: this.requireWorkspaceFile().watchFiles(req.targets) };
+    }
     async listWorkspaceFileTree(ctx, req) {
         void ctx;
         // Per-entry metadata probed user files (including `.asar` archives that

@@ -13,6 +13,18 @@ import { assertSameWorkspaceBinding, normalizeWorkspaceIndexingErrorCode, sha256
 import { deleteLocalWorkspaceArtifacts } from '../../../../infra/legacy-db/workspace-indexing-workspace-artifact-store.js';
 const DEFAULT_INITIAL_SCAN_ATTEMPTS = 2;
 /**
+ * Feedback snapshots (internal builds only) ship inside the feedback log
+ * bundle, never to the index, so they use their own ceiling instead of the
+ * indexing one (10k files / 100MB): large monorepos would otherwise always be
+ * skipped. Source compresses to roughly a quarter, so 1GB of source lands near
+ * the bundle's 512MB cap; a snapshot that does not fit is the first artifact
+ * dropped and the logs still ship.
+ */
+const FEEDBACK_SNAPSHOT_SCAN_LIMITS = {
+    maxFiles: 100_000,
+    maxTotalBytes: 1024 * 1024 * 1024,
+};
+/**
  * Metric and observation shape per terminal preparation status. `observed`
  * absent means the status is real bookkeeping but not a user-visible
  * lifecycle change, so the business layer never sees it.
@@ -270,6 +282,15 @@ export class WorkspaceIndexingService {
         }
         this.reportPreparation(sink, result, this.nowMs() - startedMs);
         return result;
+    }
+    /**
+     * Feedback attachment for internal builds: one full Workspace snapshot in a
+     * caller-owned directory. Deliberately not gated on the indexing preference
+     * (the caller gates on the build) and never touches Session/Revision state,
+     * metrics, or the remote queue.
+     */
+    async captureFeedbackSnapshot(input, limits = FEEDBACK_SNAPSHOT_SCAN_LIMITS) {
+        return this.capture.captureStandaloneSnapshot({ ...input, limits });
     }
     async deleteSession(sessionId, completeSessionDeletion) {
         await this.operations.run(sessionId, async () => {

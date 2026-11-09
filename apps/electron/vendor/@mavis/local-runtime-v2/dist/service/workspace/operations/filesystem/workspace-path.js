@@ -63,6 +63,7 @@ const TEXT_EXTENSIONS = new Set([
 const BINARY_EXTENSIONS = new Set([
     '.7z',
     '.aac',
+    '.avif',
     '.bin',
     '.bmp',
     '.db',

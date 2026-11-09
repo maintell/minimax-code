@@ -70,6 +70,22 @@ export class BrowserProfileImportService {
             const installed = source === 'automatic' ? await this.dependencies.isChromeInstalled() : false;
             const profiles = source === 'automatic' ? [] : await this.dependencies.discoverProfiles({ source });
             const available = source === 'automatic' ? installed : profiles.length > 0;
+            // Only probed once a profile is actually in hand. The automatic path is
+            // a cheap installation check and must not start touching Chrome's data.
+            //
+            // Windows only. The hint says to close Chrome, and that is the right advice
+            // only where Chrome holds the database exclusively, which is a Windows
+            // behaviour. On macOS the same open can fail for a different reason: TCC
+            // reports a permission problem as EACCES, which this probe cannot tell
+            // apart from an exclusive holder. Telling a macOS user to close Chrome
+            // when the real obstacle is a permission grant sends them somewhere that
+            // cannot fix it.
+            const lockedProfile = profiles.find((profile) => profile.cookieDatabasePath);
+            const cookieDatabaseLocked = this.dependencies.platform === 'win32' && lockedProfile
+                ? await this.dependencies
+                    .isCookieDatabaseLocked(lockedProfile.cookieDatabasePath)
+                    .catch(() => false)
+                : false;
             return {
                 success: true,
                 capability: {
@@ -78,6 +94,7 @@ export class BrowserProfileImportService {
                     cookieImport: true,
                     passwordImport: false,
                     platform: this.dependencies.platform,
+                    ...(cookieDatabaseLocked ? { cookieDatabaseLocked: true } : {}),
                     ...(!available ? { unavailableReason: 'chrome_not_found' } : {}),
                 },
                 profiles: profiles.map((profile) => profile.publicMetadata),

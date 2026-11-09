@@ -1,7 +1,7 @@
 {
   "schema": "mavis.pptx_font_pack_audit.v1",
   "auditStatus": "approved",
-  "manifestVersion": "pptx-font-pack.v9",
+  "manifestVersion": "pptx-font-pack.v11",
   "fallbackPolicyVersion": "pptx-font-fallback.v5",
   "licenses": [
     {
@@ -43,6 +43,16 @@
       "spdx": "OFL-1.1",
       "noticePath": "fonts/NotoEmoji-OFL.txt",
       "sha256": "sha256:500bb1ccf43df7bbb522112f9133a52b16e1c35e809632f5d8609b179152de5b"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/Tinos-OFL.txt",
+      "sha256": "sha256:cb3382d4643e8b02c12e322c220a3c76a5020d667e4fd4e7c75e744cca6caa6b"
+    },
+    {
+      "spdx": "OFL-1.1",
+      "noticePath": "fonts/NotoSerifCJK-OFL.txt",
+      "sha256": "sha256:6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
     }
   ],
   "fonts": [
@@ -137,6 +147,31 @@
       "byteLength": 30737452,
       "scripts": ["Hans", "Hant", "Hani", "Hira", "Kana", "Hang", "Bopo", "Latn", "Grek", "Cyrl"],
       "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "fontId": "noto-serif-sc-variable",
+      "family": "Noto Serif SC",
+      "aliases": [
+        "Noto Serif CJK SC",
+        "Source Han Serif SC",
+        "思源宋体",
+        "SimSun",
+        "宋体",
+        "NSimSun",
+        "新宋体",
+        "Songti SC",
+        "STSong",
+        "华文宋体"
+      ],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/NotoSerifSC-VF.otf",
+      "sha256": "sha256:71b4d3ded2d90ff43bb75a4e48cdbe170f0b8d5486dc89ff87f2a1728b56da64",
+      "byteLength": 22613272,
+      "scripts": ["Hans", "Hant", "Hani", "Hira", "Kana", "Bopo", "Latn", "Grek", "Cyrl"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/NotoSerifCJK-OFL.txt"
     },
     {
       "fontId": "noto-sans-symbols2-regular",
@@ -319,6 +354,62 @@
       "scripts": ["Latn"],
       "licenseSpdx": "OFL-1.1",
       "licenseNoticePath": "fonts/Arvo-OFL.txt"
+    },
+    {
+      "fontId": "tinos-regular",
+      "family": "Tinos",
+      "aliases": ["Times New Roman", "Times"],
+      "style": "normal",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Tinos-Regular.ttf",
+      "sha256": "sha256:60a0e8ef0c04dd5dd69ffe91025fa2ae5836cbd35600a82ba031977557e2cb61",
+      "byteLength": 521588,
+      "scripts": ["Latn", "Grek", "Cyrl", "Hebr"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Tinos-OFL.txt"
+    },
+    {
+      "fontId": "tinos-bold",
+      "family": "Tinos",
+      "aliases": ["Times New Roman", "Times"],
+      "style": "normal",
+      "weight": 700,
+      "stretch": 100,
+      "assetPath": "fonts/Tinos-Bold.ttf",
+      "sha256": "sha256:393269dbab8899f938db19783eca5eac92eb431f7ae0ab45b8349ca895f1a06b",
+      "byteLength": 597880,
+      "scripts": ["Latn", "Grek", "Cyrl", "Hebr"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Tinos-OFL.txt"
+    },
+    {
+      "fontId": "tinos-italic",
+      "family": "Tinos",
+      "aliases": ["Times New Roman", "Times"],
+      "style": "italic",
+      "weight": 400,
+      "stretch": 100,
+      "assetPath": "fonts/Tinos-Italic.ttf",
+      "sha256": "sha256:5942266ed398b155d7dc23e36833e7ec6be988f2439bdbeb8ef1bede808eaa91",
+      "byteLength": 565016,
+      "scripts": ["Latn", "Grek", "Cyrl", "Hebr"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Tinos-OFL.txt"
+    },
+    {
+      "fontId": "tinos-bold-italic",
+      "family": "Tinos",
+      "aliases": ["Times New Roman", "Times"],
+      "style": "italic",
+      "weight": 700,
+      "stretch": 100,
+      "assetPath": "fonts/Tinos-BoldItalic.ttf",
+      "sha256": "sha256:a5de79f0fe863ea0954757acb3d47b3ccd0a930ce3dd5b97230cd3866790a06e",
+      "byteLength": 578976,
+      "scripts": ["Latn", "Grek", "Cyrl", "Hebr"],
+      "licenseSpdx": "OFL-1.1",
+      "licenseNoticePath": "fonts/Tinos-OFL.txt"
     }
   ],
   "fallbackPolicy": {
@@ -352,7 +443,7 @@
     {
       "repository": "https://github.com/notofonts/noto-cjk",
       "commit": "f8d157532fbfaeda587e826d4cd5b21a49186f7c",
-      "families": ["Noto Sans SC"],
+      "families": ["Noto Sans SC", "Noto Serif SC"],
       "licenseSpdx": "OFL-1.1"
     },
     {
@@ -363,7 +454,8 @@
         "Montserrat",
         "Roboto Condensed",
         "Arvo",
-        "Arimo"
+        "Arimo",
+        "Tinos"
       ],
       "licenseSpdx": "OFL-1.1"
     },
@@ -378,6 +470,12 @@
       "release": "v4.1",
       "archiveSha256": "sha256:9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e",
       "families": ["Inter"],
+      "licenseSpdx": "OFL-1.1"
+    },
+    {
+      "repository": "https://github.com/googlefonts/tinos",
+      "commit": "3b4482a99b80ea5fc75f187b1be3120a3f5905b3",
+      "families": ["Tinos"],
       "licenseSpdx": "OFL-1.1"
     }
   ]

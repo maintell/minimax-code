@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { toNativeWindowsDrivePath } from '../files/path-utils.js';
 export class IdeLauncherError extends Error {
     status;
     code;
@@ -15,7 +16,7 @@ export function expandTilde(input) {
     return input.startsWith('~') ? path.join(homedir(), input.slice(1)) : input;
 }
 export function resolvePath(input) {
-    return path.resolve(expandTilde(input));
+    return path.resolve(toNativeWindowsDrivePath(expandTilde(input)));
 }
 function isPathInsideOrEqual(root, target) {
     const rel = path.relative(root, target);

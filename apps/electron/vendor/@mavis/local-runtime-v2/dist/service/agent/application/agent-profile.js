@@ -465,10 +465,9 @@ function toConfigSelection(config) {
         ...(config.tools === undefined ? {} : { tools: config.tools }),
         ...(config.disallowedTools === undefined ? {} : { disallowedTools: config.disallowedTools }),
         ...(config.mcpServers === undefined ? {} : { mcpServers: config.mcpServers }),
+        // Preloaded on the first Turn only. `x-mavis.extensionSkills` is still
+        // parsed and kept in the file but no longer selects Skills.
         ...(config.skills === undefined ? {} : { skills: config.skills }),
-        ...(config.xMavis?.extensionSkills === undefined
-            ? {}
-            : { extensionSkills: config.xMavis.extensionSkills }),
     };
 }
 function frozenConfigSelection(definition) {
@@ -484,10 +483,15 @@ function frozenConfigSelection(definition) {
         ...copyFrozenSelector(capabilities, 'tools'),
         ...copyFrozenSelector(capabilities, 'disallowedTools'),
         ...frozenMcpServers(copyFrozenSelector(capabilities, 'mcpServers').mcpServers, current),
-        ...copyFrozenSelector(capabilities, 'skills'),
-        ...copyFrozenSelector(capabilities, 'extensionSkills'),
+        // Frozen `skills` / `extensionSkills` record the Skills ready at capture,
+        // not a preload list, so reading them back would preload every Skill. Only
+        // `preloadSkills` is; a snapshot without it preloads none.
+        ...frozenPreloadSkills(copyFrozenSelector(capabilities, 'preloadSkills').preloadSkills),
         frozenSelectorVersion: current ? FROZEN_SELECTOR_VERSION : 'legacy',
     };
+}
+function frozenPreloadSkills(value) {
+    return value === undefined ? {} : { skills: value };
 }
 /**
  * Turns a frozen `mcpServers` back into an Agent selector. A version 2
@@ -512,7 +516,9 @@ function copyFrozenSelector(capabilities, key) {
     if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
         throw new AgentServiceError('AGENT_CONFIG_INVALID', `Frozen Agent definition ${key} must be a string array.`, undefined, { field: `definition.capabilities.${key}`, reason: 'must be a string array' });
     }
-    return { [key]: [...value] };
+    const copied = {};
+    copied[key] = [...value];
+    return copied;
 }
 export function asAgentConfigServiceError(error) {
     if (!(error instanceof AgentConfigError))

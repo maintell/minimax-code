@@ -104,6 +104,8 @@ function validateCapabilities(capabilities) {
     }
     if (capabilities.disallowedTools !== undefined)
         validateStringArray(capabilities.disallowedTools);
+    if (capabilities.preloadSkills !== undefined)
+        validateStringArray(capabilities.preloadSkills);
     decodeSelectorVersion(capabilities.selectorVersion);
 }
 /** A Plugin Agent has no Custom Agent incarnation and is owned by its scoped name. */
@@ -166,6 +168,9 @@ function freezeCapabilities(capabilities) {
         mcpServers: Object.freeze([...capabilities.mcpServers]),
         skills: Object.freeze([...capabilities.skills]),
         extensionSkills: Object.freeze([...capabilities.extensionSkills]),
+        ...(capabilities.preloadSkills === undefined
+            ? {}
+            : { preloadSkills: Object.freeze([...capabilities.preloadSkills]) }),
         ...(capabilities.selectorVersion === undefined
             ? {}
             : { selectorVersion: capabilities.selectorVersion }),
@@ -179,6 +184,7 @@ function decodeCapabilities(capabilities) {
         mcpServers: requiredStringArray(capabilities, 'mcpServers'),
         skills: requiredStringArray(capabilities, 'skills'),
         extensionSkills: requiredStringArray(capabilities, 'extensionSkills'),
+        ...optionalStringArray(capabilities, 'preloadSkills'),
         ...(selectorVersion === undefined ? {} : { selectorVersion }),
     };
 }

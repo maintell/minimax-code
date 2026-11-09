@@ -7,7 +7,7 @@ import { repairCanonicalHistory } from './canonical-history-recovery.js';
 import { deleteSessionHistory } from './session-history-paths.js';
 import { createSessionHistoryLocationResolver, } from './session-history-location.js';
 import { ensureCanonicalHistoryMaterialized, } from './canonical-history-materializer.js';
-import { HistoryScannerError, scanCanonicalHistoryArtifacts, } from './mutation/canonical-history-scanner.js';
+import { HistoryScannerError, verifyCompactionParent, } from './mutation/canonical-history-scanner.js';
 import { isUserMessageId } from '../../shared/user-message-id.js';
 import { isSideChatModeMessage } from '../../shared/sidechat-mode.js';
 import { createSessionHistoryIoLane, } from './mutation/session-history-coordination.js';
@@ -26,13 +26,9 @@ function historySnapshot(records, useActiveRevision) {
 function isMissingParentScannerError(error) {
     return error instanceof HistoryScannerError && error.code === 'parent-snapshot-missing';
 }
-async function scanCompactionLineageAllowingMissingParent(paths, sessionId) {
+async function verifyCompactionParentAllowingMissing(paths, activeRecords) {
     try {
-        await scanCanonicalHistoryArtifacts({
-            activePath: paths.messages,
-            snapshotsPath: paths.snapshots,
-            sessionId,
-        });
+        await verifyCompactionParent({ activeRecords, snapshotsPath: paths.snapshots });
     }
     catch (error) {
         if (!isMissingParentScannerError(error))
@@ -106,7 +102,7 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             // The snapshot and the replacement rewrite the whole file, so start from a full disk read.
             files.forget?.(paths.messages);
             const active = await files.readActiveStrict(paths.messages);
-            await scanCompactionLineageAllowingMissingParent(paths, change.sessionId);
+            await verifyCompactionParentAllowingMissing(paths, active);
             const generation = activeGeneration(active);
             const compactionId = safeCompactionId(change.compactionId);
             const snapshotPath = join(paths.snapshots, `g${String(generation).padStart(12, '0')}--${compactionId}.jsonl`);
@@ -389,30 +385,8 @@ function assertChange(change, reason) {
 function compactionReplacementEnvelopes(change, active) {
     const currentUserTail = readCurrentUserTail(change, active);
     const baseMessages = currentUserTail?.baseMessages ?? change.messages;
-    if (change.method === 'llm_checkpoint') {
-        const replacement = baseMessages.map((message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }));
-        assertCheckpointReplacement(replacement);
-        return currentUserTail ? [...replacement, ...currentUserTail.envelopes] : replacement;
-    }
-    const sourceIndexes = validateToolReplacementSourceIndexes(change, active, baseMessages.length);
-    const retainedExternalUsers = new Set();
-    const replacement = baseMessages.map((message, index) => {
-        const sourceIndex = sourceIndexes[index];
-        const source = sourceIndex === undefined ? undefined : active[sourceIndex];
-        if (!source)
-            throw new TypeError('Canonical ToolResult compaction source identity is missing.');
-        const normalized = historyMessage(message);
-        assertToolReplacementMessage(source, normalized);
-        if (isUserMessageId(source.message_id))
-            retainedExternalUsers.add(source.message_id);
-        return { ...withoutHistoryArtifact(source), message: normalized };
-    });
-    if (currentUserTail)
-        retainedExternalUsers.add(currentUserTail.user.message_id);
-    const missingExternalUser = active.find(({ message_id }) => isUserMessageId(message_id) && !retainedExternalUsers.has(message_id));
-    if (missingExternalUser) {
-        throw new TypeError(`Canonical ToolResult compaction dropped an external user identity: ${missingExternalUser.message_id}`);
-    }
+    const replacement = baseMessages.map((message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }));
+    assertCheckpointReplacement(replacement);
     return currentUserTail ? [...replacement, ...currentUserTail.envelopes] : replacement;
 }
 function assertCheckpointReplacement(replacement) {
@@ -486,45 +460,6 @@ function isHiddenTypedCustom(value) {
         Boolean(Reflect.get(value, 'customType').trim()) &&
         typeof Reflect.get(value, 'timestamp') === 'number' &&
         Number.isFinite(Reflect.get(value, 'timestamp')));
-}
-function validateToolReplacementSourceIndexes(change, active, expectedLength) {
-    const indexes = change.replacementSourceIndexes;
-    if (!Array.isArray(indexes) || indexes.length !== expectedLength) {
-        throw new TypeError('Canonical ToolResult compaction source lineage is incomplete.');
-    }
-    let previous = -1;
-    indexes.forEach((index) => {
-        if (!Number.isSafeInteger(index) ||
-            index <= previous ||
-            index >= active.length ||
-            index === change.currentUserSourceIndex) {
-            throw new TypeError('Canonical ToolResult compaction source lineage is invalid.');
-        }
-        previous = index;
-    });
-    return indexes;
-}
-function assertToolReplacementMessage(source, replacement) {
-    if (source.message.role !== replacement.role) {
-        throw new TypeError('Canonical ToolResult compaction changed a message role.');
-    }
-    if (isUserMessageId(source.message_id) && !sameJson(source.message, replacement)) {
-        throw new TypeError(`Canonical ToolResult compaction changed external user payload: ${source.message_id}`);
-    }
-    if (source.message.role !== 'user' &&
-        source.message.role !== 'toolResult' &&
-        !sameJson(source.message, replacement)) {
-        throw new TypeError(`Canonical ToolResult compaction changed a non-result message: ${source.message_id}`);
-    }
-    if (source.message.role === 'toolResult' &&
-        !sameJson(withoutContent(source.message), withoutContent(replacement))) {
-        throw new TypeError(`Canonical ToolResult compaction changed tool result identity: ${source.message_id}`);
-    }
-}
-function withoutContent(message) {
-    const semanticMessage = { ...message };
-    delete semanticMessage['content'];
-    return semanticMessage;
 }
 function sameJson(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);

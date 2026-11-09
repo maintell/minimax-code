@@ -18,6 +18,7 @@ export function initializeMiniAppSupervisor(options) {
             ...(options.permissionSwitches ? { permissionSwitches: options.permissionSwitches } : {}),
             ...(options.toolGateway ? { toolGateway: options.toolGateway } : {}),
             ...(options.logger ? { logger: options.logger } : {}),
+            ...(options.hostRequestActivity ? { activity: options.hostRequestActivity } : {}),
         }),
     });
     const supervisor = new DefaultMiniAppSupervisor({
@@ -27,7 +28,6 @@ export function initializeMiniAppSupervisor(options) {
         verifyCandidate: options.verifyCandidate,
         ...(options.nowMs ? { nowMs: options.nowMs } : {}),
         ...(options.closeTimeoutMs ? { closeTimeoutMs: options.closeTimeoutMs } : {}),
-        ...(options.idleTimeoutMs ? { idleTimeoutMs: options.idleTimeoutMs } : {}),
         ...(options.logCapacity ? { logCapacity: options.logCapacity } : {}),
     });
     return supervisor;

@@ -130,12 +130,8 @@ export function registerDeepLinkHandler(action, handler) {
  * the deep-link dependency graph.
  */
 export function acquireSingleInstanceLock() {
-    // Windows/Linux: 通过 second-instance 事件接收
-    // 确保单实例运行：lock key 同时区分协议（中/外、test/staging）、构建环境
-    // （dev/prod）和开发 worktree，既能与已安装的 `.app` 并存，也允许多个
-    // worktree 的开发客户端并行运行。
-    // 详见 single-instance-lock.ts 的注释。
-    // 注意：必须在注册协议之前请求单实例锁，否则新启动的实例可能在退出前就注册了协议
+    // Packaged apps retain the single-instance lock and second-instance deep-link routing.
+    // Acquire the lock before protocol registration so a secondary process cannot replace it.
     const lockKey = buildSingleInstanceLockKey(PROTOCOL_NAME, {
         isDev: isDev,
         isTest: isTest,
@@ -153,6 +149,10 @@ export function acquireSingleInstanceLock() {
     };
     const gotTheLock = app.requestSingleInstanceLock(launchData);
     if (!gotTheLock) {
+        // Ordinary dev launches may share data. Keep protocol callbacks routed to
+        // the existing lock owner, including Windows OAuth launches.
+        if (isDev && !process.argv.some(isDeepLinkUrl))
+            return true;
         // 另一个实例已在运行，退出当前实例
         // 不要做任何其他操作，直接退出
         app.quit();

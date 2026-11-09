@@ -1,5 +1,6 @@
 import { convertResponsesMessages, convertResponsesTools } from '@earendil-works/pi-ai';
-import { thinkingToPortableText, toProviderMessages } from './messages-count-tokens-messages.js';
+import { thinkingToPortableText } from '@mavis/agent-core/pi-turn-runner';
+import { toProviderMessages } from './messages-count-tokens-messages.js';
 const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS = new Set(['openai', 'openai-codex', 'opencode']);
 export function buildResponsesInputTokensRequestBody(messages, systemPrompt, model, tools) {
     const context = {

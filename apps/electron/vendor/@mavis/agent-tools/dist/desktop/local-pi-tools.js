@@ -34,11 +34,12 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 };
 import { attachProgrammaticErrorData, bindTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
 import { sanitizeBashSubprocessEnv } from '@mavis/agent-core/bash-subprocess-env';
+import { logger } from '@mavis/shared/local-runtime-logging/logger';
 import { createBashTool, createEditTool, createReadTool, createWriteTool, DEFAULT_MAX_LINES, } from '@earendil-works/pi-coding-agent/tools';
 import { getShellConfig } from '@earendil-works/pi-coding-agent/shell';
 import { IMAGE_DIMENSION_HEADER_BYTES, parseImageDimensionsFromBytes, } from '@mavis/shared/image-dimensions';
 import { access, readFile, stat } from '../shared/physical-fs.js';
-import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { basename, extname, isAbsolute, relative, resolve as resolvePath, sep } from 'node:path';
 import { homedir, release } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -49,6 +50,8 @@ import { LocalBashToolDef, LocalEditToolDef, LocalReadToolDef, LocalWriteToolDef
 import { executeLocalHostTrashIfRequested, } from './host-trash-executor.js';
 import { copyWithPermissionExecutionPlan, readPermissionExecutionPlan, resolvePermissionBashEnvPolicy, } from './permission-execution.js';
 import { inferReadVideoMimeType, readVideoAsToolResult } from '../shared/read-video.js';
+import { readNativeMediaAsToolResult } from '../shared/read-native-media.js';
+import { nativeAudioMimeForExtension } from '../shared/multimodal-attachments.js';
 import { buildReplaceAllEdit, ReplaceAllError, withReplaceAllCount, } from '../shared/replace-all-edit.js';
 import { checkBlockedDeviceRead, checkNonRegularFileRead, detectBinaryRead, detectPiSupportedImageMimeTypeFromFile, } from '../shared/read-guards.js';
 import { isPdfReadPath, readPdfAsToolResult } from '../shared/read-pdf.js';
@@ -60,6 +63,7 @@ import { executeEditWithLineNumberRetry, normalizeEditsForLineNumberRetry, } fro
 import { createCapturingEditOperations } from '../shared/edit-capture.js';
 import { withCompatibleBashToolResponseFromPiDetails, withCompatibleEditToolResponse, } from '../plugin-hooks/vendor-tool-response.js';
 import { buildWriteToolResult, createCapturingWriteOperations } from '../shared/write-capture.js';
+import { assertOverwriteAllowed, isRememberedVersionCurrent, observeFileVersion, rememberCurrentFileVersion, rememberFileVersion, WriteGuardRejectedError, writeGuardRejectedResult, } from '../shared/file-read-ledger.js';
 import { applyDesktopTextLimit, DESKTOP_BASH_MAX_BYTES, DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, DESKTOP_READ_TEXT_MAX_BYTES, isPtcChildCall, limitDesktopHeadTailLines, limitDesktopPrefixLines, PTC_CHILD_FULL_OUTPUT_MAX_BYTES, withDesktopOutputContinuation, } from './output-limit.js';
 export function getLocalBashEnvironment() {
     let shell = 'unavailable';
@@ -80,6 +84,36 @@ export function getLocalBashEnvironment() {
         shell,
     };
 }
+/**
+ * Pi's read tool for one call, recording in `piRead` the file it opens.
+ * `uncapped` is the run_code child variant: no line limit, and Pi's byte limit
+ * raised to PTC_CHILD_FULL_OUTPUT_MAX_BYTES, so an over-budget window is cut
+ * by Pi before it becomes one huge numbered string (the read then falls back).
+ */
+function createObservedReadTool(workspaceRoot, piRead, uncapped) {
+    // The host's request media extension encodes every tool result image to
+    // `requestMedia.image`; a second resize here would cap it and add a note.
+    return createReadTool(workspaceRoot, {
+        autoResizeImages: false,
+        operations: {
+            access,
+            detectImageMimeType: detectPiSupportedImageMimeTypeFromFile,
+            async readFile(path) {
+                piRead.reached = true;
+                piRead.observed = await observeFileVersion(path);
+                return readFile(path);
+            },
+        },
+        ...(uncapped
+            ? {
+                truncation: {
+                    maxLines: Number.POSITIVE_INFINITY,
+                    maxBytes: PTC_CHILD_FULL_OUTPUT_MAX_BYTES,
+                },
+            }
+            : {}),
+    });
+}
 let LocalReadTool = (() => {
     let _classDecorators = [bindTool(LocalReadToolDef)];
     let _classDescriptor;
@@ -95,30 +129,8 @@ let LocalReadTool = (() => {
             __runInitializers(_classThis, _classExtraInitializers);
         }
         workspaceRoot;
-        tool;
-        /**
-         * For run_code children: no line limit, and Pi's byte limit raised to
-         * PTC_CHILD_FULL_OUTPUT_MAX_BYTES, so an over-budget window is cut by Pi
-         * before it becomes one huge numbered string (the read then falls back).
-         */
-        uncappedTool;
         constructor(workspaceRoot) {
             this.workspaceRoot = workspaceRoot;
-            // The host's request media extension encodes every tool result image to
-            // `requestMedia.image`; a second resize here would cap it and add a note.
-            const options = {
-                autoResizeImages: false,
-                operations: {
-                    access,
-                    readFile,
-                    detectImageMimeType: detectPiSupportedImageMimeTypeFromFile,
-                },
-            };
-            this.tool = createReadTool(workspaceRoot, options);
-            this.uncappedTool = createReadTool(workspaceRoot, {
-                ...options,
-                truncation: { maxLines: Number.POSITIVE_INFINITY, maxBytes: PTC_CHILD_FULL_OUTPUT_MAX_BYTES },
-            });
         }
         async execute(ctx, input, signal) {
             try {
@@ -147,6 +159,24 @@ let LocalReadTool = (() => {
             if (irregularError) {
                 return withReadKind(readErrorResult(LocalReadToolDef.name, irregularError), 'text');
             }
+            // Stat before reading: if the file changes during the read, the recorded
+            // version is already stale and a later overwrite asks for a fresh read.
+            // An existing regular file is recorded even when read refuses or fails
+            // (binary content, blocked extension, no read permission): read cannot
+            // show those by design, and write must still be able to overwrite them.
+            // Missing and non-regular files record nothing.
+            const observed = await observeFileVersion(readAbs);
+            const piRead = { reached: false };
+            try {
+                return await this.readRegularFile(ctx, input, readAbs, piRead, signal);
+            }
+            finally {
+                const seen = piRead.reached ? piRead.observed : observed;
+                if (seen && !signal?.aborted)
+                    rememberFileVersion(ctx.sessionId, seen);
+            }
+        }
+        async readRegularFile(ctx, input, readAbs, piRead, signal) {
             // pi natively inlines images (jpg/png/gif/webp). Video is not part of
             // pi's built-in mime detection, so we mirror cloud-runtime here: when
             // the path looks like an inline-capable video, run the shared helper
@@ -170,15 +200,27 @@ let LocalReadTool = (() => {
                     // ENOENT — let pi retry with its macOS-aware path variants.
                 }
             }
+            // Audio and PDF go inline only for a model that reads them natively
+            // (Gemini); otherwise audio hits the binary guard and PDF is extracted.
+            const audioMime = nativeAudioMimeForExtension(extname(readAbs));
+            if (audioMime) {
+                const audio = await this.readNativeMedia(ctx, readAbs, 'audio', audioMime, signal);
+                if (audio)
+                    return withReadKind(audio, 'audio');
+            }
             // PDF / notebook dispatch: these never reach pi (which would read them
-            // as UTF-8 garbage / raw JSON).
+            // as UTF-8 garbage / raw JSON). A page range always uses text extraction.
             if (isPdfReadPath(readAbs)) {
-                return withReadKind(await readPdfAsToolResult({
-                    toolName: LocalReadToolDef.name,
-                    absolutePath: readAbs,
-                    pages: input.pages,
-                    signal,
-                }), 'pdf');
+                const native = input.pages === undefined
+                    ? await this.readNativeMedia(ctx, readAbs, 'pdf', 'application/pdf', signal)
+                    : undefined;
+                return withReadKind(native ??
+                    (await readPdfAsToolResult({
+                        toolName: LocalReadToolDef.name,
+                        absolutePath: readAbs,
+                        pages: input.pages,
+                        signal,
+                    })), 'pdf');
             }
             if (isNotebookReadPath(readAbs)) {
                 return withReadKind(await readNotebookAsToolResult({
@@ -196,13 +238,17 @@ let LocalReadTool = (() => {
             // Strip `pages` before delegating: pi's read schema does not know the
             // parameter, and models occasionally send it for non-PDF files.
             const { pages: _pages, ...piInput } = input;
+            // Pi resolves the path itself (strips `@`, normalizes whitespace), so it
+            // may read another file than readAbs. Both reads below record the file pi
+            // actually reads, as seen just before reading, so the key matches the file
+            // write targets; when the child read falls back, the second read wins.
             // A run_code child reads the whole file, or exactly offset/limit: Pi's
             // 2000-line / 50 KB head limit, the 2000-character line cap and the
             // Desktop 24 KiB cap are for the model (see isPtcChildCall). Over
             // PTC_CHILD_FULL_OUTPUT_MAX_BYTES it gets the direct-call page and the
             // offset to continue instead, like a Bash child's preview.
             if (isPtcChildCall(ctx) && !(await fileOverPtcReadBudget(readAbs, input.limit))) {
-                const res = await this.uncappedTool.execute('', piInput, signal);
+                const res = await createObservedReadTool(this.workspaceRoot, piRead, true).execute('', piInput, signal);
                 const result = piReadResultToToolResult(LocalReadToolDef.name, res, {
                     offset: input.offset,
                     maxLineChars: Number.POSITIVE_INFINITY,
@@ -211,11 +257,29 @@ let LocalReadTool = (() => {
                     return withReadProgrammaticResult(result, input.limit, readCapSkipped(result));
                 }
             }
-            const res = await this.tool.execute('', piInput, signal);
+            const res = await createObservedReadTool(this.workspaceRoot, piRead, false).execute('', piInput, signal);
             const result = piReadResultToToolResult(LocalReadToolDef.name, res, {
                 offset: input.offset,
             });
             return withReadProgrammaticResult(limitDesktopReadTextResult(result, input.offset), input.limit);
+        }
+        async readNativeMedia(ctx, absolutePath, kind, mimeType, signal) {
+            try {
+                return await readNativeMediaAsToolResult({
+                    toolName: LocalReadToolDef.name,
+                    absolutePath,
+                    kind,
+                    mimeType,
+                    capabilities: ctx.parentAgentConfig?.model?.capabilities,
+                    signal,
+                });
+            }
+            catch (err) {
+                // ENOENT: let the later readers and pi's path variants report it.
+                if (isFsNotFoundError(err))
+                    return undefined;
+                throw err;
+            }
         }
     };
     return LocalReadTool = _classThis;
@@ -425,10 +489,21 @@ let LocalWriteTool = (() => {
             __runInitializers(_classThis, _classExtraInitializers);
         }
         workspaceRoot;
-        constructor(workspaceRoot) {
+        observeGuardCheck;
+        constructor(workspaceRoot, observeGuardCheck) {
             this.workspaceRoot = workspaceRoot;
+            this.observeGuardCheck = observeGuardCheck;
         }
-        async execute(_ctx, input, signal) {
+        /** Diagnostics only: a throwing observer must not change what the write does. */
+        reportGuardCheck(result) {
+            try {
+                this.observeGuardCheck?.(result);
+            }
+            catch {
+                // The write already has its own outcome; observation never overrides it.
+            }
+        }
+        async execute(ctx, input, signal) {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
             // Per-execute capture context. This tool instance is a process-level
@@ -437,10 +512,48 @@ let LocalWriteTool = (() => {
             // execute keeps each write's byte count / diff its own. The injected
             // writeFile still runs inside pi's withFileMutationQueue slot: it captures
             // the old file (BOM/encoding/content) and writes with the preserved
-            // encoding — see write-capture.ts / design doc.
-            const { operations, takeCapture } = createCapturingWriteOperations();
+            // encoding — see write-capture.ts / design doc. In the same slot the guard
+            // refuses to overwrite a file this session has not read, or that changed
+            // after its last read (file-read-ledger.ts).
+            const { operations, takeCapture } = createCapturingWriteOperations({
+                guard: {
+                    beforeWrite: async (path, current) => {
+                        // No regular file to overwrite: the guard has nothing to compare.
+                        if (!current) {
+                            this.reportGuardCheck('new_file');
+                            return;
+                        }
+                        try {
+                            await assertOverwriteAllowed(ctx.sessionId, path, current);
+                        }
+                        catch (err) {
+                            if (err instanceof WriteGuardRejectedError) {
+                                this.reportGuardCheck(err.code === 'WRITE_NOT_READ' ? 'not_read' : 'stale_read');
+                            }
+                            throw err;
+                        }
+                        this.reportGuardCheck('allowed');
+                    },
+                    afterWrite: (path) => rememberCurrentFileVersion(ctx.sessionId, path),
+                },
+            });
             const tool = createWriteTool(this.workspaceRoot, { operations });
-            const res = await executeWithFailurePath(input.path, () => tool.execute('', input, signal));
+            let res;
+            try {
+                res = await executeWithFailurePath(input.path, () => tool.execute('', input, signal));
+            }
+            catch (err) {
+                if (!(err instanceof WriteGuardRejectedError))
+                    throw err;
+                logger.warn({
+                    sessionId: ctx.sessionId,
+                    path: writeGuardLogPath(input.path, this.workspaceRoot),
+                    reason: err.code,
+                    recordedVersion: err.recorded ?? null,
+                    currentVersion: err.current,
+                }, 'write guard refused to overwrite file');
+                return writeGuardRejectedResult(LocalWriteToolDef.name, input.path, err.code);
+            }
             const capture = takeCapture(resolveLocalCandidatePath(input.path, this.workspaceRoot));
             const result = buildWriteToolResult(LocalWriteToolDef.name, input.path, input.content, capture, toToolResult(LocalWriteToolDef.name, res).text);
             const created = result.details?.created;
@@ -475,7 +588,7 @@ let LocalEditTool = (() => {
         constructor(workspaceRoot) {
             this.workspaceRoot = workspaceRoot;
         }
-        async execute(_ctx, input, signal) {
+        async execute(ctx, input, signal) {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
             // Translate the compatible style public schema (file_path + old_string +
@@ -485,7 +598,13 @@ let LocalEditTool = (() => {
             // withFileMutationQueue locking for free. The execution is then routed
             // through the line-number-retry wrapper so a model that pasted read's
             // `N→` prefixes into old_string still recovers (CR !4027 P1).
-            const capture = createCapturingEditOperations();
+            // Edit does not require a read. It only refreshes a read record that
+            // still matches the file, so the session can overwrite its own edit
+            // without reading again.
+            const capture = createCapturingEditOperations({
+                isRecordCurrent: (path) => isRememberedVersionCurrent(ctx.sessionId, path),
+                refresh: (path) => rememberCurrentFileVersion(ctx.sessionId, path),
+            });
             const { piInput, piResult } = await executeWithFailurePath(input.file_path, async () => {
                 const prepared = await buildPiEditInput(input, this.workspaceRoot);
                 const tool = createEditTool(this.workspaceRoot, { operations: capture.operations });
@@ -1045,9 +1164,11 @@ function toToolResult(toolName, res) {
  * capture semantics.
  */
 /**
- * Keep the ledger key byte-for-byte aligned with Pi's `resolveToCwd` input.
- * This is deliberately lexical: `realpath` would collapse symlink aliases and
- * broaden a read authorization beyond the path spelling the agent inspected.
+ * Lexical normalization for capture hints and read dispatch, aligned with
+ * Pi's `resolveToCwd` input. It is not the read-before-write key: the
+ * read ledger (file-read-ledger.ts) deliberately keys by realpath, so symlink
+ * aliases of one file share a read record; the version check still catches
+ * any change made through either alias.
  */
 export function normalizeLocalExistingPath(absolutePath, resolveAbsolutePath = resolvePath) {
     return resolveAbsolutePath(absolutePath);
@@ -1061,6 +1182,21 @@ function resolveLocalCandidatePath(input, workspaceRoot) {
         path = resolvePath(homedir(), path.slice(2));
     }
     return normalizeLocalExistingPath(isAbsolute(path) ? path : resolvePath(workspaceRoot, path));
+}
+/**
+ * Log label for a refused write. Logs must not carry a private path in full
+ * (.harness/docs/code-standards.md), so a file inside the workspace is logged
+ * workspace-relative and anything else as `<path>/<basename>`, the shape the
+ * Mini App startup-failure log already uses.
+ */
+function writeGuardLogPath(inputPath, workspaceRoot) {
+    const absolutePath = resolveLocalCandidatePath(inputPath, workspaceRoot);
+    const fromWorkspace = relative(workspaceRoot, absolutePath);
+    const outside = fromWorkspace === '' ||
+        fromWorkspace === '..' ||
+        fromWorkspace.startsWith(`..${sep}`) ||
+        isAbsolute(fromWorkspace);
+    return outside ? `<path>/${basename(absolutePath)}` : fromWorkspace.split(sep).join('/');
 }
 async function resolveLocalReadPath(input, workspaceRoot) {
     const literalResolved = resolveLocalCandidatePath(input, workspaceRoot);

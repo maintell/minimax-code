@@ -19,6 +19,8 @@ export class ProjectMcpRuntime {
         await this.clearSnapshot(context.sessionId);
         const snapshot = {
             document,
+            sessionId: context.sessionId,
+            workspaceRoot: context.workspaceRoot,
             servers: Object.create(null),
             keys: new Map(),
             statuses: new Map(),
@@ -85,6 +87,19 @@ export class ProjectMcpRuntime {
                 workspaceRoot: snapshot.document.root,
                 ...(config.timeout ? { timeout: config.timeout } : {}),
             },
+        };
+    }
+    authSource(config) {
+        const binding = this.bindings.get(config);
+        if (!binding)
+            return undefined;
+        const { snapshot, name } = binding;
+        return {
+            serverName: name,
+            sessionId: snapshot.sessionId,
+            workspaceRoot: snapshot.workspaceRoot,
+            realRoot: snapshot.document.root,
+            configPath: snapshot.document.path,
         };
     }
     signal(config) {

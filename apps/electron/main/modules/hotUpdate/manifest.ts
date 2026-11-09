@@ -111,6 +111,11 @@ export function validateManifest(raw, expected) {
     if (record.appVersion !== expected.baseAppVersion) {
         return { ok: false, reason: 'app_version_mismatch' };
     }
+    if (expected.channel === 'test' &&
+        ((record.branchKey ?? null) !== (expected.branchKey ?? null) ||
+            (expected.branchKey != null && !/^[0-9a-f]{64}$/.test(expected.branchKey)))) {
+        return { ok: false, reason: 'branch_mismatch' };
+    }
     const parsedVersion = parseRendererVersion(record.version);
     if (!parsedVersion || parsedVersion.appVersion !== record.appVersion) {
         return { ok: false, reason: 'invalid_version' };

@@ -6,6 +6,7 @@ import { LocalWebSearchClient } from './local-web-search-client.js';
  */
 export function createManagedLocalWebSearchClient(options = {}) {
     return new LocalWebSearchClient({
+        ...(options.matrixLogger ? { matrixLogger: options.matrixLogger } : {}),
         ...(options.authContext ? { authContext: options.authContext } : {}),
         ...(options.authContextGetter ? { authContextGetter: options.authContextGetter } : {}),
         ...(options.authContextInvalidator

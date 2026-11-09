@@ -1,4 +1,4 @@
-import { parseCompatibleMcpObject } from '../../mcp/config.js';
+import { parseCompatibleMcpObject, } from '../../mcp/config.js';
 import { readPluginSkill } from '../../skill/reader.js';
 import { canonicalizePluginRoot, isRecord, listDirectChildDirectories, pluginPathExists, readPluginJsonObject, resolvePluginDirectory, resolvePluginFile, } from './filesystem.js';
 import { PluginReaderError, readerFail } from './reader-errors.js';
@@ -17,7 +17,7 @@ export async function readCompatiblePluginPackage(packageRoot, options = {}) {
     if (!name)
         readerFail('MANIFEST_SCHEMA_INVALID', 'Compatible Plugin name is required');
     const skills = await readCompatibleSkills(root, manifest.skills);
-    const mcp = await readCompatibleMcp(root, manifest.mcpServers);
+    const mcp = await readCompatibleMcp(root, manifest.mcpServers, kind);
     const iconPath = await readOptionalIcon(root, manifest.icon);
     const author = readAuthor(manifest.author);
     const hookResult = await readPluginHooks(root, {
@@ -98,17 +98,19 @@ async function addSkill(root, relativePath, skills, seenFiles) {
     seenFiles.add(file);
     skills.push(await readPluginSkill(root, relativePath));
 }
-async function readCompatibleMcp(root, declared) {
+async function readCompatibleMcp(root, declared, kind) {
+    // Each format has its own OAuth fields and pre-registered redirect_uri shape.
+    const format = kind === 'CODEX' ? 'codex' : 'localhost-callback';
     const groups = [];
     if (await pluginPathExists(root, '.mcp.json', 'file')) {
-        groups.push(await readCompatibleMcpPath(root, '.mcp.json'));
+        groups.push(await readCompatibleMcpPath(root, '.mcp.json', format));
     }
     if (isRecord(declared)) {
-        groups.push(await parseCompatibleMcpObject(root, declared));
+        groups.push(await parseCompatibleMcpObject(root, declared, format));
     }
     else {
         for (const relativePath of stringOrStringArray(declared)) {
-            groups.push(await readCompatibleMcpPath(root, relativePath));
+            groups.push(await readCompatibleMcpPath(root, relativePath, format));
         }
     }
     const servers = [];
@@ -130,9 +132,9 @@ async function readCompatibleMcp(root, declared) {
     }
     return { servers, diagnostics };
 }
-async function readCompatibleMcpPath(root, relativePath) {
+async function readCompatibleMcpPath(root, relativePath, format) {
     const { value } = await readPluginJsonObject(root, relativePath);
-    return parseCompatibleMcpObject(root, value);
+    return parseCompatibleMcpObject(root, value, format);
 }
 async function readOptionalIcon(root, value) {
     const relativePath = stringValue(value);

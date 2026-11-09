@@ -419,8 +419,13 @@ function acceptPackageSkills(input) {
     return accepted;
 }
 function acceptPackageServers(input) {
+    const pluginId = input.sourceKind === 'official'
+        ? { name: input.plugin.name, marketplace: OFFICIAL_PLUGIN_MARKETPLACE }
+        : (input.pluginId ?? { name: input.plugin.name, marketplace: LOCAL_PLUGIN_MARKETPLACE });
     return input.plugin.mcpServers.map((server) => freeze({
         pluginName: input.plugin.name,
+        pluginId: freeze({ ...pluginId }),
+        ...(input.plugin.displayName ? { pluginDisplayName: input.plugin.displayName } : {}),
         source: input.plugin.source,
         packageContentDigest: input.packageContentDigest,
         server,

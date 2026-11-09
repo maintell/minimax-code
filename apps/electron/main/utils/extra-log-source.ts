@@ -156,6 +156,14 @@ export function getExtraLogSources() {
                     prefix: 'windows-installer/',
                     maxBytesPerFile: 1024 * 1024,
                 },
+                {
+                    // Chrome Cookie 导入的 ABE broker 诊断日志（broker 自身限制在 64 KiB）。
+                    // 提权失败时宿主只能拿到退出码，阶段名和 Win32 错误都在这个文件里。
+                    dir: path.join(process.env.LOCALAPPDATA, 'MiniMax Code', 'logs'),
+                    match: (name) => name === 'abe-broker.log',
+                    prefix: 'abe-broker/',
+                    maxBytesPerFile: 128 * 1024,
+                },
             ]
             : []),
     ];

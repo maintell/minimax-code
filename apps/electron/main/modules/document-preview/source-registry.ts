@@ -294,9 +294,21 @@ export class DocumentPreviewSourceRegistry {
                 2 * 1024 * 1024) {
             return failure('invalid_request', 'Invalid notes save');
         }
+        return this.applyPptxEdit(senderId, request, (original) => updatePptxNotes(original, request.edits), ownerToken);
+    }
+    /** Main-only writer seam; renderer IPC never accepts a transform or arbitrary PPTX bytes. */
+    async applyPptxEdit(senderId, request, transform, ownerToken) {
+        if (!request ||
+            typeof request.sourceId !== 'string' ||
+            !/^sha256:[a-f0-9]{64}$/u.test(request.contentSha256) ||
+            !Number.isSafeInteger(request.sourceGeneration) ||
+            request.sourceGeneration < 0)
+            return failure('invalid_request', 'Invalid PPTX save');
         const entry = this.getOwnedEntry(senderId, request.sourceId, ownerToken);
         if (!entry)
             return failure('source_not_found', 'Notes source unavailable');
+        if (entry.readOnly)
+            return failure('invalid_request', 'Preview source is read-only');
         if (entry.source.contentSha256 !== request.contentSha256 ||
             entry.generation !== request.sourceGeneration ||
             this.notesWrites.has(entry.absolutePath)) {
@@ -312,7 +324,9 @@ export class DocumentPreviewSourceRegistry {
             if (!read.ok)
                 return read;
             const original = Buffer.from(read.value.bytes);
-            const updated = await updatePptxNotes(original, request.edits);
+            const updated = await transform(original);
+            if (original.equals(updated))
+                return { ok: true, value: { ...entry.source, sourceGeneration: entry.generation } };
             const fingerprint = await commitPptxNotes({
                 file: lease.path,
                 original,
@@ -612,6 +626,8 @@ export class DocumentPreviewSourceRegistry {
             }
             this.pendingSources.delete(sourceReservation);
             this.entries.set(sourceId, {
+                pptEditingAllowed: input.pptEditingAllowed !== false,
+                readOnly: input.readOnly === true,
                 ...(assetResolution ? { assetSidecar: assetResolution.sidecarPath } : {}),
                 senderId,
                 ownerToken,
@@ -1311,6 +1327,29 @@ export class DocumentPreviewSourceRegistry {
      */
     getSourceGeneration(senderId, sourceId, ownerToken) {
         return this.getOwnedEntry(senderId, sourceId, ownerToken)?.generation ?? null;
+    }
+    canEditPptxSource(senderId, sourceId, ownerToken) {
+        const entry = this.getOwnedEntry(senderId, sourceId, ownerToken);
+        return Boolean(entry &&
+            entry.pptEditingAllowed !== false &&
+            !entry.readOnly &&
+            entry.sourceKind === 'ooxml' &&
+            /\.pptx$/iu.test(entry.source.fileName));
+    }
+    canOpenPptxEditor(senderId, sourceId, ownerToken) {
+        const entry = this.getOwnedEntry(senderId, sourceId, ownerToken);
+        return Boolean(entry &&
+            entry.pptEditingAllowed !== false &&
+            entry.sourceKind === 'ooxml' &&
+            /\.pptx$/iu.test(entry.source.fileName));
+    }
+    /** Main-only check whether a resolved real path is the owned source file itself. */
+    isSourceFile(senderId, sourceId, file, ownerToken) {
+        return this.getOwnedEntry(senderId, sourceId, ownerToken)?.absolutePath === file;
+    }
+    /** Main-only metadata lookup; keeps the same source ownership boundary as read. */
+    getSource(senderId, sourceId, ownerToken) {
+        return this.getOwnedEntry(senderId, sourceId, ownerToken)?.source ?? null;
     }
     /**
      * Retire a staged copy only when it is still the generation observed by the

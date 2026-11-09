@@ -10,8 +10,11 @@
  * 失败语义:
  *   - `base_resp.status_code != 0` → 固定业务失败(`ok:false`),保留数值
  *     `status_code`，不透传下游 `status_msg`。
- *   - HTTP 层失败(非 2xx / 网络 / JSON 解析失败) → 固定请求失败(`ok:false`),
- *     能识别时保留数值 `http_status`，不把下游原文交给 tool/event/log 出口。
+ *   - 请求前缺凭据(`MatrixAuthRequiredError`) → `MATRIX_TOOL_AUTH_REQUIRED`,
+ *     文案直接告诉模型/用户需要登录 MiniMax 或设置 MATRIX_TOKEN。
+ *   - HTTP 层失败(非 2xx / 超时 / 网络 / JSON 解析失败) → 固定请求失败(`ok:false`),
+ *     按固定枚举 `failure_cause` 说明原因，能识别时保留数值 `http_status`；
+ *     文案只由本地枚举拼出，不把下游原文交给 tool/event/log 出口。
  *
  * 超时:每个工具从 `MATRIX_TOOL_TIMEOUTS` 表查自己的超时(生成类 10 min /
  * 其他 2 min),覆盖 `postJson` 默认的 15s —— 服务端生成动辄数分钟,
@@ -24,11 +27,17 @@
  * 持久化的 jsonl。如果某个 tool 的响应过大,后续 truncation wrapper
  * (`withToolResultTruncation`)会按 token budget 自动截断。
  */
+import { readMatrixAuthRequiredReason, readMatrixGatewayBackend, } from './types.js';
 import { MATRIX_TOOL_TIMEOUTS } from './tool-defs.js';
 const MATRIX_TOOL_REQUEST_FAILED = 'MATRIX_TOOL_REQUEST_FAILED';
+const MATRIX_TOOL_AUTH_REQUIRED = 'MATRIX_TOOL_AUTH_REQUIRED';
 const MATRIX_TOOL_BUSINESS_FAILED = 'MATRIX_TOOL_BUSINESS_FAILED';
 const MATRIX_TOOL_REQUEST_FAILED_TEXT = 'MATRIX_TOOL_REQUEST_FAILED: Matrix tool request failed.';
 const MATRIX_TOOL_BUSINESS_FAILED_TEXT = 'MATRIX_TOOL_BUSINESS_FAILED: Matrix tool request was rejected.';
+const MATRIX_TOOL_AUTH_REQUIRED_TEXT = {
+    managed_login: 'MATRIX_TOOL_AUTH_REQUIRED: This tool needs a signed-in MiniMax account, and none is signed in. Ask the user to sign in to MiniMax (for example /login in the MiniMax Code CLI), then retry. Do NOT retry before the user signs in.',
+    matrix_token: 'MATRIX_TOOL_AUTH_REQUIRED: MATRIX_BASE_URL points to a custom Matrix backend, but MATRIX_TOKEN is not set. Ask the user to set MATRIX_TOKEN, then retry.',
+};
 export async function callMatrixTool(opts) {
     const { toolName, path, input, archonServer, signal } = opts;
     if (signal?.aborted)
@@ -42,11 +51,11 @@ export async function callMatrixTool(opts) {
         });
     }
     catch (err) {
-        const httpStatus = httpStatusFromError(err);
-        logCallError(opts, startMs, httpStatus);
+        const failure = classifyRequestFailure(err, resolveTimeout(opts), signal?.aborted === true);
+        logCallError(opts, startMs, failure);
         if (signal?.aborted)
             throw err;
-        return matrixRequestFailure(toolName, path, httpStatus);
+        return matrixRequestFailure(toolName, path, failure);
     }
     const baseResp = isRecord(resp.base_resp) ? resp.base_resp : undefined;
     const statusCode = baseResp?.status_code ?? 0;
@@ -80,11 +89,11 @@ export async function callMatrixToolRaw(opts) {
         });
     }
     catch (err) {
-        const httpStatus = httpStatusFromError(err);
-        logCallError(opts, startMs, httpStatus);
+        const failure = classifyRequestFailure(err, resolveTimeout(opts), signal?.aborted === true);
+        logCallError(opts, startMs, failure);
         if (signal?.aborted)
             throw err;
-        return { ok: false, result: matrixRequestFailure(toolName, path, httpStatus) };
+        return { ok: false, result: matrixRequestFailure(toolName, path, failure) };
     }
     const baseResp = isRecord(resp.base_resp) ? resp.base_resp : undefined;
     const statusCode = baseResp?.status_code ?? 0;
@@ -129,23 +138,97 @@ function logCallEnd(opts, startMs, resp, statusCode) {
     const ok = statusCode === 0;
     ctx.matrixLogger?.info(ctx, `matrix-tools response tool=${toolName} path=${path} ok=${ok} status_code=${statusCode} duration_ms=${durationMs} resp_bytes=${respBytes} session=${ctx.sessionId} turn=${ctx.turnId}`);
 }
-function logCallError(opts, startMs, httpStatus) {
+function logCallError(opts, startMs, failure) {
     const { toolName, path, ctx, signal } = opts;
     const durationMs = Date.now() - startMs;
-    ctx.matrixLogger?.warn(ctx, `matrix-tools error tool=${toolName} path=${path} stage=request code=${MATRIX_TOOL_REQUEST_FAILED} http_status=${httpStatus ?? 'none'} duration_ms=${durationMs} aborted=${signal?.aborted === true} session=${ctx.sessionId} turn=${ctx.turnId}`);
+    ctx.matrixLogger?.warn(ctx, `matrix-tools error tool=${toolName} path=${path} stage=request code=${requestFailureCode(failure)} cause=${failure.cause} http_status=${failure.httpStatus ?? 'none'} duration_ms=${durationMs} aborted=${signal?.aborted === true} session=${ctx.sessionId} turn=${ctx.turnId}`);
 }
-function matrixRequestFailure(toolName, path, httpStatus) {
+function matrixRequestFailure(toolName, path, failure) {
+    const text = requestFailureText(failure);
     return {
         tool_name: toolName,
-        text: MATRIX_TOOL_REQUEST_FAILED_TEXT,
-        content: [{ type: 'text', text: MATRIX_TOOL_REQUEST_FAILED_TEXT }],
+        text,
+        content: [{ type: 'text', text }],
         details: {
             ok: false,
             path,
-            error_code: MATRIX_TOOL_REQUEST_FAILED,
-            ...(httpStatus !== undefined ? { http_status: httpStatus } : {}),
+            error_code: requestFailureCode(failure),
+            failure_cause: failure.cause,
+            ...(failure.authReason !== undefined ? { auth_reason: failure.authReason } : {}),
+            ...(failure.httpStatus !== undefined ? { http_status: failure.httpStatus } : {}),
         },
     };
+}
+function requestFailureCode(failure) {
+    return failure.cause === 'auth_required' ? MATRIX_TOOL_AUTH_REQUIRED : MATRIX_TOOL_REQUEST_FAILED;
+}
+/**
+ * Built only from the local cause enum and numeric status, never from the error
+ * message: a gateway error message can embed the downstream response body.
+ */
+function requestFailureText(failure) {
+    switch (failure.cause) {
+        case 'auth_required':
+            return MATRIX_TOOL_AUTH_REQUIRED_TEXT[failure.authReason ?? 'managed_login'];
+        case 'http_error':
+            return `MATRIX_TOOL_REQUEST_FAILED: Matrix tool request failed (HTTP ${failure.httpStatus}).${httpFailureHint(failure)}`;
+        case 'timeout':
+            return failure.timeoutMs !== undefined
+                ? `MATRIX_TOOL_REQUEST_FAILED: Matrix tool request timed out after ${Math.max(1, Math.round(failure.timeoutMs / 1000))}s.`
+                : 'MATRIX_TOOL_REQUEST_FAILED: Matrix tool request timed out.';
+        case 'network_error':
+            return 'MATRIX_TOOL_REQUEST_FAILED: Matrix tool request failed: network error before any response.';
+        case 'invalid_response':
+            return 'MATRIX_TOOL_REQUEST_FAILED: Matrix tool request failed: the response was not valid JSON.';
+        case 'aborted':
+            return 'MATRIX_TOOL_REQUEST_FAILED: Matrix tool request was cancelled.';
+        case 'unknown':
+            return MATRIX_TOOL_REQUEST_FAILED_TEXT;
+    }
+}
+/**
+ * A 401 names the credential of the backend that rejected it; 403 can also mean
+ * an entitlement, region or feature denial, so it does not blame the sign-in.
+ */
+function httpFailureHint(failure) {
+    if (failure.httpStatus === 403)
+        return ' Access was denied.';
+    if (failure.httpStatus !== 401)
+        return '';
+    if (failure.backend === 'managed') {
+        return ' The MiniMax sign-in was rejected and may have expired; ask the user to sign in again.';
+    }
+    if (failure.backend === 'custom') {
+        return ' MATRIX_TOKEN was rejected by the custom Matrix backend; ask the user to check MATRIX_TOKEN.';
+    }
+    return ' The credentials were rejected.';
+}
+/**
+ * Maps a request error to a fixed cause. Only an abort the caller did not ask
+ * for is the request timeout; a caller abort is logged as such and rethrown.
+ */
+function classifyRequestFailure(error, timeoutMs, callerAborted) {
+    if (callerAborted)
+        return { cause: 'aborted' };
+    const authReason = readMatrixAuthRequiredReason(error);
+    if (authReason)
+        return { cause: 'auth_required', authReason };
+    const httpStatus = httpStatusFromError(error);
+    if (httpStatus !== undefined) {
+        const backend = readMatrixGatewayBackend(error);
+        return { cause: 'http_error', httpStatus, ...(backend ? { backend } : {}) };
+    }
+    if (!(error instanceof Error))
+        return { cause: 'unknown' };
+    if (error.name === 'AbortError' || error.name === 'TimeoutError') {
+        return { cause: 'timeout', ...(timeoutMs !== undefined ? { timeoutMs } : {}) };
+    }
+    if (error instanceof SyntaxError)
+        return { cause: 'invalid_response' };
+    // undici reports connection, DNS and TLS failures as `TypeError: fetch failed`.
+    if (error instanceof TypeError)
+        return { cause: 'network_error' };
+    return { cause: 'unknown' };
 }
 function matrixBusinessFailure(toolName, path, input) {
     const text = input.payloadCode === 402

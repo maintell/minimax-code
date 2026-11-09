@@ -14,6 +14,7 @@ export { scanWorkspace } from './indexing/scan/scanner.js';
 export { createLocalFileApiGitChangesCoordinator } from './files/api.js';
 export { routeLocalFileApi } from './files/api.js';
 export { createWorkspaceIndexingHostSubsystem } from './indexing/scan/index.js';
+export { hostCaptureWorkspaceFeedbackSnapshot } from './indexing/scan/index.js';
 export { hostCaptureWorkspaceRevisionAfterTurn } from './indexing/scan/index.js';
 export { hostLogWorkspaceSemanticSearchUnavailable } from './indexing/scan/index.js';
 export { hostPrewarmWorkspaceIndexingForWorkspace } from './indexing/scan/index.js';

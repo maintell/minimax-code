@@ -1,14 +1,3 @@
-const MINIAPP_RUNTIME_FAILURE_REASON_CODES = new Set([
-    'ENTRY_OUTSIDE_ARTIFACT',
-    'HOST_CONNECTOR_PROTOCOL_VIOLATION',
-    'HOST_CONNECTOR_UNAVAILABLE',
-    'NO_CANDIDATE_PORT',
-    'READINESS_TIMEOUT',
-    'RUNNER_LIFECYCLE_INVALID',
-    'RUNNER_START_FAILED',
-    'START_EXPORT_MISSING',
-    'TCP_CONNECT_TIMEOUT',
-]);
 export const MINIAPP_RUNTIME_ERROR_TEXT_MAX_BYTES = 64 * 1024;
 const runtimeErrorDetails = new WeakMap();
 const provenRootTerminationErrors = new WeakSet();
@@ -87,20 +76,6 @@ export function isMiniAppRootTerminationProven(error) {
         return false;
     return provenRootTerminationErrors.has(error);
 }
-export function normalizeMiniAppRuntimeError(error, message) {
-    if (error instanceof MiniAppError)
-        return error;
-    const code = miniAppErrorCode(error);
-    const reasonCode = runtimeFailureReasonCode(error);
-    const busyReason = miniAppBusyReason(error);
-    const runtimeError = readMiniAppRuntimeErrorDetail(error);
-    return new MiniAppError(code === 'BUSY' ? 'BUSY' : 'RUNTIME_START_FAILED', message, {
-        cause: error,
-        ...(reasonCode ? { reasonCode } : {}),
-        ...(code === 'BUSY' && busyReason ? { busyReason } : {}),
-        ...(runtimeError ? { runtimeError } : {}),
-    });
-}
 /** Returns only explicit, bounded BUSY metadata; private messages and class names are ignored. */
 export function miniAppBusyReason(error) {
     const visited = new Set();
@@ -115,6 +90,12 @@ export function miniAppBusyReason(error) {
     }
     return undefined;
 }
+/** Code of the rejection a generation-checked stop gives when its root was replaced meanwhile. */
+export const MINIAPP_STOP_TARGET_REPLACED = 'MINIAPP_STOP_TARGET_REPLACED';
+/** True for that rejection: the replacement root stays up and is not this stop's target. */
+export function isMiniAppStopTargetReplaced(error) {
+    return readProperty(error, 'code') === MINIAPP_STOP_TARGET_REPLACED;
+}
 export function cancellationOrSupersededError(signal, message) {
     return signal.reason instanceof Error ? signal.reason : new MiniAppError('SUPERSEDED', message);
 }
@@ -123,12 +104,6 @@ export function assertMiniAppCleanupsProven(results) {
     if (!failure)
         return;
     throw failure.reason;
-}
-function runtimeFailureReasonCode(error) {
-    const code = readProperty(error, 'code');
-    return typeof code === 'string' && MINIAPP_RUNTIME_FAILURE_REASON_CODES.has(code)
-        ? code
-        : undefined;
 }
 function isRecord(value) {
     try {

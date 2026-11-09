@@ -1,5 +1,6 @@
 require("./preload.js");
 import { ipcRenderer, contextBridge } from "electron";
+import { createMiniAppHostAPI } from "./miniapp-host-preload.js";
 import { isMiniAppSpeechAudioFormat, readMiniAppSpeechAudio, readMiniAppSpeechPartialMessage, MINIAPP_SPEECH_AUDIO_FORMAT, parseMiniAppSpeechTranscribeResponse, readMiniAppAgentObserveRequest, readMiniAppAgentObservedEvent, parseMiniAppAgentObserveResult, parseMiniAppAgentSessionsResult, readMiniAppAgentSessionRequest, parseMiniAppAgentSessionResult, readMiniAppAgentRunEvent, parseMiniAppAgentRunResult, MINIAPP_SURFACE_ID_ARGUMENT_PREFIX, MINIAPP_COMPOSER_MAX_TEXT_LENGTH, parseMiniAppComposerAppendResult, readMiniAppAgentRunRequest, readMiniAppAgentReplyRequest, parseMiniAppAgentReplyResult, readMiniAppAgentAnswerRequest, readMiniAppAgentOpenRequest, parseMiniAppAgentOpenResult, parseMiniAppAgentModelsResult, parseMiniAppAgentAgentsResult, readMiniAppAgentCreateRequest, parseMiniAppAgentCreateResult, MINIAPP_TOOL_REQUEST_MAX_NAMES, hasMiniAppHostCapability, parseMiniAppWindowResult, parseMiniAppWindowPatch } from "@mavis/shared/miniapp-surface";
 const MINIAPP_COMPOSER_APPEND = 'miniapp:composer-append';
 const MINIAPP_AGENT_RUN = 'miniapp:agent-run';
@@ -446,6 +447,10 @@ if (process.isMainFrame) {
                 },
             },
             window: createMiniAppWindowHandle(surfaceId),
+            host: createMiniAppHostAPI({
+                isUserActivated: () => windowGlobal.navigator?.userActivation?.isActive === true,
+                onPageHide: (handler) => windowGlobal.addEventListener?.('pagehide', handler),
+            }),
             // Requires `deviceAccess: ["microphone"]` and that switch on; Main decides per call.
             speech: {
                 transcribe(input, options) {

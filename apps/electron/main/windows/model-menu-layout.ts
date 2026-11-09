@@ -67,6 +67,10 @@ export function isModelMenuActionAllowed(data, action) {
         return Boolean(data.auto);
     if (action.type === 'source')
         return Boolean(data.source && !data.source.disabled);
+    if (action.type === 'reorganize')
+        return data.panelAdd?.mode === 'menu';
+    if (action.type === 'reorganize-done')
+        return data.panelAdd?.mode === 'edit';
     const row = data.rows.find((row) => row.key === ('key' in action ? action.key : undefined));
     if (!row || row.disabled)
         return false;
@@ -78,7 +82,9 @@ export function isModelMenuActionAllowed(data, action) {
                 action.key !== action.overKey &&
                 data.rows.some((candidate) => candidate.key === action.overKey && !candidate.disabled));
         case 'select':
-            return !row.zoom;
+            return !row.zoom && data.panelAdd?.mode !== 'edit';
+        case 'toggle-pin':
+            return data.panelAdd?.mode === 'edit';
         case 'zoom':
             if (data.kind !== 'browser-more' || !row.zoom)
                 return false;

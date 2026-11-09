@@ -7,37 +7,13 @@ import { ComputerUseError } from './contracts.js';
 export function desktopLockRoot() {
     return path.join(homedir(), '.minimax-computer-use', 'locks');
 }
+/**
+ * Creates missing runtime directories as 0700. The permissions, ownership and links of the
+ * user's home and other existing ancestors are left alone: they are user environment, and
+ * component integrity is enforced by manifest hashes rather than by directory modes.
+ */
 export async function privateDirectory(directory) {
-    await assertSafeAncestors(directory);
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await assertSafeAncestors(directory);
-    const info = await lstat(directory);
-    if (!info.isDirectory() ||
-        info.isSymbolicLink() ||
-        (process.platform !== 'win32' && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0))) {
-        throw new ComputerUseError('computer_runtime_directory_unsafe', 'Runtime directory must be owned by the current user with mode 0700.');
-    }
-}
-// Shared permission-evidence ancestors may be 0755, but may not be replaceable by another user.
-// Never chmod an existing directory to make an unsafe installation appear safe.
-async function assertSafeAncestors(directory) {
-    const resolved = path.resolve(directory);
-    const parent = path.dirname(resolved);
-    if (parent !== resolved)
-        await assertSafeAncestors(parent);
-    try {
-        const info = await lstat(resolved);
-        if (!info.isDirectory() ||
-            info.isSymbolicLink() ||
-            (process.platform !== 'win32' &&
-                ((info.uid !== process.getuid?.() && info.uid !== 0) || (info.mode & 0o022) !== 0))) {
-            throw new ComputerUseError('computer_runtime_directory_unsafe', 'Runtime ancestors must be real directories owned by the current user or root and not group/world writable.');
-        }
-    }
-    catch (error) {
-        if (error.code !== 'ENOENT')
-            throw error;
-    }
 }
 /** Signal-0 probe; EPERM means the PID exists under another account and counts as alive. */
 export function processAlive(pid) {

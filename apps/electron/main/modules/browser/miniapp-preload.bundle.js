@@ -67,9 +67,120 @@ import_electron.contextBridge.exposeInIsolatedWorld(
 );
 
 // main/modules/browser/miniapp-preload.ts
+var import_electron3 = require("electron");
+
+// main/modules/browser/miniapp-host-preload.ts
 var import_electron2 = require("electron");
 
+// ../../packages/shared/dist/miniapp-host.js
+var MINIAPP_HOST_ERROR_CODES = Object.freeze([
+  "invalid_request",
+  "not_permitted",
+  "host_unavailable",
+  "unsupported_source",
+  "unsupported_target",
+  "target_unavailable",
+  "result_unknown"
+]);
+function isMiniAppHostErrorCode(value) {
+  return MINIAPP_HOST_ERROR_CODES.includes(value);
+}
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+var VIEWS = ["home", "conversation", "plugins", "schedule", "other"];
+function parseView(value) {
+  return VIEWS.includes(value) ? value : null;
+}
+function readOverlay(value) {
+  if (value === null)
+    return null;
+  return isRecord(value) && value.type === "settings" ? { type: "settings" } : void 0;
+}
+function parseMiniAppHostUIState(value) {
+  if (!isRecord(value))
+    return null;
+  const { theme, language } = value;
+  return (theme === "light" || theme === "dark") && typeof language === "string" && language.length > 0 && language.length <= 64 && /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/u.test(language) ? { theme, language } : null;
+}
+function parseMiniAppHostNavigationState(value) {
+  if (!isRecord(value))
+    return null;
+  const { key } = value;
+  const view = parseView(value.view);
+  const overlay = readOverlay(value.overlay);
+  return typeof key === "string" && key.length > 0 && key.length <= 256 && view && overlay !== void 0 ? { key, view, overlay } : null;
+}
+function readMiniAppHostOpenTarget(value) {
+  if (!isRecord(value) || typeof value.id !== "string")
+    return { success: false, code: "invalid_request" };
+  const exact = (keys) => Object.keys(value).every((key) => keys.includes(key));
+  if (value.id === "home" || value.id === "plugins" || value.id === "schedule") {
+    return exact(["id"]) ? { success: true, target: { id: value.id } } : { success: false, code: "invalid_request" };
+  }
+  if (value.id === "settings") {
+    if (!exact(["id", "section"]))
+      return { success: false, code: "invalid_request" };
+    if (value.section === void 0)
+      return { success: true, target: { id: "settings" } };
+    return value.section === "appearance" || value.section === "language" ? { success: true, target: { id: "settings", section: value.section } } : { success: false, code: "unsupported_target" };
+  }
+  if (value.id === "session") {
+    if (!exact(["id", "sessionId", "source"]) || typeof value.sessionId !== "string" || !value.sessionId.trim() || value.sessionId.length > 256 || /[\u0000-\u001f\u007f]/u.test(value.sessionId)) {
+      return { success: false, code: "invalid_request" };
+    }
+    if (typeof value.source !== "string")
+      return { success: false, code: "invalid_request" };
+    if (value.source !== "local")
+      return { success: false, code: "unsupported_source" };
+    return {
+      success: true,
+      target: { id: "session", sessionId: value.sessionId, source: "local" }
+    };
+  }
+  return { success: false, code: "unsupported_target" };
+}
+function parseMiniAppHostOpenResult(value) {
+  if (!isRecord(value))
+    return null;
+  if (value.status === "opened")
+    return { status: "opened" };
+  return value.status === "cancelled" && (value.reason === "user_cancelled" || value.reason === "superseded") ? { status: "cancelled", reason: value.reason } : null;
+}
+function parseFailure(value) {
+  return value.success === false && isMiniAppHostErrorCode(value.code) ? { success: false, code: value.code } : null;
+}
+function parseMiniAppHostUIResponse(value) {
+  if (!isRecord(value))
+    return null;
+  const state = value.success === true ? parseMiniAppHostUIState(value.state) : null;
+  return state ? { success: true, state } : parseFailure(value);
+}
+function parseMiniAppHostNavigationResponse(value) {
+  if (!isRecord(value))
+    return null;
+  const state = value.success === true ? parseMiniAppHostNavigationState(value.state) : null;
+  return state ? { success: true, state } : parseFailure(value);
+}
+function parseMiniAppHostOpenResponse(value) {
+  if (!isRecord(value))
+    return null;
+  const result = value.success === true ? parseMiniAppHostOpenResult(value.result) : null;
+  return result ? { success: true, result } : parseFailure(value);
+}
+
 // ../../packages/shared/dist/miniapp-surface.js
+var MINIAPP_MEMORY_PROTECTIONS = Object.freeze([
+  "visible",
+  "in_use",
+  "transition",
+  "active"
+]);
+var MINIAPP_SLEEP_REASONS = Object.freeze([
+  "count-cap",
+  "pressure-moderate",
+  "pressure-critical"
+]);
 var MINIAPP_COMPOSER_MAX_TEXT_LENGTH = 1e5;
 var MINIAPP_COMPOSER_FAILURE_CODES = [
   "user_cancelled",
@@ -170,6 +281,11 @@ var MINIAPP_HOST_CAPABILITIES = Object.freeze([
   "agent.run",
   "agent.session",
   "agent.sessions",
+  "host.navigation.getState",
+  "host.navigation.open",
+  "host.navigation.subscribe",
+  "host.ui.getState",
+  "host.ui.subscribe",
   "hostConnector",
   "message.append",
   "speech.transcribe",
@@ -873,6 +989,163 @@ function parseMiniAppWindowResult(value) {
   return value.success === false && code ? { success: false, code } : null;
 }
 
+// main/modules/browser/miniapp-host-preload.ts
+var GET_STATE = "miniapp:host-get-state";
+var SUBSCRIBE = "miniapp:host-subscribe";
+var UNSUBSCRIBE = "miniapp:host-unsubscribe";
+var EVENT = "miniapp:host-event";
+var OPEN = "miniapp:host-open";
+var READ_TIMEOUT_MS = 1e4;
+var OPEN_TIMEOUT_MS = 65e3;
+var isRecord2 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+function failure(code) {
+  return { code, message: code };
+}
+async function invoke(channel, payload, timeoutMs = READ_TIMEOUT_MS) {
+  let timer;
+  try {
+    return await Promise.race([
+      import_electron2.ipcRenderer.invoke(channel, payload),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(failure("result_unknown")), timeoutMs);
+      })
+    ]);
+  } catch {
+    throw failure("result_unknown");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function createMiniAppHostAPI(environment) {
+  let sequence = 0;
+  let ended = false;
+  const subscriptions = /* @__PURE__ */ new Set();
+  function subscribe(module2, parseState, listener, options) {
+    const invalid = typeof listener !== "function" || options !== void 0 && (!isRecord2(options) || options.onError !== void 0 && typeof options.onError !== "function");
+    const onError = typeof options?.onError === "function" ? options.onError : void 0;
+    const subscriptionId = `host-${++sequence}`;
+    let disposed = false;
+    let registered = false;
+    let revision = -1;
+    let baselineTimer;
+    function dispose() {
+      if (disposed) return;
+      disposed = true;
+      clearTimeout(baselineTimer);
+      subscriptions.delete(dispose);
+      if (!registered) return;
+      import_electron2.ipcRenderer.removeListener(EVENT, receive);
+      try {
+        import_electron2.ipcRenderer.send(UNSUBSCRIBE, { subscriptionId });
+      } catch {
+      }
+    }
+    function terminate(code) {
+      if (disposed) return;
+      dispose();
+      try {
+        if (onError) onError(failure(code));
+        else console.error("[miniapp] Host subscription ended:", code);
+      } catch {
+        console.error("[miniapp] Host onError handler threw");
+      }
+    }
+    function receive(_event, value) {
+      if (disposed || !isRecord2(value) || value.subscriptionId !== subscriptionId) return;
+      if (isRecord2(value.error)) {
+        terminate(isMiniAppHostErrorCode(value.error.code) ? value.error.code : "result_unknown");
+        return;
+      }
+      if (!Number.isSafeInteger(value.revision) || value.revision < 0) {
+        terminate("result_unknown");
+        return;
+      }
+      if (value.revision <= revision) return;
+      const state = parseState(value.state);
+      if (!state) {
+        terminate("result_unknown");
+        return;
+      }
+      revision = value.revision;
+      clearTimeout(baselineTimer);
+      try {
+        listener(state);
+      } catch {
+        console.error("[miniapp] Host state listener threw");
+      }
+    }
+    if (invalid || ended) {
+      queueMicrotask(() => terminate(invalid ? "invalid_request" : "host_unavailable"));
+      return { dispose };
+    }
+    import_electron2.ipcRenderer.on(EVENT, receive);
+    registered = true;
+    subscriptions.add(dispose);
+    baselineTimer = setTimeout(() => terminate("result_unknown"), READ_TIMEOUT_MS);
+    void invoke(SUBSCRIBE, { module: module2, subscriptionId }).then(
+      (value) => {
+        if (disposed) {
+          try {
+            import_electron2.ipcRenderer.send(UNSUBSCRIBE, { subscriptionId });
+          } catch {
+          }
+          return;
+        }
+        if (isRecord2(value) && value.success === true) {
+          if (value.paused === true) clearTimeout(baselineTimer);
+          return;
+        }
+        terminate(
+          isRecord2(value) && isMiniAppHostErrorCode(value.code) ? value.code : "result_unknown"
+        );
+      },
+      () => terminate("result_unknown")
+    );
+    return { dispose };
+  }
+  environment.onPageHide(() => {
+    ended = true;
+    for (const dispose of [...subscriptions]) dispose();
+  });
+  return {
+    ui: {
+      async getState() {
+        if (ended) throw failure("host_unavailable");
+        const result = parseMiniAppHostUIResponse(await invoke(GET_STATE, { module: "ui" }));
+        if (!result) throw failure("result_unknown");
+        if (!result.success) throw failure(result.code);
+        return result.state;
+      },
+      subscribe: (listener, options) => subscribe("ui", parseMiniAppHostUIState, listener, options)
+    },
+    navigation: {
+      async getState() {
+        if (ended) throw failure("host_unavailable");
+        const result = parseMiniAppHostNavigationResponse(
+          await invoke(GET_STATE, { module: "navigation" })
+        );
+        if (!result) throw failure("result_unknown");
+        if (!result.success) throw failure(result.code);
+        return result.state;
+      },
+      subscribe: (listener, options) => subscribe("navigation", parseMiniAppHostNavigationState, listener, options),
+      async open(target) {
+        const userActivated = environment.isUserActivated();
+        if (!userActivated) throw failure("not_permitted");
+        if (ended) throw failure("host_unavailable");
+        const read = readMiniAppHostOpenTarget(target);
+        if (!read.success) throw failure(read.code);
+        const result = parseMiniAppHostOpenResponse(
+          await invoke(OPEN, { target: read.target, userActivated }, OPEN_TIMEOUT_MS)
+        );
+        if (!result) throw failure("result_unknown");
+        if (!result.success) throw failure(result.code);
+        return result.result;
+      }
+    }
+  };
+}
+
 // main/modules/browser/miniapp-preload.ts
 var MINIAPP_COMPOSER_APPEND = "miniapp:composer-append";
 var MINIAPP_AGENT_RUN = "miniapp:agent-run";
@@ -910,10 +1183,10 @@ async function transcribeSpeech(input, options) {
       console.error("[miniapp] speech onPartial handler threw", error);
     }
   };
-  if (onPartial) import_electron2.ipcRenderer.on(MINIAPP_SPEECH_PARTIAL, listener);
+  if (onPartial) import_electron3.ipcRenderer.on(MINIAPP_SPEECH_PARTIAL, listener);
   let response;
   try {
-    response = await import_electron2.ipcRenderer.invoke(MINIAPP_SPEECH_TRANSCRIBE, {
+    response = await import_electron3.ipcRenderer.invoke(MINIAPP_SPEECH_TRANSCRIBE, {
       requestId,
       audio: samples,
       format: MINIAPP_SPEECH_AUDIO_FORMAT
@@ -921,7 +1194,7 @@ async function transcribeSpeech(input, options) {
   } catch {
     throw new Error("result_unknown");
   } finally {
-    if (onPartial) import_electron2.ipcRenderer.removeListener(MINIAPP_SPEECH_PARTIAL, listener);
+    if (onPartial) import_electron3.ipcRenderer.removeListener(MINIAPP_SPEECH_PARTIAL, listener);
   }
   const result = parseMiniAppSpeechTranscribeResponse(response);
   if (!result) throw new Error("result_unknown");
@@ -958,7 +1231,7 @@ async function followAgentStream(input) {
       console.error("[miniapp] agent onEvent handler threw", error);
     }
   };
-  import_electron2.ipcRenderer.on(MINIAPP_AGENT_EVENT, listener);
+  import_electron3.ipcRenderer.on(MINIAPP_AGENT_EVENT, listener);
   let guard;
   try {
     let reply;
@@ -982,7 +1255,7 @@ async function followAgentStream(input) {
     ]);
   } finally {
     if (guard !== void 0) clearTimeout(guard);
-    import_electron2.ipcRenderer.removeListener(MINIAPP_AGENT_EVENT, listener);
+    import_electron3.ipcRenderer.removeListener(MINIAPP_AGENT_EVENT, listener);
   }
 }
 async function observeAgent(input, options) {
@@ -1002,7 +1275,7 @@ async function observeAgent(input, options) {
       requestId,
       onEvent,
       read: readMiniAppAgentObservedEvent,
-      invoke: () => import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_OBSERVE, request),
+      invoke: () => import_electron3.ipcRenderer.invoke(MINIAPP_AGENT_OBSERVE, request),
       // Observing changes nothing, so a lost settlement is simply retryable.
       lost: "runtime_unavailable"
     });
@@ -1015,7 +1288,7 @@ async function observeAgent(input, options) {
 async function listAgentSessions() {
   let response;
   try {
-    response = await import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_SESSIONS);
+    response = await import_electron3.ipcRenderer.invoke(MINIAPP_AGENT_SESSIONS);
   } catch {
     throw new Error("runtime_unavailable");
   }
@@ -1028,7 +1301,7 @@ async function getAgentSession(sessionId) {
   if (!request) throw new Error("invalid_request");
   let response;
   try {
-    response = await import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_SESSION, request);
+    response = await import_electron3.ipcRenderer.invoke(MINIAPP_AGENT_SESSION, request);
   } catch {
     throw new Error("runtime_unavailable");
   }
@@ -1042,7 +1315,7 @@ async function invokeAgentTurn(channel, requestId, payload, options) {
   const onEvent = typeof options?.onEvent === "function" ? options.onEvent : void 0;
   inFlightAgentRequests.add(requestId);
   const observe = onEvent !== void 0;
-  const invoke = () => import_electron2.ipcRenderer.invoke(channel, { requestId, ...payload, observe });
+  const invoke2 = () => import_electron3.ipcRenderer.invoke(channel, { requestId, ...payload, observe });
   let response;
   try {
     if (onEvent) {
@@ -1050,13 +1323,13 @@ async function invokeAgentTurn(channel, requestId, payload, options) {
         requestId,
         onEvent,
         read: readMiniAppAgentRunEvent,
-        invoke,
+        invoke: invoke2,
         // The turn may already have been submitted; never retry implicitly.
         lost: "result_unknown"
       });
     } else {
       try {
-        response = await invoke();
+        response = await invoke2();
       } catch {
         throw new Error("result_unknown");
       }
@@ -1068,14 +1341,14 @@ async function invokeAgentTurn(channel, requestId, payload, options) {
   if (!result.ok) throw agentFailureError(result);
   return result.result;
 }
-function agentFailureError(failure) {
-  const error = new Error(failure.code);
-  return failure.reason ? Object.assign(error, { reason: failure.reason }) : error;
+function agentFailureError(failure2) {
+  const error = new Error(failure2.code);
+  return failure2.reason ? Object.assign(error, { reason: failure2.reason }) : error;
 }
 async function invokeAgentCall(channel, payload, parse) {
   let response;
   try {
-    response = await import_electron2.ipcRenderer.invoke(channel, payload);
+    response = await import_electron3.ipcRenderer.invoke(channel, payload);
   } catch {
     throw new Error("result_unknown");
   }
@@ -1096,7 +1369,7 @@ if (process.isMainFrame) {
     (argument) => argument.startsWith(MINIAPP_SURFACE_ID_ARGUMENT_PREFIX)
   );
   const surfaceId = surfaceIdArgument ? surfaceIdArgument.slice(MINIAPP_SURFACE_ID_ARGUMENT_PREFIX.length) : "";
-  import_electron2.contextBridge.exposeInMainWorld("mcode", {
+  import_electron3.contextBridge.exposeInMainWorld("mcode", {
     miniapp: {
       message: {
         // Only an individually confirmed draft append. Sent messages are never writable here.
@@ -1109,7 +1382,7 @@ if (process.isMainFrame) {
           }
           let response;
           try {
-            response = await import_electron2.ipcRenderer.invoke(MINIAPP_COMPOSER_APPEND, { text });
+            response = await import_electron3.ipcRenderer.invoke(MINIAPP_COMPOSER_APPEND, { text });
           } catch {
             throw new Error("result_unknown");
           }
@@ -1147,14 +1420,14 @@ if (process.isMainFrame) {
         // AbortSignal cannot cross contextBridge, so cancellation is an explicit id-based call.
         cancel(requestId) {
           if (!inFlightAgentRequests.has(requestId)) return;
-          import_electron2.ipcRenderer.send(MINIAPP_AGENT_CANCEL, { requestId });
+          import_electron3.ipcRenderer.send(MINIAPP_AGENT_CANCEL, { requestId });
         },
         async reply(input) {
           const request = readMiniAppAgentReplyRequest(input);
           if (!request) throw new Error("invalid_request");
           let response;
           try {
-            response = await import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_REPLY, request);
+            response = await import_electron3.ipcRenderer.invoke(MINIAPP_AGENT_REPLY, request);
           } catch {
             throw new Error("result_unknown");
           }
@@ -1184,7 +1457,7 @@ if (process.isMainFrame) {
           if (!request) throw new Error("invalid_request");
           let response;
           try {
-            response = await import_electron2.ipcRenderer.invoke(MINIAPP_AGENT_OPEN, request);
+            response = await import_electron3.ipcRenderer.invoke(MINIAPP_AGENT_OPEN, request);
           } catch {
             throw new Error("result_unknown");
           }
@@ -1220,7 +1493,7 @@ if (process.isMainFrame) {
           }
           let response;
           try {
-            response = await import_electron2.ipcRenderer.invoke(MINIAPP_TOOL_REQUEST, { names: [...names] });
+            response = await import_electron3.ipcRenderer.invoke(MINIAPP_TOOL_REQUEST, { names: [...names] });
           } catch {
             throw new Error("result_unknown");
           }
@@ -1228,6 +1501,10 @@ if (process.isMainFrame) {
         }
       },
       window: createMiniAppWindowHandle(surfaceId),
+      host: createMiniAppHostAPI({
+        isUserActivated: () => windowGlobal.navigator?.userActivation?.isActive === true,
+        onPageHide: (handler) => windowGlobal.addEventListener?.("pagehide", handler)
+      }),
       // Requires `deviceAccess: ["microphone"]` and that switch on; Main decides per call.
       speech: {
         transcribe(input, options) {
@@ -1298,7 +1575,7 @@ function createMiniAppWindowHandle(surfaceId) {
   async function invokeWindowIpc(channel, ...args) {
     let response;
     try {
-      response = await import_electron2.ipcRenderer.invoke(channel, ...args);
+      response = await import_electron3.ipcRenderer.invoke(channel, ...args);
     } catch {
       throw new Error("result_unknown");
     }

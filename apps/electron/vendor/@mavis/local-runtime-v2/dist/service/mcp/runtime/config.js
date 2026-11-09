@@ -51,7 +51,7 @@ export function normalizeServerConfig(config) {
         ...(readRecord(config['env']) ? { env: readStringRecord(config['env']) } : {}),
         ...(readString(config['url']) ? { url: readString(config['url']) } : {}),
         ...(readTransport(config['type']) ? { type: readTransport(config['type']) } : {}),
-        ...(readRecord(config['auth']) ? { auth: readRecord(config['auth']) } : {}),
+        ...(readRecord(config['oauth']) ? { oauth: readRecord(config['oauth']) } : {}),
         enabled: config['enabled'] !== false,
         configured: config['configured'] !== false,
         builtin: config['builtin'] === true,
@@ -84,27 +84,12 @@ export function inferTransport(config) {
         return 'stdio';
     return 'none';
 }
-export function inferAuthStatus(config) {
-    if (!config.auth)
-        return 'none';
-    if (readString(config.auth['token']) || readString(config.auth['accessToken'])) {
-        return 'authenticated';
-    }
-    if (config.auth['type'] === 'oauth2')
-        return 'pending_auth';
-    return 'configured';
-}
 function readString(value) {
     return typeof value === 'string' && value.trim() ? value : undefined;
 }
 export function readRecord(value) {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value
-        : undefined;
-}
-export function readStringArray(value) {
-    return Array.isArray(value)
-        ? value.filter((item) => typeof item === 'string')
         : undefined;
 }
 export function buildNativeToolName(server, tool, config) {

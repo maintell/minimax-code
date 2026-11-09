@@ -7,10 +7,10 @@ import { checkout } from '../source/git-checkout.js';
 import { GitRemote } from '../source/git-remote.js';
 import { GitCommandError } from '../source/git-runner.js';
 import { githubArchiveUrl } from './github-source.js';
-const DOWNLOAD_TIMEOUT_MS = 60_000;
+const DOWNLOAD_TIMEOUT_MS = 300_000;
 // A repository archive is only the transport envelope. The selected Plugin
 // subtree still uses the stricter 64 MiB / 1,024-file package contract below.
-const MAX_GITHUB_ARCHIVE_BYTES = 128 * 1024 * 1024;
+const MAX_GITHUB_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const MAX_GITHUB_ARCHIVE_ENTRIES = 100_000;
 export async function cloneGitRepositoryPlugin(dataDir, source, signal) {
     const parsed = GitRemote.parse(source.repositoryUrl);
@@ -119,7 +119,7 @@ function validateArchiveResponse(response) {
     }
     const declared = Number(response.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > MAX_GITHUB_ARCHIVE_BYTES) {
-        fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 128 MiB');
+        fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 512 MiB');
     }
 }
 async function readResponseBounded(body, signal) {
@@ -131,7 +131,7 @@ async function readResponseBounded(body, signal) {
         total += result.value.byteLength;
         if (total > MAX_GITHUB_ARCHIVE_BYTES) {
             await reader.cancel();
-            fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 128 MiB');
+            fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 512 MiB');
         }
         chunks.push(Buffer.from(result.value));
         result = await readArchiveChunk(reader, signal);

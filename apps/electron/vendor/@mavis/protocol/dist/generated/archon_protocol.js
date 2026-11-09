@@ -189,6 +189,7 @@ export var CommunicateSource;
 (function (CommunicateSource) {
     CommunicateSource[CommunicateSource["ToolCall"] = 1] = "ToolCall";
     CommunicateSource[CommunicateSource["TeamEngine"] = 2] = "TeamEngine";
+    CommunicateSource[CommunicateSource["ExternalSession"] = 3] = "ExternalSession";
 })(CommunicateSource || (CommunicateSource = {}));
 export var HarnessSessionTransferPurpose;
 (function (HarnessSessionTransferPurpose) {

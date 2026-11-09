@@ -13,31 +13,53 @@ export class HistoryScannerError extends Error {
     }
 }
 export async function scanCanonicalHistoryArtifacts(paths, files = createCanonicalHistoryFileAdapter()) {
-    const activeBase = await readArtifact(files.readActiveStrict(paths.activePath), paths.activePath, 'active');
-    const activeGeneration = inferActiveGeneration(activeBase.records);
-    const active = { ...activeBase, generation: activeGeneration };
-    const activeMarker = readV2Marker(active.records, activeGeneration);
+    const lineage = createExternalUserLineage();
+    const { active, activeMarker } = await readActiveArtifact(files, paths.activePath, lineage);
     const names = await listSnapshotNames(paths.snapshotsPath);
-    const chain = await scanReachableSnapshots(files, active.generation, activeMarker, names);
-    const reachable = [...chain.artifacts];
-    const activeScanned = { ...active, generation: active.generation, fileName: 'messages.jsonl' };
-    reachable.push(activeScanned);
-    validateExternalUserLineage(reachable);
+    const chain = await scanReachableSnapshots({
+        files,
+        activeGeneration: active.generation,
+        activeMarker,
+        names,
+        lineage,
+    });
+    lineage.assertConsistent();
     return {
         catalog: {
             schemaVersion: 1,
             sessionId: paths.sessionId,
             activeGeneration: active.generation,
             activeRevision: active.revision,
-            artifacts: reachable.map(({ path: _path, records: _records, ...artifact }) => artifact),
+            artifacts: [...chain.artifacts, active],
         },
         orphans: names
             .filter((entry) => !chain.reachedNames.has(entry.fileName))
             .map((entry) => entry.fileName),
     };
 }
-async function scanReachableSnapshots(files, activeGeneration, activeMarker, names) {
+/**
+ * Compaction only builds on the active generation, so it verifies the one snapshot the
+ * active marker points to. Walking the whole lineage here would hold every generation
+ * ever compacted in memory, which grows without bound in long sessions.
+ */
+export async function verifyCompactionParent(input, files = createCanonicalHistoryFileAdapter()) {
+    const generation = inferActiveGeneration(input.activeRecords);
+    const marker = readV2Marker(input.activeRecords, generation);
+    if (generation === 0)
+        return;
+    await readReachableParent({
+        files,
+        generation,
+        marker,
+        byGeneration: groupSnapshotsByGeneration(await listSnapshotNames(input.snapshotsPath)),
+        reachedNames: new Set(),
+    });
+}
+async function scanReachableSnapshots(input) {
+    const { files, activeGeneration, activeMarker, names, lineage } = input;
     const byGeneration = groupSnapshotsByGeneration(names);
+    // Newest first; each generation's records are released once its user lineage is recorded,
+    // so memory stays bounded by one snapshot however many times the session compacted.
     const artifacts = [];
     const reachedNames = new Set();
     let generation = activeGeneration;
@@ -50,7 +72,8 @@ async function scanReachableSnapshots(files, activeGeneration, activeMarker, nam
             byGeneration,
             reachedNames,
         });
-        artifacts.unshift(parent.artifact);
+        lineage.observe(parent.artifact.records, parent.artifact.generation);
+        artifacts.unshift(catalogArtifact(parent.artifact));
         generation = parent.artifact.generation;
         marker = parent.marker;
     }
@@ -92,30 +115,51 @@ async function readReachableParent(input) {
         marker: readV2Marker(scanned.records, snapshot.generation),
     };
 }
+async function readActiveArtifact(files, activePath, lineage) {
+    const scanned = await readArtifact(files.readActiveStrict(activePath), activePath, 'active');
+    const generation = inferActiveGeneration(scanned.records);
+    const activeMarker = readV2Marker(scanned.records, generation);
+    lineage.observe(scanned.records, generation);
+    return {
+        active: catalogArtifact({ ...scanned, generation, fileName: 'messages.jsonl' }),
+        activeMarker,
+    };
+}
+function catalogArtifact({ path: _path, records: _records, ...artifact }) {
+    return artifact;
+}
 /**
  * A user message keeps its `msg-user-v1-` identity across compaction generations.
  * Every occurrence must be a user message, and a repeated occurrence must carry the
- * same payload in the next generation; otherwise the reachable chain is corrupt.
+ * same payload in the adjacent generation; otherwise the reachable chain is corrupt.
+ * Generations are observed newest first and only one fingerprint per identity is kept.
+ * The conflict is raised after the walk so other chain errors keep their precedence.
  */
-function validateExternalUserLineage(artifacts) {
-    const lineage = new Map();
-    for (const artifact of artifacts) {
-        for (const record of artifact.records) {
-            if (!isExternalUserId(record.message_id))
-                continue;
-            if (record.message.role !== 'user') {
-                throw new HistoryScannerError('external-user-lineage-conflict');
+function createExternalUserLineage() {
+    const oldestSeen = new Map();
+    let conflict = false;
+    return {
+        observe(records, generation) {
+            for (const record of records) {
+                if (!isExternalUserId(record.message_id))
+                    continue;
+                if (record.message.role !== 'user') {
+                    conflict = true;
+                    continue;
+                }
+                const fingerprint = externalUserFingerprint(record);
+                const newer = oldestSeen.get(record.message_id);
+                if (newer && (newer.fingerprint !== fingerprint || newer.generation !== generation + 1)) {
+                    conflict = true;
+                }
+                oldestSeen.set(record.message_id, { fingerprint, generation });
             }
-            const fingerprint = externalUserFingerprint(record);
-            const previous = lineage.get(record.message_id);
-            if (previous &&
-                (previous.fingerprint !== fingerprint ||
-                    previous.lastGeneration + 1 !== artifact.generation)) {
+        },
+        assertConsistent() {
+            if (conflict)
                 throw new HistoryScannerError('external-user-lineage-conflict');
-            }
-            lineage.set(record.message_id, { fingerprint, lastGeneration: artifact.generation });
-        }
-    }
+        },
+    };
 }
 function externalUserFingerprint(envelope) {
     const semanticEnvelope = {

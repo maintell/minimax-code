@@ -1,10 +1,33 @@
 import { withProgrammaticResult } from '@mavis/agent-core/tools';
 import { redactSecretText } from '@mavis/shared/logging/redact-log-secret';
 import { sanitizeObservabilityText } from '@mavis/shared/local-runtime-diagnostics/redaction';
+/**
+ * Bounds of a retained Todo snapshot. The tool asks for brief items and a real
+ * plan stays far below 100 entries, so both caps only stop an abnormal
+ * argument from inflating the durable PTC envelope that every reminder reads
+ * back (compaction/algorithm/todo-cadence.ts). Text is capped per field rather
+ * than dropping the call, because a lost snapshot silently stops the Todo
+ * cadence instead of just shortening one line.
+ */
+const TODO_EVIDENCE_MAX_ITEMS = 100;
+const TODO_EVIDENCE_MAX_TEXT_LENGTH = 500;
 /** Only final admitted builtin arguments may become durable model evidence. */
 export function projectDesktopPtcEvidenceInput(input) {
     if (input.source !== 'builtin' || !isRecord(input.args))
         return undefined;
+    const projected = {};
+    const redactedFields = [];
+    // TodoWrite exists only inside run_code on a PTC Turn, so its snapshot is the
+    // one argument set that must survive: it is what the Todo cadence reads back
+    // from durable history, and safety reconciliation keeps it like a file path.
+    if (input.toolName === 'todowrite') {
+        const todos = projectTodoEvidence(input.args.todos);
+        if (todos) {
+            projected.todos = todos.items;
+            if (todos.changed)
+                redactedFields.push('todos');
+        }
+    }
     const fields = ['read', 'write', 'edit'].includes(input.toolName)
         ? ['path', 'file_path', 'filePath']
         : input.toolName === 'bash'
@@ -12,8 +35,6 @@ export function projectDesktopPtcEvidenceInput(input) {
             : ['task_query', 'task_output', 'task_stop'].includes(input.toolName)
                 ? ['task_id']
                 : [];
-    const projected = {};
-    const redactedFields = [];
     for (const field of fields) {
         const value = input.args[field];
         if (typeof value !== 'string' || !value.trim())
@@ -29,6 +50,47 @@ export function projectDesktopPtcEvidenceInput(input) {
     if (redactedFields.length > 0)
         projected.redacted_fields = redactedFields;
     return projected;
+}
+/**
+ * One todowrite child call as durable evidence: content, status and priority
+ * of each item, through the same mask as every other retained argument. An
+ * item without content or status cannot become Todo state (compaction
+ * normalizeTodoItems), so it is left out rather than stored half way.
+ * `changed` reports that the stored snapshot is not what the call carried,
+ * whether a value was masked, capped or dropped, which is what
+ * `redacted_fields` already means. An empty list is the tool's own "clear
+ * the list" call and is retained.
+ */
+function projectTodoEvidence(value) {
+    if (!Array.isArray(value))
+        return undefined;
+    const items = [];
+    let changed = value.length > TODO_EVIDENCE_MAX_ITEMS;
+    for (const entry of value.slice(0, TODO_EVIDENCE_MAX_ITEMS)) {
+        if (!isRecord(entry)) {
+            changed = true;
+            continue;
+        }
+        const item = {};
+        for (const field of ['content', 'status', 'priority']) {
+            const text = entry[field];
+            if (typeof text !== 'string' || !text.trim()) {
+                if (text !== undefined)
+                    changed = true;
+                continue;
+            }
+            const safe = safeEvidenceText(text).slice(0, TODO_EVIDENCE_MAX_TEXT_LENGTH);
+            item[field] = safe;
+            if (safe !== text)
+                changed = true;
+        }
+        if (!item.content || !item.status) {
+            changed = true;
+            continue;
+        }
+        items.push(item);
+    }
+    return { items, changed };
 }
 /** Drops guest/free text rather than moving rejected content into metadata. */
 export function sanitizePtcExecutionDetailsForSafety(details) {

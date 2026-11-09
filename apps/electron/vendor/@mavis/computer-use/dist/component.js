@@ -13,10 +13,8 @@ export function componentInstallRoot(dataDir, platform = process.platform, arch 
 }
 /**
  * The host-selected profile root may itself be a link (for example a Windows junction that
- * moves `~/.minimax` to another drive). Resolve only that root; every path created below it is
- * still checked for links and unsafe ancestors. A root that does not exist yet, or that the
- * volume cannot resolve (some virtual, RAM or network drives), stays unchanged: the strict
- * ancestor checks then apply to the original path exactly as they did before this resolution.
+ * moves `~/.minimax` to another drive). A root that does not exist yet, or that the volume
+ * cannot resolve (some virtual, RAM or network drives), stays unchanged.
  */
 export async function resolveProfileDataDir(dataDir) {
     try {
@@ -65,9 +63,8 @@ export async function discoverComponent(input) {
         const file = componentPath(root, relative);
         await assertNoSymlink(file);
         const stat = await lstat(file);
-        if (!stat.isFile() || (platform !== 'win32' && (stat.mode & 0o022) !== 0)) {
-            throw invalid('Component files must be regular and not group/world writable.');
-        }
+        if (!stat.isFile())
+            throw invalid('Component files must be regular files.');
         const hash = createHash('sha256');
         for await (const chunk of createReadStream(file))
             hash.update(chunk);
@@ -119,13 +116,13 @@ function componentPath(root, relative) {
         throw invalid('Component path escapes its root.');
     return path.join(root, ...relative.split('/'));
 }
+/**
+ * Rejects a link at this exact path. Ancestors are user environment (relocated homes, Windows
+ * junctions) and are not inspected; links inside a component tree are rejected by `inventory`.
+ */
 export async function assertNoSymlink(file) {
-    const resolved = path.resolve(file);
-    const parent = path.dirname(resolved);
-    if (parent !== resolved)
-        await assertNoSymlink(parent);
     try {
-        const info = await lstat(resolved);
+        const info = await lstat(path.resolve(file));
         if (info.isSymbolicLink())
             throw invalid('Symbolic links are not allowed in component/runtime paths.');
     }

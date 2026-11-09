@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { isContextOverflow } from '@earendil-works/pi-ai';
-import { isLLMImageLimitMessage, isLLMRequestTooLargeMessage, keepsRequestImages, LLM_RETRY_REQUEST_SETTLED_OBSERVER, projectAgentMessagesForModel, } from '@mavis/agent-core/pi-turn-runner';
+import { hasThinkingPrefixBinding, isLLMImageLimitMessage, isLLMRequestTooLargeMessage, LLM_RETRY_REQUEST_SETTLED_OBSERVER, projectAgentMessagesForModel, } from '@mavis/agent-core/pi-turn-runner';
 import { createDefaultTokenEstimator, withoutThinking } from '@mavis/context-manager';
 import { CheckpointCandidateMediaRejectedError, CheckpointCandidateTooLargeError, } from '../contracts.js';
 import { buildCheckpointControl, buildSharedPrefixCheckpointControl, CHECKPOINT_SYSTEM_PROMPT, CHECKPOINT_SYSTEM_PROMPT_KEY, } from './checkpoint-prompt.js';
@@ -195,12 +195,15 @@ function reportUnobservedCheckpointSettlement(onRequestSettled, requestSettled, 
     onRequestSettled(event);
 }
 /**
- * The main request's request-only projection (shared prefix only), then the
- * same model projection as the main request.
+ * Messages for the checkpoint request, then the same model projection as the
+ * main request. The shared-prefix request repeats the main request's own
+ * request-only projection; the isolated request only filters.
  */
-function projectCheckpointMessages(options, messages, requestOnly) {
-    const filtered = options.projectRequestMessages?.(messages) ?? messages;
-    return projectAgentMessagesForModel(requestOnly?.(filtered) ?? filtered, options.model).messages;
+function projectCheckpointMessages(options, messages, mainRequest) {
+    const request = mainRequest
+        ? mainRequest(messages)
+        : (options.projectRequestMessages?.(messages) ?? messages);
+    return projectAgentMessagesForModel(request, options.model).messages;
 }
 function checkpointControlMessage(text, projected) {
     return {
@@ -213,9 +216,9 @@ function checkpointControlMessage(text, projected) {
 function buildIsolatedCheckpointRequest(options, input, protocol = CHECKPOINT_SYSTEM_PROMPT) {
     const outbound = projectCheckpointMessages(options, input.messages);
     // The isolated request has its own system prompt and no tools, so thinking
-    // bound to the main conversation's prefix is invalid for prefix-cached models.
-    // The shared-prefix request repeats that prefix and keeps its thinking.
-    const projected = keepsRequestImages(options.model) ? withoutThinking(outbound) : outbound;
+    // bound to the main conversation's prefix can no longer verify. The
+    // shared-prefix request repeats that prefix and keeps its thinking.
+    const projected = hasThinkingPrefixBinding(options.model) ? withoutThinking(outbound) : outbound;
     return {
         systemPrompt: protocol,
         messages: [
@@ -226,7 +229,7 @@ function buildIsolatedCheckpointRequest(options, input, protocol = CHECKPOINT_SY
 }
 /** The main request's prefix followed by the control message that carries the protocol. */
 function buildSharedPrefixCheckpointRequest(options, prefix, input, protocol) {
-    const projected = projectCheckpointMessages(options, input.messages, prefix.projectRequestMedia);
+    const projected = projectCheckpointMessages(options, input.messages, prefix.projectRequestMessages);
     return buildSharedPrefixCheckpointContext(prefix, projected, checkpointControlMessage(buildSharedPrefixCheckpointControl(protocol, input.instructions), projected));
 }
 function fitsCheckpointRequest(options, input, context) {

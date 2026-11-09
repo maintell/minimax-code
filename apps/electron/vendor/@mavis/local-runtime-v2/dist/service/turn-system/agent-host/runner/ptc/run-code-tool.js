@@ -6,6 +6,7 @@ import { createPtcToolBridge } from '../../execution/ptc/tool-bridge.js';
 import { isPtcJsonValue, PTC_LIMITS, PTC_RESULT_TOO_LARGE, } from '../../execution/ptc/contracts.js';
 import { programWallClock } from '../../execution/ptc/program-wall-clock.js';
 import { ptcReturnTruncationNotice, spillPtcReturnValue, } from '../../execution/ptc/return-spill.js';
+import { fillDescription, parentDescriptionOf } from '../../execution/ptc/run-code-description.js';
 import { executePtcQuickJs } from './quickjs-executor.js';
 import { projectPtcOuterMedia } from './media-projection.js';
 import { createPtcProgramTiming, ptcChildCallStatus, ptcChildOutputFields, ptcProgramOutcome, ptcRejectedProgram, } from './ptc-observability.js';
@@ -73,6 +74,7 @@ export function createPtcRunCodeTool(childTools, options = {}, trustedNativeTool
         label: 'Run code',
         description: runCodeDescription(childTools, nativeDataTools(trustedNativeTools)),
         schema: RunCodeSchema,
+        prepareArguments: fillDescription,
         executionMode: 'sequential',
         source: 'builtin',
         execute: async (context, input, signal) => await executeRunCode(context, input, signal, {
@@ -105,6 +107,7 @@ async function executeRunCode(context, input, signal, options) {
         logRunCodeRejected(context, parentToolCallId, 'PTC_UNAVAILABLE', wallClock);
         return failedRunCode('PTC_UNAVAILABLE', 'run_code is available only during an active Desktop turn.');
     }
+    const parentDescription = parentDescriptionOf(context, parentToolCallId, input.description);
     if (wallClock.source === 'capped' || wallClock.source === 'invalid') {
         // The model asked for something other than what runs; say what was used.
         writeRunCodeEvent(context, parentToolCallId, 'ptc run_code timeout_ms adjusted', {
@@ -173,7 +176,7 @@ async function executeRunCode(context, input, signal, options) {
             const evidenceSource = readPtcToolEvidenceSource(options.runCode, mavis?.tool ?? listed);
             const outcome = await timing.run(call.requestId, () => executor.execute({
                 parentToolCallId,
-                parentDescription: input.description,
+                ...parentDescription,
                 toolCallId: childToolCallIds.get(call.requestId) ?? crypto.randomUUID(),
                 toolName: mavis ? mavis.tool.def.name : call.name,
                 args: mavis ? { command: mavis.command, args: call.args } : call.args,

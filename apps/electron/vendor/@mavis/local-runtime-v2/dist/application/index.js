@@ -1,4 +1,4 @@
-export { createRuntimeServicesLifecycle, closeRuntimeServiceResources, bindGoalConversation, startupRecoveryControls, startupRecoveryInputs, closeRuntimeServiceOwnersAfterFailure, createRuntimeServicesGlobalEventWriter, createRuntimePluginAuthContextNotifier, createRuntimePluginSessionLifecycle, } from './session/runtime-services-lifecycle.js';
+export { createRuntimeServicesLifecycle, closeRuntimeServiceResources, closeRuntimeOwners, bindGoalConversation, startupRecoveryControls, startupRecoveryInputs, closeRuntimeServiceOwnersAfterFailure, createRuntimeServicesGlobalEventWriter, closeRuntimeTitles, composeModelAccessRuntimeLifecycle, createDisabledModelAccessComposition, createModelAccessComposition, createRuntimePluginAuthContextNotifier, createRuntimePluginSessionLifecycle, } from './session/runtime-services-lifecycle.js';
 export { STARTUP_RECOVERY_STEP_NAMES, startupRecoveryFaultOption, } from './session/startup-recovery.js';
 export { configureRuntimePluginHooks, } from './session/runtime-plugin-hook-composition.js';
 export { AgentApplication, createAgentSessionPorts, createRuntimeAgentApplication, } from './agent/agent-application.js';
@@ -29,5 +29,7 @@ export { toSessionInfoView, toSessionTreeChildView } from './session/wire.js';
 export { SessionHandoffApplication, } from './session/handoff-application.js';
 export { initializeApplications } from './initialize.js';
 export { ModelProviderApplication } from './session/model-provider-application.js';
+export { ModelAccessApplication } from './session/model-access-application.js';
+export { toModelAccessAppError } from './session/model-access-errors.js';
 export { createRuntimeSkillApplication, RuntimeSkillApplication, } from './session/runtime-skill-application.js';
 //# sourceMappingURL=index.js.map

@@ -1,6 +1,6 @@
 // GENERATED FILE — DO NOT EDIT BY HAND.
 // Regenerate with: node scripts/generate-local-runtime-schema-snapshot.mjs
-// Source: sqlite_master after running ALL_MIGRATIONS (schema version 53).
+// Source: sqlite_master after running ALL_MIGRATIONS (schema version 54).
 //
 // Safe-mode startup replays these idempotent statements to backfill schema
 // structure when a migration is quarantined; the contract test in
@@ -155,5 +155,10 @@ export const SCHEMA_SNAPSHOT_STATEMENTS = [
     'CREATE INDEX IF NOT EXISTS idx_local_runtime_background_tasks_owner_status_delivery ON local_runtime_background_tasks(owner_session_id, status, delivered_at_ms, ended_at_ms, task_id)',
     'CREATE TABLE IF NOT EXISTS local_runtime_schema_migrations (\n      version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL\n    )',
     "CREATE TABLE IF NOT EXISTS local_runtime_plugin_miniapp_permission (\n      plugin_id TEXT NOT NULL,\n      plugin_source TEXT NOT NULL,\n      permission TEXT NOT NULL,\n      enabled INTEGER NOT NULL,\n      updated_at_ms INTEGER NOT NULL,\n      PRIMARY KEY (plugin_id, plugin_source, permission),\n      CONSTRAINT local_runtime_plugin_miniapp_permission_source\n        CHECK (plugin_source IN ('local', 'official')),\n      CONSTRAINT local_runtime_plugin_miniapp_permission_enabled CHECK (enabled IN (0, 1))\n    )",
+    'CREATE TABLE IF NOT EXISTS local_runtime_ppt_preview_artifacts (artifact_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES local_runtime_sessions(session_id) ON DELETE CASCADE, artifact_key TEXT NOT NULL, state_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL)',
+    'CREATE INDEX IF NOT EXISTS idx_ppt_preview_session ON local_runtime_ppt_preview_artifacts(session_id)',
+    'CREATE TABLE IF NOT EXISTS local_runtime_ppt_preview_requests (session_id TEXT NOT NULL REFERENCES local_runtime_sessions(session_id) ON DELETE CASCADE, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL, PRIMARY KEY(session_id, request_id))',
+    'CREATE TABLE IF NOT EXISTS local_runtime_ppt_preview_events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES local_runtime_sessions(session_id) ON DELETE CASCADE, artifact_id TEXT NOT NULL, event_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)',
+    'CREATE INDEX IF NOT EXISTS idx_ppt_preview_events_session ON local_runtime_ppt_preview_events(session_id, cursor)',
 ];
 //# sourceMappingURL=safe-mode-snapshot.js.map

@@ -503,6 +503,7 @@ export function clearDesktopConfig() {
         plainTextEditorEnabled: current.plainTextEditorEnabled ?? true,
         activityGroupsExpandedByDefault: current.activityGroupsExpandedByDefault ?? defaultConfig.activityGroupsExpandedByDefault,
         fileOpenInNewTabEnabled: current.fileOpenInNewTabEnabled ?? defaultConfig.fileOpenInNewTabEnabled,
+        sidePanelEntryLayout: current.sidePanelEntryLayout,
         // Mirrors registry state that outlives the signed-in account.
         fileOpenWithEnhancedEnabled: current.fileOpenWithEnhancedEnabled ?? defaultConfig.fileOpenWithEnhancedEnabled,
         globalAccessShortcut: current.globalAccessShortcut ?? defaultConfig.globalAccessShortcut,

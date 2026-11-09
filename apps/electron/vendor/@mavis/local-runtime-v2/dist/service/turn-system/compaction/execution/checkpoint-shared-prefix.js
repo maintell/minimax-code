@@ -1,20 +1,20 @@
-import { projectRequestMedia, } from './request-media-projection.js';
+import { createMainRequestProjection } from './request-projection.js';
 /** The main-request prefix for a Host-selected `shared_prefix` request; otherwise none. */
-export function resolveCheckpointSharedPrefix(input) {
+export function resolveCheckpointSharedPrefix(input, mainRequest = createMainRequestProjection().project) {
     if (input.checkpointRequestShape !== 'shared_prefix' || input.systemPrompt === undefined) {
         return undefined;
     }
-    const media = {
-        model: input.model,
-        ...(input.maxSerializedInputBytes === undefined
-            ? {}
-            : { maxSerializedInputBytes: input.maxSerializedInputBytes }),
-    };
+    const { sessionId, model, maxSerializedInputBytes } = input;
     return {
-        sessionId: input.sessionId,
+        sessionId,
         systemPrompt: input.systemPrompt,
         tools: input.tools ?? [],
-        projectRequestMedia: (messages) => projectRequestMedia({ ...media, messages }).messages,
+        projectRequestMessages: (messages) => mainRequest({
+            sessionId,
+            model,
+            messages,
+            ...(maxSerializedInputBytes === undefined ? {} : { maxSerializedInputBytes }),
+        }),
     };
 }
 /**

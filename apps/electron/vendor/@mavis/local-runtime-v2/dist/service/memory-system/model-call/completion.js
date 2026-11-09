@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { withLLMRetry } from '@mavis/agent-core/pi-turn-runner';
 import { streamSimple } from '@earendil-works/pi-ai';
 import { ThinkingLevel } from '@mavis/protocol';
 import { parseMemoryModelOverride } from './model-override.js';
@@ -43,12 +44,22 @@ export function createGlobalMemoryModelCompletion(input) {
             tools: [],
             skills: [],
         };
+        const turnId = `turn_memory_${randomUUID()}`;
         const resolved = await input.preparation.resolveModel({
             sessionId: GLOBAL_MEMORY_MODEL_ANCHOR,
-            turnId: `turn_memory_${randomUUID()}`,
+            turnId,
             agentConfig,
         });
-        return { resolved };
+        const base = resolved.streamFn ?? streamSimple;
+        const stream = resolved.callLifecycle
+            ? withLLMRetry(base, {
+                sessionId: GLOBAL_MEMORY_MODEL_ANCHOR,
+                turnId,
+                scope: 'memory',
+                lifecycle: resolved.callLifecycle,
+            })
+            : base;
+        return { resolved, stream };
     };
     return {
         async resolveModel(request) {
@@ -66,8 +77,7 @@ export function createGlobalMemoryModelCompletion(input) {
             };
         },
         async complete(request) {
-            const { resolved } = await resolve(request.reasoningEffort, request.modelName);
-            const stream = resolved.streamFn ?? streamSimple;
+            const { resolved, stream } = await resolve(request.reasoningEffort, request.modelName);
             const startedAtMs = input.nowMs();
             input.diagnosticEvent?.('llm.request', {
                 kind: request.kind,
@@ -80,11 +90,12 @@ export function createGlobalMemoryModelCompletion(input) {
             });
             const result = await observeMemoryModelCall({
                 modelCalls: input.modelCalls,
+                retryManaged: !!resolved.callLifecycle,
                 model: `${resolved.model.provider}/${resolved.model.id}`,
                 reasoningEffort: request.reasoningEffort,
                 nowMs: input.nowMs,
                 signal: request.signal,
-            }, async () => {
+            }, async (retryOptions) => {
                 const response = await stream(resolved.model, {
                     systemPrompt: request.systemPrompt,
                     ...(request.outputTool ? { tools: [request.outputTool] } : {}),
@@ -98,6 +109,8 @@ export function createGlobalMemoryModelCompletion(input) {
                 }, {
                     ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
                     ...(resolved.headers ? { headers: resolved.headers } : {}),
+                    ...(resolved.fetch ? { fetch: resolved.fetch } : {}),
+                    ...(retryOptions ?? {}),
                     // 推理强度来自记忆配置（设计 §2.3），覆盖会话侧 thinkingLevel。
                     reasoning: request.reasoningEffort,
                     maxTokens: request.maxOutputTokens,
@@ -137,8 +150,7 @@ export function createGlobalMemoryModelCompletion(input) {
             ];
             for (let turn = 0; turn < request.maxTurns; turn += 1) {
                 // 整轮可持续数十分钟，登录凭证会在期间轮换；每步重新解析，避免沿用过期 token 收到 401。
-                const { resolved } = await resolve(request.reasoningEffort, request.modelName);
-                const stream = resolved.streamFn ?? streamSimple;
+                const { resolved, stream } = await resolve(request.reasoningEffort, request.modelName);
                 const startedAtMs = input.nowMs();
                 input.diagnosticEvent?.('llm.request', {
                     kind: request.kind,
@@ -185,11 +197,12 @@ async function runMemoryLoopStep(step) {
     const { stream, resolved, request } = step;
     const result = await observeMemoryModelCall({
         modelCalls: step.modelCalls,
+        retryManaged: !!resolved.callLifecycle,
         model: `${resolved.model.provider}/${resolved.model.id}`,
         reasoningEffort: request.reasoningEffort,
         nowMs: step.nowMs,
         signal: request.signal,
-    }, async () => {
+    }, async (retryOptions) => {
         const response = await stream(resolved.model, {
             systemPrompt: request.systemPrompt,
             messages: [...step.messages],
@@ -197,6 +210,8 @@ async function runMemoryLoopStep(step) {
         }, {
             ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
             ...(resolved.headers ? { headers: resolved.headers } : {}),
+            ...(resolved.fetch ? { fetch: resolved.fetch } : {}),
+            ...(retryOptions ?? {}),
             reasoning: request.reasoningEffort,
             maxTokens: request.maxOutputTokens,
             signal: request.signal,

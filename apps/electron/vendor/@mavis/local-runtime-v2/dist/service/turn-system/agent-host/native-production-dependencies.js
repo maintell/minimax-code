@@ -3,6 +3,7 @@ import { createDesktopPtcResultProjection, getLocalBashEnvironment, projectDeskt
 import { redactSecretText } from '@mavis/shared/logging/redact-log-secret';
 import { sanitizeObservabilityText } from '@mavis/shared/local-runtime-diagnostics/redaction';
 import { buildLocalTurnToolCatalog, } from './assembly/local-turn-tool-catalog.js';
+import { renderAgentSkillPreload } from './tools/index.js';
 import { createLocalTurnToolCatalogInput, } from './assembly/local-turn-tool-catalog-source.js';
 import { NativeLocalTurnExecutionPreparationSource, } from './assembly/local-turn-execution-preparation.js';
 import { LocalTurnInputPreparer, } from './assembly/local-turn-input-preparation.js';
@@ -176,22 +177,40 @@ function createToolCatalogSource(options) {
     };
 }
 async function buildToolCatalog(options, input) {
-    return buildLocalTurnToolCatalog({
+    const sources = await options.resolveSources(toolCatalogSourceInput(input));
+    const catalog = buildLocalTurnToolCatalog({
         sessionId: input.sessionId,
         turnId: input.turnId,
         agentName: input.agentName,
-        sources: await options.resolveSources(toolCatalogSourceInput(input)),
+        sources,
         llmModel: input.llmModel,
         effectivePluginSkills: input.effectivePluginSkills,
         userText: input.userText,
         ...toolCatalogBuildOptions(options, input),
     });
+    // Rendered into the first user message only, which history then keeps: later
+    // Turns neither inject nor read these Skills again.
+    const preload = input.sessionFirstTurn
+        ? await renderAgentSkillPreload({
+            sessionId: input.sessionId,
+            turnId: input.turnId,
+            agentName: input.agentName,
+            names: input.agentProfile?.configSelection?.skills,
+            ...(sources.readSkill ? { readSkill: sources.readSkill } : {}),
+            ...(options.logger ? { logger: options.logger } : {}),
+        })
+        : '';
+    if (!preload)
+        return catalog;
+    return {
+        ...catalog,
+        userPromptPrefix: [preload, catalog.userPromptPrefix].filter(Boolean).join('\n\n'),
+    };
 }
 function toolCatalogSourceInput(input) {
     return {
         ...input,
         ...agentProfileSourceOptions(input.agentProfile),
-        ...runtimeSkillSelectorFacts(input.agentProfile),
     };
 }
 function agentProfileSourceOptions(profile) {
@@ -223,15 +242,6 @@ function toolCatalogBuildOptions(options, input) {
             ? { hostCapabilityRegistry: options.hostCapabilityRegistry }
             : {}),
         writePtcReturnArtifact: options.writePtcReturnArtifact,
-    };
-}
-function runtimeSkillSelectorFacts(profile) {
-    const selection = profile?.configSelection;
-    return {
-        ...(selection?.skills === undefined ? {} : { allowedSkillNames: selection.skills }),
-        ...(selection?.extensionSkills === undefined
-            ? {}
-            : { allowedExtensionSkillNames: selection.extensionSkills }),
     };
 }
 //# sourceMappingURL=native-production-dependencies.js.map

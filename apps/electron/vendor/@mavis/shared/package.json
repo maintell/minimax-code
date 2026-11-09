@@ -3,6 +3,12 @@
   "version": "0.2.1",
   "type": "module",
   "exports": {
+    "./model-access-catalog": {
+      "import": "./dist/model-access-catalog.js"
+    },
+    "./model-access-presentation": {
+      "import": "./dist/model-access-presentation.js"
+    },
     "./browser-webview": {
       "import": "./dist/browser-webview.js"
     },
@@ -284,6 +290,13 @@
     "./project-icon": {
       "import": "./dist/project-icon.js",
       "default": "./dist/project-icon.js"
+    },
+    "./ppt-preview": {
+      "import": "./dist/ppt-preview.js"
+    },
+    "./pptx-editing": {
+      "import": "./dist/pptx-editing.js",
+      "default": "./dist/pptx-editing.js"
     }
   },
   "main": "./dist/index.js",

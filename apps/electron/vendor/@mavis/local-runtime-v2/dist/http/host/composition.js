@@ -15,7 +15,7 @@ import { createV1WorkspaceLocalActionsPort, createV1WorkspaceIndexingWorker, } f
 import {} from './initialize.js';
 import { updateLocalConfigFile } from '../../infra/config/update.js';
 import {} from '../../service/channel-system/index.js';
-import { createV1CommerceCompatibility, createV1AttachmentRegistration, legacyCollisionMigrationId, resolveDelegatableAgentReference, createV1AgentHostProductCapabilities, createV1MiniAppToolRules, } from './agent-product-capabilities.js';
+import { createV1CanvasCompatibility, createV1CommerceCompatibility, createV1AttachmentRegistration, legacyCollisionMigrationId, resolveDelegatableAgentReference, createV1AgentHostProductCapabilities, createV1MiniAppToolRules, } from './agent-product-capabilities.js';
 import { createV1SessionCompatibility } from './session-capabilities.js';
 /**
  * Legacy Agent storage scope for the V2 cutover. Takes no lock: the caller
@@ -285,6 +285,7 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
                 },
                 sessionV2: createV1SessionCompatibility(host),
                 commerce: createV1CommerceCompatibility(api),
+                canvas: createV1CanvasCompatibility(api),
                 sessionHandoff: {
                     hosted: hostedCloudHandoff,
                     workspace: {
@@ -310,6 +311,7 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
                     dataDir: host.dataDir,
                     configGetter: api.configGetter,
                     authContextGetter: options.authContextGetter ?? (() => undefined),
+                    routingContextGetter: () => options.routingContextGetter?.(),
                     fetchImpl: options.fetchImpl ?? globalThis.fetch,
                     ...(options.appVersion ? { appVersion: options.appVersion } : {}),
                     metrics: host.metricsClient,

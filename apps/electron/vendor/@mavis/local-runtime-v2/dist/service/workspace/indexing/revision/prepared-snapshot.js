@@ -14,7 +14,6 @@ export async function createWorkspacePreparedSnapshot(input) {
     await mkdir(paths.prewarmRoot, { recursive: true, mode: 0o700 });
     await chmod(paths.prewarmRoot, 0o700);
     const temporaryDir = path.join(paths.prewarmRoot, `.prewarm-tmp-${randomUUID()}`);
-    const stagingDir = path.join(temporaryDir, '.source-staging');
     const archivePath = path.join(temporaryDir, 'workspace.zip');
     const metadataPath = path.join(temporaryDir, 'snapshot.json');
     const backupDir = path.join(paths.prewarmRoot, `.prewarm-old-${randomUUID()}`);
@@ -24,7 +23,6 @@ export async function createWorkspacePreparedSnapshot(input) {
     try {
         const archive = await (input.archiveWriter ?? writeWorkspaceArchive)({
             targetPath: archivePath,
-            stagingDir,
             scan: input.scan,
             includedPaths: new Set(input.scan.files.map((entry) => entry.path)),
             ...(input.signal ? { signal: input.signal } : {}),

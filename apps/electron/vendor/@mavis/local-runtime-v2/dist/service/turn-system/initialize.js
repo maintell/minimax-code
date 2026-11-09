@@ -48,7 +48,7 @@ export async function initializeTurnSystem(options) {
         controller,
         preparation: options.sessions.agentProjection.preparation,
         failures: options.sessions.agentProjection.failures,
-        onBeginSettlement: completions.beginSettlement,
+        onBeginSettlement: beginTurnSettlement(completions, options.onTurnSettling),
         released,
         ...(subagentSiblingWake.afterSettlement
             ? { afterSettlement: subagentSiblingWake.afterSettlement }
@@ -706,6 +706,13 @@ function receiptReader(repository) {
     return {
         findReceipt: (turnId) => repository.findReceipt(turnId),
         findClientRequestBindings: (input) => repository.findClientRequestBindings(input),
+    };
+}
+/** Settlement first closes admission cancellation, then tells the owner (Mini App turn holds). */
+function beginTurnSettlement(completions, onTurnSettling) {
+    return (sessionId, turnId) => {
+        completions.beginSettlement(sessionId, turnId);
+        onTurnSettling?.({ sessionId, turnId });
     };
 }
 //# sourceMappingURL=initialize.js.map

@@ -30,11 +30,13 @@ function dispatchedRequestCompletions(requests) {
 function requestCompletions(requests) {
     return [...requests.values()].map((request) => request.completion);
 }
-function registerActiveHostRequest(requests, id, controller, method) {
+function registerActiveHostRequest(requests, id, method, activity) {
+    const controller = new AbortController();
     let resolveCompletion;
     const completion = new Promise((resolve) => {
         resolveCompletion = resolve;
     });
+    const endActivity = activity.start(method);
     const request = {
         method,
         controller,
@@ -44,6 +46,7 @@ function registerActiveHostRequest(requests, id, controller, method) {
         complete: () => {
             requests.delete(id);
             resolveCompletion();
+            endActivity();
         },
     };
     requests.set(id, request);
@@ -71,6 +74,30 @@ function abortDispatchedRequests(requests) {
             request.controller.abort();
     }
 }
+function createHostRequestActivityLedger(activity, pluginId) {
+    const open = new Set();
+    return {
+        start(method) {
+            if (!activity)
+                return () => undefined;
+            activity.requestStarted(pluginId, method);
+            let ended = false;
+            const end = () => {
+                if (ended)
+                    return;
+                ended = true;
+                open.delete(end);
+                activity.requestEnded(pluginId, method);
+            };
+            open.add(end);
+            return end;
+        },
+        endAll() {
+            for (const end of [...open])
+                end();
+        },
+    };
+}
 /** Host-side generation-bound session backed only by the ConnectorGateway seam. */
 export function createMiniAppHostConnectorSessionFactory(options) {
     return {
@@ -97,6 +124,7 @@ function createHostConnectorSession(options, input) {
     const makeToolRef = options.makeToolRef ?? randomUUID;
     const makeInvocationId = options.makeInvocationId ?? randomUUID;
     const timeouts = hostSessionTimeouts(options);
+    const activity = createHostRequestActivityLedger(options.activity, input.pluginId);
     const writer = createHostResponseWriter(input.transport, () => publishResponses && !lifecycle.isRetired() && input.transport.connected !== false);
     const enqueueResponse = writer.enqueue;
     const { agent, tool, releaseBindings } = createHostSessionBindings({
@@ -124,11 +152,10 @@ function createHostConnectorSession(options, input) {
             return;
         }
         highestRequestId = requireHostRequestAdmission(frame.id, frame.method, highestRequestId, requests);
-        const controller = new AbortController();
-        const request = registerActiveHostRequest(requests, frame.id, controller, frame.method);
+        const request = registerActiveHostRequest(requests, frame.id, frame.method, activity);
         request.execution = runTimedHostRequest({
             frame,
-            controller,
+            controller: request.controller,
             timeoutMs: isAgentStreamMethod(frame.method) ? undefined : requestTimeoutMs(frame, timeouts),
             dispatch,
             fail,
@@ -210,6 +237,7 @@ function createHostConnectorSession(options, input) {
         }
         await settleWithin(Promise.allSettled([...requestCompletions(requests), writer.idle()]), timeouts.settleMs);
         lifecycle.markRetired();
+        activity.endAll();
         refs.clear();
         refsByHandle.clear();
         detach();
@@ -223,6 +251,7 @@ function createHostConnectorSession(options, input) {
         refsByHandle.clear();
         detach();
         releaseBindings();
+        activity.endAll();
     }
     function fail(error) {
         if (fatalReported || lifecycle.isRetired())

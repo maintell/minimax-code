@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { MINIAPP_AGENT_FAILURE_CODES, readMiniAppAgentObservedEvent, readMiniAppAgentRunEvent, readMiniAppAgentRunResult, toMiniAppAgentFailureCode, isMiniAppAgentBusyReason, parseMiniAppPermissionId, readMiniAppAgentModelSelection, MINIAPP_AGENT_MAX_TEXT_LENGTH, isMiniAppAgentWhenBusy, isMiniAppAgentPermissionDecision, readMiniAppAgentAnswers, readMiniAppAgentObserveTarget, readMiniAppAgentSessionList, readMiniAppAgentSessionDetail, readMiniAppAgentModels, readMiniAppAgentAgents, readMiniAppAgentCreateResponse, validateMiniAppSurfaceWindow, parseMiniAppPermissionList } from "@mavis/shared/miniapp-surface";
+import { MINIAPP_AGENT_FAILURE_CODES, readMiniAppAgentObservedEvent, readMiniAppAgentRunEvent, readMiniAppAgentRunResult, toMiniAppAgentFailureCode, isMiniAppAgentBusyReason, parseMiniAppPermissionId, readMiniAppAgentModelSelection, MINIAPP_AGENT_MAX_TEXT_LENGTH, isMiniAppAgentWhenBusy, isMiniAppAgentPermissionDecision, readMiniAppAgentAnswers, readMiniAppAgentObserveTarget, readMiniAppAgentSessionList, readMiniAppAgentSessionDetail, readMiniAppAgentModels, readMiniAppAgentAgents, readMiniAppAgentCreateResponse, isMiniAppMemoryProtection, validateMiniAppSurfaceWindow, parseMiniAppPermissionList } from "@mavis/shared/miniapp-surface";
+import { MINIAPP_ATTENTION_MAX_TABS } from "../../browser/miniapp-attention";
 import { parseMiniAppLoopbackOrigin } from "../../browser/miniapp-loopback-origin";
 import { isSafeBrokerRequestId } from "./control";
 const UTILITY_CONSOLE_LOGGER = {
@@ -11,6 +12,7 @@ const MINIAPP_ERROR_MESSAGES = {
     not_found: 'Mini App was not found',
     busy: 'Mini App is busy',
     refresh_failed: 'Mini App page refresh failed',
+    close_failed: 'Mini App page failed to close',
     stop_failed: 'Mini App failed to stop',
     start_failed: 'Mini App failed to start',
     detach_failed: 'Mini App page could not open in its own window',
@@ -97,6 +99,7 @@ const MINIAPP_BROKER_HOST_CODES = [
     'CLOSED',
     'DISABLED',
     'MINIAPP_CATALOG_STALE',
+    'MINIAPP_MCP_SERVER_MISSING',
     'MINIAPP_NOT_AVAILABLE',
     'MINIAPP_PREPARATION_FAILED',
     'NOT_FOUND',
@@ -121,6 +124,7 @@ const MINIAPP_BROKER_REASON_CODES = [
     'HOST_CONNECTOR_PROTOCOL_VIOLATION',
     'HOST_CONNECTOR_UNAVAILABLE',
     'MINIAPP_MCP_RUNTIME_NOT_READY',
+    'MINIAPP_MCP_SERVER_MISSING',
     'MCP_SERVER_START_FAILED',
     'NO_CANDIDATE_PORT',
     'PUBLICATION_NOT_ACCEPTED',
@@ -186,6 +190,18 @@ export class MainMiniAppBrokerClient {
             return Promise.reject(miniAppError('invalid_request'));
         }
         return this.dispatch(target, message);
+    }
+    /** Short request; Main's callers ignore the acknowledgement and resend on the next change. */
+    async reportAttention(target, snapshot) {
+        const message = {
+            type: 'miniapp-request',
+            requestId: randomUUID(),
+            method: 'attention.snapshot',
+            payload: { tabs: snapshot.tabs.map(copyAttentionTab), atMs: snapshot.atMs },
+        };
+        if (!isMiniAppBrokerRequestMessage(message))
+            throw miniAppError('invalid_request');
+        await this.dispatch(target, message);
     }
     /** Agent turns can run for minutes: no request deadline, only caller cancellation or target loss. */
     runAgent(target, input, options = {}) {
@@ -592,7 +608,7 @@ export class UtilityMiniAppBrokerServer {
             if (!this.takePending(requestId, pending))
                 return;
             if (!isMiniAppBrokerResult(result)) {
-                this.postError(requestId, isPermissionMethod(value.method) ? 'permission_failed' : 'start_failed');
+                this.postError(requestId, failedResultCode(value.method));
                 return;
             }
             this.postResult(requestId, value.method, result);
@@ -924,6 +940,10 @@ async function execute(application, request, signal) {
     if (request.method === 'permissions.set') {
         return { permissions: await application.setPermission(request.payload) };
     }
+    if (request.method === 'attention.snapshot') {
+        application.reportAttention(request.payload);
+        return { acknowledged: true };
+    }
     const pluginId = request.pluginId;
     if (!pluginId)
         throw miniAppError('invalid_request');
@@ -981,6 +1001,8 @@ function normalizeErrorCode(error, method) {
     if (isPermissionMethod(method)) {
         return code === 'PERMISSION_UNKNOWN' ? 'permission_unknown' : 'permission_failed';
     }
+    if (isMemoryMethod(method))
+        return 'runtime_unavailable';
     if (method === 'stop')
         return 'stop_failed';
     if (method === 'applyUpdate')
@@ -1122,6 +1144,11 @@ function isMiniAppBrokerRequestMessage(value) {
             isSafeBrokerRequestId(value.requestId) &&
             isPermissionSetPayload(value.payload));
     }
+    if (value.method === 'attention.snapshot') {
+        return (hasOnlyKeys(value, ['type', 'requestId', 'method', 'payload']) &&
+            isSafeBrokerRequestId(value.requestId) &&
+            isAttentionSnapshot(value.payload));
+    }
     if (!hasOnlyKeys(value, ['type', 'requestId', 'method', 'pluginId']))
         return false;
     if (!isSafeBrokerRequestId(value.requestId))
@@ -1138,6 +1165,50 @@ function isMiniAppBrokerRequestMessage(value) {
 }
 function isPermissionMethod(method) {
     return method === 'permissions.list' || method === 'permissions.set';
+}
+function isMemoryMethod(method) {
+    return method === 'attention.snapshot';
+}
+/** Code for a result the Utility cannot vouch for; memory methods start nothing. */
+function failedResultCode(method) {
+    if (isPermissionMethod(method))
+        return 'permission_failed';
+    return isMemoryMethod(method) ? 'runtime_unavailable' : 'start_failed';
+}
+function isNonNegativeFinite(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+function isAttentionTab(value) {
+    if (!isRecord(value) ||
+        !hasOnlyKeys(value, ['sessionId', 'pluginId', 'tabId', 'state', 'hiddenAtMs']) ||
+        !isSafePluginId(value.sessionId) ||
+        !isSafePluginId(value.pluginId) ||
+        !Number.isSafeInteger(value.tabId) ||
+        value.tabId <= 0) {
+        return false;
+    }
+    if (value.state === 'visible')
+        return value.hiddenAtMs === undefined;
+    return ((value.state === 'hidden' || value.state === 'sleeping') &&
+        isNonNegativeFinite(value.hiddenAtMs));
+}
+function isAttentionSnapshot(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['tabs', 'atMs']) &&
+        typeof value.atMs === 'number' &&
+        Number.isFinite(value.atMs) &&
+        Array.isArray(value.tabs) &&
+        value.tabs.length <= MINIAPP_ATTENTION_MAX_TABS &&
+        value.tabs.every(isAttentionTab));
+}
+function copyAttentionTab(tab) {
+    return {
+        sessionId: tab.sessionId,
+        pluginId: tab.pluginId,
+        tabId: tab.tabId,
+        state: tab.state,
+        ...(tab.hiddenAtMs !== undefined ? { hiddenAtMs: tab.hiddenAtMs } : {}),
+    };
 }
 function isPermissionSetPayload(value) {
     return (isRecord(value) &&
@@ -1295,9 +1366,19 @@ function isMiniAppBrokerCancelMessage(value) {
 function isMiniAppSurfaceSummary(value) {
     if (!isRecord(value))
         return false;
-    if (!hasOnlyKeys(value, ['pluginId', 'displayName', 'description', 'iconUrl', 'runtime', 'update'])) {
+    if (!hasOnlyKeys(value, [
+        'pluginId',
+        'displayName',
+        'description',
+        'iconUrl',
+        'runtime',
+        'update',
+        'memory',
+    ])) {
         return false;
     }
+    if (value.memory !== undefined && !isMiniAppSurfaceMemory(value.memory))
+        return false;
     if (!isSafePluginId(value.pluginId))
         return false;
     if ((value.displayName !== undefined && !isSafeLabel(value.displayName)) ||
@@ -1321,6 +1402,20 @@ function isMiniAppSurfaceSummary(value) {
     if (value.update !== undefined && !isMiniAppSurfaceUpdate(value.update))
         return false;
     return value.runtime.errorCode === undefined || isSafeLabel(value.runtime.errorCode);
+}
+function isMiniAppSurfaceMemory(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['lastAttendedAtMs', 'protection']) &&
+        (value.lastAttendedAtMs === undefined || isNonNegativeFinite(value.lastAttendedAtMs)) &&
+        (value.protection === undefined || isMiniAppMemoryProtection(value.protection)));
+}
+function isMiniAppCapacity(value) {
+    return (isRecord(value) &&
+        hasOnlyKeys(value, ['limit', 'occupied']) &&
+        Number.isSafeInteger(value.limit) &&
+        value.limit > 0 &&
+        Number.isSafeInteger(value.occupied) &&
+        value.occupied >= 0);
 }
 function isMiniAppSurfaceUpdate(value) {
     if (!isRecord(value))
@@ -1371,6 +1466,9 @@ function isSafeMiniAppWindow(value) {
 function isMiniAppBrokerResult(value) {
     if (!isRecord(value))
         return false;
+    if ('acknowledged' in value) {
+        return hasOnlyKeys(value, ['acknowledged']) && value.acknowledged === true;
+    }
     if ('stopped' in value)
         return hasOnlyKeys(value, ['stopped']) && value.stopped === true;
     if ('running' in value)
@@ -1387,10 +1485,11 @@ function isMiniAppBrokerResult(value) {
             isSafeLoopbackToken(value.credential.loopbackToken));
     }
     if ('miniApps' in value) {
-        return (hasOnlyKeys(value, ['miniApps']) &&
+        return (hasOnlyKeys(value, ['miniApps', 'capacity']) &&
             Array.isArray(value.miniApps) &&
             value.miniApps.length <= 256 &&
-            value.miniApps.every(isMiniAppSurfaceSummary));
+            value.miniApps.every(isMiniAppSurfaceSummary) &&
+            (value.capacity === undefined || isMiniAppCapacity(value.capacity)));
     }
     return (hasOnlyKeys(value, ['miniApp', 'launch']) &&
         isMiniAppSurfaceSummary(value.miniApp) &&
@@ -1433,7 +1532,7 @@ function readBrokerResultMessage(value, method) {
         return readAgentSessionsResult(value.result);
     if (method === 'agent.session')
         return readAgentSessionResult(value.result);
-    if (isAgentPanelMethod(method)) {
+    if (isAgentPanelMethod(method) || method === 'attention.snapshot') {
         return isRecord(value.result) &&
             hasOnlyKeys(value.result, ['acknowledged']) &&
             value.result.acknowledged === true

@@ -93,4 +93,21 @@ export function readPtcNativeCatalog(tools) {
     }
     return undefined;
 }
+/**
+ * Whether this Session's current Turn can call TodoWrite only inside
+ * run_code. Registered once per Turn from the same object registration every
+ * other PTC consumer reads, because the Todo cadence reminder is a fixed
+ * before-LLM hook that never sees this Turn's tool objects. Overwritten on
+ * every Turn, so a Turn without PTC never inherits an earlier one's answer;
+ * one boolean per Session, replaced rather than accumulated.
+ */
+const childTodoWriteBySession = new Map();
+export function registerPtcTurnChildTodoWrite(sessionId, tools) {
+    const childTools = readPtcChildTools(tools);
+    childTodoWriteBySession.set(sessionId, childTools?.some((tool) => tool.def.name.toLowerCase() === 'todowrite') === true);
+}
+/** False for any Session that has not registered a Turn yet. */
+export function hasPtcTurnChildTodoWrite(sessionId) {
+    return childTodoWriteBySession.get(sessionId) === true;
+}
 //# sourceMappingURL=catalog.js.map

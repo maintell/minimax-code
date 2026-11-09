@@ -110,6 +110,7 @@ export function toModelInputView(model) {
     return {
         modelId: model.modelId,
         ...(model.displayName !== undefined ? { displayName: model.displayName } : {}),
+        ...(model.api !== undefined ? { api: model.api } : {}),
         ...(model.configurationSource !== undefined
             ? { configurationSource: model.configurationSource }
             : {}),

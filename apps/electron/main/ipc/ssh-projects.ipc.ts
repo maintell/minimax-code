@@ -2,6 +2,7 @@ import { powerMonitor, ipcMain } from "electron";
 import { IPC_CHANNELS } from "../config/constants";
 import { isDev } from "../config";
 import { bindUtilityRuntimeRendererWebContentsLifecycle } from "../modules/local-runtime/utility/renderer-lifecycle";
+import { registerRemoteSessionSshSource } from "../modules/local-runtime/utility/remote-session-broker";
 import { createPersistentSshProjectRepository } from "../modules/ssh-runtime/project-repository";
 import { SshAttachmentUploader } from "../modules/ssh-runtime/attachment-upload";
 import { ProjectRuntimeRegistry } from "../modules/ssh-runtime/project-runtime-registry";
@@ -106,6 +107,11 @@ export function setupSshProjectsIPC(options) {
     });
     ipcMain.handle(IPC_CHANNELS.PROJECT_RUNTIME_GET_STATUS, (_event, runtimeId) => registry.getStatus(runtimeId));
     const unregisterMediaRequestHandler = registerProjectRuntimeMediaRequestHandler((runtimeId, request) => registry.fetchMedia(runtimeId, request));
+    // The Runtime reads SSH sessions for the mavis tool through Main, read-only.
+    registerRemoteSessionSshSource({
+        listProjects: () => registry.listSessionProjects(),
+        readConnected: (runtimeId, request) => registry.readConnected(runtimeId, request),
+    });
     return {
         restoreEnabledHosts: () => registry.restoreEnabledHosts(),
         ensureHost: (alias, options) => registry.ensureHost(alias, options),
@@ -126,6 +132,7 @@ export function setupSshProjectsIPC(options) {
             ipcMain.removeListener(IPC_CHANNELS.PROJECT_RUNTIME_NETWORK_ONLINE, onOnline);
             ipcMain.removeListener(IPC_CHANNELS.PROJECT_RUNTIME_ACTIVE_PROJECT, onActiveProject);
             unregisterMediaRequestHandler();
+            registerRemoteSessionSshSource(undefined);
             await previewStaging.dispose();
             await registry.stop();
         },

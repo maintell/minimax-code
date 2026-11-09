@@ -2,11 +2,10 @@ const SWITCHED = 'ptc session mode switched';
 const SWITCH_FAILED = 'ptc session mode switch failed';
 const REFRESH_SKIPPED = 'ptc session mode refresh skipped';
 /**
- * Only a summary (`llm_checkpoint`) compaction replaces the earlier tool calls, so only after it
+ * A summary (`llm_checkpoint`) compaction replaces the earlier tool calls, so only after it
  * does every Session (conversation, Task child, Peek, channel, cron) adopt the current switch.
- * `tool_archive` and `tool_trim` replace tool results but keep the calls; switching there would
- * leave calls of the old catalog in the history, so the mode waits for the next summary
- * compaction or a new Session. A missing or unknown method keeps the mode too. The next Turn
+ * A missing or unknown method keeps the mode, so the mode waits for the next summary compaction
+ * or a new Session. The next Turn
  * assembles with the new mode; the running Turn keeps the catalog it was assembled with.
  * Best-effort: the compaction already succeeded and must not fail because of this; the next
  * summary compaction retries.

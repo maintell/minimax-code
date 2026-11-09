@@ -6,7 +6,7 @@ import { PluginSystemError, } from '../../service/plugin-system/index.js';
 export function createSessionMiniAppLifecycle(plugins, supervisor, sessions, options = {}) {
     if (!supervisor)
         return undefined;
-    const { surface, diagnostics } = options;
+    const { surface, diagnostics, memory } = options;
     const definition = async (pluginId) => {
         const miniApp = (await plugins.listAvailableMiniApps()).find((candidate) => candidate.pluginId === pluginId);
         if (miniApp)
@@ -24,6 +24,7 @@ export function createSessionMiniAppLifecycle(plugins, supervisor, sessions, opt
         const status = supervisor
             .inspect(miniApp.pluginId)
             .find(({ pluginId }) => pluginId === miniApp.pluginId);
+        const entry = memory?.view().entries.find(({ pluginId }) => pluginId === miniApp.pluginId);
         return {
             miniApp: summary(miniApp, status ? { ...status, failureCode: status.diagnostics?.failure?.code } : undefined),
             diagnostics: status?.diagnostics ?? {
@@ -31,6 +32,17 @@ export function createSessionMiniAppLifecycle(plugins, supervisor, sessions, opt
                 retention: 'runtime-memory',
                 logs: { entries: [], truncated: false, omittedCount: 0 },
             },
+            ...(entry
+                ? {
+                    memory: {
+                        ...(entry.lastAttendedAtMs !== undefined
+                            ? { lastAttendedAtMs: entry.lastAttendedAtMs }
+                            : {}),
+                        ...(entry.protection ? { protection: entry.protection } : {}),
+                        ...(entry.lastSleep ? { lastSleep: entry.lastSleep } : {}),
+                    },
+                }
+                : {}),
         };
     };
     const publishFromSession = async (context) => {
@@ -198,7 +210,7 @@ function definitionFromAccepted(miniApp) {
 function mapRuntimeStatus(phase) {
     if (phase === 'active')
         return 'running';
-    if (phase === 'starting' || phase === 'preparing')
+    if (phase === 'preparing')
         return 'starting';
     if (phase === 'failed' || phase === 'quarantined')
         return 'failed';
@@ -348,6 +360,7 @@ const PREPARATION_REASON_BY_HOST_CODE = {
     MINIAPP_HOST_CONNECTOR_ACCESS_INVALID: 'MINIAPP_CONNECTOR_ACCESS_INVALID',
     MINIAPP_AGENT_ACCESS_INVALID: 'MINIAPP_AGENT_ACCESS_INVALID',
     MINIAPP_AGENT_CONCURRENCY_INVALID: 'MINIAPP_AGENT_CONCURRENCY_INVALID',
+    MINIAPP_HOST_ACCESS_INVALID: 'MINIAPP_HOST_ACCESS_INVALID',
     MINIAPP_DEVICE_ACCESS_INVALID: 'MINIAPP_DEVICE_ACCESS_INVALID',
     MINIAPP_MANIFEST_FIELD_UNSUPPORTED: 'MINIAPP_MANIFEST_FIELD_UNSUPPORTED',
     MINIAPP_ENGINES_INVALID: 'MINIAPP_ENGINES_INVALID',

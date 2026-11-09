@@ -60,7 +60,7 @@ function acceptPluginAgent(context, candidate, diagnostics) {
     if (candidate.config.systemPrompt.includes(USER_CONFIG_REFERENCE)) {
         diagnostics.push(agentDiagnostic('AGENT_USER_CONFIG_UNSUPPORTED', candidate.agentPath));
     }
-    const { skills, extensionSkills, ...config } = candidate.config;
+    const { skills, ...config } = candidate.config;
     return Object.freeze({
         name: candidate.segments.join(':'),
         scopedName,
@@ -68,34 +68,22 @@ function acceptPluginAgent(context, candidate, diagnostics) {
         content: candidate.content,
         agentFilePath: candidate.agentFilePath,
         ...config,
-        ...pluginSkillSelectors(context, skills, extensionSkills),
+        ...pluginSkillPreloads(context, skills),
     });
 }
 /**
- * `skills` is an allowlist. A Plugin Skill is readable only when both
- * `skills` and `extensionSkills` admit its runtime name, so same-Plugin names
- * are rewritten to that runtime name in both lists.
+ * `skills` lists Skills to preload, in both source formats. A same-Plugin
+ * name is rewritten to its runtime name `<plugin>:<skill>` so the Skill reader
+ * finds it; other names stay as written.
  */
-function pluginSkillSelectors(context, skills, extensionSkills) {
-    if (skills === undefined) {
-        return extensionSkills === undefined ? {} : { extensionSkills };
-    }
+function pluginSkillPreloads(context, skills) {
+    if (skills === undefined)
+        return {};
     const packageSkills = new Map(context.skills.map((skill) => [skill.name.trim().toLowerCase(), skill.name]));
-    const selected = [];
-    const mapped = [...(extensionSkills ?? [])];
-    for (const name of skills) {
+    const names = skills.map((name) => {
         const packageSkill = packageSkills.get(name.trim().toLowerCase());
-        if (!packageSkill) {
-            selected.push(name);
-            continue;
-        }
-        const runtimeName = buildPluginSkillRuntimeName(context.pluginName, packageSkill);
-        selected.push(runtimeName);
-        mapped.push(runtimeName);
-    }
-    return {
-        skills: Object.freeze([...new Set(selected)]),
-        extensionSkills: Object.freeze([...new Set(mapped)]),
-    };
+        return packageSkill ? buildPluginSkillRuntimeName(context.pluginName, packageSkill) : name;
+    });
+    return { skills: Object.freeze([...new Set(names)]) };
 }
 //# sourceMappingURL=accept.js.map

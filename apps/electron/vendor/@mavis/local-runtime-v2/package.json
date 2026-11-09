@@ -35,6 +35,9 @@
     "./agent": {
       "import": "./dist/service/agent/public.js"
     },
+    "./ppt-preview-cli": {
+      "import": "./dist/service/ppt-preview/publication/ppt-preview-cli.js"
+    },
     "./diagnostics": {
       "import": "./dist/infra/diagnostics/index.js"
     },
@@ -95,11 +98,13 @@
       "src/infra/config/routing-headers.ts!",
       "src/infra/runtime-owner/index.ts!",
       "src/infra/legacy-db/workspace-indexing-types.ts!",
-      "src/service/turn-system/agent-host/runner/ptc/quickjs-worker.ts!"
+      "src/service/turn-system/agent-host/runner/ptc/quickjs-worker.ts!",
+      "src/service/model-access-extension/host-process/shim/host-entry.ts!"
     ],
     "project": [
       "src/**/*.ts!",
-      "!src/**/*.test.ts!"
+      "!src/**/*.test.ts!",
+      "!src/**/*.test-support.ts!"
     ]
   },
   "dependencies": {
@@ -114,19 +119,20 @@
     "@mavis/goal": "file:../goal",
     "@minimax/mcode-sandbox-runtime": "file:../../@minimax/mcode-sandbox-runtime",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@napi-rs/keyring": "2.1.1",
     "@sinclair/typebox": "^0.34.0",
     "better-sqlite3": "file:../../better-sqlite3",
     "bmp-js": "0.1.0",
     "croner": "^9",
     "diff": "^8.0.4",
     "drizzle-orm": "^0.45.2",
+    "es-module-lexer": "1.7.0",
     "gpt-tokenizer": "3.4.0",
     "handlebars": "^4.7.9",
     "hono": "^4.7.11",
     "jpeg-js": "0.4.4",
     "js-yaml": "^4",
     "jszip": "file:../../jszip",
-    "lazystream": "^1.0.1",
     "pngjs": "6.0.0",
     "proper-lockfile": "^4",
     "quickjs-emscripten": "0.31.0",

@@ -1,0 +1,223 @@
+diff --git a/matrix/api_common/model_access_desktop.thrift b/matrix/api_common/model_access_desktop.thrift
+index b7e997d39..cc07f6934 100644
+--- a/matrix/api_common/model_access_desktop.thrift
++++ b/matrix/api_common/model_access_desktop.thrift
+@@ -56,9 +56,39 @@ struct ModelAccessInstallationInfo {
+     10: optional string version
+     11: optional list<ModelAccessManifestProvider> providers
+     12: optional list<ModelAccessSourceInfo> sources
+-    // 信任来源：official（官方远端下发）| dev-import（开发模式本地导入）| bundled（旧版本随 app
++    // 信任来源：official（官方远端下发）| user-import（用户导入的文件夹/zip）| dev-session
++    // （开发会话中的包）| dev-import（开发构建导入的官方包测试副本，受官方规则约束）| bundled（旧版本随 app
+     // 发布、远端尚未替换的存量安装）；未知值按不可信处理。客户端不再内置扩展包。
+     13: optional string trust_source
++    // 来源分组：official | user | dev。官方 catalog 规则、文案和图标只作用于 official；
++    // user/dev 包与官方包可声明同名 provider，按 installation 区分。
++    14: optional string origin
++    // 包自带展示信息（仅 user/dev 包）；缺失时 UI 回退内置 logo 与默认图标。
++    15: optional list<ModelAccessPackagePresentation> presentation
++}
++
++// 用户包 manifest 自带的 provider/source 展示信息。图标是 runtime 校验过的本地快照路径。
++struct ModelAccessPackagePresentation {
++    // provider | source
++    1: required string kind
++    2: required string id
++    3: optional ModelAccessLocalizedText display_name
++    4: optional string icon_path
++    5: optional string dark_icon_path
++}
++
++// 开发会话：用户同意在本次会话内运行该真实路径下的包；每次 reload 重新快照该路径。
++// 会话仅存于内存，App 重启后结束，残留包在下次启动时移除。
++struct ModelAccessDevSession {
++    1: required string session_id
++    2: required string path
++    3: required string installation_id
++    4: required string name
++    5: required string digest
++    6: required i64 started_at
++    7: optional i64 reloaded_at
++    // 最近一次加载失败的安全错误码（未失败为空）。
++    8: optional string error_code
+ }
+ 
+ struct ModelAccessGlobals {
+@@ -89,11 +119,15 @@ struct ModelAccessRemoteCapabilityRule {
+     2: optional string source_id
+     // 入口规则：<capability>/<entryId>/<target>，例如 login/browser/cn。缺省表示整类能力。
+     3: optional string entry_key
++    // catalog v2 包级规则：只作用于该官方包的安装；缺省表示所有官方包。
++    4: optional string package_name
+ }
+ 
+ // 远端停用的厂商（catalog providerPolicy）。直接隐藏；新请求被拒，进行中的请求可完成，凭据保留。
+ struct ModelAccessRemoteProviderRule {
+     1: required string provider_id
++    // catalog v2 包级规则：只作用于该官方包的安装；缺省表示所有官方包。
++    2: optional string package_name
+ }
+ 
+ // 远端下发的入口展示信息（catalog presentation.sources.<id>.entries）。
+@@ -156,6 +190,25 @@ struct ModelAccessSnapshot {
+     5: optional bool subscriptions_enabled
+     // 官方远端下发状态。
+     6: optional ModelAccessRemoteState remote
++    // 当前开发会话。
++    7: optional list<ModelAccessDevSession> dev_sessions
++    // Agent 发起、等待用户批准的开发会话请求；批准前不运行任何扩展代码。
++    8: optional list<ModelAccessDevRequest> dev_requests
++}
++
++struct ModelAccessDevRequest {
++    1: required string request_id
++    2: required string path
++    3: required string name
++    4: required string digest
++    5: required i64 requested_at
++    // 发起请求的会话；会话内的确认卡片只展示本会话的请求。
++    6: optional string session_id
++    // run：以开发模式运行；keep：把当前开发内容保留为用户包。缺省按 run。
++    7: optional string kind
++    8: optional string version
++    // 同名用户包已存在：run 时开发版临时接管它，keep 时原地更新它（账号与模型配置保留）。
++    9: optional bool replaces_kept
+ }
+ 
+ struct ListModelAccessReq {
+@@ -167,9 +220,17 @@ struct ListModelAccessResp {
+     255: optional base_rpc.BaseResp base_resp
+ }
+ 
++// 用户包来源：kind 为 dir（本地文件夹）或 zip（本地压缩包），path 为绝对路径。
++struct ModelAccessPackageSource {
++    1: required string kind
++    2: required string path
++}
++
+ // 预览不导入代码、不执行扩展；只返回内容摘要和声明的能力。
++// source_ref 优先；只给 source 时按路径推断（.zip 为压缩包，否则为文件夹）。
+ struct PreviewModelAccessPackageReq {
+     1: required string source (api.body="source")
++    2: optional ModelAccessPackageSource source_ref (api.body="source_ref")
+     255: optional base_rpc.BaseReq base_req (api.none="")
+ }
+ 
+@@ -186,13 +247,90 @@ struct PreviewModelAccessPackageResp {
+ }
+ 
+ // 信任是对确切内容摘要的同意；摘要变化时拒绝导入。新增能力不默认开启。
++// 安装为用户包（user 分组），启用后运行于用户分组进程；@mavis/* 名称保留给官方包。
+ struct ImportModelAccessPackageReq {
+     1: required string source (api.body="source")
+     2: required string expected_digest (api.body="expected_digest")
+     3: required bool trust_native_code (api.body="trust_native_code")
++    4: optional ModelAccessPackageSource source_ref (api.body="source_ref")
++    255: optional base_rpc.BaseReq base_req (api.none="")
++}
++
++// 开始开发会话：trust_native_code 表示用户同意在本次会话内运行 path 下的包。
++struct StartModelAccessDevSessionReq {
++    1: required string path (api.body="path")
++    2: required bool trust_native_code (api.body="trust_native_code")
++    255: optional base_rpc.BaseReq base_req (api.none="")
++}
++
++// 批准 Agent 的开发请求（trust_native_code 必须为 true）：run 请求开始该路径的开发会话，keep
++// 请求把该路径的开发会话保留为用户包。expected_digest 为用户看到的摘要，内容变化时拒绝。
++struct ApproveModelAccessDevRequestReq {
++    1: required string request_id (api.body="request_id")
++    2: required string expected_digest (api.body="expected_digest")
++    3: required bool trust_native_code (api.body="trust_native_code")
++    255: optional base_rpc.BaseReq base_req (api.none="")
++}
++
++struct DismissModelAccessDevRequestReq {
++    1: required string request_id (api.body="request_id")
++    255: optional base_rpc.BaseReq base_req (api.none="")
++}
++
++struct ModelAccessDevSessionReq {
++    1: required string session_id (api.body="session_id")
++    255: optional base_rpc.BaseReq base_req (api.none="")
++}
++
++struct ModelAccessDevSessionResp {
++    1: required ModelAccessDevSession session
++    2: required ModelAccessSnapshot snapshot
++    255: optional base_rpc.BaseResp base_resp
++}
++
++// 转正：用户同意当前开发内容（expected_digest）作为用户包长期运行。
++struct PromoteModelAccessDevSessionReq {
++    1: required string session_id (api.body="session_id")
++    2: required string expected_digest (api.body="expected_digest")
++    3: required bool trust_native_code (api.body="trust_native_code")
++    255: optional base_rpc.BaseReq base_req (api.none="")
++}
++
++// 只读诊断：加载状态与 provider/登录方式，不含凭据、token 或扩展日志原文。
++struct GetModelAccessExtensionStatusReq {
++    1: required string installation_id (api.body="installation_id")
+     255: optional base_rpc.BaseReq base_req (api.none="")
+ }
+ 
++struct ModelAccessExtensionProbe {
++    1: required string provider_id
++    2: required list<string> methods
++    // 公共 provider 可列出的模型 id；需要登录的 provider 为空。
++    3: optional list<string> models
++    4: optional string error_code
++}
++
++struct GetModelAccessExtensionStatusResp {
++    1: required ModelAccessInstallationInfo installation
++    2: required list<ModelAccessExtensionProbe> providers
++    // official | user | dev 分组进程是否在运行。
++    3: optional bool host_running
++    255: optional base_rpc.BaseResp base_resp
++}
++
++// 导出用户/开发包当前运行内容为 zip；再次导入得到相同摘要。target 为绝对路径且以 .zip 结尾。
++struct ExportModelAccessPackageReq {
++    1: required string installation_id (api.body="installation_id")
++    2: required string target (api.body="target")
++    255: optional base_rpc.BaseReq base_req (api.none="")
++}
++
++struct ExportModelAccessPackageResp {
++    1: required string path
++    2: required string digest
++    255: optional base_rpc.BaseResp base_resp
++}
++
+ struct ModelAccessInstallationReq {
+     1: required string installation_id (api.body="installation_id")
+     255: optional base_rpc.BaseReq base_req (api.none="")
+diff --git a/matrix/desktop_service/desktop_service.thrift b/matrix/desktop_service/desktop_service.thrift
+index 97c6f631d..62406ec21 100644
+--- a/matrix/desktop_service/desktop_service.thrift
++++ b/matrix/desktop_service/desktop_service.thrift
+@@ -64,6 +64,22 @@ service DesktopService {
+         (api.post="/minimax-desktop/api/v1/model-access/packages/rollback", api.domain="model_access")
+     model_access_desktop.ModelAccessSnapshotResp UninstallModelAccessPackage(1: model_access_desktop.ModelAccessInstallationReq req)
+         (api.post="/minimax-desktop/api/v1/model-access/packages/uninstall", api.domain="model_access")
++    model_access_desktop.ModelAccessDevSessionResp StartModelAccessDevSession(1: model_access_desktop.StartModelAccessDevSessionReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/dev-sessions/start", api.domain="model_access")
++    model_access_desktop.ModelAccessDevSessionResp ApproveModelAccessDevRequest(1: model_access_desktop.ApproveModelAccessDevRequestReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/dev-requests/approve", api.domain="model_access")
++    model_access_desktop.ModelAccessSnapshotResp DismissModelAccessDevRequest(1: model_access_desktop.DismissModelAccessDevRequestReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/dev-requests/dismiss", api.domain="model_access")
++    model_access_desktop.ModelAccessDevSessionResp ReloadModelAccessDevSession(1: model_access_desktop.ModelAccessDevSessionReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/dev-sessions/reload", api.domain="model_access")
++    model_access_desktop.ModelAccessSnapshotResp StopModelAccessDevSession(1: model_access_desktop.ModelAccessDevSessionReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/dev-sessions/stop", api.domain="model_access")
++    model_access_desktop.ModelAccessSnapshotResp PromoteModelAccessDevSession(1: model_access_desktop.PromoteModelAccessDevSessionReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/dev-sessions/promote", api.domain="model_access")
++    model_access_desktop.GetModelAccessExtensionStatusResp GetModelAccessExtensionStatus(1: model_access_desktop.GetModelAccessExtensionStatusReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/packages/status", api.domain="model_access")
++    model_access_desktop.ExportModelAccessPackageResp ExportModelAccessPackage(1: model_access_desktop.ExportModelAccessPackageReq req)
++        (api.post="/minimax-desktop/api/v1/model-access/packages/export", api.domain="model_access")
+     model_access_desktop.ModelAccessSnapshotResp SetModelAccessGlobal(1: model_access_desktop.SetModelAccessGlobalReq req)
+         (api.post="/minimax-desktop/api/v1/model-access/policy/global", api.domain="model_access")
+     model_access_desktop.ModelAccessSnapshotResp SetModelAccessTarget(1: model_access_desktop.SetModelAccessTargetReq req)

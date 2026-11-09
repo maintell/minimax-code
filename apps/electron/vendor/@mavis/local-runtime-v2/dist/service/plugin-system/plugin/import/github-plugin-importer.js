@@ -2,6 +2,7 @@ import { hasSupportedCapability, readImportedPluginPackage } from '../package/pa
 import { PluginPackageContractError } from '../package/package-contract.js';
 import { PluginReaderError } from '../package/reader-errors.js';
 import { PluginSystemError } from '../../errors.js';
+import { readPluginReadmePreview } from '../package/miniapp/readme.js';
 import { downloadGithubPlugin, cloneGitRepositoryPlugin, } from './github-archive.js';
 import { resolveGitRepositorySource, validateGithubPluginSource, validateGitRepositorySource, isGithubRepositoryUrl, } from './github-source.js';
 export class GithubPluginImporter {
@@ -9,7 +10,7 @@ export class GithubPluginImporter {
     constructor(options) {
         this.options = options;
     }
-    async preview(url, signal) {
+    async preview(url, signal, readmeLocale) {
         try {
             const source = await resolveGitRepositorySource(url, {
                 fetchImpl: this.options.fetchImpl,
@@ -17,7 +18,11 @@ export class GithubPluginImporter {
             });
             const extracted = await this.download(source, signal);
             try {
-                return await this.readPreview(source, extracted);
+                const preview = await this.readPreview(source, extracted);
+                const readme = preview.plugin.miniapp
+                    ? await readPluginReadmePreview(preview.plugin.rootPath, readmeLocale)
+                    : undefined;
+                return { ...preview, ...(readme ? { readme } : {}) };
             }
             finally {
                 await extracted.discard();

@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import fs, { existsSync, readFileSync } from 'node:fs';
+import fs, { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import yaml from 'js-yaml';
 import lockfile from 'proper-lockfile';
@@ -88,8 +88,8 @@ class LocalModelProviderConfigWriteError extends Error {
  * Lock-protected write path for the secret-bearing BYOK trees. The generic
  * config update API deliberately cannot reach these roots.
  */
-export async function updateLocalByokConfig(mutate) {
-    return withLockedConfig(async (raw, currentConfig) => {
+export async function updateLocalByokConfig(mutate, beforeCommit) {
+    const { config } = await withLockedConfig(async (raw, currentConfig) => {
         const draft = {
             minimax_api: isPlainRecord(raw.minimax_api) ? raw.minimax_api : undefined,
             custom_provider: withoutEmptyEntries(isPlainRecord(raw.custom_provider) ? raw.custom_provider : undefined),
@@ -120,7 +120,8 @@ export async function updateLocalByokConfig(mutate) {
         setOptionalString(raw, 'defaultModel', draft.defaultModel);
         setOptionalString(raw, 'defaultModelVariant', draft.defaultModelVariant);
         return { write: true, value: undefined };
-    }).then(({ config }) => ({ config }));
+    }, beforeCommit);
+    return { config };
 }
 /** Atomically persist the default model and its optional variant. */
 export async function updateLocalModelSelection(input) {
@@ -183,7 +184,7 @@ export async function compareAndSetLocalModelContext(input, beforeCommit) {
     });
     return { config: outcome.config, updated: outcome.value };
 }
-async function withLockedConfig(operation) {
+async function withLockedConfig(operation, beforeCommit) {
     const configPath = getConfigPath();
     let release;
     try {
@@ -200,7 +201,7 @@ async function withLockedConfig(operation) {
         const outcome = await operation(previous, getConfig());
         if (outcome.write) {
             assertSafeConfigRecord(previous);
-            await atomicWriteFile(configPath, serializeConfigPreservingComments(readFileSync(configPath, 'utf-8'), previousRaw, previous));
+            await atomicWriteFile(configPath, serializeConfigPreservingComments(readFileSync(configPath, 'utf-8'), previousRaw, previous), beforeCommit);
             resetConfig();
         }
         return { config: getConfig(), value: outcome.value };
@@ -216,7 +217,7 @@ async function withLockedConfig(operation) {
         await release?.().catch(() => undefined);
     }
 }
-async function atomicWriteFile(filePath, content) {
+async function atomicWriteFile(filePath, content, beforeCommit) {
     const tmpPath = join(dirname(filePath), `.config-tmp-${randomBytes(6).toString('hex')}`);
     let created = false;
     try {
@@ -230,6 +231,8 @@ async function atomicWriteFile(filePath, content) {
         finally {
             await temporary.close();
         }
+        // Last synchronous admission before dispatching the atomic pointer replacement.
+        beforeCommit?.();
         await fs.promises.rename(tmpPath, filePath);
     }
     catch {

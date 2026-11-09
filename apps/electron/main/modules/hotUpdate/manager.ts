@@ -8,7 +8,7 @@
  *    pending → active、未确认健康的 active 回滚、清理旧版本目录。
  * 2. 首屏可见（first_content_visible）后确认 active 健康，并延迟开始检查更新。
  * 3. 检查：拉取 `{cdnRoot}/{channel}/{appVersion}/manifest.json`，验签并校验通道、语言、
- *    appVersion、壳指纹；下载 → 校验 size/sha256 → 解压到 staging → rename 到 versions/<version>
+ *    appVersion、壳指纹（test 额外按分支隔离路径与签名）；下载 → 校验 size/sha256 → 解压到 staging → rename 到 versions/<version>
  *    → 标记 pending，下次启动生效。
  * 4. 整包更新已下载待安装时跳过热更新。
  */
@@ -20,6 +20,7 @@ import { app } from "electron";
 import { getIsEn } from "../../utils";
 import { getCategoryLogger } from "../../utils/logger";
 import { hasUpdateReady } from "../updater/state";
+import { getTestBuildInfo } from "../updater/test-branch";
 import { enqueueElectronObservabilityEvent } from "../observability/outbox";
 import { HOT_UPDATE_CHANNEL, HOT_UPDATE_SIGNING_PUBLIC_KEYS, HOT_UPDATE_LOCALE, MAX_UNCONFIRMED_BOOTS, FIRST_CHECK_DELAY_AFTER_VISIBLE_MS, CHECK_INTERVAL, HOT_UPDATE_CDN_ROOT, MANIFEST_FILENAME, VERSION_COMPLETE_MARKER, FIRST_CHECK_FALLBACK_DELAY_MS } from "./config";
 import { resolveBootRenderer, isVersionInstalled, confirmBootHealthy, DOWNLOADS_DIRNAME, STAGING_DIRNAME, getVersionDir } from "./boot";
@@ -76,6 +77,9 @@ export class HotUpdateManager {
         }
         return this.shellFingerprint;
     }
+    getBranchKey() {
+        return HOT_UPDATE_CHANNEL === 'test' ? (getTestBuildInfo()?.branchKey ?? null) : null;
+    }
     /** 该构建是否具备热更新能力（通道、签名公钥、壳指纹齐全） */
     isSupported() {
         return (HOT_UPDATE_CHANNEL !== null &&
@@ -107,6 +111,7 @@ export class HotUpdateManager {
                     bundledRoot,
                     channel: HOT_UPDATE_CHANNEL,
                     locale: HOT_UPDATE_LOCALE,
+                    branchKey: this.getBranchKey(),
                     baseAppVersion: getBaseAppVersion(),
                     shellFingerprint: this.getShellFingerprint(),
                     maxUnconfirmedBoots: MAX_UNCONFIRMED_BOOTS,
@@ -142,7 +147,10 @@ export class HotUpdateManager {
         return this.isDownloading;
     }
     getPendingVersion() {
-        const pending = readState(getHotUpdateDir()).pending;
+        const state = readState(getHotUpdateDir());
+        if (state.branchKey !== this.getBranchKey())
+            return null;
+        const pending = state.pending;
         return pending && isVersionInstalled(getHotUpdateDir(), pending) ? pending : null;
     }
     hasPendingRestart() {
@@ -213,7 +221,9 @@ export class HotUpdateManager {
         this.emitStatus({ type: 'checking' });
         try {
             const baseAppVersion = getBaseAppVersion();
-            const manifestUrl = `${HOT_UPDATE_CDN_ROOT}/${HOT_UPDATE_CHANNEL}/${baseAppVersion}/${MANIFEST_FILENAME}`;
+            const branchKey = this.getBranchKey();
+            const branchPath = branchKey ? `branches/${branchKey}/` : '';
+            const manifestUrl = `${HOT_UPDATE_CDN_ROOT}/${HOT_UPDATE_CHANNEL}/${branchPath}${baseAppVersion}/${MANIFEST_FILENAME}`;
             logger.info(`[HotUpdate] Fetching manifest: ${manifestUrl}`);
             const raw = await fetchText(manifestUrl);
             updateState(hotUpdateDir, (state) => {
@@ -227,6 +237,7 @@ export class HotUpdateManager {
             const validation = validateManifest(raw, {
                 channel: HOT_UPDATE_CHANNEL,
                 locale: HOT_UPDATE_LOCALE,
+                branchKey: this.getBranchKey(),
                 baseAppVersion,
                 shellFingerprint: this.getShellFingerprint(),
                 publicKeys: HOT_UPDATE_SIGNING_PUBLIC_KEYS,

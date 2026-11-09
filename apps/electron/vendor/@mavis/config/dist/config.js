@@ -1,5 +1,7 @@
 import { MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID, MINIMAX_MODELS } from './minimax-model-catalog.js';
 import fs from 'node:fs';
+import { configFileSignature } from './config-file-signature.js';
+import { parseNotificationsConfig, parseStartupRecoveryFault } from './config-section-parsers.js';
 import { restrictConfigFileSync, writePrivateConfigFileSync } from './private-config-file.js';
 import { parseConfigText, serializeConfigPreservingComments, } from './comment-preserving-config-write.js';
 import { resolveRunawayGuardConfig } from './runaway-guard-config.js';
@@ -193,6 +195,7 @@ export const BETA_FEATURE_DEFS = {
         configurableVisibility: 'online',
     },
     pluginMarketplaces: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
+    modelAccess: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
 };
 assertBetaFeatureDefinitions(BETA_FEATURE_DEFS);
 function getBetaFeatureChannel(context) {
@@ -806,23 +809,6 @@ function readConfigFileText(configPath = getConfigPath()) {
     }
 }
 let _cached = null;
-function parseStartupRecoveryFault(raw) {
-    if (!raw || typeof raw !== 'object')
-        return {};
-    const step = Reflect.get(raw, 'step');
-    const mode = Reflect.get(raw, 'mode');
-    if (typeof step !== 'string' || (mode !== 'hang' && mode !== 'fail'))
-        return {};
-    return { startupRecoveryFault: { step, mode } };
-}
-function parseNotificationsConfig(raw) {
-    if (raw == null || typeof raw !== 'object' || Array.isArray(raw))
-        return undefined;
-    const obj = raw;
-    return {
-        branchFinish: typeof obj.branchFinish === 'boolean' ? obj.branchFinish : false,
-    };
-}
 // ── BYOK config parsing + required provider overrides: see ./byok-config.ts ──
 const REQUIRED_PROVIDER_OVERRIDE_DEPS = {
     isManagedRuntime,
@@ -851,12 +837,20 @@ export function prepareConfigFileForRead(configPath) {
 export function resetConfig() {
     _cached = null;
 }
+let cachedConfigSignature;
 export function getConfig() {
-    if (_cached)
+    const signature = configFileSignature(getConfigPath());
+    if (_cached && signature === cachedConfigSignature)
         return _cached;
+    _cached = null;
     ensureConfigFile();
-    const raw = readConfigFile();
-    _cached = resolveConfigFromRaw(raw, getDataDir());
+    // The signature is taken before the content (as Magpie's filememo stats before it reads): a
+    // write by another runtime landing between the two pairs the old signature with whatever was
+    // read, and the next call reads again. The other order could pair new content's signature
+    // with old content and keep it until the file changed again.
+    const readSignature = configFileSignature(getConfigPath());
+    _cached = resolveConfigFromRaw(readConfigFile(), getDataDir());
+    cachedConfigSignature = readSignature;
     return _cached;
 }
 export function resolveConfigFromRaw(raw, dataDir) {

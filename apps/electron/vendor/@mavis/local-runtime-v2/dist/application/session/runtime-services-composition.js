@@ -1,4 +1,4 @@
-import { createMiniAppControlExtension } from '@mavis/agent-extension';
+import { createMiniAppControlExtension, createPptPreviewExtension, } from '@mavis/agent-extension';
 import { prepareBackgroundTasks, } from './background-task-composition.js';
 import { createRuntimeCronSessionPorts, initializeCronService, } from '../../service/cron/index.js';
 import { composeTurnAdmissionPolicies, createDesktopSubagentConcurrency, } from '../../service/turn-system/index.js';
@@ -14,10 +14,19 @@ import { initializeRuntimeWorkspaceServices, WorkspaceIndexingPolicy, } from '..
 import { createProductionSessionComposition, } from './runtime-session-composition.js';
 import { createHostSessionMiniAppLifecycle } from './miniapp-host.js';
 import { createMemoryRecallAdmissionPolicy } from './memory-recall-admission.js';
+import { isPptPreviewPluginSkillEffective } from './ppt-preview-plugin-gate.js';
 export function createRuntimeNormalExtensions(input) {
     const miniAppLifecycle = createHostSessionMiniAppLifecycle(input.miniApp);
-    // Office edits use source files; the workspace owns draft conflicts and refresh.
-    return miniAppLifecycle ? [createMiniAppControlExtension(miniAppLifecycle)] : [];
+    return [
+        ...(input.pptPreview
+            ? [
+                createPptPreviewExtension(input.pptPreview, {
+                    isAvailable: isPptPreviewPluginSkillEffective,
+                }),
+            ]
+            : []),
+        ...(miniAppLifecycle ? [createMiniAppControlExtension(miniAppLifecycle)] : []),
+    ];
 }
 export function initializeRuntimeCron(input) {
     if (!input.options.scheduler) {

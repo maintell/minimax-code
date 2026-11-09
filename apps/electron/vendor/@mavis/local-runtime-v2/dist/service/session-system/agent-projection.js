@@ -227,6 +227,7 @@ async function projectCommittedConversation(options, input) {
         : latest, undefined);
     const lastUserMsgId = lastUser?.msg_id;
     const retractedInput = describeRetractedInput(lastUser);
+    const variant = input.change.operation.variant ?? 'content';
     await options.messages.rewind({
         sessionId: input.context.sessionId,
         messageIds,
@@ -236,13 +237,13 @@ async function projectCommittedConversation(options, input) {
         sessionId: input.context.sessionId,
         turnId: input.context.turnId,
         kind: 'messages-rewound',
-        data: { messageIds },
+        data: { messageIds, variant },
     });
     await options.conversationFacts.handle({
         kind: 'turn-retracted',
         sessionId: input.context.sessionId,
         turnId: input.context.turnId,
-        variant: input.change.operation.variant ?? 'content',
+        variant,
         ...(lastUserMsgId ? { lastUserMsgId } : {}),
         // 界面收到撤回时这些消息行已经删了；还没加载这一轮的界面（比如从首页发起的目标）
         // 只能用 `lastUserContent` 回填输入框。
@@ -366,10 +367,7 @@ function terminalCompactionOutcome(input) {
 function readCompactionMethod(value) {
     if (!isRecord(value))
         return undefined;
-    const method = value.method;
-    return method === 'tool_archive' || method === 'tool_trim' || method === 'llm_checkpoint'
-        ? method
-        : undefined;
+    return value.method === 'llm_checkpoint' ? 'llm_checkpoint' : undefined;
 }
 function readCompactionMetricMetadata(value) {
     if (!isRecord(value))
@@ -388,7 +386,7 @@ function readCompactionMetricMetadata(value) {
             method,
             ...counts,
             ...compactionTokenUsageMetadata(tokenUsage),
-            hmidOverflowRecovered: method === 'llm_checkpoint' && Reflect.get(value, 'hmidOverflowRecovered') === true,
+            hmidOverflowRecovered: Reflect.get(value, 'hmidOverflowRecovered') === true,
         }
         : undefined;
 }

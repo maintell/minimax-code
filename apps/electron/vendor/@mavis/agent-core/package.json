@@ -60,6 +60,7 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
+    "mediabunny": "1.64.0",
     "typebox": "1.1.38",
     "zod": "^3"
   }

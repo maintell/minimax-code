@@ -3,11 +3,11 @@ import { isLegacyMemoryRecallEnabled, isMemoryV2Enabled } from '@mavis/config';
 import { isPromptSnapshotInvalidError, PromptSnapshotInvalidError, } from '@mavis/agent-runtime';
 import { DEFAULT_RETRY_CONTINUATION_PROMPT, readOutputRevisionInstruction, RETRY_CONTINUATION_PROMPT_KEY, } from './prompt-templates.js';
 import { resolveAgentCapabilities } from '@mavis/config';
-import { isLegacyMinimaxProvider, modelConfigForRef, modelRefForModel, savedSessionModel, } from '../../../../model-system/index.js';
+import { isLegacyMinimaxProvider, modelConfigForRef, modelRefForModel, savedSessionModel, withNativeAudioPdfCapabilities, } from '../../../../model-system/index.js';
 import { INSTRUCTIONS_CONTEXT_PREAMBLE } from '../prompt-blocks.js';
 import { createLocalStaticPromptReader, } from '../static-prompt-reader.js';
 import { resolveTurnModelSelection, turnModelParameters, } from './session-model-selection.js';
-import { addRuntimeRules } from './runtime-prompt-rules.js';
+import { addRuntimeRules, runtimeFeatureScope } from './runtime-prompt-rules.js';
 import { AdditionalWorkspaceRootsBinding, environmentContextBlock, } from './environment-prompt-composer.js';
 import { collectMemoryBlocks, toMemoryPromptSources, } from './memory-prompt-composer.js';
 /** Builds one AgentConfig solely from validated Agent/Session facts and narrow capabilities. */
@@ -237,7 +237,10 @@ function ptcRequestedField(runtimeFacts) {
 }
 async function loadPromptLayers(parameters) {
     const { input, config, runtimeFacts, options, staticPrompts, nowMs, modelContextWindow, profile, } = parameters;
-    const executionScope = createExecutionScope(input.session, runtimeFacts, profile, options.miniappAvailable === true);
+    const executionScope = createExecutionScope(input.session, runtimeFacts, profile, {
+        miniappAvailable: options.miniappAvailable === true,
+        pptPreviewAvailable: options.pptPreviewAvailable === true,
+    });
     const capabilityOptions = createPromptCapabilityOptions(input.agent, runtimeFacts, profile);
     const memoryBlocks = loadMemoryBlocks({
         session: input.session,
@@ -260,15 +263,13 @@ async function loadPromptLayers(parameters) {
         options.skills.listRuntimeSkills(executionScope),
     ]);
     const [{ basePrompt, sessionPrompt }, projectInstructions, globalInstructions, memory, skills] = loaded;
-    const filteredRuntimeSkills = skills.skills.filter((skill) => isRuntimeSkillSelected(profile?.configSelection, skill));
-    const standaloneNames = new Set(filteredRuntimeSkills.map((skill) => normalizedSkillName(skill.name)));
+    // The Agent's `skills` preloads Skills and does not limit them: the catalog
+    // lists every ready Skill (README "Desktop Local Agent 定义").
+    const standaloneNames = new Set(skills.skills.map((skill) => normalizedSkillName(skill.name)));
     const hideCodeReviewSkill = suppressesCodeReviewSkill(input.session);
-    const allowedExtensionSkills = profile?.configSelection?.extensionSkills;
     const desktopSkills = (input.desktopCapabilities?.skills ?? []).filter((skill) => {
         const name = normalizedSkillName(skill.name);
-        return (!(hideCodeReviewSkill && name === CODE_REVIEW_SKILL_NAME) &&
-            !standaloneNames.has(name) &&
-            isExtensionSkillSelected(allowedExtensionSkills, skill.pluginName, skill.name));
+        return !(hideCodeReviewSkill && name === CODE_REVIEW_SKILL_NAME) && !standaloneNames.has(name);
     });
     const catalog = await options.skills.renderCatalog({
         ...executionScope,
@@ -286,7 +287,7 @@ async function loadPromptLayers(parameters) {
         projectInstructions,
         globalInstructions,
         memoryBlocks: memory,
-        skills: { ...skills, skills: filteredRuntimeSkills },
+        skills,
         catalog,
         desktopPluginSkills: desktopSkills.map((skill) => ({
             pluginName: skill.pluginName,
@@ -294,14 +295,14 @@ async function loadPromptLayers(parameters) {
         })),
     };
 }
-function createExecutionScope(session, runtimeFacts, profile, miniappAvailable) {
+function createExecutionScope(session, runtimeFacts, profile, hostFeatures) {
     return {
         agentName: profile?.resourceReadRef ?? runtimeFacts.resourceAgentName,
         ...profileResourceScope(profile),
         workspaceDir: session.workspaceDir,
         ...builtinSkillScope(session, runtimeFacts),
         ...profileSelectionScope(profile),
-        ...runtimeFeatureScope(runtimeFacts, profile, miniappAvailable),
+        ...runtimeFeatureScope(runtimeFacts, profile, hostFeatures),
     };
 }
 function profileResourceScope(profile) {
@@ -324,12 +325,6 @@ function builtinSkillNamesFor(session, runtimeFacts) {
 }
 function profileSelectionScope(profile) {
     return {
-        ...(profile?.configSelection?.skills === undefined
-            ? {}
-            : { allowedSkillNames: profile.configSelection.skills }),
-        ...(profile?.configSelection?.extensionSkills === undefined
-            ? {}
-            : { allowedExtensionSkillNames: profile.configSelection.extensionSkills }),
         ...(profile
             ? {
                 agentPolicy: {
@@ -339,14 +334,6 @@ function profileSelectionScope(profile) {
                 },
             }
             : {}),
-    };
-}
-function runtimeFeatureScope(runtimeFacts, profile, miniappAvailable) {
-    return {
-        ...(runtimeFacts.exposeComputerUseActive
-            ? { computerUseActive: runtimeFacts.computerUseActive }
-            : {}),
-        ...(miniappAvailable && profile?.surface === 'interactive' ? { miniappAvailable: true } : {}),
     };
 }
 function createPromptCapabilityOptions(agent, runtimeFacts, profile) {
@@ -597,7 +584,7 @@ export function modelRefFromConfig(config, override, options = {}) {
 function modelRefForSelection(config, selection, implicitCustomProviderThinking = false, legacyFrozenSelection = false) {
     const model = modelRefForModel(selection.providerId, selection.modelId, modelConfigForRef(config, selection.providerId, selection.modelId), modelRefOptions(config, selection, implicitCustomProviderThinking, legacyFrozenSelection));
     return {
-        ...model,
+        ...withNativeAudioPdfCapabilities(model, config, selection.providerId, selection.modelId),
         ...(selection.contextLimit !== undefined ? { context_window: selection.contextLimit } : {}),
         ...(selection.maxOutputTokens !== undefined ? { max_tokens: selection.maxOutputTokens } : {}),
     };
@@ -699,26 +686,5 @@ function toPluginSkillRefs(skills, effective) {
 }
 function normalizedSkillName(name) {
     return name.trim().normalize('NFKC').toLocaleLowerCase('en-US');
-}
-function isExtensionSkillSelected(selected, pluginName, skillName) {
-    if (selected === undefined)
-        return true;
-    const name = normalizedSkillName(skillName);
-    const qualified = `${normalizedSkillName(pluginName)}:${name}`;
-    return selected.some((candidate) => {
-        const normalized = normalizedSkillName(candidate);
-        return normalized === name || normalized === qualified;
-    });
-}
-function isRuntimeSkillSelected(selection, skill) {
-    if (skill.selectionScope === 'capability-owned')
-        return true;
-    const selected = selection?.skills;
-    if (selected &&
-        !selected.some((name) => normalizedSkillName(name) === normalizedSkillName(skill.name))) {
-        return false;
-    }
-    return (skill.sourceType === MINIMAX_OFFICIAL_SKILL_SOURCE ||
-        isExtensionSkillSelected(selection?.extensionSkills, '', skill.name));
 }
 //# sourceMappingURL=local-agent-config-builder.js.map

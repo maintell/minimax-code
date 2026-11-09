@@ -1,6 +1,7 @@
 import { BaseWindow, dialog, app, webContents as electronWebContents } from "electron";
 import { sanitizeConsoleDiagnosticUrl, BROWSER_TIMEOUTS, withTimeout } from "@mavis/browser-core";
 import { getConfig } from "@mavis/config";
+import { MINIAPP_ATTENTION_MAX_TABS } from "./miniapp-attention";
 import { randomUUID } from "node:crypto";
 import { BrowserController } from "./controller";
 import { browserBackendPolicy } from "./browser-backend-policy.js";
@@ -11,7 +12,7 @@ import { setBrowserTelemetryProcessSource } from "./browser-telemetry-runtime.js
 import { browserUrlScheme, browserUrlHost } from "./browser-telemetry.js";
 import { onTelemetryDetach, onTelemetryTabDestroyed, onTelemetryTabSuspended, onTelemetryPageCrash, bindTelemetryResponsiveness, onTelemetryTabCreateFailed, onTelemetryTabCreated, onTelemetryTabResumed, onTelemetryTabLoaded, onTelemetryLoadFailed, onTelemetryGuestRebuild, onTelemetryAgentOperation, recordTelemetryCompatibility } from "./embedded-browser-telemetry.js";
 import { EmbeddedBrowserDownloadTracker } from "./embedded-browser-downloads.js";
-import { BackgroundBrowserRenderHost } from "./background-browser-render-host";
+import { BackgroundBrowserRenderHost, isBackgroundRenderForegroundClaim } from "./background-browser-render-host";
 import { EmbeddedBrowserToolRuntime } from "./embedded-browser-tool-runtime";
 import { EMBEDDED_COMMENT_WORLD_ID, EMBEDDED_COMMENT_BRIDGE_SCRIPT, EMBEDDED_COMMENT_CONTROL_NAME, normalizeCommentBridgeMessage } from "./embedded-comment-bridge";
 import { loadEmbeddedPropsPanelScript } from "./embedded-props-panel";
@@ -22,7 +23,7 @@ import { getMainWindow } from "../../windows/mainWindow";
 import { getCategoryLogger } from "../../utils/logger";
 import { openExternalTarget } from "../../utils/open-external-target";
 import { PersistentBrowserRegistry, normalizePersistedBrowserUrl, MAX_PERSISTED_BROWSER_HISTORY_ENTRIES, createPersistentBrowserRegistry } from "./persistent-browser-registry";
-import { ENABLE_BROWSER_INPUT_DIAGNOSTICS, safeError, urlHost, OFFSCREEN_BOUNDS, presentationLoadError, normalizeBrowserTarget, nowMs, normalizeCommentSelectionMode, normalizeCommentKeys, normalizeCommentRevisions, normalizeUrl, HIDDEN_SWEEP_INTERVAL_MS, MAX_HIDDEN_TABS, HIDDEN_IDLE_TIMEOUT_MS, AGENT_OPERATION_KEEPALIVE_MS, HIDDEN_LOADING_GRACE_MS, finiteNumber, DEFAULT_BOUNDS, isMainDocumentNavigation, asRecord, asString, asCommentRenumberMap, asNumber, normalizeCommentPayload, PENDING_COMMENT_EVENT_LIMIT, assertBrowserTabBelongsToSession, AGENT_BROWSER_ACTIONS } from "./embedded-browser-manager-helpers";
+import { ENABLE_BROWSER_INPUT_DIAGNOSTICS, safeError, nowMs, normalizeBrowserTarget, urlHost, OFFSCREEN_BOUNDS, presentationLoadError, normalizeCommentSelectionMode, normalizeCommentKeys, normalizeCommentRevisions, normalizeUrl, HIDDEN_SWEEP_INTERVAL_MS, MAX_HIDDEN_TABS, HIDDEN_IDLE_TIMEOUT_MS, AGENT_OPERATION_KEEPALIVE_MS, HIDDEN_LOADING_GRACE_MS, finiteNumber, DEFAULT_BOUNDS, isMainDocumentNavigation, asRecord, asString, asCommentRenumberMap, asNumber, normalizeCommentPayload, PENDING_COMMENT_EVENT_LIMIT, assertBrowserTabBelongsToSession, AGENT_BROWSER_ACTIONS } from "./embedded-browser-manager-helpers";
 import { setTabDevicePreviewMode, updateTabDevicePreview } from "./embedded-browser-device-preview";
 import { EmbeddedBrowserResourceDiagnostics } from "./embedded-browser-resource-diagnostics";
 import { EmbeddedBrowserAdaptiveBudget, memoryWeightedLruValue } from "./embedded-browser-adaptive-budget";
@@ -30,10 +31,10 @@ import { capturePageResume, restorePageResume } from "./embedded-browser-page-re
 import { safeEmbeddedBrowserFaviconUrl } from "./embedded-browser-tab-metadata";
 import { runFindInPage, createEmbeddedBrowserFindReporter, toEmbeddedBrowserFindResult, pendingEmbeddedBrowserFindResult, isEmbeddedBrowserFindShortcut } from "./embedded-browser-find";
 import { isEmbeddedBrowserReloadShortcut } from "./embedded-browser-reload";
-import { openDetachedWindow, attachDetachedTab, showDetachedPlaceholder, hideDetachedPlaceholder, closeDetachedWindow } from "./miniapp-detached-window";
+import { openDetachedWindow, attachDetachedTab, releaseDetachedWindow, closeKeptDetachedWindow, bindKeptDetachedWindow, isDetachedWindowInView, adoptDetachedWindow, showDetachedPlaceholder, hideDetachedPlaceholder, closeDetachedWindow } from "./miniapp-detached-window";
 import { registerMiniAppLoopbackAuth } from "./miniapp-loopback-auth";
 import { MiniAppDevicePermissionGate } from "./miniapp-device-permissions";
-import { readMiniAppWindowState, updateMiniAppWindow, focusMiniAppWindow, revealMiniAppWindow } from "./miniapp-window-handle";
+import { revealMiniAppWindow, readMiniAppWindowState, updateMiniAppWindow, focusMiniAppWindow } from "./miniapp-window-handle";
 const logger = getCategoryLogger('archon');
 const browserInputDiagnosticLogger = getCategoryLogger('archon', 'browser-input');
 const browserNavigationDiagnosticLogger = getCategoryLogger('archon', 'browser-navigation');
@@ -48,6 +49,8 @@ function browserPageDestroyedError(label) {
     return Object.assign(new Error(`BROWSER_PAGE_DESTROYED: Browser page was destroyed during ${label}`), { code: 'BROWSER_TRANSPORT_CLOSED' });
 }
 const MAX_PAGE_DIAGNOSTIC_TEXT_CHARS = 4096;
+const COMMENT_SCREENSHOT_MAX_EDGE = 1280;
+const COMMENT_SCREENSHOT_JPEG_QUALITY = 80;
 const BROWSER_NAVIGATION_DIAGNOSTIC_WORLD_ID = 1004;
 const SECURITY_CHALLENGE_SIGNALS = [
     '访问受到安全保护',
@@ -91,6 +94,12 @@ async function readBrowserSecurityChallengeSummary(webContents, title) {
 function browserWebviewAnchorKey(tabId) {
     return `browser-tab:${tabId}`;
 }
+/** A refusal for several pages reports the strongest reason first. */
+const MINIAPP_SLEEP_REFUSAL_ORDER = [
+    'visible',
+    'loading',
+    'busy',
+];
 const MAX_IN_MEMORY_HISTORY_PAGE_STATE_BYTES = 4 * 1024 * 1024;
 /** Covers the 30s page load timeout of a page opened by an Agent action. */
 const AGENT_PAGE_OPEN_SETTLE_TIMEOUT_MS = 35000;
@@ -119,7 +128,7 @@ export class EmbeddedBrowserManager {
         this.destroyingTabIds = new Set();
         this.suspendingTabIds = new Set();
         this.coldResumeSnapshots = new Map();
-        this.suspendedTabs = new Map();
+        this.pagelessTabs = new Map();
         this.resumingTabs = new Map();
         this.recoveringWebviewTabs = new Map();
         /**
@@ -137,6 +146,8 @@ export class EmbeddedBrowserManager {
         // A finished download may make a protected hidden tab reclaimable again.
         this.downloads = new EmbeddedBrowserDownloadTracker(() => this.ensureHiddenSweepTimer());
         this.ensuringSessionTabs = new Map();
+        /** Latest adoptSession target per source session, so in-flight restores keep the new owner. */
+        this.adoptedSessions = new Map();
         /** Pages opened by an in-flight Agent action; that action returns after they settle. */
         this.agentPageOpens = new Map();
         this.creatingTabs = new Map();
@@ -144,6 +155,9 @@ export class EmbeddedBrowserManager {
         this.miniAppWindowTransfers = new Set();
         this.miniAppOperationControllers = new Map();
         this.miniAppOperationEpochs = new Map();
+        this.miniAppVisibilityListeners = new Set();
+        this.miniAppHostEndListeners = new WeakMap();
+        this.miniAppPermissionListeners = new Set();
         this.miniAppLoopbackAuth = new Map();
         this.miniAppLoopbackAuthSessions = new WeakSet();
         this.miniAppDevicePermissionSessions = new WeakSet();
@@ -161,6 +175,12 @@ export class EmbeddedBrowserManager {
         this.registry = options.registry ?? new PersistentBrowserRegistry();
         this.backgroundRenderHost = options.backgroundRenderHost ?? new BackgroundBrowserRenderHost();
         this.isAgentCursorEnabled = options.isAgentCursorEnabled ?? (() => true);
+        this.onMiniAppAttentionChanged = options.onMiniAppAttentionChanged ?? (() => undefined);
+        // Dynamic: `miniapp-surface` imports this module (a static import would be circular) and pulls
+        // in the Utility bridge, which this module must not load just by being imported.
+        this.reopenMiniAppTab =
+            options.reopenMiniAppTab ??
+                (async (target) => (await import('./miniapp-surface')).openManagedMiniAppSurface(target));
         this.controllerFactory =
             options.controllerFactory ??
                 (() => new BrowserController({
@@ -235,6 +255,7 @@ export class EmbeddedBrowserManager {
             parkOtherVisibleInlineTabs: (tab, reason) => {
                 this.parkOtherVisibleInlineTabs(tab, reason);
             },
+            onVisibilityChanged: (tab) => this.notifyMiniAppAttention(tab),
             isAppQuitting: () => windowManager.isAppQuitting(),
         };
         this.adaptiveBudget = options.adaptiveBudget ?? new EmbeddedBrowserAdaptiveBudget();
@@ -295,13 +316,34 @@ export class EmbeddedBrowserManager {
         const pluginId = input.pluginId.trim();
         return this.runMiniAppTargetOperation({ sessionId, pluginId }, async (signal) => {
             const tab = this.requireMiniAppTabBySession(sessionId, pluginId);
-            // Read the credential once this operation is actually dequeued, not when refresh was
-            // requested, so a restart that finished while this waited is picked up. The read and the
-            // sync below run back-to-back inside this serialized per-target operation; a restart
-            // landing in that microsecond gap is corrected by the next open/refresh.
+            // Read after dequeue so a restart while waiting is picked up. A new-run navigation
+            // rechecks the credential at its execution boundary before changing this tab's identity.
             const credential = await input.readCredential?.();
             if (credential)
                 this.syncMiniAppLoopbackCredential(pluginId, credential);
+            const previousMiniApp = tab.miniApp;
+            const readCredential = input.readCredential;
+            const runId = credential?.runId;
+            if (credential &&
+                readCredential &&
+                previousMiniApp &&
+                typeof runId === 'string' &&
+                runId.length > 0 &&
+                runId !== previousMiniApp.runId &&
+                credential.origin === previousMiniApp.origin) {
+                await this.navigateMiniAppLaunch(tab, { ...previousMiniApp, runId }, {
+                    url: tab.url,
+                    label: 'miniapp-refresh',
+                    operationSignal: signal,
+                    readCredential: async () => {
+                        const current = await readCredential();
+                        if (!current || current.runId !== runId || current.origin !== credential.origin)
+                            throw new Error('Mini App changed during refresh');
+                        return { ...current, runId };
+                    },
+                });
+                return this.miniAppTabSummary(tab);
+            }
             tab.lastLoadError = null;
             await this.withTabOperation(tab, 'miniapp-refresh', () => tab.controller.reload(), {
                 signal,
@@ -323,6 +365,7 @@ export class EmbeddedBrowserManager {
                     if (tab.detachedWindow)
                         onTelemetryDetach(tab);
                 });
+                this.notifyMiniAppVisibility();
             }
             return this.miniAppTabSummary(tab);
         });
@@ -333,10 +376,19 @@ export class EmbeddedBrowserManager {
         const pluginId = input.pluginId.trim();
         this.assertMiniAppWindowTransferAvailable(this.resolveMiniAppTabBySession(sessionId, pluginId));
         return this.runMiniAppWindowTransferOperation({ sessionId, pluginId }, async (signal) => {
+            // A page that slept in its pop-out has no page to move: the tab stays asleep in the panel.
+            const sleeping = this.resolveMiniAppTabBySession(sessionId, pluginId)
+                ? undefined
+                : this.findSleepingMiniAppTab(sessionId, pluginId);
+            if (sleeping) {
+                this.closeSleepingMiniAppWindow(sleeping);
+                return sleepingMiniAppSurfaceSummary(sleeping);
+            }
             const tab = this.requireMiniAppTabBySession(sessionId, pluginId);
             if (tab.detachedWindow) {
                 await this.runConfirmedMiniAppWindowTransfer(tab, signal, () => Promise.resolve(attachDetachedTab(this.detachedWindowHost, tab, signal)));
             }
+            this.notifyMiniAppVisibility();
             return this.miniAppTabSummary(tab);
         });
     }
@@ -467,6 +519,114 @@ export class EmbeddedBrowserManager {
     /** The Host renderer switched a Mini App permission; device switches also answer page checks. */
     onMiniAppPermissionChanged(pluginId, permission, enabled) {
         this.miniAppDevicePermissions.applySwitch(pluginId, permission, enabled);
+        for (const listener of this.miniAppPermissionListeners)
+            listener(pluginId, permission, enabled);
+    }
+    /** Page identity and the logical Host fixed when this tab was created. */
+    captureMiniAppHostSource(sender, senderFrame) {
+        const tab = this.resolveMiniAppSenderTab(sender, senderFrame);
+        if (!tab?.miniApp || !senderFrame || tab.miniApp.stoppedRunId === tab.miniApp.runId)
+            return null;
+        const miniApp = tab.miniApp;
+        const ownerWindow = miniApp.ownerWindow;
+        try {
+            const owner = ownerWindow && !ownerWindow.isDestroyed() ? ownerWindow.webContents : null;
+            const ownerFrame = owner && !owner.isDestroyed() ? owner.mainFrame : null;
+            if (!owner || !ownerFrame || ownerFrame.detached)
+                return null;
+            const generation = tab.navigationGeneration;
+            return {
+                pluginId: miniApp.miniApp.pluginId,
+                page: sender,
+                frame: senderFrame,
+                owner,
+                ownerFrame,
+                isCurrent: () => {
+                    try {
+                        return (this.resolveMiniAppSenderTab(sender, senderFrame) === tab &&
+                            tab.navigationGeneration === generation &&
+                            tab.miniApp?.runId === miniApp.runId &&
+                            tab.miniApp.stoppedRunId !== miniApp.runId &&
+                            tab.miniApp?.ownerWindow === ownerWindow &&
+                            !owner.isDestroyed() &&
+                            owner.mainFrame === ownerFrame &&
+                            !ownerFrame.detached);
+                    }
+                    catch {
+                        return false;
+                    }
+                },
+                isVisible: () => {
+                    try {
+                        const window = tab.detachedWindow ?? ownerWindow;
+                        return (!!window &&
+                            !window.isDestroyed() &&
+                            window.isVisible() &&
+                            !window.isMinimized() &&
+                            (!!tab.detachedWindow || isMiniAppTabInView(tab)));
+                    }
+                    catch {
+                        return false;
+                    }
+                },
+                revealOwner: () => {
+                    if (!ownerWindow || ownerWindow.isDestroyed())
+                        return;
+                    revealMiniAppWindow(ownerWindow);
+                },
+            };
+        }
+        catch {
+            return null;
+        }
+    }
+    observeMiniAppPermissionChanges(listener) {
+        this.miniAppPermissionListeners.add(listener);
+        return () => {
+            this.miniAppPermissionListeners.delete(listener);
+        };
+    }
+    /** Native visibility, not Chromium focus/occlusion, bounds this navigation observation. */
+    observeMiniAppVisibility(page, onChange) {
+        let windowDisposers = [];
+        let windows = [];
+        const changed = () => {
+            const tab = Array.from(this.tabs.values()).find((candidate) => this.getWebContents(candidate) === page);
+            const next = [tab?.miniApp?.ownerWindow, tab?.detachedWindow].filter((window) => !!window && !window.isDestroyed());
+            if (next.length !== windows.length ||
+                next.some((window, index) => window !== windows[index])) {
+                for (const dispose of windowDisposers)
+                    dispose();
+                windowDisposers = [];
+                windows = next;
+                for (const window of windows) {
+                    window.on('show', changed);
+                    window.on('hide', changed);
+                    window.on('minimize', changed);
+                    window.on('restore', changed);
+                    window.on('closed', changed);
+                    windowDisposers.push(() => {
+                        window.removeListener('show', changed);
+                        window.removeListener('hide', changed);
+                        window.removeListener('minimize', changed);
+                        window.removeListener('restore', changed);
+                        window.removeListener('closed', changed);
+                    });
+                }
+            }
+            onChange();
+        };
+        this.miniAppVisibilityListeners.add(changed);
+        changed();
+        return () => {
+            this.miniAppVisibilityListeners.delete(changed);
+            for (const dispose of windowDisposers)
+                dispose();
+        };
+    }
+    notifyMiniAppVisibility() {
+        for (const listener of this.miniAppVisibilityListeners)
+            listener();
     }
     /** Identify the managed page once; Session and Host availability are independent targets. */
     captureMiniAppComposerSource(sender, senderFrame) {
@@ -476,6 +636,7 @@ export class EmbeddedBrowserManager {
         let ownerWebContents = null;
         let ownerFrame = null;
         try {
+            // Composer targets keep the tab's Session but use the currently presenting Host.
             const ownerWindow = this.hostWindow;
             if (ownerWindow && !ownerWindow.isDestroyed()) {
                 const contents = ownerWindow.webContents;
@@ -508,6 +669,7 @@ export class EmbeddedBrowserManager {
     resolveMiniAppPromptTarget(pluginId) {
         const page = Array.from(this.tabs.values()).find((tab) => tab.miniApp?.miniApp.pluginId === pluginId);
         try {
+            // Node prompts belong to the plugin, so their presentation follows the current Host.
             const window = this.hostWindow;
             if (!window || window.isDestroyed())
                 return null;
@@ -591,12 +753,306 @@ export class EmbeddedBrowserManager {
             },
         };
     }
-    destroyMiniAppTabs(pluginId) {
+    /** A successful Runtime stop revokes Host APIs even when the toolbar preserves its page. */
+    onMiniAppRuntimeStopped(pluginId) {
         this.revokeMiniAppTargetOperations(pluginId);
-        const tabs = Array.from(this.tabs.values()).filter((tab) => tab.miniApp?.miniApp.pluginId === pluginId);
+        for (const tab of this.tabs.values()) {
+            if (tab.miniApp?.miniApp.pluginId !== pluginId)
+                continue;
+            tab.miniApp.stoppedRunId = tab.miniApp.runId;
+            const page = this.getWebContents(tab);
+            if (!page)
+                continue;
+            for (const end of [...(this.miniAppHostEndListeners.get(page) ?? [])])
+                end();
+        }
+    }
+    destroyMiniAppTabs(pluginId) {
+        return this.destroyMiniAppTabsOf(pluginId);
+    }
+    /** Every live and sleeping tab of `pluginId`, or of every plugin when it is undefined. */
+    destroyMiniAppTabsOf(pluginId) {
+        this.revokeMiniAppTargetOperations(pluginId);
+        const tabs = Array.from(this.tabs.values()).filter((tab) => tab.miniApp !== undefined &&
+            (pluginId === undefined || tab.miniApp.miniApp.pluginId === pluginId));
         for (const tab of tabs)
             this.destroyTab(tab, 'explicit');
-        return tabs.map((tab) => tab.tabId);
+        const sleeping = this.sleepingMiniAppRecords().filter((record) => pluginId === undefined || record.pluginId === pluginId);
+        for (const record of sleeping)
+            this.dropSleepingMiniAppTab(record);
+        return [...tabs.map((tab) => tab.tabId), ...sleeping.map((record) => record.tabId)];
+    }
+    /**
+     * Destroys hidden Mini App pages to free memory and keeps their logical tabs: the session's
+     * tab list and selection are unchanged and `getState` reports them with `sleeping: true`.
+     * With `sessionId`: that session's page of the plugin; without: every page of the plugin.
+     * Refuses as a whole (changing nothing) when any requested page is visible, loading or busy.
+     */
+    sleepMiniAppTabs(input) {
+        const tabs = Array.from(this.tabs.values()).filter((tab) => tab.miniApp?.miniApp.pluginId === input.pluginId &&
+            typeof tab.sessionId === 'string' &&
+            (input.sessionId === undefined || tab.sessionId === input.sessionId));
+        if (tabs.length === 0) {
+            // A plugin without live pages has nothing left to keep alive; one page must exist.
+            if (input.sessionId !== undefined)
+                return { slept: false, refusal: 'not_found' };
+            const record = this.sleepingMiniAppRecords().find((candidate) => candidate.pluginId === input.pluginId);
+            return sleptResult(0, record?.miniApp);
+        }
+        const refusals = new Set(tabs.map((tab) => this.miniAppSleepRefusal(tab)));
+        const refusal = MINIAPP_SLEEP_REFUSAL_ORDER.find((candidate) => refusals.has(candidate));
+        if (refusal)
+            return { slept: false, refusal };
+        const summary = tabs[0]?.miniApp?.miniApp;
+        let firstError;
+        let failed = false;
+        for (const tab of tabs) {
+            try {
+                this.sleepMiniAppTab(tab);
+            }
+            catch (error) {
+                // The other pages still sleep; the backend must not stop while this one survives.
+                if (!failed)
+                    firstError = error;
+                failed = true;
+                logger.warn(`[EmbeddedBrowser] Mini App page sleep failed plugin=${input.pluginId} tab=${tab.tabId}: ${safeError(error)}`);
+            }
+        }
+        if (failed)
+            throw firstError;
+        return sleptResult(tabs.length, summary);
+    }
+    /** Every live and sleeping Mini App tab as the memory coordinator ranks attention. */
+    miniAppAttentionSnapshot() {
+        const tabs = [];
+        for (const tab of this.tabs.values()) {
+            const pluginId = tab.miniApp?.miniApp.pluginId;
+            if (!pluginId || typeof tab.sessionId !== 'string' || this.isUncommittedMiniAppTab(tab)) {
+                continue;
+            }
+            const base = { sessionId: tab.sessionId, pluginId, tabId: tab.tabId };
+            tabs.push(isMiniAppTabInView(tab)
+                ? { ...base, state: 'visible' }
+                : { ...base, state: 'hidden', hiddenAtMs: miniAppHiddenAt(tab) });
+        }
+        // A record outlives the uncommitted page of a reopen in progress, which stays asleep.
+        for (const record of this.sleepingMiniAppRecords()) {
+            tabs.push({
+                sessionId: record.sessionId,
+                pluginId: record.pluginId,
+                tabId: record.tabId,
+                state: 'sleeping',
+                hiddenAtMs: record.hiddenAt,
+            });
+        }
+        return { tabs: tabs.slice(0, MINIAPP_ATTENTION_MAX_TABS), atMs: nowMs() };
+    }
+    miniAppSleepRefusal(tab) {
+        if (isMiniAppTabInView(tab))
+            return 'visible';
+        if (tab.windowTransferPhase || tab.transferringPage || tab.rebuildingPage)
+            return 'busy';
+        if (this.isUncommittedMiniAppTab(tab))
+            return 'loading';
+        try {
+            if (tab.controller.getState().isLoading === true)
+                return 'loading';
+        }
+        catch {
+            // An unreadable page state is not safe to tear down.
+            return 'busy';
+        }
+        return (tab.operationCount ?? 0) > 0 ? 'busy' : undefined;
+    }
+    /**
+     * Throws when the page could not be torn down. `destroyTab` had already revoked its credential
+     * and dropped its listeners; only the credential is given back, so the surviving page is not
+     * locked out of its backend.
+     */
+    sleepMiniAppTab(tab) {
+        const miniApp = tab.miniApp;
+        if (!miniApp || typeof tab.sessionId !== 'string')
+            return;
+        this.refreshTabState(tab);
+        const path = sameOriginPath(tab.url, miniApp.origin);
+        const record = {
+            kind: 'miniapp',
+            tabId: tab.tabId,
+            sessionId: tab.sessionId,
+            pluginId: miniApp.miniApp.pluginId,
+            miniApp: miniApp.miniApp,
+            surfaceId: miniApp.surfaceId,
+            ownerWindow: miniApp.ownerWindow ?? null,
+            ...(path !== undefined ? { path } : {}),
+            hiddenAt: miniAppHiddenAt(tab),
+            presentationRevision: tab.presentationRevision,
+            zoomFactor: tab.controller.getZoomFactor(),
+            devicePreviewMode: tab.controller.getDevicePreviewMode(),
+            restore: new AbortController(),
+        };
+        // A minimized or hidden pop-out outlives its page; only the page is destroyed.
+        const keptWindow = releaseDetachedWindow(tab);
+        try {
+            this.destroyTab(tab, 'miniapp-sleep', { preserveLogicalTab: true });
+        }
+        catch (error) {
+            // The record is written only after a teardown that finished; as before, the window of a
+            // page that failed to tear down does not survive it.
+            if (keptWindow)
+                closeKeptDetachedWindow(keptWindow);
+            if (this.tabs.get(tab.tabId) === tab)
+                this.restoreMiniAppLoopbackAuth(tab);
+            throw error;
+        }
+        if (keptWindow)
+            this.keepSleepingMiniAppWindow(record, keptWindow);
+        this.pagelessTabs.set(tab.tabId, record);
+    }
+    /** Hands a pop-out window to the sleeping record of the page that slept in it. */
+    keepSleepingMiniAppWindow(record, kept) {
+        const sleepingWindow = {
+            ...kept,
+            unbind: bindKeptDetachedWindow(kept.window, {
+                isAppQuitting: () => windowManager.isAppQuitting(),
+                onShown: () => this.reopenSleepingMiniAppWindow(record),
+                onClose: () => this.closeSleepingMiniAppWindow(record),
+                onClosed: () => {
+                    // Gone without the record closing it (app quit): only the bookkeeping follows.
+                    if (record.detachedWindow === sleepingWindow)
+                        this.takeSleepingMiniAppWindow(record);
+                    kept.boundsPersistence?.dispose();
+                },
+            }),
+        };
+        record.detachedWindow = sleepingWindow;
+    }
+    /** Detaches the kept window from its record without closing it. */
+    takeSleepingMiniAppWindow(record) {
+        const sleepingWindow = record.detachedWindow;
+        if (!sleepingWindow)
+            return undefined;
+        delete record.detachedWindow;
+        sleepingWindow.unbind();
+        return sleepingWindow;
+    }
+    /** Closes a sleeping tab's kept window; the tab stays asleep, now in the panel. */
+    closeSleepingMiniAppWindow(record) {
+        const sleepingWindow = this.takeSleepingMiniAppWindow(record);
+        if (!sleepingWindow)
+            return;
+        // The panel swaps its detached placeholder for the sleeping one.
+        record.presentationRevision += 1;
+        closeKeptDetachedWindow(sleepingWindow);
+    }
+    /**
+     * The user restored or showed the window a page slept in: reopen the page through the same
+     * user-initiated open the panel uses, which moves it into that window. When that fails (the
+     * device's running limit included) the window closes and the tab stays asleep in the panel,
+     * whose own restore flow takes over from there.
+     */
+    reopenSleepingMiniAppWindow(record) {
+        const sleepingWindow = record.detachedWindow;
+        if (!sleepingWindow || sleepingWindow.reopening)
+            return;
+        sleepingWindow.reopening = true;
+        void this.reopenMiniAppTab({
+            sessionId: record.sessionId,
+            pluginId: record.pluginId,
+            restoreTabId: record.tabId,
+        })
+            .catch((error) => {
+            logger.warn(`[EmbeddedBrowser] Mini App pop-out reopen failed plugin=${record.pluginId} tab=${record.tabId}: ${safeError(error)}`);
+        })
+            .then(() => {
+            // A reopened page adopted the window; otherwise it is still the record's.
+            if (record.detachedWindow === sleepingWindow)
+                this.closeSleepingMiniAppWindow(record);
+        });
+    }
+    restoreMiniAppLoopbackAuth(tab) {
+        try {
+            this.syncMiniAppLoopbackAuth(tab);
+        }
+        catch (error) {
+            logger.warn(`[EmbeddedBrowser] Mini App credential restore failed tab=${tab.tabId}: ${safeError(error)}`);
+        }
+    }
+    /** Forgets a sleeping tab entirely, as closing it would, including the window it slept in. */
+    dropSleepingMiniAppTab(record) {
+        if (!this.pagelessTabs.delete(record.tabId))
+            return;
+        record.restore.abort(miniAppTabClosedDuringRestoreError());
+        this.closeSleepingMiniAppWindow(record);
+        if (!this.tabs.has(record.tabId)) {
+            this.detachTabFromSession({ tabId: record.tabId, sessionId: record.sessionId });
+        }
+        this.notifyMiniAppAttention();
+    }
+    /**
+     * The sleeping tab of `pluginId` in `sessionId`, for a caller about to start its backend: the
+     * summary to answer with when only the backend is wanted, and the signal a restore of it runs
+     * under (aborted with `not_found` once the tab is closed).
+     */
+    sleepingMiniAppTab(sessionId, pluginId) {
+        const record = this.findSleepingMiniAppTab(sessionId, pluginId);
+        if (!record)
+            return undefined;
+        return {
+            tabId: record.tabId,
+            signal: record.restore.signal,
+            summary: sleepingMiniAppSurfaceSummary(record),
+        };
+    }
+    sleepingMiniAppRecords() {
+        return Array.from(this.pagelessTabs.values()).filter((record) => record.kind === 'miniapp');
+    }
+    findSleepingMiniAppTab(sessionId, pluginId) {
+        return this.sleepingMiniAppRecords().find((record) => record.sessionId === sessionId && record.pluginId === pluginId);
+    }
+    suspendedBrowserTab(tabId) {
+        const record = this.pagelessTabs.get(tabId);
+        return record?.kind === 'browser' ? record : undefined;
+    }
+    /** The pageless tab a Browser target names: by tab id, else the session's selected tab. */
+    resolvePagelessTab(target) {
+        const normalized = normalizeBrowserTarget(target);
+        let tabId;
+        if (typeof normalized.tabId === 'number') {
+            tabId = normalized.tabId;
+        }
+        else if (typeof normalized.sessionId === 'string') {
+            tabId = this.sessions.get(normalized.sessionId)?.selectedTabId;
+        }
+        if (typeof tabId !== 'number')
+            return undefined;
+        const record = this.pagelessTabs.get(tabId);
+        if (!record)
+            return undefined;
+        if (typeof normalized.sessionId === 'string' && record.sessionId !== normalized.sessionId) {
+            return undefined;
+        }
+        return record;
+    }
+    /** Selects a sleeping tab in its session; `park` also clears the panel for its placeholder. */
+    selectSleepingMiniAppTab(record, park) {
+        const session = this.getOrCreateSession(record.sessionId);
+        if (!session.tabIds.includes(record.tabId))
+            session.tabIds.push(record.tabId);
+        session.selectedTabId = record.tabId;
+        session.updatedAt = nowMs();
+        if (park)
+            this.parkOtherVisibleInlineTabs(record, 'sleeping-tab-switch');
+        return { success: true, tabId: record.tabId, sleeping: true };
+    }
+    notifyMiniAppAttention(tab) {
+        if (tab && !tab.miniApp)
+            return;
+        try {
+            this.onMiniAppAttentionChanged();
+        }
+        catch (error) {
+            logger.warn(`[EmbeddedBrowser] Mini App attention listener failed: ${safeError(error)}`);
+        }
     }
     resolveMiniAppTabBySession(sessionId, pluginId) {
         return (Array.from(this.tabs.values()).find((candidate) => candidate.sessionId === sessionId && candidate.miniApp?.miniApp.pluginId === pluginId) ?? null);
@@ -676,11 +1132,7 @@ export class EmbeddedBrowserManager {
     }
     /** Revokes every native tab owned by the current Utility generation. */
     destroyAllMiniAppTabs() {
-        this.revokeMiniAppTargetOperations();
-        const tabs = Array.from(this.tabs.values()).filter((tab) => tab.miniApp !== undefined);
-        for (const tab of tabs)
-            this.destroyTab(tab, 'explicit');
-        return tabs.map((tab) => tab.tabId);
+        return this.destroyMiniAppTabsOf(undefined);
     }
     /**
      * Rotates the loopback credential of every tab of one plugin that still points at the
@@ -726,15 +1178,82 @@ export class EmbeddedBrowserManager {
                 this.miniAppLoopbackAuth.delete(webContentsId);
         }
     }
+    async navigateMiniAppLaunch(tab, launch, options) {
+        let previousMiniApp = tab.miniApp;
+        let previousLastLoadError = tab.lastLoadError;
+        let attempted = false;
+        let documentCommitted = false;
+        try {
+            const result = await this.withTabOperation(tab, options.label, async (operationSignal) => {
+                const beforeDocumentLoad = async (loadSignal) => {
+                    const current = await options.readCredential?.();
+                    loadSignal?.throwIfAborted();
+                    options.signal?.throwIfAborted();
+                    operationSignal?.throwIfAborted();
+                    assertMiniAppGenerationCurrent(options.isGenerationCurrent);
+                    if (current && (current.runId !== launch.runId || current.origin !== launch.origin))
+                        throw Object.assign(new Error('Mini App launch is stale'), { code: 'stale_launch' });
+                    let loopbackToken = launch.loopbackToken;
+                    if (current)
+                        loopbackToken = current.loopbackToken;
+                    else if (tab.miniApp?.origin === launch.origin)
+                        loopbackToken = tab.miniApp.loopbackToken;
+                    this.syncMiniAppLoopbackCredential(launch.miniApp.pluginId, {
+                        origin: launch.origin,
+                        loopbackToken,
+                    });
+                    previousMiniApp = tab.miniApp;
+                    previousLastLoadError = tab.lastLoadError;
+                    attempted = true;
+                    tab.miniApp = { ...launch, loopbackToken };
+                    this.syncMiniAppLoopbackAuth(tab);
+                    tab.lastLoadError = null;
+                };
+                if (launch.runId !== tab.miniApp?.runId) {
+                    return tab.controller.loadForPresentation({ url: options.url }, {
+                        ...miniAppNavigationOptions(options.signal, operationSignal),
+                        forceNewDocument: true,
+                        beforeDocumentLoad,
+                        onDocumentCommitted: () => {
+                            documentCommitted = true;
+                        },
+                    });
+                }
+                await beforeDocumentLoad();
+                return tab.controller.navigate({ url: options.url }, miniAppNavigationOptions(options.signal, operationSignal));
+            }, { signal: options.operationSignal });
+            assertMiniAppNavigationSucceeded(result);
+            assertMiniAppGenerationCurrent(options.isGenerationCurrent);
+            this.refreshTabState(tab);
+        }
+        catch (error) {
+            if (attempted && !documentCommitted) {
+                const failed = tab.miniApp;
+                // Restore the loaded launch while retaining token rotations and a stop during navigation.
+                if (previousMiniApp &&
+                    failed?.origin === previousMiniApp.origin &&
+                    failed.loopbackToken !== previousMiniApp.loopbackToken)
+                    previousMiniApp = { ...previousMiniApp, loopbackToken: failed.loopbackToken };
+                if (previousMiniApp &&
+                    failed &&
+                    failed.stoppedRunId === failed.runId &&
+                    previousMiniApp.stoppedRunId !== previousMiniApp.runId)
+                    previousMiniApp = { ...previousMiniApp, stoppedRunId: previousMiniApp.runId };
+                tab.miniApp = previousMiniApp;
+                this.syncMiniAppLoopbackAuth(tab);
+                tab.lastLoadError = previousLastLoadError;
+            }
+            throw error;
+        }
+    }
     async openMiniAppTabOnce(input, sessionId, revocationSignal) {
         const { url, runId } = input;
         const origin = new URL(url).origin;
         // Before any navigation, and before the credential read so nothing awaits between that
         // read and its use: the page reads `Notification.permission` synchronously at load.
         await this.miniAppDevicePermissions.load(input.miniApp.pluginId);
-        // Read the credential once this operation is actually dequeued, not when open was
-        // requested, mirroring refreshMiniAppTab. A launch that no longer matches the run
-        // currently serving the plugin must not write its token into any tab.
+        // Read after dequeue and recheck at the navigation boundary. A launch that no longer
+        // matches the serving run must not write its token into any tab.
         const current = await input.readCredential?.();
         if (current && (current.runId !== runId || current.origin !== origin)) {
             throw Object.assign(new Error('Mini App launch is stale'), { code: 'stale_launch' });
@@ -749,75 +1268,155 @@ export class EmbeddedBrowserManager {
             const launchChanged = existing.miniApp?.runId !== runId ||
                 (input.preserveCurrentUrl ? urlHost(existing.url) !== urlHost(url) : existing.url !== url);
             const previousMiniApp = existing.miniApp;
-            const previousLastLoadError = existing.lastLoadError;
-            existing.miniApp = {
+            const launch = {
                 miniApp: input.miniApp,
                 runId,
                 origin,
                 loopbackToken,
                 // The page's WebContents (and the argv carrying this id) is reused.
                 surfaceId: previousMiniApp?.surfaceId ?? randomUUID(),
+                ownerWindow: previousMiniApp ? (previousMiniApp.ownerWindow ?? null) : this.getHostWindow(),
+                ...(previousMiniApp?.stoppedRunId ? { stoppedRunId: previousMiniApp.stoppedRunId } : {}),
                 ...(input.window ? { window: input.window } : {}),
             };
-            this.syncMiniAppLoopbackAuth(existing);
-            existing.lastLoadError = null;
             if (launchChanged) {
-                try {
-                    const result = await this.withTabOperation(existing, 'miniapp-restart', (operationSignal) => existing.controller.navigate({ url }, miniAppNavigationOptions(input.signal, operationSignal)), { signal: revocationSignal });
-                    assertMiniAppNavigationSucceeded(result);
-                    assertMiniAppGenerationCurrent(input.isGenerationCurrent);
-                    this.refreshTabState(existing);
-                }
-                catch (error) {
-                    // Roll back the launch identity only. When the failed relaunch kept the origin, another
-                    // session may have rotated that origin's credential meanwhile; the newest token survives.
-                    const attempted = existing.miniApp;
-                    existing.miniApp =
-                        previousMiniApp &&
-                            attempted?.origin === previousMiniApp.origin &&
-                            attempted.loopbackToken !== previousMiniApp.loopbackToken
-                            ? { ...previousMiniApp, loopbackToken: attempted.loopbackToken }
-                            : previousMiniApp;
-                    this.syncMiniAppLoopbackAuth(existing);
-                    existing.lastLoadError = previousLastLoadError;
-                    throw error;
-                }
+                await this.navigateMiniAppLaunch(existing, launch, {
+                    ...input,
+                    label: 'miniapp-restart',
+                    operationSignal: revocationSignal,
+                });
+            }
+            else {
+                existing.miniApp = launch;
+                this.syncMiniAppLoopbackAuth(existing);
+                existing.lastLoadError = null;
             }
             assertMiniAppGenerationCurrent(input.isGenerationCurrent);
-            this.markTabSessionSelected(existing);
+            // A restore (`restoreTabId`) only puts the page back; selection stays the user's.
+            if (input.restoreTabId === undefined)
+                this.markTabSessionSelected(existing);
             // An `open` of an already-detached Mini App is a request to see it.
             const detachedWindow = existing.detachedWindow;
             if (detachedWindow && !detachedWindow.isDestroyed())
                 revealMiniAppWindow(detachedWindow);
             return this.miniAppTabSummary(existing);
         }
-        const tab = await this.openTab({
-            url,
-            active: false,
-            bounds: OFFSCREEN_BOUNDS,
-            sessionId,
-            miniApp: {
-                miniApp: input.miniApp,
-                runId,
-                origin,
-                loopbackToken,
-                surfaceId: randomUUID(),
-                ...(input.window ? { window: input.window } : {}),
-            },
-            ...(input.signal ? { signal: input.signal } : {}),
-            operationSignal: revocationSignal,
-        });
+        // A sleeping tab of this (session, plugin) is reopened in place: same tab id, place in the
+        // session and window id, at the page it showed unless the caller asked for another path.
+        const sleeping = this.findSleepingMiniAppTab(sessionId, input.miniApp.pluginId);
+        if (input.restoreTabId !== undefined && sleeping?.tabId !== input.restoreTabId) {
+            // The tab this restore was for was closed meanwhile: the backend is up, but the user has
+            // nothing to see it in, and a fresh page would resurrect what they closed.
+            throw miniAppTabClosedDuringRestoreError();
+        }
+        const restoredUrl = sleeping?.path !== undefined && input.preserveCurrentUrl
+            ? (resolveSameOriginUrl(origin, sleeping.path) ?? url)
+            : url;
+        // Set the moment the window's own restore/show asked for this page, before any wait: such a
+        // reopen only reveals the window if the user has not put it away again since.
+        const reopenedFromWindow = sleeping?.detachedWindow?.reopening === true;
+        const sleepingPosition = sleeping
+            ? (this.sessions.get(sessionId)?.tabIds.indexOf(sleeping.tabId) ?? -1)
+            : -1;
+        let tab;
         try {
+            tab = await this.openTab({
+                ...(sleeping ? { tabId: sleeping.tabId } : {}),
+                url: restoredUrl,
+                active: false,
+                bounds: OFFSCREEN_BOUNDS,
+                sessionId,
+                miniApp: {
+                    miniApp: input.miniApp,
+                    runId,
+                    origin,
+                    loopbackToken,
+                    surfaceId: sleeping?.surfaceId ?? randomUUID(),
+                    ownerWindow: sleeping ? (sleeping.ownerWindow ?? null) : this.getHostWindow(),
+                    ...(input.window ? { window: input.window } : {}),
+                },
+                ...(input.signal ? { signal: input.signal } : {}),
+                operationSignal: revocationSignal,
+            });
             assertMiniAppGenerationCurrent(input.isGenerationCurrent);
-            this.markTabSessionSelected(tab);
         }
         catch (error) {
-            if (this.tabs.has(tab.tabId)) {
-                this.destroyTab(tab, 'explicit', { revokeMiniAppOperation: false });
+            if (tab && this.tabs.get(tab.tabId) === tab) {
+                this.destroyTab(tab, 'explicit', this.failedMiniAppPageDestroyOptions(tab));
+            }
+            // A failed reopen leaves the tab asleep where it was, unless it was closed meanwhile.
+            // Selection is not this code's to decide: it stays wherever the user has it.
+            if (sleeping && this.pagelessTabs.get(sleeping.tabId) === sleeping) {
+                this.keepSleepingTabInSession(sleeping, sleepingPosition);
             }
             throw error;
         }
+        // Taken before the record goes: its restore/show listeners must not see the reveal below.
+        const keptWindow = sleeping ? this.takeSleepingMiniAppWindow(sleeping) : undefined;
+        if (sleeping) {
+            this.pagelessTabs.delete(sleeping.tabId);
+            // Forces the panel to present the new page even if it polls `detached` unchanged.
+            tab.presentationRevision = sleeping.presentationRevision + 1;
+        }
+        const movedIntoWindow = sleeping && keptWindow ? await this.moveIntoKeptWindow(tab, keptWindow, input.signal) : false;
+        // The page may have been closed while it moved: nothing is left to present or select.
+        if (this.tabs.get(tab.tabId) !== tab)
+            throw miniAppTabClosedDuringRestoreError();
+        // A restore (`restoreTabId`) puts the page back into the tab the user already has, selected
+        // or not; it never changes the selection. An open the user asked for selects what it opened.
+        if (movedIntoWindow && sleeping && keptWindow) {
+            this.keepSleepingTabInSession(sleeping, sleepingPosition);
+            tab.lastUsedAt = nowMs();
+            // Like an `open` of a live pop-out: a request to see it. Unless the user put the window
+            // away while the page loaded: then it stays where they left it, page and all.
+            if (!reopenedFromWindow || isDetachedWindowInView(keptWindow.window)) {
+                revealMiniAppWindow(keptWindow.window);
+            }
+        }
+        else if (input.restoreTabId === undefined) {
+            this.markTabSessionSelected(tab);
+        }
+        else {
+            tab.lastUsedAt = nowMs();
+        }
+        this.notifyMiniAppAttention(tab);
         return this.miniAppTabSummary(tab);
+    }
+    /** False when the page stays inline: the window is gone or could not take the page. */
+    async moveIntoKeptWindow(tab, kept, signal) {
+        if (kept.window.isDestroyed()) {
+            kept.boundsPersistence?.dispose();
+            return false;
+        }
+        try {
+            await adoptDetachedWindow(this.detachedWindowHost, tab, kept, signal);
+            return true;
+        }
+        catch (error) {
+            logger.warn(`[EmbeddedBrowser] Mini App pop-out reattach failed tab=${tab.tabId}: ${safeError(error)}`);
+            return false;
+        }
+    }
+    /**
+     * A failed page of a sleeping tab's reopen leaves the tab in its session, so the selection
+     * stays wherever the user has it instead of falling back to the session's first tab.
+     */
+    failedMiniAppPageDestroyOptions(tab) {
+        return {
+            revokeMiniAppOperation: false,
+            keepSessionPlace: this.pagelessTabs.get(tab.tabId)?.kind === 'miniapp',
+        };
+    }
+    /** Puts a sleeping tab back into its session after a failed reopen dropped it there. */
+    keepSleepingTabInSession(record, position) {
+        const session = this.getOrCreateSession(record.sessionId);
+        if (!session.tabIds.includes(record.tabId)) {
+            const index = position < 0 ? session.tabIds.length : Math.min(position, session.tabIds.length);
+            session.tabIds.splice(index, 0, record.tabId);
+        }
+        if (session.selectedTabId === null)
+            session.selectedTabId = record.tabId;
+        session.updatedAt = nowMs();
     }
     async createOrShow(bounds, sessionId, options) {
         const normalizedSessionId = sessionId ?? null;
@@ -851,6 +1450,13 @@ export class EmbeddedBrowserManager {
                 ? (this.registry.getSelectedTab(normalizedSessionId)?.persistentTabId ?? null)
                 : null,
         });
+        // A sleeping Mini App selected in the session is the renderer's to reopen. The persisted
+        // selection only knows Browser tabs, so it must not stand in and open one in its place.
+        if (options?.restoreOnly &&
+            typeof normalizedSessionId === 'string' &&
+            this.resolvePagelessTab({ sessionId: normalizedSessionId })?.kind === 'miniapp') {
+            return this.getState({ sessionId: normalizedSessionId });
+        }
         // External links create their own tab after restoration; an empty session
         // must not acquire an unrelated blank tab as a side effect of mounting.
         if (options?.restoreOnly &&
@@ -860,7 +1466,7 @@ export class EmbeddedBrowserManager {
                 (this.sessions
                     .get(normalizedSessionId)
                     ?.tabIds.some((tabId) => tabId === this.sessions.get(normalizedSessionId)?.selectedTabId &&
-                    this.suspendedTabs.get(tabId)?.sessionId === normalizedSessionId) ||
+                    this.suspendedBrowserTab(tabId)?.sessionId === normalizedSessionId) ||
                     this.registry.getSelectedTab(normalizedSessionId)))) {
             return this.getState({ sessionId: normalizedSessionId });
         }
@@ -908,6 +1514,12 @@ export class EmbeddedBrowserManager {
             tab.lastLoadError = presentationLoadError(tab.lastLoadError, result, initialUrl);
             this.refreshTabState(tab);
         }
+        // adoptSession may have handed this tab to another session while it was restored.
+        if (typeof normalizedSessionId === 'string' &&
+            tab.sessionId !== normalizedSessionId &&
+            tab.sessionId === this.adoptedSessions.get(normalizedSessionId)) {
+            return this.tabSummary(tab);
+        }
         tab.sessionId = normalizedSessionId;
         // Hidden restore completion must not undo a newer foreground/blank-tab selection.
         if (visible)
@@ -945,7 +1557,7 @@ export class EmbeddedBrowserManager {
                 tab.lastForegroundBounds = tab.bounds;
                 await tab.controller.setBounds(OFFSCREEN_BOUNDS);
                 tab.bounds = OFFSCREEN_BOUNDS;
-                this.markTabHidden(tab);
+                this.parkTabUnderOverlay(tab);
             }));
         }
         return {
@@ -978,7 +1590,7 @@ export class EmbeddedBrowserManager {
             if (tab.bounds.x >= 0 && tab.bounds.y >= 0) {
                 await tab.controller.setBounds(OFFSCREEN_BOUNDS);
                 tab.bounds = OFFSCREEN_BOUNDS;
-                this.markTabHidden(tab);
+                this.parkTabUnderOverlay(tab);
             }
             return { success: true, tabId: tab.tabId, deferred: 'blocking-overlay' };
         }
@@ -1006,7 +1618,7 @@ export class EmbeddedBrowserManager {
             await tab.controller.setBounds(OFFSCREEN_BOUNDS);
             tab.bounds = OFFSCREEN_BOUNDS;
             tab.lastForegroundBounds = normalizedBounds;
-            this.markTabHidden(tab);
+            this.parkTabUnderOverlay(tab);
             return { success: true, tabId: tab.tabId, deferred: 'blocking-overlay' };
         }
         tab.bounds = normalizedBounds;
@@ -1072,6 +1684,12 @@ export class EmbeddedBrowserManager {
         let tab;
         try {
             tab = this.resolveBrowserTab(normalizedTarget, { allowLegacyActive: true });
+            // The renderer reopens a sleeping page through `miniAppAPI.open`; until then the panel
+            // shows the tab's placeholder, so nothing else may keep painting over it. A reopen in
+            // progress keeps its record until the new page commits, so its tab is still asleep.
+            const pageless = this.resolvePagelessTab(normalizedTarget);
+            if (pageless?.kind === 'miniapp')
+                return this.selectSleepingMiniAppTab(pageless, true);
             if (!tab && typeof requestedTabId === 'number') {
                 tab = await this.resumeSuspendedTab(requestedTabId, normalizedTarget.sessionId);
             }
@@ -1099,11 +1717,12 @@ export class EmbeddedBrowserManager {
         tab.lastForegroundBounds = normalizedBounds;
         if (this.blocksNativeTab(tab)) {
             this.markTabSessionSelected(tab, target?.selectForAgent !== true);
-            if (tab.bounds.x >= 0 && tab.bounds.y >= 0) {
+            const onscreen = tab.bounds.x >= 0 && tab.bounds.y >= 0;
+            if (onscreen) {
                 await tab.controller.setBounds(OFFSCREEN_BOUNDS);
                 tab.bounds = OFFSCREEN_BOUNDS;
-                this.markTabHidden(tab);
             }
+            this.parkTabUnderOverlay(tab, { markHidden: onscreen });
             return { success: true, tabId: tab.tabId, deferred: 'blocking-overlay' };
         }
         await this.backgroundRenderHost.claimForeground(tab.controller);
@@ -1165,17 +1784,17 @@ export class EmbeddedBrowserManager {
                         : null;
             }
             else if (typeof params.tabId === 'number') {
-                const suspended = this.suspendedTabs.get(params.tabId);
-                if (!suspended ||
-                    (typeof params.sessionId === 'string' && suspended.sessionId !== params.sessionId)) {
+                const pageless = this.resolvePagelessTab(params);
+                if (!pageless)
                     return { success: false, error: 'No embedded tab is available' };
-                }
-                const session = this.sessions.get(suspended.sessionId);
+                if (pageless.kind === 'miniapp')
+                    return this.selectSleepingMiniAppTab(pageless, false);
+                const session = this.sessions.get(pageless.sessionId);
                 if (session) {
-                    session.agentTabId = params.selectIfAgentTarget ? suspended.tabId : null;
-                    session.selectedTabId = suspended.tabId;
+                    session.agentTabId = params.selectIfAgentTarget ? pageless.tabId : null;
+                    session.selectedTabId = pageless.tabId;
                 }
-                this.registry.selectTab(suspended.sessionId, suspended.persistentTabId);
+                this.registry.selectTab(pageless.sessionId, pageless.persistentTabId);
             }
         }
         if (!tab)
@@ -1185,15 +1804,60 @@ export class EmbeddedBrowserManager {
         if (!this.claimLayoutCommand(tab, layoutCommandId)) {
             return { success: true, tabId: tab.tabId, ignored: 'stale-layout-command' };
         }
+        this.clearOverlayPark(tab);
         tab.controller.setBounds(OFFSCREEN_BOUNDS);
         tab.bounds = OFFSCREEN_BOUNDS;
         this.markTabHidden(tab);
         return { success: true, tabId: tab.tabId };
     }
+    /** Hands a session's Browser tabs to another session; the pages keep running untouched. */
+    adoptSession(fromSessionId, toSessionId) {
+        if (fromSessionId === toSessionId)
+            return;
+        const source = this.sessions.get(fromSessionId);
+        if (source) {
+            this.sessions.delete(fromSessionId);
+            const target = this.sessions.get(toSessionId);
+            if (target) {
+                target.tabIds = [...target.tabIds, ...source.tabIds];
+                target.selectedTabId = source.selectedTabId ?? target.selectedTabId;
+                target.visibleTabId = source.visibleTabId ?? target.visibleTabId;
+                target.updatedAt = nowMs();
+            }
+            else {
+                this.sessions.set(toSessionId, { ...source, sessionId: toSessionId, updatedAt: nowMs() });
+            }
+        }
+        for (const tab of [...this.tabs.values(), ...this.pagelessTabs.values()]) {
+            if (tab.sessionId === fromSessionId)
+                tab.sessionId = toSessionId;
+        }
+        for (const creation of this.creatingTabs.values()) {
+            if (creation.sessionId === fromSessionId)
+                creation.sessionId = toSessionId;
+        }
+        const pendingCreation = this.ensuringSessionTabs.get(fromSessionId);
+        if (pendingCreation) {
+            this.ensuringSessionTabs.delete(fromSessionId);
+            if (!this.ensuringSessionTabs.has(toSessionId)) {
+                this.ensuringSessionTabs.set(toSessionId, pendingCreation);
+            }
+        }
+        this.adoptedSessions.set(fromSessionId, toSessionId);
+        const prefix = `${fromSessionId}\u0000`;
+        for (const [key, snapshot] of [...this.coldResumeSnapshots]) {
+            if (!key.startsWith(prefix))
+                continue;
+            this.coldResumeSnapshots.delete(key);
+            this.coldResumeSnapshots.set(`${toSessionId}\u0000${key.slice(prefix.length)}`, snapshot);
+        }
+        this.registry.renameSession(fromSessionId, toSessionId);
+        this.registry.flush();
+    }
     destroy(params) {
         const normalized = typeof params === 'number' ? { tabId: params } : (params ?? {});
         let targetIds;
-        let suspendedTargetIds = [];
+        let pagelessTargetIds = [];
         try {
             if (typeof normalized.tabId === 'number') {
                 const creation = this.creatingTabs.get(normalized.tabId);
@@ -1204,22 +1868,22 @@ export class EmbeddedBrowserManager {
                 }
                 const tab = this.resolveBrowserTab(normalized, { allowLegacyActive: true });
                 targetIds = tab ? [tab.tabId] : [];
-                const suspended = this.suspendedTabs.get(normalized.tabId);
-                if (suspended) {
+                const pageless = this.pagelessTabs.get(normalized.tabId);
+                if (pageless) {
                     if (typeof normalized.sessionId === 'string' &&
-                        suspended.sessionId !== normalized.sessionId) {
+                        pageless.sessionId !== normalized.sessionId) {
                         throw new Error(`Embedded browser tab ${normalized.tabId} does not belong to session ${normalized.sessionId}`);
                     }
-                    suspendedTargetIds = [suspended.tabId];
+                    pagelessTargetIds = [pageless.tabId];
                 }
             }
             else if (normalized.sessionId !== undefined) {
                 targetIds = Array.from(this.tabs.values())
                     .filter((tab) => tab.sessionId === normalized.sessionId)
                     .map((tab) => tab.tabId);
-                suspendedTargetIds = Array.from(this.suspendedTabs.values())
-                    .filter((tab) => tab.sessionId === normalized.sessionId)
-                    .map((tab) => tab.tabId);
+                pagelessTargetIds = Array.from(this.pagelessTabs.values())
+                    .filter((record) => record.sessionId === normalized.sessionId)
+                    .map((record) => record.tabId);
             }
             else {
                 targetIds = [this.activeTabId].filter((id) => id !== null);
@@ -1231,7 +1895,7 @@ export class EmbeddedBrowserManager {
         const targetSessionId = normalized.sessionId !== undefined
             ? normalized.sessionId
             : (this.tabs.get(targetIds[0] ?? -1)?.sessionId ??
-                this.suspendedTabs.get(suspendedTargetIds[0] ?? -1)?.sessionId);
+                this.pagelessTabs.get(pagelessTargetIds[0] ?? -1)?.sessionId);
         for (const [tabId, creation] of this.creatingTabs) {
             if (typeof normalized.tabId === 'number'
                 ? tabId === normalized.tabId
@@ -1250,12 +1914,12 @@ export class EmbeddedBrowserManager {
             if (tab)
                 this.destroyTab(tab, 'explicit');
         }
-        for (const targetId of suspendedTargetIds) {
-            const tab = this.suspendedTabs.get(targetId);
-            if (tab)
-                this.destroySuspendedTab(tab, 'explicit');
+        for (const targetId of pagelessTargetIds) {
+            const record = this.pagelessTabs.get(targetId);
+            if (record)
+                this.destroyPagelessTab(record, 'explicit');
         }
-        const remainingTabs = [...this.tabs.values(), ...this.suspendedTabs.values()].filter((tab) => tab.sessionId === targetSessionId);
+        const remainingTabs = [...this.tabs.values(), ...this.pagelessTabs.values()].filter((tab) => tab.sessionId === targetSessionId);
         const hasPendingTabs = [...this.creatingTabs.values()].some((creation) => creation.sessionId === targetSessionId && !creation.cancelled);
         const sessionClosed = targetSessionId !== undefined && remainingTabs.length === 0 && !hasPendingTabs;
         if (typeof targetSessionId === 'string' && sessionClosed) {
@@ -1270,15 +1934,22 @@ export class EmbeddedBrowserManager {
         this.registry.flush();
         return {
             success: true,
-            tabIds: [...targetIds, ...suspendedTargetIds],
+            tabIds: [...new Set([...targetIds, ...pagelessTargetIds])],
             sessionClosed,
             ...(targetSessionId === undefined
                 ? {}
                 : { state: this.getState({ sessionId: targetSessionId }) }),
         };
     }
+    /** Closes a tab that has no live page, as closing its page would. */
+    destroyPagelessTab(record, reason) {
+        if (record.kind === 'miniapp')
+            this.dropSleepingMiniAppTab(record);
+        else
+            this.destroySuspendedTab(record, reason);
+    }
     destroySuspendedTab(tab, reason) {
-        this.suspendedTabs.delete(tab.tabId);
+        this.pagelessTabs.delete(tab.tabId);
         this.coldResumeSnapshots.delete(this.coldResumeKey(tab));
         const session = this.sessions.get(tab.sessionId);
         if (session) {
@@ -1339,7 +2010,7 @@ export class EmbeddedBrowserManager {
         try {
             tab.controller.destroy();
             this.tabs.delete(tab.tabId);
-            if (options.preserveLogicalTab) {
+            if (options.preserveLogicalTab || options.keepSessionPlace) {
                 if (typeof tab.sessionId === 'string') {
                     const session = this.sessions.get(tab.sessionId);
                     if (session?.visibleTabId === tab.tabId)
@@ -1367,6 +2038,7 @@ export class EmbeddedBrowserManager {
         this.stopHiddenSweepTimerIfIdle();
         this.browserResourceDiagnostics.onTabDestroyed();
         onTelemetryTabDestroyed(tab, Boolean(options.preserveLogicalTab));
+        this.notifyMiniAppAttention(tab);
     }
     destroyAllTabs() {
         this.revokeMiniAppTargetOperations();
@@ -1376,7 +2048,12 @@ export class EmbeddedBrowserManager {
         for (const tab of Array.from(this.tabs.values())) {
             this.destroyTab(tab, 'host-teardown');
         }
-        this.suspendedTabs.clear();
+        const sleeping = this.sleepingMiniAppRecords();
+        for (const record of sleeping)
+            this.closeSleepingMiniAppWindow(record);
+        this.pagelessTabs.clear();
+        if (sleeping.length > 0)
+            this.notifyMiniAppAttention();
         this.resumingTabs.clear();
         this.activeTabId = null;
         this.sessions.clear();
@@ -1426,7 +2103,7 @@ export class EmbeddedBrowserManager {
                 pid = undefined;
             }
             const metric = pid ? metrics.get(pid) : undefined;
-            const url = live?.url ?? this.suspendedTabs.get(tabId)?.url ?? '';
+            const url = live?.url ?? this.suspendedBrowserTab(tabId)?.url ?? '';
             pages.push({
                 tabId,
                 rendererBackend: backend.rendererBackend,
@@ -1500,7 +2177,9 @@ export class EmbeddedBrowserManager {
                     : {}),
             };
         });
-        const suspended = Array.from(this.suspendedTabs.values()).map((tab) => {
+        const suspended = Array.from(this.pagelessTabs.values())
+            .filter((tab) => tab.kind === 'browser')
+            .map((tab) => {
             const backend = selection(tab.backendSelection);
             return {
                 ...backend,
@@ -1547,16 +2226,16 @@ export class EmbeddedBrowserManager {
                 return true;
             return item.sessionId === params?.sessionId;
         });
-        const suspendedTabs = Array.from(this.suspendedTabs.values()).filter((item) => {
+        const pagelessTabs = Array.from(this.pagelessTabs.values()).filter((item) => {
             if (!hasRequestedSession)
                 return true;
             return item.sessionId === params?.sessionId;
         });
         const liveById = new Map(liveTabs.map((item) => [item.tabId, item]));
-        const suspendedById = new Map(suspendedTabs.map((item) => [item.tabId, item]));
+        const pagelessById = new Map(pagelessTabs.map((item) => [item.tabId, item]));
         const orderedTabIds = sessionState?.tabIds ?? [
             ...liveTabs.map((item) => item.tabId),
-            ...suspendedTabs.map((item) => item.tabId),
+            ...pagelessTabs.map((item) => item.tabId),
         ];
         this.logGetStateDiagnostic({
             requestedSessionId: hasRequestedSession ? params.sessionId : undefined,
@@ -1568,13 +2247,19 @@ export class EmbeddedBrowserManager {
             const live = liveById.get(tabId);
             if (live)
                 return [this.tabSummary(live)];
-            const suspended = suspendedById.get(tabId);
-            return suspended ? [this.suspendedTabSummary(suspended)] : [];
+            const pageless = pagelessById.get(tabId);
+            if (!pageless)
+                return [];
+            return [
+                pageless.kind === 'miniapp'
+                    ? sleepingMiniAppTabSummary(pageless)
+                    : this.suspendedTabSummary(pageless),
+            ];
         });
-        const requestedSuspendedTab = typeof params?.tabId === 'number' ? this.suspendedTabs.get(params.tabId) : undefined;
+        const requestedPagelessTab = typeof params?.tabId === 'number' ? this.pagelessTabs.get(params.tabId) : undefined;
         return {
             success: true,
-            activeTabId: tab?.tabId ?? requestedSuspendedTab?.tabId ?? null,
+            activeTabId: tab?.tabId ?? requestedPagelessTab?.tabId ?? null,
             selectedTabId: sessionState?.selectedTabId ?? tab?.tabId ?? null,
             agentTabId: sessionState?.agentTabId ?? sessionState?.selectedTabId ?? null,
             visibleTabId: typeof tab?.sessionId === 'string'
@@ -1766,7 +2451,9 @@ export class EmbeddedBrowserManager {
             globalActiveTabId: this.activeTabId,
             enabled,
             targetAvailable: Boolean(tab),
-            targetSuspended: typeof options?.tabId === 'number' ? this.suspendedTabs.has(options.tabId) : false,
+            targetSuspended: typeof options?.tabId === 'number'
+                ? this.suspendedBrowserTab(options.tabId) !== undefined
+                : false,
         });
         if (!tab)
             return { success: false, error: 'No embedded tab is available' };
@@ -1884,6 +2571,27 @@ export class EmbeddedBrowserManager {
             type: 'voice-update',
             state: update.state,
             ...(typeof update.text === 'string' ? { text: update.text } : {}),
+        });
+        return { success: true, tabId: tab.tabId };
+    }
+    /**
+     * Host UI layered over the page (the app's floating chat), in the host's
+     * pixels over the page box. The page composer opens clear of it.
+     */
+    async setCommentHostObstacle(obstacle, target) {
+        let tab;
+        try {
+            tab = this.resolveBrowserTab(target, { allowLegacyActive: true });
+        }
+        catch (error) {
+            return { success: false, error: safeError(error) };
+        }
+        if (!tab)
+            return { success: false, error: 'No embedded tab is available' };
+        await this.postCommentBridgeMessage(tab, {
+            type: 'set-host-obstacle',
+            rect: obstacle?.rect ?? null,
+            viewport: obstacle?.viewport ?? null,
         });
         return { success: true, tabId: tab.tabId };
     }
@@ -2189,7 +2897,8 @@ export class EmbeddedBrowserManager {
         try {
             if (options.signal?.aborted)
                 throw new Error('ABORTED: Browser action was cancelled');
-            const hidden = tab.hiddenAt != null || tab.bounds.x < 0 || tab.bounds.y < 0;
+            // A minimized pop-out is hidden only for memory management; its page never leaves its window.
+            const hidden = !tab.detachedWindow && (tab.hiddenAt != null || tab.bounds.x < 0 || tab.bounds.y < 0);
             if (hidden && options.requiresBackgroundRender !== false) {
                 const lastForegroundBounds = tab.lastForegroundBounds;
                 const renderOptions = {
@@ -2207,13 +2916,58 @@ export class EmbeddedBrowserManager {
                         }
                         : {}),
                 };
+                // The action follows every abort of its render request except a
+                // foreground claim. A panel reveal only takes the page off the shared
+                // background compositor; the page is now on screen and the action
+                // continues there under the caller's signal and the same deadline.
+                // The claim never restarts the operation.
+                const action = new AbortController();
+                const abortAction = (source) => {
+                    if (!action.signal.aborted)
+                        action.abort(source.reason);
+                };
+                operationSignal.addEventListener('abort', () => abortAction(operationSignal), {
+                    once: true,
+                });
+                const render = {
+                    startedAt,
+                };
                 const run = (signal) => {
+                    render.signal = signal;
+                    render.startedAt = nowMs();
+                    signal.addEventListener('abort', () => {
+                        if (!isBackgroundRenderForegroundClaim(signal))
+                            abortAction(signal);
+                    }, { once: true });
                     operationSettled = false;
-                    operationPromise = Promise.resolve().then(() => operation(signal));
+                    operationPromise = Promise.resolve().then(() => operation(action.signal));
+                    render.operation = operationPromise;
                     void operationPromise.then(markOperationSettled, markOperationSettled);
                     return operationPromise;
                 };
-                return await this.backgroundRenderHost.run(tab.controller, run, renderOptions);
+                try {
+                    return await this.backgroundRenderHost.run(tab.controller, run, renderOptions);
+                }
+                catch (renderError) {
+                    const handedOff = render.operation;
+                    // A request claimed before its operation started had no effect; it fails as before.
+                    if (!handedOff || !isBackgroundRenderForegroundClaim(render.signal))
+                        throw renderError;
+                    browserInputDiagnosticLogger.info({
+                        msg: '[EmbeddedBrowserOperation] foreground-handoff',
+                        label,
+                        tabId: tab.tabId,
+                        sessionId: tab.sessionId,
+                        durationMs: nowMs() - startedAt,
+                    });
+                    const deadlineMs = options.operationTimeoutMs ?? BROWSER_TIMEOUTS.tabOperation;
+                    return await withTimeout((timeoutSignal) => {
+                        timeoutSignal.addEventListener('abort', () => abortAction(timeoutSignal), {
+                            once: true,
+                        });
+                        return handedOff;
+                    }, Math.max(1, deadlineMs - (nowMs() - render.startedAt)), `withTabOperation[${label}]`, { signal: operationSignal });
+                }
             }
             const operationTimeoutMs = options.operationTimeoutMs ?? BROWSER_TIMEOUTS.tabOperation;
             return await withTimeout((timeoutSignal) => {
@@ -2321,6 +3075,12 @@ export class EmbeddedBrowserManager {
         this.markTabSelected(tab, preserveAgentTarget);
         tab.controller.setAudioMuted(false);
         tab.hiddenAt = null;
+        if (previousHiddenAt !== null)
+            this.notifyMiniAppAttention(tab);
+        // One page paints in the panel at a time: whatever an overlay parked is no longer what the
+        // user returns to.
+        for (const other of this.tabs.values())
+            this.clearOverlayPark(other);
         if (typeof tab.sessionId !== 'string')
             return;
         const session = this.getOrCreateSession(tab.sessionId);
@@ -2328,6 +3088,7 @@ export class EmbeddedBrowserManager {
         session.updatedAt = nowMs();
         if (hiddenMs > 0)
             this.logTabLifecycle('shown', tab, { hiddenMs });
+        this.notifyMiniAppVisibility();
     }
     markTabHidden(tab) {
         tab.controller.setAudioMuted(true);
@@ -2343,9 +3104,32 @@ export class EmbeddedBrowserManager {
                 session.updatedAt = nowMs();
             }
         }
-        if (wasVisible)
+        if (wasVisible) {
             this.logTabLifecycle('hidden', tab);
+            this.notifyMiniAppAttention(tab);
+        }
+        this.notifyMiniAppVisibility();
         this.ensureHiddenSweepTimer();
+    }
+    /**
+     * Parks a page the user is looking at while a blocking native overlay (a modal, a menu) covers
+     * the panel. Memory management still counts it as visible until another page is shown in the
+     * panel or the renderer explicitly hides it. A page that was already offscreen keeps its
+     * hidden state: only the park is recorded.
+     */
+    parkTabUnderOverlay(tab, options = {}) {
+        tab.parkedByOverlay = true;
+        if (options.markHidden !== false)
+            this.markTabHidden(tab);
+        else
+            this.notifyMiniAppVisibility();
+        this.notifyMiniAppAttention(tab);
+    }
+    clearOverlayPark(tab) {
+        if (!tab.parkedByOverlay)
+            return;
+        delete tab.parkedByOverlay;
+        this.notifyMiniAppAttention(tab);
     }
     claimLayoutCommand(tab, layoutCommandId) {
         if (typeof layoutCommandId !== 'number')
@@ -2454,7 +3238,8 @@ export class EmbeddedBrowserManager {
                     navigationHistory,
                     pageResume,
                 });
-                this.suspendedTabs.set(tab.tabId, {
+                this.pagelessTabs.set(tab.tabId, {
+                    kind: 'browser',
                     backendSelection: tab.backendSelection,
                     guestGeneration: tab.guestGeneration,
                     tabId: tab.tabId,
@@ -2473,9 +3258,9 @@ export class EmbeddedBrowserManager {
                     devicePreviewState: tab.controller.getDevicePreviewState(),
                 });
             }
-            if (this.suspendedTabs.has(tab.tabId))
+            if (this.pagelessTabs.has(tab.tabId))
                 onTelemetryTabSuspended(tab);
-            this.destroyTab(tab, reason, { preserveLogicalTab: this.suspendedTabs.has(tab.tabId) });
+            this.destroyTab(tab, reason, { preserveLogicalTab: this.pagelessTabs.has(tab.tabId) });
         }
         finally {
             this.suspendingTabIds.delete(tab.tabId);
@@ -2829,6 +3614,7 @@ export class EmbeddedBrowserManager {
      * not keep painting over the panel's placeholder. Parking only hides and
      * mutes the page; reclamation is left to the hidden-tab sweep's idle and
      * budget limits so switching back stays a live, stateful handoff.
+     * The target may be a sleeping Mini App tab that has no live page yet.
      */
     parkOtherVisibleInlineTabs(target, reason) {
         const previouslyVisibleTabs = Array.from(this.tabs.values()).filter((other) => other.tabId !== target.tabId &&
@@ -2890,7 +3676,7 @@ export class EmbeddedBrowserManager {
             await target.controller.setBounds(OFFSCREEN_BOUNDS);
             target.bounds = OFFSCREEN_BOUNDS;
             target.lastForegroundBounds = bounds;
-            this.markTabHidden(target);
+            this.parkTabUnderOverlay(target);
             return false;
         }
         if (options.shouldCommit && !options.shouldCommit()) {
@@ -2950,7 +3736,7 @@ export class EmbeddedBrowserManager {
         }
         if (typeof sessionId === 'string') {
             const selectedTabId = this.sessions.get(sessionId)?.selectedTabId;
-            if (typeof selectedTabId === 'number' && this.suspendedTabs.has(selectedTabId)) {
+            if (typeof selectedTabId === 'number' && this.suspendedBrowserTab(selectedTabId)) {
                 const resumed = await this.resumeSuspendedTab(selectedTabId, sessionId);
                 if (resumed)
                     return resumed;
@@ -2968,8 +3754,10 @@ export class EmbeddedBrowserManager {
             return await creation;
         }
         finally {
-            if (this.ensuringSessionTabs.get(sessionId) === creation) {
-                this.ensuringSessionTabs.delete(sessionId);
+            // adoptSession may have moved the pending entry to another session key.
+            for (const [key, pendingCreation] of this.ensuringSessionTabs) {
+                if (pendingCreation === creation)
+                    this.ensuringSessionTabs.delete(key);
             }
         }
     }
@@ -3056,6 +3844,24 @@ export class EmbeddedBrowserManager {
             // must not make the hidden-tab sweeper reclaim it between awaits.
             target.operationCount += 1;
             target.controller.setBackgroundThrottlingAllowed(false);
+            // A user-opened page takes the foreground before it loads, so a slow load
+            // cannot switch tabs later while the user keeps working on the source.
+            const reveal = async () => {
+                if (!canReveal() || this.blocksNativeTab(target))
+                    return false;
+                await this.backgroundRenderHost.claimForeground(target.controller);
+                const bounds = panelBounds();
+                const revealed = canReveal() && bounds
+                    ? await this.showTabExclusive(target, bounds, { shouldCommit: canReveal })
+                    : false;
+                // An uncommitted reveal must not keep the hidden page foreground-owned,
+                // or its background load is rejected and the new tab is destroyed.
+                if (!revealed && !isShownInPanel(target)) {
+                    this.backgroundRenderHost.releaseForeground(target.controller);
+                }
+                return revealed;
+            };
+            const revealedBeforeLoad = await reveal();
             const result = await this.withTabOperation(target, 'page-open', () => target.controller.loadForPresentation({ url }));
             target.lastLoadError = presentationLoadError(target.lastLoadError, result, url);
             this.refreshTabState(target);
@@ -3067,15 +3873,9 @@ export class EmbeddedBrowserManager {
                     this.adoptAgentOpenedTab(target);
                 }
             }
-            if (!canReveal() || this.blocksNativeTab(target))
-                return;
-            await this.backgroundRenderHost.claimForeground(target.controller);
-            if (canReveal()) {
-                const bounds = panelBounds();
-                // canReveal() already confirmed this is defined; re-narrow for TS.
-                if (bounds)
-                    await this.showTabExclusive(target, bounds, { shouldCommit: canReveal });
-            }
+            // A native overlay may have blocked the early reveal; retry once it is gone.
+            if (!revealedBeforeLoad)
+                await reveal();
         }
         catch {
             if (opened && this.tabs.get(opened.tabId) === opened)
@@ -3091,7 +3891,7 @@ export class EmbeddedBrowserManager {
                 opened.operationCount = Math.max(0, opened.operationCount - 1);
                 if (this.tabs.get(opened.tabId) === opened &&
                     !this.tabs.has(source.tabId) &&
-                    !this.suspendedTabs.has(source.tabId)) {
+                    !this.suspendedBrowserTab(source.tabId)) {
                     this.destroyTab(opened, 'explicit');
                 }
                 if (opened.operationCount === 0 &&
@@ -3179,7 +3979,8 @@ export class EmbeddedBrowserManager {
                 args.signal?.throwIfAborted();
                 throw new Error('Embedded browser tab creation was cancelled');
             }
-            const normalizedSessionId = args.sessionId ?? null;
+            // adoptSession may have moved this tab to another session while it was created.
+            const normalizedSessionId = creation.sessionId;
             const persistedTab = typeof normalizedSessionId === 'string' && !args.miniApp
                 ? this.registry.createTab(normalizedSessionId, {
                     ...(args.persistentTabId ? { persistentTabId: args.persistentTabId } : {}),
@@ -3271,7 +4072,7 @@ export class EmbeddedBrowserManager {
                 }
                 catch (error) {
                     if (args.miniApp && this.tabs.has(tab.tabId)) {
-                        this.destroyTab(tab, 'explicit', { revokeMiniAppOperation: false });
+                        this.destroyTab(tab, 'explicit', this.failedMiniAppPageDestroyOptions(tab));
                     }
                     throw error;
                 }
@@ -3285,20 +4086,24 @@ export class EmbeddedBrowserManager {
                 this.creatingTabs.delete(tabId);
         }
     }
+    /** The tab's page, cold-resuming a suspended Browser tab; refuses a sleeping Mini App tab. */
     async resumeSuspendedTab(tabId, requestedSessionId) {
-        const live = this.tabs.get(tabId);
+        const pageless = this.pagelessTabs.get(tabId);
+        // A Mini App reopen in progress keeps its record until the new page commits: still asleep.
+        const live = pageless?.kind === 'miniapp' ? undefined : this.tabs.get(tabId);
         if (live)
             return live;
-        const suspended = this.suspendedTabs.get(tabId);
-        if (!suspended)
+        if (!pageless)
             return null;
-        if (typeof requestedSessionId === 'string' && suspended.sessionId !== requestedSessionId) {
+        if (typeof requestedSessionId === 'string' && pageless.sessionId !== requestedSessionId) {
             throw new Error(`Embedded browser tab ${tabId} does not belong to session ${requestedSessionId}`);
         }
+        if (pageless.kind === 'miniapp')
+            throw miniAppTabAsleepError();
         const existingResume = this.resumingTabs.get(tabId);
         if (existingResume)
             return existingResume;
-        const resume = this.rehydrateSuspendedTab(suspended);
+        const resume = this.rehydrateSuspendedTab(pageless);
         this.resumingTabs.set(tabId, resume);
         try {
             return await resume;
@@ -3342,11 +4147,11 @@ export class EmbeddedBrowserManager {
                     : {}),
             ...(coldResume?.pageResume ? { pageResume: coldResume.pageResume } : {}),
         });
-        if (this.suspendedTabs.get(suspended.tabId) !== suspended) {
+        if (this.pagelessTabs.get(suspended.tabId) !== suspended) {
             this.destroyTab(tab, 'explicit');
             throw new Error(`Embedded browser tab was closed while resuming: tabId=${suspended.tabId}`);
         }
-        this.suspendedTabs.delete(suspended.tabId);
+        this.pagelessTabs.delete(suspended.tabId);
         this.coldResumeSnapshots.delete(resumeKey);
         onTelemetryTabResumed(tab);
         return tab;
@@ -3527,7 +4332,7 @@ export class EmbeddedBrowserManager {
         host.on('render-process-gone', end);
         return dispose;
     }
-    /** Observe the end of a Mini App page document: main-frame navigation, reload, crash or close. */
+    /** Observing document endings must not block a window move the user has confirmed. */
     observeMiniAppPageEnd(page, onEnd) {
         let disposed = false;
         const onNavigation = (...args) => {
@@ -3549,6 +4354,31 @@ export class EmbeddedBrowserManager {
         page.on('did-start-navigation', onNavigation);
         page.on('destroyed', end);
         page.on('render-process-gone', end);
+        return dispose;
+    }
+    /** Host subscriptions end with either their document or their serving Runtime run. */
+    observeMiniAppHostEnd(page, onEnd) {
+        const listeners = this.miniAppHostEndListeners.get(page) ?? new Set();
+        this.miniAppHostEndListeners.set(page, listeners);
+        let disposed = false;
+        let stopDocument = () => { };
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            stopDocument();
+            listeners.delete(end);
+            if (listeners.size === 0)
+                this.miniAppHostEndListeners.delete(page);
+        };
+        const end = () => {
+            if (disposed)
+                return;
+            dispose();
+            onEnd();
+        };
+        listeners.add(end);
+        stopDocument = this.observeMiniAppPageEnd(page, end);
         return dispose;
     }
     addHostWindowListener(source, event, listener) {
@@ -4696,9 +5526,18 @@ export class EmbeddedBrowserManager {
             const captureRect = tab.controller.toCapturePageRect({ x, y, width, height });
             const captured = await withAgentCursorHiddenForCapture(tab, () => wc.capturePage(captureRect));
             const image = tab.controller.normalizeCapturedImage?.(captured) ?? captured;
-            return image.isEmpty()
-                ? undefined
-                : `data:image/png;base64,${image.toPNG().toString('base64')}`;
+            if (image.isEmpty())
+                return undefined;
+            // Comment screenshots travel as chat attachments and live in the composer
+            // store, so cap the long edge and use JPEG to keep each one small.
+            const size = image.getSize();
+            const longEdge = Math.max(size.width, size.height);
+            const scaled = longEdge > COMMENT_SCREENSHOT_MAX_EDGE
+                ? image.resize(size.width >= size.height
+                    ? { width: COMMENT_SCREENSHOT_MAX_EDGE }
+                    : { height: COMMENT_SCREENSHOT_MAX_EDGE })
+                : image;
+            return `data:image/jpeg;base64,${scaled.toJPEG(COMMENT_SCREENSHOT_JPEG_QUALITY).toString('base64')}`;
         }
         catch (error) {
             logger.warn(`[EmbeddedBrowser] browser comment screenshot failed: ${safeError(error)}`);
@@ -4734,14 +5573,11 @@ export class EmbeddedBrowserManager {
             return existing;
         }
         if (typeof normalized.tabId === 'number') {
-            const resumed = await this.resumeSuspendedTab(normalized.tabId, normalized.sessionId);
-            if (resumed)
-                return resumed;
-            throw new Error(`Embedded browser tab not found: tabId=${normalized.tabId}`);
+            return this.requireResumedTab(normalized.tabId, normalized.sessionId);
         }
         if (typeof normalized.sessionId === 'string') {
             const selectedTabId = this.sessions.get(normalized.sessionId)?.selectedTabId;
-            if (typeof selectedTabId === 'number' && this.suspendedTabs.has(selectedTabId)) {
+            if (typeof selectedTabId === 'number' && this.pagelessTabs.has(selectedTabId)) {
                 const resumed = await this.resumeSuspendedTab(selectedTabId, normalized.sessionId);
                 if (resumed)
                     return resumed;
@@ -4771,6 +5607,12 @@ export class EmbeddedBrowserManager {
             ...(persisted ? { persistentTabId: persisted.persistentTabId } : {}),
         }));
     }
+    async requireResumedTab(tabId, requestedSessionId) {
+        const resumed = await this.resumeSuspendedTab(tabId, requestedSessionId);
+        if (resumed)
+            return resumed;
+        throw new Error(`Embedded browser tab not found: tabId=${tabId}`);
+    }
     resolveSelectedTabBySession(sessionId) {
         const session = this.sessions.get(sessionId);
         if (session?.selectedTabId !== null && session?.selectedTabId !== undefined) {
@@ -4778,7 +5620,7 @@ export class EmbeddedBrowserManager {
             if (selected?.sessionId === sessionId && !this.isUncommittedMiniAppTab(selected)) {
                 return selected;
             }
-            if (this.suspendedTabs.get(session.selectedTabId)?.sessionId === sessionId)
+            if (this.pagelessTabs.get(session.selectedTabId)?.sessionId === sessionId)
                 return null;
         }
         for (const tab of this.tabs.values()) {
@@ -4848,7 +5690,7 @@ export class EmbeddedBrowserManager {
         }
         if (!this.isSessionShownInPanel(sessionId)) {
             const live = this.tabs.get(agentTabId);
-            const suspended = this.suspendedTabs.get(agentTabId);
+            const suspended = this.suspendedBrowserTab(agentTabId);
             if (live?.sessionId === sessionId) {
                 this.markTabSessionSelected(live);
             }
@@ -4902,8 +5744,8 @@ export class EmbeddedBrowserManager {
             const agentTab = this.tabs.get(agentTabId);
             if (agentTab?.sessionId === sessionId)
                 return agentTab;
-            if (this.suspendedTabs.get(agentTabId)?.sessionId === sessionId) {
-                return this.requireBrowserTab({ sessionId, tabId: agentTabId });
+            if (this.pagelessTabs.get(agentTabId)?.sessionId === sessionId) {
+                return this.requireResumedTab(agentTabId, sessionId);
             }
         }
         const pending = this.ensuringSessionTabs.get(sessionId);
@@ -4914,8 +5756,8 @@ export class EmbeddedBrowserManager {
             return selected;
         const selectedTabId = this.sessions.get(sessionId)?.selectedTabId;
         if (typeof selectedTabId === 'number' &&
-            this.suspendedTabs.get(selectedTabId)?.sessionId === sessionId) {
-            return this.requireBrowserTab({ sessionId, tabId: selectedTabId });
+            this.pagelessTabs.get(selectedTabId)?.sessionId === sessionId) {
+            return this.requireResumedTab(selectedTabId, sessionId);
         }
         const ordinary = this.resolveOrdinaryTabBySession(sessionId);
         if (ordinary) {
@@ -5185,8 +6027,55 @@ function miniAppTargetKey(sessionId, pluginId) {
 function isShownInPanel(tab) {
     return !tab.detachedWindow && tab.hiddenAt == null && tab.bounds.x >= 0 && tab.bounds.y >= 0;
 }
+/**
+ * Whether memory management treats a Mini App page as in view: painted in the File Panel, parked
+ * only because a blocking overlay covers the panel, or in a pop-out window that is shown and not
+ * minimized. A minimized or hidden pop-out is hidden like a panel page and may sleep; its window
+ * stays for the page to reopen in. Minimizing the main window hides nothing.
+ */
+function isMiniAppTabInView(tab) {
+    const window = tab.detachedWindow;
+    if (window)
+        return isDetachedWindowInView(window);
+    return tab.parkedByOverlay === true || isShownInPanel(tab);
+}
+/** When a Mini App page left view (creation time for a page never shown). */
+function miniAppHiddenAt(tab) {
+    return tab.hiddenAt ?? tab.createdAt;
+}
+/** pathname + search + hash of `url` when it is on `origin`; a restore reopens it there. */
+function sameOriginPath(url, origin) {
+    try {
+        const parsed = new URL(url);
+        if (parsed.origin !== origin)
+            return undefined;
+        return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    }
+    catch {
+        return undefined;
+    }
+}
+function sleptResult(sleptPages, miniApp) {
+    return miniApp?.displayName !== undefined
+        ? { slept: true, sleptPages, displayName: miniApp.displayName }
+        : { slept: true, sleptPages };
+}
 function miniAppTabNotFoundError() {
     return Object.assign(new Error('Mini App tab was not found'), { code: 'not_found' });
+}
+/** A restore whose sleeping tab was closed (tab, session or plugin) before its page committed. */
+export function miniAppTabClosedDuringRestoreError() {
+    return Object.assign(new Error('Mini App tab was closed before its restore finished'), {
+        code: 'not_found',
+    });
+}
+/**
+ * Reopening counts against the Mini App limit and Agent opens never take a slot from another
+ * App, so Main neither reopens a sleeping tab for an Agent Browser action nor moves the
+ * selection elsewhere.
+ */
+function miniAppTabAsleepError() {
+    return new Error('MINIAPP_TAB_ASLEEP: The selected Mini App tab is asleep to save memory; reopen it with the miniapp tool before using Browser on it');
 }
 function assertMiniAppGenerationCurrent(isGenerationCurrent) {
     if (!isGenerationCurrent)
@@ -5221,11 +6110,16 @@ function hasLoadedBrowserPage(url) {
     return normalized.length > 0 && !normalized.startsWith('about:blank');
 }
 let embeddedBrowserManager = null;
+const managedMiniAppAttentionListeners = new Set();
 export function getEmbeddedBrowserManager() {
     if (!embeddedBrowserManager) {
         const manager = new EmbeddedBrowserManager({
             registry: createPersistentBrowserRegistry(),
             isAgentCursorEnabled: () => getConfig().beta.browserAgentCursor === true,
+            onMiniAppAttentionChanged: () => {
+                for (const listener of managedMiniAppAttentionListeners)
+                    listener();
+            },
         });
         embeddedBrowserManager = manager;
         setBrowserTelemetryProcessSource(() => manager.getBrowserProcessIds());
@@ -5252,6 +6146,23 @@ export function destroyManagedMiniAppTabs(pluginId) {
 export function syncManagedMiniAppLoopbackCredential(pluginId, credential) {
     embeddedBrowserManager?.syncMiniAppLoopbackCredential(pluginId, credential);
 }
+/** Puts hidden Mini App pages to sleep; no Browser owner means no page to sleep. */
+export function sleepManagedMiniAppTabs(input) {
+    if (embeddedBrowserManager)
+        return embeddedBrowserManager.sleepMiniAppTabs(input);
+    return input.sessionId === undefined
+        ? { slept: true, sleptPages: 0 }
+        : { slept: false, refusal: 'not_found' };
+}
+/** Every Mini App tab Main holds, without instantiating the Browser owner. */
+export function managedMiniAppAttentionSnapshot() {
+    return embeddedBrowserManager?.miniAppAttentionSnapshot() ?? { tabs: [], atMs: nowMs() };
+}
+/** Called synchronously on every Mini App tab visibility, sleep, creation or close. */
+export function subscribeManagedMiniAppAttention(listener) {
+    managedMiniAppAttentionListeners.add(listener);
+    return () => managedMiniAppAttentionListeners.delete(listener);
+}
 export async function openEmbeddedBrowserExternally(target) {
     const state = getEmbeddedBrowserManager().getState(target);
     const tabs = state.tabs;
@@ -5262,4 +6173,43 @@ export async function openEmbeddedBrowserExternally(target) {
         return { success: true, url };
     }
     return { success: false, error: 'No navigated embedded browser tab' };
+}
+/** A sleeping tab as a Mini App surface; `detached` while it still has its pop-out window. */
+function sleepingMiniAppSurfaceSummary(record) {
+    return {
+        tabId: record.tabId,
+        title: record.miniApp.displayName ?? record.miniApp.pluginId,
+        surfaceKind: 'miniapp',
+        miniApp: record.miniApp,
+        detached: record.detachedWindow !== undefined,
+        presentationRevision: record.presentationRevision,
+        sleeping: true,
+    };
+}
+/** Same fields as a live Mini App tab's state entry, with `sleeping: true` and no page state. */
+function sleepingMiniAppTabSummary(record) {
+    return {
+        ...sleepingMiniAppSurfaceSummary(record),
+        persistentTabId: null,
+        active: false,
+        canGoBack: false,
+        canGoForward: false,
+        isLoading: false,
+        annotationEnabled: false,
+        zoomFactor: record.zoomFactor,
+        devicePreviewMode: record.devicePreviewMode,
+        lastLoadError: null,
+    };
+}
+/** `path` resolved against the launch origin; undefined when it would leave that origin. */
+function resolveSameOriginUrl(origin, path) {
+    if (!path.startsWith('/') || path.startsWith('//'))
+        return undefined;
+    try {
+        const resolved = new URL(path, `${origin}/`);
+        return resolved.origin === origin ? resolved.href : undefined;
+    }
+    catch {
+        return undefined;
+    }
 }

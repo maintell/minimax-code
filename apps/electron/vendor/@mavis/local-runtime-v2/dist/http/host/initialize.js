@@ -93,6 +93,7 @@ export function createLocalRuntimeHost(options) {
         bashCompletionCorrelation,
         configUpdater,
         hostDiagnosticsProvider: options.hostDiagnosticsProvider,
+        remoteSessionHost: options.remoteSessionHost,
         skillRegistryDiagnostics: options.skillRegistryDiagnostics,
         skillEnabledState: options.skillEnabledState,
         skillRuntime: options.skillRuntime,

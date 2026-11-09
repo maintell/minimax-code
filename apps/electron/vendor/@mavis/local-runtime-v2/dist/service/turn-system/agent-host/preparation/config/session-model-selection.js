@@ -52,19 +52,42 @@ export async function resolveTurnModelSelection(input) {
     if (outcome.kind === 'passthrough' && outcome.reason === 'unmanaged_route') {
         return gateUnmanagedRoute(input, selection, log, from);
     }
-    if (outcome.kind === 'passthrough' || !isReplaceable(input, selection)) {
-        // Not ours to decide: a frozen official selection, or an official route
-        // that lists nothing. Send it unchanged; record why.
-        const reason = outcome.kind === 'passthrough' ? outcome.reason : 'frozen';
-        logModelGateOutcome(input.logger, { outcome: 'passthrough', reason, ...log, model: from });
+    if (outcome.kind === 'replaced' && !isReplaceable(input, selection)) {
+        return keepUnreplaceable(input, selection, outcome, { ...log, model: from });
+    }
+    if (outcome.kind === 'passthrough') {
+        // Not ours to decide: an official route that lists nothing. Send it unchanged.
+        logModelGateOutcome(input.logger, {
+            outcome: 'passthrough',
+            reason: outcome.reason,
+            ...log,
+            model: from,
+        });
         return selection;
     }
     if (repairsSession(input, selection))
-        await repairSession(input, selection, outcome.model);
+        await repairSession(input, selection, outcome.model, outcome.cause);
     const to = `${outcome.model.providerId}/${outcome.model.modelId}`;
-    input.logger?.info?.({ ...log, tier: outcome.tier, from_model: from, to_model: to }, 'turn_model_replaced');
+    input.logger?.info?.({ ...log, tier: outcome.tier, cause: outcome.cause, from_model: from, to_model: to }, 'turn_model_replaced');
     // The retired model's variant/effort/context do not carry over.
     return { ...outcome.model, source: selection.source };
+}
+/**
+ * A frozen selection is never rewritten. A retired official model is sent unchanged for the
+ * upstream to decide; a withdrawn agent model access provider cannot run at all, so this
+ * Turn uses the replacement without touching the stored definition.
+ */
+function keepUnreplaceable(input, selection, outcome, log) {
+    if (outcome.cause === 'unavailable') {
+        logModelGateOutcome(input.logger, {
+            outcome: 'replaced_unpersisted',
+            reason: 'unavailable',
+            ...log,
+        });
+        return { ...outcome.model, source: selection.source };
+    }
+    logModelGateOutcome(input.logger, { outcome: 'passthrough', reason: 'frozen', ...log });
+    return selection;
 }
 /**
  * Retirement only concerns official catalogs, so a non-official route keeps
@@ -136,7 +159,7 @@ function fallbackTiers(input, source) {
     }
     return source === 'session_override' ? [configDefault] : [];
 }
-async function repairSession(input, stale, replacement) {
+async function repairSession(input, stale, replacement, cause = 'retired') {
     if (!input.repair)
         return;
     await input.repair.repairSessionModel({
@@ -151,9 +174,15 @@ async function repairSession(input, stale, replacement) {
         effectiveModel: `${replacement.providerId}/${replacement.modelId}`,
         effectiveModelVariant: null,
         effectiveModelThinking: null,
-        ...(stale.modelId === replacement.modelId
+        ...(stale.modelId === replacement.modelId && cause === 'retired'
             ? {}
-            : { replacedFrom: { providerId: stale.providerId, modelId: stale.modelId } }),
+            : {
+                replacedFrom: {
+                    providerId: stale.providerId,
+                    modelId: stale.modelId,
+                    ...(cause === 'unavailable' ? { reason: 'unavailable' } : {}),
+                },
+            }),
     });
 }
 /**

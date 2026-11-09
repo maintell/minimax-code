@@ -28,6 +28,7 @@ import { handleLocalRuntimeRequest, isLocalRuntimeReady } from "../local-runtime
 import { setRemoteAccessEnabled } from "../power";
 import { createRcAuditLogger } from "./audit-log";
 import { getHostDeviceName } from "./device-name";
+import { registerRemoteSessionRcDeviceIdProvider } from "../local-runtime/utility/remote-session-broker";
 import { createRemoteControlGlobalEventSource } from "./global-events";
 let remoteControlBridgeModulePromise = null;
 function importEsm(specifier) {
@@ -227,6 +228,8 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     const rc = proxy ?? buildDefaultProxy(log, await loadBridge());
     activeProxy = rc;
     activeLogger = log;
+    // The Runtime's mavis tool reads controlled devices' sessions as this desktop.
+    registerRemoteSessionRcDeviceIdProvider(() => rc.getDeviceId());
     ipcMain.handle(IPC_CHANNELS.RC_CONNECT, async () => {
         log.info('[rc.ipc] rc:connect invoked');
         try {

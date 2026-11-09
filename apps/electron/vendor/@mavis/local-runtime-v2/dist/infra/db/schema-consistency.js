@@ -2,7 +2,7 @@ import { EXPECTED_TABLES, SESSION_QUERY_INDEX_NAMES, AGENT_COLUMN_DEFINITIONS, M
 import { readName, readNullableString, readNumber, readSql, readString, } from './schema-consistency.metadata-rows.js';
 import { readIndexColumns, readIndexDefinition } from './schema-consistency.index-metadata.js';
 import { canonicalizeSqlContract as compactSql, canonicalizeSqlDefault, canonicalizeSqlDefinition as normalizeDefinition, canonicalizeSqlExpression, extractSqlCheckContracts, } from './sql-contract.js';
-import { SESSION_STORAGE_RAW_OBJECTS, SESSION_STORAGE_SCHEMA, SESSION_STORAGE_TABLE_METADATA, SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA, SESSION_STORAGE_TRIGGER_METADATA, SESSION_STORAGE_VIRTUAL_TABLE_METADATA, } from './schema/session-storage.js';
+import { PPT_PREVIEW_TABLE_METADATA, SESSION_STORAGE_RAW_OBJECTS, SESSION_STORAGE_SCHEMA, SESSION_STORAGE_TABLE_METADATA, SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA, SESSION_STORAGE_TRIGGER_METADATA, SESSION_STORAGE_VIRTUAL_TABLE_METADATA, } from './schema/session-storage.js';
 import { MINIAPP_STATE_TABLE_METADATA } from './schema/miniapp.js';
 import { SESSION_CLIO_INDEX_NAMES, SESSION_CLIO_TABLE_NAMES } from './schema/session-clio.js';
 import { LEGACY_HISTORY_NOTICE_REPAIR_CUTOFF_TABLE } from './legacy-history-notice-cutoff.js';
@@ -179,6 +179,9 @@ const GOAL_TABLE_MIGRATIONS = new Map([
 const TABLE_MIGRATIONS = new Map([
     ...GOAL_TABLE_MIGRATIONS,
     ['local_runtime_plugin_miniapp_permission', 50],
+    ['local_runtime_ppt_preview_artifacts', 54],
+    ['local_runtime_ppt_preview_requests', 54],
+    ['local_runtime_ppt_preview_events', 54],
 ]);
 function shouldSkipRequiredTableCheck(db, table) {
     const tableMigration = TABLE_MIGRATIONS.get(table);
@@ -676,7 +679,7 @@ function allPresentSessionTables(db) {
     ];
 }
 function activeSessionTables(db) {
-    return SESSION_TABLE_CONFIGS.filter((table) => baseSessionTableActive(db, table.name) && lateSessionTableActive(db, table.name));
+    return [...SESSION_TABLE_CONFIGS, ...PPT_PREVIEW_TABLE_METADATA].filter((table) => baseSessionTableActive(db, table.name) && lateSessionTableActive(db, table.name));
 }
 function baseSessionTableActive(db, tableName) {
     return ((queueConvergenceApplied(db) || !QUEUE_CONVERGENCE_TABLE_NAMES.has(tableName)) &&
@@ -685,6 +688,8 @@ function baseSessionTableActive(db, tableName) {
         (taskSessionBindingsApplied(db) || !TASK_SESSION_BINDING_TABLE_NAMES.has(tableName)));
 }
 function lateSessionTableActive(db, tableName) {
+    if (tableName.startsWith('local_runtime_ppt_preview_'))
+        return migrationVersionApplied(db, 54);
     if (tableName === 'local_runtime_session_sidechats')
         return sessionSideChatsSchemaActive(db);
     if (QUEUE_PAUSE_TABLE_NAMES.has(tableName))

@@ -201,7 +201,6 @@ const CHECKPOINT_STOP_REASONS = new Set([
 ]);
 const CHECKPOINT_CANDIDATES = new Set([
     'h0',
-    'htrim',
     'hall',
     'hvideo',
     'hmid',
@@ -215,7 +214,7 @@ const CHECKPOINT_ATTEMPT_OUTCOMES = new Set([
     'failed',
 ]);
 const STABLE_COMPACTION_FAILURES = [
-    ['INVALID_HISTORY', 'tool_trim'],
+    ['INVALID_HISTORY', 'history'],
     ['INVALID_CHECKPOINT', 'llm_checkpoint'],
     ['CHECKPOINT_PROVIDER_FAILED', 'llm_checkpoint'],
     ['COMPACTION_INPUT_TOO_LARGE', 'llm_checkpoint'],
@@ -508,21 +507,15 @@ export function captureContextCompactionResult(result, expectedMessagesBefore) {
     }).value;
 }
 function validateCompletedCompaction(snapshot, expectedMessagesBefore) {
-    if (snapshot.method !== 'tool_archive' &&
-        snapshot.method !== 'tool_trim' &&
-        snapshot.method !== 'llm_checkpoint') {
+    if (snapshot.method !== 'llm_checkpoint') {
         throw new ContextCompactionResultValidationError('method');
     }
-    if ((snapshot.method !== 'llm_checkpoint' && Object.hasOwn(snapshot, 'summary')) ||
-        (snapshot.method === 'llm_checkpoint' && typeof snapshot.summary !== 'string')) {
+    if (typeof snapshot.summary !== 'string') {
         throw new ContextCompactionResultValidationError('summary');
     }
     validateHmidOverflowRecovery(snapshot);
     validateCompletedTokenUsage(snapshot);
     validateReplacement(snapshot, expectedMessagesBefore);
-    if (snapshot.method !== 'llm_checkpoint') {
-        validateReplacementSourceIndexes(snapshot);
-    }
     validateCounts(snapshot, [
         'tokensBefore',
         'tokensAfter',
@@ -539,7 +532,7 @@ function validateCompletedTokenUsage(snapshot) {
 function validateHmidOverflowRecovery(snapshot) {
     if (!Object.hasOwn(snapshot, 'hmidOverflowRecovered'))
         return;
-    if (snapshot.method === 'llm_checkpoint' && snapshot.hmidOverflowRecovered === true)
+    if (snapshot.hmidOverflowRecovered === true)
         return;
     throw new ContextCompactionResultValidationError('hmidOverflowRecovered');
 }
@@ -563,25 +556,9 @@ export function createCompactionReplaceMetadata(result, phase, attemptId) {
         messagesAfter: result.messagesAfter,
         compactionPhase: phase,
         ...(result.hmidOverflowRecovered ? { hmidOverflowRecovered: true } : {}),
-        ...(result.method !== 'llm_checkpoint'
-            ? { replacementSourceIndexes: [...result.replacementSourceIndexes] }
-            : {}),
         ...(contextUsage === undefined ? {} : { contextUsage }),
         ...compactionTokenUsageMetadata(tokenUsage),
     }).value;
-}
-function validateReplacementSourceIndexes(result) {
-    if (!Array.isArray(result.replacementSourceIndexes) ||
-        result.replacementSourceIndexes.length !== result.replacementMessages.length) {
-        throw new ContextCompactionResultValidationError('replacementSourceIndexes');
-    }
-    let previous = -1;
-    result.replacementSourceIndexes.forEach((index) => {
-        if (!Number.isSafeInteger(index) || index <= previous || index >= result.messagesBefore) {
-            throw new ContextCompactionResultValidationError('replacementSourceIndexes');
-        }
-        previous = index;
-    });
 }
 function validateReplacement(result, expectedMessagesBefore) {
     if (!Array.isArray(result.replacementMessages)) {
@@ -656,9 +633,7 @@ function readCompactionLifecycleCounts(value) {
         : undefined;
 }
 function readCompactionMethod(value) {
-    return value === 'tool_archive' || value === 'tool_trim' || value === 'llm_checkpoint'
-        ? value
-        : undefined;
+    return value === 'llm_checkpoint' ? value : undefined;
 }
 export function readPostCompactionContextUsage(value) {
     if (!isRecord(value) || Reflect.get(value, 'totalCountSource') !== 'LOCAL_ESTIMATE') {

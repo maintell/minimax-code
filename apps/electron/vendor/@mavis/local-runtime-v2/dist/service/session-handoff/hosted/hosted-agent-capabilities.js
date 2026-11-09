@@ -166,6 +166,7 @@ function resolveHostedToolSources(host, restrictions, input) {
     const builtinCapabilities = applyHostedCapabilityRestrictions(input.builtinCapabilities ?? resolveAgentCapabilities(), restrictions);
     return host.buildOwnerTurnToolSources({
         session: toLocalSessionRecord(input.session),
+        turnId: input.turnId,
         resourceAgentName: input.resourceAgentName,
         ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
         ...(input.expectedAgentInstanceId
@@ -180,6 +181,7 @@ function resolveHostedToolSources(host, restrictions, input) {
         cronEnabled: !restrictions.disableCron,
         ...(restrictions.resumeCodexAvailable === true ? { resumeCodexAvailable: true } : {}),
         ...(input.miniappAvailable === true ? { miniappAvailable: true } : {}),
+        ...(input.pptPreviewAvailable === true ? { pptPreviewAvailable: true } : {}),
         ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
     });
 }
@@ -204,12 +206,6 @@ function hostedToolSkillOptions(restrictions, input) {
         ...(input.agentMemoryReadNames === undefined
             ? {}
             : { memoryReadAgentNames: input.agentMemoryReadNames }),
-        ...(input.allowedSkillNames === undefined
-            ? {}
-            : { allowedSkillNames: input.allowedSkillNames }),
-        ...(input.allowedExtensionSkillNames === undefined
-            ? {}
-            : { allowedExtensionSkillNames: input.allowedExtensionSkillNames }),
         ...(restrictions.disabledBuiltinSkillNames
             ? { disabledBuiltinSkillNames: restrictions.disabledBuiltinSkillNames }
             : {}),

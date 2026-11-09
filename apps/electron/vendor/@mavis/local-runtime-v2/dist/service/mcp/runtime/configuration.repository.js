@@ -1,13 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { LocalMcpSettingsError } from '../errors.js';
 import { readRecord, normalizeServerName, normalizeServerConfig } from './config.js';
 import { isRetiredLegacyMatrixMcpServerConfig } from './builtin-matrix.js';
 import { isRetiredLegacyCuMcpServerConfig } from './retired-cu.js';
 import { assertStoredMcpServerConfig, replacementFileMode } from './settings-config.js';
-export async function readLocalMcpFile(filePath, failClosed = false) {
+/**
+ * The legacy `auth` field is accepted and ignored: it never reaches the normalized
+ * configuration, so the next write strips it (plan §6.1).
+ */
+export async function readLocalMcpFile(filePath, failClosed = false, onLegacyAuthIgnored) {
     let lastReadFile;
     try {
         const parsed = JSON.parse(await readFile(filePath, 'utf8'));
@@ -18,7 +22,7 @@ export async function readLocalMcpFile(filePath, failClosed = false) {
             return lastReadFile;
         }
         const root = parsed;
-        const { normalized, retiredLegacyServer } = normalizeDocument(root, failClosed);
+        const { normalized, retiredLegacyServer } = normalizeDocument(root, failClosed, onLegacyAuthIgnored);
         lastReadFile = { ...root, mcpServers: normalized };
         if (retiredLegacyServer) {
             // Retirement is best-effort: a failed cleanup must not discard readable servers.
@@ -72,7 +76,7 @@ export async function writeLocalMcpFile(filePath, file) {
         throw new LocalMcpSettingsError(500, 'The MCP configuration could not be saved.', 'MCP_STORAGE_WRITE_FAILED');
     }
 }
-function normalizeDocument(root, failClosed) {
+function normalizeDocument(root, failClosed, onLegacyAuthIgnored) {
     const rawServers = root['mcpServers'];
     const servers = readRecord(rawServers);
     if (failClosed && rawServers !== undefined && !servers) {
@@ -82,9 +86,10 @@ function normalizeDocument(root, failClosed) {
     const normalizedNames = new Set();
     let retiredLegacyServer = false;
     for (const [name, config] of Object.entries(servers ?? {})) {
-        const rawConfig = validateEntry(config, failClosed);
-        if (!rawConfig)
+        const validConfig = validateEntry(config, failClosed);
+        if (!validConfig)
             continue;
+        const rawConfig = withoutLegacyAuth(validConfig, onLegacyAuthIgnored);
         const serverName = normalizeServerName(name);
         if (failClosed && normalizedNames.has(serverName))
             throw new SyntaxError('MCP server names must remain unique after normalization.');
@@ -101,6 +106,12 @@ function normalizeDocument(root, failClosed) {
     }
     return { normalized, retiredLegacyServer };
 }
+function withoutLegacyAuth(config, onIgnored) {
+    const { auth, ...rest } = config;
+    if (auth !== undefined)
+        onIgnored?.();
+    return rest;
+}
 function validateEntry(config, failClosed) {
     const rawConfig = readRecord(config);
     if (!rawConfig) {
@@ -116,5 +127,18 @@ function isRetiredServer(name, config) {
     return (isRetiredLegacyMatrixMcpServerConfig(name, config) ||
         isRetiredLegacyCuMcpServerConfig(name, config) ||
         (name === 'nd' && config.builtin === true));
+}
+/** The ignored legacy `auth` field is stripped from every server on write (plan §6.1). */
+export async function writeLocalMcpRawDocument(filePath, document) {
+    const servers = readRecord(document['mcpServers']) ?? {};
+    const stripped = {
+        ...document,
+        mcpServers: Object.fromEntries(Object.entries(servers).map(([name, config]) => {
+            const record = readRecord(config);
+            return [name, record ? withoutLegacyAuth(record, undefined) : config];
+        })),
+    };
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, `${JSON.stringify(stripped, null, 2)}\n`, 'utf8');
 }
 //# sourceMappingURL=configuration.repository.js.map

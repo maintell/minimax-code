@@ -23,8 +23,6 @@ export function statusFor(state, diagnostics, pluginId) {
         phase: statusPhase(state, pluginId, active),
         ...(active ? { active: active.view } : {}),
         retiringGenerationIds: retiring.map((generation) => generation.view.miniAppGeneration),
-        leaseCount: (active?.leases.size ?? 0) +
-            retiring.reduce((count, generation) => count + generation.leases.size, 0),
         ...(failureCode ? { failureCode } : {}),
         logs: diagnostics.logs(pluginId),
         diagnostics: diagnostics.inspect(pluginId, active?.view.processGeneration, failureCode),

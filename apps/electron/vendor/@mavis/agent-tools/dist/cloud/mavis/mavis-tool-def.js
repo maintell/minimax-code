@@ -120,4 +120,27 @@ EXAMPLES
         args: Type.Optional(MavisArgsSchema),
     }),
 };
+const MAVIS_TEAM_RECOMMENDATION = '; for team plans use the standalone `team` tool.';
+const MAVIS_COMMAND_TEAM_RECOMMENDATION = ' Team plans use the standalone `team` tool; sending messages to peers';
+/**
+ * Cloud sessions with an explicit Team disable policy keep `mavis` but must
+ * not be pointed at the removed `team` tool. Cloud Runtime selects this
+ * variant per session; the default definition stays unchanged.
+ */
+export const MavisBaseToolDefWithoutTeam = {
+    ...MavisBaseToolDef,
+    description: replaceOnce(MavisBaseToolDef.description, MAVIS_TEAM_RECOMMENDATION, '.'),
+    schema: Type.Object({
+        command: Type.String({
+            description: replaceOnce(MavisBaseToolDef.schema.properties.command.description ?? '', MAVIS_COMMAND_TEAM_RECOMMENDATION, ' Sending messages to peers'),
+        }),
+        args: Type.Optional(MavisArgsSchema),
+    }),
+};
+function replaceOnce(text, search, replacement) {
+    if (!text.includes(search)) {
+        throw new Error(`MavisBaseToolDefWithoutTeam: missing Team recommendation: ${search}`);
+    }
+    return text.replace(search, replacement);
+}
 //# sourceMappingURL=mavis-tool-def.js.map

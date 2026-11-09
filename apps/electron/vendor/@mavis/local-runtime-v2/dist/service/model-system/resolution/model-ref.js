@@ -9,6 +9,23 @@ const THINKING_VARIANT = 'thinking';
 const NONE_THINKING_VARIANT = '';
 const APOLLO_NONE_THINKING_VARIANT = 'none-thinking';
 const PI_THINKING_LEVELS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+/** Gemini thinking efforts: the `thinkingLevel` values every Gemini 3+ text model accepts. */
+const GEMINI_THINKING_LEVELS = new Set(['low', 'medium', 'high']);
+/**
+ * Pi's level below `low`. Gemini has no such universal level (several models
+ * return 400), so a Gemini model never offers or accepts it.
+ */
+const GEMINI_REJECTED_EFFORT = 'minimal';
+/** True for an effort a Gemini (`google-generative-ai`) model must not offer. */
+export function isGeminiRejectedEffort(api, effort) {
+    return api === 'google-generative-ai' && effort.trim().toLowerCase() === GEMINI_REJECTED_EFFORT;
+}
+/** Rejects a Gemini model configuration that offers an effort below `low`. */
+export function assertGeminiEffortOptions(api, effortOptions) {
+    if (!effortOptions?.some((effort) => isGeminiRejectedEffort(api, effort)))
+        return;
+    throw new LocalModelProviderError(400, 'Gemini thinking effort options must be low, medium or high', 'VALIDATION_ERROR');
+}
 export const MINIMAX_M3_MODEL_ID = 'MiniMax-M3';
 const SELECTED_THINKING_EFFORT_CAPABILITY = 'selected_thinking_effort';
 const SUPPORT_JSON_OBJECT_OUTPUT_CAPABILITY = 'support_json_object_output';
@@ -300,6 +317,10 @@ function resolveDisabledThinkingProtocol(api, effort) {
             completionsThinkingFormat: 'openai',
         };
     }
+    // Pi's Google transport sends the disabled thinkingConfig for a reasoning model
+    // with no level: `thinkingBudget: 0` on Gemini 2.x, the lowest level on 3+.
+    if (api === 'google-generative-ai')
+        return { ...base, requestPatch: {} };
     return { ...base, requestPatch: { reasoning: { effort: 'none' } } };
 }
 export function resolveModelThinkingProtocol(api, value, modelId) {
@@ -313,6 +334,17 @@ export function resolveModelThinkingProtocol(api, value, modelId) {
     if (disabledProtocol)
         return disabledProtocol;
     const piLevel = PI_THINKING_LEVELS.has(effort) ? effort : 'high';
+    if (api === 'google-generative-ai') {
+        assertGeminiEffortOptions(api, [effort]);
+        // Pi derives `thinkingConfig` from the level map; stronger or custom efforts
+        // use Gemini's highest universal level.
+        return {
+            effort,
+            piLevel,
+            thinkingLevelMap: { [piLevel]: GEMINI_THINKING_LEVELS.has(effort) ? effort : 'high' },
+            requestPatch: {},
+        };
+    }
     const base = {
         effort,
         piLevel,
@@ -349,6 +381,9 @@ export function capabilitiesFromModelConfig(modelConfig) {
         ...normalizeLocalFileApiCapabilities(modelConfig?.capabilities),
         ...normalizeLocalMultimodalLimitCapabilities(modelConfig?.capabilities),
         ...maxImagesPerRequestCapability(modelConfig?.capabilities?.max_images_per_request),
+        ...(typeof modelConfig?.capabilities?.thinking_prefix_binding === 'boolean'
+            ? { thinking_prefix_binding: modelConfig.capabilities.thinking_prefix_binding }
+            : {}),
         ...(modelConfig?.capabilities?.support_json_object_output === true
             ? { [SUPPORT_JSON_OBJECT_OUTPUT_CAPABILITY]: true }
             : {}),

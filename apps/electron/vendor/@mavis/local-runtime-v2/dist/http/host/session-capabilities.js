@@ -51,6 +51,15 @@ export function createV1SessionCompatibility(host) {
                 const record = await resolveSessionLocalAsset({ dataDir: host.dataDir, sessionId, assetId });
                 return record ? toSessionAssetResolution(record) : undefined;
             },
+            importGenerated: async ({ sessionId, path, fileName, mimeType, generatedBy }) => toSessionAssetResolution(await registerSessionLocalAsset({
+                dataDir: host.dataDir,
+                sessionId,
+                sourcePath: path,
+                fileName,
+                mimeType,
+                kind: 'image',
+                generatedBy,
+            })),
         },
         diff: {
             capability: diffCapability,

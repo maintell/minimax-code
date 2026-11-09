@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { IDE_APPS_CACHE_TTL_MS, IDE_APP_RESOLVE_CONCURRENCY, IDE_CATALOG, IDE_PATH_PROBE_CONCURRENCY, IDE_UNAVAILABLE_REASON, isPresentationApp, isPresentationFile, } from './catalog.js';
+import { toNativeWindowsDrivePath } from '../files/path-utils.js';
 import { pathExists, IdeLauncherError, resolvePath, assertWithinWorkspace, assertRegularFileExists, expandTilde, } from './launch-target.js';
 const execFile = promisify(execFileCallback);
 function stripIdeLaunchFields(app) {
@@ -173,7 +174,9 @@ export class IdeLauncher {
         const workspaceRoot = workspaceDir
             ? await this.resolveWorkspaceDirectory(workspaceDir)
             : undefined;
-        const trimmedPath = filePath?.trim();
+        const rawPath = filePath?.trim();
+        // Models may write file-URI style drive paths (/D:/x); win32 maps them to D:\x.
+        const trimmedPath = rawPath ? toNativeWindowsDrivePath(rawPath) : rawPath;
         if (!trimmedPath) {
             if (workspaceRoot && !fileOnly)
                 return { workspaceRoot };

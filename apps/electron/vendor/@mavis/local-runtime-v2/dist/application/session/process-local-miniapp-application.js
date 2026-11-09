@@ -1,8 +1,12 @@
 import { parseMiniAppPermissionId, } from '@mavis/shared/miniapp-surface';
 import { classifyMiniAppCandidateChange, miniAppBusyReason, } from '../../service/miniapp/index.js';
 import { PluginSystemError, } from '../../service/plugin-system/index.js';
-/** Projects installed MiniApp definitions and Supervisor state for the Electron bridge. */
-export function createProcessLocalMiniAppApplication(plugins, supervisor) {
+/**
+ * Projects installed MiniApp definitions and Supervisor state for the Electron bridge. Every
+ * path here is the renderer's, so an open is the user's: it counts as attention and may put the
+ * least recently attended Mini App to sleep for room.
+ */
+export function createProcessLocalMiniAppApplication(plugins, supervisor, memory) {
     if (!supervisor)
         return undefined;
     const applying = new Set();
@@ -45,10 +49,14 @@ export function createProcessLocalMiniAppApplication(plugins, supervisor) {
         };
     };
     const launch = (projection, status) => {
-        const run = currentRun(projection.available.candidate.pluginId, status);
+        const pluginId = projection.available.candidate.pluginId;
+        const run = currentRun(pluginId, status);
         if (!run)
             throw applicationError(status?.failureCode ?? 'RUNTIME_FAILED');
-        return { miniApp: summary(projection, status), launch: run };
+        return {
+            miniApp: summary(projection, status, memory?.view().entries.find((entry) => entry.pluginId === pluginId)),
+            launch: run,
+        };
     };
     const runPluginAction = async (action) => {
         try {
@@ -64,15 +72,23 @@ export function createProcessLocalMiniAppApplication(plugins, supervisor) {
     const open = async (pluginId, signal) => {
         signal?.throwIfAborted();
         await requireProjection(pluginId);
-        await runPluginAction(() => plugins.ensureMiniAppStarted({ pluginId, ...(signal ? { signal } : {}) }));
+        memory?.recordAttention(pluginId);
+        await runPluginAction(() => plugins.ensureMiniAppStarted({ pluginId, initiator: 'user', ...(signal ? { signal } : {}) }));
         signal?.throwIfAborted();
         return launch(await requireProjection(pluginId), supervisor.inspect(pluginId)[0]);
     };
     return {
         list: async () => {
             const statuses = new Map(supervisor.inspect().map((status) => [status.pluginId, status]));
+            const listed = await projections();
+            const view = memory?.view();
+            const entries = new Map(view?.entries.map((entry) => [entry.pluginId, entry]));
             return {
-                miniApps: (await projections()).map((projection) => summary(projection, statuses.get(projection.available.candidate.pluginId))),
+                miniApps: listed.map((projection) => {
+                    const pluginId = projection.available.candidate.pluginId;
+                    return summary(projection, statuses.get(pluginId), entries.get(pluginId));
+                }),
+                ...(view ? { capacity: view.capacity } : {}),
             };
         },
         open: ({ pluginId, signal }) => open(pluginId, signal),
@@ -130,6 +146,7 @@ export function createProcessLocalMiniAppApplication(plugins, supervisor) {
                 throw applicationError('PERMISSION_UNKNOWN');
             return permissionCall(() => plugins.setMiniAppPermission({ pluginId, permission: parsed.id, enabled }));
         },
+        reportAttention: (snapshot) => memory?.reportSurfaces(snapshot),
     };
 }
 const PERMISSION_ERROR_CODES = {
@@ -146,10 +163,12 @@ async function permissionCall(operation) {
         throw code ? applicationError(code, { cause: error }) : error;
     }
 }
-function summary(projection, status) {
+/** `memory` is given only while the backend runs; a stopped Mini App has nothing to protect. */
+function summary(projection, status, memory) {
     const { available } = projection;
     const runtimeStatus = mapRuntimeStatus(status?.phase);
     const update = pendingUpdate(projection);
+    const surfaceMemory = runtimeStatus === 'running' ? summaryMemory(memory) : undefined;
     return {
         pluginId: available.candidate.pluginId,
         ...(available.displayName ? { displayName: available.displayName } : {}),
@@ -163,6 +182,15 @@ function summary(projection, status) {
                 : {}),
         },
         ...(update ? { update } : {}),
+        ...(surfaceMemory ? { memory: surfaceMemory } : {}),
+    };
+}
+function summaryMemory(memory) {
+    if (!memory)
+        return undefined;
+    return {
+        ...(memory.lastAttendedAtMs !== undefined ? { lastAttendedAtMs: memory.lastAttendedAtMs } : {}),
+        ...(memory.protection ? { protection: memory.protection } : {}),
     };
 }
 /** Derived, never stored: a running official package differs from the available one by a restart-class change. */
@@ -188,7 +216,7 @@ function localIconUrl(iconPath) {
 function mapRuntimeStatus(phase) {
     if (phase === 'active')
         return 'running';
-    if (phase === 'starting' || phase === 'preparing')
+    if (phase === 'preparing')
         return 'starting';
     if (phase === 'failed' || phase === 'quarantined')
         return 'failed';

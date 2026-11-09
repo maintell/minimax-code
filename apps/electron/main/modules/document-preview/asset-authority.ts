@@ -1,3 +1,4 @@
+import { recoverPptAssetCommit } from "./pptx-edit/asset-commit-recovery";
 import { randomBytes } from "node:crypto";
 import { readdir, realpath, lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
@@ -176,7 +177,7 @@ async function resolveSidecar(assetsRoot, assetId, sessionId, findSidecars, logg
             sidecarInfo = await lstat(sidecarPath, { bigint: true });
             if (!sidecarInfo.isFile() || sidecarInfo.isSymbolicLink())
                 continue;
-            const parsed = parseSidecar(JSON.parse(await readFile(sidecarPath, 'utf8')));
+            let parsed = parseSidecar(JSON.parse(await readFile(sidecarPath, 'utf8')));
             if (!parsed || parsed.assetId !== assetId)
                 continue;
             if (!matchesSessionScope(parsed.sessionId, sessionId))
@@ -197,6 +198,15 @@ async function resolveSidecar(assetsRoot, assetId, sessionId, findSidecars, logg
                 .replace(/[\\/]/gu, '/');
             if (expectedRelative !== parsed.relativePath)
                 continue;
+            if (/\.pptx$/iu.test(canonicalFile)) {
+                await recoverPptAssetCommit(canonicalFile, sidecarPath);
+                parsed = parseSidecar(JSON.parse(await readFile(sidecarPath, 'utf8')));
+                if (!parsed ||
+                    parsed.assetId !== assetId ||
+                    !matchesSessionScope(parsed.sessionId, sessionId))
+                    continue;
+                sidecarInfo = await lstat(sidecarPath, { bigint: true });
+            }
             const canonicalSidecar = await realpath(sidecarPath);
             if (canonicalSidecar !== sidecarPath)
                 continue;

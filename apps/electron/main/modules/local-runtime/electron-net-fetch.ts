@@ -292,6 +292,10 @@ function setRequestHeaders(request, fetchRequest) {
     }
     const setHeader = request.setHeader.bind(request);
     fetchRequest.headers.forEach((value, name) => {
+        // Chromium calculates the upload length; setting it explicitly makes
+        // net.request reject the upload with net::ERR_INVALID_ARGUMENT.
+        if (name === 'content-length')
+            return;
         setHeader(name, value);
     });
 }

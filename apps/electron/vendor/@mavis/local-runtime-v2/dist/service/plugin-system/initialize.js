@@ -4,6 +4,7 @@ import { initializeHostConnectorSystem } from '../host-connector-system/index.js
 import { ConnectorCloudClient } from './app/cloud-client.js';
 import { PluginSystemCloudTransport } from './cloud-transport.js';
 import { createMiniAppPluginMcpTools } from './mcp/miniapp-plugin-mcp-tools.js';
+import { createPluginMcpAuthPort, PluginMcpCredentials } from './mcp/oauth.js';
 import { PluginMcpRuntime } from './mcp/runtime.js';
 import { GithubPluginImporter } from './plugin/import/github-plugin-importer.js';
 import { createPluginMarketplaceService } from './plugin/marketplace/marketplace-service.js';
@@ -27,19 +28,33 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         isLoggedOut: () => officialAuthState() === 'logged_out',
         metrics: metricTags,
     });
+    const mcpCredentials = dependencies.mcpOAuth
+        ? new PluginMcpCredentials({
+            service: dependencies.mcpOAuth,
+            ...(dependencies.publishAuthRequired
+                ? { publishAuthRequired: dependencies.publishAuthRequired }
+                : {}),
+            logger: dependencies.logger,
+        })
+        : undefined;
+    // Bound by the runtime composition: it holds the plugin for the calling turn and tells a Mini
+    // App's own sessions apart (it needs the session repository for that).
+    let managedMiniAppToolCall;
     const createPluginMcpRuntime = () => new PluginMcpRuntime({
         names: dependencies.mcp.getRuntimeNameRegistry(),
+        ...(mcpCredentials ? { auth: mcpCredentials } : {}),
         logger: {
             info: (message, fields) => dependencies.logger.info(fields ?? {}, message),
             warn: (message, fields) => dependencies.logger.warn(fields ?? {}, message),
             error: (message, fields) => dependencies.logger.error(fields ?? {}, message),
         },
         metrics: metricTags,
+        onManagedMiniAppToolCall: (call) => managedMiniAppToolCall?.(call),
     });
     const pluginMcpRuntime = createPluginMcpRuntime();
     const repository = new SqlitePluginRepository(dependencies.database);
     const cloudTransport = new PluginSystemCloudTransport({
-        baseUrl: resolveCloudBaseUrl(),
+        baseUrl: resolvePluginCloudBaseUrl(),
         fetchImpl: dependencies.fetchImpl,
         authContextGetter: dependencies.authContextGetter,
         appVersion: dependencies.appVersion,
@@ -73,6 +88,7 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         officialCacheRoot,
         repository,
         authContextGetter: dependencies.authContextGetter,
+        ...(mcpCredentials ? { mcpCredentials } : {}),
         deploymentGetter,
         listReservations: dependencies.listReservations,
         mcpRuntime: pluginMcpRuntime,
@@ -115,11 +131,23 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
     return {
         plugin,
         mcp: dependencies.mcp,
+        mcpAuthPort: createPluginMcpAuthPort({
+            get currentSnapshot() {
+                return system.currentSnapshot;
+            },
+            waitUntilReady: () => system.waitUntilReady(),
+            probeMcpServer: (serverName) => system.probeMcpServer(serverName),
+            rediscoverMcpServers: (serverNames) => system.rediscoverMcpServers(serverNames),
+        }),
         skill: dependencies.skill,
         hostConnectorGateway: hostConnectorSystem.gateway,
         miniAppPermissionSwitches: system.miniAppPublication.permissionSwitches,
         miniAppPluginMcp: createMiniAppPluginMcpTools(system),
         attachMiniAppPublication: (input) => system.miniAppPublication.attach(input),
+        bindMiniAppMemory: (coordinator) => system.miniAppPublication.bindMemory(coordinator),
+        observeManagedMiniAppToolCalls: (listener) => {
+            managedMiniAppToolCall = listener;
+        },
         listAcceptedMiniApps: () => system.miniAppPublication.listAcceptedMiniApps(),
         isAcceptedMiniAppRunning: (pluginId) => system.miniAppPublication.isAcceptedMiniAppRunning(pluginId),
         listAvailableMiniApps: () => system.miniAppPublication.listAvailableMiniApps(),
@@ -172,7 +200,8 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         },
     };
 }
-function resolveCloudBaseUrl() {
+/** Desktop's archon_biz origin for the current region/build; NEXT_PUBLIC_DOMAIN_URL overrides. */
+export function resolvePluginCloudBaseUrl() {
     const configured = process.env.NEXT_PUBLIC_DOMAIN_URL?.trim();
     if (configured)
         return configured;

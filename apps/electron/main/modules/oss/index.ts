@@ -5,7 +5,7 @@
 import * as fs from "fs/promises";
 import { createReadStream } from "fs";
 import path_ from "path";
-import { net } from "electron";
+import { net, app } from "electron";
 import { getUserInfo } from "../../ipc/storage.ipc";
 import logger from "../../utils/logger";
 import { isDev, isEn, DOMAIN_URL } from "../../config";
@@ -15,6 +15,21 @@ const FILE_META_SUCCESS = 1;
 const FILE_META_FAILED = 0;
 const PATH = '/matrix/api/v1/log/upload';
 const DESKTOP_UPLOAD_PATH = '/matrix/api/v1/desktop/upload';
+/** 这次拿到的登录凭证不属于调用方指定的账号（发请求前换了号），请求没有发出。 */
+export class SharedAuthAccountMismatchError extends Error {
+    constructor() {
+        super('Shared OAuth access token belongs to another account.');
+        this.name = 'SharedAuthAccountMismatchError';
+    }
+}
+
+/** 查这次凭证属于哪个账号（按 token 缓存），和 expectedUserId 对不上、或查不出账号就不发请求。 */
+async function assertLeaseAccount(session, lease, expectedUserId) {
+    const identity = await session.resolveRuntimeIdentity?.(lease);
+    const userId = identity?.realUserID || identity?.userID;
+    if (userId !== expectedUserId)
+        throw new SharedAuthAccountMismatchError();
+}
 let sharedAuthConfiguration;
 export function configureOSSSharedAuthSession(session, options = {}) {
     const configuration = { session, ...options };
@@ -24,55 +39,94 @@ export function configureOSSSharedAuthSession(session, options = {}) {
             sharedAuthConfiguration = undefined;
     };
 }
+/** 合并调用方的取消信号和超时；两者都没有时返回 undefined，保持原来不限时的行为。 */
+function combineSignals(signal, timeoutMs) {
+    const timeout = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
+    if (signal && timeout)
+        return AbortSignal.any([signal, timeout]);
+    return signal ?? timeout;
+}
+/** 主进程直连 Matrix 网关的域名；开发包固定走测试环境，与 renderer 的 AUTH_API_URL 一致。 */
+export function resolveMatrixApiOrigin() {
+    return isDev
+        ? isEn
+            ? 'https://matrix-overseas-test.xaminim.com'
+            : 'https://matrix-test.xaminim.com'
+        : DOMAIN_URL;
+}
+/**
+ * 主进程带登录态发 POST：Bearer 取自 Shared OAuth session，401 时按 session 的决定刷新重试一次，
+ * 期间换了登录账号就放弃；最终要求重新登录时通知调用方同步登出。返回最后一次响应，由调用方判断状态。
+ */
+export async function fetchWithSharedAuth(url, request) {
+    const configuration = sharedAuthConfiguration;
+    if (!configuration) {
+        throw new Error('Main OSS Shared OAuth session is not configured.');
+    }
+    const signal = combineSignals(request.signal, request.timeoutMs);
+    let lease = await configuration.session.getAccessToken(30000);
+    if (request.expectedUserId !== undefined) {
+        await assertLeaseAccount(configuration.session, lease, request.expectedUserId);
+    }
+    const send = () => net.fetch(url, {
+        method: 'POST',
+        ...(signal ? { signal } : {}),
+        headers: {
+            'User-Agent': getStandardUserAgent(),
+            Origin: DOMAIN_URL,
+            Referer: DOMAIN_URL + '/',
+            'Content-Type': 'application/json',
+            ...request.extraHeaders?.(),
+            Authorization: `Bearer ${lease.accessToken}`,
+        },
+        body: request.body,
+    });
+    let resp = await send();
+    if (resp.status === 401) {
+        let decision = await configuration.session.handleUnauthorized(lease.generation, lease.loginEpoch);
+        if (decision === 'retry') {
+            await resp.arrayBuffer().catch(() => undefined);
+            const requestEpoch = lease.loginEpoch;
+            lease = await configuration.session.getAccessToken(30000);
+            assertSameLoginEpoch(requestEpoch, lease.loginEpoch);
+            resp = await send();
+            if (resp.status === 401) {
+                decision = await configuration.session.handleUnauthorized(lease.generation, lease.loginEpoch);
+            }
+        }
+        if (decision === 'logout') {
+            await configuration.onAccessTokenInvalidated?.();
+        }
+    }
+    return resp;
+}
 /**
  * 获取预签名 URL
  * @returns 预签名 URL 响应
  */
-export const getPresignedUrl = async (isLog = false, baseFileName) => {
+export const getPresignedUrl = async (isLog = false, baseFileName,
+/** 可选取消信号（上传总超时用）；不传与原来一致。 */
+signal,
+/** 要求凭证属于该账号，见 fetchWithSharedAuth；不传不核对。 */
+expectedUserId) => {
     const userInfo = getUserInfo();
-    const path = `${isDev
-        ? isEn
-            ? 'https://matrix-overseas-test.xaminim.com'
-            : 'https://matrix-test.xaminim.com'
-        : DOMAIN_URL}${isLog ? PATH : DESKTOP_UPLOAD_PATH}`;
+    const url = new URL(`${resolveMatrixApiOrigin()}${isLog ? PATH : DESKTOP_UPLOAD_PATH}`);
+    if (isLog) {
+        // 与渲染进程公共参数同名：安装包版本带通道后缀（内测包是 -preview），服务端据此区分内测上报。
+        url.searchParams.set('is_desktop', '1');
+        url.searchParams.set('desktop_version', app.getVersion());
+    }
+    const path = url.toString();
     try {
-        const configuration = sharedAuthConfiguration;
-        if (!configuration) {
-            throw new Error('Main OSS Shared OAuth session is not configured.');
-        }
         const body = JSON.stringify({
             device_id: userInfo.deviceID,
             base_file_name: baseFileName,
         });
-        let lease = await configuration.session.getAccessToken(30000);
-        const fetchPresignedUrl = () => net.fetch(path, {
-            method: 'POST',
-            headers: {
-                'User-Agent': getStandardUserAgent(),
-                Origin: DOMAIN_URL,
-                Referer: DOMAIN_URL + '/',
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${lease.accessToken}`,
-            },
+        const resp = await fetchWithSharedAuth(path, {
             body,
+            ...(signal ? { signal } : {}),
+            ...(expectedUserId !== undefined ? { expectedUserId } : {}),
         });
-        let resp = await fetchPresignedUrl();
-        if (resp.status === 401) {
-            let decision = await configuration.session.handleUnauthorized(lease.generation, lease.loginEpoch);
-            if (decision === 'retry') {
-                await resp.arrayBuffer().catch(() => undefined);
-                const requestEpoch = lease.loginEpoch;
-                lease = await configuration.session.getAccessToken(30000);
-                assertSameLoginEpoch(requestEpoch, lease.loginEpoch);
-                resp = await fetchPresignedUrl();
-                if (resp.status === 401) {
-                    decision = await configuration.session.handleUnauthorized(lease.generation, lease.loginEpoch);
-                }
-            }
-            if (decision === 'logout') {
-                await configuration.onAccessTokenInvalidated?.();
-            }
-        }
         if (!resp.ok) {
             throw new Error(`OSS presigned URL request failed with HTTP ${resp.status}.`);
         }
@@ -90,8 +144,15 @@ export const getPresignedUrl = async (isLog = false, baseFileName) => {
  * @param fileInfo 文件元信息
  * @returns 上传结果
  */
-export const uploadToOSS = async (fileInfo, isLog = false) => {
+export const uploadToOSS = async (fileInfo, isLog = false,
+/**
+ * timeoutMs：取预签名地址加上传的总超时，超时按上传失败返回；不传不限，其他调用方行为不变。
+ * expectedUserId：取预签名地址的凭证必须属于该账号，否则抛 SharedAuthAccountMismatchError
+ * （不当成普通上传失败），由调用方决定怎么处理；不传不核对。
+ */
+options = {}) => {
     const { file_path } = fileInfo;
+    const signal = combineSignals(undefined, options.timeoutMs);
     if (!file_path) {
         return {
             ...fileInfo,
@@ -108,7 +169,7 @@ export const uploadToOSS = async (fileInfo, isLog = false) => {
         // ignored
     }
     try {
-        const { upload_url: presignedUrl, upload_id: uploadId } = await (0, getPresignedUrl)(isLog, fileName);
+        const { upload_url: presignedUrl, upload_id: uploadId } = await (0, getPresignedUrl)(isLog, fileName, signal, options.expectedUserId);
         logger.info(`[OSS] Upload ID: ${uploadId}`);
         if (!presignedUrl) {
             return {
@@ -161,6 +222,7 @@ export const uploadToOSS = async (fileInfo, isLog = false) => {
                 method: 'PUT',
                 body,
                 duplex: 'half',
+                ...(signal ? { signal } : {}),
             });
         }
         else {
@@ -168,6 +230,7 @@ export const uploadToOSS = async (fileInfo, isLog = false) => {
             uploadResponse = await net.fetch(presignedUrl, {
                 method: 'PUT',
                 body: fileBuffer,
+                ...(signal ? { signal } : {}),
             });
         }
         logger.info(`[OSS] Upload response: ${JSON.stringify(uploadResponse)}`);
@@ -199,6 +262,8 @@ export const uploadToOSS = async (fileInfo, isLog = false) => {
         };
     }
     catch (error) {
+        if (error instanceof SharedAuthAccountMismatchError)
+            throw error;
         logger.error(`[OSS] Upload error: ${error}`);
         return {
             ...fileInfo,

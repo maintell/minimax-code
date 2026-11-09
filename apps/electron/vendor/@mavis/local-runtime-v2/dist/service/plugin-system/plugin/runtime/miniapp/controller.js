@@ -1,4 +1,4 @@
-import { MiniAppError } from '../../../../miniapp/index.js';
+import { MiniAppError, } from '../../../../miniapp/index.js';
 import { LOCAL_PLUGIN_MARKETPLACE } from '@mavis/shared';
 import { normalizeMiniAppPreparationError, } from '../../../publication.js';
 import { PluginSystemError } from '../../../errors.js';
@@ -9,7 +9,7 @@ import { withholdsMiniAppForHost } from '../snapshot-builder.js';
 import { activateAvailableMiniApp } from './activation.js';
 import { findMiniAppPermissionTarget, miniAppPermissionList, PluginMiniAppPermissionSwitches, } from './permissions.js';
 import { listEnabledMiniAppDefinitions, listAcceptedMiniApps, miniAppCandidateFromPackage, sameMiniAppCandidate, } from './candidate.js';
-import { attachSupervisedMiniAppPublication, isSupervisedBusyError, normalizeSupervisedPreparationError, SupervisedMiniAppPublicationParticipant, } from './publication.js';
+import { attachSupervisedMiniAppPublication, isSupervisedBusyError, miniAppStopTargetReplacedError, normalizeSupervisedPreparationError, SupervisedMiniAppPublicationParticipant, } from './publication.js';
 import { projectColdMiniAppPublication } from './projection.js';
 import { restartSupervisedMiniAppPublication } from './restart.js';
 /** Owns the MiniApp-specific facade while PluginSystem retains the generic transaction. */
@@ -34,6 +34,14 @@ export class PluginMiniAppPublicationController {
     /** What the Mini App gateways read at every call; see `setPermission`. */
     permissionSwitches;
     nameReservation;
+    /** Admits backends that are not running yet; absent outside the desktop Host. */
+    memoryValue;
+    get memory() {
+        return this.memoryValue;
+    }
+    bindMemory(coordinator) {
+        this.memoryValue = coordinator;
+    }
     get participant() {
         return this.participantValue;
     }
@@ -56,14 +64,15 @@ export class PluginMiniAppPublicationController {
             return this.ensureStarted(input);
         }
         const host = this.options.host;
-        await restartSupervisedMiniAppPublication(input, {
+        // Restarting a stopped App starts a backend, so it needs a slot; replacing a running one not.
+        await this.withAdmission(input, 'agent', () => restartSupervisedMiniAppPublication(input, {
             initialize: () => host.initialize(),
             assertUsable: () => host.assertUsable(),
             runExclusive: (operation) => host.runExclusive(operation),
             currentSnapshot: () => host.currentSnapshot,
             setDesiredSnapshot: this.options.setDesiredSnapshot,
             prepare: (snapshot, options) => this.prepareSnapshotPublication(snapshot, options),
-        });
+        }));
     }
     /** Restarts an accepted official Mini App on the newest available package. */
     async applyUpdate(input) {
@@ -116,6 +125,11 @@ export class PluginMiniAppPublicationController {
         host.assertUsable();
         throwIfAborted(input.signal);
         await this.cancelStartup(input.pluginId);
+        // A board that is not running yet needs a slot; replacing a running one does not.
+        return this.withAdmission(input, 'agent', () => this.publishWorkspaceExclusive(input));
+    }
+    publishWorkspaceExclusive(input) {
+        const host = this.options.host;
         return host.runExclusive(async () => {
             throwIfAborted(input.signal);
             await this.nameReservation.assertAvailable(input.pluginId, {
@@ -172,6 +186,10 @@ export class PluginMiniAppPublicationController {
         await host.initialize();
         host.assertUsable();
         throwIfAborted(input.signal);
+        // A memory stop aimed at one root never cancels a start (or replacement) still in flight.
+        if (input.expectedProcessGeneration !== undefined && this.startups.has(input.pluginId)) {
+            throw miniAppStopTargetReplacedError();
+        }
         const cancelledStart = await this.cancelStartup(input.pluginId);
         await this.runStopPublication(input, cancelledStart);
         this.adoptPendingUpdate(input.pluginId);
@@ -274,6 +292,10 @@ export class PluginMiniAppPublicationController {
             disabled: this.options.miniAppPermissions.listDisabledMiniAppPermissions(pluginId, target.source),
         });
     }
+    /**
+     * One admission per shared startup: the first caller's `initiator` (default `agent`, which
+     * never puts another Mini App to sleep) decides it; later callers join that startup.
+     */
     async ensureStarted(input) {
         throwIfAborted(input.signal);
         let startup = this.startups.get(input.pluginId);
@@ -281,24 +303,43 @@ export class PluginMiniAppPublicationController {
             const controller = new AbortController();
             startup = {
                 controller,
-                promise: this.ensureAcceptedRuntime(input.pluginId, controller.signal),
+                promise: this.ensureAcceptedRuntime(input.pluginId, input.initiator ?? 'agent', controller.signal),
             };
             this.startups.set(input.pluginId, startup);
         }
         await waitForStartup(startup.promise, input.signal);
     }
-    async ensureAcceptedRuntime(pluginId, signal) {
+    async ensureAcceptedRuntime(pluginId, initiator, signal) {
         try {
             await this.options.host.initialize();
             this.options.host.assertUsable();
             throwIfAborted(signal);
             if (!this.isAcceptedMiniAppRunning(pluginId)) {
-                await this.activate({ pluginId, startOnly: true, signal });
+                await this.activate({ pluginId, startOnly: true, signal, initiator });
             }
         }
         finally {
             if (this.startups.get(pluginId)?.controller.signal === signal)
                 this.startups.delete(pluginId);
+        }
+    }
+    /**
+     * Holds a memory admission while a backend that is not running starts; released when the
+     * start settles either way. A full device rejects with BUSY `capacity_busy` before the start.
+     * Without a coordinator the Node runtime's own cap still applies.
+     */
+    async withAdmission(target, initiator, start) {
+        const memory = this.memoryValue;
+        if (!memory || this.isAcceptedMiniAppRunning(target.pluginId))
+            return start();
+        const { pluginId, signal } = target;
+        const admission = await memory.admit({ pluginId, initiator, ...(signal ? { signal } : {}) });
+        try {
+            throwIfAborted(signal);
+            return await start();
+        }
+        finally {
+            admission.release();
         }
     }
     cancelPendingStarts() {
@@ -330,7 +371,15 @@ export class PluginMiniAppPublicationController {
             }
         }
     }
+    /**
+     * Holds one memory admission while a backend that is not running starts. `initiator` defaults
+     * to `agent` (agent tool and update paths), which never puts another Mini App to sleep.
+     */
     async activate(input) {
+        const { initiator = 'agent', ...activation } = input;
+        await this.withAdmission(activation, initiator, () => this.activatePublication(activation));
+    }
+    async activatePublication(input) {
         const participant = this.requireParticipant();
         const host = this.options.host;
         await activateAvailableMiniApp(input, {

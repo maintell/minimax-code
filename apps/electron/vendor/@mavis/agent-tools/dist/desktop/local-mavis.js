@@ -171,6 +171,9 @@ const cronSessionsSchema = z.object({
     cursor: optionalString,
     limit: optionalNumber,
 });
+const SESSION_SOURCES = ['local', 'ssh', 'rc', 'cloud'];
+const sessionReadSource = z.enum(SESSION_SOURCES).optional();
+const deviceIdArg = idString.optional();
 const sessionListSchema = z.union([
     z.object({
         mode: z.literal('peers'),
@@ -183,10 +186,15 @@ const sessionListSchema = z.union([
         archive_filter: z.enum(['Unarchived', 'Archived']).optional(),
         cursor: optionalString,
         limit: optionalNumber,
+        source: sessionReadSource,
+        device_id: deviceIdArg,
     }),
 ]);
-const sessionReadSource = z.enum(['local', 'cloud']).optional();
-const sessionGetSchema = z.object({ session_id: idString, source: sessionReadSource });
+const sessionGetSchema = z.object({
+    session_id: idString,
+    source: sessionReadSource,
+    device_id: deviceIdArg,
+});
 const sessionSendSchema = z
     .object({
     session_id: idString,
@@ -197,6 +205,9 @@ const sessionSendSchema = z
     // Default false: routing follows the desktop composer send preference
     // unless the caller explicitly demands the steer entry point.
     force_steer: optionalBoolean,
+    // ssh / rc / cloud deliver through SendRemoteMessage on the target's own runtime.
+    source: sessionReadSource,
+    device_id: deviceIdArg,
 })
     .strict();
 const sessionUpdateSchema = z.object({
@@ -212,6 +223,7 @@ const sessionInterruptSchema = z.object({
 const sessionMessagesSchema = z.object({
     session_id: idString,
     source: sessionReadSource,
+    device_id: deviceIdArg,
     limit: optionalNumber,
     before: optionalString,
     include_tool_outputs: optionalBoolean,
@@ -593,14 +605,9 @@ function isLowSurrogate(code) {
 }
 export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
     const command = normalizeCommand(rawCommand);
-    if (rawArgs?.source !== undefined) {
-        if (command !== 'session get' && command !== 'session messages') {
-            return failure(command, 'validation', 'source is supported only for session get/messages');
-        }
-        if (rawArgs.source === 'cloud' && isMeSentinel(rawArgs.session_id)) {
-            return failure(command, 'validation', 'Cloud reads require an explicit session_id');
-        }
-    }
+    const sourceFailure = validateSessionSourceArgs(command, rawArgs);
+    if (sourceFailure)
+        return sourceFailure;
     if (!isKnownCommand(command)) {
         if (command === 'help' || command.endsWith(' help')) {
             return failure(command, 'validation', 'Unknown help target. Valid help commands: agent help, cron help, session help, mcp help.', { valid_help_commands: ['agent help', 'cron help', 'session help', 'mcp help'] });
@@ -1003,6 +1010,17 @@ async function handleSessionList(ctx, args, signal) {
         const current = await adapter.getSession({ sessionId }, signal);
         return success(ctx.command, await adapter.listSessions({ agentName: current.session?.agentName, limit: 100 }, signal));
     }
+    if (args.source && args.source !== 'local') {
+        // Remote agent names belong to the remote host; they are passed through as written.
+        const remoteAgentName = args.agent_name?.trim();
+        return success(ctx.command, await adapter.listSessions({
+            source: args.source,
+            ...(args.device_id ? { deviceId: args.device_id } : {}),
+            ...(remoteAgentName ? { agentName: remoteAgentName } : {}),
+            ...(args.cursor ? { cursor: args.cursor } : {}),
+            ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        }, signal));
+    }
     const agentName = args.agent_name
         ? await resolveAgentReadName(ctx, args.agent_name, signal)
         : undefined;
@@ -1018,7 +1036,11 @@ async function handleSessionList(ctx, args, signal) {
 }
 async function handleSessionGet(ctx, args, signal) {
     const sessionId = resolveSessionId(ctx, args.session_id);
-    const response = await requireSessionAdapter(ctx).getSession({ sessionId, ...(args.source ? { source: args.source } : {}) }, signal);
+    const response = await requireSessionAdapter(ctx).getSession({
+        sessionId,
+        ...(args.source ? { source: args.source } : {}),
+        ...(args.device_id ? { deviceId: args.device_id } : {}),
+    }, signal);
     if (!response.session) {
         return failure(ctx.command, 'local_runtime', 'session not found', { session_id: sessionId });
     }
@@ -1040,6 +1062,8 @@ async function handleSessionSend(ctx, args, signal) {
         // adapter owns the defaults (async delivery, preference routing).
         ...(Object.hasOwn(args, 'sync') ? { sync: args.sync } : {}),
         ...(Object.hasOwn(args, 'force_steer') ? { forceSteer: args.force_steer } : {}),
+        ...(args.source ? { source: args.source } : {}),
+        ...(args.device_id ? { deviceId: args.device_id } : {}),
     }, signal));
 }
 async function handleSessionUpdate(ctx, args, signal) {
@@ -1073,6 +1097,7 @@ async function handleSessionMessages(ctx, args, signal) {
     const page = await requireSessionAdapter(ctx).listMessages({
         sessionId,
         ...(args.source ? { source: args.source } : {}),
+        ...(args.device_id ? { deviceId: args.device_id } : {}),
         ...(args.limit !== undefined ? { limit: args.limit } : {}),
         ...(args.before ? { before: args.before } : {}),
     }, signal);
@@ -1083,21 +1108,42 @@ async function handleSessionMessages(ctx, args, signal) {
 async function handleSessionHelp(ctx) {
     return success(ctx.command, {
         group: 'session',
-        summary: 'Read and manage local desktop Mavis sessions.',
+        summary: 'Read and manage desktop Mavis sessions. list/get/messages/send also reach sessions on SSH projects (ssh), devices this desktop controls with Remote Control (rc) and the cloud (cloud); every other command works on local sessions only.',
         commands: [
             {
                 command: 'session list',
-                args: ['agent_name?', 'parent_session_id?', 'archive_filter?', 'cursor?', 'limit?'],
+                args: [
+                    'agent_name?',
+                    'parent_session_id? (local only)',
+                    'archive_filter? (local only)',
+                    'cursor?',
+                    'limit?',
+                    'source? (local|ssh|rc|cloud; default local)',
+                    'device_id? (ssh|rc)',
+                ],
+                summary: "ssh/rc without device_id lists every connected device; limit applies per device, each row carries device_id, and devices reports each device and its paging. Page one device with device_id + cursor. rc lists only the Mavis sidebar sessions of each controlled device, so agent_name is not accepted for rc; rc pages follow the device's project order (sessions sorted by activity within a page), so rows are not newest first across pages. cloud lists one agent: the account Mavis agent unless agent_name names a cloud agent (cloud agent names are the numeric agentName values in cloud rows).",
             },
-            { command: 'session get', args: ['session_id', 'source? (local|cloud; default local)'] },
+            {
+                command: 'session get',
+                args: ['session_id', 'source? (local|ssh|rc|cloud; default local)', 'device_id? (ssh|rc)'],
+                summary: 'ssh/rc find the device holding session_id. When the same ID exists on several devices, the error lists candidates; pass one device_id.',
+            },
             {
                 command: 'session send',
-                args: ['session_id', 'content', 'sync? (default false)', 'force_steer? (default false)'],
-                summary: 'Deliver a message to an existing unarchived local session. Returns an admission ACK by default without waiting; a busy session queues (or merges into the running turn) instead of failing. sync: true waits for the turn and returns its reply text, except for a merged steer, which has no separate reply. force_steer: true merges into the running turn instead of following the desktop composer send preference.',
+                args: [
+                    'session_id',
+                    'content',
+                    'sync? (default false)',
+                    'force_steer? (default false)',
+                    'source? (local|ssh|rc|cloud; default local)',
+                    'device_id? (ssh|rc)',
+                ],
+                summary: 'Deliver a message to an existing unarchived session. Returns an admission ACK by default without waiting; a busy session queues (or merges into the running turn) instead of failing. sync: true waits for the turn and returns its reply text, except for a merged steer, which has no separate reply. force_steer: true merges into the running turn instead of following the desktop composer send preference. ssh / rc / cloud targets are on another device: they receive the message as from this session but cannot send back, so read their reply with sync: true or with session messages (same source). A remote sync wait gives up after 10 minutes and returns the ACK. The cloud answers started or steered only and ignores force_steer.',
                 examples: [
                     'mavis({ command: "session send", args: { session_id: "mvs_target", content: "Continue with the follow-up requirement." } })',
                     'mavis({ command: "session send", args: { session_id: "mvs_target", content: "What did you conclude?", sync: true } })',
                     'mavis({ command: "session send", args: { session_id: "mvs_target", content: "Also cover the rollback path.", force_steer: true } })',
+                    'mavis({ command: "session send", args: { session_id: "mvs_remote", source: "ssh", content: "Run the tests on the server and report.", sync: true } })',
                 ],
             },
             {
@@ -1114,8 +1160,9 @@ async function handleSessionHelp(ctx) {
                 command: 'session messages',
                 args: [
                     'session_id',
-                    'source? (local|cloud; default local)',
-                    'limit? (cloud default 20, max 100)',
+                    'source? (local|ssh|rc|cloud; default local)',
+                    'device_id? (ssh|rc)',
+                    'limit? (ssh/rc/cloud default 20, max 100)',
                     'before?',
                     'include_tool_outputs? (default false)',
                     'max_output_chars? (default 2000, max 20000)',
@@ -1416,6 +1463,54 @@ async function resolveAgentExactName(ctx, rawName, signal) {
     }
     return ctx.agentAdapter.requireExactAgentKey(name, signal);
 }
+const SESSION_SOURCE_COMMANDS = new Set([
+    'session list',
+    'session get',
+    'session messages',
+    'session send',
+]);
+/**
+ * Source and device checks that must run on the raw arguments: before `me`
+ * substitution, and before a command could quietly read the local copy of a
+ * remote request.
+ */
+function validateSessionSourceArgs(command, rawArgs) {
+    const source = rawArgs?.source;
+    const deviceId = rawArgs?.device_id;
+    if (source === undefined && deviceId === undefined)
+        return undefined;
+    if (!SESSION_SOURCE_COMMANDS.has(command)) {
+        return failure(command, 'validation', 'source and device_id are supported only for session list/get/messages/send');
+    }
+    if (source !== undefined && !SESSION_SOURCES.includes(source)) {
+        return failure(command, 'validation', 'source must be one of local, ssh, rc, cloud');
+    }
+    if (deviceId !== undefined && source !== 'ssh' && source !== 'rc') {
+        return failure(command, 'validation', 'device_id requires source ssh or rc');
+    }
+    if (source === undefined || source === 'local')
+        return undefined;
+    if (isMeSentinel(rawArgs?.session_id)) {
+        return failure(command, 'validation', 'Reads and sends to ssh, rc or cloud require an explicit session_id, not me');
+    }
+    if (command !== 'session list')
+        return undefined;
+    if (rawArgs?.mode === 'peers') {
+        return failure(command, 'validation', 'peers mode lists local sessions only');
+    }
+    for (const field of ['parent_session_id', 'archive_filter']) {
+        if (rawArgs?.[field] !== undefined) {
+            return failure(command, 'validation', `${field} is supported only for local session list`);
+        }
+    }
+    if (isMeSentinel(rawArgs?.agent_name)) {
+        return failure(command, 'validation', 'agent_name "me" names a local agent; pass the remote agent name or omit it');
+    }
+    if (source !== 'cloud' && rawArgs?.cursor !== undefined && deviceId === undefined) {
+        return failure(command, 'validation', 'cursor pages one device; pass the device_id the cursor came from');
+    }
+    return undefined;
+}
 function substituteMe(value, currentAgentName, currentSessionId) {
     return substituteMeValue(value, currentAgentName, currentSessionId, '');
 }
@@ -1490,6 +1585,12 @@ const INPUT_CONDITION_ERROR_CODES = new Set([
     'SESSION_CREATE_INVALID_WORKSPACE',
     'SESSION_CREATE_INVALID_LOCATION',
     'SESSION_CREATE_MODEL_UNRESOLVED',
+    'SESSION_ID_AMBIGUOUS',
+    'INVALID_DEVICE_ID',
+    'REMOTE_DEVICE_NOT_FOUND',
+    'INVALID_PAGE_SIZE',
+    'INVALID_CURSOR',
+    'RC_AGENT_UNSUPPORTED',
 ]);
 /**
  * Kind for a session error code. Input and precondition codes are validation;
@@ -1521,6 +1622,10 @@ function errorToFailure(command, error) {
             code: error.code,
         });
     }
+    // Checked before the runtime-error shape: a DOMException AbortError carries a
+    // numeric `code` (20) that would otherwise read as a runtime failure.
+    if (isCancellation(error))
+        return failure(command, 'unknown', 'aborted', { aborted: true });
     if (isLocalRuntimeError(error)) {
         // These codes name bad input or a precondition, even though the runtime
         // reports them with a status. Everything else with a status stays a runtime failure.
@@ -1533,14 +1638,23 @@ function errorToFailure(command, error) {
             ...(error.requestedTurnId ? { requested_turn_id: error.requestedTurnId } : {}),
             ...(error.reason ? { reason: error.reason } : {}),
             ...(error.field ? { field: error.field } : {}),
+            // Only details a host marks as model-facing reach the output, under their own key.
+            ...(isPlainRecord(error.modelDetails) ? { details: error.modelDetails } : {}),
         });
     }
     if (error instanceof Error) {
-        if (error.name === 'AbortError')
-            return failure(command, 'unknown', 'aborted', { aborted: true });
         return failure(command, 'unknown', error.message, { name: error.name });
     }
     return failure(command, 'unknown', String(error));
+}
+/** An AbortError; one with a string code is a runtime error that names its own cause. */
+function isCancellation(error) {
+    return (error instanceof Error &&
+        error.name === 'AbortError' &&
+        typeof error.code !== 'string');
+}
+function isPlainRecord(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 function isLocalRuntimeError(error) {
     return error instanceof Error && ('status' in error || 'code' in error);

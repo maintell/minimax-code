@@ -49,6 +49,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 };
 import { bindTool } from '@mavis/agent-core/tools';
 import { normalizeMavisCommand } from '../../shared/mavis-operation-classifier.js';
+import { isMavisTeamCommand, teamDisabledFailure } from './commands/team.js';
 import { dispatchDofld } from './dispatcher.js';
 import { CLOUD_MAVIS_COMMANDS, MavisBaseToolDef } from './mavis-tool-def.js';
 import { toToolResult } from './output.js';
@@ -72,6 +73,12 @@ let DofldTool = (() => {
         }
         async execute(ctx, input, signal) {
             const normalized = normalizeMavisCommand(input.command);
+            // Trusted session policy wins before every compatibility redirect and the
+            // command whitelist, so a disabled session always gets a stable TEAM_DISABLED.
+            const teamDisabled = ctx.parentAgentConfig?.team?.disabled === true;
+            if (teamDisabled && isMavisTeamCommand(normalized)) {
+                return toToolResult(teamDisabledFailure(normalized));
+            }
             if (normalized === 'session list' ||
                 normalized === 'session get' ||
                 normalized === 'session update' ||
@@ -137,6 +144,7 @@ let DofldTool = (() => {
                     : {}),
                 ...(ctx.timezone ? { timezone: ctx.timezone } : {}),
                 ...(this.deps.teamRuntime ? { teamRuntime: this.deps.teamRuntime } : {}),
+                ...(teamDisabled ? { teamDisabled: true } : {}),
             }, input.command, input.args, signal);
             return toToolResult(output);
         }
@@ -151,5 +159,5 @@ export function currentCloudCronModel(ctx) {
         return undefined;
     return { provider_id: providerId, model_id: modelId };
 }
-export { CLOUD_MAVIS_COMMANDS, MavisBaseToolDef } from './mavis-tool-def.js';
+export { CLOUD_MAVIS_COMMANDS, MavisBaseToolDef, MavisBaseToolDefWithoutTeam, } from './mavis-tool-def.js';
 //# sourceMappingURL=index.js.map

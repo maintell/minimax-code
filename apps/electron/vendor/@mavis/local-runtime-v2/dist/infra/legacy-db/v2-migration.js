@@ -12,6 +12,7 @@ import { isLayoutMigrationReceiptCurrent, writeLayoutMigrationReceipt, LAYOUT_RE
 const MANIFEST_PREFIX = 'current-local-runtime';
 const ASSET_REF_MIGRATION_VERSION = 1;
 const ASSET_REF_MIGRATION_CURRENT_SKIP = 'sqlite:asset-refs:migration-current';
+const ROW_KEY_PAGE_SIZE = 1000;
 const RESERVED_RECONCILE_TABLES = new Set(['local_runtime_schema_migrations']);
 const REQUIRED_LOCAL_RUNTIME_TABLES = getLocalRuntimeSqliteTableRoleLegend().tables.map((entry) => entry.table);
 const V2_LAYOUT_MIGRATION_RECEIPT_BRAND = Symbol('v2-layout-migration-receipt-brand');
@@ -291,10 +292,7 @@ function readCurrentRuntimeDbIdentity(dataDir) {
     }
 }
 function isSameDbIdentity(previous, current) {
-    return Boolean(previous &&
-        previous.dev === current.dev &&
-        previous.ino === current.ino &&
-        previous.birthtimeMs === current.birthtimeMs);
+    return Boolean(previous && previous.ino === current.ino && previous.birthtimeMs === current.birthtimeMs);
 }
 function readLatestV2LayoutMigrationManifest(dataDir) {
     const root = resolveV2DirectoryContract(dataDir).migrationManifests;
@@ -387,52 +385,92 @@ function dedupeRootSessionsBestEffort(db, input) {
 function migrateJsonRows(db, input) {
     if (!tableExists(db, input.table))
         return 0;
-    const rows = db
-        .prepare(`SELECT ${input.idColumn} AS id, ${input.jsonColumn} AS data, ${input.sessionColumn} AS sessionId FROM ${input.table}`)
-        .all();
+    const selectRow = db.prepare(`SELECT ${input.jsonColumn} AS data, ${input.sessionColumn} AS sessionId FROM ${input.table} WHERE ${input.idColumn} = ?`);
+    const updateRow = db.prepare(`UPDATE ${input.table} SET ${input.jsonColumn} = ? WHERE ${input.idColumn} = ?`);
     let updated = 0;
-    for (const row of rows) {
+    forEachAttachmentRowKey(db, { table: input.table, keyColumn: input.idColumn, jsonColumns: [input.jsonColumn] }, (id) => {
+        const row = selectRow.get(id);
+        if (!row)
+            return;
         const parsed = parseJsonRecord(row.data);
         if (parsed === undefined)
-            continue;
+            return;
         const result = migrateAttachmentRefs(parsed, { ...input, sessionId: row.sessionId });
         if (!result.changed)
-            continue;
-        db.prepare(`UPDATE ${input.table} SET ${input.jsonColumn} = ? WHERE ${input.idColumn} = ?`).run(JSON.stringify(result.value), row.id);
+            return;
+        updateRow.run(JSON.stringify(result.value), id);
         updated += result.updated;
-    }
+    });
     return updated;
+}
+/**
+ * Visits the keys of rows whose JSON columns mention `"attachments"`, one
+ * keyset page of keys at a time; the caller loads and rewrites one row per
+ * key. migrateAttachmentRefs only rewrites entries of `attachments` arrays,
+ * so every other row is filtered inside SQLite without entering the JS heap,
+ * and peak memory stays at a single row even on multi-GB databases. Each key
+ * page is fully read before the caller's UPDATEs run on the same connection.
+ */
+function forEachAttachmentRowKey(db, input, visit) {
+    const mentionsAttachments = input.jsonColumns
+        .map((column) => `instr(${column}, '"attachments"') > 0`)
+        .join(' OR ');
+    const select = `SELECT ${input.keyColumn} AS rowKey FROM ${input.table}`;
+    const order = `ORDER BY ${input.keyColumn} LIMIT ?`;
+    const selectFirstPage = db.prepare(`${select} WHERE (${mentionsAttachments}) ${order}`);
+    const selectNextPage = db.prepare(`${select} WHERE ${input.keyColumn} > ? AND (${mentionsAttachments}) ${order}`);
+    let cursor;
+    for (;;) {
+        const page = (cursor === undefined
+            ? selectFirstPage.all(ROW_KEY_PAGE_SIZE)
+            : selectNextPage.all(cursor, ROW_KEY_PAGE_SIZE));
+        const last = page.at(-1);
+        if (!last)
+            return;
+        cursor = last.rowKey;
+        for (const row of page)
+            visit(row.rowKey);
+    }
 }
 function migratePackedMessageRows(db, input) {
     if (!tableExists(db, 'local_runtime_messages'))
         return 0;
-    const rows = db
-        .prepare('SELECT session_id AS sessionId, display_messages_json AS displayMessages, pi_history_json AS piHistory FROM local_runtime_messages')
-        .all();
+    const selectRow = db.prepare('SELECT display_messages_json AS displayMessages, pi_history_json AS piHistory FROM local_runtime_messages WHERE session_id = ?');
+    const updateRow = db.prepare('UPDATE local_runtime_messages SET display_messages_json = ?, pi_history_json = ? WHERE session_id = ?');
     let updated = 0;
-    for (const row of rows) {
-        const displayMessages = parseJsonRecord(row.displayMessages);
-        const piHistory = parseJsonRecord(row.piHistory);
-        let changed = false;
-        let rowUpdated = 0;
-        if (displayMessages !== undefined) {
-            const result = migrateAttachmentRefs(displayMessages, { ...input, sessionId: row.sessionId });
-            changed = changed || result.changed;
-            rowUpdated += result.updated;
-            row.displayMessages = JSON.stringify(result.value);
-        }
-        if (piHistory !== undefined) {
-            const result = migrateAttachmentRefs(piHistory, { ...input, sessionId: row.sessionId });
-            changed = changed || result.changed;
-            rowUpdated += result.updated;
-            row.piHistory = JSON.stringify(result.value);
-        }
-        if (!changed)
-            continue;
-        db.prepare('UPDATE local_runtime_messages SET display_messages_json = ?, pi_history_json = ? WHERE session_id = ?').run(row.displayMessages, row.piHistory, row.sessionId);
-        updated += rowUpdated;
-    }
+    forEachAttachmentRowKey(db, {
+        table: 'local_runtime_messages',
+        keyColumn: 'session_id',
+        jsonColumns: ['display_messages_json', 'pi_history_json'],
+    }, (sessionId) => {
+        const row = selectRow.get(sessionId);
+        if (!row)
+            return;
+        updated += migratePackedMessageRow({ sessionId: String(sessionId), ...row }, updateRow, input);
+    });
     return updated;
+}
+function migratePackedMessageRow(row, updateRow, input) {
+    const displayMessages = parseJsonRecord(row.displayMessages);
+    const piHistory = parseJsonRecord(row.piHistory);
+    let changed = false;
+    let rowUpdated = 0;
+    if (displayMessages !== undefined) {
+        const result = migrateAttachmentRefs(displayMessages, { ...input, sessionId: row.sessionId });
+        changed = changed || result.changed;
+        rowUpdated += result.updated;
+        row.displayMessages = JSON.stringify(result.value);
+    }
+    if (piHistory !== undefined) {
+        const result = migrateAttachmentRefs(piHistory, { ...input, sessionId: row.sessionId });
+        changed = changed || result.changed;
+        rowUpdated += result.updated;
+        row.piHistory = JSON.stringify(result.value);
+    }
+    if (!changed)
+        return 0;
+    updateRow.run(row.displayMessages, row.piHistory, row.sessionId);
+    return rowUpdated;
 }
 function migrateAttachmentRefs(value, input) {
     let changed = false;

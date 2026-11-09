@@ -244,7 +244,13 @@ export function runMiniAppHostRunner(options = {}) {
         })());
     });
     processPort.once('disconnect', () => dispatch(stop(0)));
-    processPort.once('SIGTERM', () => dispatch(stop(0)));
+    processPort.on('SIGTERM', () => {
+        if (stopping) {
+            processPort.exit?.(processPort.exitCode ?? 0);
+            return;
+        }
+        dispatch(stop(0));
+    });
     processPort.once('SIGINT', () => dispatch(stop(0)));
     processPort.once('uncaughtException', (error) => dispatch(fail(error)));
     processPort.once('unhandledRejection', (error) => dispatch(fail(error)));
@@ -458,6 +464,9 @@ function nativeProcessPort() {
         disconnect() {
             if (process.connected)
                 process.disconnect();
+        },
+        exit(code) {
+            process.exit(code);
         },
     };
 }

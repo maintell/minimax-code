@@ -55,8 +55,9 @@ function pluginAgentSelectors(agent) {
         ...(agent.tools ? { tools: [...agent.tools] } : {}),
         ...(agent.disallowedTools ? { disallowedTools: [...agent.disallowedTools] } : {}),
         ...(agent.mcpServers ? { mcpServers: [...agent.mcpServers] } : {}),
-        ...(agent.skills ? { skills: [...agent.skills] } : {}),
-        ...(agent.extensionSkills ? { extensionSkills: [...agent.extensionSkills] } : {}),
+        // Both Plugin formats preload `skills`; same-Plugin names are already
+        // runtime names (`<plugin>:<skill>`). `extensionSkills` selects nothing.
+        ...(agent.skills ? { preloadSkills: [...agent.skills] } : {}),
     };
 }
 const COMPATIBLE_FORMAT = '\u0063\u006c\u0061\u0075\u0064\u0065';

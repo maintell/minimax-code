@@ -1,5 +1,9 @@
-import { rm } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { resolveWorkspaceCollectionPolicy } from '../capture/collection-policy.js';
+import { writeWorkspaceArchive } from '../scan/workspace-archive-writer.js';
+import { WORKSPACE_MANIFEST_SCHEMA_VERSION } from '../../../../infra/legacy-db/workspace-indexing-types.js';
+import { toManifestEntry, } from '../scan/scanner.js';
 import { assertSameWorkspaceBinding, normalizeWorkspaceIndexingErrorCode, toSkippedResult, } from './service-helpers.js';
 import { readWorkspaceCaptureManifest, toWorkspaceIndexingRevisionRecord, } from '../../../../infra/legacy-db/workspace-indexing-workspace-artifact-store.js';
 function needsSessionRevisionRefresh(session, latest, policyWorkspaceVersion) {
@@ -141,6 +145,46 @@ export class WorkspaceIndexingCaptureRunner {
             totalBytes: scan.totalBytes,
         };
     }
+    /**
+     * Writes a full Workspace snapshot into `outputDir` with the same stable
+     * scan, collection policy and archive rules as an Initial Revision, but
+     * commits no Session/Revision state and enqueues no upload. The caller owns
+     * `outputDir` and its cleanup.
+     */
+    async captureStandaloneSnapshot(input) {
+        const scan = await this.scanStable(input.workspaceDir, this.maxScanAttempts, undefined, input.limits);
+        if (scan.status === 'skipped_limit')
+            return toSkippedResult(scan);
+        const archivePath = path.join(input.outputDir, 'workspace.zip');
+        const manifestPath = path.join(input.outputDir, 'manifest.json');
+        const entries = scan.files.map(toManifestEntry);
+        const archive = await writeWorkspaceArchive({
+            targetPath: archivePath,
+            scan,
+            includedPaths: new Set(entries.map((entry) => entry.path)),
+        });
+        const manifest = {
+            schemaVersion: WORKSPACE_MANIFEST_SCHEMA_VERSION,
+            workspaceId: scan.workspaceId,
+            sessionId: input.sessionId,
+            createdAtMs: this.nowMs(),
+            rootHash: scan.rootHash,
+            policyWorkspaceVersion: scan.policy.workspaceVersion,
+            fileCount: entries.length,
+            totalBytes: scan.totalBytes,
+            entries,
+            archive: { filename: 'workspace.zip', sha256: archive.sha256, sizeBytes: archive.sizeBytes },
+        };
+        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+        return {
+            status: 'captured',
+            archivePath,
+            manifestPath,
+            rootHash: scan.rootHash,
+            fileCount: entries.length,
+            totalBytes: scan.totalBytes,
+        };
+    }
     async commitInitialLimit(input, existing, scan) {
         const nowMs = this.nowMs();
         await this.store.putSession({
@@ -206,12 +250,13 @@ export class WorkspaceIndexingCaptureRunner {
             throw error;
         }
     }
-    async scanStable(workspaceDir, attempts, signal) {
+    async scanStable(workspaceDir, attempts, signal, limits) {
         let lastError;
         for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
                 return await this.scan(workspaceDir, {
                     ...this.scanOptions,
+                    ...limits,
                     ...(signal ? { signal } : {}),
                 });
             }

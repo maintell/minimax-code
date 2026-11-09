@@ -27,6 +27,7 @@
 import { readFile as fsReadFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, realpath as fsRealpath, mkdir as fsMkdir, } from './physical-fs.js';
 import { formatPatch, structuredPatch } from 'diff';
 import { withPluginHookCompatibleToolResponse } from '../plugin-hooks/vendor-tool-response.js';
+import { regularFileVersion } from './file-read-ledger.js';
 /** Old files above this size still get BOM/encoding preservation and the
  * created/overwrote distinction, but no oldText/diff (memory + diff cost). */
 export const WRITE_CAPTURE_MAX_BYTES = 1024 * 1024;
@@ -90,15 +91,17 @@ function encodeText(body, encoding, bom) {
 }
 async function probeOldFile(absolutePath) {
     const fresh = { existed: false, encoding: 'utf-8', srcBom: false };
-    let size;
+    let stats;
     try {
-        size = (await fsStat(absolutePath)).size;
+        stats = await fsStat(absolutePath);
     }
     catch (err) {
         if (err.code === 'ENOENT')
             return fresh;
         throw err;
     }
+    const size = stats.size;
+    const version = regularFileVersion(stats);
     if (size > WRITE_CAPTURE_MAX_BYTES) {
         // Sample just enough bytes for BOM/encoding preservation; skip oldText.
         const sample = Buffer.alloc(Math.min(BINARY_SAMPLE_BYTES, size));
@@ -110,16 +113,33 @@ async function probeOldFile(absolutePath) {
             await handle.close();
         }
         const { encoding, bom } = detectEncodingFromBuffer(sample);
-        return { existed: true, encoding, srcBom: bom, captureSkipped: 'too_large' };
+        return { existed: true, encoding, srcBom: bom, version, captureSkipped: 'too_large' };
     }
     const raw = await fsReadFile(absolutePath);
     const { encoding, bom } = detectEncodingFromBuffer(raw);
     if (encoding === 'utf-8' && raw.subarray(0, BINARY_SAMPLE_BYTES).includes(0)) {
         // NULs in a non-UTF-16 file: binary — diffing it would be garbage.
         // The overwrite itself still proceeds (status-quo semantics).
-        return { existed: true, encoding, srcBom: bom, captureSkipped: 'binary' };
+        return { existed: true, encoding, srcBom: bom, version, captureSkipped: 'binary' };
     }
-    return { existed: true, encoding, srcBom: bom, oldText: decodeText(raw, encoding) };
+    return { existed: true, encoding, srcBom: bom, version, oldText: decodeText(raw, encoding) };
+}
+/**
+ * Pre-write version for the guard. Reuses the probe's stat; when the probe
+ * failed, stats again so an existing file is still checked, and lets stat
+ * errors other than ENOENT refuse the write.
+ */
+async function guardedFileVersion(absolutePath, probe) {
+    if (probe)
+        return probe.version;
+    try {
+        return regularFileVersion(await fsStat(absolutePath));
+    }
+    catch (err) {
+        if (err.code === 'ENOENT')
+            return undefined;
+        throw err;
+    }
 }
 /**
  * Build the `WriteOperations` to inject into pi's `createWriteTool`, plus
@@ -138,8 +158,11 @@ async function probeOldFile(absolutePath) {
  * in-flight write, so this only bridges a hint/normalization mismatch), and
  * abstains when several entries are pending — the caller then degrades to pi's
  * own result text rather than risking a cross-file mixup.
+ *
+ * `guard` is desktop-only; without it (cloud) the write path is unchanged.
  */
-export function createCapturingWriteOperations() {
+export function createCapturingWriteOperations(options = {}) {
+    const { guard } = options;
     const captures = new Map();
     const operations = {
         realpath: fsRealpath,
@@ -156,11 +179,16 @@ export function createCapturingWriteOperations() {
                 // own result text.
                 probe = undefined;
             }
+            if (guard) {
+                await guard.beforeWrite(absolutePath, await guardedFileVersion(absolutePath, probe));
+            }
             const { bom: nextBom, text: body } = splitBomText(content);
             const encoding = probe?.encoding ?? 'utf-8';
             const bom = (probe?.srcBom ?? false) || nextBom;
             const buffer = encodeText(body, encoding, bom);
             await fsWriteFile(absolutePath, buffer);
+            if (guard)
+                await guard.afterWrite(absolutePath);
             if (!probe)
                 return;
             if (captures.size >= MAX_PENDING_CAPTURES) {

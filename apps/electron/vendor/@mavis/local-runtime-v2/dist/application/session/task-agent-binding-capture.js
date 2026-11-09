@@ -598,33 +598,21 @@ function freezeSelectorCapabilities(profile, ready, authorToolsAllowlistScope) {
         ? COMPUTER_USE_TOOL_NAMES.filter((name) => filtered.selector.allowsTool(name))
         : [];
     const tools = frozenToolNames(filtered, deferredComputerTools, toolsAllowlistScope, profile.configSelection?.tools);
-    // The Skill reader checks both allowlists for Desktop Plugin Skills, so a
-    // frozen Plugin Skill must be named in `skills` as well as `extensionSkills`.
-    const desktopSkills = (filtered.desktopCapabilities?.skills ?? [])
-        .filter((skill) => filtered.selector.allowsExtensionSkill(skill.pluginName, skill.name))
-        .map((skill) => ({ ...skill, runtimeName: `${skill.pluginName}:${skill.name}` }));
-    const skills = uniqueNames([
-        ...ready.skills
-            .filter((skill) => filtered.selector.allowsSkill(skill.name))
-            .map((skill) => skill.name),
-        ...desktopSkills
-            .filter((skill) => filtered.selector.allowsSkill(skill.name) ||
-            filtered.selector.allowsSkill(skill.runtimeName))
-            .map((skill) => skill.runtimeName),
-    ]);
+    // Agent `skills` preloads Skills and no longer limits them. Older releases
+    // still read `skills` / `extensionSkills` as an upper bound, so both keep
+    // every Skill ready at capture; this release never reads them back.
+    const desktopSkills = (filtered.desktopCapabilities?.skills ?? []).map((skill) => `${skill.pluginName}:${skill.name}`);
+    const skills = uniqueNames([...ready.skills.map((skill) => skill.name), ...desktopSkills]);
     const extensionSkills = uniqueNames([
-        ...ready.skills
-            .filter((skill) => !isBuiltinRuntimeSkill(skill))
-            .filter((skill) => filtered.selector.allowsSkill(skill.name))
-            .filter((skill) => filtered.selector.allowsExtensionSkill('', skill.name))
-            .map((skill) => skill.name),
-        ...desktopSkills.map((skill) => skill.runtimeName),
+        ...ready.skills.filter((skill) => !isBuiltinRuntimeSkill(skill)).map((skill) => skill.name),
+        ...desktopSkills,
     ]);
+    const preloadSkills = uniqueNames(profile.configSelection?.skills ?? []);
     const disallowedTools = profile.configSelection?.disallowedTools ?? [];
     return {
-        // The snapshot is an upper bound for internal tools and Skills only:
-        // undefined selectors resolve to the ready inventory at Task creation (plus
-        // the allowed deferred Computer Use names), and later installs can only be
+        // The snapshot is an upper bound for internal tools only: undefined
+        // selectors resolve to the ready inventory at Task creation (plus the
+        // allowed deferred Computer Use names), and later installs can only be
         // removed by current runtime gates. MCP and Plugin tools are not bounded by
         // it; they follow the Agent's `mcpServers` and `disallowedTools` on every
         // Turn (README "Desktop Local Agent 定义").
@@ -635,6 +623,7 @@ function freezeSelectorCapabilities(profile, ready, authorToolsAllowlistScope) {
         mcpServers: frozenMcpServerSelector(profile.configSelection?.mcpServers),
         skills,
         extensionSkills,
+        ...(preloadSkills.length > 0 ? { preloadSkills } : {}),
         selectorVersion: FROZEN_SELECTOR_VERSION,
     };
 }

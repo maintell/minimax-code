@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { MINIAPP_DEVICE_ACCESS_ITEMS, isMiniAppAgentAccess, isMiniAppDeviceAccessItem, validateMiniAppSurfaceWindow, } from '@mavis/shared/miniapp-surface';
+import { MINIAPP_DEVICE_ACCESS_ITEMS, isMiniAppAgentAccess, isMiniAppDeviceAccessItem, isMiniAppHostAccess, validateMiniAppSurfaceWindow, } from '@mavis/shared/miniapp-surface';
 import { MINIAPP_AGENT_MAX_CONCURRENCY } from '../../../../miniapp/index.js';
 import { isRecord, resolvePluginDirectory, resolvePluginFile, } from '../filesystem.js';
 import { validatePluginPortablePath } from '../package-contract.js';
@@ -18,6 +18,7 @@ const MINIAPP_FIELDS = new Set([
     'engines',
     'toolAccess',
     'deviceAccess',
+    'hostAccess',
 ]);
 const ARTIFACT_FIELDS = new Set(['client', 'node']);
 const PROCESS_RUNTIME_FIELDS = new Set(['kind', 'entry', 'lifecycle']);
@@ -45,6 +46,7 @@ export async function readMiniAppManifest(root, value, mcpServerNames, payloadDi
     const engines = readEngines(value.engines);
     const toolAccess = readToolAccess(value.toolAccess);
     const deviceAccess = readDeviceAccess(value.deviceAccess);
+    const hostAccess = readHostAccess(value.hostAccess);
     return {
         artifacts,
         runtime,
@@ -56,6 +58,7 @@ export async function readMiniAppManifest(root, value, mcpServerNames, payloadDi
         ...(engines ? { engines } : {}),
         ...(toolAccess ? { toolAccess } : {}),
         ...(deviceAccess ? { deviceAccess } : {}),
+        ...(hostAccess ? { hostAccess } : {}),
     };
 }
 async function readArtifacts(root, value, payloadDirectory) {
@@ -215,6 +218,15 @@ function readToolAccess(value) {
         return undefined;
     if (!Array.isArray(value) || value.some((capability) => capability !== 'call')) {
         miniAppFail('TOOL_ACCESS_INVALID', 'toolAccess may only contain call');
+    }
+    return [...new Set(value)];
+}
+/** Host behavior the page may observe; each declaration has its own user switch. */
+function readHostAccess(value) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value) || !value.every(isMiniAppHostAccess)) {
+        miniAppFail('HOST_ACCESS_INVALID', 'hostAccess may only contain navigation.read');
     }
     return [...new Set(value)];
 }

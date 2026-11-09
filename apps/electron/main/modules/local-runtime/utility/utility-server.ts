@@ -628,6 +628,39 @@ export function startLocalRuntimeUtilityServer(options) {
                 })();
                 return;
             }
+            case 'runtime-workspace-snapshot-request': {
+                const { requestId, sessionId, outputDir } = message;
+                void (async () => {
+                    let response;
+                    if (phase !== 'ready' || !surface) {
+                        response = {
+                            type: 'runtime-workspace-snapshot-error',
+                            requestId,
+                            message: 'workspace_snapshot_runtime_unavailable',
+                        };
+                    }
+                    else {
+                        try {
+                            const snapshot = await surface.captureWorkspaceSnapshot(sessionId, outputDir);
+                            response = { type: 'runtime-workspace-snapshot-result', requestId, snapshot };
+                        }
+                        catch (error) {
+                            response = {
+                                type: 'runtime-workspace-snapshot-error',
+                                requestId,
+                                message: reportErrorMessage(error),
+                            };
+                        }
+                    }
+                    try {
+                        parentPort.postMessage(response);
+                    }
+                    catch {
+                        log('runtime-workspace-snapshot response post failed');
+                    }
+                })();
+                return;
+            }
             case 'runtime-shutdown':
                 logShutdownReceived(message.app_instance_id);
                 void handleShutdown();

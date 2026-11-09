@@ -193,6 +193,7 @@ let CloudTeamTool = (() => {
                 workspaceRoot: this.deps.workspaceRoot,
                 sessionId: ctx.sessionId,
                 ...(this.deps.teamRuntime ? { teamRuntime: this.deps.teamRuntime } : {}),
+                ...(ctx.parentAgentConfig?.team?.disabled === true ? { teamDisabled: true } : {}),
             }, input.command, normalizeTeamToolArgs(input), signal);
             return toToolResult(output, TeamToolDef.name);
         }

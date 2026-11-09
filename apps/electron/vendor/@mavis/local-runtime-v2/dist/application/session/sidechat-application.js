@@ -22,6 +22,8 @@ export class SideChatApplication {
         this.options = options;
     }
     async createSideChat(_context, req) {
+        if (req.advisor !== undefined)
+            throw new AppError(501, 'NOT_IMPLEMENTED', 'Side chat advisor selection is not implemented');
         if (!req.clientRequestId?.trim())
             throw new AppError(400, 'CLIENT_REQUEST_ID_REQUIRED', 'clientRequestId is required');
         if (req.createOnly &&

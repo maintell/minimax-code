@@ -1,4 +1,5 @@
 import { getGlobalDispatcher, fetch as undiciFetch } from 'undici';
+import { MatrixAuthRequiredError } from '../cloud/matrix-tools/types.js';
 import { getDesktopMatrixEndpoint, isManagedMatrixBaseUrl, normalizeMatrixBaseUrl, } from './matrix-env.js';
 const MATRIX_USER_AGENT = 'MiniMaxAgent';
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -11,12 +12,16 @@ export class DesktopGatewayHttpError extends Error {
     pathname;
     statusCode;
     errorCode;
-    constructor(pathname, statusCode, errorCode, responsePreview = '') {
+    backend;
+    constructor(pathname, statusCode, errorCode, responsePreview = '', 
+    /** Whose credential the request carried, so a 401 names the right one. */
+    backend) {
         // Preserve the pre-existing error text for every non-WebSearch caller.
         super(`Matrix backend ${pathname} HTTP ${statusCode}: ${responsePreview}`);
         this.pathname = pathname;
         this.statusCode = statusCode;
         this.errorCode = errorCode;
+        this.backend = backend;
         this.name = 'DesktopGatewayHttpError';
     }
 }
@@ -73,7 +78,7 @@ export class DesktopMatrixClient {
             const res = await this.fetchImpl(`${this.baseUrl}${pathname}`, init);
             const text = await res.text();
             if (!res.ok) {
-                throw new DesktopGatewayHttpError(pathname, res.status, readGatewayErrorCode(text), text.slice(0, 500));
+                throw new DesktopGatewayHttpError(pathname, res.status, readGatewayErrorCode(text), text.slice(0, 500), this.managedEndpoint ? 'managed' : 'custom');
             }
             return text ? JSON.parse(text) : {};
         }
@@ -127,9 +132,9 @@ export class DesktopMatrixClient {
     buildHeaders(extraHeaders = {}) {
         const token = this.explicitAccessToken ?? this.getManagedAccessToken();
         if (!token) {
-            throw new Error(this.useManagedAuth
-                ? 'Matrix tools require a managed-login access token.'
-                : 'Matrix tools require MATRIX_TOKEN for non-managed MATRIX_BASE_URL.');
+            throw this.useManagedAuth
+                ? new MatrixAuthRequiredError('managed_login', 'Matrix tools require a managed-login access token.')
+                : new MatrixAuthRequiredError('matrix_token', 'Matrix tools require MATRIX_TOKEN for non-managed MATRIX_BASE_URL.');
         }
         return {
             'User-Agent': MATRIX_USER_AGENT,

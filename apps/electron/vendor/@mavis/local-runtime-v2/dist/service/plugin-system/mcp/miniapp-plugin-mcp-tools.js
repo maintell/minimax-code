@@ -2,6 +2,7 @@ import { McpToolCallNotDispatchedError, McpToolCallTimeoutError } from '@mavis/m
 const UNAVAILABLE_SERVER_DIAGNOSTICS = new Set([
     'MCP_SERVER_LIST_FAILED',
     'MCP_SERVER_WARMING',
+    'MCP_SERVER_AUTH_REQUIRED',
 ]);
 /**
  * Serves `context.tool` every published Plugin MCP tool under its runtime name, as an Agent turn

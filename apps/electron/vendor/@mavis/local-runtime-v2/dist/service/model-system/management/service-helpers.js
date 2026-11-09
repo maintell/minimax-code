@@ -3,6 +3,7 @@ import { parseProviderId, parseSourceQualifiedModelKey } from '../resolution/mod
 import { cacheStatusView, minimaxApiModels, } from '../catalog/list-models.js';
 import { modelConfigFingerprint } from '../catalog/model-cache.js';
 import { LocalModelProviderError } from '../contracts.js';
+import { assertGeminiEffortOptions } from '../resolution/model-ref.js';
 const providerMutationTails = new Map();
 export function patchModelParameters(model, normalizedPatch) {
     return {
@@ -12,6 +13,12 @@ export function patchModelParameters(model, normalizedPatch) {
 }
 export function removeLegacyCustomProviderNpm(provider) {
     delete provider.npm;
+}
+/** Validates against the final protocol, so switching an existing provider to Gemini is covered too. */
+export function assertCustomProviderEffortOptions(provider) {
+    for (const model of Object.values(provider.models ?? {})) {
+        assertGeminiEffortOptions(provider.api, model.thinking?.effortOptions);
+    }
 }
 /**
  * Keep the global default callable after a custom Provider/model mutation.
@@ -108,5 +115,21 @@ async function ignoreMutationOutcome(value) {
     catch {
         // A failed mutation releases the queue for the next caller.
     }
+}
+export function customProviderViewOptions(deps) {
+    const bindings = deps.modelAccess?.bindings;
+    return {
+        ...(deps.byokKeyPool ? { byokKeyPool: deps.byokKeyPool } : {}),
+        ...(bindings
+            ? { modelAccessBinding: (providerKey) => bindings.peek(providerKey) }
+            : {}),
+    };
+}
+/** Owned by an extension, but its binding is gone: never fall back to legacy credentials. */
+export function modelAccessBindingMissingError() {
+    return new LocalModelProviderError(409, 'Extension provider has no current binding; sign in again or remove it', 'MODEL_ACCESS_BINDING_MISSING');
+}
+export function modelAccessProviderReadOnlyError() {
+    return new LocalModelProviderError(400, 'Extension provider credentials, base_url and api format cannot be edited', 'MODEL_ACCESS_READ_ONLY');
 }
 //# sourceMappingURL=service-helpers.js.map

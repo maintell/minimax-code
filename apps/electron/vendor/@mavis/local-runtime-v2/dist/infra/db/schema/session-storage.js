@@ -1,3 +1,4 @@
+import { pptPreviewArtifacts, pptPreviewRequests, pptPreviewEvents } from './ppt-preview.js';
 import { getTableConfig, SQLiteSyncDialect } from 'drizzle-orm/sqlite-core';
 import { fileHistoryMigrations, legacyMigrations, legacyOwnerMigrations, legacyPiHistoryRowMigrations, legacyPiHistoryRows, } from './legacy-session.js';
 import { legacyMessages, messageRowMigrations, messageRows, sessionAssetIndexState, sessionAssets, } from './messages.js';
@@ -97,6 +98,11 @@ export const SESSION_STORAGE_TABLE_METADATA = {
     optionalDiagnostic: SESSION_STORAGE_SCHEMA.legacyDiagnostic.map(tableMetadata),
     conditionalLegacyInput: SESSION_STORAGE_SCHEMA.conditionalLegacyInput.map(tableMetadata),
 };
+export const PPT_PREVIEW_TABLE_METADATA = [
+    pptPreviewArtifacts,
+    pptPreviewRequests,
+    pptPreviewEvents,
+].map(tableMetadata);
 const finalProjectMetadata = tableMetadata(projects);
 export const SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA = [
     {

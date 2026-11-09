@@ -10,6 +10,7 @@ const MAX_SESSION_LOG_BYTES = 5 * 1024 * 1024;
  * takes the five Sessions written to most recently. Files are chosen by
  * Session rather than by the bundle's time window (the directory keeps seven
  * days), and each file is capped to its last 5MB.
+ * 反馈装包按会话最后活跃时间设了截止时间时也不截这里：会话自己的日志都要带上。
  */
 export function createRuntimeSessionLogSource(logsDir, sessionId) {
     const dir = join(logsDir, SESSION_LOG_DIR);
@@ -25,6 +26,7 @@ export function createRuntimeSessionLogSource(logsDir, sessionId) {
         uploadDefault: 'consent-required',
         maxBytesPerFile: MAX_SESSION_LOG_BYTES,
         sinceMs: 0,
+        untilMs: Number.POSITIVE_INFINITY,
     });
 }
 /** Latest write time across one Session's log files; undefined when none is readable. */

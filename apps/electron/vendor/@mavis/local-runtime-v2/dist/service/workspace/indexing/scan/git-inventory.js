@@ -2,7 +2,14 @@ import { spawn } from 'node:child_process';
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 const STDERR_MAX_BYTES = 64 * 1024;
+/**
+ * Filtering inventory paths is synchronous CPU work over tens of thousands of
+ * records in large repositories. It runs inside the runtime process, so it
+ * yields this often to keep streaming turns and requests responsive.
+ */
+export const INVENTORY_FILTER_SLICE_MS = 8;
 export async function appendGitWorkspacePaths(input) {
     input.signal?.throwIfAborted();
     if (!Number.isInteger(input.maxFiles) || input.maxFiles < 0) {
@@ -33,17 +40,29 @@ export async function appendGitWorkspacePaths(input) {
             child.kill();
         }
     };
-    child.stdout.on('data', (chunk) => {
-        if (limitExceeded)
-            return;
-        pending += stdoutDecoder.write(chunk);
-        let separatorIndex = pending.indexOf('\0');
-        while (separatorIndex >= 0 && !limitExceeded) {
-            acceptRecord(pending.slice(0, separatorIndex));
-            pending = pending.slice(separatorIndex + 1);
-            separatorIndex = pending.indexOf('\0');
+    // Consumed as an async iterator rather than 'data' events: libuv drains a
+    // ready pipe in one poll pass, so event handlers would filter the whole
+    // inventory in a single blocking turn. Pausing here applies backpressure.
+    const consumeStdout = async () => {
+        let sliceStartedMs = performance.now();
+        for await (const chunk of child.stdout) {
+            if (limitExceeded)
+                return;
+            pending += stdoutDecoder.write(chunk);
+            let recordStart = 0;
+            let separatorIndex = pending.indexOf('\0');
+            while (separatorIndex >= 0 && !limitExceeded) {
+                acceptRecord(pending.slice(recordStart, separatorIndex));
+                recordStart = separatorIndex + 1;
+                separatorIndex = pending.indexOf('\0', recordStart);
+                if (performance.now() - sliceStartedMs >= INVENTORY_FILTER_SLICE_MS) {
+                    await yieldToEventLoop();
+                    sliceStartedMs = performance.now();
+                }
+            }
+            pending = pending.slice(recordStart);
         }
-    });
+    };
     child.stderr.on('data', (chunk) => {
         if (stderrBytes >= STDERR_MAX_BYTES)
             return;
@@ -51,7 +70,7 @@ export async function appendGitWorkspacePaths(input) {
         stderrChunks.push(bounded);
         stderrBytes += bounded.byteLength;
     });
-    const outcome = await new Promise((resolve) => {
+    const closed = new Promise((resolve) => {
         let settled = false;
         const finish = (result) => {
             if (settled)
@@ -62,6 +81,16 @@ export async function appendGitWorkspacePaths(input) {
         child.once('error', (error) => finish({ code: null, error }));
         child.once('close', (code) => finish({ code }));
     });
+    try {
+        await consumeStdout();
+    }
+    catch (error) {
+        // An aborted or failed read surfaces through the child's own outcome.
+        child.kill();
+        if (!input.signal?.aborted)
+            throw error;
+    }
+    const outcome = await closed;
     if (limitExceeded)
         return { status: 'limit_exceeded' };
     input.signal?.throwIfAborted();

@@ -271,6 +271,7 @@ function createStartedHost(v1, ownerRuntime, ready) {
         ...(ownerRuntime
             ? {
                 notifyAuthContextChanged: (authState) => ownerRuntime.services.notifyAuthContextChanged(authState),
+                notifyRoutingContextChanged: () => ownerRuntime.services.notifyRoutingContextChanged(),
             }
             : {}),
     };
@@ -552,12 +553,14 @@ function bindV2ChannelSubsystem(apiHost, channelSystem) {
 }
 function configureV1HostOptions(options, compatibility, agentRuntimePort, owners) {
     const { sandboxOperationsFactory, prepared } = owners;
-    const { browserAdapter, browserToolExposure, promptConfigKey, promptMode, systemPromptOverrides, ...v1Options } = options;
+    const { browserAdapter, browserToolExposure, promptConfigKey, promptMode, systemPromptOverrides, modelAccessExecutionMode, pptPreviewRenderHost, ...v1Options } = options;
     void browserAdapter;
     void browserToolExposure;
     void promptConfigKey;
     void promptMode;
     void systemPromptOverrides;
+    void modelAccessExecutionMode;
+    void pptPreviewRenderHost;
     // V2 owns the channel startup point: the V1 shell must build stores, APIs,
     // runner and registries without restoring a single transport.
     delete v1Options.computerUseClient;
@@ -669,10 +672,14 @@ async function initializeOwnerRuntime(input) {
             runtimeOwnerKind: options.runtimeOwnerKind,
             runtimeCapabilities: options.capabilities,
             browserUse: createBrowserUseServiceOptions(options),
+            pptPreviewRenderHost: options.pptPreviewRenderHost,
             executionAuthMode: options.executionAuthMode,
             ...(options.promptConfigKey ? { promptConfigKey: options.promptConfigKey } : {}),
             capabilityProfile: options.capabilityProfile,
             systemPromptOverrides: options.systemPromptOverrides,
+            modelAccessExecutionMode: options.modelAccessExecutionMode,
+            // Build gate: products that turn `beta.modelAccess` off never create the owner.
+            modelAccessEnabled: modelAccessBuildEnabled(v1.apiHost.configGetter, options.configGetter),
             getRunawayGuardConfig: options.getRunawayGuardConfig,
             getPromptSuggestionPolicy: options.getPromptSuggestionPolicy,
             promptSuggestionSurface: options.promptSuggestionSurface,
@@ -858,5 +865,13 @@ async function stopV1Producers(v1, recordError) {
             recordError(error);
         }
     }
+}
+function modelAccessBuildEnabled(...getters) {
+    for (const getter of getters) {
+        const config = getter?.();
+        if (config)
+            return config.beta?.modelAccess !== false;
+    }
+    return true;
 }
 //# sourceMappingURL=runtime.js.map

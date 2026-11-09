@@ -22,6 +22,7 @@ const RC_FILE_CONTENT_MAX_BYTES_HEADER = 'X-MCode-Remote-Control-File-Content-Ma
 const DEFAULT_RC_FILE_CONTENT_MAX_BYTES = 10 * 1024 * 1024;
 const PREVIEW_BINARY_MIME_TYPES = new Map([
     ['.aac', 'audio/aac'],
+    ['.avif', 'image/avif'],
     ['.bmp', 'image/bmp'],
     // Workbook saves compare the original file hash, including CSV encoding/BOM.
     ['.csv', 'text/csv'],

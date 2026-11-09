@@ -1,5 +1,6 @@
 export const AGENT_BUILTIN_TOOL_IDS = [
     'read',
+    'ppt_preview',
     'write',
     'edit',
     'bash',
@@ -12,6 +13,7 @@ export const AGENT_BUILTIN_TOOL_IDS = [
     'web_fetch',
     'website_deploy',
     'workspace_semantic_search',
+    'skill',
 ];
 /**
  * Standalone Builtin Matrix MCP tools that may be selected independently.

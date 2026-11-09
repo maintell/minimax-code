@@ -36,6 +36,8 @@ export { isVisibleTreeSession } from './conversation/visibility.js';
 export { applyLocalSessionListOptions } from './conversation/representation/list-options.js';
 export { withoutLocalSessionPagination } from './conversation/representation/list-options.js';
 export { buildMavisSessionAdapter } from './session-send/mavis-tool-adapters.js';
+export { mapTurnRejection } from './session-send/mavis-session-send-errors.js';
+export { createRemoteSessionReader } from './session-send/remote-sessions/index.js';
 export { createSessionSendWaitGraph } from './session-send/mavis-session-send-wait-graph.js';
 export { LocalPiHistoryStore } from './conversation/pi-history-store.js';
 export { routeLocalUsageSummaryApi } from './compatibility/usage-api.js';

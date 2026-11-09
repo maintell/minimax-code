@@ -235,6 +235,11 @@ export class WorkspaceFileControllerBase {
         void req;
         throw new NotImplementedError('searchWorkspaceReviewDiffs');
     }
+    async watchWorkspaceFiles(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('watchWorkspaceFiles');
+    }
     async streamWorkspaceFileSearch(ctx, req) {
         void ctx;
         void req;

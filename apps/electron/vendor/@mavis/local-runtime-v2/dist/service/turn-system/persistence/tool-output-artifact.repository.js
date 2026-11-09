@@ -196,13 +196,20 @@ function isMissingPathError(error) {
 function artifactIdentity(input) {
     // The reports directory already scopes artifacts to a Session. Exclude the
     // projecting turn so the same historical tool result keeps one stable path.
+    // A part (one page of a web_search, for example) also names its tool and position, so the file
+    // shows which call and which item it holds: `web_search-<call>-result-01-<sha256>.txt`.
     const contentSha256 = sha256Text(input.text);
-    const baseName = `${callDigest(input)}-${contentSha256}`;
+    const baseName = input.part
+        ? `${fileNameSegment(input.toolName)}-${callDigest(input)}-${fileNameSegment(input.part)}-${contentSha256}`
+        : `${callDigest(input)}-${contentSha256}`;
     return {
         fileName: `${baseName}.txt`,
         readableFileName: `${baseName}.readable.v${READABLE_FORMAT_VERSION}.jsonl`,
         contentSha256,
     };
+}
+function fileNameSegment(value) {
+    return value.replaceAll(/[^A-Za-z0-9_-]/gu, '_').slice(0, 64) || 'part';
 }
 async function ensureRawArtifact(artifactPath, text, contentSha256) {
     const expected = { bytes: Buffer.byteLength(text), sha256: contentSha256 };

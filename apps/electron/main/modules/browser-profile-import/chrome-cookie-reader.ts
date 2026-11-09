@@ -121,6 +121,104 @@ function reportCookieDatabaseFailure(report, requestId, platform, failure) {
         // Diagnostic reporting must never replace the stable public import error.
     }
 }
+/**
+ * 直读失败后值得改走卷影副本的原因。
+ *
+ * 只包含「被占用」类原因：access_denied 是权限问题，corrupt 是库损坏，
+ * 两者都不会因为换个副本能解决，反而会把真实原因掩盖成卷影失败。
+ */
+const SHADOW_RETRY_REASONS = new Set([
+    'busy',
+    'locked',
+    'cannot_open',
+]);
+/**
+ * 判断直读失败后是否值得改走卷影副本。
+ *
+ * 导出成纯函数是为了能穷举决策矩阵：文件系统层面无法跨平台稳定构造出
+ * `cannot_open`（Windows 上要靠 Chrome 的独占锁才有），所以这条分支的正确性
+ * 只能靠纯函数单测，加上真机验证（本机 Chrome 156 实测卷影副本可读出全部 897 条）。
+ */
+/**
+ * Decide what a failed shadow copy means for the user.
+ *
+ * Only a snapshot that was attempted and did not produce a readable copy is a
+ * shadow_unavailable, because that is the case where closing Chrome actually
+ * helps. The privileged path classifies its own failures before they get here,
+ * and those classifications carry the action the user can take: a declined UAC
+ * prompt is a choice to retry, and a failed elevation is a system setting to
+ * change. Collapsing either into shadow_unavailable tells the user to close
+ * Chrome, which is neither the cause nor something they can act on from there.
+ */
+export function classifyShadowSnapshotFailure(error) {
+    if (error instanceof BrowserProfileImportFailure)
+        return error;
+    return new CookieDatabaseDiagnosticError('shadow_snapshot', 'shadow_unavailable');
+}
+export function shouldUseShadowSnapshot(input) {
+    if (input.platform !== 'win32')
+        return false;
+    if (!input.hasHook)
+        return false;
+    return SHADOW_RETRY_REASONS.has(input.reason);
+}
+/**
+ * 打开 Cookies 库的可读快照，必要时先绕开 Chrome 的独占锁。
+ *
+ * Chrome 在 Windows 上以无共享方式持有 Cookies 库（实测裸文件只读打开即 EBUSY），
+ * 因此直读失败且原因是「被占用」时，改从卷影副本读同一文件。
+ * 卷影副本由已提权的 broker 创建，读取仍在用户态完成，cookie 数据不经过特权管道。
+ *
+ * 先直读再降级是有意的：Chrome 已退出时直读本就可用，
+ * 而创建卷影副本约需 20 秒，不该为不需要的场景付这个代价。
+ */
+async function openCookieDatabaseSnapshot(source, signal, context) {
+    try {
+        return await snapshotCookieDatabase(source, signal);
+    }
+    catch (error) {
+        if (signal.aborted)
+            throw error;
+        const failure = asCookieDatabaseDiagnosticError(error, 'snapshot_backup');
+        const { platform, options, report, requestId } = context;
+        const shadowHook = options.createWindowsShadowSnapshot;
+        if (!shadowHook ||
+            !shouldUseShadowSnapshot({ platform, reason: failure.reason, hasHook: true })) {
+            throw failure;
+        }
+        const shadowStartedAt = Date.now();
+        // The grant is announced before it is requested, not after it fails: on this
+        // path the shadow copy is the first privileged call, so this is where the
+        // UAC prompt actually appears. Leaving the phase as "reading" means the user
+        // sees a system dialog with no explanation of what asked for it.
+        options.onAuthorizationRequired?.();
+        let shadowPath;
+        try {
+            shadowPath = await shadowHook(source, signal);
+        }
+        catch (shadowError) {
+            if (signal.aborted)
+                throw shadowError;
+            throw classifyShadowSnapshotFailure(shadowError);
+        }
+        if (requestId && report) {
+            report({
+                event: 'cookie_shadow_snapshot_completed',
+                requestId,
+                platform,
+                durationMs: Date.now() - shadowStartedAt,
+            });
+        }
+        try {
+            return await snapshotCookieDatabase(shadowPath, signal);
+        }
+        catch (shadowReadError) {
+            if (signal.aborted)
+                throw shadowReadError;
+            throw asCookieDatabaseDiagnosticError(shadowReadError, 'snapshot_backup');
+        }
+    }
+}
 async function snapshotCookieDatabase(source, signal) {
     signal.throwIfAborted();
     const directory = await mkdtemp(path.join(os.tmpdir(), 'mavis-chrome-cookies-'));
@@ -193,13 +291,30 @@ export async function readChromeCookies(profile, signal, options = {}) {
     const snapshotStartedAt = Date.now();
     let snapshot;
     try {
-        snapshot = await snapshotCookieDatabase(profile.cookieDatabasePath, signal);
+        snapshot = await openCookieDatabaseSnapshot(profile.cookieDatabasePath, signal, {
+            platform,
+            options,
+            report,
+            requestId,
+        });
     }
     catch (error) {
         if (signal.aborted)
             throw error;
-        reportCookieDatabaseFailure(report, requestId, platform, asCookieDatabaseDiagnosticError(error, 'snapshot_backup'));
-        throw new BrowserProfileImportFailure('cookie_database_unavailable');
+        // A failure the privileged path already classified carries the action the
+        // user can actually take, so it travels unchanged. Re-deriving a code here
+        // would turn a declined UAC prompt back into "close Chrome and retry".
+        if (error instanceof BrowserProfileImportFailure)
+            throw error;
+        const failure = asCookieDatabaseDiagnosticError(error, 'snapshot_backup');
+        reportCookieDatabaseFailure(report, requestId, platform, failure);
+        // A blocked shadow fallback is reported apart from an unreadable database,
+        // because the fix is in the user's hands: close Chrome and the direct read
+        // works. Reporting it as a database problem sends them looking at file
+        // permissions, where nothing is wrong.
+        throw new BrowserProfileImportFailure(failure.reason === 'shadow_unavailable'
+            ? 'shadow_unavailable'
+            : 'cookie_database_unavailable');
     }
     if (requestId && report) {
         report({
@@ -210,6 +325,10 @@ export async function readChromeCookies(profile, signal, options = {}) {
     }
     let database = null;
     let databaseStage = 'snapshot_open';
+    // Declared out here rather than beside the lookups so the finally block can
+    // reach them: a let inside the try is a sibling scope, not a visible one.
+    let windowsMasterKey;
+    let windowsAppBoundKey;
     try {
         let databaseVersion = 0;
         let rows;
@@ -278,7 +397,6 @@ export async function readChromeCookies(profile, signal, options = {}) {
             });
         }
         let macPassword;
-        let windowsMasterKey;
         let secretAccess;
         try {
             if (platform === 'darwin' && encryptedRows.length > 0) {
@@ -347,6 +465,29 @@ export async function readChromeCookies(profile, signal, options = {}) {
                     });
                 }
             }
+            if (platform === 'win32' &&
+                options.getWindowsAppBoundKey &&
+                encryptedRows.some((row) => row.encrypted_value.subarray(0, 3).toString('ascii') === 'v20')) {
+                // v20 需要 SYSTEM 上下文，属于用户可见的授权动作，沿用 authorizing 生命周期。
+                options.onAuthorizationRequired?.();
+                secretAccess = { provider: 'windows_dpapi', startedAt: Date.now() };
+                if (requestId && report) {
+                    report({ event: 'secret_access_started', requestId, provider: 'windows_dpapi' });
+                }
+                windowsAppBoundKey = await options.getWindowsAppBoundKey(profile.localStatePath, signal);
+                if (windowsAppBoundKey.length !== 32) {
+                    throw new BrowserProfileImportFailure('decryption_failed');
+                }
+                options.onAuthorizationCompleted?.();
+                if (requestId && report) {
+                    report({
+                        event: 'secret_access_completed',
+                        requestId,
+                        provider: 'windows_dpapi',
+                        durationMs: Date.now() - secretAccess.startedAt,
+                    });
+                }
+            }
         }
         catch (error) {
             if (requestId && report && secretAccess) {
@@ -359,6 +500,10 @@ export async function readChromeCookies(profile, signal, options = {}) {
                 });
             }
             if (signal.aborted)
+                throw error;
+            // 已经分好类的失败原样上抛。压平成 decryption_failed 会丢掉「用户取消了
+            // UAC」这类信息，而那恰恰是唯一需要区别对待的一种。
+            if (error instanceof BrowserProfileImportFailure)
                 throw error;
             throw new BrowserProfileImportFailure(error instanceof MacSafeStorageAccessError
                 ? macSafeStorageErrorCode(error)
@@ -384,6 +529,7 @@ export async function readChromeCookies(profile, signal, options = {}) {
                         const decrypted = await decryptWindowsChromeCookie({
                             encryptedValue: row.encrypted_value,
                             masterKey: windowsMasterKey,
+                            appBoundKey: windowsAppBoundKey,
                             hostKey: row.host_key,
                             databaseVersion,
                             dpapiUnprotect: (encrypted) => (options.dpapiUnprotect ?? windowsDpapiUnprotect)(encrypted, signal),
@@ -420,6 +566,12 @@ export async function readChromeCookies(profile, signal, options = {}) {
         return { cookies, skippedCount, unsupportedCount };
     }
     finally {
+        // Both keys are cleared before the buffers become garbage. abe-key-provider
+        // zeroes every intermediate plaintext it handles, so leaving the final key
+        // sitting in a reachable buffer until collection would be the one place in
+        // this path where key material outlives its use.
+        windowsAppBoundKey?.fill(0);
+        windowsMasterKey?.fill(0);
         database?.close();
         await snapshot.cleanup();
     }

@@ -1,3 +1,4 @@
+import { withPptPreviewTaskStop } from './ppt-task-stop-cascade.js';
 import { getRuntimeRegion, isLocalSourceProvenanceEnabled, } from '@mavis/config';
 import { createRuntimeAuthSubmissionPreparation } from './runtime-execution-auth.js';
 import { SAFETY_SCENE } from '../../service/content-safety/index.js';
@@ -105,11 +106,9 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         db: input.options.db,
         onBackgroundTaskWaitChanged: (payload) => input.writeGlobalEvent({ type: 'session.background_task_wait', payload }),
         // Explicit user stops cascade into this Session's background work. Owned by
-        // the injected V2 background owner; an accepted stop pauses the active Goal
-        // through the v2 Goal owner first.
-        userStop: input.options.compatibility.backgroundTasks.createUserStop({
-            pauseActiveGoal: input.goalPort.pauseActiveForAbort,
-        }),
+        // the injected V2 background owner; an
+        // accepted stop pauses the active Goal through the v2 Goal owner first.
+        userStop: createRuntimeUserStop(input),
         // A redelivered queue item runs under a fresh Turn id; its Goal token
         // attribution follows it.
         onQueuedTurnIdentity: ({ turnId, previousTurnIds }) => input.goalPort.followQueuedTurn({ turnId, previousTurnIds }),
@@ -241,6 +240,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         shouldYieldFifoPosition: queueSelection.shouldYieldFifoPosition,
         createMessageDelivery: createTurnSystemMessageDelivery(input.messageDelivery),
         beforeStart: prepareMentionedMiniApps(input, prepareMiniAppTurn),
+        onTurnSettling: dependencies.miniAppMemory && releaseMiniAppTurn(dependencies.miniAppMemory),
         ...(input.sessionClio ? { sessionClio: input.sessionClio.capture } : {}),
         ...(input.sessionClio || input.product.turnSettlement
             ? {
@@ -291,16 +291,47 @@ function createTurnQueueSelection(input, plan, planEntryEnabled) {
 }
 /** A session a Mini App started must not cold-start other Mini Apps by mentioning them. */
 function prepareMentionedMiniApps(input, prepareMiniAppTurn) {
-    return async ({ input: message, sessionId, signal }) => {
+    return async ({ input: message, sessionId, turnId, source, signal }) => {
         const record = await input.sessionSystem.sessions.repository.get(sessionId);
         if (record?.miniAppOrigin)
             return;
+        const members = [message, ...(message.queuedMessages ?? [])];
         return prepareMiniAppTurn({
-            messages: [message, ...(message.queuedMessages ?? [])].map(({ text }) => ({
-                content: text,
-            })),
+            sessionId,
+            turnId,
+            initiator: mentionInitiator(source, members),
+            messages: members.map(({ text }) => ({ content: text })),
             signal,
         });
+    };
+}
+/**
+ * An @ mention counts as the local user's (and may put another Mini App to sleep) only when the
+ * Desktop user typed every message of the turn: `api` source, and no member of the batch has a
+ * channel sender (a remote person on Feishu/Telegram/...) or an origin (a background-task
+ * delivery or another session's `session send`). Every source other than `api` starts the turn
+ * as `agent`: cron, Goal continuation and subagent turns, and also locally typed code review and
+ * questionnaire turns.
+ */
+function mentionInitiator(source, members) {
+    return source === 'api' &&
+        members.every(({ origin, channelContext }) => !origin && !channelContext)
+        ? 'user'
+        : 'agent';
+}
+/**
+ * Drops every hold the turn took (@ references and managed MCP calls). `releaseTurn` cannot throw
+ * today; the guard only keeps settlement total. A thrown release would leave the plugins in the
+ * foreground tier until restart.
+ */
+function releaseMiniAppTurn(memory) {
+    return (turn) => {
+        try {
+            memory.releaseTurn(turn);
+        }
+        catch {
+            // The Turn settles regardless.
+        }
     };
 }
 /** Adds the prompt-suggestion port and stops suggestions and countdown wake timers on close. */
@@ -320,6 +351,11 @@ function withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection)
             await turnSystem.close();
         },
     };
+}
+function createRuntimeUserStop(input) {
+    return withPptPreviewTaskStop(input.options.compatibility.backgroundTasks.createUserStop({
+        pauseActiveGoal: input.goalPort.pauseActiveForAbort,
+    }), input.pptPreview);
 }
 /** Records that an AskUser v2 answer reached the model (v1 questionnaire owner, CAS once). */
 function markQuestionnaireAnswerDelivered(input) {

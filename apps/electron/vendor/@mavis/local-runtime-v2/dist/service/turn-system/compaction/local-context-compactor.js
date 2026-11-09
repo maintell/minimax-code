@@ -22,6 +22,7 @@ export class LocalContextCompactor {
         this.checkpointContext = {
             reminder: context.reminder,
             projectRequestMessages: context.projectRequestMessages,
+            mainRequestMessages: context.mainRequestMessages,
         };
         this.imageFileWriter = context.imageFileWriter;
         this.resolveEarlierFiles = context.resolveEarlierFiles;
@@ -40,6 +41,7 @@ export class LocalContextCompactor {
             promptSnapshots: this.promptSnapshots,
             checkpointReminder: this.checkpointContext.reminder,
             checkpointRequestMessages: this.checkpointContext.projectRequestMessages,
+            mainRequestMessages: this.checkpointContext.mainRequestMessages,
             imageFileWriter: this.imageFileWriter,
             resolveEarlierFiles: this.resolveEarlierFiles,
         });
@@ -119,7 +121,6 @@ async function runManualPolicy(options) {
         ...(input.customInstructions === undefined ? {} : { instructions: input.customInstructions }),
         limits: manualLimits(input, preparation.providerInputLimit),
         measurePair: async (pair) => preparation.measurer.measurePair(pair),
-        allowLegacyToolTrim: false,
         // An explicit user request always commits a validly generated checkpoint.
         // Growth is possible on short histories (checkpoint output cap plus host
         // appendix) and stays bounded; it is observed below, never intercepted.
@@ -131,6 +132,7 @@ async function runManualPolicy(options) {
             providerInputLimit: preparation.providerInputLimit,
             promptSnapshots: options.promptSnapshots,
             projectRequestMessages: options.checkpointRequestMessages,
+            mainRequestMessages: options.mainRequestMessages,
         }),
         ...manualSubagentCapture(input.sessionId, options.checkpointState, options.logger),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -144,7 +146,7 @@ function manualLimits(input, providerInputLimit) {
             : { maxSerializedInputBytes: input.maxSerializedInputBytes }),
     };
 }
-function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, projectRequestMessages, }) {
+function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, projectRequestMessages, mainRequestMessages, }) {
     return {
         tokensBefore,
         timestamp: Date.now(),
@@ -174,15 +176,15 @@ function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, prom
                 ...(hooks?.onProviderRequestSettled
                     ? { onRequestSettled: hooks.onProviderRequestSettled }
                     : {}),
-                ...manualSharedPrefixOption(input),
+                ...manualSharedPrefixOption(input, mainRequestMessages),
                 ...checkpointGenerationObservers(hooks),
                 ...(promptSnapshots ? { promptSnapshots } : {}),
             });
         },
     };
 }
-function manualSharedPrefixOption(input) {
-    const sharedPrefix = resolveCheckpointSharedPrefix(input);
+function manualSharedPrefixOption(input, mainRequestMessages) {
+    const sharedPrefix = resolveCheckpointSharedPrefix(input, mainRequestMessages);
     return sharedPrefix ? { sharedPrefix } : {};
 }
 function manualSubagentCapture(sessionId, checkpointState, logger) {
@@ -224,11 +226,12 @@ function logManualReplacementGrowthBestEffort(logger, sessionId, decision, limit
     }
 }
 function completedManualCompaction(history, decision) {
-    const completed = {
+    return {
         status: 'completed',
         compactionId: `ctx_${randomUUID()}`,
         strategyVersion: 'local-context-compaction-v3',
         method: decision.method,
+        summary: decision.summary,
         replacementMessages: [...decision.replacementMessages],
         messagesBefore: history.length,
         messagesAfter: decision.replacementMessages.length,
@@ -236,22 +239,8 @@ function completedManualCompaction(history, decision) {
         tokensAfter: decision.measurement.after.inputTokens,
         serializedBytesBefore: decision.measurement.before.serializedBytes,
         serializedBytesAfter: decision.measurement.after.serializedBytes,
-        ...hmidRecoveryMetadata(decision),
-        ...(decision.method === 'llm_checkpoint' && decision.tokenUsage !== undefined
-            ? { tokenUsage: decision.tokenUsage }
-            : {}),
+        ...(decision.hmidOverflowRecovered ? { hmidOverflowRecovered: true } : {}),
+        ...(decision.tokenUsage !== undefined ? { tokenUsage: decision.tokenUsage } : {}),
     };
-    return decision.method === 'llm_checkpoint'
-        ? { ...completed, method: decision.method, summary: decision.summary }
-        : {
-            ...completed,
-            method: decision.method,
-            replacementSourceIndexes: history.map((_message, index) => index),
-        };
-}
-function hmidRecoveryMetadata(decision) {
-    return decision.method === 'llm_checkpoint' && decision.hmidOverflowRecovered
-        ? { hmidOverflowRecovered: true }
-        : {};
 }
 //# sourceMappingURL=local-context-compactor.js.map

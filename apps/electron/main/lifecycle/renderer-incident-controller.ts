@@ -1,6 +1,26 @@
 const RENDERER_INCIDENT_WINDOW_MS = 60000;
 const FORCED_RELOAD_PROCESS_EXIT_GRACE_MS = 10000;
 const FORCED_RENDERER_EXIT_WAIT_MS = 2000;
+/** Disposable worker hosts terminate on renderer death instead of reloading a user window. */
+export function observeDisposableRendererExit(contents, terminate) {
+    let active = true;
+    const dispose = () => {
+        if (!active)
+            return;
+        active = false;
+        contents.removeListener('render-process-gone', gone);
+        contents.removeListener('destroyed', dispose);
+    };
+    const gone = () => {
+        if (!active)
+            return;
+        dispose();
+        terminate();
+    };
+    contents.on('render-process-gone', gone);
+    contents.on('destroyed', dispose);
+    return dispose;
+}
 const AUTO_RELOAD_REASONS = new Set(['crashed', 'oom', 'unresponsive', 'resume-health-failure']);
 export class RendererIncidentController {
     constructor(dependencies) {

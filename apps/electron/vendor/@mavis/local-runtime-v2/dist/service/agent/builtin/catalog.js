@@ -54,7 +54,7 @@ export class BuiltinAgentCatalog {
         const agentDir = join(await this.assetsDir(), canonical);
         const persona = await this.readLocalizedPersona(agentDir, 'en');
         const frontmatter = parseFrontmatter(persona ?? '').frontmatter;
-        const capabilityOverride = await this.readCapabilityOverride(agentDir);
+        const { capabilityOverride, preloadSkills } = await this.readAgentSelectors(agentDir);
         const identity = {
             ...(typeof frontmatter.display_name === 'string'
                 ? { displayName: frontmatter.display_name }
@@ -70,6 +70,7 @@ export class BuiltinAgentCatalog {
             legacyNames: legacyNamesFor(canonical),
             identity,
             ...(capabilityOverride ? { capabilityOverride } : {}),
+            ...(preloadSkills ? { preloadSkills } : {}),
         };
     }
     async render(input, agentSystemTemplate) {
@@ -313,17 +314,26 @@ export class BuiltinAgentCatalog {
         const names = parsed.filter((value) => typeof value === 'string');
         return names.map((name) => canonicalBuiltinName(name));
     }
-    async readCapabilityOverride(agentDir) {
+    /**
+     * `skills` is the Agent's preload list, as for every Agent: it is not a
+     * Builtin Skill override, so it does not limit Skills and may name any Skill.
+     */
+    async readAgentSelectors(agentDir) {
         const raw = await this.readOptionalFile(join(agentDir, 'agent.md'));
         if (raw === undefined)
-            return undefined;
+            return {};
+        const path = `${agentDir}/agent.md`;
         const frontmatter = parseFrontmatter(raw).frontmatter;
-        const capabilityFields = Object.fromEntries(['persona', 'tools', 'builtinTools', 'skills', 'features']
+        const capabilityFields = Object.fromEntries(['persona', 'tools', 'builtinTools', 'features']
             .filter((key) => Object.hasOwn(frontmatter, key))
             .map((key) => [key, frontmatter[key]]));
-        return Object.keys(capabilityFields).length > 0
-            ? parseAgentCapabilityConfig(capabilityFields, `${agentDir}/agent.md`)
-            : undefined;
+        const preloadSkills = parseBuiltinPreloadSkills(frontmatter.skills, path);
+        return {
+            ...(Object.keys(capabilityFields).length > 0
+                ? { capabilityOverride: parseAgentCapabilityConfig(capabilityFields, path) }
+                : {}),
+            ...(preloadSkills ? { preloadSkills } : {}),
+        };
     }
     async renderFeaturePrompts(canonical, input) {
         const result = {};
@@ -468,5 +478,14 @@ function v2PromptReadContext(input) {
 }
 function isPromptReadScope(value) {
     return Boolean(value && 'source' in value && 'snapshot' in value);
+}
+function parseBuiltinPreloadSkills(value, path) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value) ||
+        value.some((entry) => typeof entry !== 'string' || entry.trim().length === 0)) {
+        throw new Error(`Invalid configuration at ${path}.skills: must be an array of Skill names`);
+    }
+    return value.map((entry) => entry.trim());
 }
 //# sourceMappingURL=catalog.js.map

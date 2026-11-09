@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isMiniAppSleepReason } from "@mavis/shared/miniapp-surface";
 import { isSafeBrokerRequestId } from "./control";
 const SURFACE_ERROR_MESSAGES = {
     invalid_request: 'Invalid Mini App request',
@@ -12,6 +13,17 @@ const SURFACE_CLOSE_ERROR_MESSAGES = {
     runtime_unavailable: 'Mini App runtime is unavailable',
     close_failed: 'Mini App surface cleanup failed',
 };
+const SURFACE_SLEEP_ERROR_MESSAGES = {
+    invalid_request: 'Invalid Mini App sleep request',
+    runtime_unavailable: 'Mini App runtime is unavailable',
+    sleep_failed: 'Mini App page could not be put to sleep',
+};
+const SURFACE_SLEEP_REFUSALS = [
+    'visible',
+    'loading',
+    'busy',
+    'not_found',
+];
 // The surface request serially includes a 60s runtime launch and up to a 60s
 // background-render queue plus a 60s tab operation. Keep the outer deadline
 // above every valid inner phase with the same cleanup margin as Browser IPC.
@@ -37,6 +49,17 @@ export class MainOwnedMiniAppSurfaceBroker {
                 return true;
             }
             this.startClose(target, value);
+            return true;
+        }
+        if (value.type === 'miniapp-surface-sleep') {
+            const requestId = value.requestId;
+            if (!isSafeBrokerRequestId(requestId))
+                return true;
+            if (!isMiniAppSurfaceSleepRequestMessage(value)) {
+                this.postSleepError(target, requestId, 'invalid_request');
+                return true;
+            }
+            this.startSleep(target, value);
             return true;
         }
         if (value.type === 'miniapp-surface-open-cancel') {
@@ -85,8 +108,50 @@ export class MainOwnedMiniAppSurfaceBroker {
         return count;
     }
     startClose(target, message) {
-        if (this.pendingByTarget.get(target)?.has(message.requestId)) {
-            this.postCloseError(target, message.requestId, 'invalid_request');
+        const close = this.options.close;
+        this.runShortRequest(target, message.requestId, {
+            run: close
+                ? (isGenerationCurrent) => close({ pluginId: message.pluginId, isGenerationCurrent })
+                : undefined,
+            onResult: () => this.postCloseResult(target, message.requestId),
+            onError: (code) => this.postCloseError(target, message.requestId, code === 'failed' ? 'close_failed' : code),
+        });
+    }
+    startSleep(target, message) {
+        const sleep = this.options.sleep;
+        this.runShortRequest(target, message.requestId, {
+            run: sleep
+                ? (isGenerationCurrent) => sleep({
+                    pluginId: message.pluginId,
+                    ...(message.sessionId !== undefined ? { sessionId: message.sessionId } : {}),
+                    reason: message.reason,
+                    notify: message.notify,
+                    isGenerationCurrent,
+                })
+                : undefined,
+            onResult: (outcome) => {
+                const result = readSleepOutcome(outcome);
+                if (!result) {
+                    this.postSleepError(target, message.requestId, 'sleep_failed');
+                    return;
+                }
+                this.postSleepResult(target, message.requestId, result);
+            },
+            onError: (code, error) => {
+                if (code === 'failed') {
+                    this.options.logger?.warn(`[MiniAppSurface] sleep failed plugin=${message.pluginId} session=${message.sessionId ?? '*'}: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                this.postSleepError(target, message.requestId, code === 'failed' ? 'sleep_failed' : code);
+            },
+        });
+    }
+    /**
+     * Close and sleep share one registry: no cancel message, a Main-side deadline, and a request id
+     * that must not collide with any open, close or sleep still pending for the same Utility.
+     */
+    runShortRequest(target, requestId, handlers) {
+        if (this.pendingByTarget.get(target)?.has(requestId)) {
+            handlers.onError('invalid_request');
             return;
         }
         let pending = this.closePendingByTarget.get(target);
@@ -94,37 +159,34 @@ export class MainOwnedMiniAppSurfaceBroker {
             pending = new Map();
             this.closePendingByTarget.set(target, pending);
         }
-        if (pending.has(message.requestId)) {
-            this.postCloseError(target, message.requestId, 'invalid_request');
+        if (pending.has(requestId)) {
+            handlers.onError('invalid_request');
             return;
         }
         const request = {};
-        pending.set(message.requestId, request);
-        const close = this.options.close;
-        if (!close) {
-            this.takePendingClose(target, message.requestId, request);
-            this.postCloseError(target, message.requestId, 'runtime_unavailable');
+        pending.set(requestId, request);
+        const run = handlers.run;
+        if (!run) {
+            this.takePendingClose(target, requestId, request);
+            handlers.onError('runtime_unavailable');
             return;
         }
         request.timeout = setTimeout(() => {
-            if (!this.takePendingClose(target, message.requestId, request))
+            if (!this.takePendingClose(target, requestId, request))
                 return;
-            this.postCloseError(target, message.requestId, 'runtime_unavailable');
+            handlers.onError('runtime_unavailable');
         }, SURFACE_SETTLEMENT_TIMEOUT_MS);
         request.timeout.unref?.();
         void Promise.resolve()
-            .then(() => close({
-            pluginId: message.pluginId,
-            isGenerationCurrent: () => this.closePendingByTarget.get(target)?.get(message.requestId) === request,
-        }))
-            .then(() => {
-            if (!this.takePendingClose(target, message.requestId, request))
+            .then(() => run(() => this.closePendingByTarget.get(target)?.get(requestId) === request))
+            .then((value) => {
+            if (!this.takePendingClose(target, requestId, request))
                 return;
-            this.postCloseResult(target, message.requestId);
-        }, () => {
-            if (!this.takePendingClose(target, message.requestId, request))
+            handlers.onResult(value);
+        }, (error) => {
+            if (!this.takePendingClose(target, requestId, request))
                 return;
-            this.postCloseError(target, message.requestId, 'close_failed');
+            handlers.onError('failed', error);
         });
     }
     takePendingClose(target, requestId, expected) {
@@ -156,6 +218,31 @@ export class MainOwnedMiniAppSurfaceBroker {
                 requestId,
                 code,
                 message: SURFACE_CLOSE_ERROR_MESSAGES[code],
+            });
+        }
+        catch {
+            // Utility exited between request settlement and delivery.
+        }
+    }
+    postSleepResult(target, requestId, outcome) {
+        try {
+            target.postMessage({
+                type: 'miniapp-surface-sleep-result',
+                requestId,
+                ...outcome,
+            });
+        }
+        catch {
+            // Utility exited between request settlement and delivery.
+        }
+    }
+    postSleepError(target, requestId, code) {
+        try {
+            target.postMessage({
+                type: 'miniapp-surface-sleep-error',
+                requestId,
+                code,
+                message: SURFACE_SLEEP_ERROR_MESSAGES[code],
             });
         }
         catch {
@@ -264,6 +351,7 @@ export class UtilityMiniAppSurfaceClient {
         this.options = options;
         this.pending = new Map();
         this.closePending = new Map();
+        this.sleepPending = new Map();
         this.closed = false;
         this.requestTimeoutMs = options.requestTimeoutMs ?? SURFACE_REQUEST_TIMEOUT_MS;
         this.closeRequestTimeoutMs = options.closeRequestTimeoutMs ?? SURFACE_CLOSE_REQUEST_TIMEOUT_MS;
@@ -276,11 +364,34 @@ export class UtilityMiniAppSurfaceClient {
         this.port = {
             open: (input) => this.open(input),
             close: (input) => this.closeSurface(input),
+            sleep: (input) => this.sleepSurface(input),
         };
     }
     handleMessage(value) {
         if (!isRecord(value))
             return false;
+        if (value.type === 'miniapp-surface-sleep-result' ||
+            value.type === 'miniapp-surface-sleep-error') {
+            const requestId = value.requestId;
+            if (!isSafeBrokerRequestId(requestId))
+                return true;
+            const pending = this.sleepPending.get(requestId);
+            if (!pending)
+                return true;
+            this.sleepPending.delete(requestId);
+            clearTimeout(pending.timeout);
+            const outcome = readSleepResultMessage(value);
+            if (outcome) {
+                pending.resolve(outcome);
+            }
+            else if (isMiniAppSurfaceSleepErrorMessage(value)) {
+                pending.reject(surfaceSleepError(value.code));
+            }
+            else {
+                pending.reject(surfaceSleepError('invalid_request'));
+            }
+            return true;
+        }
         if (value.type === 'miniapp-surface-close-result' ||
             value.type === 'miniapp-surface-close-error') {
             const requestId = value.requestId;
@@ -345,9 +456,56 @@ export class UtilityMiniAppSurfaceClient {
             pending.reject(surfaceCloseError('runtime_unavailable'));
         }
         this.closePending.clear();
+        for (const pending of this.sleepPending.values()) {
+            clearTimeout(pending.timeout);
+            pending.reject(surfaceSleepError('runtime_unavailable'));
+        }
+        this.sleepPending.clear();
     }
     pendingCount() {
-        return this.pending.size + this.closePending.size;
+        return this.pending.size + this.closePending.size + this.sleepPending.size;
+    }
+    hasPending(requestId) {
+        return (this.pending.has(requestId) ||
+            this.closePending.has(requestId) ||
+            this.sleepPending.has(requestId));
+    }
+    /** Like close: no cancel message; the deadline rejects and Main's own deadline cleans up. */
+    sleepSurface(input) {
+        if (this.closed)
+            return Promise.reject(surfaceSleepError('runtime_unavailable'));
+        const requestId = (this.options.createRequestId ?? randomUUID)();
+        const message = {
+            type: 'miniapp-surface-sleep',
+            requestId,
+            pluginId: input.pluginId,
+            ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+            reason: input.reason,
+            notify: input.notify,
+        };
+        if (!isMiniAppSurfaceSleepRequestMessage(message) || this.hasPending(requestId)) {
+            return Promise.reject(surfaceSleepError('invalid_request'));
+        }
+        // The main tsconfig targets a lib without `Promise.withResolvers`.
+        return new Promise((resolve, reject) => {
+            const pending = { resolve, reject };
+            this.sleepPending.set(requestId, pending);
+            pending.timeout = setTimeout(() => {
+                if (this.sleepPending.get(requestId) !== pending)
+                    return;
+                this.sleepPending.delete(requestId);
+                reject(surfaceSleepError('runtime_unavailable'));
+            }, this.closeRequestTimeoutMs);
+            pending.timeout.unref?.();
+            try {
+                this.options.postMessage(message);
+            }
+            catch {
+                this.sleepPending.delete(requestId);
+                clearTimeout(pending.timeout);
+                reject(surfaceSleepError('runtime_unavailable'));
+            }
+        });
     }
     closeSurface(input) {
         if (this.closed)
@@ -358,9 +516,7 @@ export class UtilityMiniAppSurfaceClient {
             requestId,
             pluginId: input.pluginId,
         };
-        if (!isMiniAppSurfaceCloseRequestMessage(message) ||
-            this.pending.has(requestId) ||
-            this.closePending.has(requestId)) {
+        if (!isMiniAppSurfaceCloseRequestMessage(message) || this.hasPending(requestId)) {
             return Promise.reject(surfaceCloseError('invalid_request'));
         }
         return new Promise((resolve, reject) => {
@@ -406,9 +562,7 @@ export class UtilityMiniAppSurfaceClient {
             pluginId: input.pluginId,
             ...(input.path !== undefined ? { path: input.path } : {}),
         };
-        if (!isMiniAppSurfaceOpenRequestMessage(message) ||
-            this.pending.has(requestId) ||
-            this.closePending.has(requestId)) {
+        if (!isMiniAppSurfaceOpenRequestMessage(message) || this.hasPending(requestId)) {
             return Promise.reject(surfaceError('invalid_request'));
         }
         return new Promise((resolve, reject) => {
@@ -518,6 +672,9 @@ function surfaceError(code) {
 function surfaceCloseError(code) {
     return Object.assign(new Error(SURFACE_CLOSE_ERROR_MESSAGES[code]), { code });
 }
+function surfaceSleepError(code) {
+    return Object.assign(new Error(SURFACE_SLEEP_ERROR_MESSAGES[code]), { code });
+}
 function abortError() {
     return Object.assign(new Error('Mini App request was cancelled'), { name: 'AbortError' });
 }
@@ -599,4 +756,50 @@ function isMiniAppSurfaceCloseErrorMessage(value) {
         return false;
     }
     return value.message === SURFACE_CLOSE_ERROR_MESSAGES[value.code];
+}
+function isMiniAppSurfaceSleepRequestMessage(value) {
+    return (isRecord(value) &&
+        value.type === 'miniapp-surface-sleep' &&
+        hasOnlyKeys(value, ['type', 'requestId', 'pluginId', 'sessionId', 'reason', 'notify']) &&
+        isSafeBrokerRequestId(value.requestId) &&
+        isSafeIdentifier(value.pluginId) &&
+        (value.sessionId === undefined || isSafeIdentifier(value.sessionId)) &&
+        isMiniAppSleepReason(value.reason) &&
+        typeof value.notify === 'boolean');
+}
+function isSleepRefusal(value) {
+    return SURFACE_SLEEP_REFUSALS.includes(value);
+}
+/** Rebuilds an outcome from `slept` / `refusal` only; `extraKeys` are the envelope's own fields. */
+function readSleepOutcome(value, extraKeys = []) {
+    if (!isRecord(value))
+        return null;
+    if (value.slept === true) {
+        return hasOnlyKeys(value, [...extraKeys, 'slept']) ? { slept: true } : null;
+    }
+    return value.slept === false &&
+        hasOnlyKeys(value, [...extraKeys, 'slept', 'refusal']) &&
+        isSleepRefusal(value.refusal)
+        ? { slept: false, refusal: value.refusal }
+        : null;
+}
+function readSleepResultMessage(value) {
+    if (value.type !== 'miniapp-surface-sleep-result' || !isSafeBrokerRequestId(value.requestId)) {
+        return null;
+    }
+    return readSleepOutcome(value, ['type', 'requestId']);
+}
+function isMiniAppSurfaceSleepErrorMessage(value) {
+    if (!isRecord(value) || value.type !== 'miniapp-surface-sleep-error')
+        return false;
+    if (!hasOnlyKeys(value, ['type', 'requestId', 'code', 'message']))
+        return false;
+    if (!isSafeBrokerRequestId(value.requestId))
+        return false;
+    if (value.code !== 'invalid_request' &&
+        value.code !== 'runtime_unavailable' &&
+        value.code !== 'sleep_failed') {
+        return false;
+    }
+    return value.message === SURFACE_SLEEP_ERROR_MESSAGES[value.code];
 }

@@ -118,6 +118,13 @@ const MINIAPP_FAILURE_CATALOG = {
         message: 'The Mini App Agent concurrency declaration is invalid.',
         hint: 'Declare agentConcurrency as an integer from 1 to 32, or omit it for the default of 4.',
     },
+    MINIAPP_HOST_ACCESS_INVALID: {
+        lifecycleCode: 'PREPARATION_FAILED',
+        stage: 'workspace',
+        recovery: 'edit_workspace',
+        message: 'The Mini App Host access declaration is invalid.',
+        hint: 'Declare hostAccess as a string array containing only navigation.read.',
+    },
     MINIAPP_DEVICE_ACCESS_INVALID: {
         lifecycleCode: 'PREPARATION_FAILED',
         stage: 'workspace',

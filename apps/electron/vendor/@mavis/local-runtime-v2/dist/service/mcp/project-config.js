@@ -3,6 +3,7 @@ import { open, realpath } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { normalizeServerName, readRecord } from './runtime/config.js';
+import { assertOAuthHeaderExclusive, parseMcpOAuthConfig } from './auth/oauth-config.js';
 export function projectMcpDigest(value) {
     return createHash('sha256').update(value).digest('hex');
 }
@@ -111,7 +112,11 @@ function remoteServer(raw, type, env) {
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
         throw new Error('MCP URL must be HTTP or HTTPS without embedded credentials.');
     }
-    return { type, url, headers: expandRecord(raw['headers'], env) };
+    const headers = expandRecord(raw['headers'], env);
+    // Repository-owned config may only pin the callback port (plan §6.1, §8).
+    const oauth = raw['oauth'] === undefined ? undefined : parseMcpOAuthConfig(raw['oauth'], 'project');
+    assertOAuthHeaderExclusive(oauth, headers);
+    return { type, url, headers, ...(oauth ? { oauth: { ...oauth } } : {}) };
 }
 function nonemptyCommand(command) {
     if (!command.trim())

@@ -11,16 +11,19 @@ import { resolveV2DirectoryContract } from './v2-paths.js';
  * are therefore never gated by it (they are re-copied on every run).
  *
  * The legacy sources are frozen after a completed pass, so their identity is
- * sampled aggressively: (dev, ino, birthtimeMs, sizeBytes, mtimeMs) plus the
+ * sampled aggressively: (ino, birthtimeMs, sizeBytes, mtimeMs) plus the
  * existence/size/mtime of the sibling `-wal` file. A downgraded v1-era build
  * writes into those databases in place (same inode and birthtime), and a
  * downgrade crash can leave committed rows only in the WAL — both must
  * invalidate the receipt. WAL size alone is not enough: checkpoint cycles
  * rewrite WAL frames in place at an identical length, so the sample also
- * carries mtime. The v2 target keeps the plain (dev, ino, birthtimeMs)
- * triple: it is written on every normal run, so size/mtime there would void
- * the receipt permanently. Any mismatch, corruption, or missing/outdated
- * receipt falls back to the full migration pass. See
+ * carries mtime. The v2 target keeps the plain (ino, birthtimeMs) pair: it
+ * is written on every normal run, so size/mtime there would void the receipt
+ * permanently. `dev` is recorded but never compared: macOS may assign a
+ * different st_dev to the same APFS volume after a reboot, and treating that
+ * as a new file would re-run the full migration on every reboot. Any
+ * mismatch, corruption, or missing/outdated receipt falls back to the full
+ * migration pass. See
  * `.harness/docs/adr/local-runtime-migration-fault-tolerance.md`.
  */
 const LAYOUT_MIGRATION_RECEIPT_FILE = 'layout-receipt.json';
@@ -185,7 +188,7 @@ function isLayoutReceiptWalSample(value) {
 function isSameFileIdentity(left, right) {
     if (left === 'missing' || right === 'missing')
         return left === right;
-    return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
+    return left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
 }
 function isSameSourceIdentity(left, right) {
     if (left === 'missing' || right === 'missing')

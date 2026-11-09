@@ -1,8 +1,8 @@
 import { createBackgroundCadenceReminder } from './background-cadence-reminder.js';
 import { createMemorySummaryReminder } from './memory-summary-reminder.js';
 import { fitsReminderInFinalRequest } from './reminder-admission.js';
-/** Memory V2 off: nothing to show, so summaries left in history are withdrawn. */
-const noMemorySummary = async () => undefined;
+/** Memory V2 off: no recall access, so summaries left in history are withdrawn. */
+const noMemorySummary = async () => ({ status: 'disabled' });
 /** Host-owned Turn reminders that measure request budget against one usage anchor. */
 export function createHostTurnReminders(usageAnchor, memorySummaryContext) {
     return {

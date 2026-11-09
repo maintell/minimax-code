@@ -321,13 +321,18 @@ function peerSessionEnvelope(messages, text) {
     if (!origin)
         return text;
     const title = origin.fromTitle?.trim();
+    const device = origin.fromDevice?.trim();
     const attributes = [
         `from_session_id="${escapeXmlAttribute(origin.fromSession)}"`,
         ...(origin.fromAgent ? [`from_agent="${escapeXmlAttribute(origin.fromAgent)}"`] : []),
         ...(title ? [`from_title="${escapeXmlAttribute(title)}"`] : []),
+        ...(device ? [`from_device="${escapeXmlAttribute(device)}"`] : []),
     ];
-    return `<cross-session-message ${attributes.join(' ')}>\n${neutralizeEnvelope(text)}\n</cross-session-message>`;
+    const envelope = `<cross-session-message ${attributes.join(' ')}>\n${neutralizeEnvelope(text)}\n</cross-session-message>`;
+    return origin.remote === true ? `${envelope}\n${REMOTE_SENDER_REPLY_NOTE}` : envelope;
 }
+/** A remote sender cannot be reached from this runtime; its reply is read back from here. */
+const REMOTE_SENDER_REPLY_NOTE = 'The sender is a session on another device, so session send cannot reach it. Reply directly in this conversation; the sender reads your reply from here.';
 /** Narrows the union only; trust was already decided in `createCanonicalUserInput`. */
 function isPeerSessionOrigin(origin) {
     return (origin !== undefined &&
@@ -410,13 +415,19 @@ function hasValidInlineMedia(media) {
 function buildAttachmentReminder(entries, inlinedKeys, capabilities, dimensionNotes = new Map()) {
     if (entries.length === 0)
         return '';
+    // 内联序号按清单里 inline="true" 的条目顺序从 1 开始，与模型收到的媒体顺序一致。一次发多条消息
+    // (immediate-send batch)时，发给模型前会按消息顺序合并成一条，所以序号不分消息、连续编号。
+    let inlineCount = 0;
     const lines = entries.map(({ messageIndex, prepared }) => {
         const key = attachmentKey(messageIndex, prepared);
-        const inline = inlinedKeys.has(key) ? 'true' : 'false';
+        const inlined = inlinedKeys.has(key);
+        if (inlined)
+            inlineCount += 1;
+        const inline = inlined ? 'true' : 'false';
         const dimensionNote = dimensionNotes.get(key);
         return [
             `<attachment name="${escapeAttribute(prepared.fileName)}" mime="${escapeAttribute(prepared.mimeType)}" path="${escapeAttribute(prepared.filePath)}" message_index="${messageIndex + 1}" kind="${prepared.kind}" inline="${inline}">`,
-            attachmentWorkflowInstruction(prepared.kind, inline === 'true', capabilities),
+            attachmentWorkflowInstruction(prepared.kind, inlined ? inlineCount : undefined, capabilities),
             ...(dimensionNote ? [dimensionNote] : []),
             '</attachment>',
         ].join('\n');
@@ -424,18 +435,27 @@ function buildAttachmentReminder(entries, inlinedKeys, capabilities, dimensionNo
     return [
         '<system-reminder>',
         'The user provided local attachments for this turn. Use the exact file paths below and do not guess filenames.',
+        'Attachments marked inline="true" are also attached to this message as media, in the order listed.',
         ...lines,
         '</system-reminder>',
     ].join('\n');
 }
-function attachmentWorkflowInstruction(kind, inlined, capabilities) {
-    if (inlined)
-        return 'This media attachment is also provided inline to the resolved model.';
+function attachmentWorkflowInstruction(kind, inlineIndex, capabilities) {
+    if (inlineIndex !== undefined) {
+        const position = `This media attachment is also provided inline as media item ${inlineIndex} of this message.`;
+        return kind === 'image'
+            ? `${position} The inline copy may be resized or re-encoded; the file at path is the original.`
+            : position;
+    }
     if (kind === 'image' && capabilities?.support_image !== true) {
         return 'The current model cannot read this image inline. Do not use the read tool to infer its visual contents. If images_understand is available, pass the exact path to it; otherwise explain the limitation and ask the user to switch to a multimodal model or provide a text description.';
     }
     if (kind === 'video' && capabilities?.support_video !== true) {
         return 'The current model cannot read this video inline. Do not use the read tool to infer its visual contents. If videos_understand is available, pass the exact path to it; otherwise explain the limitation and ask the user to switch to a multimodal model or provide a text description.';
+    }
+    // 模型支持图片但没内联：超限、超数量、格式不支持、无法解码都用同一句。
+    if (kind === 'image') {
+        return "This image is not provided inline because it exceeds this model's inline media limits or its format is not supported. To view it, use the read tool on the exact path first. If read rejects it as too large or in an unsupported format, save a compressed or converted copy inside the workspace and read that copy.";
     }
     return 'Use the exact local path with an appropriate file/tool workflow when its contents are needed.';
 }

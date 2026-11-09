@@ -9,9 +9,7 @@ export function readCompactionCommitMetadata(value) {
     const tail = readOptionalCurrentUserTail(value, lifecycle);
     if (tail === null)
         return undefined;
-    return lifecycle.method === 'llm_checkpoint'
-        ? readCheckpointCommitMetadata(lifecycle, summary, tail)
-        : readToolResultCommitMetadata(value, lifecycle, summary, tail);
+    return readCheckpointCommitMetadata(lifecycle, summary, tail);
 }
 function readCheckpointCommitMetadata(lifecycle, summary, tail) {
     // Native summary, optional owned mode, then the exact markers + external user tail.
@@ -23,31 +21,6 @@ function readCheckpointCommitMetadata(lifecycle, summary, tail) {
         compactionId: lifecycle.compactionId,
         method: 'llm_checkpoint',
         summary,
-        ...currentUserTailFields(tail),
-    });
-}
-function readToolResultCommitMetadata(value, lifecycle, summary, tail) {
-    if (lifecycle.method === 'llm_checkpoint')
-        return undefined;
-    const replacementSourceIndexes = Reflect.get(value, 'replacementSourceIndexes');
-    const expectedSourceCount = tail === undefined
-        ? lifecycle.messagesAfter
-        : lifecycle.messagesAfter - 1 - tail.placedMarkerCount;
-    if (!Array.isArray(replacementSourceIndexes) ||
-        expectedSourceCount < 0 ||
-        replacementSourceIndexes.length !== expectedSourceCount ||
-        !replacementSourceIndexes.every((index, position) => Number.isSafeInteger(index) &&
-            index >= 0 &&
-            index < lifecycle.messagesBefore &&
-            index !== tail?.currentUserSourceIndex &&
-            (position === 0 || index > replacementSourceIndexes[position - 1]))) {
-        return undefined;
-    }
-    return Object.freeze({
-        compactionId: lifecycle.compactionId,
-        method: lifecycle.method,
-        summary,
-        replacementSourceIndexes: Object.freeze([...replacementSourceIndexes]),
         ...currentUserTailFields(tail),
     });
 }

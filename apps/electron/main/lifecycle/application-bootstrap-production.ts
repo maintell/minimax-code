@@ -1,3 +1,4 @@
+import { disposePptPreviewRenderHost } from "../modules/document-preview/generation-preview/render-host";
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { readdir, lstat, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -17,6 +18,7 @@ import { setupDeepLink } from "../modules/deeplink";
 import { clearGpuSentinel } from "../modules/gpu-guard";
 import { handleLocalRuntimeRequest, configureLocalRuntimeAuthRecovery, stopLocalRuntime, prepareLocalRuntime } from "../modules/local-runtime";
 import { recoverSharedRuntimeProjection, refreshSharedRuntimeProjection, watchSharedRuntimeProjection } from "../modules/auth/runtime-projection";
+import { scheduleComputerUseDaemonReclaim } from "../modules/local-runtime/computer-use";
 import { resolveLocalRuntimeDataDir } from "../modules/local-runtime/data-dir";
 import { resolveRuntimeTransportMode } from "../modules/local-runtime/utility/transport-mode";
 import { createDesktopAuthSession } from "../modules/auth";
@@ -369,6 +371,7 @@ function createProductionComposition(options = {}) {
                 },
                 cleanupOldLogs: logger_1.cleanupOldLogs,
                 setupDocumentPreviewProtocolHandler: setupDocumentPreviewProtocolHandler,
+                disposeDocumentPreview: disposePptPreviewRenderHost,
                 setupProtocolHandler: () => setupProtocolHandler({
                     ...(runtimeTransportMode === 'protocol'
                         ? { cloudJsonFetch: handleCloudProtocolJsonRequest }
@@ -410,7 +413,10 @@ function createProductionComposition(options = {}) {
                 initRuntimeFetchDevTools: createRuntimeFetchDevToolsInitializer(session, {
                     warn: logLifecycleWarning,
                 }),
-                createInitialWindow: () => windowManager.createInitialWindow(),
+                createInitialWindow: async () => {
+                    await windowManager.createInitialWindow();
+                    scheduleComputerUseDaemonReclaim();
+                },
                 flushDockFileQueue: () => {
                     flushDockFileQueue();
                 },

@@ -1,3 +1,5 @@
+import { UtilityPptPreviewQueryServer } from "./ppt-preview-query-broker";
+import { UtilityPptPreviewRenderClient } from "./ppt-preview-render-broker";
 /**
  * Local-runtime utility process entry.
  *
@@ -20,7 +22,6 @@
  * Electron-only Browser and diagnostics capabilities stay in main and are
  * reached through request-id brokers on the parent control channel.
  */
-
 import dns from "dns";
 import { getHeapStatistics } from "node:v8";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
@@ -31,6 +32,7 @@ import { startLocalRuntimeUtilityServer } from "./utility-server";
 import { UtilityBrowserBrokerClient } from "./browser-broker";
 import { UtilityDiagnosticsBrokerClient } from "./diagnostics-broker";
 import { UtilityAuthRecoveryBrokerClient } from "./auth-recovery-broker";
+import { UtilityRemoteSessionBrokerClient } from "./remote-session-broker";
 import { UtilityMiniAppBrokerServer } from "./miniapp-broker";
 import { UtilityMiniAppSurfaceClient } from "./miniapp-surface-broker";
 import { UtilityMiniAppToolBroker } from "./miniapp-tool-broker";
@@ -322,6 +324,13 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             warn: (message, fields) => common.logger.warn({ ...(fields ?? {}) }, `utility MCP: ${message}`),
             error: (message, fields) => common.logger.error({ ...(fields ?? {}) }, `utility MCP: ${message}`),
         },
+        ...(brokers.pptPreview
+            ? {
+                pptPreviewRenderHost: {
+                    prepare: (input, signal) => brokers.pptPreview.port.execute(input.sessionId, { ...input }, signal),
+                },
+            }
+            : {}),
         ...(init.hostCapabilities.browser ? { browserAdapter: brokers.browser.adapter } : {}),
         ...(init.hostCapabilities.diagnostics
             ? { hostDiagnosticsProvider: brokers.diagnostics.provider }
@@ -334,6 +343,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
                 },
             }
             : {}),
+        remoteSessionHost: brokers.remoteSession.host,
         enableLiveMcp: true,
         ...(wechatRuntimeSdk ? { wechatRuntimeSdk } : {}),
     });
@@ -341,6 +351,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     // background infra all completed by the time this resolves.
     reportBootstrapProgress('sqlite-ready');
     await host.apiHost.ensureBuiltinAgents();
+    brokers.pptQueries.bind(host.application?.pptPreview);
     brokers.miniApp.bind(host.application?.miniApps, host.application?.miniAppAgent);
     brokers.miniAppTool.bind(host.application?.miniAppTools);
     return {
@@ -354,6 +365,9 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             }
             return diagnostics.collectSessionReport(sessionId);
         },
+        captureWorkspaceSnapshot: async (sessionId, outputDir) => ({
+            ...(await host.apiHost.captureWorkspaceFeedbackSnapshot(sessionId, outputDir)),
+        }),
         setAuthContext: async (next) => {
             const changed = JSON.stringify(authContext) !== JSON.stringify(next ?? null);
             authContext = (next ?? null);
@@ -371,6 +385,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         },
         setRoutingContext: (next) => {
             routingContext = next;
+            host.notifyRoutingContextChanged?.();
         },
         setContextWindowUsageEnabled: (enabled) => {
             contextWindowUsageEnabled = enabled;
@@ -401,7 +416,10 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         shutdown: async () => {
             brokers.auth.close();
             brokers.browser.close();
+            brokers.pptPreview?.close();
+            brokers.pptQueries.close();
             brokers.diagnostics.close();
+            brokers.remoteSession.close();
             brokers.miniApp.close();
             brokers.miniAppSurface.close();
             brokers.miniAppTool.close();
@@ -467,6 +485,8 @@ if (parentPort) {
     const auth = new UtilityAuthRecoveryBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
+    const pptPreview = new UtilityPptPreviewRenderClient((message) => parentPort.postMessage(message));
+    const pptQueries = new UtilityPptPreviewQueryServer((message) => parentPort.postMessage(message));
     const browser = new UtilityBrowserBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
@@ -488,6 +508,9 @@ if (parentPort) {
     const computerUse = new UtilityComputerUseBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
+    const remoteSession = new UtilityRemoteSessionBrokerClient({
+        postMessage: (message) => parentPort.postMessage(message),
+    });
     startLocalRuntimeUtilityServer({
         parentPort,
         prepareRuntime: async (init, ports) => {
@@ -495,8 +518,11 @@ if (parentPort) {
             const surface = await prepareRuntime(init, {
                 auth,
                 browser,
+                pptPreview,
+                pptQueries,
                 diagnostics,
                 computerUse,
+                remoteSession,
                 reportSkillRegistryDiagnostic: (event) => {
                     try {
                         const message = {
@@ -530,9 +556,12 @@ if (parentPort) {
             };
         },
         handleMainMessage: (message) => auth.handleMessage(message) ||
+            pptPreview.handleMessage(message) ||
+            pptQueries.handleMessage(message) ||
             browser.handleMessage(message) ||
             diagnostics.handleMessage(message) ||
             computerUse.handleMessage(message) ||
+            remoteSession.handleMessage(message) ||
             miniApp.handleMessage(message) ||
             miniAppSurface.handleMessage(message) ||
             miniAppTool.handleMessage(message) ||

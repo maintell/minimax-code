@@ -10,6 +10,7 @@ import { decodeWorkspaceText, isPathInside, isWorkspaceFileBinary, resolveWorksp
 export const DEFAULT_MAX_INLINE_FILE_BYTES = 10 * 1024 * 1024;
 const PREVIEW_MIME_TYPES = new Map([
     ['.aac', 'audio/aac'],
+    ['.avif', 'image/avif'],
     ['.bmp', 'image/bmp'],
     ['.csv', 'text/csv'],
     ['.doc', 'application/msword'],

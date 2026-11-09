@@ -27,6 +27,32 @@ export class CliService {
             throw new Error('Session has no workspace for project MCP.');
         return { sessionId, workspaceRoot };
     }
+    /** Only a `sessionId` resolves that Session's workspace; both are used as given. */
+    async listMcpAuthStates(input) {
+        const mcpAuth = this.requireCapability('mcpAuth', 'MCP Auth');
+        const context = input.sessionId && !input.workspaceRoot
+            ? await this.projectMcpContext(input.sessionId)
+            : input;
+        return { states: await mcpAuth.listStates(context) };
+    }
+    testMcpAuthTarget(target) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').test(target);
+    }
+    startMcpAuth(target, options) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').start(target, options);
+    }
+    cancelMcpAuth(attemptId) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').cancel(attemptId);
+    }
+    completeMcpAuth(attemptId, callbackUrl) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').complete(attemptId, callbackUrl);
+    }
+    clearMcpAuth(target) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').clear(target);
+    }
+    setMcpUserClientSecret(serverName, secret) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').setUserClientSecret(serverName, secret);
+    }
     clearSessionMcpServers(sessionId) {
         return this.requireCapability('mcp', 'MCP').clearSessionServers(sessionId);
     }
@@ -374,6 +400,13 @@ export class CliService {
     }
     listUserModelProviders() {
         return this.requireCapability('modelProviders', 'Model Provider').listUser();
+    }
+    /** Synchronous: false when this build does not ship agent model access (`beta.modelAccess`). */
+    hasModelAccess() {
+        return this.options.application.modelAccess !== undefined;
+    }
+    getModelAccess() {
+        return this.requireCapability('modelAccess', 'Model Access');
     }
     listProviderPresets() {
         return this.requireCapability('modelProviders', 'Model Provider').listProviderPresets();

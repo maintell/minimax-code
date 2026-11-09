@@ -1,7 +1,17 @@
 import { closeSync, createReadStream, fstatSync, lstatSync, openSync, readSync, readdirSync, realpathSync, statSync, } from 'node:fs';
 import { isAbsolute, join, relative } from 'node:path';
 import { createInterface } from 'node:readline';
+function modelAccessPrivatePath(file) {
+    const normalized = file.replaceAll('\\', '/');
+    return (/(?:^|\/)codex-auth(?:\.|$)/u.test(normalized) ||
+        /(?:^|\/)model-access\/(?:auth(?:\.|\/)|data\/|\.[^/]*account-)/u.test(normalized));
+}
 const DEFAULT_ERROR_LEVEL_REGEX = /^(?:ERROR|WARN|FATAL)(?:\s|$)/;
+/**
+ * 截止时间按文件 mtime 判断时留的余量。日级文件（如 main-YYYY-MM-DD.log）的 mtime 是当天最后
+ * 一次写入，截止时间落在当天中间时，这份文件仍有截止前的内容，所以多放宽一天。
+ */
+const UNTIL_MTIME_GRACE_MS = 24 * 60 * 60 * 1000;
 /**
  * CSI escape sequences (SGR colors, cursor movement). Log files written
  * before the disk arm started stripping ANSI (see
@@ -26,6 +36,7 @@ export class FileDiagnosticArtifactSource {
     maxBytesPerFile;
     errorContext;
     sinceMs;
+    untilMs;
     constructor(options) {
         this.id = options.id;
         this.label = options.label;
@@ -38,6 +49,7 @@ export class FileDiagnosticArtifactSource {
         this.maxBytesPerFile = options.maxBytesPerFile;
         this.errorContext = options.errorContext;
         this.sinceMs = options.sinceMs;
+        this.untilMs = options.untilMs;
     }
     describe() {
         return {
@@ -62,9 +74,11 @@ export class FileDiagnosticArtifactSource {
             return [];
         }
         const artifacts = [];
-        for (const entry of entries) {
+        for (const { entry, stat } of this.newestFirst(entries, input)) {
+            if (modelAccessPrivatePath(entry.absolutePath))
+                continue;
             try {
-                const artifact = await this.collectFile(entry, dirRealPath, input);
+                const artifact = await this.collectFile(entry, stat, dirRealPath, input);
                 if (artifact)
                     artifacts.push(artifact);
             }
@@ -75,12 +89,33 @@ export class FileDiagnosticArtifactSource {
         }
         return artifacts;
     }
-    async collectFile(entry, dirRealPath, input) {
-        const path = entry.absolutePath;
-        const stat = lstatSync(path);
-        if (stat.isSymbolicLink() || !stat.isFile() || stat.mtimeMs < (this.sinceMs ?? input.sinceMs)) {
-            return undefined;
+    /**
+     * 只留时间窗口内的普通文件，按 mtime 从新到旧排：总量装不下时，被丢掉的是最旧的文件。
+     * 截止时间多放宽 UNTIL_MTIME_GRACE_MS。
+     */
+    newestFirst(entries, input) {
+        const sinceMs = this.sinceMs ?? input.sinceMs;
+        const latestMtimeMs = (this.untilMs ?? input.untilMs ?? Number.POSITIVE_INFINITY) + UNTIL_MTIME_GRACE_MS;
+        const candidates = [];
+        for (const entry of entries) {
+            try {
+                const stat = lstatSync(entry.absolutePath);
+                if (stat.isSymbolicLink() || !stat.isFile())
+                    continue;
+                if (stat.mtimeMs < sinceMs || stat.mtimeMs > latestMtimeMs)
+                    continue;
+                candidates.push({ entry, stat });
+            }
+            catch {
+                // Files can disappear or become unreadable while collection is running.
+                continue;
+            }
         }
+        return candidates.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs ||
+            left.entry.relativeName.localeCompare(right.entry.relativeName));
+    }
+    async collectFile(entry, stat, dirRealPath, input) {
+        const path = entry.absolutePath;
         if (!isPathInside(dirRealPath, realpathSync(path)))
             return undefined;
         if (this.errorContext) {
@@ -176,26 +211,43 @@ function resolveBundleLimits(limits) {
         maxBytes: limits?.maxBytes ?? 512 * 1024 * 1024,
     };
 }
+/** 截止时间只在传了的时候出现在采集参数和清单里。 */
+function untilWindow(untilMs) {
+    return untilMs === undefined ? {} : { untilMs };
+}
+/** A source's artifacts, or none and the reason it failed. */
+async function collectSource(source, input) {
+    try {
+        return { collected: await source.collect(input) };
+    }
+    catch (err) {
+        return { collected: [], failure: err instanceof Error ? err.message : String(err) };
+    }
+}
 export async function collectDiagnosticBundle(input) {
     const limits = resolveBundleLimits(input.limits);
     const nowMs = input.nowMs ?? Date.now();
+    const window = untilWindow(input.untilMs);
+    const collectInput = {
+        sinceMs: input.sinceMs,
+        ...window,
+        nowMs,
+        limits,
+    };
     const artifacts = [];
     const manifestSources = [];
     let totalBytes = 0;
     const skippedArtifacts = [];
     for (const source of input.sources) {
         const description = source.describe();
-        let collected = [];
-        let skipped;
-        try {
-            collected = await source.collect({ sinceMs: input.sinceMs, nowMs, limits });
-        }
-        catch (err) {
-            skipped = err instanceof Error ? err.message : String(err);
-            collected = [];
-        }
+        const { collected, failure } = await collectSource(source, collectInput);
+        let skipped = failure;
         const accepted = [];
         for (const artifact of collected) {
+            if (modelAccessPrivatePath(artifact.path ?? artifact.name)) {
+                skippedArtifacts.push({ name: artifact.name, reason: 'private_model_access_credential' });
+                continue;
+            }
             if (artifacts.length + accepted.length + 1 > limits.maxFiles) {
                 skipped = 'diagnostic_bundle_too_many_files';
                 break;
@@ -225,6 +277,7 @@ export async function collectDiagnosticBundle(input) {
             schemaVersion: 1,
             generatedAtMs: nowMs,
             sinceMs: input.sinceMs,
+            ...window,
             sources: manifestSources,
             artifacts: artifacts.map((artifact) => ({
                 name: artifact.name,

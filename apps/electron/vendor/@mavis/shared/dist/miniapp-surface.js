@@ -1,3 +1,33 @@
+import { isMiniAppHostAccess } from './miniapp-host.js';
+export * from './miniapp-host.js';
+/**
+ * Why the Host will not put a running Mini App to sleep on its own right now. `visible`: a page
+ * is on screen; `in_use`: the current turn depends on it (an @ reference, or the main Agent called
+ * its managed MCP tool); `transition`: it is starting, publishing, restarting or stopping, or
+ * started less than a minute ago; `active`: the Host is serving a request from its backend, or
+ * served one less than 10 minutes ago (still slept last under critical memory pressure).
+ */
+export const MINIAPP_MEMORY_PROTECTIONS = Object.freeze([
+    'visible',
+    'in_use',
+    'transition',
+    'active',
+]);
+export function isMiniAppMemoryProtection(value) {
+    return MINIAPP_MEMORY_PROTECTIONS.includes(value);
+}
+/**
+ * Why the Host put a Mini App (or one of its pages) to sleep. `count-cap`: the user opened
+ * another Mini App beyond the device limit; `pressure-*`: system memory pressure.
+ */
+export const MINIAPP_SLEEP_REASONS = Object.freeze([
+    'count-cap',
+    'pressure-moderate',
+    'pressure-critical',
+]);
+export function isMiniAppSleepReason(value) {
+    return MINIAPP_SLEEP_REASONS.includes(value);
+}
 /**
  * Request header that carries the Host-issued loopback credential to a Mini App's own
  * port. Only the name is shared; the value stays in Electron main and local-runtime.
@@ -148,6 +178,11 @@ export const MINIAPP_HOST_CAPABILITIES = Object.freeze([
     'agent.run',
     'agent.session',
     'agent.sessions',
+    'host.navigation.getState',
+    'host.navigation.open',
+    'host.navigation.subscribe',
+    'host.ui.getState',
+    'host.ui.subscribe',
     'hostConnector',
     'message.append',
     'speech.transcribe',
@@ -194,6 +229,8 @@ function isMiniAppPermissionItem(domain, item) {
             return item === 'call';
         case 'device':
             return isMiniAppDeviceAccessItem(item);
+        case 'host':
+            return isMiniAppHostAccess(item);
         default:
             return false;
     }

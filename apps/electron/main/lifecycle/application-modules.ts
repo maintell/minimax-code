@@ -96,6 +96,9 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
             name: 'document-preview-protocol-handler',
             phase: 'whenReady',
             init: dependencies.setupDocumentPreviewProtocolHandler,
+            dispose: dependencies.disposeDocumentPreview,
+            disposeStage: 'parallel',
+            disposeTimeoutMs: 3000,
             onInitError: 'fatal',
         },
         {

@@ -2,9 +2,14 @@ import { MiniAppError } from '../errors.js';
 export function activeStatusPhase(active, hasFailure) {
     if (active.runtime)
         return 'active';
-    if (hasFailure)
-        return 'failed';
-    return active.startPromise ? 'starting' : 'cold';
+    return hasFailure ? 'failed' : 'cold';
+}
+export function requireActiveGeneration(active, pluginId) {
+    const generation = active.get(pluginId);
+    if (!generation) {
+        throw new MiniAppError('NO_ACTIVE_GENERATION', 'Mini App has no active generation');
+    }
+    return generation;
 }
 export function publishedView(candidate, miniAppGeneration, runtime) {
     return {
@@ -39,7 +44,7 @@ export function persistedState(candidate, runtime, updatedAtMs) {
     };
 }
 export function isReusableGeneration(generation, candidate) {
-    if (!generation.runtime || hasRuntimeTransition(generation))
+    if (!generation.runtime)
         return false;
     return (sameMiniAppProcessContract(generation.candidate, candidate) &&
         generation.runtime.nodeDigest === candidate.nodeDigest);
@@ -65,11 +70,6 @@ export function assertGenerationRunCurrent(input) {
         return undefined;
     }
     throw new MiniAppError('SERVICE_RESTARTED', 'Mini App service changed before this operation could be dispatched');
-}
-export function scheduleTimeout(delayMs, callback) {
-    const timer = setTimeout(callback, Math.max(0, delayMs));
-    timer.unref();
-    return { cancel: () => clearTimeout(timer) };
 }
 /** Node process contract: the parts of a candidate a running root cannot change under. */
 function sameMiniAppProcessContract(current, candidate) {
@@ -102,12 +102,6 @@ export function classifyMiniAppCandidateChange(current, next) {
         return 'reuse';
     }
     return 'restart';
-}
-function hasRuntimeTransition(generation) {
-    return Boolean(generation.startPromise ||
-        generation.startController ||
-        generation.idleTimer ||
-        generation.idleStopPromise);
 }
 function canonicalMcpEndpoints(candidate) {
     return JSON.stringify(candidate.mcpEndpoints

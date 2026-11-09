@@ -11,6 +11,7 @@ import { normalizeMavisCommand } from '../../shared/mavis-operation-classifier.j
 import { CRON_CREATE_ME_REJECTED_MESSAGE, isMeSessionSentinel, } from '../../shared/cron-schedule-input.js';
 import { AgentNameResolverError, createResolverCache, resolveAgentId, resolveAgentName, } from './agent-name-resolver.js';
 import { handleAgentCreate, handleAgentDelete, handleAgentGet, handleAgentList, handleAgentUpdate, } from './commands/agent.js';
+import { isMavisTeamCommand, teamDisabledFailure } from './commands/team.js';
 // Disabled: communication group is intentionally not registered. The
 // standalone `communicate` LLM tool owns this surface in cloud-runtime
 // (single source of truth). Handler files are kept in tree so re-enabling
@@ -145,6 +146,9 @@ function substituteMe(value, deps, path) {
 }
 export async function dispatchDofld(deps, rawCommand, rawArgs, signal) {
     const command = normalizeCommand(rawCommand);
+    if (deps.teamDisabled === true && isMavisTeamCommand(command)) {
+        return teamDisabledFailure(command);
+    }
     if (!isKnownCommand(command)) {
         // Friendly fallback for help typos:
         //   - bare "help" / "-h"   → list the 4 group help entries

@@ -1,0 +1,13 @@
+{
+  "name": "@minimax/model-access-sdk",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Type contracts and static manifest validation for MiniMax Code model access extensions.",
+  "license": "UNLICENSED",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  }
+}

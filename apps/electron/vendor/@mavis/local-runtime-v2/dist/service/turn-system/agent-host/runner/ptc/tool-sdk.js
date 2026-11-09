@@ -48,7 +48,7 @@ const COMPUTER_DATA_TYPES = {
 const NATIVE_DATA_TYPES = {
     read: {
         name: 'ReadData',
-        declaration: 'type ReadData = { kind: "text"; content: string; startLine: number; lineCount: number; totalLines: number } | { kind: "image"; mimeType: string; width: number; height: number; originalWidth: number; originalHeight: number } | { kind: "image"; mimeType: string; omittedReason: "too_large" | "processor_unavailable" } | { kind: "pdf" | "notebook" | "video" }; // content has no line numbers; on failure only kind',
+        declaration: 'type ReadData = { kind: "text"; content: string; startLine: number; lineCount: number; totalLines: number } | { kind: "image"; mimeType: string; width: number; height: number; originalWidth: number; originalHeight: number } | { kind: "image"; mimeType: string; omittedReason: "too_large" | "processor_unavailable" } | { kind: "pdf" | "notebook" | "video" | "audio" }; // content has no line numbers; on failure only kind',
     },
     write: {
         name: 'WriteData',

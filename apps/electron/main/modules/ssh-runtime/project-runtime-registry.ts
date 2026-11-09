@@ -380,6 +380,42 @@ export class ProjectRuntimeRegistry {
     fetchMedia(runtimeId, request) {
         return this.files.fetchMedia(runtimeId, request);
     }
+    /** Persisted projects and whether their host is connected now; never creates connection demand. */
+    listSessionProjects() {
+        return this.options.repository.list().map((project) => {
+            const state = this.getStatus(project.runtimeId)?.state ?? 'disconnected';
+            return {
+                runtimeId: project.runtimeId,
+                name: project.name,
+                host: project.host,
+                workspaceDir: project.workspaceDir,
+                connected: state === 'connected',
+                ...(state === 'connected' ? {} : { state }),
+            };
+        });
+    }
+    /**
+     * One read through a project's already connected host, holding an operation
+     * lease until the body is read. Null when the host is not connected; never
+     * starts a connection.
+     */
+    async readConnected(runtimeId, request) {
+        const projectId = sshProjectIdFromRuntimeId(runtimeId);
+        const target = projectId ? this.options.repository.getRuntimeTarget(projectId) : null;
+        if (this.stopped || !target || !this.options.connections.get(target.host)?.enabled)
+            return null;
+        const manager = this.hostManagers.get(target.host);
+        if (!manager?.isReady())
+            return null;
+        const release = this.retainHostOperation(target.host);
+        try {
+            const response = await manager.fetch(request);
+            return { status: response.status, text: await response.text() };
+        }
+        finally {
+            release();
+        }
+    }
     readWorkspaceFileBytes(...args) {
         return this.files.readWorkspaceFileBytes(...args);
     }

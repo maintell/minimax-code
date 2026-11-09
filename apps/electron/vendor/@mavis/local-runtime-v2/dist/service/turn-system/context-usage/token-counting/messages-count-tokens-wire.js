@@ -1,11 +1,5 @@
 export const NON_VISION_USER_IMAGE_PLACEHOLDER = '(image omitted: model does not support images)';
 export const NON_VISION_TOOL_IMAGE_PLACEHOLDER = '(tool image omitted: model does not support images)';
-export const PRIOR_THINKING_OPEN = '<|prior-thinking|>';
-export const PRIOR_THINKING_CLOSE = '<|/prior-thinking|>';
-export const SIBLING_NATIVE_THINKING_APIS = new Set([
-    'anthropic-messages',
-    'bedrock-converse-stream',
-]);
 const REFERENCE_CLI_TOOLS = [
     'Read',
     'Write',

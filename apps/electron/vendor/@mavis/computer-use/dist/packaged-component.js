@@ -48,18 +48,17 @@ export async function prepareInstalledPackagedComponent(input) {
     }
     const dataDir = await resolveProfileDataDir(input.dataDir);
     const source = path.join(input.packagedRoot, CUA_VERSION, target);
-    const verify = async (root, installed) => {
+    const verify = async (root) => {
         await discoverComponent({
             dataDir,
             platform,
             arch,
             trustedInstalledComponent: { root, manifestSha256 },
         });
-        await verifyTreePermissions(root, installed);
     };
     // Even a cached installation must correspond to the complete, verified product resources.
     try {
-        await verify(source, false);
+        await verify(source);
     }
     catch (error) {
         if (error.code === 'ENOENT' ||
@@ -74,19 +73,19 @@ export async function prepareInstalledPackagedComponent(input) {
     const trusted = { root, manifestSha256 };
     if (await exists(root)) {
         await privateDirectory(root);
-        await verify(root, true);
+        await verify(root);
         return trusted;
     }
     const staging = await mkdtemp(path.join(parent, '.install-'));
     try {
         await copyTree(source, staging);
-        await verify(staging, true);
+        await verify(staging);
         // Renaming a complete nonempty directory is atomic. A concurrent winner's nonempty
         // directory cannot be replaced by rename on macOS or Windows; never remove it.
         try {
             if (await exists(root)) {
                 await privateDirectory(root);
-                await verify(root, true);
+                await verify(root);
                 return trusted;
             }
             await rename(staging, root);
@@ -97,7 +96,7 @@ export async function prepareInstalledPackagedComponent(input) {
             if (!(await exists(root)))
                 throw error;
             await privateDirectory(root);
-            await verify(root, true);
+            await verify(root);
         }
         return trusted;
     }
@@ -115,20 +114,6 @@ async function exists(file) {
         if (error.code === 'ENOENT')
             return false;
         throw error;
-    }
-}
-async function verifyTreePermissions(root, installed) {
-    await assertNoSymlink(root);
-    const info = await lstat(root);
-    if ((!info.isDirectory() && !info.isFile()) ||
-        (process.platform !== 'win32' &&
-            ((info.uid !== process.getuid?.() && (installed || info.uid !== 0)) ||
-                (info.mode & (installed ? 0o077 : 0o022)) !== 0))) {
-        throw new ComputerUseError('computer_component_invalid', 'Component paths have unsafe ownership, permissions or file types.');
-    }
-    if (info.isDirectory()) {
-        for (const entry of await readdir(root))
-            await verifyTreePermissions(path.join(root, entry), installed);
     }
 }
 async function copyTree(source, destination) {

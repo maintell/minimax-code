@@ -35,6 +35,41 @@ export class McpControllerBase {
         void req;
         throw new NotImplementedError('testLocalMcpServer');
     }
+    async setLocalMcpServerOAuthClientSecret(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('setLocalMcpServerOAuthClientSecret');
+    }
+    async listLocalMcpAuthStates(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('listLocalMcpAuthStates');
+    }
+    async testLocalMcpAuthTarget(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('testLocalMcpAuthTarget');
+    }
+    async startLocalMcpAuth(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('startLocalMcpAuth');
+    }
+    async cancelLocalMcpAuth(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('cancelLocalMcpAuth');
+    }
+    async completeLocalMcpAuth(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('completeLocalMcpAuth');
+    }
+    async clearLocalMcpAuth(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('clearLocalMcpAuth');
+    }
     async listLocalMcpRuntimeServers(ctx, req) {
         void ctx;
         void req;

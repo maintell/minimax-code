@@ -6,17 +6,19 @@ export function createContextCompactors(input) {
     return {
         automatic: new AutomaticContextCompactor(input.contextUsageAnchor, input.checkpointState, input.logger, {
             checkpointRequestMessages: input.checkpointRequestMessages,
+            mainRequestMessages: input.mainRequestMessages,
             checkpointReminder: input.checkpointReminder,
-            toolResultArchiver: input.toolResultArchiver,
+            imageFileWriter: input.imageFileWriter,
             promptSnapshots: input.promptSnapshots,
             resolveEarlierFiles: input.resolveEarlierFiles,
             getCompactionTriggerAt: createCompactionTriggerAtGetter(input.readConfig, input.logger),
         }),
         manual: new LocalContextCompactor(input.checkpointState, input.logger, input.promptSnapshots, {
-            imageFileWriter: input.toolResultArchiver,
+            imageFileWriter: input.imageFileWriter,
             resolveEarlierFiles: input.resolveEarlierFiles,
             reminder: input.checkpointReminder,
             projectRequestMessages: input.checkpointRequestMessages,
+            mainRequestMessages: input.mainRequestMessages,
         }),
     };
 }

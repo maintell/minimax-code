@@ -8,7 +8,6 @@ const MAX_RETRY_COUNT = 3;
 let retryCount = 0;
 // 当前更新状态
 let updateStatus = 'idle';
-// 缓存的更新信息
 let cachedUpdateInfo = null;
 // 缓存的下载进度
 let cachedProgress = null;

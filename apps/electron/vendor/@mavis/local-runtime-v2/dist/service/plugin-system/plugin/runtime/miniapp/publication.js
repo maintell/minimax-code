@@ -1,4 +1,4 @@
-import { MINIAPP_LOOPBACK_TOKEN_HEADER, miniAppBusyReason, miniAppFailureReasonCode, } from '../../../../miniapp/index.js';
+import { MINIAPP_LOOPBACK_TOKEN_HEADER, MINIAPP_STOP_TARGET_REPLACED, miniAppBusyReason, miniAppFailureReasonCode, } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
 import { runAllFinally } from '../../../plugin-system-helpers.js';
 import { isEffectiveLocalPlugin, withPluginMcpRuntime, } from '../snapshot-builder.js';
@@ -84,6 +84,9 @@ export class SupervisedMiniAppPublicationParticipant {
         const request = {
             pluginId: input.pluginId,
             ...(input.signal ? { signal: input.signal } : {}),
+            ...(input.expectedProcessGeneration !== undefined
+                ? { expectedProcessGeneration: input.expectedProcessGeneration }
+                : {}),
         };
         this.stopRequest = request;
         try {
@@ -102,7 +105,6 @@ export class SupervisedMiniAppPublicationParticipant {
             throw publicationError('MINIAPP_PUBLICATION_PARTICIPANT_CLOSED');
         const previous = this.active;
         const next = new Map(previous);
-        const leases = [];
         const stopped = [];
         let changed = false;
         for (const [pluginId, item] of previous) {
@@ -114,8 +116,6 @@ export class SupervisedMiniAppPublicationParticipant {
             if (stoppedRecoveryAlreadyProjected(snapshot, status, item))
                 continue;
             changed = true;
-            if (item.mcpLease)
-                leases.push(item.mcpLease);
             stopped.push(item);
             next.set(pluginId, stoppedAcceptedMiniApp(item, status?.active));
         }
@@ -124,13 +124,17 @@ export class SupervisedMiniAppPublicationParticipant {
         if (this.active !== previous)
             throw publicationError('PUBLICATION_SUPERSEDED');
         this.active = next;
-        await releaseRecoveryLeases(leases);
         return failureRecoveryPlan(snapshot, this.rewriteAcceptedSnapshot(snapshot, next, snapshot), stopped);
     }
     async prepareStoppedPublication(input, previous, request) {
         const accepted = previous.get(request.pluginId);
         if (!accepted)
             throw publicationError('MINIAPP_NOT_ACCEPTED');
+        // Chosen for an older root: a restart or update replaced it while this stop queued.
+        if (request.expectedProcessGeneration !== undefined &&
+            accepted.target.processGeneration !== request.expectedProcessGeneration) {
+            throw miniAppStopTargetReplacedError();
+        }
         const authored = listAcceptedMiniApps(input.snapshot).find(({ candidate }) => candidate.pluginId === request.pluginId);
         if (!authored || !sameMiniAppCandidate(authored.candidate, accepted.candidate)) {
             throw publicationError('MINIAPP_REQUIRED_TARGET_NOT_ACCEPTED');
@@ -148,7 +152,6 @@ export class SupervisedMiniAppPublicationParticipant {
                 ...accepted,
                 target: stop.target,
                 stopTransition: stop,
-                mcpLease: undefined,
                 runtimeStopped: true,
             });
             const state = {
@@ -224,7 +227,7 @@ export class SupervisedMiniAppPublicationParticipant {
                 plugins: Object.freeze(rosterSource.turnCapabilities.plugins.filter(({ source }) => source !== 'official')),
             },
         };
-        // Keep this.active intact: the queued scope publication still owns root and lease retirement.
+        // Keep this.active intact: the queued scope publication still owns root retirement.
         return this.rewriteAcceptedSnapshot(snapshot, visibleAccepted, localRoster);
     }
     /** Confirms that the accepted projection still names the Supervisor's running generation. */
@@ -251,9 +254,7 @@ export class SupervisedMiniAppPublicationParticipant {
         if (this.closed)
             return;
         this.closed = true;
-        const active = this.active;
         this.active = new Map();
-        await releaseLeases([...active.values()].flatMap(({ mcpLease }) => (mcpLease ? [mcpLease] : [])));
         await releaseRetainedOfficialRoots(this.retainedRoots);
     }
     fallback(input, accepted) {
@@ -340,7 +341,6 @@ export class SupervisedMiniAppPublicationParticipant {
         const previous = state.previous;
         let committed = false;
         let rolledBack = false;
-        let retired = [];
         let releasedRoots = [];
         return {
             snapshot,
@@ -352,7 +352,6 @@ export class SupervisedMiniAppPublicationParticipant {
                     return;
                 if (this.active !== previous)
                     throw publicationError('PUBLICATION_SUPERSEDED');
-                const acquired = [];
                 try {
                     for (const transition of state.transitions)
                         await transition.commit();
@@ -360,17 +359,14 @@ export class SupervisedMiniAppPublicationParticipant {
                         await disable.commit();
                     for (const stop of state.stops)
                         await stop.commit();
-                    await acquireManagedMcpLeases(state.next, this.options.supervisor, acquired);
                     if (!heldEntriesStillRunning(options.held, this.options.supervisor)) {
                         throw publicationError('PUBLICATION_SUPERSEDED');
                     }
-                    retired = [...previous].flatMap(([pluginId, item]) => state.next.get(pluginId) === item ? [] : [item]);
                     releasedRoots = retainAcceptedOfficialRoots(this.retainedRoots, state.next, this.options);
                     this.active = state.next;
                     committed = true;
                 }
                 catch (error) {
-                    await ignoreFailure(releaseLeases([...acquired].reverse()));
                     await ignoreFailure(rollbackState(state));
                     throw error;
                 }
@@ -379,19 +375,8 @@ export class SupervisedMiniAppPublicationParticipant {
                 if (rolledBack)
                     return;
                 rolledBack = true;
-                const nextLeases = [...state.next.values()].flatMap(({ mcpLease }) => mcpLease && !previousHasLease(previous, mcpLease) ? [mcpLease] : []);
-                const stoppedLeases = committed
-                    ? state.stops.flatMap(({ pluginId }) => {
-                        const lease = previous.get(pluginId)?.mcpLease;
-                        return lease ? [lease] : [];
-                    })
-                    : [];
                 try {
-                    await runAllFinally([
-                        () => releaseLeases(nextLeases),
-                        () => rollbackState(state),
-                        () => releaseLeases(stoppedLeases),
-                    ]);
+                    await rollbackState(state);
                 }
                 finally {
                     if (committed)
@@ -405,7 +390,6 @@ export class SupervisedMiniAppPublicationParticipant {
                     ...state.transitions.map((transition) => () => transition.finalize()),
                     ...state.disables.map((disable) => () => disable.finalize()),
                     ...state.stops.map((stop) => () => stop.finalize()),
-                    () => releaseLeases(retired.flatMap(({ mcpLease }) => (mcpLease ? [mcpLease] : []))),
                     () => releaseOfficialRoots(releasedRoots),
                 ]);
             },
@@ -421,25 +405,6 @@ export function attachSupervisedMiniAppPublication(input) {
     }
     const { supervisor, retainOfficialPackage } = input;
     return new SupervisedMiniAppPublicationParticipant({ supervisor, retainOfficialPackage });
-}
-async function acquireManagedMcpLeases(next, supervisor, acquired) {
-    for (const [pluginId, item] of next) {
-        if (!item.transition ||
-            item.runtimeStopped ||
-            item.mcpLease ||
-            item.candidate.mcpEndpoints.length === 0) {
-            continue;
-        }
-        const lease = await supervisor.acquire({
-            pluginId,
-            expectedMiniAppGeneration: item.target.miniAppGeneration,
-            ...(item.target.processGeneration
-                ? { expectedProcessGeneration: item.target.processGeneration }
-                : {}),
-        });
-        acquired.push(lease);
-        next.set(pluginId, { ...item, mcpLease: lease });
-    }
 }
 /**
  * Rebuilds one coherent input set: candidate ordinary capabilities are current,
@@ -576,7 +541,6 @@ function rewriteManagedMcpServers(snapshot, accepted) {
         if (!replacement) {
             if (!expected.has(key))
                 return [entry];
-            used.add(key);
             return [];
         }
         used.add(key);
@@ -607,7 +571,9 @@ function rewriteManagedMcpServers(snapshot, accepted) {
         };
         return [rewritten];
     });
-    if (used.size !== expected.size)
+    // Stopped definitions still own their authored MCP names, but their endpoints may
+    // already be absent from a published snapshot. Only live replacements are required.
+    if (used.size !== replacements.size)
         throw publicationError('MINIAPP_MCP_SERVER_MISSING');
     return Object.freeze({ ...snapshot, mcpServers: Object.freeze(mcpServers) });
 }
@@ -687,9 +653,6 @@ function stoppedRecoveryAlreadyProjected(snapshot, status, item) {
         status?.phase !== 'active' &&
         !snapshotHasManagedEndpoint(snapshot, item));
 }
-function previousHasLease(previous, lease) {
-    return [...previous.values()].some((item) => item.mcpLease === lease);
-}
 async function rollbackState(state) {
     await rollbackResources([...state.transitions, ...state.disables, ...state.stops]);
 }
@@ -709,13 +672,6 @@ function assertStoppedTarget(accepted, target) {
         return;
     }
     throw publicationError('MINIAPP_STOP_TARGET_INVALID');
-}
-async function releaseLeases(leases) {
-    await runAllFinally(leases.map((lease) => () => lease.release()));
-}
-async function releaseRecoveryLeases(leases) {
-    for (const lease of leases)
-        await ignoreFailure(lease.release());
 }
 function stoppedAcceptedMiniApp(item, observed) {
     return {
@@ -752,6 +708,9 @@ function throwIfAborted(signal) {
 }
 function publicationError(code) {
     return new PluginSystemError(code, 'Mini App publication preparation failed');
+}
+export function miniAppStopTargetReplacedError() {
+    return publicationError(MINIAPP_STOP_TARGET_REPLACED);
 }
 function supervisedPreparationReasonCode(error) {
     return error instanceof PluginSystemError

@@ -17,6 +17,19 @@ function validatePresentation(data) {
         !data.tokens ||
         typeof data.tokens !== 'object' ||
         JSON.stringify(data).length > 256000 ||
+        (data.search !== undefined &&
+            (data.kind !== undefined ||
+                !data.search ||
+                typeof data.search.placeholder !== 'string' ||
+                typeof data.search.emptyLabel !== 'string' ||
+                data.search.placeholder.length > 100 ||
+                data.search.emptyLabel.length > 100)) ||
+        (data.panelAdd !== undefined &&
+            (data.kind !== 'panel-add' ||
+                !data.panelAdd ||
+                !['menu', 'edit'].includes(data.panelAdd.mode) ||
+                !Array.isArray(data.panelAdd.moreKeys) ||
+                !data.panelAdd.moreKeys.every((key) => data.rows.some((row) => row?.key === key)))) ||
         data.rows.some((row) => !row ||
             typeof row.key !== 'string' ||
             typeof row.label !== 'string' ||
@@ -162,6 +175,7 @@ export function setupModelMenuPopupIPC() {
             ready: false,
             measured: false,
             menuBounds: undefined,
+            submenuBounds: undefined,
             openTimeout: undefined,
             idleTimeout: undefined,
             close: (restoreFocus = false, error = false) => {
@@ -171,6 +185,7 @@ export function setupModelMenuPopupIPC() {
                     return;
                 entry.request = undefined;
                 entry.menuBounds = undefined;
+                entry.submenuBounds = undefined;
                 if (!popup.isDestroyed())
                     popup.hide();
                 sendState(entry);
@@ -208,6 +223,15 @@ export function setupModelMenuPopupIPC() {
             },
         };
         const close = () => entry.close();
+        const isPointerInsideVisibleMenu = () => {
+            const point = screen.getCursorScreenPoint();
+            const contains = (rect) => Boolean(rect &&
+                point.x >= rect.x &&
+                point.x < rect.x + rect.width &&
+                point.y >= rect.y &&
+                point.y < rect.y + rect.height);
+            return contains(entry.menuBounds) || contains(entry.submenuBounds);
+        };
         // ponytail: close on geometry changes; continuous tracking can be added if product needs it.
         const ownerEvents = [
             'move',
@@ -224,7 +248,19 @@ export function setupModelMenuPopupIPC() {
         popup.on('blur', () => {
             const request = entry.request;
             if (request?.presentation.kind !== 'panel-tabs') {
-                close();
+                // A native child window can emit blur while the pointer crosses from the
+                // main menu into its parameter submenu. Defer the decision until Electron
+                // has applied the new hover target, then keep the menu alive if the pointer
+                // is still over either visible menu surface.
+                setImmediate(() => {
+                    if (entry.request !== request)
+                        return;
+                    if (isPointerInsideVisibleMenu()) {
+                        popup.focus();
+                        return;
+                    }
+                    close();
+                });
                 return;
             }
             // Native blur can precede the owner's focus event when the trigger is clicked.
@@ -333,6 +369,7 @@ export function setupModelMenuPopupIPC() {
         clearTimeout(entry.idleTimeout);
         entry.measured = false;
         entry.menuBounds = undefined;
+        entry.submenuBounds = undefined;
         entry.request = request;
         clearTimeout(entry.openTimeout);
         entry.openTimeout = setTimeout(() => {
@@ -420,7 +457,8 @@ export function setupModelMenuPopupIPC() {
             }, area,
             // A panel can reach the display edge. Keep its 8 CSS-pixel inset
             // instead of shifting the menu left to fit the default shadow gutter.
-            entry.request.presentation.kind === 'panel-tabs' || entry.request.presentation.kind === 'panel-add'
+            entry.request.presentation.kind === 'panel-tabs' ||
+                entry.request.presentation.kind === 'panel-add'
                 ? Math.min(16, 8 * zoom)
                 : undefined);
             entry.menuBounds = {
@@ -429,6 +467,14 @@ export function setupModelMenuPopupIPC() {
                 width: measured.menu.width * zoom,
                 height: measured.menu.height * zoom,
             };
+            entry.submenuBounds = measured.submenu && geometry.layout.submenu
+                ? {
+                    x: geometry.bounds.x + geometry.layout.submenu.x,
+                    y: geometry.bounds.y + geometry.layout.submenu.y,
+                    width: measured.submenu.width * zoom,
+                    height: measured.submenu.height * zoom,
+                }
+                : undefined;
             entry.popup.setBounds(geometry.bounds, false);
             entry.measured = true;
             const layout = geometry.layout;

@@ -1,3 +1,4 @@
+import { isSensitiveSearchRoot } from '@mavis/agent-tools/desktop';
 import { logger } from '../../../../infra/logging/logger.js';
 import { emitWorkspaceIndexingObservation, resolveWorkspaceIndexingObservationSink, WorkspaceIndexingMetrics, } from '../scan/metrics.js';
 import { isWorkspaceIndexingSessionEligible } from '../scan/preference.js';
@@ -6,7 +7,7 @@ import { WorkspaceIndexingRemoteWorker, } from '../revision/remote-worker.js';
 import { WorkspaceSemanticSearchService } from './semantic-search.js';
 import { detachWorkspacePreparation } from './service-helpers.js';
 import { WorkspaceSemanticIndexStore } from '../../../../infra/legacy-db/workspace-indexing-semantic-index-store.js';
-import { WorkspaceIndexingService } from './service.js';
+import { WorkspaceIndexingService, } from './service.js';
 import { SqliteWorkspaceIndexingStore, } from '../../../../infra/legacy-db/workspace-indexing-store.js';
 export function createWorkspaceIndexingHostSubsystem(options) {
     const metrics = new WorkspaceIndexingMetrics(options.metricsClient);
@@ -131,6 +132,30 @@ export async function hostCaptureWorkspaceRevisionAfterTurn(host, sessionId) {
     catch (error) {
         logWorkspaceRevisionFailure(sessionId, error);
     }
+}
+/**
+ * Writes the Session's Workspace snapshot for a feedback upload into a
+ * caller-owned directory. Eligibility matches indexing (a user-selected,
+ * non-default Workspace); the indexing preference is not consulted because the
+ * caller already decided a snapshot may be taken. Failures propagate.
+ *
+ * Secret-path rules only see Workspace-relative paths, so a secret tree chosen
+ * as the root itself (~/.aws, ~/.kube, also via symlink) would ship its
+ * credentials; such a Workspace is skipped without scanning.
+ */
+export async function hostCaptureWorkspaceFeedbackSnapshot(host, sessionId, outputDir) {
+    const session = await host.getSessionById(sessionId);
+    if (!session)
+        return { status: 'no_session' };
+    if (!isWorkspaceIndexingSessionEligible(session))
+        return { status: 'no_workspace' };
+    if (await isSensitiveSearchRoot(session.workspaceDir))
+        return { status: 'sensitive_workspace' };
+    return host.workspaceIndexingService.captureFeedbackSnapshot({
+        sessionId,
+        workspaceDir: session.workspaceDir,
+        outputDir,
+    });
 }
 export function hostLogWorkspaceSemanticSearchUnavailable(sessionId, error) {
     logger.warn({

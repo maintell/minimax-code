@@ -2,7 +2,7 @@ import { createPtcToolFactCollector, } from '@mavis/agent-core/tools';
 import { applyProcessLocalToolResultPolicy } from '../../runner/policy/process-local-tool-result-policy.js';
 import { observePtcAdmission } from '../../runner/policy/ptc-admission-observability.js';
 import { createPtcToolLabeler, createPtcTurnObserver } from '../../runner/ptc/ptc-observability.js';
-import { isNativeTaskOutputTool, readPtcChildTools, readPtcNativeCatalog, readPtcTurnReminder, } from './catalog.js';
+import { isNativeTaskOutputTool, readPtcChildTools, readPtcNativeCatalog, readPtcTurnReminder, registerPtcTurnChildTodoWrite, } from './catalog.js';
 import { createPtcCompactionReminderRestorer, } from './compaction-reminder.js';
 /** The PTC reminder restorer for a Turn; undefined when the Turn has no PTC reminder. */
 export function createPtcTurnCompactionReminder(input, options) {
@@ -59,6 +59,9 @@ export function preparePtcExecution(tools, nativeTools, options, input) {
  * input on a PTC Turn and the assembled catalog itself otherwise.
  */
 export function observePtcTurnAdmission(input, ptc, options, prefix) {
+    // Every Turn, PTC or not: the fixed Todo cadence hook reads this back to
+    // know whether TodoWrite is reachable through run_code on this Turn.
+    registerPtcTurnChildTodoWrite(input.lease.sessionId, input.assembly.tools);
     observePtcAdmission(input, ptc.ptcTools !== undefined, options, {
         ...prefix,
         nativeCatalog: readPtcNativeCatalog(input.assembly.tools) ?? input.assembly.tools,

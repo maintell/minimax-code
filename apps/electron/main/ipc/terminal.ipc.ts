@@ -104,6 +104,11 @@ export function setupTerminalIPC(options = {}) {
         requireString(params?.terminalId, 'terminalId');
         getTerminalManager().dispose(params.terminalId, requireRuntimeId(params.runtimeId));
     });
+    ipcMain.handle(IPC_CHANNELS.TERMINAL_REASSIGN, async (_evt, params) => {
+        requireString(params?.fromSessionId, 'fromSessionId');
+        requireString(params?.toSessionId, 'toSessionId');
+        getTerminalManager().reassignSession(params.fromSessionId, params.toSessionId, requireRuntimeId(params.runtimeId));
+    });
     logger.info('[TerminalIPC] handlers registered');
 }
 // ---------------------------------------------------------------------------

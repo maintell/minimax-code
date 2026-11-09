@@ -5,53 +5,72 @@ export const MEMORY_SUMMARY_REMINDER_CUSTOM_TYPE = 'memory_v2_summary';
  * Places the Memory summary as one hidden message near the start of the
  * model-visible context, the way Codex and ZCode carry theirs.
  *
- * Memory owns the text; this module only decides where it sits. The message is
- * durable, so while the summary stays the same it is byte-identical at the same
- * position and the prompt cache keeps hitting; the system prompt keeps only the
- * stable rules.
+ * Memory owns the text; this module only decides where it sits. The summary is
+ * background reference, so it is frozen for one context window: the copy in
+ * context stays byte-identical even after consolidation, forget or manual edits
+ * change the file, and the prompt cache keeps hitting. The current
+ * summary only replaces it once compaction has summarized the old copy away,
+ * when the prefix is rebuilt anyway. Mid-window, the model reads current memory
+ * through memories_search / memories_read.
  *
- * Each Turn reads the current summary once. A copy in context counts only when
- * its text equals the current summary: Reset, forget, manual edits and new
- * consolidations all change that text, so stale copies are withdrawn from the
- * provider request (durable history stays untouched) and the current summary
- * goes before the current user message. Compaction that summarizes it away gets
- * it put back. Without a summary (recall off, Memory V2 not assembled, nothing
- * generated) every copy is withdrawn.
+ * Only a loss of recall access (recall off, Memory V2 not assembled, a Reset
+ * after the Session was created) withdraws the copies from the provider
+ * request; durable history stays untouched.
  */
 export function createMemorySummaryReminder(loadSummaryContext, usageAnchor) {
     return {
         async prepare({ hookInput }) {
-            const content = await loadSummaryContext(hookInput.sessionId);
-            const withdraw = createStaleSummaryWithdrawHook(content);
-            if (!content)
-                return { beforeUserMessages: [], hooks: [withdraw] };
-            const marker = carriesCurrentSummary(hookInput.canonicalMessages, content)
+            const summary = await loadSummaryContext(hookInput.sessionId);
+            if (summary.status === 'disabled') {
+                return { beforeUserMessages: [], hooks: [createWithdrawAllHook()] };
+            }
+            const keepOne = createKeepWindowCopyHook();
+            if (summary.status !== 'ready')
+                return { beforeUserMessages: [], hooks: [keepOne] };
+            const marker = carriesSummaryInWindow(hookInput.canonicalMessages)
                 ? undefined
-                : createMemorySummaryMarker(content);
+                : createMemorySummaryMarker(summary.content);
             const fits = marker !== undefined && fitsReminderInFinalRequest(hookInput, marker, usageAnchor);
             return {
                 beforeUserMessages: marker && fits ? [marker] : [],
-                hooks: [withdraw, createMemorySummaryRestoreHook(content, usageAnchor)],
+                hooks: [keepOne, createMemorySummaryRestoreHook(summary.content, usageAnchor)],
             };
         },
     };
 }
-/** Request-only: copies that no longer match the current summary must not reach the model. */
-function createStaleSummaryWithdrawHook(content) {
-    const isStale = (message) => isMemorySummaryMessage(message) && message.content !== content;
+/** Request-only: without recall access no copy may reach the model. */
+function createWithdrawAllHook() {
     return (input) => {
-        if (!input.messages.some(isStale))
+        if (!input.messages.some(isMemorySummaryMessage))
             return undefined;
         return {
             type: 'replaceRequestMessages',
             reason: `${MEMORY_SUMMARY_REMINDER_CUSTOM_TYPE}_withdrawn`,
-            messages: input.messages.filter((message) => !isStale(message)),
+            messages: input.messages.filter((message) => !isMemorySummaryMessage(message)),
+        };
+    };
+}
+/**
+ * Request-only: sends exactly the frozen copy of the current window. Earlier
+ * Runtimes appended a fresh copy whenever the summary changed; keeping the
+ * latest one matches what they sent, so upgrading does not move the prefix.
+ */
+function createKeepWindowCopyHook() {
+    return (input) => {
+        const keep = latestSummaryIndexInWindow(input.messages);
+        const extra = (message, index) => isMemorySummaryMessage(message) && index !== keep;
+        if (!input.messages.some(extra))
+            return undefined;
+        return {
+            type: 'replaceRequestMessages',
+            reason: `${MEMORY_SUMMARY_REMINDER_CUSTOM_TYPE}_deduplicated`,
+            messages: input.messages.filter((message, index) => !extra(message, index)),
         };
     };
 }
 function createMemorySummaryRestoreHook(content, usageAnchor) {
     return (input) => {
-        if (carriesCurrentSummary(input.canonicalMessages, content))
+        if (carriesSummaryInWindow(input.canonicalMessages))
             return undefined;
         const marker = createMemorySummaryMarker(content);
         if (!fitsReminderInFinalRequest(input, marker, usageAnchor))
@@ -76,11 +95,14 @@ function createMemorySummaryMarker(content) {
     };
 }
 /**
- * Whether the current summary is in context after the latest compaction (or
- * anywhere when never compacted).
+ * Whether a summary copy, whatever its text, is in context after the latest
+ * compaction (or anywhere when never compacted).
  * @internal Exported only for focused tests.
  */
-export function carriesCurrentSummary(messages, content) {
+export function carriesSummaryInWindow(messages) {
+    return latestSummaryIndexInWindow(messages) !== -1;
+}
+function latestSummaryIndexInWindow(messages) {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
         const message = messages[index];
         if (!isRecord(message))
@@ -88,12 +110,12 @@ export function carriesCurrentSummary(messages, content) {
         // Native summaries and legacy (archon) compaction markers both start a
         // fresh model-visible context; anything before them was summarized away.
         if (message.role === 'compactionSummary' || Object.hasOwn(message, 'archonCompaction')) {
-            return false;
+            return -1;
         }
-        if (isMemorySummaryMessage(message) && message.content === content)
-            return true;
+        if (isMemorySummaryMessage(message))
+            return index;
     }
-    return false;
+    return -1;
 }
 function isMemorySummaryMessage(message) {
     return (isRecord(message) &&

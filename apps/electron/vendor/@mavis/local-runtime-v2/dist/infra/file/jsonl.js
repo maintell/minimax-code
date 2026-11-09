@@ -3,8 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { link, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
-const RENAME_RETRY_DELAYS_MS = [50, 100, 150];
-const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+import { logger } from '../logging/logger.js';
+// Windows reports a handle held by another process (scanner, indexer, backup) as one of these
+// codes; the holder usually lets go within a second, so wait about 1.5s in total before failing.
+const FILE_LOCK_RETRY_DELAYS_MS = [50, 100, 200, 400, 800];
+const TRANSIENT_FILE_LOCK_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 export class JsonlAppendCommitUncertainError extends Error {
     filePath;
     cause;
@@ -423,7 +426,8 @@ function jsonSerializationError(reason) {
 async function openExistingAppendTarget(filePath) {
     try {
         // String append flags include O_CREAT; numeric flags let an absent target take the staged path.
-        return await open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND);
+        // Nothing has been written yet, so waiting out a held target cannot duplicate records.
+        return await withFileLockRetries('append-open', filePath, () => open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND));
     }
     catch (error) {
         if (hasErrorCode(error, 'ENOENT'))
@@ -556,23 +560,56 @@ function hasErrorCode(error, code) {
     return (typeof error === 'object' && error !== null && error.code === code);
 }
 async function renameWithRetries(temporaryPath, filePath) {
-    for (let attempt = 0;; attempt += 1) {
+    await withFileLockRetries('rename', filePath, () => rename(temporaryPath, filePath));
+}
+async function withFileLockRetries(operation, filePath, run) {
+    let waitedMs = 0;
+    let lockCode;
+    for (let attempt = 1;; attempt += 1) {
+        const retry = (outcome, code) => ({
+            operation,
+            filePath,
+            code,
+            attempts: attempt,
+            waitedMs,
+            outcome,
+        });
         try {
-            await rename(temporaryPath, filePath);
-            return;
+            const result = await run();
+            logFileLockRetry(retry('recovered', lockCode));
+            return result;
         }
         catch (error) {
-            const delayMs = RENAME_RETRY_DELAYS_MS[attempt];
-            if (!isTransientRenameError(error) || delayMs === undefined)
+            const code = transientFileLockCode(error);
+            const delayMs = code === undefined ? undefined : FILE_LOCK_RETRY_DELAYS_MS[attempt - 1];
+            if (delayMs === undefined) {
+                logFileLockRetry(retry(code ? 'exhausted' : 'failed', code ?? lockCode));
                 throw error;
+            }
+            lockCode = code;
             await sleep(delayMs);
+            waitedMs += delayMs;
         }
     }
 }
-function isTransientRenameError(error) {
-    return (typeof error === 'object' &&
-        error !== null &&
-        TRANSIENT_RENAME_CODES.has(error.code ?? ''));
+function transientFileLockCode(error) {
+    if (typeof error !== 'object' || error === null)
+        return undefined;
+    const code = error.code;
+    return code !== undefined && TRANSIENT_FILE_LOCK_CODES.has(code) ? code : undefined;
+}
+/** Logs one line per wait; an operation that never met a lock logs nothing. */
+function logFileLockRetry(retry) {
+    if (retry.code === undefined)
+        return;
+    logger.warn({
+        operation: retry.operation,
+        code: retry.code,
+        attempts: retry.attempts,
+        waited_ms: retry.waitedMs,
+        outcome: retry.outcome,
+        file: basename(retry.filePath),
+    }, '[jsonl] file held by another process');
 }
 async function sleep(delayMs) {
     await new Promise((resolve) => {

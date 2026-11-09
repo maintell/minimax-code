@@ -1,0 +1,2 @@
+export { MODEL_ACCESS_SDK_MAJORS, ModelAccessContractError, desktopVersionSatisfies, parseModelAccessManifest, validateModelAccessAsset, validateModelAccessEntry, } from './manifest.js';
+//# sourceMappingURL=index.js.map

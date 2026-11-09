@@ -21,30 +21,8 @@ export function buildLocalNativeRuntimeTools(input) {
     const nativeTools = [
         ...buildLocalToolRegistry({
             workspaceRoot: input.workspaceRoot,
-            skillReader: {
-                readSkill: (name, agentName) => requireSkillRuntime(input.skillRuntime).readNativeSkill({
-                    name,
-                    policy: capabilities,
-                    gates: {
-                        computerUseActive: input.computerUseActive === true,
-                        miniappAvailable: input.miniappAvailable === true,
-                        disabledSkillNames: input.disabledBuiltinSkillNames,
-                        resumeCodexAvailable: input.resumeCodexAvailable === true,
-                    },
-                    scope: {
-                        agentName: agentName ?? input.agentName,
-                        ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
-                        ...(input.expectedAgentInstanceId
-                            ? { expectedAgentInstanceId: input.expectedAgentInstanceId }
-                            : {}),
-                        ...(input.skipAgentResolution ? { skipAgentResolution: true } : {}),
-                        workspaceDir: input.workspaceRoot,
-                        allowedSkillNames: input.allowedSkillNames,
-                        allowedExtensionSkillNames: input.allowedExtensionSkillNames,
-                    },
-                    desktopSkills: input.desktopCapabilities?.skills,
-                }),
-            },
+            ...writeGuardCheckDeps(input.metricsClient),
+            skillReader: createLocalNativeSkillReader(input),
             todoEventSink: {
                 emitTodoUpdated: (ctx, todos, signal) => emitLocalTodoUpdatedEvent({
                     ctx,
@@ -91,6 +69,58 @@ export function buildLocalNativeRuntimeTools(input) {
     })), capabilities);
 }
 /**
+ * `write_guard_check_total{result}`: how often the desktop write tool's
+ * overwrite check ran and what it decided, so a rising `not_read` /
+ * `stale_read` share is visible without reading logs. Counts and one enum
+ * only — never a path, a file name or a session id. The tool itself already
+ * swallows a throwing observer, so this only maps the outcome to the metric.
+ */
+function writeGuardCheckDeps(metricsClient) {
+    if (!metricsClient)
+        return {};
+    return {
+        writeGuardCheckObserver: (result) => {
+            try {
+                metricsClient.counter('write_guard_check_total', 1, { result });
+            }
+            catch {
+                // Observation must not change what the write does.
+            }
+        },
+    };
+}
+/**
+ * The `skill` tool's reader. The Agent's `skills` preload uses the same
+ * reader, so a preloaded Skill is exactly one the tool can read: standalone,
+ * Plugin (`<plugin>:<skill>`) and capability-owned Skills behind their gates.
+ * Agent selectors do not limit it; only the Builtin Skill policy and gates do.
+ */
+function createLocalNativeSkillReader(input) {
+    const capabilities = input.builtinCapabilities ?? resolveAgentCapabilities();
+    return {
+        readSkill: (name, agentName) => requireSkillRuntime(input.skillRuntime).readNativeSkill({
+            name,
+            policy: capabilities,
+            gates: {
+                computerUseActive: input.computerUseActive === true,
+                miniappAvailable: input.miniappAvailable === true,
+                disabledSkillNames: input.disabledBuiltinSkillNames,
+                resumeCodexAvailable: input.resumeCodexAvailable === true,
+            },
+            scope: {
+                agentName: agentName ?? input.agentName,
+                ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
+                ...(input.expectedAgentInstanceId
+                    ? { expectedAgentInstanceId: input.expectedAgentInstanceId }
+                    : {}),
+                ...(input.skipAgentResolution ? { skipAgentResolution: true } : {}),
+                workspaceDir: input.workspaceRoot,
+            },
+            desktopSkills: input.desktopCapabilities?.skills,
+        }),
+    };
+}
+/**
  * Returns still-unmigrated product-domain tool sources before the v2
  * AgentRuntime applies model gates, MCP disclosure and final catalog ordering.
  */
@@ -104,20 +134,30 @@ export async function buildLocalTurnToolSources(input) {
     }
     const cuRuntimeAvailable = false;
     const builtinCapabilities = input.builtinCapabilities ?? resolveAgentCapabilities();
-    const nativeTools = buildTurnNativeTools(input, builtinCapabilities);
+    const nativeInput = nativeToolsInput(input, builtinCapabilities);
+    const nativeTools = buildTurnNativeTools(input, nativeInput);
     const mcpEntries = await buildTurnMcpEntries(input, builtinCapabilities);
+    const skillReader = createLocalNativeSkillReader(nativeInput);
     return {
         nativeTools: nativeTools,
         mcpEntries,
         cuRuntimeAvailable,
+        readSkill: (name) => skillReader.readSkill(name, undefined),
     };
 }
-function buildTurnNativeTools(input, builtinCapabilities) {
+function buildTurnNativeTools(input, nativeInput) {
+    const nativeTools = buildLocalNativeRuntimeTools(nativeInput);
+    const gatedNativeTools = input.enableTodoWriteTool === false
+        ? nativeTools.filter((tool) => tool.def.name !== LocalTodoWriteToolDef.name)
+        : nativeTools;
+    return gatedNativeTools;
+}
+function nativeToolsInput(input, builtinCapabilities) {
     const enableTaskControlTools = input.enableTaskControlTools ?? !!input.taskControlAdapter;
     // `task` and `task_append` are the same delegation entry point: a surface
     // that may not start a task may not continue one either.
     const delegationEntryPointsEnabled = input.enableTaskTool !== false && builtinCapabilities.features.delegation;
-    const nativeTools = buildLocalNativeRuntimeTools({
+    return {
         skillRuntime: input.skillRuntime,
         dataDir: input.dataDir,
         configGetter: input.configGetter,
@@ -133,6 +173,7 @@ function buildTurnNativeTools(input, builtinCapabilities) {
         authContextInvalidator: input.authContextInvalidator,
         routingContextGetter: input.routingContextGetter,
         fetchImpl: input.fetchImpl,
+        matrixLogger: input.matrixLogger,
         webSearchEnabled: input.nativeWebSearchEnabled === true,
         taskAdapter: delegationEntryPointsEnabled ? input.taskAdapter : undefined,
         taskAppendAdapter: delegationEntryPointsEnabled ? input.taskAppendAdapter : undefined,
@@ -146,33 +187,24 @@ function buildTurnNativeTools(input, builtinCapabilities) {
         workspaceSemanticSearchAdapter: input.workspaceSemanticSearchAdapter,
         emitBusEvent: input.emitBusEvent,
         metrics: input.metrics,
+        ...(input.metricsClient ? { metricsClient: input.metricsClient } : {}),
         computerUseActive: input.computerUseActive === true,
-        ...(input.miniappAvailable === true ? { miniappAvailable: true } : {}),
-        desktopCapabilities: input.desktopCapabilities,
+        ...nativeProductCapabilities(input),
         builtinCapabilities,
         memoryEnabled: input.memoryEnabled,
         memoryReadEnabled: input.memoryReadEnabled,
         memoryWriteEnabled: input.memoryWriteEnabled,
         memoryAgentScopeEnabled: input.memoryAgentScopeEnabled,
         memoryReadAgentNames: input.memoryReadAgentNames,
-        ...(input.allowedSkillNames === undefined
-            ? {}
-            : { allowedSkillNames: input.allowedSkillNames }),
-        ...(input.allowedExtensionSkillNames === undefined
-            ? {}
-            : { allowedExtensionSkillNames: input.allowedExtensionSkillNames }),
         disabledBuiltinSkillNames: input.disabledBuiltinSkillNames,
         resumeCodexAvailable: input.resumeCodexAvailable,
-    });
-    const gatedNativeTools = input.enableTodoWriteTool === false
-        ? nativeTools.filter((tool) => tool.def.name !== LocalTodoWriteToolDef.name)
-        : nativeTools;
-    return gatedNativeTools;
+    };
 }
 async function buildTurnMcpEntries(input, builtinCapabilities) {
     const allEntries = await input.mcpService.listToolEntriesForTurn({
         sessionId: input.sessionId,
         workspaceRoot: input.workspaceRoot,
+        ...(input.turnId ? { turnId: input.turnId } : {}),
         ...(input.authContext ? { authContext: input.authContext } : {}),
         routingContextGetter: input.routingContextGetter,
         emitBusEvent: input.emitBusEvent,
@@ -186,6 +218,13 @@ async function buildTurnMcpEntries(input, builtinCapabilities) {
         ? selectedBuiltinMcpEntries
         : selectedBuiltinMcpEntries.filter((entry) => !(entry.source === 'builtin-matrix' && entry.tool.def.name === MatrixWebSearchToolDef.name));
     return selectedMcpEntries;
+}
+function nativeProductCapabilities(input) {
+    return {
+        ...(input.miniappAvailable === true ? { miniappAvailable: true } : {}),
+        ...(input.pptPreviewAvailable === true ? { pptPreviewAvailable: true } : {}),
+        desktopCapabilities: input.desktopCapabilities,
+    };
 }
 function nativeAgentScope(input) {
     return {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ELECTRON_BROWSER_PUBLIC_ACTIONS } from "../../browser/electron-browser-route-policy";
-import { isBrowserBrokerAbortMessage, isSafeBrokerRequestId, isBrowserBrokerRequestMessage, isStrictStructuredCloneValue, isBrowserBrokerResultMessage, isBrowserBrokerErrorMessage, isBrowserBrokerAction } from "./control";
+import { BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH, isBrowserBrokerAbortMessage, isSafeBrokerRequestId, isBrowserBrokerRequestMessage, isStrictStructuredCloneValue, isBrowserBrokerResultMessage, isBrowserBrokerErrorMessage, isBrowserBrokerAction } from "./control";
 const BROWSER_ERROR_MESSAGES = {
     aborted: 'Operation aborted',
     ambiguous_target: 'AMBIGUOUS_TARGET: Browser target is not unique; inspect and narrow it',
@@ -16,6 +16,7 @@ const BROWSER_ERROR_MESSAGES = {
     duplicate_request: 'Duplicate Browser broker request',
     invalid_request: 'Invalid Browser broker request',
     invalid_result: 'Invalid Browser broker result',
+    miniapp_tab_asleep: 'MINIAPP_TAB_ASLEEP: The selected Mini App tab is asleep to save memory; reopen it with the miniapp tool before using Browser on it',
     snapshot_continuation_mismatch: 'SNAPSHOT_CONTINUATION_MISMATCH: Continue with the exact nextOffset returned by Browser',
     snapshot_kind_mismatch: 'SNAPSHOT_KIND_MISMATCH: Continue the observation with its original Browser action',
     stale_element_ref: 'STALE_ELEMENT_REF: Browser target expired; inspect the current page again',
@@ -29,12 +30,43 @@ const STRUCTURED_BROWSER_ERROR_CODES = {
     BROWSER_RESULT_TOO_LARGE: 'browser_result_too_large',
     CURRENT_TAB_OCCUPIED: 'current_tab_occupied',
     FRAME_COORDINATES_UNAVAILABLE: 'frame_coordinates_unavailable',
+    MINIAPP_TAB_ASLEEP: 'miniapp_tab_asleep',
     SNAPSHOT_CONTINUATION_MISMATCH: 'snapshot_continuation_mismatch',
     SNAPSHOT_KIND_MISMATCH: 'snapshot_kind_mismatch',
     STALE_ELEMENT_REF: 'stale_element_ref',
     STALE_SNAPSHOT: 'stale_snapshot',
 };
 const BROWSER_BROKER_REQUEST_TIMEOUT_MS = 275000;
+const SECRET_ASSIGNMENT_PATTERN = /\b(access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|apikey|key|secret|password|passwd|pwd|authorization|cookie|session[_-]?id|sid|signature|sig|credential[s]?)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&,;'")\]]+)/giu;
+const BEARER_PATTERN = /\b(bearer|basic)\s+[a-z0-9._~+/=-]{8,}/giu;
+const WINDOWS_PATH_PATTERN = /\b[a-z]:\\[^\s'"<>|]*/giu;
+const POSIX_PRIVATE_PATH_PATTERN = /(^|[\s'"(=])(\/(?:Users|home|root|private|var\/folders|tmp)\/[^\s'"<>)]*)/gu;
+/** An over-long detail keeps its ending, where Browser errors put their next step. */
+const DETAIL_TAIL_CHARS = 280;
+/**
+ * The original exception tells the model why an action failed. Forward it
+ * without credentials or local file paths: credential assignments,
+ * Bearer/Basic tokens and local paths are removed, control characters and
+ * runs of whitespace collapse. An over-long message keeps its start and end.
+ */
+export function redactBrowserErrorDetail(error) {
+    const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+    const redacted = raw
+        .replace(SECRET_ASSIGNMENT_PATTERN, '$1$2[redacted]')
+        .replace(BEARER_PATTERN, '$1 [redacted]')
+        .replace(WINDOWS_PATH_PATTERN, '[path]')
+        .replace(POSIX_PRIVATE_PATH_PATTERN, '$1[path]')
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\u0000-\u001f\u007f]+/gu, ' ')
+        .replace(/\s+/gu, ' ')
+        .trim();
+    if (!redacted)
+        return undefined;
+    if (redacted.length <= BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH)
+        return redacted;
+    const head = redacted.slice(0, BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH - DETAIL_TAIL_CHARS - 1);
+    return `${head}…${redacted.slice(-DETAIL_TAIL_CHARS)}`;
+}
 function browserBrokerErrorCode(error, aborted) {
     if (aborted)
         return 'aborted';
@@ -57,7 +89,27 @@ function browserBrokerErrorCode(error, aborted) {
     }
     return 'browser_action_failed';
 }
-function postBrowserError(target, requestId, code, onDeliveryFailure, error) {
+/**
+ * The redacted original message for the generic failure and allowlisted
+ * recovery codes. Timeouts keep their label/deadline contract instead.
+ */
+function browserBrokerErrorDetail(code, error) {
+    const actionable = code === 'browser_action_failed' ||
+        (code !== 'browser_operation_timeout' &&
+            Object.values(STRUCTURED_BROWSER_ERROR_CODES).includes(code));
+    if (!actionable)
+        return undefined;
+    const detail = redactBrowserErrorDetail(error);
+    if (!detail || detail === BROWSER_ERROR_MESSAGES[code])
+        return undefined;
+    // A recovery cause the fixed guidance already states adds nothing.
+    const cause = detail.replace(/^[A-Z][A-Z0-9_]+:\s*/u, '');
+    if (code !== 'browser_action_failed' && BROWSER_ERROR_MESSAGES[code].includes(cause)) {
+        return undefined;
+    }
+    return detail;
+}
+function postBrowserError(target, requestId, code, onDeliveryFailure, error, detail) {
     const source = error && typeof error === 'object' ? error : {};
     const label = 'label' in source && typeof source.label === 'string' ? source.label.trim().slice(0, 200) : '';
     const timeoutMs = 'timeoutMs' in source &&
@@ -71,6 +123,7 @@ function postBrowserError(target, requestId, code, onDeliveryFailure, error) {
         requestId,
         code,
         message: BROWSER_ERROR_MESSAGES[code],
+        ...(detail ? { detail } : {}),
         ...(label ? { label } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     };
@@ -182,11 +235,25 @@ export class MainOwnedBrowserBroker {
         }, (error) => {
             if (!this.takePending(target, message.requestId, pending))
                 return;
-            this.postError(target, message.requestId, browserBrokerErrorCode(error, pending.controller.signal.aborted), error);
+            const code = browserBrokerErrorCode(error, pending.controller.signal.aborted);
+            const detail = browserBrokerErrorDetail(code, error);
+            try {
+                this.options.onActionFailure?.({
+                    requestId: message.requestId,
+                    sessionId: message.context.sessionId,
+                    action: message.action,
+                    code,
+                    ...(detail ? { detail } : {}),
+                });
+            }
+            catch {
+                // Diagnostics must never change the settled broker request.
+            }
+            postBrowserError(target, message.requestId, code, this.options.onDeliveryFailure, error, detail);
         });
     }
-    postError(target, requestId, code, error) {
-        postBrowserError(target, requestId, code, this.options.onDeliveryFailure, error);
+    postError(target, requestId, code) {
+        postBrowserError(target, requestId, code, this.options.onDeliveryFailure);
     }
     abortRequest(target, requestId) {
         const pending = this.pendingByTarget.get(target);
@@ -210,6 +277,9 @@ export class MainOwnedBrowserBroker {
 }
 
 function browserBrokerClientError(message) {
+    const detailCode = message.code === 'browser_action_failed' && message.detail
+        ? /^([A-Z][A-Z0-9_]+):/u.exec(message.detail)?.[1]
+        : undefined;
     const code = message.code === 'aborted'
         ? 'ABORTED'
         : message.code === 'browser_session_poisoned'
@@ -220,10 +290,16 @@ function browserBrokerClientError(message) {
                     message.code === 'background_render_operation_timeout' ||
                     message.code === 'background_render_queue_timeout'
                     ? 'BROWSER_OPERATION_TIMEOUT'
-                    : message.code;
+                    : (detailCode ?? message.code);
+    // The generic failure shows the original (redacted) message itself; an
+    // allowlisted recovery code keeps its fixed guidance and appends the cause.
     const publicMessage = code === 'BROWSER_OPERATION_TIMEOUT' && message.label && message.timeoutMs !== undefined
         ? `BROWSER_OPERATION_TIMEOUT: Operation "${message.label}" exceeded ${message.timeoutMs}ms`
-        : message.message;
+        : message.detail === undefined
+            ? message.message
+            : message.code === 'browser_action_failed'
+                ? message.detail
+                : `${message.message} (${message.detail.replace(/^[A-Z][A-Z0-9_]+:\s*/u, '')})`;
     return Object.assign(new Error(publicMessage), {
         code,
         brokerCode: message.code,

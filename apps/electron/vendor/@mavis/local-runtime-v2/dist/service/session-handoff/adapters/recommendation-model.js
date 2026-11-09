@@ -1,5 +1,6 @@
 import { resolveModelCallRoute } from '@mavis/config';
 import { streamSimple } from '@earendil-works/pi-ai';
+import { withLLMRetry } from '@mavis/agent-core/pi-turn-runner';
 import { parseSourceQualifiedModelKey, } from '../../model-system/index.js';
 import { buildLocalTurnPayloadTransform, } from '../../turn-system/index.js';
 const RECOMMENDATION_TURN_ID = 'session-handoff-file-recommendation';
@@ -30,6 +31,7 @@ export function createHandoffRecommendationModelPort(options) {
             const final = await runHandoffModelTurn(options, {
                 session: request.session,
                 turnId: RECOMMENDATION_TURN_ID,
+                scope: 'handoff-recommendation',
                 systemPrompt: SYSTEM_PROMPT,
                 userPrompt: buildUserPrompt(request),
                 maxTokens: MAX_OUTPUT_TOKENS,
@@ -60,7 +62,7 @@ export async function runHandoffModelTurn(options, request) {
         turnId: request.turnId,
         agentConfig,
     });
-    const response = await (llm.streamFn ?? streamSimple)(llm.model, {
+    const response = await handoffStream(llm, request)(llm.model, {
         systemPrompt: request.systemPrompt,
         messages: [
             {
@@ -73,6 +75,7 @@ export async function runHandoffModelTurn(options, request) {
     }, {
         ...(llm.apiKey ? { apiKey: llm.apiKey } : {}),
         ...(llm.headers ? { headers: { ...llm.headers } } : {}),
+        fetch: llm.fetch,
         maxTokens: request.maxTokens,
         timeoutMs: REQUEST_TIMEOUT_MS,
         maxRetries: 0,
@@ -98,6 +101,17 @@ export async function runHandoffModelTurn(options, request) {
  * as this Session's worker model. Otherwise the Session's own model answers, so a handoff never
  * silently ships Workspace paths and Session context to a second provider route.
  */
+function handoffStream(llm, request) {
+    const base = llm.streamFn ?? streamSimple;
+    return llm.callLifecycle
+        ? withLLMRetry(base, {
+            sessionId: request.session.sessionId,
+            turnId: request.turnId,
+            scope: request.scope,
+            lifecycle: llm.callLifecycle,
+        })
+        : base;
+}
 function recommendationModelOverride(config, session) {
     const light = parseSourceQualifiedModelKey(config.defaultLightModel);
     const worker = parseSourceQualifiedModelKey(session.effectiveModel ?? config.defaultModel);

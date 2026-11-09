@@ -395,6 +395,16 @@ export function setupEmbeddedBrowserIPC() {
         }, layoutCommandId);
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_DESTROY, async (_event, params) => manager.destroy(normalizeDestroyParams(params)));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_ADOPT_SESSION, async (_event, params) => {
+        const { fromSessionId, toSessionId } = (params ?? {});
+        if (typeof fromSessionId !== 'string' ||
+            !fromSessionId ||
+            typeof toSessionId !== 'string' ||
+            !toSessionId) {
+            throw new Error('fromSessionId and toSessionId are required');
+        }
+        manager.adoptSession(fromSessionId, toSessionId);
+    });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_GET_STATE, async (_event, params) => manager.getState({
         ...normalizeBrowserTarget(params),
         ...(typeof params?.afterEventId === 'number' ? { afterEventId: params.afterEventId } : {}),
@@ -548,6 +558,24 @@ export function setupEmbeddedBrowserIPC() {
             : 'idle',
         ...(typeof params?.text === 'string' ? { text: params.text.slice(0, 4000) } : {}),
     }, normalizeBrowserTarget(params)));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_HOST_OBSTACLE, async (_event, params) => {
+        const box = (value, keys) => {
+            if (!value || typeof value !== 'object')
+                return null;
+            const record = value;
+            return keys.every((key) => typeof record[key] === 'number' && Number.isFinite(record[key]))
+                ? record
+                : null;
+        };
+        const rect = box(params?.rect, ['x', 'y', 'width', 'height']);
+        const viewport = box(params?.viewport, ['width', 'height']);
+        return manager.setCommentHostObstacle(rect && viewport
+            ? {
+                rect: rect,
+                viewport: viewport,
+            }
+            : null, normalizeBrowserTarget(params));
+    });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_COMMENTS, async (_event, params) => {
         // Only a missing field opts into legacy full-page handling. An
         // explicit malformed `commentKeys` array must fail closed without
