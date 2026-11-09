@@ -17,7 +17,7 @@ import type { ToolDiagnosticLogger as MatrixToolLogger } from "../observability/
 import type { LocalMavisCronAdapter } from "@mavis/agent-tools/desktop";
 import type { RuntimeConversation } from "@mavis/conversation-contract";
 import type { CronStorePort } from "@mavis/cron";
-import type { PermissionRuleMatcher } from "@mavis/permission";
+import type { PermissionRuleMatcher, ShellFamily } from "@mavis/permission";
 import type { GlobalEventPayloadMap } from "@mavis/shared/global-events";
 import type { AgentReferenceResolver } from "../agent/port.js";
 import type { LocalAgentRuntimePort } from "../agent/runtime-port.js";
@@ -98,7 +98,7 @@ export interface LocalRuntimeApiHostOptions {
   capabilityProfile?: "cli";
   capabilities?: Partial<LocalRuntimeCapabilities>;
   /** Explicit shell provenance supplied by the local executor; unknown remains fail-closed on Windows native delete. */
-  shellFamily?: "cmd" | "powershell";
+  shellFamily?: ShellFamily;
   /** Composition overrides injected by the Cron v2 owner for legacy Local Mavis commands. */
   mavisCronAdapterProvider?: () => LocalMavisCronAdapter | undefined;
   /** Host boundary for cleaning up Cron definitions when an Agent is deleted. */
@@ -290,6 +290,11 @@ export interface LocalPermissionRequest {
   persistWholeToolRuleOnReply?: boolean;
   toolInput?: string;
   toolDescription?: string;
+  /** PTC only: the run_code child call this approval belongs to. */
+  parentToolCallId?: string;
+  parentToolDescription?: string;
+  /** PTC only: denying this child call stops the whole program instead of failing one call. */
+  stopPtcOnDeny?: boolean;
   reason: string;
   createdAt: number;
   /**
@@ -387,12 +392,25 @@ export function buildLegacyDaemonProxyPath(
 }
 
 // ─── Response factories ────────────────────────────────────────────────
+/**
+ * JSON HTTP response. Drops `stack` keys and turns Error values into
+ * `{ name, message }` so a caller cannot leak stack frames through this sink
+ * (CodeQL js/stack-trace-exposure).
+ */
 export function json(data: unknown, init?: ResponseInit): Response {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify(data, publicJsonReplacer), {
     status: init?.status ?? 200,
     statusText: init?.statusText,
     headers: { ...JSON_HEADERS, ...(init?.headers ?? {}) },
   });
+}
+
+function publicJsonReplacer(key: string, value: unknown): unknown {
+  if (key === 'stack') return undefined;
+  if (value instanceof Error) {
+    return { name: value.name, message: value.message };
+  }
+  return value;
 }
 
 export function notFound(pathname: string): Response {

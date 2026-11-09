@@ -8,7 +8,6 @@ import { normalizeAccountStatus } from "../../../../../src/runtime/adapters/norm
 import { TuiWelcome } from "../../../../../src/tui/shell/welcome/component.js";
 import { stripAnsi } from "../../../../../src/tui/rendering/text.js";
 import { LIGHTWEIGHT_SESSION_PURPOSE } from "@mavis/protocol/local";
-import { UNBOUNDED_RETRY_ATTEMPTS } from "@mavis/shared/llm-retry-event";
 
 const defaultQueueLabel = `${formatTuiShortcut("alt+enter")} queue`;
 
@@ -458,32 +457,6 @@ describe("visible presentation selector", () => {
     });
   });
 
-  it("shows an unbounded retry budget as ∞ instead of the raw attempt cap", () => {
-    const presentation = resolve({
-      snapshot: { ...idleChat, activeTurnId: "turn-1" },
-      llmRetry: {
-        type: "session.llm_retry",
-        timestampMs: 100,
-        source: "runtime",
-        sessionId: "session-1",
-        turnId: "turn-1",
-        callId: "call-1",
-        scope: "agent",
-        status: "waiting",
-        retryAttempt: 7,
-        maxRetries: UNBOUNDED_RETRY_ATTEMPTS,
-        requestAttempt: 8,
-        delayMs: 3_000,
-        error: { reason: "network" },
-      },
-    });
-
-    expect(presentation.activity).toMatchObject({
-      phase: "retrying",
-      message: "Retrying model request · 7/∞ · next in 3s · Network",
-    });
-  });
-
   it("withdraws both run controls once the Turn is already stopping", () => {
     const presentation = resolve({
       snapshot: { ...idleChat, activeTurnId: "turn-1", cancelling: true },
@@ -869,5 +842,32 @@ describe("visible presentation selector", () => {
       phase: "error",
       errorSettled: true,
     });
+  });
+});
+
+describe('next-message suggestion in the composer', () => {
+  const promptSuggestion = 'Run the parser tests and fix any failures';
+
+  it('offers the suggestion as the placeholder of an idle, empty composer', () => {
+    expect(resolve({ promptSuggestion }).composer).toMatchObject({
+      placeholder: promptSuggestion,
+      promptSuggestion,
+    });
+  });
+
+  it.each([
+    ['a running turn', { snapshot: { ...idleChat, activeTurnId: 'turn-2' } }],
+    ['a draft', { draftCharacterCount: 3 }],
+    ['an attachment', { attachmentCount: 1 }],
+    ['a pending permission', { activePermission: true }],
+    ['a transient hint', { transientHint: 'Press Esc again to edit the latest message' }],
+    ['a goal draft', { goalDraft: true }],
+    ['the welcome surface', { surface: 'welcome' as const }],
+    ['a side conversation', { sideConversation: { view: 'side' as const } }],
+  ])('keeps the composer for its owner during %s', (_case, overrides) => {
+    const composer = resolve({ promptSuggestion, ...overrides }).composer;
+
+    expect(composer.promptSuggestion).toBeUndefined();
+    expect(composer.placeholder).not.toBe(promptSuggestion);
   });
 });

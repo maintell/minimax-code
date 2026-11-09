@@ -1,10 +1,11 @@
 import type { StreamFn } from '@earendil-works/pi-agent-core';
-import type {
-  AssistantMessage,
-  AssistantMessageEvent,
-  AssistantMessageEventStream,
-  ProviderResponse,
-  SimpleStreamOptions,
+import {
+  isContextOverflow,
+  type AssistantMessage,
+  type AssistantMessageEvent,
+  type AssistantMessageEventStream,
+  type ProviderResponse,
+  type SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import {
   isLLMDeterministicRequestRejection,
@@ -13,23 +14,13 @@ import {
   toLLMProtocolClassification,
   toLLMRetryDecision,
   type LLMMetricErrorKind,
-  type LLMRetryDecision,
   type LLMRetryReason,
   type NormalizedLLMError,
 } from '@mavis/shared/llm-error-classifier';
-import { UNBOUNDED_RETRY_ATTEMPTS } from '@mavis/shared/llm-retry-event';
 
-/**
- * Errors that stay terminal for every provider. Retrying them cannot succeed by
- * waiting: the credential is wrong, or the account has no quota left. Everything
- * else — transport faults, 5xx, overload, and any shape no signal matched —
- * keeps retrying on the fixed cadence.
- */
-const TERMINAL_ERROR_KINDS: ReadonlySet<LLMMetricErrorKind> = new Set([
-  'auth',
-  'usage_limit',
-  'credits_exhausted',
-]);
+function isByokProvider(provider: string): boolean {
+  return provider === 'minimax_api' || provider.startsWith('custom_provider:');
+}
 
 export type LLMCallScope = 'agent' | 'compaction' | 'title';
 export type LLMRetryStatus = 'waiting' | 'recovered' | 'exhausted' | 'cancelled';
@@ -46,33 +37,16 @@ export const LLM_RETRY_REQUEST_SETTLED_OBSERVER: unique symbol = Symbol(
 
 export interface LLMRetryPolicy {
   maxRetries: number;
-  /**
-   * Fixed interval between retry attempts. The framework retries unstable
-   * upstreams on this cadence and never backs off: a transient failure is
-   * retried three seconds later, every time.
-   */
   baseDelayMs: number;
-  /** Upper bound for a server-directed `Retry-After` wait. */
   maxDelayMs: number;
   maxRetryElapsedMs: number;
 }
 
-/**
- * Provider errors are retried without a practical limit, on a fixed cadence:
- * an unstable upstream (connection resets, incomplete chunked encoding, 5xx,
- * overload, or any failure no signal matched) must recover on its own, and a
- * three-second interval keeps a transient blip invisible. Every provider shares
- * this classification. The attempt budget stays a serialisable integer for
- * retry events (one million attempts is ~35 days at this cadence) and the
- * wall-clock budget is unlimited. Only task-level outcomes — user cancellation,
- * a model refusal, a wrong credential, an exhausted plan or credits, and a
- * deterministic request rejection — stay terminal; see `failureResult`.
- */
 export const DEFAULT_LLM_RETRY_POLICY: Readonly<LLMRetryPolicy> = {
-  maxRetries: UNBOUNDED_RETRY_ATTEMPTS,
-  baseDelayMs: 3_000,
+  maxRetries: 5,
+  baseDelayMs: 1_000,
   maxDelayMs: 30_000,
-  maxRetryElapsedMs: Number.POSITIVE_INFINITY,
+  maxRetryElapsedMs: 120_000,
 };
 
 export interface LLMRetryError {
@@ -158,6 +132,7 @@ export interface LLMRetryOptions {
   onCallSettled?: (event: LLMCallSettledEvent) => void | Promise<void>;
   generateCallId?: () => string;
   nowMs?: () => number;
+  random?: () => number;
   sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -217,6 +192,7 @@ const PUBLIC_ERROR_MESSAGES: Record<LLMMetricErrorKind, string> = {
 export function withLLMRetry(inner: StreamFn, input: LLMRetryOptions): StreamFn {
   const policy = resolvePolicy(input.policy);
   const nowMs = input.nowMs ?? Date.now;
+  const random = input.random ?? Math.random;
   const sleep = input.sleep ?? abortableSleep;
 
   return (async (model, context, options) => {
@@ -243,6 +219,7 @@ export function withLLMRetry(inner: StreamFn, input: LLMRetryOptions): StreamFn 
         options,
         nowMs,
         callIdentity,
+        isByokProvider(model.provider),
         requestAttempt,
         requestSettledObserver(options),
       );
@@ -298,7 +275,7 @@ export function withLLMRetry(inner: StreamFn, input: LLMRetryOptions): StreamFn 
 
       lastFailure = preflight.failure;
       const retryAttempt = requestAttempt;
-      const delayMs = retryDelayMs(lastFailure.retryAfterMs, policy);
+      const delayMs = retryDelayMs(lastFailure.retryAfterMs, retryAttempt, policy, random);
       const failureAtMs = nowMs();
       retryStartedAtMs ??= failureAtMs;
       const retryDeadlineExceeded =
@@ -385,6 +362,7 @@ async function preflightAttempt(
   options: Parameters<StreamFn>[2],
   nowMs: () => number,
   callIdentity: object,
+  retryAllErrors: boolean,
   requestAttempt: number,
   onRequestSettled: LLMRequestSettledObserver | undefined,
 ): Promise<PreflightResult> {
@@ -409,7 +387,7 @@ async function preflightAttempt(
     stream = await inner(model, context, attemptOptions);
   } catch (thrown) {
     notifyRequestSettled(onRequestSettled, requestAttempt, undefined, thrown, options?.signal);
-    return failureResult({ thrown, response, buffered: [], nowMs });
+    return failureResult({ thrown, response, buffered: [], nowMs, retryAllErrors });
   }
 
   let iterator: AsyncIterator<AssistantMessageEvent>;
@@ -417,7 +395,7 @@ async function preflightAttempt(
     iterator = stream[Symbol.asyncIterator]();
   } catch (thrown) {
     notifyRequestSettled(onRequestSettled, requestAttempt, undefined, thrown, options?.signal);
-    return failureResult({ thrown, response, stream, buffered: [], nowMs });
+    return failureResult({ thrown, response, stream, buffered: [], nowMs, retryAllErrors });
   }
 
   const buffered: AssistantMessageEvent[] = [];
@@ -427,7 +405,7 @@ async function preflightAttempt(
       next = await iterator.next();
     } catch (thrown) {
       notifyRequestSettled(onRequestSettled, requestAttempt, undefined, thrown, options?.signal);
-      return failureResult({ thrown, response, stream, iterator, buffered, nowMs });
+      return failureResult({ thrown, response, stream, iterator, buffered, nowMs, retryAllErrors });
     }
     if (next.done) {
       try {
@@ -441,6 +419,7 @@ async function preflightAttempt(
             iterator,
             buffered,
             nowMs,
+            retryAllErrors,
           });
         }
         notifyRequestSettled(onRequestSettled, requestAttempt, final, undefined, options?.signal);
@@ -454,6 +433,7 @@ async function preflightAttempt(
           iterator,
           buffered,
           nowMs,
+          retryAllErrors,
         });
       }
     }
@@ -474,15 +454,15 @@ async function preflightAttempt(
         iterator,
         buffered,
         nowMs,
+        retryAllErrors,
       });
     }
     // A visible delta is the retry commit boundary for every provider. Once
     // callers can observe output, silently replacing the physical request
     // would either buffer the whole response or replay duplicate content.
-    // A stream that ends without visible output keeps going through
-    // `stream.result()` below, so a failure reported only there stays
-    // retryable instead of committing a broken response.
-    if (commitsOutput(next.value)) {
+    // BYOK keeps its broader pre-output retry classification, but a later
+    // stream failure must stay on the already-committed attempt.
+    if (commitsOutput(next.value) || (!retryAllErrors && next.value.type === 'done')) {
       return {
         kind: 'committed',
         stream: observeRequestSettlement(
@@ -591,38 +571,40 @@ function failureResult(input: {
   iterator?: AsyncIterator<AssistantMessageEvent>;
   buffered: AssistantMessageEvent[];
   nowMs: () => number;
+  retryAllErrors?: boolean;
 }): PreflightResult {
+  // A 2xx response status only says the stream opened; a gateway that reports
+  // the rejection inside the stream (an SSE `error` event after HTTP 200) has
+  // no HTTP status for it. Classify such a failure by its own payload, so a
+  // wrapped size rejection is not vetoed as "status 200" and resent.
+  const responseStatus = input.response?.status;
+  const failureStatus =
+    responseStatus !== undefined && (responseStatus < 200 || responseStatus >= 300)
+      ? responseStatus
+      : undefined;
   const normalized = normalizeLLMError({
     ...(input.thrown !== undefined ? { raw: input.thrown } : {}),
     ...(input.final?.stopReason ? { finishReason: input.final.stopReason } : {}),
     ...(input.final?.errorMessage ? { errorMessage: input.final.errorMessage } : {}),
-    ...(input.response ? { statusCode: input.response.status } : {}),
+    ...(failureStatus !== undefined ? { statusCode: failureStatus } : {}),
     explicitAbort: input.final?.stopReason === 'aborted',
   });
-  // Every provider gets the same classification. The strict policy already
-  // names the transient cases precisely (timeout, network, 429, overload, 5xx,
-  // empty response), so its decision is kept whenever it retries. What changes
-  // is the failure it used to fail closed on: provider endpoints report transient
-  // faults inconsistently — a gateway may answer with a non-standard status, a
-  // plain-text body or nothing at all — so an unclassified failure is upstream
-  // instability far more often than a rejected request, and it retries too.
-  //
-  // What stays terminal is the set no amount of waiting can fix: user
-  // cancellation, a model safety refusal, a wrong credential (`auth`), an
-  // exhausted usage plan or credits, and a deterministic request rejection (too
-  // many images, HTTP 400 `invalid_request_error`, oversized body). The
-  // deterministic check excludes anything that also looks transient
-  // (timeout, network, 408/429/5xx).
-  const strict = toLLMRetryDecision(normalized);
-  const taskLevelTerminal =
-    normalized.facts.explicitAbort ||
-    normalized.facts.signals.has('refusal') ||
-    TERMINAL_ERROR_KINDS.has(toLLMMetricErrorKind(normalized.facts)) ||
-    isLLMDeterministicRequestRejection(normalized);
-  const decision: LLMRetryDecision =
-    strict.retryable || taskLevelTerminal
-      ? strict
-      : { retryable: true, reason: 'network' };
+  // BYOK retries every pre-output failure because custom gateways report errors
+  // inconsistently, but some failures are deterministic: a model safety refusal,
+  // or a request the provider rejects as invalid (too many images, or an HTTP
+  // 400 `invalid_request_error`). Retrying those only re-sends the same request,
+  // repeats (and may re-bill) the rejection and delays the actionable error by
+  // the whole backoff window. The deterministic check excludes anything that
+  // also looks transient (timeout, network, 408/429/5xx). A context overflow,
+  // by tokens or by request bytes, is left to context management as in Pi.
+  const decision =
+    input.retryAllErrors &&
+    !normalized.facts.explicitAbort &&
+    !normalized.facts.signals.has('refusal') &&
+    !isLLMDeterministicRequestRejection(normalized) &&
+    !(input.final && isContextOverflow(input.final))
+      ? { retryable: true, reason: 'network' as const }
+      : toLLMRetryDecision(normalized);
   if (!decision.retryable) {
     return {
       kind: 'terminal',
@@ -920,12 +902,19 @@ function resolvePolicy(policy: Partial<LLMRetryPolicy> | undefined): LLMRetryPol
   return { ...DEFAULT_LLM_RETRY_POLICY, ...(policy ?? {}) };
 }
 
-function retryDelayMs(retryAfterMs: number | undefined, policy: LLMRetryPolicy): number {
-  // A server-directed wait (`Retry-After` / `Retry-After-Ms`) is an explicit
-  // provider instruction and still wins. Framework retries themselves never
-  // back off or jitter: the delay is the fixed `baseDelayMs` cadence.
+function retryDelayMs(
+  retryAfterMs: number | undefined,
+  retryAttempt: number,
+  policy: LLMRetryPolicy,
+  random: () => number,
+): number {
   if (retryAfterMs !== undefined) return Math.min(policy.maxDelayMs, Math.max(0, retryAfterMs));
-  return policy.baseDelayMs;
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retryAttempt - 1));
+  return Math.floor(exponential / 2 + (clampRandom(random()) * exponential) / 2);
+}
+
+function clampRandom(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
 }
 
 function parseRetryAfterMs(
