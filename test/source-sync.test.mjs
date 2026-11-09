@@ -1032,6 +1032,11 @@ test('suite runner pins its locale, preserves gate arguments and canonicalizes W
     const expected = platform === 'win32' ? realpathSync.native(alias) : alias;
     assert.equal(child.temp, expected);
     assert.equal(child.tmp, expected);
+    // Windows takes the ICU default locale from the OS user locale, not from
+    // LC_ALL, so only the POSIX platforms can assert the pinned `en-US`.
+    const expectedLocale = process.platform === 'win32'
+      ? Intl.DateTimeFormat().resolvedOptions().locale
+      : 'en-US';
     assert.deepEqual(
       {
         lang: child.lang,
@@ -1040,7 +1045,7 @@ test('suite runner pins its locale, preserves gate arguments and canonicalizes W
         lcMessages: child.lcMessages,
         locale: child.locale,
       },
-      { lang: 'C', language: 'C', lcAll: 'C', lcMessages: 'C', locale: 'en-US' },
+      { lang: 'C', language: 'C', lcAll: 'C', lcMessages: 'C', locale: expectedLocale },
     );
   }
 });
