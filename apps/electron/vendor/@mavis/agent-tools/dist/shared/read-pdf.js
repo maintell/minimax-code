@@ -19,7 +19,7 @@
  * `unpdf` is imported lazily inside the PDF branch only — it embeds a
  * ~2MB pdfjs build that must not sit on the startup path of every read.
  */
-import { readFile } from 'node:fs/promises';
+import { readFile } from './physical-fs.js';
 import { extname } from 'node:path';
 import { readErrorResult } from './read-result.js';
 /** reference CLI apiLimits.ts: PDF_MAX_PAGES_PER_READ */

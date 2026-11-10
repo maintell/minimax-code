@@ -13,6 +13,12 @@ export function createQueueWakeFailureReporter(reportFailure, prefix) {
         reportFailure?.(sessionId, `${prefix}:${describeError(error)}`);
     };
 }
+function clientRequestFields(input) {
+    return {
+        ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}),
+        ...(input.receiptAliases?.length ? { receiptAliases: input.receiptAliases } : {}),
+    };
+}
 function activationDeliveryFields(delivery) {
     return {
         ...(delivery?.messageKey ? { messageKey: delivery.messageKey } : {}),
@@ -61,7 +67,7 @@ export function createTurnSystemMessageDelivery(delivery) {
                     ...((input.userMessageId ?? input.delivery?.userMessageId)
                         ? { userMessageId: input.userMessageId ?? input.delivery?.userMessageId }
                         : {}),
-                    ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}),
+                    ...clientRequestFields(input),
                     ...(input.admissionPriority ? { admissionPriority: input.admissionPriority } : {}),
                     ...(input.resume ? { resume: input.resume } : {}),
                     ...(input.delivery?.preDelivery ? { preDelivery: input.delivery.preDelivery } : {}),
@@ -158,10 +164,9 @@ async function generateTitleFromCommittedUserMessage(input) {
     try {
         const messages = await input.sessions.messages.repository.listTurn(input.sessionId, input.turnId);
         const userMessage = messages.find((message) => message.role === Role.User);
-        const titleSource = userMessage?.msg_content;
-        if (typeof titleSource === 'string' && titleSource.length > 0) {
-            input.sessions.titles.generate(input.sessionId, titleSource);
-        }
+        if (!userMessage || typeof userMessage.msg_content !== 'string' || !userMessage.msg_content)
+            return;
+        input.sessions.titles.generate(input.sessionId, userMessage.msg_content);
     }
     catch (error) {
         try {

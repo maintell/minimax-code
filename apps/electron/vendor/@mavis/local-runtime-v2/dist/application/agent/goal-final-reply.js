@@ -7,8 +7,8 @@ import { createGoalFinalReplyGate } from '@mavis/goal';
  * no Turn identity; it finds the Turn by the agent run's context object, which
  * the extension's `after_tool_call` receives as `input.context`.
  */
-export function createGoalFinalReply() {
-    const gate = createGoalFinalReplyGate();
+export function createGoalFinalReply(options = {}) {
+    const gate = createGoalFinalReplyGate(options);
     return {
         toolPolicyGuard: {
             async beforeToolCall(input) {

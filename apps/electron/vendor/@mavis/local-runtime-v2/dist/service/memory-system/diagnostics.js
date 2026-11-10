@@ -3,6 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open } from 'node:fs/promises';
 import { join } from 'node:path';
+const MEMORIES_DIR = 'memories';
+/** 详细日志目录（相对 dataDir，正斜杠便于报告链接复用）；V2 只写 memories/，Reset 与留存清理只作用于 scopes/、tmp/ 与用户资料迁移副本 legacy/user.md。 */
+export const MEMORY_DIAGNOSTICS_DIR = `${MEMORIES_DIR}/logs`;
 /** 完整本地调试记录；业务调用只观察结果，日志失败独立降级。 */
 export class MemoryDiagnostics {
     options;
@@ -91,9 +94,12 @@ export class MemoryDiagnostics {
     async append(previous, fileName, line) {
         await previous;
         try {
-            const dir = join(this.options.dataDir, 'memeory');
+            const root = join(this.options.dataDir, MEMORIES_DIR);
+            const dir = join(this.options.dataDir, MEMORY_DIAGNOSTICS_DIR);
             await mkdir(this.options.dataDir, { recursive: true });
             await assertDirectory(this.options.dataDir);
+            await mkdir(root, { recursive: true });
+            await assertDirectory(root);
             await mkdir(dir, { recursive: true, mode: 0o700 });
             await assertDirectory(dir);
             const handle = await open(join(dir, fileName), constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
@@ -114,7 +120,7 @@ export class MemoryDiagnostics {
         this.warned = true;
         process.emitWarning('Memory diagnostic logs could not be written.', {
             code: 'MEMORY_DIAGNOSTICS_WRITE_FAILED',
-            detail: `directory=${join(this.options.dataDir, 'memeory')}; error=${error instanceof Error ? error.message : String(error)}`,
+            detail: `directory=${join(this.options.dataDir, MEMORY_DIAGNOSTICS_DIR)}; error=${error instanceof Error ? error.message : String(error)}`,
         });
     }
 }

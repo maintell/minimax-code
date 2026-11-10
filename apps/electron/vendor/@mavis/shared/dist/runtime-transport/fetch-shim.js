@@ -1,3 +1,4 @@
+import { WORKSPACE_GIT_OBSERVATION_HEADER, WORKSPACE_GIT_OBSERVATION_MAX_BYTES, } from './workspace-git-observation.js';
 /**
  * Fetch shim over the runtime transport frame protocol.
  *
@@ -305,6 +306,7 @@ export function createRuntimeTransportFetch(options) {
             let bodyController = null;
             let lastSeq = -1;
             let responseStatus = 0;
+            let workspaceGitObservation;
             const streamWindow = RUNTIME_TRANSPORT_DEFAULT_STREAM_WINDOW;
             let outstandingStreamCredits = streamWindow;
             let flowControlledResponse = false;
@@ -329,11 +331,12 @@ export function createRuntimeTransportFetch(options) {
                     status: responseStatus,
                     durationMs: Math.max(0, Date.now() - requestStartedAtMs),
                     requestKind,
+                    ...(workspaceGitObservation ? { workspaceGitObservation } : {}),
                 };
                 try {
                     globalThis.setTimeout(() => {
                         try {
-                            observer(completedRequest);
+                            void Promise.resolve(observer(completedRequest)).catch(() => { });
                         }
                         catch {
                             // Observability must never enter the transport control path.
@@ -434,6 +437,14 @@ export function createRuntimeTransportFetch(options) {
                     case 'response-start': {
                         if (responseSettled)
                             return;
+                        try {
+                            const value = frame.headers[WORKSPACE_GIT_OBSERVATION_HEADER];
+                            if (typeof value === 'string' && value.length <= WORKSPACE_GIT_OBSERVATION_MAX_BYTES)
+                                workspaceGitObservation = value;
+                        }
+                        catch {
+                            /* Optional metadata never affects transport admission. */
+                        }
                         responseSettled = true;
                         lastSeq = frame.seq;
                         flowControlledResponse = hasEventStreamContentType(frame.headers);

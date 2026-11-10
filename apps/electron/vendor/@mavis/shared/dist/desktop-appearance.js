@@ -14,6 +14,11 @@
  * chain owns pre-paint application and build-time px mapping. Both slices are
  * broadcast together as one appearance snapshot.
  */
+export function getChatContentWidthPercent(value) {
+    if (value === 'full')
+        return 100;
+    return clampNumber(value, 0, 0, 100);
+}
 export const DEFAULT_THEME_PACK_ID = 'mcode-default';
 const EMPTY_COLORS = {
     accent: null,
@@ -60,6 +65,25 @@ const MAX_THEME_PACK_ID_LENGTH = 80;
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+/**
+ * Copy one of the exported default constants without hard-depending on
+ * `structuredClone`.
+ *
+ * These normalizers run while the renderer store module is still being
+ * evaluated, and on the Native H5 offline bundle that module is part of a
+ * first-screen chunk. A system WebView older than Chrome 98 has no
+ * `structuredClone`, so a bare call here threw a ReferenceError before React
+ * could mount and the page stayed blank. The defaults are plain JSON constants,
+ * so a JSON round-trip is lossless — and `structuredClone` is still preferred
+ * wherever it exists so modern runtimes keep their current behaviour.
+ */
+function cloneDefault(value) {
+    const structuredCloneFn = globalThis
+        .structuredClone;
+    if (typeof structuredCloneFn === 'function')
+        return structuredCloneFn(value);
+    return JSON.parse(JSON.stringify(value));
+}
 function clampNumber(value, fallback, min, max) {
     return typeof value === 'number' && Number.isFinite(value)
         ? Math.min(max, Math.max(min, Math.round(value)))
@@ -87,7 +111,7 @@ function parseColorOverrides(value) {
 }
 export function normalizeAppearancePreferences(value) {
     if (!isRecord(value))
-        return structuredClone(DEFAULT_APPEARANCE_PREFERENCES);
+        return cloneDefault(DEFAULT_APPEARANCE_PREFERENCES);
     const colors = isRecord(value.colors) ? value.colors : {};
     return {
         uiFontFamily: UI_FONT_FAMILIES.has(value.uiFontFamily)
@@ -108,7 +132,9 @@ export function normalizeAppearancePreferences(value) {
             : DEFAULT_APPEARANCE_PREFERENCES.density,
         chatContentWidth: CHAT_CONTENT_WIDTHS.has(value.chatContentWidth)
             ? value.chatContentWidth
-            : DEFAULT_APPEARANCE_PREFERENCES.chatContentWidth,
+            : typeof value.chatContentWidth === 'number' && Number.isFinite(value.chatContentWidth)
+                ? getChatContentWidthPercent(value.chatContentWidth)
+                : DEFAULT_APPEARANCE_PREFERENCES.chatContentWidth,
         contrast: clampNumber(value.contrast, DEFAULT_APPEARANCE_PREFERENCES.contrast, 0, 100),
         colors: {
             light: parseColorOverrides(colors.light),
@@ -127,7 +153,7 @@ function normalizeWallpaperProfile(value) {
 }
 export function normalizeDesktopAppearanceState(value) {
     if (!isRecord(value))
-        return structuredClone(DEFAULT_DESKTOP_APPEARANCE_STATE);
+        return cloneDefault(DEFAULT_DESKTOP_APPEARANCE_STATE);
     const themePackId = typeof value.themePackId === 'string' &&
         value.themePackId.length > 0 &&
         value.themePackId.length <= MAX_THEME_PACK_ID_LENGTH

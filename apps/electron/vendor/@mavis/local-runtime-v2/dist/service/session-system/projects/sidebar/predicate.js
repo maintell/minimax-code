@@ -15,8 +15,8 @@ function membership(column, values, negate = false) {
         ? sql `${column} NOT IN (SELECT value FROM json_each(${JSON.stringify(values)}))`
         : sql `${column} IN (SELECT value FROM json_each(${JSON.stringify(values)}))`;
 }
-export function eligible(includeHiddenProject = false, internalRootIds = []) {
-    return and(eq(s.columnarVersion, 3), eq(s.archived, 0), isNull(s.parentSessionId), includeHiddenProject ? undefined : eq(p.hidden, 0), sessionAfterProjectRemoval(), membership(s.sessionId, internalRootIds, true), or(and(eq(s.sessionType, 'branch'), ne(s.visibility, 'hidden'), notInArray(s.sessionKind, ['peek', 'task', 'channel'])), and(eq(s.sessionType, 'branch'), eq(s.sessionKind, 'channel')), and(ne(s.visibility, 'hidden'), projectConversationRootPredicate())));
+export function eligible(includeHiddenProject = false, internalRootIds = [], includeArchived = false) {
+    return and(eq(s.columnarVersion, 3), includeArchived ? undefined : eq(s.archived, 0), isNull(s.parentSessionId), includeHiddenProject ? undefined : eq(p.hidden, 0), sessionAfterProjectRemoval(), membership(s.sessionId, internalRootIds, true), or(and(eq(s.sessionType, 'branch'), ne(s.visibility, 'hidden'), notInArray(s.sessionKind, ['peek', 'task', 'channel'])), and(eq(s.sessionType, 'branch'), eq(s.sessionKind, 'channel')), and(ne(s.visibility, 'hidden'), projectConversationRootPredicate())));
 }
 export function sidebarProjectPredicate(q) {
     return and(eq(p.hidden, 0), eq(p.pinned, 0), membership(p.projectId, q.excludedProjectIds, true));

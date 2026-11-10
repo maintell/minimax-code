@@ -1,5 +1,8 @@
 import { convertToLlm } from '@earendil-works/pi-coding-agent/messages';
 import { imageDimensions } from './image-dimensions.js';
+import { limitRequestImages, resolveMaxImagesPerRequest } from './request-image-limit.js';
+import { projectUnsupportedMediaBlocks, resolveRequestMediaSupport, } from './request-media-support.js';
+import { hasThinkingPrefixBinding } from './thinking-prefix-binding.js';
 const PRIOR_THINKING_OPEN = '<|prior-thinking|>';
 const PRIOR_THINKING_CLOSE = '<|/prior-thinking|>';
 const SIBLING_NATIVE_THINKING_APIS = new Set([
@@ -30,15 +33,30 @@ export function projectAgentMessagesForModel(messages, targetModel) {
     const compatible = removeOrphanToolResults(mergeImmediateSendBatches(convertToLlm(providerVisible)).map(stripHostOnlyFields));
     const normalized = normalizeOutboundMessagesForModel(compatible.messages, targetModel);
     const undetermined = new Map();
+    const mediaSupport = resolveRequestMediaSupport(targetModel);
     // Order matters: projectVideoBlocks turns `video` blocks into `image` blocks,
-    // so the size filter has to run after it or it would miss every
-    // video-derived image.
+    // so the media-support and size filters have to run after it or they would
+    // miss every video-derived image. Unsupported media go before the size
+    // filter so a dropped video is not counted as an undetermined image.
     const projected = normalized
         .map(projectVideoBlocks)
-        .map((message) => projectUndersizedImageBlocks(message, undetermined));
+        // Audio/PDF become text first: the media-support filter treats every
+        // non-video image block as a still image.
+        .map((message) => projectNonNativeDocumentMedia(message, targetModel))
+        .map((message) => projectUnsupportedMediaBlocks(message, mediaSupport))
+        .map((message) => projectUndersizedImageBlocks(message, undetermined))
+        .map((message) => projectErrorToolResultImages(message, targetModel));
+    // Last, so the ceiling counts exactly the images that would be sent: video
+    // frames projected to images count, undersized placeholders do not. A model
+    // whose thinking is bound to its prefix keeps every image; compaction
+    // removes them instead.
+    const limited = hasThinkingPrefixBinding(targetModel)
+        ? { messages: projected, omittedCount: 0 }
+        : limitRequestImages(projected, resolveMaxImagesPerRequest(targetModel));
     return {
         removedCount: compatible.removedCount,
-        messages: projected,
+        messages: limited.messages,
+        omittedImageCount: limited.omittedCount,
         undeterminedImageMimeTypes: Object.fromEntries(undetermined),
     };
 }
@@ -178,7 +196,8 @@ function normalizeAssistantMessage(message, targetModel) {
         content,
     };
 }
-function thinkingToPortableText(block) {
+/** Thinking replayed as plain text for a target that cannot verify its signature. */
+export function thinkingToPortableText(block) {
     if (block.redacted || !block.thinking || block.thinking.trim().length === 0)
         return [];
     return [
@@ -230,11 +249,12 @@ function projectUndersizedImageBlocks(message, undetermined) {
         const size = imageDimensions(candidate.data, candidate.mimeType);
         if (!size) {
             // The size check itself still ran above and still applies: only the
-            // telemetry skips blocks projected from `video`, which keep their
-            // `video/*` mimeType and are unparseable by design. Counting them would
-            // pre-pollute the very signal this counter exists to surface.
+            // telemetry skips media blocks (video, audio, PDF) that ride the image
+            // block with their real mimeType and are unparseable by design.
+            // Counting them would pre-pollute the very signal this counter exists
+            // to surface.
             const mimeType = typeof candidate.mimeType === 'string' ? candidate.mimeType : 'unknown';
-            if (!mimeType.toLowerCase().startsWith('video/')) {
+            if (!isNonImageMediaMime(mimeType)) {
                 undetermined.set(mimeType, (undetermined.get(mimeType) ?? 0) + 1);
             }
             return block;
@@ -248,5 +268,67 @@ function projectUndersizedImageBlocks(message, undetermined) {
         };
     });
     return changed ? { ...message, content } : message;
+}
+/** Protocols whose wire format carries audio and PDF inline (see the BYOK capability gate). */
+const NATIVE_DOCUMENT_MEDIA_APIS = new Set(['google-generative-ai']);
+function isDocumentMediaMime(mimeType) {
+    if (typeof mimeType !== 'string')
+        return false;
+    const normalized = mimeType.toLowerCase();
+    return normalized.startsWith('audio/') || normalized === 'application/pdf';
+}
+function isNonImageMediaMime(mimeType) {
+    return mimeType.toLowerCase().startsWith('video/') || isDocumentMediaMime(mimeType);
+}
+/**
+ * Audio and PDF blocks exist only in sessions that ran on a native transport
+ * (Gemini). After a switch to another protocol they would be sent as images
+ * and rejected, so the request copy gets a text placeholder instead.
+ */
+function projectNonNativeDocumentMedia(message, targetModel) {
+    if (NATIVE_DOCUMENT_MEDIA_APIS.has(targetModel.api))
+        return message;
+    if (typeof message.content === 'string' || !Array.isArray(message.content))
+        return message;
+    let changed = false;
+    const content = message.content.map((block) => {
+        // Persisted history can hold malformed (null) blocks; pass them through.
+        if (block?.type !== 'image' || !isDocumentMediaMime(block.mimeType))
+            return block;
+        changed = true;
+        const kind = block.mimeType.toLowerCase() === 'application/pdf' ? 'PDF' : 'audio';
+        return {
+            type: 'text',
+            text: `[${kind} omitted: the current model cannot read ${block.mimeType} inline]`,
+        };
+    });
+    return changed ? { ...message, content } : message;
+}
+/**
+ * Anthropic Messages rejects the whole request when an `is_error` tool_result
+ * holds anything but text ("all content must be type `text` if `is_error` is
+ * true"), and the result is persisted history, so the session would fail on
+ * every later request. A failed run_code attaches its children's media
+ * (Browser and Computer Use screenshots), and other tools can return an image
+ * with an error. Keep the error and its text; replace each image on the
+ * request copy only, so a request that would have been accepted is unchanged.
+ */
+function projectErrorToolResultImages(message, targetModel) {
+    if (targetModel.api !== 'anthropic-messages')
+        return message;
+    if (message.role !== 'toolResult' || !message.isError || !Array.isArray(message.content)) {
+        return message;
+    }
+    if (!message.content.some((block) => block.type === 'image'))
+        return message;
+    return {
+        ...message,
+        content: message.content.map((block) => block.type === 'image'
+            ? {
+                type: 'text',
+                text: '[image omitted: the model provider accepts only text in a failed tool result]',
+            }
+            : block),
+    };
 }
 //# sourceMappingURL=outbound-message-normalizer.js.map

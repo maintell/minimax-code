@@ -64,7 +64,9 @@ export class QueueSteerWorkflow {
         }
         if (!result.delivered) {
             await this.options.control.release(claim);
-            throw new ApplicationError(409, 'local_queue_dispatch_rejected', `Queue item could not start (${result.reason}): ${claim.sessionId}/${claim.item.itemId}`);
+            throw new ApplicationError(409, result.reason === 'computer-use-requires-new-turn'
+                ? 'local_computer_use_requires_new_turn'
+                : 'local_queue_dispatch_rejected', `Queue item could not start (${result.reason}): ${claim.sessionId}/${claim.item.itemId}`);
         }
         return result;
     }
@@ -85,6 +87,10 @@ export class QueueSteerWorkflow {
             // delivery instead of replaying the old receipt as a duplicate that
             // consumes the item without any Turn reading it.
             idempotencyKey: claim.claimId,
+            // The item's own request id becomes a receipt of the Turn this delivers
+            // into, so a repeated request for that item finds it instead of
+            // delivering the same message again.
+            ...(claim.clientRequestId ? { receiptAliases: [claim.clientRequestId] } : {}),
             modelSelectionScope: 'activation-only',
             admissionPriority: { kind: 'selected-queue-item', queueClaimId: claim.claimId },
             ...(delivery.ingress.provenance.source === 'api' ||

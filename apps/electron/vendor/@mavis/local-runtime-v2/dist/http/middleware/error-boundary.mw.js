@@ -1,4 +1,5 @@
 import { responseHeadersFromHttpServiceContext } from '@mavis/thrift-gen/runtime';
+import { settleInBackground } from '../../service/plugin-system/index.js';
 import { toErrorBody } from '../errors.js';
 function hasGetResponse(err) {
     return (typeof err === 'object' &&
@@ -6,19 +7,19 @@ function hasGetResponse(err) {
         'getResponse' in err &&
         typeof err.getResponse === 'function');
 }
+/** Keeps the original failure visible in logs when it was mapped to a stable status. */
+function describeError(err) {
+    const cause = err instanceof Error ? err.cause : undefined;
+    return cause === undefined ? String(err) : `${String(err)} (cause: ${String(cause)})`;
+}
 /** Start best-effort cancellation without delaying the replacement response. */
 export function cancelDiscardedBody(body) {
     if (!body)
         return;
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises -- cancellation is intentionally detached so a pending stream cannot block the replacement response
-    (async () => {
-        try {
-            await body.cancel();
-        }
-        catch {
-            // A rejected cancel still allows the replacement response to proceed.
-        }
-    })();
+    settleInBackground(cancelBody(body));
+}
+async function cancelBody(body) {
+    await body.cancel();
 }
 /**
  * Catches pre-open failures only. Once an SSE stream Response is returned
@@ -65,7 +66,7 @@ export function errorBoundaryMiddleware() {
         else {
             const body = toErrorBody(err);
             if (body.code >= 500)
-                ctx.logger.ctxError(ctx, {}, `unhandled error: ${String(err)}`);
+                ctx.logger.ctxError(ctx, {}, `unhandled error: ${describeError(err)}`);
             replacement = new Response(JSON.stringify(body), {
                 status: body.code,
                 headers: responseHeadersFromHttpServiceContext(ctx, { 'Content-Type': 'application/json' }),

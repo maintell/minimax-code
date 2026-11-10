@@ -1,9 +1,11 @@
-import { MINIMAX_MODELS } from './minimax-model-catalog.js';
+import { MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID, MINIMAX_MODELS } from './minimax-model-catalog.js';
 import fs from 'node:fs';
+import { configFileSignature } from './config-file-signature.js';
+import { parseNotificationsConfig, parseStartupRecoveryFault } from './config-section-parsers.js';
 import { restrictConfigFileSync, writePrivateConfigFileSync } from './private-config-file.js';
 import { parseConfigText, serializeConfigPreservingComments, } from './comment-preserving-config-write.js';
 import { resolveRunawayGuardConfig } from './runaway-guard-config.js';
-import { MEMORY_V2_DEFAULTS, parseMemoryConfig } from './memory-config.js';
+import { MEMORY_V2_DEFAULTS, parseMemoryConfig, resolveMemoryDefaults, } from './memory-config.js';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -23,6 +25,7 @@ import { ASK_USER_CONFIG_DEFAULTS, parseAskUserConfig, } from './ask-user-config
 import { DATA_CONTRIBUTION_CONFIG_DEFAULTS, parseDataContributionConfig, } from './data-contribution-config.js';
 import { GOAL_CONFIG_DEFAULTS, parseGoalConfig } from './goal-config.js';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from './tool-result-compaction-config.js';
+import { REQUEST_MEDIA_DEFAULTS, parseRequestMediaConfig, } from './request-media-config.js';
 import { BROWSER_CONFIG_DEFAULTS, parseBrowserConfig, } from './browser-config.js';
 import { parseSandboxConfig, SANDBOX_CONFIG_DEFAULTS, } from './sandbox-config.js';
 import { parseSubagentConfig, SUBAGENT_CONFIG_DEFAULTS, } from './subagent-config.js';
@@ -167,6 +170,14 @@ export const BETA_FEATURE_DEFS = {
     browserAgentCursor: { defaultVisibility: 'online', configurableVisibility: 'online' },
     desktopPlanMode: { defaultVisibility: 'online', configurableVisibility: 'online' },
     desktopPlanModeAgentEntry: { defaultVisibility: 'none', configurableVisibility: 'online' },
+    // On by default everywhere except the public production build: dev/test/staging through the
+    // test channel, Internal and inside packages through their build variant. An explicit `false`
+    // always wins, and explicit `true` still opts a production install in.
+    ptc: {
+        defaultVisibility: 'test',
+        defaultBuildVariants: ['internal', 'inside'],
+        configurableVisibility: 'online',
+    },
     peek: { defaultVisibility: 'test', configurableVisibility: 'test' },
     keepAlive: { defaultVisibility: 'test', configurableVisibility: 'test' },
     promptOverride: { defaultVisibility: 'test', configurableVisibility: 'test' },
@@ -183,6 +194,8 @@ export const BETA_FEATURE_DEFS = {
         defaultVisibility: 'online',
         configurableVisibility: 'online',
     },
+    pluginMarketplaces: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
+    modelAccess: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
 };
 assertBetaFeatureDefinitions(BETA_FEATURE_DEFS);
 function getBetaFeatureChannel(context) {
@@ -615,7 +628,7 @@ function buildPresetEntry(key) {
     };
     return {
         provider: { minimax: provider },
-        defaultModel: 'minimax/MiniMax-M3.1-Flash-Preview',
+        defaultModel: `minimax/${MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID}`,
     };
 }
 export const DEFAULT_MODEL_PRESETS = {
@@ -632,6 +645,8 @@ const DEFAULTS = {
     logLevel: 'info',
     devPort: DEFAULT_UI_PORT,
     permissionMode: 'auto',
+    skipWindowsHardSafetyChecks: false,
+    skipParentDeathGuard: false,
     sseErrorPush: {
         history: true,
         stream: true,
@@ -688,6 +703,9 @@ const DEFAULTS = {
         // Default ON. See `SessionTitleConfig`.
         enabled: true,
     },
+    promptSuggestion: {
+    // Unset: the effective default is resolved with the remote policy.
+    },
     cli: {
         spawn: {
             enabled: false,
@@ -716,6 +734,7 @@ const DEFAULTS = {
     },
     runawayGuard: { enabled: true },
     toolResultCompaction: { ...TOOL_RESULT_COMPACTION_DEFAULTS },
+    requestMedia: { ...REQUEST_MEDIA_DEFAULTS },
     agentRuntime: {
         // Single source of truth lives in `./agent-runtime-config.ts` so the
         // default and the union type cannot drift.
@@ -772,6 +791,9 @@ function ensureConfigFile() {
         dataContribution: { enabled: DATA_CONTRIBUTION_CONFIG_DEFAULTS.enabled },
         // 仅新安装写入，避免改变已有用户缺省开启的选择。
         memory: { enabled: false },
+        // 首装写出可编辑的安全默认值；已有文件不补写、不覆盖用户选择。
+        skipWindowsHardSafetyChecks: DEFAULTS.skipWindowsHardSafetyChecks,
+        skipParentDeathGuard: DEFAULTS.skipParentDeathGuard,
     });
     writePrivateConfigFileSync(configPath, content, true);
 }
@@ -787,14 +809,6 @@ function readConfigFileText(configPath = getConfigPath()) {
     }
 }
 let _cached = null;
-function parseNotificationsConfig(raw) {
-    if (raw == null || typeof raw !== 'object' || Array.isArray(raw))
-        return undefined;
-    const obj = raw;
-    return {
-        branchFinish: typeof obj.branchFinish === 'boolean' ? obj.branchFinish : false,
-    };
-}
 // ── BYOK config parsing + required provider overrides: see ./byok-config.ts ──
 const REQUIRED_PROVIDER_OVERRIDE_DEPS = {
     isManagedRuntime,
@@ -823,12 +837,20 @@ export function prepareConfigFileForRead(configPath) {
 export function resetConfig() {
     _cached = null;
 }
+let cachedConfigSignature;
 export function getConfig() {
-    if (_cached)
+    const signature = configFileSignature(getConfigPath());
+    if (_cached && signature === cachedConfigSignature)
         return _cached;
+    _cached = null;
     ensureConfigFile();
-    const raw = readConfigFile();
-    _cached = resolveConfigFromRaw(raw, getDataDir());
+    // The signature is taken before the content (as Magpie's filememo stats before it reads): a
+    // write by another runtime landing between the two pairs the old signature with whatever was
+    // read, and the next call reads again. The other order could pair new content's signature
+    // with old content and keep it until the file changed again.
+    const readSignature = configFileSignature(getConfigPath());
+    _cached = resolveConfigFromRaw(readConfigFile(), getDataDir());
+    cachedConfigSignature = readSignature;
     return _cached;
 }
 export function resolveConfigFromRaw(raw, dataDir) {
@@ -904,6 +926,10 @@ export function resolveConfigFromRaw(raw, dataDir) {
             })()
             : undefined,
         defaultLightModel: typeof raw.defaultLightModel === 'string' ? raw.defaultLightModel : undefined,
+        skipWindowsHardSafetyChecks: raw.skipWindowsHardSafetyChecks === true,
+        skipParentDeathGuard: raw.skipParentDeathGuard === true,
+        diagnostics: parseDiagnosticsConfig(raw.diagnostics),
+        ...parseStartupRecoveryFault(raw.startupRecoveryFault),
         permissionMode: typeof raw.permissionMode === 'string' &&
             ['default', 'bypassPermissions', 'auto', 'off'].includes(raw.permissionMode)
             ? raw.permissionMode
@@ -931,7 +957,8 @@ export function resolveConfigFromRaw(raw, dataDir) {
         subAgentsDir: path.join(dataDir, 'subagents'),
         beta,
         agents: parseAgentsConfig(raw.agents),
-        memory: parseMemoryConfig(raw, DEFAULTS.memory),
+        // 构建变体在模块加载后注入，默认值随配置解析计算。
+        memory: parseMemoryConfig(raw, resolveMemoryDefaults(DEFAULTS.memory, isInternalBuild() || isInsideBuild())),
         subagent: parseSubagentConfig(raw.subagent),
         skillEvolve: parseSkillEvolveConfig(raw, beta),
         sessionRotate: parseSessionRotateConfig(raw),
@@ -941,6 +968,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         askUser: parseAskUserConfig(raw, DEFAULTS.askUser),
         dataContribution: parseDataContributionConfig(raw, DEFAULTS.dataContribution),
         sessionTitle: parseSessionTitleConfig(raw),
+        promptSuggestion: parsePromptSuggestionConfig(raw),
         cli: parseCliConfig(raw),
         browser: parseBrowserConfig(raw.browser),
         tui: parseTuiConfig(raw),
@@ -948,6 +976,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         contextManagement: parseContextManagementConfig(raw),
         runawayGuard: resolveRunawayGuardConfig(raw.runawayGuard),
         toolResultCompaction: parseToolResultCompactionConfig(raw.toolResultCompaction),
+        requestMedia: parseRequestMediaConfig(raw.requestMedia),
         agentRuntime: parseAgentRuntimeConfig(raw.agentRuntime),
         logRetentionDays: parseLogRetentionDays(raw),
         contentReview: parseContentReviewConfig(raw),
@@ -960,23 +989,40 @@ export function resolveConfigFromRaw(raw, dataDir) {
         sandbox: parseSandboxConfig(raw.sandbox),
     };
 }
+/** Only an absolute, non-empty `steerFaultFile` string enables the tree. */
+export function parseDiagnosticsConfig(raw) {
+    if (raw == null || typeof raw !== 'object' || Array.isArray(raw))
+        return undefined;
+    const steerFaultFile = Reflect.get(raw, 'steerFaultFile');
+    if (typeof steerFaultFile !== 'string' || !path.isAbsolute(steerFaultFile))
+        return undefined;
+    return { steerFaultFile };
+}
 // ── Beta features config parsing ────────────────────────────────
 function parseBetaConfig(raw) {
     const obj = raw.beta != null && typeof raw.beta === 'object' && !Array.isArray(raw.beta)
         ? raw.beta
         : {};
-    const context = {
+    const context = currentBetaResolutionContext();
+    const result = {};
+    for (const key of Object.keys(BETA_FEATURE_DEFS)) {
+        result[key] = resolveBetaFeature(key, obj[key], context);
+    }
+    return result;
+}
+/**
+ * The build facts `parseBetaConfig` resolves every flag with. Exported so a caller holding a
+ * raw (unparsed) config can resolve one flag exactly as `getConfig()` would for this process,
+ * instead of rebuilding the context and drifting from it.
+ */
+export function currentBetaResolutionContext() {
+    return {
         buildEnv: getRuntimeBuildEnv(),
         defaultBuildEnvironment: getBetaDefaultBuildEnvironment(),
         internalBuild: isInternalBuild(),
         insideBuild: isInsideBuild(),
         mcodeToolsDevMode: process.env.MAVIS_DEV_MCODE_TOOLS_MODE === 'published' ? 'published' : undefined,
     };
-    const result = {};
-    for (const key of Object.keys(BETA_FEATURE_DEFS)) {
-        result[key] = resolveBetaFeature(key, obj[key], context);
-    }
-    return result;
 }
 // ── Skill Evolve config parsing ─────────────────────────────────
 /**
@@ -1193,6 +1239,16 @@ function parseSessionTitleConfig(raw) {
         enabled: typeof obj.enabled === 'boolean' ? obj.enabled : defaults.enabled,
     };
 }
+// ── prompt suggestion config parsing ────────────────────────────
+function parsePromptSuggestionConfig(raw) {
+    const value = raw.promptSuggestion;
+    const enabled = value != null && typeof value === 'object' && !Array.isArray(value)
+        ? value.enabled
+        : undefined;
+    // Keep "never chose" distinct from an explicit `false`: the effective default
+    // depends on the remote policy, which parsing cannot see.
+    return typeof enabled === 'boolean' ? { enabled } : {};
+}
 // ── CLI config parsing ──────────────────────────────────────────
 function parseCliConfig(raw) {
     const defaults = DEFAULTS.cli;
@@ -1230,7 +1286,14 @@ function parseContextManagementConfig(raw) {
     const cuMaxScreenshotsInContext = typeof rawCuMax === 'number' && Number.isFinite(rawCuMax) && rawCuMax >= 0
         ? Math.floor(rawCuMax)
         : defaults.cuMaxScreenshotsInContext;
-    return { disableSystemReminderModels, cuMaxScreenshotsInContext };
+    // Semantic validation (ratio vs. token count) lives with the trigger in
+    // @mavis/context-manager; keep numbers so the runtime can warn on bad ones.
+    const compactionTriggerAt = typeof obj.compactionTriggerAt === 'number' ? obj.compactionTriggerAt : undefined;
+    return {
+        disableSystemReminderModels,
+        cuMaxScreenshotsInContext,
+        ...(compactionTriggerAt === undefined ? {} : { compactionTriggerAt }),
+    };
 }
 // ── Agent Runtime config parsing — see ./agent-runtime-config.ts for the
 // canonical implementation. Re-exposed here so the public `getConfig()`

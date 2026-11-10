@@ -55,4 +55,40 @@ function validEnqueueMetadata(input) {
         (input.createdAt === undefined || Number.isFinite(input.createdAt)) &&
         (input.expiresAt === undefined || Number.isFinite(input.expiresAt)));
 }
+function activeClaim(item, liveness) {
+    if (liveness.scope?.claimedAtOrBeforeMs !== undefined &&
+        item.claimedAt !== undefined &&
+        item.claimedAt <= liveness.scope.claimedAtOrBeforeMs) {
+        return false;
+    }
+    return (Boolean(item.claimOwnerId) &&
+        item.claimedAt !== undefined &&
+        (item.claimLeaseExpiresAt ?? item.claimedAt + liveness.claimLeaseMs) > liveness.nowMs &&
+        liveness.isOwnerAlive(item.claimOwnerId));
+}
+export function transferExpired(item, nowMs) {
+    return item.expiresAt !== undefined && item.expiresAt <= nowMs;
+}
+export function groupRecoverable(items, liveness) {
+    const grouped = new Map();
+    items.forEach((item) => {
+        if (item.status !== 'claimed' || !item.claimId)
+            return;
+        grouped.set(item.claimId, [...(grouped.get(item.claimId) ?? []), item]);
+    });
+    return new Map([...grouped].filter(([, claimed]) => !claimed.some((item) => activeClaim(item, liveness))));
+}
+export function replaceItemMessage(item, message) {
+    const { channelContext, ...withoutContext } = item;
+    void channelContext;
+    const replacement = {
+        ...message,
+        ...(item.message.clientIntent !== undefined ? { clientIntent: item.message.clientIntent } : {}),
+    };
+    return {
+        ...withoutContext,
+        message: replacement,
+        ...(replacement.channelContext ? { channelContext: replacement.channelContext } : {}),
+    };
+}
 //# sourceMappingURL=policy.js.map

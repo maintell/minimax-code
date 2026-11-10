@@ -47,7 +47,8 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     }
     return useValue ? value : void 0;
 };
-import { randomUUID } from 'node:crypto';
+import { cloudToolHookTargets, withCloudToolTargetHooks } from './cloud-tool-target-hooks.js';
+import { createHash, randomUUID } from 'node:crypto';
 import { withMcodeToolsMasterReminder } from '@mavis/system-reminder';
 import { bindTool, isRuntimeToolInputValid, } from '@mavis/agent-core/tools';
 import { CloudTaskToolDef } from './builtin-defs.js';
@@ -66,6 +67,11 @@ export const INVALID_SUBAGENT_TARGET = 'INVALID_SUBAGENT_TARGET';
 export const CLOUD_UNIFIED_TASK_DISABLED = 'CLOUD_UNIFIED_TASK_DISABLED';
 export const SUBAGENT_PERSISTENCE_FAILED = 'SUBAGENT_PERSISTENCE_FAILED';
 export const SUBAGENT_EXECUTION_FAILED = 'SUBAGENT_EXECUTION_FAILED';
+/**
+ * CreateSubAgentChild rejected the call because the parent Session already
+ * runs its configured number of child Agents. No child Session was created.
+ */
+export const SUBAGENT_CONCURRENCY_LIMIT = 'SUBAGENT_CONCURRENCY_LIMIT';
 const SUBAGENT_CHILD_CREATE_FAILED = 'SUBAGENT_CHILD_CREATE_FAILED';
 const SUBAGENT_CHILD_RESPONSE_INVALID = 'SUBAGENT_CHILD_RESPONSE_INVALID';
 const STABLE_COORDINATOR_ERROR_CODES = new Set([
@@ -91,6 +97,11 @@ function childTitleFromDescription(description) {
  * environment via `background_task.headless_max_wait_ms`.
  */
 export const DEFAULT_BACKGROUND_MAX_RUN_MS = 30 * 60 * 1000;
+// Full SHA-256 encoded without padding keeps every canonical child Turn at 54
+// bytes, within all existing downstream 64-byte display/usage storage columns.
+function canonicalChildTurnId(sessionId) {
+    return `child-turn:${createHash('sha256').update(sessionId, 'utf8').digest('base64url')}`;
+}
 let CloudTaskTool = (() => {
     let _classDecorators = [bindTool(CloudTaskToolDef)];
     let _classDescriptor;
@@ -148,7 +159,11 @@ let CloudTaskTool = (() => {
             // The caller owns this idempotency key. RemoteArchonServerAdapter may retry
             // the HTTP request, but every attempt serializes this same request object.
             const requestedSubSessionId = randomUUID();
-            const subTurnId = randomUUID();
+            // Canonical creation admits this exact Turn in the coordinator transaction.
+            // Gate-off compatibility keeps the legacy random Turn identity.
+            let subTurnId = this.runtime.createSubAgentChild
+                ? canonicalChildTurnId(requestedSubSessionId)
+                : randomUUID();
             // Reject impossible background launches before persistence so a disabled
             // background path cannot leave an orphan child Session behind.
             if (input.run_in_background === true &&
@@ -165,6 +180,9 @@ let CloudTaskTool = (() => {
             }
             let resolved;
             let subSessionId = requestedSubSessionId;
+            // Only a coordinator admission yields an occupancy snapshot; the gate-off
+            // resolver path admits nothing and leaves this undefined.
+            let childTaskConcurrency;
             let reportBackgroundSetupFailure;
             const childSetupDetails = (childSessionId) => ({
                 sub_session_id: childSessionId,
@@ -247,8 +265,25 @@ let CloudTaskTool = (() => {
                 const statusCode = response.base_resp?.status_code ?? 0;
                 const statusMessage = response.base_resp?.status_msg?.trim() ?? '';
                 const stableErrorCode = stableCoordinatorErrorCode(statusMessage);
+                const concurrencyLimit = parseSubagentConcurrencyLimit(statusMessage);
+                if (concurrencyLimit && !response.sub_session_id) {
+                    // Expected admission rejection rather than a setup failure: the
+                    // coordinator created no child Session, so there is nothing to
+                    // terminalize, start, or log as an error.
+                    const executionMode = input.run_in_background === true ? 'background' : 'foreground';
+                    logger.info(`[cloud-task] child admission rejected code=${SUBAGENT_CONCURRENCY_LIMIT} parent_session_id=${ctx.sessionId} parent_turn_id=${ctx.turnId} tool_call_id=${ctx.toolCallId} execution_mode=${executionMode} active=${concurrencyLimit.active ?? 'unknown'} limit=${concurrencyLimit.limit ?? 'unknown'}`);
+                    if (input.run_in_background === true) {
+                        this.background?.metrics?.recordBackgroundTaskTool({
+                            tool: 'task',
+                            mode: 'background',
+                            result: 'concurrency_limited',
+                        });
+                    }
+                    return taskError(input, SUBAGENT_CONCURRENCY_LIMIT, `${SUBAGENT_CONCURRENCY_LIMIT}: ${subagentConcurrencyLimitMessage(concurrencyLimit)}`, { requested_sub_session_id: requestedSubSessionId });
+                }
                 if (response.sub_session_id && !response.agent_config) {
                     subSessionId = response.sub_session_id;
+                    subTurnId = canonicalChildTurnId(subSessionId);
                     const childReporter = createChildReporter(subSessionId);
                     if (!childReporter)
                         return childReporterUnavailable(subSessionId);
@@ -275,6 +310,7 @@ let CloudTaskTool = (() => {
                         return taskError(input, SUBAGENT_CHILD_RESPONSE_INVALID, 'Sub-agent child response is missing sub_session_id', { requested_sub_session_id: requestedSubSessionId });
                     }
                     subSessionId = response.sub_session_id;
+                    subTurnId = canonicalChildTurnId(subSessionId);
                     const childReporter = createChildReporter(subSessionId);
                     if (!childReporter)
                         return childReporterUnavailable(subSessionId);
@@ -287,7 +323,7 @@ let CloudTaskTool = (() => {
                     }
                     try {
                         const assembled = this.runtime.assembleChildRuntime
-                            ? await this.runtime.assembleChildRuntime(response.agent_config, signal)
+                            ? await this.runtime.assembleChildRuntime(response.agent_config, signal, ctx.workspaceRoot)
                             : { config: response.agent_config, tools: [] };
                         resolved = {
                             ...assembled,
@@ -300,6 +336,7 @@ let CloudTaskTool = (() => {
                         return childReportSetupFailure(SUBAGENT_EXECUTION_FAILED, 'Child sub-agent execution failed', 'assemble_child_runtime');
                     }
                     reportBackgroundSetupFailure = childReportSetupFailure;
+                    childTaskConcurrency = readChildTaskConcurrency(response);
                 }
             }
             else if (target.kind === 'agent_name') {
@@ -308,6 +345,7 @@ let CloudTaskTool = (() => {
             // Gate-off compatibility path. The alias is passed to the local resolver
             // exactly as received; no ListAgent/display_name reverse lookup exists here.
             if (!resolved) {
+                subTurnId = randomUUID();
                 resolved = this.subagents.resolve(target.value, ctx.parentAgentConfig);
             }
             if (!resolved) {
@@ -321,7 +359,7 @@ let CloudTaskTool = (() => {
                 return taskError(input, 'unknown_type', `Unknown subagent type: ${target.value}`);
             }
             if (input.run_in_background === true) {
-                return this.executeInBackground(ctx, input, resolved, subSessionId, subTurnId, signal, reportBackgroundSetupFailure);
+                return this.executeInBackground(ctx, input, resolved, subSessionId, subTurnId, signal, reportBackgroundSetupFailure, childTaskConcurrency);
             }
             const run = await this.runSubagentTurn(ctx, input, resolved, subSessionId, subTurnId, signal);
             const finalText = run.finalText;
@@ -373,7 +411,7 @@ let CloudTaskTool = (() => {
                 ...(usage ? { totalTokens: usage.total_tokens } : {}),
             });
         }
-        async executeInBackground(ctx, input, resolved, subSessionId, subTurnId, signal, reportSetupFailure) {
+        async executeInBackground(ctx, input, resolved, subSessionId, subTurnId, signal, reportSetupFailure, childTaskConcurrency) {
             // Per-user rollout gate (symmetric with cloud-bash executeInBackground).
             // archon-server assembler ships AgentConfig.background_task_enabled after the
             // Apollo whitelist+rollout decision; when not allowed (false / undefined for
@@ -473,7 +511,9 @@ let CloudTaskTool = (() => {
                 mode: 'background',
                 result: 'background_started',
             });
-            const text = `<task_background>\nBackground task ${taskId} started.\n</task_background>`;
+            // Same receipt shape as the Desktop task tool. Without a valid snapshot
+            // (older archon_server, gate-off path) the receipt stays byte-identical.
+            const text = `<task_background${childTaskConcurrencyAttributes(childTaskConcurrency)}>\nBackground task ${taskId} started.\n</task_background>`;
             const result = {
                 tool_name: CloudTaskToolDef.name,
                 text,
@@ -485,6 +525,12 @@ let CloudTaskTool = (() => {
                     sub_turn_id: subTurnId,
                     status: 'background_started',
                     lease_until: started.leaseUntil,
+                    ...(childTaskConcurrency
+                        ? {
+                            active_child_tasks: childTaskConcurrency.active,
+                            child_task_limit: childTaskConcurrency.limit,
+                        }
+                        : {}),
                 },
             };
             return withPluginHookCompatibleToolResponse(result, {
@@ -812,7 +858,7 @@ let CloudTaskTool = (() => {
             const subToolContext = {
                 sessionId: resolved.persistent ? subSessionId : ctx.sessionId,
                 turnId: subTurnId,
-                workspaceRoot: this.workspaceRoot,
+                workspaceRoot: ctx.workspaceRoot,
                 reporter: childReporter,
                 parentAgentConfig: resolved.config,
                 ...(resolved.skillLookup
@@ -821,7 +867,9 @@ let CloudTaskTool = (() => {
                         ? { skillLookup: ctx.skillLookup }
                         : {}),
                 ...(ctx.pluginHooks ? { pluginHooks: ctx.pluginHooks } : {}),
-                ...(ctx.pluginMcpToolOwners ? { pluginMcpToolOwners: ctx.pluginMcpToolOwners } : {}),
+                ...((resolved.pluginMcpToolOwners ?? ctx.pluginMcpToolOwners)
+                    ? { pluginMcpToolOwners: resolved.pluginMcpToolOwners ?? ctx.pluginMcpToolOwners }
+                    : {}),
                 ...(ctx.pluginSubagentLifecycle
                     ? { pluginSubagentLifecycle: ctx.pluginSubagentLifecycle }
                     : {}),
@@ -849,194 +897,204 @@ let CloudTaskTool = (() => {
             let result;
             let caughtError;
             let didCatch = false;
+            let childWorkspaceAdmitted = !this.runtime.beginChildTurn;
             try {
-                pluginTranscript =
-                    (ctx.pluginHooks?.length ?? 0) > 0
-                        ? await createSubagentPluginTranscript(this.workspaceRoot, subSessionId)
-                        : undefined;
-                const pluginStartDecision = await ctx.pluginSubagentLifecycle?.start({
-                    childSessionId: subSessionId,
-                    childTurnId: subTurnId,
-                    agentId: subSessionId,
-                    agentType,
-                    agentTranscriptPath: pluginTranscript?.path ?? null,
-                    agentCodexTranscriptPath: pluginTranscript?.codexPath ?? null,
-                    model: resolved.config.model.model_id,
-                    permissionMode: 'bypassPermissions',
-                    effort: cloudPluginHookEffort(resolved.config.model),
-                }, childController.signal);
-                if (pluginStartDecision?.continue === false) {
-                    const errorMessage = pluginStartDecision.stopReason ??
-                        pluginStartDecision.systemMessage ??
-                        'Sub-agent stopped by Plugin Hook.';
-                    return {
-                        subSessionId,
-                        subTurnId,
-                        finalText: '',
-                        eventCount: 0,
-                        errorMessage,
-                        terminalStatus: 'failed',
+                try {
+                    await this.runtime.beginChildTurn?.(subToolContext, childController.signal, () => childController.abort());
+                    childWorkspaceAdmitted = true;
+                    pluginTranscript =
+                        (ctx.pluginHooks?.length ?? 0) > 0
+                            ? await createSubagentPluginTranscript(ctx.workspaceRoot, subSessionId)
+                            : undefined;
+                    const pluginStartDecision = await ctx.pluginSubagentLifecycle?.start({
+                        childSessionId: subSessionId,
+                        childTurnId: subTurnId,
+                        agentId: subSessionId,
+                        agentType,
+                        agentTranscriptPath: pluginTranscript?.path ?? null,
+                        agentCodexTranscriptPath: pluginTranscript?.codexPath ?? null,
+                        model: resolved.config.model.model_id,
+                        permissionMode: 'bypassPermissions',
+                        effort: cloudPluginHookEffort(resolved.config.model),
+                    }, childController.signal);
+                    if (pluginStartDecision?.continue === false) {
+                        const errorMessage = pluginStartDecision.stopReason ??
+                            pluginStartDecision.systemMessage ??
+                            'Sub-agent stopped by Plugin Hook.';
+                        return {
+                            subSessionId,
+                            subTurnId,
+                            finalText: '',
+                            eventCount: 0,
+                            errorMessage,
+                            terminalStatus: 'failed',
+                        };
+                    }
+                    const beforeToolCall = this.runtime.buildBeforeToolCallHook?.(resolved.config, subToolContext, childController.signal, () => childController.abort());
+                    const buildLLMModelConfig = this.runtime.buildLLMModelConfig ?? buildDefaultCloudLLMModelConfig;
+                    let llm = await buildLLMModelConfig(resolved.config, {
+                        sessionId: subSessionId,
+                        turnId: subTurnId,
+                    });
+                    const modelResponseObserver = llm.responseObserver;
+                    llm = {
+                        ...llm,
+                        ...(subToolContext.traceId
+                            ? { headers: { ...(llm.headers ?? {}), 'X-MM-Request-Id': subToolContext.traceId } }
+                            : {}),
+                        responseObserver: async (response, model) => {
+                            await modelResponseObserver?.(response, model);
+                            const traceHeader = this.runtime.pickTraceIdHeader?.(response.headers);
+                            if (traceHeader) {
+                                logger.info(`[cloud-task] stage=llm_response code=LLM_RESPONSE_RECEIVED sub_session_id=${subSessionId} sub_turn_id=${subTurnId} downstream_trace_id=${traceHeader.value}`);
+                            }
+                        },
                     };
-                }
-                const beforeToolCall = this.runtime.buildBeforeToolCallHook?.(resolved.config, subToolContext);
-                const buildLLMModelConfig = this.runtime.buildLLMModelConfig ?? buildDefaultCloudLLMModelConfig;
-                let llm = await buildLLMModelConfig(resolved.config, {
-                    sessionId: subSessionId,
-                    turnId: subTurnId,
-                });
-                const modelResponseObserver = llm.responseObserver;
-                llm = {
-                    ...llm,
-                    ...(subToolContext.traceId
-                        ? { headers: { ...(llm.headers ?? {}), 'X-MM-Request-Id': subToolContext.traceId } }
-                        : {}),
-                    responseObserver: async (response, model) => {
-                        await modelResponseObserver?.(response, model);
-                        const traceHeader = this.runtime.pickTraceIdHeader?.(response.headers);
-                        if (traceHeader) {
-                            logger.info(`[cloud-task] stage=llm_response code=LLM_RESPONSE_RECEIVED sub_session_id=${subSessionId} sub_turn_id=${subTurnId} downstream_trace_id=${traceHeader.value}`);
-                        }
-                    },
-                };
-                const pluginControl = buildSubagentPluginHooks(ctx, subSessionId, subTurnId, resolved.tools, childController.signal, pluginTranscript, resolved.config.model.model_id, cloudPluginHookEffort(resolved.config.model), agentType);
-                const hooks = {
-                    ...(pluginControl?.hooks ?? {}),
-                    ...(beforeToolCall
-                        ? {
-                            beforeToolCallHook: [
-                                ...(pluginControl?.hooks.beforeToolCallHook ?? []),
-                                beforeToolCall,
-                            ],
-                        }
-                        : {}),
-                    ...(persistChildHistory
-                        ? {
-                            onHistoryChangedHook: [
-                                ...(pluginControl?.hooks.onHistoryChangedHook ?? []),
-                                persistChildHistory,
-                            ],
-                        }
-                        : {}),
-                };
-                await this.piRunner.runTurn({
-                    sessionId: subSessionId,
-                    turnId: subTurnId,
-                    workspaceDir: this.workspaceRoot,
-                    // Raw system_prompt from the fixed subagent type — do NOT pass through
-                    // PromptComposer (it is parent-only; bundle §1.7). Description /
-                    // persona / BASE_PROMPT are not added for sub-agents.
-                    systemPrompt: resolved.config.system_prompt,
-                    userMessage: {
-                        text: [
-                            withMcodeToolsMasterReminder({
-                                reminderText: undefined,
-                                modelID: resolved.config.model.model_id,
-                                enabled: resolved.config.skills.some((skill) => skill.name === 'mcode-tools-master'),
-                            }),
-                            appendPluginHookContext(input.prompt, pluginStartDecision?.additionalContext),
-                        ].join('\n\n'),
-                    },
-                    llm,
-                    eventWriter,
-                    history,
-                    signal: childController.signal,
-                    toolConfig: {
-                        // Filtered upstream — MUST NEVER contain 'task' (recursion guard).
-                        // Disable pi builtin fallback so this remains an exact allowlist.
-                        tools: resolved.tools,
-                        disableBuiltinToolFallback: true,
-                        context: subToolContext,
-                    },
-                    hooks,
-                    ...(pluginControl
-                        ? {
-                            getSteeringMessages: pluginControl.getSteeringMessages,
-                            tryBeginClose: pluginControl.tryBeginClose,
-                        }
-                        : {}),
-                });
-                const terminal = extractSubagentTerminal(buffered);
-                if (terminal.status === 'aborted') {
-                    const safeError = safeBackgroundSubagentError({ terminalStatus: 'aborted' });
-                    result = {
-                        subSessionId,
-                        subTurnId,
-                        finalText: '',
-                        eventCount: buffered.length,
-                        errorMessage: `${safeError.code}: ${safeError.message}`,
-                        terminalStatus: 'aborted',
-                    };
-                }
-                else if (terminal.status === 'failed') {
-                    const safeError = safeBackgroundSubagentError({ terminalStatus: 'failed' });
-                    result = {
-                        subSessionId,
-                        subTurnId,
-                        finalText: '',
-                        eventCount: buffered.length,
-                        errorMessage: `${safeError.code}: ${safeError.message}`,
-                        terminalStatus: 'failed',
-                    };
-                }
-                else {
-                    result = {
-                        subSessionId,
-                        subTurnId,
-                        finalText: extractFinalAssistantText(buffered),
-                        eventCount: buffered.length,
-                        ...(extractFinalAssistantUsageFromBuffer(buffered)
-                            ? { usage: extractFinalAssistantUsageFromBuffer(buffered) }
+                    const pluginControl = buildSubagentPluginHooks(subToolContext, subSessionId, subTurnId, resolved.tools, childController.signal, pluginTranscript, resolved.config.model.model_id, cloudPluginHookEffort(resolved.config.model), agentType);
+                    const hooks = {
+                        ...(pluginControl?.hooks ?? {}),
+                        ...(beforeToolCall
+                            ? {
+                                beforeToolCallHook: [
+                                    ...(pluginControl?.hooks.beforeToolCallHook ?? []),
+                                    beforeToolCall,
+                                ],
+                            }
+                            : {}),
+                        ...(persistChildHistory
+                            ? {
+                                onHistoryChangedHook: [
+                                    ...(pluginControl?.hooks.onHistoryChangedHook ?? []),
+                                    persistChildHistory,
+                                ],
+                            }
                             : {}),
                     };
+                    await this.piRunner.runTurn({
+                        sessionId: subSessionId,
+                        turnId: subTurnId,
+                        workspaceDir: ctx.workspaceRoot,
+                        // Raw system_prompt from the fixed subagent type — do NOT pass through
+                        // PromptComposer (it is parent-only; bundle §1.7). Description /
+                        // persona / behavior sections are not added for sub-agents.
+                        systemPrompt: resolved.config.system_prompt,
+                        userMessage: {
+                            text: [
+                                withMcodeToolsMasterReminder({
+                                    reminderText: undefined,
+                                    modelID: resolved.config.model.model_id,
+                                    enabled: resolved.config.skills.some((skill) => skill.name === 'mcode-tools-master'),
+                                }),
+                                appendPluginHookContext(input.prompt, pluginStartDecision?.additionalContext),
+                            ].join('\n\n'),
+                        },
+                        llm,
+                        eventWriter,
+                        history,
+                        signal: childController.signal,
+                        toolConfig: {
+                            // Filtered upstream — MUST NEVER contain 'task' (recursion guard).
+                            // Disable pi builtin fallback so this remains an exact allowlist.
+                            tools: resolved.tools,
+                            disableBuiltinToolFallback: true,
+                            context: subToolContext,
+                        },
+                        hooks: withCloudToolTargetHooks(resolved.tools, hooks),
+                        ...(pluginControl
+                            ? {
+                                getSteeringMessages: pluginControl.getSteeringMessages,
+                                tryBeginClose: pluginControl.tryBeginClose,
+                            }
+                            : {}),
+                    });
+                    const terminal = extractSubagentTerminal(buffered);
+                    if (terminal.status === 'aborted') {
+                        const safeError = safeBackgroundSubagentError({ terminalStatus: 'aborted' });
+                        result = {
+                            subSessionId,
+                            subTurnId,
+                            finalText: '',
+                            eventCount: buffered.length,
+                            errorMessage: `${safeError.code}: ${safeError.message}`,
+                            terminalStatus: 'aborted',
+                        };
+                    }
+                    else if (terminal.status === 'failed') {
+                        const safeError = safeBackgroundSubagentError({ terminalStatus: 'failed' });
+                        result = {
+                            subSessionId,
+                            subTurnId,
+                            finalText: '',
+                            eventCount: buffered.length,
+                            errorMessage: `${safeError.code}: ${safeError.message}`,
+                            terminalStatus: 'failed',
+                        };
+                    }
+                    else {
+                        result = {
+                            subSessionId,
+                            subTurnId,
+                            finalText: extractFinalAssistantText(buffered),
+                            eventCount: buffered.length,
+                            ...(extractFinalAssistantUsageFromBuffer(buffered)
+                                ? { usage: extractFinalAssistantUsageFromBuffer(buffered) }
+                                : {}),
+                        };
+                    }
                 }
-            }
-            catch (error) {
-                didCatch = true;
-                caughtError = error;
+                catch (error) {
+                    didCatch = true;
+                    caughtError = error;
+                }
+                finally {
+                    if (childWorkspaceAdmitted)
+                        ctx.pluginSubagentLifecycle?.cancel(subSessionId);
+                    await pluginTranscript?.cleanup().catch(() => undefined);
+                }
+                const flushError = await flushChildHistory();
+                if (flushError)
+                    return persistenceFailureResult(flushError);
+                if (caughtError instanceof CloudTaskPersistenceError) {
+                    return persistenceFailureResult(caughtError);
+                }
+                if (didCatch && resolved.persistent) {
+                    logger.error(`[cloud-task] child execution failed stage=run_subagent_turn code=${SUBAGENT_EXECUTION_FAILED} parent_session_id=${ctx.sessionId} parent_turn_id=${ctx.turnId} sub_session_id=${subSessionId} sub_turn_id=${subTurnId}`);
+                }
+                const expectedTerminalStatus = result?.terminalStatus === 'failed'
+                    ? RuntimeEventStatus.FAILED
+                    : result?.terminalStatus === 'aborted'
+                        ? RuntimeEventStatus.ABORTED
+                        : RuntimeEventStatus.COMPLETED;
+                const publishableDeferred = deferredUntilFlush.filter((event) => event.type === RuntimeEventType.MESSAGE_PERSISTED ||
+                    (!didCatch &&
+                        event.type === RuntimeEventType.SESSION_STATUS &&
+                        event.payload?.status === expectedTerminalStatus));
+                if (publishableDeferred.length > 0) {
+                    try {
+                        await reportChildEvents(publishableDeferred);
+                    }
+                    catch (error) {
+                        if (error instanceof CloudTaskPersistenceError) {
+                            return persistenceFailureResult(error);
+                        }
+                        throw error;
+                    }
+                }
+                if (didCatch) {
+                    if (resolved.persistent || input.run_in_background !== true)
+                        return executionFailureResult();
+                    throw caughtError;
+                }
+                if (!result)
+                    throw new Error('Sub-agent run completed without a result');
+                return result;
             }
             finally {
-                ctx.pluginSubagentLifecycle?.cancel(subSessionId);
-                await pluginTranscript?.cleanup().catch(() => undefined);
+                if (childWorkspaceAdmitted)
+                    this.runtime.finishChildTurn?.(subToolContext.sessionId, subTurnId);
                 if (signal)
                     signal.removeEventListener('abort', onParentAbort);
             }
-            const flushError = await flushChildHistory();
-            if (flushError)
-                return persistenceFailureResult(flushError);
-            if (caughtError instanceof CloudTaskPersistenceError) {
-                return persistenceFailureResult(caughtError);
-            }
-            if (didCatch && resolved.persistent) {
-                logger.error(`[cloud-task] child execution failed stage=run_subagent_turn code=${SUBAGENT_EXECUTION_FAILED} parent_session_id=${ctx.sessionId} parent_turn_id=${ctx.turnId} sub_session_id=${subSessionId} sub_turn_id=${subTurnId}`);
-            }
-            const expectedTerminalStatus = result?.terminalStatus === 'failed'
-                ? RuntimeEventStatus.FAILED
-                : result?.terminalStatus === 'aborted'
-                    ? RuntimeEventStatus.ABORTED
-                    : RuntimeEventStatus.COMPLETED;
-            const publishableDeferred = deferredUntilFlush.filter((event) => event.type === RuntimeEventType.MESSAGE_PERSISTED ||
-                (!didCatch &&
-                    event.type === RuntimeEventType.SESSION_STATUS &&
-                    event.payload?.status === expectedTerminalStatus));
-            if (publishableDeferred.length > 0) {
-                try {
-                    await reportChildEvents(publishableDeferred);
-                }
-                catch (error) {
-                    if (error instanceof CloudTaskPersistenceError) {
-                        return persistenceFailureResult(error);
-                    }
-                    throw error;
-                }
-            }
-            if (didCatch) {
-                if (resolved.persistent || input.run_in_background !== true)
-                    return executionFailureResult();
-                throw caughtError;
-            }
-            if (!result)
-                throw new Error('Sub-agent run completed without a result');
-            return result;
         }
     };
     return CloudTaskTool = _classThis;
@@ -1047,6 +1105,7 @@ function buildSubagentPluginHooks(ctx, subSessionId, subTurnId, tools, signal, t
     const lifecycle = ctx.pluginSubagentLifecycle;
     if (handlers.length === 0 || !lifecycle)
         return undefined;
+    const hookTargets = cloudToolHookTargets(tools);
     const toolContexts = new Map();
     const toolStartedAtMs = new Map();
     let stopHookActive = false;
@@ -1075,7 +1134,7 @@ function buildSubagentPluginHooks(ctx, subSessionId, subTurnId, tools, signal, t
                 agent_type: agentType,
             },
         }, signal);
-        const invalidRewrite = applyPluginToolRewrite(tools, toolContext, result.decision.updatedInput);
+        const invalidRewrite = applyPluginToolRewrite(hookTargets, toolContext, result.decision.updatedInput);
         if (invalidRewrite) {
             toolContexts.delete(toolContext.toolCall.id);
             return { block: true, reason: invalidRewrite };
@@ -1118,7 +1177,7 @@ function buildSubagentPluginHooks(ctx, subSessionId, subTurnId, tools, signal, t
                 },
             }, signal);
             const permissionUpdatedInputIsValid = !permission.decision.updatedInput ||
-                isRuntimeToolInputValid(tools, toolContext.toolCall.name, permission.decision.updatedInput);
+                isRuntimeToolInputValid(hookTargets, toolContext.toolCall.name, permission.decision.updatedInput);
             const permissionUpdatesAreSupported = !permission.decision.updatedPermissions?.length;
             if (permission.decision.updatedInput &&
                 permissionUpdatedInputIsValid &&
@@ -1136,6 +1195,30 @@ function buildSubagentPluginHooks(ctx, subSessionId, subTurnId, tools, signal, t
                 permission.decision.continue !== false &&
                 permission.decision.interrupt !== true) {
                 return undefined;
+            }
+            if (permissionUpdatedInputIsValid &&
+                permissionUpdatesAreSupported &&
+                permission.decision.permissionDecision !== 'deny' &&
+                permission.decision.decision !== 'deny' &&
+                permission.decision.continue !== false &&
+                permission.decision.interrupt !== true &&
+                ctx.requestPermission) {
+                try {
+                    const approved = await ctx.requestPermission({
+                        toolCallId: toolContext.toolCall.id,
+                        toolName: toolContext.toolCall.name,
+                        toolInput: { ...objectRecord(toolContext.args) },
+                        reason: permission.decision.reason ??
+                            result.decision.reason ??
+                            'Plugin Hook requires confirmation',
+                        hookGeneration: '',
+                    });
+                    if (approved && !signal.aborted)
+                        return undefined;
+                }
+                catch {
+                    /* Failed or cancelled approval blocks the original call. */
+                }
             }
             toolContexts.delete(toolContext.toolCall.id);
             return {
@@ -1380,6 +1463,58 @@ function taskError(input, code, message, details = {}) {
 }
 function stableCoordinatorErrorCode(statusMessage) {
     return STABLE_COORDINATOR_ERROR_CODES.has(statusMessage) ? statusMessage : undefined;
+}
+/**
+ * Recognizes `SUBAGENT_CONCURRENCY_LIMIT: <active> running, limit <limit>`.
+ *
+ * This is the only coordinator code matched by prefix: the server appends the
+ * current occupancy and limit after the code so the model can see them. Every
+ * other stable code still requires an exact status_msg match, so an unrelated
+ * message that merely starts with a known code is not mistaken for it.
+ * Unparseable counts degrade to an occupancy without numbers.
+ */
+function parseSubagentConcurrencyLimit(statusMessage) {
+    if (statusMessage === SUBAGENT_CONCURRENCY_LIMIT)
+        return {};
+    const prefix = `${SUBAGENT_CONCURRENCY_LIMIT}:`;
+    if (!statusMessage.startsWith(prefix))
+        return undefined;
+    const match = /^(\d+) running, limit (\d+)$/u.exec(statusMessage.slice(prefix.length).trim());
+    if (!match)
+        return {};
+    const active = Number(match[1]);
+    const limit = Number(match[2]);
+    if (!Number.isSafeInteger(active) || !Number.isSafeInteger(limit))
+        return {};
+    return { active, limit };
+}
+/** Same wording as the Desktop runtime's concurrency-limit task error. */
+function subagentConcurrencyLimitMessage(occupancy) {
+    const counts = occupancy.active !== undefined && occupancy.limit !== undefined
+        ? ` (${String(occupancy.active)} running, limit ${String(occupancy.limit)})`
+        : '';
+    return `This parent Session has reached its configured child-Agent concurrency limit${counts}. Wait for one to finish, then retry.`;
+}
+/**
+ * Reads the admission snapshot archon_server returns from CreateSubAgentChild.
+ * Older servers do not return it. Both fields must be present non-negative
+ * safe integers; anything else hides the snapshot instead of showing a
+ * partial or misleading count.
+ */
+function readChildTaskConcurrency(response) {
+    const active = response.active_child_tasks;
+    const limit = response.child_task_limit;
+    if (!isNonNegativeSafeInteger(active) || !isNonNegativeSafeInteger(limit))
+        return undefined;
+    return { active, limit };
+}
+function isNonNegativeSafeInteger(value) {
+    return Number.isSafeInteger(value) && value >= 0;
+}
+function childTaskConcurrencyAttributes(concurrency) {
+    return concurrency
+        ? ` active_child_tasks="${String(concurrency.active)}" child_task_limit="${String(concurrency.limit)}"`
+        : '';
 }
 /** Project the accepted parent model without api_key/base_url credentials. */
 export function toParentModelSelection(agentConfig) {

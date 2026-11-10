@@ -21,16 +21,25 @@ const OFFICIAL_REMOTE_FIELDS = new Set([
     'timeout',
     'tools',
 ]);
-const COMPATIBLE_FIELDS = new Set([...OFFICIAL_STDIO_FIELDS, ...OFFICIAL_REMOTE_FIELDS]);
-const OAUTH_FIELDS = new Set([
+const COMPATIBLE_FIELDS = new Set([...OFFICIAL_STDIO_FIELDS, ...OFFICIAL_REMOTE_FIELDS, 'oauth']);
+const CODEX_FIELDS = new Set([...COMPATIBLE_FIELDS, 'scopes']);
+/** Credential-bearing or non-standard auth fields a server entry may never declare. */
+const LEGACY_AUTH_FIELDS = new Set([
     'auth',
-    'oauth',
     'oauth2',
     'accessToken',
     'refreshToken',
     'clientId',
     'clientSecret',
 ]);
+const LOCALHOST_CALLBACK_OAUTH_FIELDS = new Set([
+    'clientId',
+    'scopes',
+    'callbackPort',
+    'authServerMetadataUrl',
+]);
+const CODEX_OAUTH_FIELDS = new Set(['clientId', 'callbackPort', 'callbackUrl']);
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 const COMPATIBLE_PLUGIN_ROOT_TOKEN = [
     '$',
     '{\u0043\u004c\u0041\u0055\u0044\u0045_PLUGIN_ROOT}',
@@ -55,7 +64,7 @@ export async function readOfficialMcpFile(root, relativePath) {
     }
     return { servers, diagnostics: [] };
 }
-export async function parseCompatibleMcpObject(root, value) {
+export async function parseCompatibleMcpObject(root, value, format) {
     const map = isRecord(value.mcpServers) ? value.mcpServers : value;
     const servers = [];
     const diagnostics = [];
@@ -65,7 +74,7 @@ export async function parseCompatibleMcpObject(root, value) {
             continue;
         }
         try {
-            servers.push(await normalizeServer(root, name, raw, 'compatible'));
+            servers.push(await normalizeServer(root, name, raw, format));
         }
         catch (error) {
             if (!(error instanceof PluginReaderError))
@@ -76,7 +85,7 @@ export async function parseCompatibleMcpObject(root, value) {
     return { servers, diagnostics };
 }
 async function normalizeServer(root, name, raw, mode) {
-    assertNoMcpOauth(raw, name, mode);
+    assertSupportedAuthFields(raw, name, mode);
     const transportType = resolveTransportType(raw, name, mode);
     const allowedFields = fieldsForTransport(transportType, mode);
     const unknown = Object.keys(raw).find((key) => !allowedFields.has(key));
@@ -90,11 +99,13 @@ async function normalizeServer(root, name, raw, mode) {
     const description = optionalString(raw.description, name);
     const declaredTools = readDeclaredTools(raw.tools, name);
     const transport = await normalizeTransport({ root, raw, type: transportType, mode, name });
+    const oauth = readRemoteOAuth(raw, name, mode, transport);
     const resolvedServer = {
         name,
         transport,
         enabled: true,
         ...(timeout !== undefined ? { timeout } : {}),
+        ...(oauth ? { oauth } : {}),
     };
     return {
         name,
@@ -104,12 +115,135 @@ async function normalizeServer(root, name, raw, mode) {
         configJson: JSON.stringify(raw),
     };
 }
-function assertNoMcpOauth(raw, name, mode) {
-    if (!Object.keys(raw).some((key) => OAUTH_FIELDS.has(key)))
+function assertSupportedAuthFields(raw, name, mode) {
+    if (mode === 'codex' && raw.oauth_resource !== undefined) {
+        readerFail('MCP_OAUTH_UNSUPPORTED', `${name} declares an OAuth resource override`);
+    }
+    const keys = Object.keys(raw);
+    if (mode === 'official') {
+        // The MiniMax format declares no OAuth; remote servers still authorize through 401 discovery.
+        if (keys.some((key) => key === 'oauth' || LEGACY_AUTH_FIELDS.has(key))) {
+            readerFail('MCP_SCHEMA_INVALID', `${name} declares MCP OAuth`);
+        }
         return;
+    }
+    if (keys.some((key) => LEGACY_AUTH_FIELDS.has(key))) {
+        readerFail('MCP_OAUTH_UNSUPPORTED', `${name} declares MCP credentials`);
+    }
+}
+/** OAuth applies to remote transports only and never together with a static Authorization. */
+function readRemoteOAuth(raw, name, mode, transport) {
     if (mode === 'official')
-        readerFail('MCP_SCHEMA_INVALID', `${name} declares MCP OAuth`);
-    readerFail('MCP_OAUTH_UNSUPPORTED', `${name} declares MCP OAuth`);
+        return undefined;
+    const oauth = mode === 'codex'
+        ? readCodexOAuth(raw.oauth, raw.scopes, name)
+        : readLocalhostCallbackOAuth(raw.oauth, name);
+    if (!oauth || transport.type === 'stdio')
+        return undefined;
+    if (hasAuthorizationHeader(transport.headers)) {
+        readerFail('MCP_SCHEMA_INVALID', `${name} declares both OAuth and an Authorization header`);
+    }
+    return oauth;
+}
+function readLocalhostCallbackOAuth(value, name) {
+    if (value === undefined)
+        return undefined;
+    const label = `${name}.oauth`;
+    const oauth = compatibleOAuthObject(value, LOCALHOST_CALLBACK_OAUTH_FIELDS, label);
+    return oauthDescriptor({
+        redirectFormat: 'localhost-callback',
+        clientId: optionalString(oauth.clientId, `${label}.clientId`),
+        scopes: oauth.scopes === undefined ? undefined : spaceSeparatedScopes(oauth.scopes, label),
+        callbackPort: optionalCallbackPort(oauth.callbackPort, label),
+        authServerMetadataUrl: optionalHttpsUrl(oauth.authServerMetadataUrl, label),
+    });
+}
+function readCodexOAuth(value, scopes, name) {
+    if (value === undefined && scopes === undefined)
+        return undefined;
+    const label = `${name}.oauth`;
+    const oauth = value === undefined ? {} : compatibleOAuthObject(value, CODEX_OAUTH_FIELDS, label);
+    const clientId = optionalString(oauth.clientId, `${label}.clientId`);
+    const codexCallbackUrl = optionalLoopbackCallbackUrl(oauth.callbackUrl, label);
+    if (clientId !== undefined && codexCallbackUrl === undefined) {
+        // Codex derives an unpublished per-server callback path without callbackUrl.
+        readerFail('MCP_OAUTH_UNSUPPORTED', `${label} pre-registers a client without callbackUrl`);
+    }
+    return oauthDescriptor({
+        redirectFormat: 'codex',
+        clientId,
+        scopes: scopes === undefined ? undefined : scopeArray(scopes, `${name}.scopes`),
+        callbackPort: optionalCallbackPort(oauth.callbackPort, label),
+        codexCallbackUrl,
+    });
+}
+function compatibleOAuthObject(value, allowed, label) {
+    if (!isRecord(value))
+        readerFail('MCP_SCHEMA_INVALID', `${label} is not an object`);
+    if (value.clientSecret !== undefined) {
+        readerFail('MCP_OAUTH_SECRET_UNSUPPORTED', `${label} declares a client secret`);
+    }
+    if (Object.keys(value).some((key) => !allowed.has(key))) {
+        readerFail('MCP_CONFIG_UNSUPPORTED', `${label} contains an unsupported field`);
+    }
+    return value;
+}
+/** Drops absent fields so snapshots and lifecycle keys stay canonical. */
+function oauthDescriptor(input) {
+    return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+}
+function scopeArray(value, label) {
+    const scopes = stringArray(value, label);
+    if (scopes.some((scope) => !scope || /\s/u.test(scope))) {
+        readerFail('MCP_SCHEMA_INVALID', `${label} contains an invalid scope`);
+    }
+    return scopes;
+}
+function spaceSeparatedScopes(value, label) {
+    if (typeof value !== 'string')
+        readerFail('MCP_SCHEMA_INVALID', `${label}.scopes is not a string`);
+    return value.split(/\s+/u).filter(Boolean);
+}
+function optionalCallbackPort(value, label) {
+    if (value === undefined)
+        return undefined;
+    if (!Number.isInteger(value) || value < 1024 || value > 65535) {
+        readerFail('MCP_SCHEMA_INVALID', `${label}.callbackPort must be within 1024-65535`);
+    }
+    return value;
+}
+function optionalHttpsUrl(value, label) {
+    if (value === undefined)
+        return undefined;
+    const url = parseUrl(value);
+    if (url?.protocol !== 'https:') {
+        readerFail('MCP_SCHEMA_INVALID', `${label}.authServerMetadataUrl must be an https URL`);
+    }
+    return url.href;
+}
+function optionalLoopbackCallbackUrl(value, label) {
+    if (value === undefined)
+        return undefined;
+    const url = parseUrl(value);
+    if (!url)
+        readerFail('MCP_SCHEMA_INVALID', `${label}.callbackUrl is not a URL`);
+    if (url.protocol !== 'http:' || !LOOPBACK_HOSTNAMES.has(url.hostname)) {
+        readerFail('MCP_OAUTH_UNSUPPORTED', `${label}.callbackUrl is not a loopback http URL`);
+    }
+    return value.trim();
+}
+function parseUrl(value) {
+    if (typeof value !== 'string' || !value.trim())
+        return undefined;
+    try {
+        return new URL(value.trim());
+    }
+    catch {
+        return undefined;
+    }
+}
+function hasAuthorizationHeader(headers) {
+    return Object.keys(headers ?? {}).some((key) => key.toLowerCase() === 'authorization');
 }
 function resolveTransportType(raw, name, mode) {
     const declaredType = readDeclaredTransportType(raw.type, mode);
@@ -140,7 +274,9 @@ function isMcpTransportType(value) {
     return value === 'stdio' || value === 'http' || value === 'streamable-http' || value === 'sse';
 }
 function fieldsForTransport(type, mode) {
-    if (mode === 'compatible')
+    if (mode === 'codex')
+        return CODEX_FIELDS;
+    if (mode === 'localhost-callback')
         return COMPATIBLE_FIELDS;
     return type === 'stdio' ? OFFICIAL_STDIO_FIELDS : OFFICIAL_REMOTE_FIELDS;
 }
@@ -196,7 +332,7 @@ function normalizeRemoteTransport(input) {
     };
 }
 async function resolveRuntimeString(root, value, mode, mustExist = false) {
-    const containsRoot = mode === 'compatible' && value.includes(COMPATIBLE_PLUGIN_ROOT_TOKEN);
+    const containsRoot = mode !== 'official' && value.includes(COMPATIBLE_PLUGIN_ROOT_TOKEN);
     const expanded = expandCompatibleRoot(value, root.path, mode);
     const isExplicitRelative = /^\.{1,2}[/\\]/u.test(value);
     if (!containsRoot && !isExplicitRelative)
@@ -226,7 +362,7 @@ function isCrossPlatformAbsolutePath(value) {
     return path.posix.isAbsolute(value) || path.win32.isAbsolute(value);
 }
 function expandCompatibleRoot(value, root, mode) {
-    return mode === 'compatible' ? value.replaceAll(COMPATIBLE_PLUGIN_ROOT_TOKEN, root) : value;
+    return mode === 'official' ? value : value.replaceAll(COMPATIBLE_PLUGIN_ROOT_TOKEN, root);
 }
 function readDeclaredTools(value, serverName) {
     if (value === undefined)

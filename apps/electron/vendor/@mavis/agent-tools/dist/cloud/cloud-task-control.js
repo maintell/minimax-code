@@ -56,7 +56,8 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 };
 import { Type } from '@sinclair/typebox';
 import { bindTool, } from '@mavis/agent-core/tools';
-import { CloudTaskToolDef } from './builtin-defs.js';
+import { CLOUD_TASK_CONCURRENCY_GUIDANCE, CloudTaskToolDef } from './builtin-defs.js';
+import { shellStorageFailure, withStorageFailure } from './storage-failure.js';
 /**
  * Gated-off `task` definition (Phase 6). When the background gate is OFF the
  * registry binds the CloudTaskTool impl to THIS def instead of CloudTaskToolDef,
@@ -70,7 +71,9 @@ const GATED_SYNC_TASK_DESCRIPTION = `Launch a cloud sub-agent to handle complex,
 
 Use this for broad research, parallelizable investigation, or delegated implementation. Do not use it for targeted file reads, grep-style code searches, or work that is simpler to do directly.
 
-Each invocation returns the child agent's final result only to you.`;
+Each invocation returns the child agent's final result only to you.
+
+${CLOUD_TASK_CONCURRENCY_GUIDANCE}`;
 const { run_in_background: _omitRunInBackground, ...SYNC_TASK_SCHEMA_PROPS } = CloudTaskToolDef.schema.properties;
 export const GatedSyncTaskToolDef = {
     name: CloudTaskToolDef.name,
@@ -183,13 +186,18 @@ let CloudTaskOutputTool = (() => {
             });
             const body = read.content || '(no output yet)';
             const text = `<task_output status="${task.status}">\n${body}\n</task_output>`;
-            return ok(TaskOutputToolDef.name, text, {
+            const result = ok(TaskOutputToolDef.name, text, {
                 task_id: input.task_id,
                 status: task.status,
                 ...(read.nextOffset === undefined ? {} : { next_offset: read.nextOffset }),
                 ...(read.truncated === undefined ? {} : { truncated: read.truncated }),
                 ...(read.summary ? { summary: read.summary } : {}),
             });
+            // Diagnose running output before the caller advances its cursor. Completed
+            // successful pipelines can still contain the standalone node-map error.
+            return task.kind === 'bash'
+                ? withStorageFailure(result, shellStorageFailure(body, '', task.status === 'succeeded' ? 0 : 1))
+                : result;
         }
     };
     return CloudTaskOutputTool = _classThis;

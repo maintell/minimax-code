@@ -187,7 +187,11 @@ function currentWorkspaceProjectReason(tx, current) {
     const projectId = current.row.projectId;
     if (!isProjectId(projectId))
         return 'workspace-project-missing';
-    const project = tx.select().from(projects).where(eq(projects.projectId, projectId)).get();
+    const project = tx
+        .select({ projectKind: projects.projectKind, workspaceDir: projects.workspaceDir })
+        .from(projects)
+        .where(eq(projects.projectId, projectId))
+        .get();
     if (!project)
         return 'workspace-project-missing';
     if (project.projectKind !== 'workspace' || !project.workspaceDir) {

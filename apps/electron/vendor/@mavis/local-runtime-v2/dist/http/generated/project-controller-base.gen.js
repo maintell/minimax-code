@@ -10,6 +10,11 @@ export class ProjectControllerBase {
         void req;
         throw new NotImplementedError('listProjectSessions');
     }
+    async createProject(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('createProject');
+    }
     async updateProject(ctx, req) {
         void ctx;
         void req;

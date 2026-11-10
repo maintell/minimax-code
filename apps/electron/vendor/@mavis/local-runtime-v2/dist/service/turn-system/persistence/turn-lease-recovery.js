@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, inArray, lt, lte } from 'drizzle-orm';
-import { sessionLocks, turnIngress } from '../../../infra/db/schema/turn.js';
+import { SESSION_DELETION_OWNER_KIND, MAINTENANCE_DELETING_OWNER_KIND, TURN_DELETING_OWNER_KIND, COMPACTION_DELETING_OWNER_KIND, sessionLocks, turnIngress, } from '../../../infra/db/schema/turn.js';
 const LEGACY_TURN_LEASE_STALL_MS = 30_000;
 const LEGACY_TURN_LEASE_OWNER_ID = /^turn-lease:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 export function shouldRecoverStalledLegacyTurnLease(observations, observedLeases, candidate) {
@@ -28,11 +28,7 @@ export function shouldRecoverStalledLegacyTurnLease(observations, observedLeases
     observations.delete(key);
     return true;
 }
-export const SESSION_DELETION_OWNER_KIND = 'session-deletion';
 export const MAINTENANCE_OWNER_KIND = 'maintenance';
-export const MAINTENANCE_DELETING_OWNER_KIND = 'maintenance-deleting';
-export const TURN_DELETING_OWNER_KIND = 'turn-deleting';
-export const COMPACTION_DELETING_OWNER_KIND = 'compaction-deleting';
 export const DELETION_FENCE_EXPIRES_AT_MS = Number.MAX_SAFE_INTEGER;
 const PROCESS_RESTART_OWNER_KINDS = [
     'turn',
@@ -256,4 +252,5 @@ function isTurnOwnerKind(ownerKind) {
 function isDeletingTurnOwnerKind(ownerKind) {
     return ownerKind === TURN_DELETING_OWNER_KIND || ownerKind === COMPACTION_DELETING_OWNER_KIND;
 }
+export { SESSION_DELETION_OWNER_KIND, MAINTENANCE_DELETING_OWNER_KIND, TURN_DELETING_OWNER_KIND, COMPACTION_DELETING_OWNER_KIND, } from '../../../infra/db/schema/turn.js';
 //# sourceMappingURL=turn-lease-recovery.js.map

@@ -74,7 +74,7 @@ export async function cleanupExpiredToolResultArtifacts(workspaceRootInput, nowM
 }
 export function withToolResultTruncation(tool, options = {}) {
     return {
-        def: tool.def,
+        ...tool,
         impl: {
             execute: async (ctx, input, signal, onUpdate) => {
                 const result = await tool.impl.execute(ctx, input, signal, onUpdate);

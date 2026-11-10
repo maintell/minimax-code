@@ -8,7 +8,6 @@ const MAX_RETRY_COUNT = 3;
 let retryCount = 0;
 // 当前更新状态
 let updateStatus = 'idle';
-// 缓存的更新信息
 let cachedUpdateInfo = null;
 // 缓存的下载进度
 let cachedProgress = null;
@@ -51,7 +50,10 @@ export function getUpdateStatus() {
     return updateStatus;
 }
 export function setUpdateStatus(status) {
-    logger.info(`[Updater] 状态变更: ${updateStatus} -> ${status}`);
+    // 下载进度每次回调都会重复设置 downloading，只记录真正发生的状态变化
+    if (status !== updateStatus) {
+        logger.info(`[Updater] 状态变更: ${updateStatus} -> ${status}`);
+    }
     updateStatus = status;
 }
 // 便捷方法：检查当前状态

@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_COMPACTION_SETTINGS } from '@earendil-works/pi-coding-agent/compaction';
-import { resolveCompactionTokenBudget } from '@mavis/context-manager';
+import { projectAgentMessagesForModel, } from '@mavis/agent-core/pi-turn-runner';
+import { createDefaultTokenEstimator, estimatePreparedContextUsage, readContextWindowTokens, resolveCompactionTokenBudget, } from '@mavis/context-manager';
 import { compactContext, } from './algorithm/compact-context.js';
-import { createCheckpointSession } from './execution/checkpoint-provider.js';
+import { checkpointGenerationObservers, createCheckpointSession, } from './execution/checkpoint-provider.js';
+import { resolveCheckpointSharedPrefix } from './execution/checkpoint-shared-prefix.js';
 import { checkpointMaxOutputTokens } from './execution/checkpoint-prompt.js';
 import { createLocalContextFootprintMeasurer } from './execution/local-context-footprint.js';
 /** Manual caller: bypasses the automatic trigger and transient filters. */
@@ -10,10 +12,20 @@ export class LocalContextCompactor {
     checkpointState;
     logger;
     promptSnapshots;
-    constructor(checkpointState, logger, promptSnapshots) {
+    checkpointContext;
+    imageFileWriter;
+    resolveEarlierFiles;
+    constructor(checkpointState, logger, promptSnapshots, context = {}) {
         this.checkpointState = checkpointState;
         this.logger = logger;
         this.promptSnapshots = promptSnapshots;
+        this.checkpointContext = {
+            reminder: context.reminder,
+            projectRequestMessages: context.projectRequestMessages,
+            mainRequestMessages: context.mainRequestMessages,
+        };
+        this.imageFileWriter = context.imageFileWriter;
+        this.resolveEarlierFiles = context.resolveEarlierFiles;
     }
     async compactManual(input, hooks) {
         input.signal?.throwIfAborted();
@@ -27,11 +39,50 @@ export class LocalContextCompactor {
             checkpointState: this.checkpointState,
             logger: this.logger,
             promptSnapshots: this.promptSnapshots,
+            checkpointReminder: this.checkpointContext.reminder,
+            checkpointRequestMessages: this.checkpointContext.projectRequestMessages,
+            mainRequestMessages: this.checkpointContext.mainRequestMessages,
+            imageFileWriter: this.imageFileWriter,
+            resolveEarlierFiles: this.resolveEarlierFiles,
         });
         logManualReplacementGrowthBestEffort(this.logger, input.sessionId, decision, {
             providerInputLimit: preparation.providerInputLimit,
         });
-        return completedManualCompaction(preparation.history, decision);
+        const contextUsage = estimatePostCompactionContextUsage(input, decision.replacementMessages);
+        return {
+            ...completedManualCompaction(preparation.history, decision),
+            ...(contextUsage === undefined ? {} : { contextUsage }),
+        };
+    }
+}
+/** Estimate the next main request, not the Provider request that generated the summary. */
+function estimatePostCompactionContextUsage(input, replacementMessages) {
+    try {
+        const contextWindowTokens = readContextWindowTokens(input.model);
+        if (contextWindowTokens === undefined || input.contextUsagePromptRanges === undefined) {
+            return undefined;
+        }
+        const messages = projectAgentMessagesForModel(replacementMessages, input.model).messages;
+        const estimate = estimatePreparedContextUsage({
+            systemPrompt: input.systemPrompt ?? '',
+            tools: input.tools ?? [],
+            // tokensAfter already includes the system prompt and tools. Count only
+            // replacement messages here so fixed context is not charged twice.
+            messagesTokens: createDefaultTokenEstimator().estimateMessages(messages),
+            promptRanges: input.contextUsagePromptRanges,
+        });
+        if (!estimate.valid)
+            return undefined;
+        return {
+            contextWindowTokens,
+            usedTokens: estimate.usedTokens,
+            totalCountSource: 'LOCAL_ESTIMATE',
+            components: [...estimate.components],
+        };
+    }
+    catch {
+        // Optional usage reporting must never turn a successful compaction into a failure.
+        return undefined;
     }
 }
 function prepareManualCompaction(input) {
@@ -53,13 +104,23 @@ function prepareManualCompaction(input) {
     };
 }
 async function runManualPolicy(options) {
-    const { input, hooks, preparation } = options;
+    const { input, hooks, preparation, checkpointReminder, imageFileWriter, resolveEarlierFiles } = options;
     return compactContext({
+        ...(checkpointReminder
+            ? { checkpointReminder: (timestamp) => checkpointReminder(input.sessionId, timestamp) }
+            : {}),
         history: preparation.history,
+        ...(resolveEarlierFiles
+            ? { resolveEarlierFiles: () => resolveEarlierFiles(input.sessionId) }
+            : {}),
+        ...(imageFileWriter
+            ? {
+                writeImageFile: (messages, image) => imageFileWriter.writeImageFile({ sessionId: input.sessionId, messages }, image),
+            }
+            : {}),
         ...(input.customInstructions === undefined ? {} : { instructions: input.customInstructions }),
         limits: manualLimits(input, preparation.providerInputLimit),
         measurePair: async (pair) => preparation.measurer.measurePair(pair),
-        allowLegacyToolTrim: false,
         // An explicit user request always commits a validly generated checkpoint.
         // Growth is possible on short histories (checkpoint output cap plus host
         // appendix) and stays bounded; it is observed below, never intercepted.
@@ -70,6 +131,8 @@ async function runManualPolicy(options) {
             tokensBefore: preparation.before.inputTokens,
             providerInputLimit: preparation.providerInputLimit,
             promptSnapshots: options.promptSnapshots,
+            projectRequestMessages: options.checkpointRequestMessages,
+            mainRequestMessages: options.mainRequestMessages,
         }),
         ...manualSubagentCapture(input.sessionId, options.checkpointState, options.logger),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -83,7 +146,7 @@ function manualLimits(input, providerInputLimit) {
             : { maxSerializedInputBytes: input.maxSerializedInputBytes }),
     };
 }
-function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, }) {
+function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, projectRequestMessages, mainRequestMessages, }) {
     return {
         tokensBefore,
         timestamp: Date.now(),
@@ -96,6 +159,7 @@ function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, prom
                 throw new TypeError('Manual context compaction requires streamFn for checkpoint.');
             }
             return createCheckpointSession({
+                projectRequestMessages,
                 model: input.model,
                 streamFn: input.streamFn,
                 thinkingLevel: input.thinkingLevel,
@@ -112,15 +176,16 @@ function manualCheckpoint({ input, hooks, tokensBefore, providerInputLimit, prom
                 ...(hooks?.onProviderRequestSettled
                     ? { onRequestSettled: hooks.onProviderRequestSettled }
                     : {}),
-                onGenerated: (generation) => hooks?.onCheckpointGenerated?.({
-                    responseContentKinds: generation.responseContentKinds,
-                    stopReason: generation.stopReason,
-                    outputTokens: generation.outputTokens,
-                }),
+                ...manualSharedPrefixOption(input, mainRequestMessages),
+                ...checkpointGenerationObservers(hooks),
                 ...(promptSnapshots ? { promptSnapshots } : {}),
             });
         },
     };
+}
+function manualSharedPrefixOption(input, mainRequestMessages) {
+    const sharedPrefix = resolveCheckpointSharedPrefix(input, mainRequestMessages);
+    return sharedPrefix ? { sharedPrefix } : {};
 }
 function manualSubagentCapture(sessionId, checkpointState, logger) {
     if (!checkpointState)
@@ -161,11 +226,12 @@ function logManualReplacementGrowthBestEffort(logger, sessionId, decision, limit
     }
 }
 function completedManualCompaction(history, decision) {
-    const completed = {
+    return {
         status: 'completed',
         compactionId: `ctx_${randomUUID()}`,
         strategyVersion: 'local-context-compaction-v3',
         method: decision.method,
+        summary: decision.summary,
         replacementMessages: [...decision.replacementMessages],
         messagesBefore: history.length,
         messagesAfter: decision.replacementMessages.length,
@@ -173,22 +239,8 @@ function completedManualCompaction(history, decision) {
         tokensAfter: decision.measurement.after.inputTokens,
         serializedBytesBefore: decision.measurement.before.serializedBytes,
         serializedBytesAfter: decision.measurement.after.serializedBytes,
-        ...hmidRecoveryMetadata(decision),
-        ...(decision.method === 'llm_checkpoint' && decision.tokenUsage !== undefined
-            ? { tokenUsage: decision.tokenUsage }
-            : {}),
+        ...(decision.hmidOverflowRecovered ? { hmidOverflowRecovered: true } : {}),
+        ...(decision.tokenUsage !== undefined ? { tokenUsage: decision.tokenUsage } : {}),
     };
-    return decision.method === 'llm_checkpoint'
-        ? { ...completed, method: decision.method, summary: decision.summary }
-        : {
-            ...completed,
-            method: decision.method,
-            replacementSourceIndexes: history.map((_message, index) => index),
-        };
-}
-function hmidRecoveryMetadata(decision) {
-    return decision.method === 'llm_checkpoint' && decision.hmidOverflowRecovered
-        ? { hmidOverflowRecovered: true }
-        : {};
 }
 //# sourceMappingURL=local-context-compactor.js.map

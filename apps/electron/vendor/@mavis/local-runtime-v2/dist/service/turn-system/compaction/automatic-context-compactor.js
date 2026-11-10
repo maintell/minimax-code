@@ -1,101 +1,133 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_COMPACTION_SETTINGS } from '@earendil-works/pi-coding-agent/compaction';
+import { hasThinkingPrefixBinding, } from '@mavis/agent-core/pi-turn-runner';
 import { resolveCompactionTokenBudget } from '@mavis/context-manager';
 import { compactContext, } from './algorithm/compact-context.js';
-import { ToolResultArchiver, } from './algorithm/tool-result-archiver.js';
-import { createCheckpointSession } from './execution/checkpoint-provider.js';
+import { checkpointGenerationObservers, createCheckpointSession, } from './execution/checkpoint-provider.js';
+import { resolveCheckpointSharedPrefix } from './execution/checkpoint-shared-prefix.js';
 import { checkpointMaxOutputTokens } from './execution/checkpoint-prompt.js';
-import { createLocalContextFootprintMeasurer } from './execution/local-context-footprint.js';
+import { createLocalContextFootprintMeasurer, } from './execution/local-context-footprint.js';
 import { ContextUsageAnchorState } from './execution/usage-anchor.js';
 export class AutomaticContextCompactor {
     usageAnchor;
     checkpointState;
     logger;
-    toolResultArchiver;
+    checkpointReminder;
+    imageFileWriter;
     promptSnapshots;
+    resolveEarlierFiles;
+    checkpointRequestMessages;
+    mainRequestMessages;
+    getCompactionTriggerAt;
     constructor(usageAnchor, checkpointState, logger, dependencies) {
         this.usageAnchor = usageAnchor;
         this.checkpointState = checkpointState;
         this.logger = logger;
-        this.toolResultArchiver = dependencies.toolResultArchiver;
+        this.checkpointReminder = dependencies.checkpointReminder;
+        this.imageFileWriter = dependencies.imageFileWriter;
         this.promptSnapshots = dependencies.promptSnapshots;
+        this.resolveEarlierFiles = dependencies.resolveEarlierFiles;
+        this.checkpointRequestMessages = dependencies.checkpointRequestMessages;
+        this.mainRequestMessages = dependencies.mainRequestMessages;
+        this.getCompactionTriggerAt = dependencies.getCompactionTriggerAt;
     }
     probeBeforeLlm(input) {
         input.signal?.throwIfAborted();
         return {
-            shouldStart: prepareAutomaticCompaction(input, this.usageAnchor, this.toolResultArchiver)
-                .shouldStart,
+            shouldStart: prepareAutomaticCompaction(input, this.usageAnchor, this.readCompactionTriggerAt()).shouldStart,
         };
     }
     async compactBeforeLlm(input, hooks) {
         input.signal?.throwIfAborted();
-        const preparation = prepareAutomaticCompaction(input, this.usageAnchor, this.toolResultArchiver);
+        const preparation = prepareAutomaticCompaction(input, this.usageAnchor, this.readCompactionTriggerAt());
         if (!preparation.shouldStart) {
             return { status: 'unchanged', reason: 'nothing-to-compact' };
         }
         await hooks?.onStarted();
         input.signal?.throwIfAborted();
-        const toolResultCompactionCandidate = await materializeToolResultCompactionBestEffort(this.toolResultArchiver, input.sessionId, preparation.toolResultCompactionPlan, preparation.canReadArchivedToolResults);
-        input.signal?.throwIfAborted();
-        if (preparation.toolResultCompactionPlan &&
-            !toolResultCompactionCandidate &&
-            !preparation.normalTriggerMatched) {
-            return { status: 'unchanged', reason: 'nothing-to-compact' };
-        }
         const decision = await runAutomaticPolicy({
             input,
             hooks,
             preparation,
-            toolResultCompactionCandidate,
             checkpointState: this.checkpointState,
             logger: this.logger,
-            legacyToolTrim: this.toolResultArchiver === undefined,
+            imageFileWriter: this.imageFileWriter,
             promptSnapshots: this.promptSnapshots,
+            resolveEarlierFiles: this.resolveEarlierFiles,
+            checkpointReminder: this.checkpointReminder,
+            checkpointRequestMessages: this.checkpointRequestMessages,
+            mainRequestMessages: this.mainRequestMessages,
         });
         this.usageAnchor?.invalidate(input.sessionId);
-        return completedAutomaticCompaction(input.messages, decision);
+        return completedAutomaticCompaction(input, decision);
+    }
+    /** A failing config read degrades to the built-in trigger. */
+    readCompactionTriggerAt() {
+        try {
+            return this.getCompactionTriggerAt?.();
+        }
+        catch {
+            return undefined;
+        }
     }
 }
-function prepareAutomaticCompaction(input, usageAnchor, archiver) {
+/**
+ * A repeated request after a provider rejection always compacts, whatever the
+ * measured footprint: the rejection proves the request is over a limit the
+ * host could not measure. Every automatic compaction is an LLM checkpoint, so
+ * the summary replaces the history (and every image in it) at once; history is
+ * never rewritten piecewise, which would break prefix caches and thinking
+ * signatures.
+ * A model whose thinking is bound to its prefix has no request-byte trigger:
+ * its requests keep every image, so a byte estimate would rewrite the prefix
+ * before any rejection; an oversized request is rejected and recovered instead.
+ */
+function prepareAutomaticCompaction(input, usageAnchor, compactionTriggerAt) {
     const measurer = createAutomaticFootprintMeasurer(input, usageAnchor);
     const footprint = measurer.measure(input.messages);
     const { providerInputLimit, automaticTriggerAt } = resolveCompactionTokenBudget({
         contextWindow: input.model.contextWindow,
         configuredMaxOutputTokens: input.maxTokens ?? input.model.maxTokens,
+        compactionTriggerAt,
     });
-    const toolResultCompactionPlan = archiver?.plan({
-        sessionId: input.sessionId,
-        messages: input.messages,
-    });
-    const normalTriggerMatched = footprint.inputTokens > automaticTriggerAt ||
-        (input.maxSerializedInputBytes !== undefined &&
-            footprint.serializedBytes > input.maxSerializedInputBytes);
     return {
         measurer,
         footprint,
-        toolResultCompactionPlan,
-        canReadArchivedToolResults: hasReadTool(input.tools),
-        normalTriggerMatched,
-        shouldStart: toolResultCompactionPlan !== undefined || normalTriggerMatched,
+        shouldStart: input.recovery !== undefined ||
+            footprint.inputTokens > automaticTriggerAt ||
+            (!hasThinkingPrefixBinding(input.model) &&
+                serializedBytesExceed(input, footprint.serializedBytes)),
         providerInputLimit,
     };
 }
+function serializedBytesExceed(input, serializedBytes) {
+    return (input.maxSerializedInputBytes !== undefined && serializedBytes > input.maxSerializedInputBytes);
+}
 async function runAutomaticPolicy(options) {
-    const { input, hooks, preparation } = options;
+    const { input, hooks, preparation, imageFileWriter, checkpointReminder, resolveEarlierFiles } = options;
     return compactContext({
+        ...(checkpointReminder
+            ? { checkpointReminder: (timestamp) => checkpointReminder(input.sessionId, timestamp) }
+            : {}),
         history: input.messages,
+        ...(resolveEarlierFiles
+            ? { resolveEarlierFiles: () => resolveEarlierFiles(input.sessionId) }
+            : {}),
         limits: automaticLimits(input, preparation.providerInputLimit),
         measurePair: async (pair) => preparation.measurer.measurePair(pair),
-        ...(options.toolResultCompactionCandidate
-            ? { toolResultCompactionCandidate: options.toolResultCompactionCandidate }
+        ...(imageFileWriter
+            ? {
+                writeImageFile: (messages, image) => imageFileWriter.writeImageFile({ sessionId: input.sessionId, messages }, image),
+            }
             : {}),
-        allowLegacyToolTrim: options.legacyToolTrim,
         checkpoint: automaticCheckpoint({
             input,
             hooks,
             tokensBefore: preparation.footprint.inputTokens,
             providerInputLimit: preparation.providerInputLimit,
             promptSnapshots: options.promptSnapshots,
+            projectRequestMessages: options.checkpointRequestMessages,
+            mainRequestMessages: options.mainRequestMessages,
         }),
         ...automaticSubagentCapture(input.sessionId, options.checkpointState, options.logger),
         ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -109,7 +141,7 @@ function automaticLimits(input, providerInputLimit) {
             : { maxSerializedInputBytes: input.maxSerializedInputBytes }),
     };
 }
-function automaticCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, }) {
+function automaticCheckpoint({ input, hooks, tokensBefore, providerInputLimit, promptSnapshots, projectRequestMessages, mainRequestMessages, }) {
     return {
         tokensBefore,
         timestamp: Date.now(),
@@ -117,14 +149,19 @@ function automaticCheckpoint({ input, hooks, tokensBefore, providerInputLimit, p
             ? { onAttemptSettled: hooks.onCheckpointAttemptSettled }
             : {}),
         ...(hooks?.getProviderTokenUsage ? { getTokenUsage: hooks.getProviderTokenUsage } : {}),
-        open: () => openAutomaticCheckpoint(input, hooks, providerInputLimit, promptSnapshots),
+        open: () => openAutomaticCheckpoint(input, hooks, providerInputLimit, {
+            promptSnapshots,
+            projectRequestMessages,
+            mainRequestMessages,
+        }),
     };
 }
-async function openAutomaticCheckpoint(input, hooks, providerInputLimit, promptSnapshots) {
+async function openAutomaticCheckpoint(input, hooks, providerInputLimit, context) {
     if (!input.streamFn) {
         throw new TypeError('Automatic context compaction requires streamFn.');
     }
     const session = await createCheckpointSession({
+        projectRequestMessages: context.projectRequestMessages,
         model: input.model,
         streamFn: input.streamFn,
         thinkingLevel: input.thinkingLevel,
@@ -139,33 +176,15 @@ async function openAutomaticCheckpoint(input, hooks, providerInputLimit, promptS
         ...(hooks?.onProviderRequestSettled
             ? { onRequestSettled: hooks.onProviderRequestSettled }
             : {}),
-        onGenerated: (generation) => hooks?.onCheckpointGenerated?.({
-            responseContentKinds: generation.responseContentKinds,
-            stopReason: generation.stopReason,
-            outputTokens: generation.outputTokens,
-        }),
-        ...(promptSnapshots ? { promptSnapshots } : {}),
+        ...sharedPrefixOption(input, context.mainRequestMessages),
+        ...checkpointGenerationObservers(hooks),
+        ...(context.promptSnapshots ? { promptSnapshots: context.promptSnapshots } : {}),
     });
-    const measure = session.measure;
-    return {
-        ...session,
-        fits: (request) => session.fits({
-            ...request,
-            messages: projectAutomaticContextRequestMessages(request.messages),
-        }),
-        ...(measure === undefined
-            ? {}
-            : {
-                measure: (request) => measure({
-                    ...request,
-                    messages: projectAutomaticContextRequestMessages(request.messages),
-                }),
-            }),
-        generate: async (request) => await session.generate({
-            ...request,
-            messages: projectAutomaticContextRequestMessages(request.messages),
-        }),
-    };
+    return session;
+}
+function sharedPrefixOption(input, mainRequestMessages) {
+    const sharedPrefix = resolveCheckpointSharedPrefix(input, mainRequestMessages);
+    return sharedPrefix ? { sharedPrefix } : {};
 }
 function automaticSubagentCapture(sessionId, checkpointState, logger) {
     if (!checkpointState)
@@ -178,66 +197,24 @@ function automaticSubagentCapture(sessionId, checkpointState, logger) {
         }, '[local-runtime-v2] subagent checkpoint state capture failed'),
     };
 }
-function completedAutomaticCompaction(messages, decision) {
-    const completed = {
+function completedAutomaticCompaction(input, decision) {
+    const replacementMessages = [...decision.replacementMessages];
+    return {
         status: 'completed',
         compactionId: `ctx_${randomUUID()}`,
         strategyVersion: 'local-context-compaction-v3',
         method: decision.method,
-        replacementMessages: [...decision.replacementMessages],
-        messagesBefore: messages.length,
-        messagesAfter: decision.replacementMessages.length,
+        summary: decision.summary,
+        replacementMessages,
+        messagesBefore: input.messages.length,
+        messagesAfter: replacementMessages.length,
         tokensBefore: decision.measurement.before.inputTokens,
         tokensAfter: decision.measurement.after.inputTokens,
         serializedBytesBefore: decision.measurement.before.serializedBytes,
         serializedBytesAfter: decision.measurement.after.serializedBytes,
-        ...hmidRecoveryMetadata(decision),
-        ...(decision.method === 'llm_checkpoint' && decision.tokenUsage !== undefined
-            ? { tokenUsage: decision.tokenUsage }
-            : {}),
+        ...(decision.hmidOverflowRecovered ? { hmidOverflowRecovered: true } : {}),
+        ...(decision.tokenUsage !== undefined ? { tokenUsage: decision.tokenUsage } : {}),
     };
-    return decision.method === 'llm_checkpoint'
-        ? { ...completed, method: decision.method, summary: decision.summary }
-        : {
-            ...completed,
-            method: decision.method,
-            replacementSourceIndexes: messages.map((_message, index) => index),
-        };
-}
-function hmidRecoveryMetadata(decision) {
-    return decision.method === 'llm_checkpoint' && decision.hmidOverflowRecovered
-        ? { hmidOverflowRecovered: true }
-        : {};
-}
-function hasReadTool(tools) {
-    return tools?.some((tool) => tool.name === 'read') === true;
-}
-async function materializeToolResultCompactionBestEffort(archiver, sessionId, plan, canReadArchivedToolResults) {
-    if (!archiver || !plan)
-        return undefined;
-    try {
-        return canReadArchivedToolResults
-            ? await archiver.materialize({ sessionId, plan })
-            : await archiver.materializeTrim({ sessionId, plan });
-    }
-    catch {
-        return undefined;
-    }
-}
-export function createAutomaticContextRequestFilterHook() {
-    return (input) => {
-        const messages = projectAutomaticContextRequestMessages(input.messages);
-        return messages === input.messages
-            ? { type: 'continue' }
-            : {
-                type: 'replaceRequestMessages',
-                messages: [...messages],
-                reason: 'internal-context-filter',
-            };
-    };
-}
-function projectAutomaticContextRequestMessages(messages) {
-    return messages;
 }
 export function createAutomaticFootprintMeasurer(input, usageAnchor) {
     return createLocalContextFootprintMeasurer({

@@ -92,8 +92,22 @@ export function toProviderInfo(view) {
         ...(view.maskedApiKey ? { maskedApiKey: view.maskedApiKey } : {}),
         ...(view.headerNames ? { headerNames: view.headerNames } : {}),
         ...(view.configRevision ? { configRevision: view.configRevision } : {}),
+        ...(view.modelAccess ? { modelAccess: toModelAccessProviderInfo(view.modelAccess) } : {}),
+        ...(view.apiKeys ? { apiKeys: view.apiKeys.map(toApiKeyInfo) } : {}),
         models: view.models.map(toModelInfo),
         ...(view.status ? { status: toModelStatus(view.status) } : {}),
+    };
+}
+function toModelAccessProviderInfo(access) {
+    return {
+        installationId: access.installationId,
+        providerId: access.providerId,
+        bindingKind: access.bindingKind,
+        ...(access.groupProviderId ? { groupProviderId: access.groupProviderId } : {}),
+        ...(access.accountMasked ? { accountMasked: access.accountMasked } : {}),
+        status: access.status,
+        ...(access.hostAgentId ? { hostAgentId: access.hostAgentId } : {}),
+        ...(access.identityRevision !== undefined ? { identityRevision: access.identityRevision } : {}),
     };
 }
 export function toCandidateView(candidate) {
@@ -109,6 +123,44 @@ export function toCandidateView(candidate) {
         ...(candidate.models ? { models: candidate.models.map(toModelInputView) } : {}),
         ...(candidate.headers !== undefined ? { headers: candidate.headers } : {}),
         ...(candidate.removeHeaders !== undefined ? { removeHeaders: candidate.removeHeaders } : {}),
+        ...(candidate.apiKeys !== undefined
+            ? {
+                apiKeys: candidate.apiKeys.map((draft) => ({
+                    ...(draft.id !== undefined ? { id: draft.id } : {}),
+                    ...(draft.name !== undefined ? { name: draft.name } : {}),
+                    ...(draft.key !== undefined ? { key: draft.key } : {}),
+                    enabled: draft.enabled,
+                })),
+            }
+            : {}),
+    };
+}
+export function toApiKeyProbe(probe) {
+    return {
+        ok: probe.ok,
+        ...(probe.status !== undefined ? { status: probe.status } : {}),
+        ...(probe.error ? { error: probe.error } : {}),
+        ...(probe.ms !== undefined ? { ms: probe.ms } : {}),
+        ...(probe.modelId ? { modelId: probe.modelId } : {}),
+        at: probe.at,
+    };
+}
+export function toApiKeyInfo(key) {
+    return {
+        id: key.id,
+        ...(key.name ? { name: key.name } : {}),
+        masked: key.masked,
+        enabled: key.enabled,
+        ...(key.rest
+            ? {
+                rest: {
+                    reason: key.rest.reason,
+                    ...(key.rest.status !== undefined ? { status: key.rest.status } : {}),
+                    until: key.rest.until,
+                },
+            }
+            : {}),
+        ...(key.lastProbe ? { lastProbe: toApiKeyProbe(key.lastProbe) } : {}),
     };
 }
 export function toModelInputView(model) {
@@ -137,6 +189,7 @@ export function toByokPresetModelInput(model) {
 function toUserModelInputIdentityFields(model) {
     return {
         ...(model.displayName !== undefined ? { displayName: model.displayName } : {}),
+        ...(model.api !== undefined ? { api: model.api } : {}),
         ...(model.configurationSource !== undefined
             ? { configurationSource: model.configurationSource }
             : {}),
@@ -189,6 +242,7 @@ function toUserModelInputThinkingFields(model) {
 function toModelInputIdentityFields(model) {
     return {
         ...(model.displayName !== undefined ? { displayName: model.displayName } : {}),
+        ...(model.api !== undefined ? { api: model.api } : {}),
         ...(model.configurationSource !== undefined
             ? { configurationSource: model.configurationSource }
             : {}),

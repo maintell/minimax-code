@@ -1,6 +1,9 @@
 import { createEvaluatorVerifierAdapter, EvaluatorModelCallError, VerificationDispatchError, } from '@mavis/goal';
+import { randomUUID } from 'node:crypto';
+import { LLM_RETRY_CALL_IDENTITY, } from '@mavis/agent-core/pi-turn-runner';
 import { GOAL_CONFIG_DEFAULTS, resolveModelCallRoute } from '@mavis/config';
 import { isContextOverflow, streamSimple } from '@earendil-works/pi-ai';
+import { ThinkingLevel } from '@mavis/protocol';
 import { parseSourceQualifiedModelKey, resolveLegacyMinimaxModel, } from '../../service/model-system/index.js';
 import { isTaskSession, summarizeCommittedPiGoalUsage, } from '../../service/session-system/index.js';
 import { buildLocalTurnPayloadTransform, } from '../../service/turn-system/index.js';
@@ -16,14 +19,20 @@ export function createGoalEvaluatorVerifier(options) {
             if (policy && policy.modelPolicy !== 'same-route-small-fast') {
                 throw routeUnavailable('The configured Goal evaluator model policy is unsupported.');
             }
+            const deadlineAt = Date.now() +
+                positiveInteger(policy?.timeoutSeconds, GOAL_CONFIG_DEFAULTS.evaluator.timeoutSeconds) *
+                    1_000;
             const model = await resolveEvaluatorModelPort(options, config, attempt);
-            return createEvaluatorVerifierAdapter({
-                model,
+            return model.dispatch(signal, deadlineAt, (ownedModel, ownedSignal, evaluatorLifecycle) => createEvaluatorVerifierAdapter({
+                model: ownedModel,
+                ...(evaluatorLifecycle ? { lifecycle: evaluatorLifecycle } : {}),
+                sessionId: attempt.sessionId,
+                turnId: attempt.turnId,
                 maxTokens: Math.min(positiveInteger(attempt.maxTokens, GOAL_CONFIG_DEFAULTS.evaluator.maxTokens), positiveInteger(policy?.maxTokens, GOAL_CONFIG_DEFAULTS.evaluator.maxTokens)),
                 timeoutSeconds: positiveInteger(policy?.timeoutSeconds, GOAL_CONFIG_DEFAULTS.evaluator.timeoutSeconds),
                 maxRetries: nonNegativeInteger(policy?.maxRetries, GOAL_CONFIG_DEFAULTS.evaluator.maxRetries),
                 ...(options.nowMs ? { nowMs: options.nowMs } : {}),
-            }).dispatch(attempt, signal);
+            }).dispatch(attempt, ownedSignal));
         },
     };
 }
@@ -60,22 +69,79 @@ async function resolveEvaluatorModelPort(options, config, attempt) {
             turnId: `${attempt.turnId}:goal-evaluator`,
             agentConfig,
         });
-        return {
-            workerRoute,
-            evaluatorRoute,
-            call: (input) => callEvaluatorModel({
-                input,
-                agentConfig: { ...agentConfig },
-                llm,
-                nowMs: options.nowMs,
-            }),
-        };
+        return evaluatorDispatchOwner(llm.callLifecycle, attempt, (lease, identity) => {
+            const ownedLlm = lease
+                ? { ...llm, streamFn: lease.wrapAttempt(llm.streamFn ?? streamSimple) }
+                : llm;
+            return {
+                workerRoute,
+                evaluatorRoute,
+                call: (input) => callEvaluatorModel({
+                    input,
+                    agentConfig: { ...agentConfig },
+                    nowMs: options.nowMs,
+                    llm: ownedLlm,
+                    callIdentity: identity,
+                }),
+            };
+        });
     }
     catch (error) {
         if (error instanceof VerificationDispatchError)
             throw error;
         throw routeUnavailable('The same-route small-fast evaluator model could not be resolved.', error);
     }
+}
+// Runtime-only failure context: never serialize provider responses into Goal errors/history.
+const evaluatorFailures = new WeakMap();
+function evaluatorDispatchOwner(lifecycle, attempt, model) {
+    return {
+        async dispatch(signal, deadlineAt, run) {
+            if (!lifecycle)
+                return run(model(), signal);
+            signal.throwIfAborted();
+            const identity = {};
+            const timeout = AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()));
+            const lease = await lifecycle.open({
+                identity,
+                callId: randomUUID(),
+                sessionId: attempt.sessionId,
+                turnId: attempt.turnId,
+                scope: 'goal-evaluator',
+                signal: AbortSignal.any([signal, timeout]),
+                deadlineAt,
+            });
+            let closing;
+            const close = () => {
+                closing ??= (async () => {
+                    await lease.close();
+                })();
+                return closing;
+            };
+            const evaluatorLifecycle = {
+                deadlineAt,
+                lease: {
+                    signal: lease.signal,
+                    ...(lease.classifyFailure
+                        ? {
+                            classifyFailure: (error) => lease.classifyFailure(error instanceof Error
+                                ? (evaluatorFailures.get(error) ?? { thrown: error })
+                                : { thrown: error }),
+                        }
+                        : {}),
+                    ...(lease.recover ? { recover: (input) => lease.recover(input) } : {}),
+                    close,
+                },
+            };
+            try {
+                lease.signal.throwIfAborted();
+                return await run(model(lease, identity), lease.signal, evaluatorLifecycle);
+            }
+            finally {
+                await close();
+            }
+        },
+    };
 }
 function resolveEvaluatorModelSelection(config) {
     const configured = parseSourceQualifiedModelKey(config.defaultLightModel ?? config.defaultModel);
@@ -88,20 +154,39 @@ async function callEvaluatorModel(input) {
     if (input.input.images?.length && !llm.model.input.includes('image')) {
         throw new EvaluatorModelCallError('api_error', 'The configured Goal evaluator model does not support screenshot input.', 0, false);
     }
-    const requestPayloadTransform = buildLocalTurnPayloadTransform(input.agentConfig, {
+    const requestPayloadTransform = buildLocalTurnPayloadTransform(withThinkingOff(input.agentConfig), {
         thinkingLevel: 'off',
         ...(llm.thinkingRequestPatch ? { thinkingRequestPatch: llm.thinkingRequestPatch } : {}),
+        // A managed route applies the model's declared thinking mode as worker requests do,
+        // so a forced-on model is sent without the thinking switch it would reject.
+        managedProvider: llm.managedProvider === true,
         signal: input.input.signal,
     });
+    let final;
+    let response;
     try {
-        const final = await requestEvaluatorModel(input, requestPayloadTransform);
+        final = await requestEvaluatorModel(input, requestPayloadTransform, (value) => {
+            response = value;
+        });
         return evaluateFinalMessage(final, llm.model.contextWindow, input.input.signal);
     }
     catch (error) {
-        throw classifyEvaluatorCallError(input.input.signal, error);
+        const classified = classifyEvaluatorCallError(input.input.signal, error);
+        evaluatorFailures.set(classified, {
+            ...(final ? { final } : { thrown: error }),
+            ...(response ? { response } : {}),
+        });
+        throw classified;
     }
 }
-async function requestEvaluatorModel(input, requestPayloadTransform) {
+/** The evaluator asks for thinking off wherever the model allows turning it off. */
+function withThinkingOff(agentConfig) {
+    const model = agentConfig.model;
+    if (typeof model !== 'object' || model === null)
+        return agentConfig;
+    return { ...agentConfig, model: { ...model, thinking_level: ThinkingLevel.OFF } };
+}
+async function requestEvaluatorModel(input, requestPayloadTransform, onResponse) {
     const response = await (input.llm.streamFn ?? streamSimple)(input.llm.model, {
         systemPrompt: input.input.systemPrompt,
         messages: [
@@ -118,13 +203,16 @@ async function requestEvaluatorModel(input, requestPayloadTransform) {
         ],
         tools: [...input.input.tools],
     }, {
+        ...(input.callIdentity ? { [LLM_RETRY_CALL_IDENTITY]: input.callIdentity } : {}),
         ...(input.llm.apiKey ? { apiKey: input.llm.apiKey } : {}),
         ...(input.llm.headers ? { headers: { ...input.llm.headers } } : {}),
+        ...(input.llm.fetch ? { fetch: input.llm.fetch } : {}),
         maxTokens: input.input.maxTokens,
         timeoutMs: input.input.timeoutMs,
         maxRetries: 0,
         signal: input.input.signal,
         onPayload: requestPayloadTransform,
+        onResponse,
     });
     return response.result();
 }

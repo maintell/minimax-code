@@ -6,6 +6,7 @@
  * net.fetch 会使用 Chromium 的网络栈，自动遵循系统代理设置
  * 这对于使用 VPN 的用户非常重要，确保请求能正确路由到海外服务器
  */
+import { isOffline, neutralProxyResult } from "../modules/connectivity/offline-mode";
 import { ipcMain, net } from "electron";
 import { getCategoryLogger } from "../utils/logger";
 import { getStandardUserAgent } from "../utils/tool";
@@ -690,6 +691,21 @@ export async function handleCloudProtocolJsonRequest(request) {
 /**
  * 处理代理请求
  */
+/**
+ * Account/bootstrap/config endpoints that useInitFetch calls during startup.
+ * These are safe to answer with a neutral success while offline so the init
+ * chain completes instead of setting authInitFailed. Model/chat/streaming
+ * endpoints are deliberately NOT stubbed. Single-line regexes only: a regex
+ * literal must never span lines or tsc emits a broken RegExp at runtime.
+ */
+const CLOUD_FEATURE_PATH_RE = /\/(?:chat|completion|stream|message|generate|model|inference|sse|conversation)(?:\/|$)/iu;
+const OFFLINE_STUB_PREFIX_RE = /^\/(?:v1\/api\/(?:user|config|bot|device)|matrix\/api\/v1\/(?:user|commerce|charge|metric|bot)|minimax-cloud\/api\/v1\/(?:user|credit|remote-control)|mavis\/api|backend\/)/iu;
+const OFFLINE_STUB_KEYWORD_RE = /(?:common_config|config|membership|extra_info|bot_list|device\/register)/iu;
+function isOfflineStubPath(pathname) {
+    const p = String(pathname || "");
+    if (CLOUD_FEATURE_PATH_RE.test(p)) return false;
+    return OFFLINE_STUB_PREFIX_RE.test(p) || OFFLINE_STUB_KEYWORD_RE.test(p);
+}
 async function handleProxyFetch(sender, options, setupOptions = {}, debugEmitter) {
     const controller = new AbortController();
     const timeout = options.timeout || 120000;
@@ -811,6 +827,21 @@ async function handleProxyFetch(sender, options, setupOptions = {}, debugEmitter
         const duration = Date.now() - startTime;
         const errorMsg = error instanceof Error ? error.message : 'Unknown error';
         const isTimeout = error instanceof Error && error.name === 'AbortError';
+        // Offline: bootstrap/account/config calls cannot reach the cloud.
+        // Intercept BEFORE the 401/timeout/generic returns so every failure
+        // shape is covered. getCurrentUser (/v1/api/user/info) MUST succeed
+        // with a complete userInfo, otherwise useInitFetch sets
+        // authInitFailed and shows the "account unavailable" card.
+        // The startup connectivity probe can still report "online" for a few
+        // seconds after the network is gone; the init call then fails with a
+        // network error while the probe is stale, useInitFetch sets
+        // authInitFailed and the client shows the account-unavailable card.
+        // The request has already failed, so answer control-plane endpoints
+        // from the offline stub without waiting for the probe to catch up.
+        if (isOfflineStubPath(urlObj.pathname)) {
+            logger.info(`[IPC Proxy] offline stub for ${urlObj.pathname} (${errorMsg})`);
+            return neutralProxyResult(urlObj.pathname);
+        }
         if (isTimeout) {
             debugAttempt?.abort();
         }

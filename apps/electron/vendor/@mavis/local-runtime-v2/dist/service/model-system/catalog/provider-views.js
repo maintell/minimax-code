@@ -3,6 +3,10 @@
 // API keys remain write-only across this boundary.
 import { maskSecret } from '../secret.js';
 import { CUSTOM_PROVIDER_ID_PREFIX, MINIMAX_API_PROVIDER_ID, formatModelKey, parseSourceQualifiedModelKey, } from '../resolution/model-key.js';
+import { isModelAccessProvider, modelAccessProviderView } from '../model-access/projection.js';
+import { isApiKeyProvider } from '../provider-identity.js';
+import { maskApiKey, readApiKeys } from '../byok-keys/key-list.js';
+import { sharedByokKeyPool } from '../byok-keys/key-pool.js';
 import { probeProviderCredential } from '@mavis/config';
 import { modelConnectionTestFingerprint } from './config-fingerprint.js';
 import { MINIMAX_API_FORMAT, MINIMAX_API_PROVIDER_NAME, builtinProviderKind, buildModelEntry, cacheStatusView, customProviderKind, minimaxApiBaseUrl, minimaxApiModels, } from './list-models.js';
@@ -75,10 +79,10 @@ export function buildMinimaxProviderView(config, cache) {
         ...(statusOf(cache, MINIMAX_API_PROVIDER_ID) ?? {}),
     };
 }
-export function buildCustomProviderView(config, cache, providerKey, provider) {
+export function buildCustomProviderView(config, cache, { providerKey, provider }, viewOptions = {}) {
     const providerId = `${CUSTOM_PROVIDER_ID_PREFIX}${providerKey}`;
     const providerName = provider.name ?? providerKey;
-    const credential = credentialViewFields(provider.options, providerId);
+    const { modelAccess, credential } = externalAccessFields(providerKey, provider, viewOptions);
     const providerKind = customProviderKind(provider);
     return {
         providerId,
@@ -102,7 +106,51 @@ export function buildCustomProviderView(config, cache, providerKey, provider) {
             statusForModel: (modelId, model) => customModelStatus({ cache, providerId, provider, modelId, model }),
         }),
         ...(fingerprintedProviderStatus(cache, providerId, provider) ?? {}),
+        ...(modelAccess ? { modelAccess } : {}),
     };
+}
+/** Extension-owned providers never own a stored key, even if a stray one exists. */
+function externalAccessFields(providerKey, provider, viewOptions) {
+    const providerId = `${CUSTOM_PROVIDER_ID_PREFIX}${providerKey}`;
+    if (isModelAccessProvider(provider)) {
+        return {
+            modelAccess: modelAccessProviderView(provider, safeModelAccessBinding(providerKey, viewOptions)),
+            credential: { hasApiKey: false },
+        };
+    }
+    const keys = isApiKeyProvider(provider) ? readApiKeys(provider) : [];
+    if (keys.length > 0) {
+        const pool = viewOptions.byokKeyPool ?? sharedByokKeyPool();
+        const first = keys.find((key) => key.enabled);
+        return {
+            credential: {
+                // The first enabled key is the one `maskedApiKey` always meant.
+                ...credentialViewFields(first ? { apiKey: first.key } : undefined, providerId),
+                apiKeys: keys.map((key) => apiKeyView(pool, providerKey, key)),
+            },
+        };
+    }
+    return { credential: credentialViewFields(provider.options, providerId) };
+}
+function apiKeyView(pool, providerKey, key) {
+    const rest = pool.rest(providerKey, key.id);
+    const lastProbe = pool.lastProbe(providerKey, key.id);
+    return {
+        id: key.id,
+        ...(key.name ? { name: key.name } : {}),
+        masked: maskApiKey(key),
+        enabled: key.enabled,
+        ...(rest ? { rest } : {}),
+        ...(lastProbe ? { lastProbe } : {}),
+    };
+}
+function safeModelAccessBinding(providerKey, viewOptions) {
+    try {
+        return viewOptions.modelAccessBinding?.(providerKey);
+    }
+    catch {
+        return undefined;
+    }
 }
 function providerModelEntries(config, cache, input) {
     const selected = parseSourceQualifiedModelKey(config.defaultModel);

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access as fsAccess } from "node:fs/promises";
+import { access as fsAccess, stat as fsStat } from "node:fs/promises";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
 import { Type } from "typebox";
@@ -10,6 +10,7 @@ import { theme } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess, waitForChildProcessExit } from "../../utils/child-process.js";
 import { armParentDeathGuard, getShellConfig, getShellEnv, killProcessTree, terminateProcessTreeGracefully, trackDetachedChildPid, untrackDetachedChildPid, } from "../../utils/shell.js";
 import { OutputAccumulator } from "./output-accumulator.js";
+import { applyShellEncodingDefaults, decodeShellOutput, prepareWindowsAnsiCodePageEncoding } from "./shell-encoding.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "./truncate.js";
@@ -131,6 +132,9 @@ async function getWindowsPowerShellLanguageMode(shell, args, cwd, env) {
  * injected for Windows PowerShell 5.1 (pwsh 7+ is natively UTF-8).
  */
 export function createLocalBashOperations(options) {
+    if (options?.shellConfig && options.shellPath !== undefined) {
+        throw new Error("shellConfig and shellPath are mutually exclusive");
+    }
     return {
         separatesOutputStreams: true,
         exec: async (command, cwd, { onData, signal, timeout, env, onProcessEvent }) => {
@@ -142,25 +146,37 @@ export function createLocalBashOperations(options) {
                     // Observers never control execution.
                 }
             };
-            const shellConfig = getShellConfig(options?.shellPath);
+            const shellConfig = options?.shellConfig ?? getShellConfig(options?.shellPath);
             const { shell, args } = shellConfig;
             try {
-                await fsAccess(cwd, constants.F_OK);
+                if (!(await fsStat(cwd)).isDirectory()) {
+                    throw Object.assign(new Error("Not a directory"), { code: "ENOTDIR" });
+                }
+                await fsAccess(cwd, constants.X_OK);
             }
-            catch {
-                throw new Error(`Working directory does not exist: ${cwd}\nCannot execute commands.`);
+            catch (error) {
+                const code = error.code;
+                const reason = code === "ENOTDIR" ? "is not a directory"
+                    : code === "ENOENT" ? "does not exist" : "is not accessible";
+                throw Object.assign(new Error(`Working directory ${reason}: ${cwd}\nCannot execute commands.`, { cause: error }), { code });
             }
             if (signal?.aborted) {
                 throw new Error("aborted");
             }
             const shellEnv = { ...(env ?? getShellEnv()) };
-            // For Windows PowerShell 5.1, inject UTF-8 encoding setup in FullLanguage.
+            applyShellEncodingDefaults(shellEnv);
+            // Resolve the code page before output arrives so decoding never queries the registry synchronously.
+            await prepareWindowsAnsiCodePageEncoding();
+            if (signal?.aborted)
+                throw new Error("aborted");
+            // Windows console encoding can also be inherited by PowerShell 7. Use the
+            // UTF-8 transport for both Windows PowerShell families in FullLanguage.
             // ConstrainedLanguage blocks the .NET APIs used by that wrapper, so carry
             // the UTF-16 command through the process environment and evaluate it in the
             // already-constrained session instead.
             let effectiveCommand = command;
             let stdinCommand;
-            if (shellConfig.type === "powershell") {
+            if (shellConfig.type === "powershell" || (process.platform === "win32" && shellConfig.type === "pwsh")) {
                 const languageMode = await getWindowsPowerShellLanguageMode(shell, args, cwd, shellEnv);
                 if (signal?.aborted)
                     throw new Error("aborted");
@@ -173,6 +189,15 @@ export function createLocalBashOperations(options) {
                     effectiveCommand = wrapWindowsPowerShellStdinCommand();
                     stdinCommand = command;
                 }
+            }
+            else if (process.platform === "win32" && shellConfig.type === "bash") {
+                if (command.includes("\0"))
+                    throw new Error("Bash commands must not contain NUL bytes.");
+                // MSYS argument decoding can alter backslashes in a large `bash -c`
+                // script, including quoted heredoc bodies. Read the exact source before
+                // evaluating it so child commands still receive EOF on stdin, as with -c.
+                effectiveCommand = 'IFS= read -r -d "" __pi_stdin_command || :; eval "$__pi_stdin_command"';
+                stdinCommand = command;
             }
             const guardRequired = options?.parentDeathGuard === true;
             if (signal?.aborted)
@@ -225,13 +250,12 @@ export function createLocalBashOperations(options) {
             if (!guardRequired && stdinCommand !== undefined)
                 child.stdin?.end(stdinCommand);
             const childCompletion = waitForChildProcessExit(child);
-            let timedOut = false;
+            let stoppedBy;
             let timeoutHandle;
             // Stop/timeout send SIGTERM to the process group first so shell
             // `trap ... TERM` cleanup can run, then escalate to SIGKILL after a
-            // grace window. `killEscalation` cancels the pending escalation once
-            // the process exits; re-arming (timeout then abort) replaces the
-            // previous timer instead of leaking it.
+            // grace window. The first stop cause owns the escalation and result;
+            // output emitted during cleanup cannot replace an earlier timeout.
             let killEscalation;
             const scheduleGracefulKill = () => {
                 if (!child.pid)
@@ -240,6 +264,9 @@ export function createLocalBashOperations(options) {
                 killEscalation = terminateProcessTreeGracefully(child.pid);
             };
             const onAbort = () => {
+                if (stoppedBy)
+                    return;
+                stoppedBy = "abort";
                 scheduleGracefulKill();
             };
             if (signal) {
@@ -284,7 +311,9 @@ export function createLocalBashOperations(options) {
                 if (timeout !== undefined && timeout > 0) {
                     const timerStartedAt = Date.now();
                     timeoutHandle = setTimeout(() => {
-                        timedOut = true;
+                        if (stoppedBy)
+                            return;
+                        stoppedBy = "timeout";
                         observe("timeout");
                         scheduleGracefulKill();
                     }, timeout * 1000);
@@ -293,7 +322,7 @@ export function createLocalBashOperations(options) {
                 // Handle shell spawn errors and wait for the process to terminate without hanging
                 // on inherited stdio handles held by detached descendants.
                 const termination = await childCompletion;
-                if (signal?.aborted) {
+                if (stoppedBy === "abort") {
                     throw new BashExecutionError("aborted", {
                         execution: {
                             ...termination,
@@ -305,7 +334,7 @@ export function createLocalBashOperations(options) {
                         },
                     });
                 }
-                if (timedOut) {
+                if (stoppedBy === "timeout") {
                     throw new BashExecutionError(`timeout:${timeout}`, {
                         execution: {
                             ...termination,
@@ -461,7 +490,7 @@ class BashProcessStreamCapture {
     }
     snapshot() {
         return {
-            content: this.truncated ? "" : Buffer.concat(this.chunks).toString("utf-8"),
+            content: this.truncated ? "" : decodeShellOutput(Buffer.concat(this.chunks)),
             truncated: this.truncated,
         };
     }
@@ -582,6 +611,8 @@ export function createBashToolDefinition(cwd, options) {
             const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
             const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
             const output = new OutputAccumulator({ tempFilePrefix: "pi-bash", ...options?.output });
+            const outputController = new AbortController();
+            const executionSignal = signal ? AbortSignal.any([signal, outputController.signal]) : outputController.signal;
             const stdout = new BashProcessStreamCapture();
             const stderr = new BashProcessStreamCapture();
             let updateTimer;
@@ -628,6 +659,8 @@ export function createBashToolDefinition(cwd, options) {
             }
             const handleData = (data, stream) => {
                 output.append(data, stream);
+                if (output.limitExceeded && !executionSignal.aborted)
+                    outputController.abort("BASH_OUTPUT_LIMIT");
                 if (stream === "stdout")
                     stdout.append(data);
                 if (stream === "stderr")
@@ -662,32 +695,50 @@ export function createBashToolDefinition(cwd, options) {
                 }
                 if (truncation.truncated) {
                     details = { truncation, fullOutputPath: snapshot.fullOutputPath };
+                    const outputLocation = snapshot.fullOutputPath
+                        ? `${output.limitExceeded ? "Saved partial output" : "Full output"}: ${snapshot.fullOutputPath}`
+                        : "Full output unavailable";
                     const startLine = truncation.totalLines - truncation.outputLines + 1;
                     const endLine = truncation.totalLines;
                     if (truncation.lastLinePartial) {
                         const lastLineSize = formatSize(output.getLastLineBytes());
-                        text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+                        text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${outputLocation}]`;
                     }
                     else if (truncation.truncatedBy === "lines") {
-                        text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+                        text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. ${outputLocation}]`;
                     }
                     else {
-                        text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+                        text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${outputLocation}]`;
                     }
                 }
                 return { text, details };
             };
             const appendStatus = (text, status) => `${text ? `${text}\n\n` : ""}${status}`;
+            const withOutputLimit = (execution) => {
+                if (!output.limitExceeded || execution.reason === "command_timeout" || (signal?.aborted && !outputController.signal.aborted))
+                    return execution;
+                const { kind, limitBytes } = output.limitExceeded;
+                return {
+                    ...execution,
+                    status: "failed",
+                    reason: "output_limit",
+                    errorCode: "BASH_OUTPUT_LIMIT",
+                    cancellationReason: undefined,
+                    message: `Command stopped: ${kind === "buffer" ? "pending output buffer" : "captured output"} exceeded ${limitBytes} bytes. Saved output is incomplete.`,
+                };
+            };
             const resultDetails = (finished, execution) => ({
                 ...formatOutput(finished).details,
+                ...(output.limitExceeded ? { fullOutputPath: undefined } : {}),
                 execution,
                 ...(timing ? { timing } : {}),
                 ...(options?.output ? { output: {
                         rawBytes: finished.snapshot.rawBytes,
-                        persistence: finished.persistenceError ? "incomplete"
+                        persistence: finished.persistenceError || output.limitExceeded ? "incomplete"
                             : options.output.persistOutput === false ? "host"
                                 : finished.snapshot.fullOutputPath ? "complete" : "inline",
                         ...(finished.persistenceError ? { persistenceError: finished.persistenceError } : {}),
+                        ...(output.limitExceeded && finished.snapshot.fullOutputPath ? { partialOutputPath: finished.snapshot.fullOutputPath } : {}),
                     } } : {}),
                 ...(ops.separatesOutputStreams
                     ? {
@@ -695,10 +746,10 @@ export function createBashToolDefinition(cwd, options) {
                             stdout: finished.stdoutSnapshot.content,
                             stderr: finished.stderrSnapshot.content,
                             exitCode: execution.exitCode,
-                            interrupted: execution.reason === "canceled" || execution.reason === "command_timeout",
+                            interrupted: execution.reason === "canceled" || execution.reason === "command_timeout" || execution.reason === "output_limit",
                             stdoutTruncated: finished.stdoutSnapshot.truncated,
                             stderrTruncated: finished.stderrSnapshot.truncated,
-                            rawOutputPath: finished.snapshot.fullOutputPath,
+                            rawOutputPath: output.limitExceeded ? undefined : finished.snapshot.fullOutputPath,
                         },
                     }
                     : {}),
@@ -710,7 +761,7 @@ export function createBashToolDefinition(cwd, options) {
                 try {
                     const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
                         onData: handleData,
-                        signal,
+                        signal: executionSignal,
                         timeout,
                         env: spawnContext.env,
                         onProcessEvent: (event) => {
@@ -759,18 +810,19 @@ export function createBashToolDefinition(cwd, options) {
                                     : message,
                         };
                     }
+                    execution = withOutputLimit(execution);
                     throw new BashExecutionError(appendStatus(text, execution.message ?? "Command failed"), resultDetails(finished, execution), { cause: err });
                 }
                 const finished = await finishOutput();
                 const { text: outputText } = formatOutput(finished);
-                const execution = {
+                const execution = withOutputLimit({
                     status: !exitSignal && exitCode === 0 ? "succeeded" : "failed",
                     reason: exitSignal ? "signaled" : exitCode === null ? "unknown" : "exited",
                     exitCode,
                     ...(exitSignal ? { signal: exitSignal } : {}),
-                };
+                });
                 if (execution.status !== "succeeded") {
-                    execution.message = exitSignal
+                    execution.message ??= exitSignal
                         ? `Command terminated by signal ${exitSignal}`
                         : exitCode === null
                             ? "Command terminated without an exit code"

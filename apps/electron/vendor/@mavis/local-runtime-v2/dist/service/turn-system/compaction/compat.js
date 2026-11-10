@@ -3,9 +3,28 @@ const APPENDIX_START_V2 = '<mavis-context-appendix version="2">';
 const APPENDIX_START_V3 = '<mavis-context-appendix version="3">';
 const APPENDIX_START_V4 = '<mavis-context-appendix version="4">';
 const APPENDIX_START_V5 = '<mavis-context-appendix version="5">';
+const APPENDIX_START_V6 = '<mavis-context-appendix version="6">';
 const APPENDIX_END = '</mavis-context-appendix>';
 const APPENDIX_SUFFIX = `\n${APPENDIX_END}`;
+/**
+ * Saturation cap shared by the Todo and Background assistant-iteration counters
+ * and by the compaction appendix that carries them. Released histories store
+ * counts up to this value, so lowering it would reject their checkpoints.
+ */
 export const TODO_CADENCE_INTERVAL = 15;
+/**
+ * Assistant iterations since the last TodoWrite and since the last Todo
+ * reminder before the next reminder is due. Matches the 10/10 cadence other
+ * harnesses use; the counters keep saturating at TODO_CADENCE_INTERVAL.
+ */
+export const TODO_REMINDER_INTERVAL = 10;
+/**
+ * User messages since the last TodoWrite after which the list counts as left
+ * behind and the Todo reminder stops resurfacing it. Most lists are updated in
+ * the Turn that wrote them; one that three user messages passed by belongs to
+ * work the user moved on from. A new TodoWrite starts the count again.
+ */
+export const TODO_REMINDER_STALE_USER_MESSAGES = 3;
 const APPENDIX_V1_KEYS = new Set(['version', 'recentUserQueries', 'todoState']);
 const APPENDIX_V2_KEYS = new Set([...APPENDIX_V1_KEYS, 'todoCadence']);
 const APPENDIX_V3_KEYS = new Set([...APPENDIX_V2_KEYS, 'subagents']);
@@ -59,6 +78,11 @@ const CADENCE_MARKDOWN_FIELDS = [
     'Assistant iterations since Todo write',
     'Assistant iterations since reminder',
 ];
+/** Version 6 adds the user messages since the Todo write to the same section. */
+const CADENCE_MARKDOWN_FIELDS_V6 = [
+    ...CADENCE_MARKDOWN_FIELDS,
+    'User messages since Todo write',
+];
 const BACKGROUND_CADENCE_MARKDOWN_FIELDS = [
     'Assistant iterations since reminder',
     'Observed terminal task count',
@@ -83,7 +107,7 @@ const SUBAGENT_ITEM_MARKDOWN_FIELDS = [
     'Final result',
 ];
 export function appendCompactionState(summary, state) {
-    const prefix = `\n\n${APPENDIX_START_V5}\n`;
+    const prefix = `\n\n${APPENDIX_START_V6}\n`;
     return `${summary}${prefix}${renderMarkdownAppendix(state)}${APPENDIX_SUFFIX}`;
 }
 function renderMarkdownAppendix(state) {
@@ -94,9 +118,10 @@ function renderMarkdownAppendix(state) {
         sections.push(renderMarkdownItemsSection('Todo state', 'Todo', TODO_MARKDOWN_FIELDS, state.todoState.map((item) => [item.content, item.status, item.priority])));
     }
     if (state.todoCadence !== undefined) {
-        sections.push(renderMarkdownRecordSection('Todo cadence', CADENCE_MARKDOWN_FIELDS, [
+        sections.push(renderMarkdownRecordSection('Todo cadence', CADENCE_MARKDOWN_FIELDS_V6, [
             state.todoCadence.assistantIterationsSinceTodoWrite,
             state.todoCadence.assistantIterationsSinceReminder,
+            state.todoUserMessagesSinceWrite ?? null,
         ]));
     }
     if (state.backgroundCadence !== undefined) {
@@ -182,17 +207,25 @@ function readNativeSummary(summary) {
     return {
         summary: summary.slice(0, boundary.start),
         recentUserQueries: appendix.recentUserQueries,
-        ...(appendix.todoState === undefined ? {} : { todoState: appendix.todoState }),
-        ...('todoCadence' in appendix && appendix.todoCadence !== undefined
-            ? { todoCadence: appendix.todoCadence }
-            : {}),
-        ...('subagents' in appendix && appendix.subagents !== undefined
-            ? { subagents: appendix.subagents }
-            : {}),
-        ...('backgroundCadence' in appendix && appendix.backgroundCadence !== undefined
-            ? { backgroundCadence: appendix.backgroundCadence }
-            : {}),
+        ...pickAppendixState(appendix),
     };
+}
+const OPTIONAL_APPENDIX_STATE_KEYS = [
+    'todoState',
+    'todoCadence',
+    'todoUserMessagesSinceWrite',
+    'subagents',
+    'backgroundCadence',
+];
+/** Copies the optional state a parsed appendix of any version carries. */
+function pickAppendixState(appendix) {
+    const state = {};
+    for (const key of OPTIONAL_APPENDIX_STATE_KEYS) {
+        const value = Reflect.get(appendix, key);
+        if (value !== undefined)
+            state[key] = value;
+    }
+    return state;
 }
 function findTrailingAppendix(summary) {
     if (!summary.endsWith(APPENDIX_SUFFIX))
@@ -203,13 +236,14 @@ function findTrailingAppendix(summary) {
         { prefix: `\n\n${APPENDIX_START_V3}\n`, version: 3 },
         { prefix: `\n\n${APPENDIX_START_V4}\n`, version: 4 },
         { prefix: `\n\n${APPENDIX_START_V5}\n`, version: 5 },
+        { prefix: `\n\n${APPENDIX_START_V6}\n`, version: 6 },
     ].map((candidate) => ({ ...candidate, start: summary.lastIndexOf(candidate.prefix) }));
     const match = candidates.sort((left, right) => right.start - left.start)[0];
     return match && match.start >= 0 ? match : undefined;
 }
 function parseAppendix(json, version) {
-    if (version === 4 || version === 5)
-        return parseMarkdownAppendix(json, version === 5);
+    if (version >= 4)
+        return parseMarkdownAppendix(json, version);
     const value = parseJsonRecord(json);
     if (!value || value['version'] !== version)
         return undefined;
@@ -226,7 +260,8 @@ function parseJsonRecord(json) {
         return undefined;
     }
 }
-function parseMarkdownAppendix(markdown, allowBackgroundCadence) {
+function parseMarkdownAppendix(markdown, version) {
+    const allowBackgroundCadence = version >= 5;
     const sections = parseMarkdownSections(markdown);
     if (!sections)
         return undefined;
@@ -235,7 +270,7 @@ function parseMarkdownAppendix(markdown, allowBackgroundCadence) {
         return undefined;
     const recentUserQueries = parseMarkdownQueries(queryBody);
     const todoState = parseOptionalMarkdownSection(sections, 'Todo state', parseMarkdownTodos);
-    const todoCadence = parseOptionalMarkdownSection(sections, 'Todo cadence', parseMarkdownCadence);
+    const { todoCadence, todoUserMessagesSinceWrite } = parseMarkdownTodoCadenceSection(sections, version);
     const backgroundCadence = parseOptionalMarkdownSection(sections, 'Background cadence', parseMarkdownBackgroundCadence);
     const subagents = parseOptionalMarkdownSection(sections, 'Subagents', parseSubagentMarkdown);
     if (!recentUserQueries)
@@ -249,10 +284,29 @@ function parseMarkdownAppendix(markdown, allowBackgroundCadence) {
     const background = normalizeParsedMarkdownBackgroundCadence(backgroundCadence.value);
     if (!base || !background.valid)
         return undefined;
-    return {
+    const parsed = {
         ...base,
-        version: 5,
         ...(background.value === undefined ? {} : { backgroundCadence: background.value }),
+    };
+    return withAppendixVersion(parsed, version, todoUserMessagesSinceWrite);
+}
+function withAppendixVersion(parsed, version, todoUserMessagesSinceWrite) {
+    return version === 6
+        ? { ...parsed, version: 6, ...optionalCount(todoUserMessagesSinceWrite) }
+        : { ...parsed, version: 5 };
+}
+function optionalCount(todoUserMessagesSinceWrite) {
+    return todoUserMessagesSinceWrite === undefined ? {} : { todoUserMessagesSinceWrite };
+}
+/** Version 6 adds the user messages since the Todo write to the Todo cadence record. */
+function parseMarkdownTodoCadenceSection(sections, version) {
+    const fields = version === 6 ? CADENCE_MARKDOWN_FIELDS_V6 : CADENCE_MARKDOWN_FIELDS;
+    const section = parseOptionalMarkdownSection(sections, 'Todo cadence', (body) => parseMarkdownCadence(body, fields));
+    if (section.value === undefined)
+        return { todoCadence: { valid: section.valid } };
+    return {
+        todoCadence: { valid: true, value: section.value.cadence },
+        ...optionalCount(section.value.userMessagesSinceWrite),
     };
 }
 function parseMarkdownAppendixBase(recentUserQueries, todoState, todoCadence, subagents) {
@@ -280,14 +334,24 @@ function parseMarkdownQueries(body) {
 function parseMarkdownTodos(body) {
     return parseMarkdownItems(body, 'Todo', TODO_MARKDOWN_FIELDS)?.map(([content, status, priority]) => ({ content, status, priority }));
 }
-function parseMarkdownCadence(body) {
-    const values = parseMarkdownRecord(body, CADENCE_MARKDOWN_FIELDS);
-    return values
-        ? {
+function parseMarkdownCadence(body, fields) {
+    const values = parseMarkdownRecord(body, fields);
+    if (!values)
+        return undefined;
+    const userMessages = values[2];
+    if (userMessages !== undefined && userMessages !== null && !isNonNegativeCount(userMessages)) {
+        return undefined;
+    }
+    return {
+        cadence: {
             assistantIterationsSinceTodoWrite: values[0],
             assistantIterationsSinceReminder: values[1],
-        }
-        : undefined;
+        },
+        ...(typeof userMessages === 'number' ? { userMessagesSinceWrite: userMessages } : {}),
+    };
+}
+function isNonNegativeCount(value) {
+    return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 function parseMarkdownBackgroundCadence(body) {
     const values = parseMarkdownRecord(body, BACKGROUND_CADENCE_MARKDOWN_FIELDS);

@@ -1,6 +1,7 @@
 import { watch } from 'node:fs';
 import { lstat, readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, join, resolve, sep } from 'node:path';
+import { createLinuxWorkspaceGitWatcher } from './linux-watcher.js';
 const DEFAULT_QUIET_WINDOW_MS = 120;
 const DEFAULT_MAX_WAIT_MS = 800;
 const MAX_CLASSIFIED_PATHS = 1_000;
@@ -27,6 +28,9 @@ const REPOSITORY_STATE_PREFIXES = ['refs/', 'rebase-apply/', 'rebase-merge/', 's
  * manager is told to refresh; objects and logs are never watched.
  */
 export async function createWorkspaceGitWatcher(options, dependencies = {}) {
+    if ((dependencies.platform ?? process.platform) === 'linux') {
+        return createLinuxWorkspaceGitWatcher(options);
+    }
     const workspace = await realpath(options.workspace);
     const watchDirectory = dependencies.watchDirectory ??
         ((directory, recursive, listener) => watch(directory, { recursive }, (_eventType, fileName) => listener(fileName)));

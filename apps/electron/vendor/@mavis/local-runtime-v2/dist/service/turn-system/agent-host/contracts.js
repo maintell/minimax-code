@@ -54,6 +54,60 @@ function isProviderOmitHostMetadata(value) {
         hasExactProtocolKeys(value, ['providerVisibility']) &&
         value['providerVisibility'] === 'omit');
 }
+/**
+ * Accepts exactly the origin `mavis-session-send.ts` freezes at delivery.
+ *
+ * Extra keys fail closed: a caller that smuggles fields past the shape must
+ * not have them reach the model-facing envelope. A SideChat origin
+ * (`kind: 'sidechat-send'`) has no `command` and falls out here, which keeps
+ * it on its own display path instead of the peer envelope.
+ */
+export function parsePeerSessionOrigin(value) {
+    if (!isPeerSessionOriginShape(value))
+        return undefined;
+    const fromAgent = optionalProtocolString(value, 'fromAgent');
+    const fromTitle = optionalProtocolString(value, 'fromTitle');
+    const fromDevice = optionalProtocolString(value, 'fromDevice');
+    if (fromAgent === null || fromTitle === null || fromDevice === null)
+        return undefined;
+    return {
+        fromSession: value['fromSession'],
+        command: 'session send',
+        ...(fromAgent !== undefined ? { fromAgent } : {}),
+        ...(fromTitle !== undefined ? { fromTitle } : {}),
+        ...(fromDevice !== undefined ? { fromDevice } : {}),
+        ...(value['remote'] === true ? { remote: true } : {}),
+    };
+}
+const PEER_SESSION_ORIGIN_OPTIONAL_KEYS = [
+    'fromAgent',
+    'fromTitle',
+    'fromDevice',
+    'remote',
+];
+function isPeerSessionOriginShape(value) {
+    if (!isProtocolRecord(value))
+        return false;
+    const keys = [
+        'fromSession',
+        'command',
+        ...PEER_SESSION_ORIGIN_OPTIONAL_KEYS.filter((key) => Object.hasOwn(value, key)),
+    ];
+    const fromSession = value['fromSession'];
+    return (hasExactProtocolKeys(value, keys) &&
+        value['command'] === 'session send' &&
+        typeof fromSession === 'string' &&
+        fromSession.trim().length > 0 &&
+        // Only `remote: true` is accepted, so a sender on this runtime cannot mark itself remote by accident.
+        (!Object.hasOwn(value, 'remote') || value['remote'] === true));
+}
+/** `undefined` when absent, `null` when present with the wrong type. */
+function optionalProtocolString(value, key) {
+    const field = value[key];
+    if (field === undefined)
+        return undefined;
+    return typeof field === 'string' ? field : null;
+}
 export function parseBackgroundTaskOriginMetadata(value) {
     if (!isProtocolRecord(value))
         return undefined;
@@ -71,6 +125,14 @@ export function parseBackgroundTaskOriginMetadata(value) {
         taskIds,
         ...(observedTerminalCount === undefined ? {} : { observedTerminalCount }),
     };
+}
+/** Display snapshots stay on the queue message; AgentHost receives only execution metadata. */
+export function parseBackgroundTaskDeliveryOrigin(value) {
+    if (!isProtocolRecord(value))
+        return undefined;
+    const metadata = { ...value };
+    delete metadata.tasks;
+    return parseBackgroundTaskOriginMetadata(metadata);
 }
 function readNonEmptyTaskIds(value) {
     if (!Array.isArray(value) ||
@@ -98,5 +160,5 @@ function isProtocolRecord(value) {
 function readProtocolRecord(value) {
     return isProtocolRecord(value) ? value : undefined;
 }
-export { isUserSteeringProducer } from './runner/contracts.js';
+export { isHandedBackOnClose, isTeardownDurableSteeringProducer, isUserSteeringProducer, } from './runner/contracts.js';
 //# sourceMappingURL=contracts.js.map

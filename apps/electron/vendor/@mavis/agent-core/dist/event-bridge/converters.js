@@ -109,6 +109,9 @@ export function toolCallFromRuntime(tc) {
     return {
         tool_name: displayTc.tool_name,
         tool_call_id: displayTc.tool_call_id,
+        ...(displayTc.parent_tool_call_id
+            ? { parent_tool_call_id: displayTc.parent_tool_call_id }
+            : {}),
         tool_call_status: toLegacyToolCallStatus(displayTc.status),
         ...(displayTc.args !== undefined ? { tool_call_args: JSON.stringify(displayTc.args) } : {}),
         ...(displayTc.args_text_delta !== undefined
@@ -444,6 +447,10 @@ export async function buildCompletedAssistantMessage(input, respDataTransform) {
         ...(input.usage ? { usage: input.usage } : {}),
         nowMs: input.nowMs,
     }), { sessionId: input.sessionId, turnId: input.turnId }, input.logger);
+    // 只标记未被 transform 改写的系统错误，不能让替换后的正文跳过审核。
+    if (input.systemErrorContent && respData.agent_message?.msg_content === input.text) {
+        respData.agent_message.msg_content_source = 'system_error';
+    }
     return buildStreamRespEvent({
         sessionId: input.sessionId,
         turnId: input.turnId,

@@ -67,6 +67,7 @@ export function isRetiredLegacyMatrixMcpServerConfig(server, config) {
     return (config.metadata?.['mavisBuiltinMcpServer'] === BUILTIN_MATRIX_SERVER_NAME &&
         config.metadata?.['mavisBuiltinMcpVersion'] === LEGACY_MATRIX_MCP_VERSION);
 }
+/** @public exercised directly by the colocated unit suite. */
 export function buildBuiltinMatrixTokenOverrides(context) {
     const workspaceRoot = resolveMatrixWorkspaceRoot(context);
     const auth = context?.authContext;
@@ -173,5 +174,21 @@ function readProcessStringEnv() {
             env[key] = value;
     }
     return env;
+}
+/** Matrix stdio identity layered over host-provided overrides. */
+export function matrixTokenOverrides(dataDir, base, context) {
+    const matrixOverrides = buildBuiltinMatrixTokenOverrides({
+        ...(context ?? {}),
+        dataDir,
+    });
+    return {
+        ...(base ?? {}),
+        connectionKey: matrixOverrides.connectionKey,
+        env: {
+            ...(base?.env ?? {}),
+            ...matrixOverrides.env,
+        },
+        ...(base?.headers ? { headers: base.headers } : {}),
+    };
 }
 //# sourceMappingURL=builtin-matrix.js.map

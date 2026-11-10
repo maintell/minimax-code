@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { WorkspaceGitSnapshotChangedError } from '../contracts.js';
 import { getWorkspaceFileDiff } from './diffs.js';
 import { git, gitStream } from './git-process.js';
-import { readWorkspaceFile, resolveWorkspacePath } from './workspace-path.js';
+import { readWorkspaceFile, resolveWorkspacePath } from './filesystem/workspace-path.js';
 import { normalizeReviewSearchQuery, searchResolvedWorkspaceReviewDiffs, } from './review-search.js';
 const EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const REVIEW_UNTRACKED_FILE_LIMIT = 256;

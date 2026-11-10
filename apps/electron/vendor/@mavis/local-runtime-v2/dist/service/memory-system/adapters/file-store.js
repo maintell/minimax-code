@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile, } from 'node:fs/promises';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { lstat, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises';
 import { basename, dirname, join, relative, sep } from 'node:path';
 const SAFE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const SAFE_FILE_NAME_RE = /^[A-Za-z0-9_-]+\.md$/;
@@ -201,67 +202,51 @@ export class MemoryFileStoreImpl {
             throw new Error(`Unsafe consolidation workdir: ${workDir}`);
         }
     }
-    async createStaging(previewId, owner) {
-        assertSafeName(previewId);
-        const dir = this.stagingDir(previewId);
-        await assertSafePath(this.dataDir, dir);
-        await mkdir(dir, { recursive: true });
-        await writeFile(join(dir, 'owner.json'), JSON.stringify({ agentName: owner.agentName }), 'utf8');
-    }
-    async writeStaging(previewId, fileName, markdown) {
-        assertSafeName(previewId);
-        assertSafeFileName(fileName);
-        const target = join(this.stagingDir(previewId), fileName);
-        await assertSafePath(this.dataDir, target);
-        await atomicWrite(target, markdown);
-    }
-    async readStaging(previewId) {
-        assertSafeName(previewId);
-        const dir = this.stagingDir(previewId);
-        await assertSafePath(this.dataDir, dir);
-        let ownerJson;
-        try {
-            await assertSafePath(this.dataDir, join(dir, 'owner.json'));
-            ownerJson = await readFile(join(dir, 'owner.json'), 'utf8');
-        }
-        catch {
-            return undefined;
-        }
-        const owner = JSON.parse(ownerJson);
-        let entries;
-        try {
-            entries = await readdir(dir);
-        }
-        catch {
-            return undefined;
-        }
-        const files = [];
-        for (const entry of entries) {
-            if (entry === 'owner.json')
-                continue;
-            assertSafeFileName(entry);
-            await assertSafePath(this.dataDir, join(dir, entry));
-            const content = await readFile(join(dir, entry), 'utf8');
-            files.push({ fileName: entry, markdown: content });
-        }
-        return { owner, files };
-    }
-    async deleteStaging(previewId) {
-        assertSafeName(previewId);
-        await assertSafePath(this.dataDir, this.stagingDir(previewId));
-        await rm(this.stagingDir(previewId), { recursive: true, force: true });
-    }
-    async readLegacySources(agentName) {
+    async readLegacyAgentSources(agentName) {
         assertSafeName(agentName);
-        const legacyDir = join(this.dataDir, 'agents', agentName, 'memory');
         const results = [];
-        const userPath = join(this.dataDir, 'memory', 'user.md');
-        await assertSafePath(this.dataDir, userPath);
-        const userContent = await safeReadFile(userPath);
-        if (userContent !== undefined)
-            results.push({ sourceFile: 'memory/user.md', content: userContent, userAuthored: true });
-        await this.collectLegacyFiles(legacyDir, '', results);
+        await this.collectLegacyFiles(join(this.dataDir, 'agents', agentName, 'memory'), '', results);
         return results;
+    }
+    async snapshotLegacyUserMemory() {
+        const snapshotPath = this.legacyUserSnapshotPath();
+        await assertSafePath(this.dataDir, snapshotPath);
+        const existing = await safeReadFile(snapshotPath);
+        if (existing !== undefined)
+            return existing.trim() ? existing : undefined;
+        const userPath = this.userMemoryPath();
+        await assertSafePath(this.dataDir, userPath);
+        const content = (await safeReadFile(userPath)) ?? '';
+        await atomicWrite(snapshotPath, content);
+        return content.trim() ? content : undefined;
+    }
+    /**
+     * 比较与清空在同一段同步代码里完成，期间同进程的资料写入无法插入：资料编辑器先写临时文件
+     * 再改名，它的改名落在这段之后则新资料生效，落在之前则这里读到新内容、不再清空。
+     * 同一数据目录只有一个持有所有者租约的 runtime，跨进程写入不在此考虑。
+     */
+    async clearLegacyUserMemory(snapshot) {
+        const userPath = this.userMemoryPath();
+        await assertSafePath(this.dataDir, userPath);
+        let current;
+        try {
+            current = readFileSync(userPath, 'utf8');
+        }
+        catch (error) {
+            if (isENOENT(error))
+                return;
+            throw error;
+        }
+        if (current !== snapshot)
+            return;
+        const tmp = join(dirname(userPath), `.${basename(userPath)}.${process.pid}.${randomUUID()}.tmp`);
+        writeFileSync(tmp, '', { mode: 0o600, flag: 'wx' });
+        renameSync(tmp, userPath);
+    }
+    async deleteLegacyUserSnapshot() {
+        const snapshotPath = this.legacyUserSnapshotPath();
+        await assertSafePath(this.dataDir, snapshotPath);
+        await unlinkSafe(snapshotPath);
     }
     async collectLegacyFiles(root, subdir, result) {
         const dir = join(root, subdir);
@@ -286,7 +271,6 @@ export class MemoryFileStoreImpl {
                 result.push({
                     sourceFile: relative(this.dataDir, file).split(sep).join('/'),
                     content: await readFile(file, 'utf8'),
-                    userAuthored: false,
                 });
             }
         }
@@ -294,8 +278,12 @@ export class MemoryFileStoreImpl {
     scopeDir(scopeKey) {
         return join(this.memoriesRoot, 'scopes', scopeKey);
     }
-    stagingDir(previewId) {
-        return join(this.memoriesRoot, 'staging', previewId);
+    userMemoryPath() {
+        return join(this.dataDir, 'memory', 'user.md');
+    }
+    /** 用户资料的迁移副本：在 memories/ 下、任何记忆作用域之外，记忆工具读不到，也不注入对话。 */
+    legacyUserSnapshotPath() {
+        return join(this.memoriesRoot, 'legacy', 'user.md');
     }
     async ensureScopeDir(scopeKey) {
         const dir = this.scopeDir(scopeKey);
@@ -327,9 +315,8 @@ function assertSafeName(value) {
     }
 }
 /**
- * 暂存区文件名。`previewId` 之类的纯目录分量走 assertSafeName,不含点号;暂存条目文件
- * 是 `<合成 SessionId>.md`,必须放行单个 `.md` 后缀。仍然拒绝路径分隔符、`..` 与
- * 前导点,因此路径安全边界不变(§6.3)。
+ * 带单个 `.md` 后缀的文件名（如 note 文件）。纯目录分量走 assertSafeName，不含点号；
+ * 这里仍然拒绝路径分隔符、`..` 与前导点，因此路径安全边界不变(§6.3)。
  */
 function assertSafeFileName(value) {
     if (!value || !SAFE_FILE_NAME_RE.test(value)) {

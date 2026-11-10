@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createUserMessageId } from '../session-system/index.js';
-import { parseBackgroundTaskOriginMetadata } from './agent-host/contracts.js';
+import { parseBackgroundTaskDeliveryOrigin } from './agent-host/contracts.js';
 import { agentHostModelFromQueue } from './agent-host/index.js';
 export function createQueueDispatcher(options) {
     const states = new Map();
@@ -485,13 +485,20 @@ function queueDeliveryIdentity(claim) {
         unstartedFromTurnIds: attempts.map((attempt) => attempt.turnId),
     };
 }
+/**
+ * A redelivery admits under a per-claim id (an earlier attempt may hold the
+ * item's own id) and keeps the item's id as a receipt alias, so a repeated
+ * request for that item still finds the Turn that consumed it.
+ */
 function queueClientRequestIdentity(claim) {
     if (!claim.clientRequestId)
         return {};
-    const clientRequestId = claim.item.deliveryAttempts?.length
-        ? `queue-delivery:${claim.claimId}`
-        : claim.clientRequestId;
-    return { clientRequestId };
+    if (!claim.item.deliveryAttempts?.length)
+        return { clientRequestId: claim.clientRequestId };
+    return {
+        clientRequestId: `queue-delivery:${claim.claimId}`,
+        receiptAliases: [claim.clientRequestId],
+    };
 }
 function exactRejectedResult(queueItemId, result) {
     if (result.queueDisposition === 'defer')
@@ -515,7 +522,7 @@ function toAgentInput(claim, item) {
     const channelContext = claim.message.channelContext ?? item.channelContext;
     const model = toModel(item.model);
     const origin = isTrustedBackgroundQueueClaim(claim)
-        ? parseBackgroundTaskOriginMetadata(claim.message.origin)
+        ? parseBackgroundTaskDeliveryOrigin(claim.message.origin)
         : undefined;
     return {
         text: item.immediateSendBatch?.members.map((member) => member.message.content).join('\n\n') ??
@@ -525,6 +532,7 @@ function toAgentInput(claim, item) {
             : claim.message.attachments).map(toAttachment),
         ...computerUseInput(claim, item),
         ...(origin ? { origin } : {}),
+        ...(claim.message.computerUse ? { computerUse: claim.message.computerUse } : {}),
         ...(channelContext ? { channelContext } : {}),
         ...(claim.message.quotedMessage ? { quotedMessage: claim.message.quotedMessage } : {}),
         ...(model ? { model } : {}),

@@ -13,9 +13,12 @@ export function createLocalTurnToolCatalogInput(context, desktopCapabilities) {
         llmModel: readResolvedModel(context.model),
         effectivePluginSkills: readEffectivePluginSkills(context.agentConfig),
         ...(context.userInput ? { userText: context.userInput.text } : {}),
+        // The Session mode alone: the prompt prefix must not change with what started the Turn.
+        ...(context.agentConfig.ptc_enabled === true ? { ptcEnabled: true } : {}),
         ...(modelCapabilities ? { modelCapabilities } : {}),
         ...(agentProfile ? { agentProfile } : {}),
         ...(desktopCapabilities ? { desktopCapabilities } : {}),
+        ...(context.history.length === 0 ? { sessionFirstTurn: true } : {}),
     };
 }
 function readEffectivePluginSkills(agentConfig) {
@@ -88,9 +91,13 @@ function readConfigSelection(profile) {
         ...optionalStringArray(source, 'disallowedTools'),
         ...optionalStringArray(source, 'mcpServers'),
         ...optionalStringArray(source, 'skills'),
-        ...optionalStringArray(source, 'extensionSkills'),
+        ...frozenSelectorVersion(source.frozenSelectorVersion),
     };
     return Object.keys(selection).length > 0 ? selection : undefined;
+}
+/** Diagnostics only: present when the profile was rendered from a Task snapshot. */
+function frozenSelectorVersion(value) {
+    return value === 2 || value === 'legacy' ? { frozenSelectorVersion: value } : {};
 }
 function optionalStringArray(record, key) {
     const value = record[key];

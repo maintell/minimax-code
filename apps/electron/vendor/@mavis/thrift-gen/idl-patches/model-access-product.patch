@@ -1,0 +1,18 @@
+--- a/matrix/api_common/model_access.thrift
++++ b/matrix/api_common/model_access.thrift
+@@ -76,0 +77,2 @@
++    // Only account subscriptions; public services and API-key imports are unaffected.
++    5: optional bool subscriptions_enabled
+@@ -130 +132 @@
+-    // login | subscriptionBorrow | apiKeyScan
++    // subscriptions | login | subscriptionBorrow | apiKeyScan
+@@ -301,0 +304,2 @@
++    // Ordered selected connections; may omit the stable entry account, or be empty.
++    4: optional list<string> members (api.body="members")
+@@ -309,0 +314 @@
++    5: optional list<string> selected
+--- a/matrix/api_common/model_provider.thrift
++++ b/matrix/api_common/model_provider.thrift
+@@ -146,0 +147,2 @@
++    8: optional string account_masked // Display-only account label, never a credential or raw subject.
++    9: optional string group_provider_id // Stable display/routing entry; no credential locator.

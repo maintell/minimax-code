@@ -64,7 +64,11 @@ function queryTime(input, hash, nowMs) {
     return Number(previous.nowMs);
 }
 export function normalizeSidebarQuery(input, nowMs, internalRootIds = [], rootAgentNames) {
-    const normalized = { ...normalizeInputs(input), internalRootIds: [...internalRootIds].sort(), ...(rootAgentNames ? { rootAgentNames: [...new Set(rootAgentNames)].sort() } : {}) };
+    const normalized = {
+        ...normalizeInputs(input),
+        internalRootIds: [...internalRootIds].sort(),
+        ...(rootAgentNames ? { rootAgentNames: [...new Set(rootAgentNames)].sort() } : {}),
+    };
     const hash = createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
     const queryNowMs = queryTime(input, hash, nowMs);
     const context = encodeObject({ v: 1, hash, nowMs: queryNowMs });

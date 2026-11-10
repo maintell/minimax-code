@@ -57,13 +57,13 @@ export class HostConnectorSessionLifecycle {
                 this.#state = 'active';
                 return true;
             },
-            commit: async () => {
-                if (!drained || !this.#ownsQuiesce(token)) {
+            commit: async (options) => {
+                if (!this.#ownsQuiesce(token) || !(drained || options?.force === true)) {
                     throw new HostConnectorProtocolError('Host Connector quiesce is not drained');
                 }
                 this.#activeQuiesce = undefined;
                 this.#state = 'stale';
-                input.commit();
+                input.commit(!drained);
             },
         };
     }

@@ -8,7 +8,7 @@ const baseDefinitions = [
         labelKey: 'settings.shortcuts.actions.mini_chat.label',
         descriptionKey: 'settings.shortcuts.actions.mini_chat.description',
         searchKeywordsKey: 'settings.shortcuts.actions.mini_chat.keywords',
-        defaults: { mac: 'Alt+A', windows: 'Alt+A' },
+        defaults: { mac: null, windows: null },
         configurable: true,
         handledBy: 'electron-global',
     }),
@@ -77,6 +77,18 @@ const baseDefinitions = [
         commandMenuGroup: 'recommended',
     }),
     definition({
+        id: 'sidechat.create',
+        category: 'panels',
+        scope: 'app',
+        labelKey: 'settings.shortcuts.actions.sidechat_create.label',
+        descriptionKey: 'settings.shortcuts.actions.sidechat_create.description',
+        searchKeywordsKey: 'settings.shortcuts.actions.sidechat_create.keywords',
+        defaults: { mac: 'Option+Command+S', windows: 'Ctrl+Alt+S' },
+        configurable: true,
+        handledBy: 'renderer',
+        commandMenuGroup: 'panels',
+    }),
+    definition({
         id: 'sidebar.toggle',
         category: 'panels',
         scope: 'app',
@@ -132,6 +144,18 @@ const baseDefinitions = [
         descriptionKey: 'settings.shortcuts.actions.workspace_panel_toggle.description',
         searchKeywordsKey: 'settings.shortcuts.actions.workspace_panel_toggle.keywords',
         defaults: { mac: 'Command+Alt+B', windows: 'Ctrl+Alt+B' },
+        configurable: true,
+        handledBy: 'renderer',
+        commandMenuGroup: 'panels',
+    }),
+    definition({
+        id: 'workspacePanel.toggleOverview',
+        category: 'panels',
+        scope: 'app',
+        labelKey: 'settings.shortcuts.actions.workspace_panel_toggle_overview.label',
+        descriptionKey: 'settings.shortcuts.actions.workspace_panel_toggle_overview.description',
+        searchKeywordsKey: 'settings.shortcuts.actions.workspace_panel_toggle_overview.keywords',
+        defaults: { mac: 'Command+Alt+W', windows: 'Ctrl+Alt+W' },
         configurable: true,
         handledBy: 'renderer',
         commandMenuGroup: 'panels',
@@ -231,8 +255,9 @@ const baseDefinitions = [
         labelKey: 'settings.shortcuts.actions.asr_toggle.label',
         descriptionKey: 'settings.shortcuts.actions.asr_toggle.description',
         searchKeywordsKey: 'settings.shortcuts.actions.asr_toggle.keywords',
-        // Ctrl (not Command) on macOS as well, matching ChatGPT's voice toggle.
-        defaults: { mac: 'Ctrl+Shift+D', windows: 'Ctrl+Shift+D' },
+        // Ctrl (not Command) on macOS as well: one key starts dictation and the
+        // same key finishes it (the ✓ tooltip shows it as ⌃D).
+        defaults: { mac: 'Ctrl+D', windows: 'Ctrl+D' },
         configurable: true,
         handledBy: 'renderer',
     }),
@@ -348,6 +373,17 @@ export const SHORTCUT_DEFINITIONS = [
     ...baseDefinitions,
     ...sessionSlotDefinitions,
 ];
+export function isStandardShortcutAction(id) {
+    return id === 'session.find' || id === 'workspacePanel.closeCurrentTab';
+}
+const disabledAppShortcutOverrides = Object.fromEntries(SHORTCUT_DEFINITIONS.filter(({ id }) => !isStandardShortcutAction(id)).map(({ id }) => [
+    id,
+    null,
+]));
+/** Suspend MCode bindings while retaining the platform's default Find and Close commands. */
+export function getActiveShortcutOverrides(overrides, enabled) {
+    return enabled ? overrides : disabledAppShortcutOverrides;
+}
 const definitionsById = new Map(SHORTCUT_DEFINITIONS.map((value) => [value.id, value]));
 export function getShortcutDefinition(id) {
     const value = definitionsById.get(id);

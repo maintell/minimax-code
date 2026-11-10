@@ -2,7 +2,7 @@
 
 This package is the desktop client of MiniMax Code: the Electron application
 whose shell, main process, renderer bundle and runtime resources were restored
-from the publicly distributed Windows build (`MiniMax Code` 3.1.1, Electron
+from the publicly distributed Windows build (`MiniMax Code` 3.1.13, Electron
 42.8.0). See [RESTORATION.md](./RESTORATION.md) for exactly what was recovered,
 how, and which parts are shipped as prebuilt artifacts.
 
@@ -39,10 +39,31 @@ pnpm package                        # build + electron-builder -> dist/installer
 `MMX_USER_DATA_DIR` to run with an isolated profile so the instance does not
 collide with an installed client's single-instance lock.
 
+`pnpm build` also drops outputs left behind by a previous shipped build: tsc
+only emits the modules that still have a source, so a removed module would
+otherwise stay in `dist/main` (or `dist/model-menu`) and be packaged into the
+installer.
+
 `pnpm package` writes `dist/installers/win-unpacked/` and an NSIS installer.
 Native modules are shipped prebuilt for Electron 42 (extracted from the
 installed client), therefore `npmRebuild` is disabled in
 `electron-builder.yml` and no local toolchain is required.
+
+A local packaging run can fail with `makensis.exe timed out after 4 minutes`:
+electron-builder writes the NSIS script to `makensis` stdin and kills the
+process after a hard-coded four minutes (`builder-util/out/util.js`), which the
+maximum-compressed ~260 MB payload can exceed on a slow disk — the app payload
+is compressed before that step, so the failure is not a configuration error.
+For a workstation build either raise that timeout in `node_modules` (not a
+tracked file) or package with `compression: store`, which skips payload
+compression and yields a larger installer. The `Desktop release` runner has
+enough headroom and keeps the shipped settings.
+
+`pnpm package` exists for local verification. **Releases are built by GitHub
+Actions**: run the `Desktop release` workflow (or push a `desktop-v<version>` tag
+matching `package.json`), which packages the client on `windows-latest` and
+publishes the installer, its blockmap and `latest.yml` to the release. Do not
+hand-publish a workstation build.
 
 ## Dependency policy
 

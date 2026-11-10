@@ -24,7 +24,7 @@
  *
  * @module
  */
-import { isAbsolute } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { stripRuntimeBoundaryKeysFrom } from '@mavis/shared/runtime-boundary-env';
 /**
  * Precise `scrub` blocklist. Selection rule (reference CLI GHA_SUBPROCESS_SCRUB
@@ -131,10 +131,12 @@ export function resolveBashEnvPolicy(overrides, envSource = process.env) {
         mode,
         ...(overrides?.allowlist ? { allowlist: overrides.allowlist } : {}),
         ...(overrides?.prependPath ? { prependPath: overrides.prependPath } : {}),
+        ...(overrides?.removePath ? { removePath: overrides.removePath } : {}),
         ...(overrides?.spawnPreflight ? { spawnPreflight: overrides.spawnPreflight } : {}),
     };
 }
-export function sanitizeBashSubprocessEnv(env, policy) {
+export function sanitizeBashSubprocessEnv(env, source) {
+    const policy = typeof source === 'function' ? source() : source;
     policy.spawnPreflight?.();
     const out = { ...env };
     const removed = [];
@@ -165,8 +167,34 @@ export function sanitizeBashSubprocessEnv(env, policy) {
         }
     }
     removed.sort();
+    removePathEntries(out, policy.removePath);
     applyPathPrefix(out, policy.prependPath);
     return { env: out, removed };
+}
+/** Remove only the named managed directories, preserving every other PATH entry. */
+function removePathEntries(env, removePath) {
+    if (!removePath?.length)
+        return;
+    const normalize = (entry) => {
+        const absolute = resolve(entry);
+        return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+    };
+    const removed = new Set(removePath.filter(isAbsolute).map(normalize));
+    const separator = process.platform === 'win32' ? ';' : ':';
+    for (const name of Object.keys(env)) {
+        const isPath = process.platform === 'win32'
+            ? name.toUpperCase() === 'PATH'
+            : name === 'PATH' || name === 'Path';
+        if (!isPath)
+            continue;
+        const current = env[name];
+        if (current === undefined)
+            continue;
+        env[name] = current
+            .split(separator)
+            .filter((entry) => !isAbsolute(entry) || !removed.has(normalize(entry)))
+            .join(separator);
+    }
 }
 /**
  * Prepend runtime-managed shim directories to PATH, de-duplicating so repeated
@@ -179,11 +207,13 @@ function applyPathPrefix(env, prependPath) {
         return;
     const separator = process.platform === 'win32' ? ';' : ':';
     const existing = env.PATH ?? env.Path ?? '';
-    const current = existing.split(separator).filter((entry) => entry !== '');
-    const additions = prependPath.filter((dir) => isAbsolute(dir) && !current.includes(dir));
-    if (additions.length === 0)
+    const prefix = [...new Set(prependPath.filter(isAbsolute))];
+    if (prefix.length === 0)
         return;
-    const nextPath = [...additions, ...current].join(separator);
+    // A shell adapter may prepend its own bin even when our shim was inherited.
+    // Move managed entries to the front on every spawn, preserving the rest.
+    const current = (existing ? existing.split(separator) : []).filter((entry) => !prefix.includes(entry));
+    const nextPath = [...prefix, ...current].join(separator);
     // Windows env lookups are case-insensitive but the object keys are not:
     // overwrite whichever casing the inherited environment actually used.
     if (env.PATH === undefined && env.Path !== undefined)

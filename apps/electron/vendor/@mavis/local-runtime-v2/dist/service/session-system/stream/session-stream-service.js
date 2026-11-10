@@ -27,8 +27,11 @@ export class SessionStreamService {
         });
         state.hasFrames = true;
         const frame = { ...appended.value.frame, cursor: appended.cursor };
-        if (appended.appended)
+        if (appended.appended) {
+            if (frame.kind === 'turn-terminal')
+                state.lastTerminalTurnId = frame.turnId;
             state.subscribers.publish(frame, appended.byteSize);
+        }
         return { appended: appended.appended, retained: appended.retained, frame };
     }
     reserve(sessionId) {
@@ -161,22 +164,34 @@ class SessionResumeIterator {
         return Promise.resolve(done());
     }
     async initialize() {
-        const waitForTerminal = this.input.waitForTerminal ?? true;
+        const initial = this.state.ring.replay(this.input.afterCursor);
+        const initialWatermark = this.state.ring.latestCursor();
+        // Capture the terminal identity with the replay boundary, before owner reads.
+        // An emitted terminal proves that its Turn need not emit another one even
+        // while the execution lease is still being settled. Later terminals remain
+        // in catch-up/live replay and must not be mistaken for an old terminal.
+        const lastTerminalTurnId = this.state.lastTerminalTurnId;
+        const waitForTerminal = typeof this.input.waitForTerminal === 'function'
+            ? await this.input.waitForTerminal(lastTerminalTurnId)
+            : (this.input.waitForTerminal ?? true);
         if (this.initializeUnanchored(waitForTerminal))
             return;
-        const initial = this.state.ring.replay(this.input.afterCursor);
         if (initial.status !== 'ok') {
             this.finishWithResync(initial.status);
             return;
         }
         if (hasCursor(this.input.afterCursor)) {
-            this.finishCursorReplay(initial.entries, waitForTerminal);
+            const catchup = this.state.ring.replay(initialWatermark);
+            if (catchup.status !== 'ok') {
+                this.finishWithResync(catchup.status);
+                return;
+            }
+            this.finishCursorReplay([...initial.entries, ...catchup.entries], waitForTerminal);
             return;
         }
-        await this.initializeDurable(initial.entries, waitForTerminal);
+        await this.initializeDurable(initial.entries, waitForTerminal, initialWatermark);
     }
-    async initializeDurable(initial, waitForTerminal) {
-        const initialWatermark = this.state.ring.latestCursor();
+    async initializeDurable(initial, waitForTerminal, initialWatermark) {
         const durable = await this.messages.listAfter(this.input.sessionId, this.input.afterMsgId);
         if (this.closed || this.state.deleted) {
             this.close();
@@ -187,10 +202,25 @@ class SessionResumeIterator {
             return;
         }
         this.finishDurableReplay(initial, initialWatermark, durable);
-        if (!waitForTerminal)
+        if (!waitForTerminal) {
+            // A first Side subscription may arrive after its Turn ended. Preserve the
+            // latest retained terminal (including failures), not an empty successful EOF.
+            // Active/anchored resumes still exclude old terminals from earlier Turns.
+            if (this.input.replayFromStart &&
+                !this.input.afterMsgId &&
+                !this.replay.some((frame) => frame.kind === 'turn-terminal' || frame.kind === 'resync-required')) {
+                const terminal = [...initial]
+                    .reverse()
+                    .find((entry) => entry.value.frame.kind === 'turn-terminal');
+                if (terminal)
+                    this.replay.push(...toFrames([terminal]));
+            }
             this.finishIdleReplay();
+        }
     }
     initializeUnanchored(waitForTerminal) {
+        if (this.input.replayFromStart)
+            return false;
         if (hasCursor(this.input.afterCursor) || this.input.afterMsgId)
             return false;
         if (!waitForTerminal)

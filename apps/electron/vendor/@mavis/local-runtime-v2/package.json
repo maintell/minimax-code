@@ -21,7 +21,7 @@
       "import": "./dist/service/channel-system/transport/wechat/sdk/index.js"
     },
     "./testing": {
-      "import": "./dist/infra/testing/index.js"
+      "import": "./dist/testing/index.js"
     },
     "./canonical-history": {
       "import": "./dist/infra/file/canonical-history.js"
@@ -34,6 +34,24 @@
     },
     "./agent": {
       "import": "./dist/service/agent/public.js"
+    },
+    "./ppt-preview-cli": {
+      "import": "./dist/service/ppt-preview/publication/ppt-preview-cli.js"
+    },
+    "./diagnostics": {
+      "import": "./dist/infra/diagnostics/index.js"
+    },
+    "./observability": {
+      "import": "./dist/infra/observability/index.js"
+    },
+    "./routing": {
+      "import": "./dist/infra/config/routing-headers.js"
+    },
+    "./runtime-owner": {
+      "import": "./dist/infra/runtime-owner/index.js"
+    },
+    "./workspace-indexing": {
+      "import": "./dist/infra/legacy-db/workspace-indexing-types.js"
     }
   },
   "jscpd": {
@@ -62,7 +80,7 @@
       "src/local/host-contract.ts!",
       "src/local/index.ts!",
       "src/infra/logging/index.ts!",
-      "src/infra/testing/index.ts!",
+      "src/testing/index.ts!",
       "src/application/index.ts!",
       "src/infra/file/canonical-history.ts!",
       "src/service/session-system/index.ts!",
@@ -74,17 +92,22 @@
       "src/http/routing/bindings.gen.ts!",
       "src/http/routing/contracts.gen.ts!",
       "src/http/generated/**!",
-      "src/service/channel-system/transport/wechat/sdk/index.ts!"
+      "src/service/channel-system/transport/wechat/sdk/index.ts!",
+      "src/infra/diagnostics/index.ts!",
+      "src/infra/observability/index.ts!",
+      "src/infra/config/routing-headers.ts!",
+      "src/infra/runtime-owner/index.ts!",
+      "src/infra/legacy-db/workspace-indexing-types.ts!",
+      "src/service/turn-system/agent-host/runner/ptc/quickjs-worker.ts!",
+      "src/service/model-access-extension/host-process/shim/host-entry.ts!"
     ],
     "project": [
       "src/**/*.ts!",
-      "!src/**/*.test.ts!"
+      "!src/**/*.test.ts!",
+      "!src/**/*.test-support.ts!"
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
-    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
-    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
     "@mavis/agent-core": "file:../agent-core",
     "@mavis/agent-extension": "file:../agent-extension",
     "@mavis/agent-runtime": "file:../agent-runtime",
@@ -92,32 +115,35 @@
     "@mavis/config": "file:../config",
     "@mavis/context-manager": "file:../context-manager",
     "@mavis/conversation-contract": "file:../conversation-contract",
+    "@mavis/cron": "file:../cron",
     "@mavis/goal": "file:../goal",
-    "@mavis/local-runtime": "file:../local-runtime",
-    "@mavis/mcp": "file:../mcp",
-    "@mavis/permission": "file:../permission",
-    "@mavis/plugin-hooks": "file:../plugin-hooks",
-    "@mavis/protocol": "file:../protocol",
-    "@mavis/session-report": "file:../session-report",
-    "@mavis/shared": "file:../shared",
-    "@mavis/skills": "file:../skills",
-    "@mavis/system-reminder": "file:../system-reminder",
-    "@mavis/thrift-gen": "file:../thrift-gen",
     "@minimax/mcode-sandbox-runtime": "file:../../@minimax/mcode-sandbox-runtime",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@napi-rs/keyring": "2.1.1",
     "@sinclair/typebox": "^0.34.0",
     "better-sqlite3": "file:../../better-sqlite3",
     "bmp-js": "0.1.0",
     "croner": "^9",
+    "diff": "^8.0.4",
     "drizzle-orm": "^0.45.2",
+    "es-module-lexer": "1.7.0",
     "gpt-tokenizer": "3.4.0",
     "handlebars": "^4.7.9",
     "hono": "^4.7.11",
+    "jpeg-js": "0.4.4",
     "js-yaml": "^4",
     "jszip": "file:../../jszip",
     "pngjs": "6.0.0",
     "proper-lockfile": "^4",
+    "quickjs-emscripten": "0.31.0",
+    "saxes": "6.0.0",
     "smol-toml": "1.7.0",
     "typebox": "1.1.38",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "zod": "^3",
+    "@mavis/background-task": "file:../background-task"
+  },
+  "optionalDependencies": {
+    "@larksuiteoapi/node-sdk": "^1.60.0"
   }
 }

@@ -1,5 +1,5 @@
 import { normalizeAbsolutePath } from './path-normalization.js';
-import { isAgentInternalDefaultWorkspaceDir, isSessionDefaultWorkspaceDir, } from './workspace.js';
+import { isAgentInternalDefaultWorkspaceDir, isSessionDefaultWorkspaceDir } from './workspace.js';
 /**
  * Classify whether a Session belongs to the default Project.
  *

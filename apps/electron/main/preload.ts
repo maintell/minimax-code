@@ -6,6 +6,7 @@ import { ipcRenderer, contextBridge, webFrame, webUtils } from "electron";
 const modelMenuPopupAPI = {
     setModalScope: (scope) => ipcRenderer.invoke('model-menu-popup:modal-scope', scope),
     open: (request) => ipcRenderer.invoke('model-menu-popup:open', request),
+    containsPointer: () => ipcRenderer.invoke('model-menu-popup:contains-pointer'),
     update: (id, presentation) => ipcRenderer.send('model-menu-popup:owner', 'update', id, presentation),
     close: (id) => ipcRenderer.send('model-menu-popup:owner', 'close', id),
     onEvent: (listener) => {
@@ -22,10 +23,12 @@ const IPC_CHANNELS = {
     SYSTEM_SET_THEME_SOURCE: 'system:set-theme-source',
     SYSTEM_OPEN_DIR: 'system:open-dir',
     SYSTEM_CREATE_DIR: 'system:create-dir',
+    SYSTEM_ENSURE_DEFAULT_PROJECT_DIR: 'system:ensure-default-project-dir',
     SYSTEM_OPEN_FILE_IN_FOLDER: 'system:open-file-in-folder',
     SYSTEM_SHOW_IMAGE_CONTEXT_MENU: 'system:show-image-context-menu',
     SYSTEM_GET_HOME_PATH: 'system:get-home-path',
     SYSTEM_GET_APP_INSTALL_DIR: 'system:get-app-install-dir',
+    SYSTEM_GET_APP_VERSION_SYNC: 'system:get-app-version-sync',
     // 窗口控制
     WINDOW_MINIMIZE: 'window:minimize',
     WINDOW_RESTORE: 'window:restore',
@@ -45,6 +48,8 @@ const IPC_CHANNELS = {
     RUNTIME_MEMORY_MONITOR_START_HEAP_SAMPLING: 'runtime-memory-monitor:start-heap-sampling',
     RUNTIME_MEMORY_MONITOR_STOP_HEAP_SAMPLING: 'runtime-memory-monitor:stop-heap-sampling',
     RUNTIME_MEMORY_MONITOR_REVEAL_PROFILE: 'runtime-memory-monitor:reveal-profile',
+    GOAL_DIAGNOSTICS_EXPORT: 'goal-diagnostics:export',
+    GOAL_DIAGNOSTICS_REVEAL: 'goal-diagnostics:reveal',
     ASR_PUSH_TO_TALK_KEY_UP: 'asr:push-to-talk-key-up',
     // 菜单事件
     MENU_NEW_CHAT: 'menu:new-chat',
@@ -106,6 +111,12 @@ const IPC_CHANNELS = {
     RC_REFRESH_BINDING: 'rc:refresh-binding',
     RC_BINDING_LOST: 'rc:binding-lost',
     RC_MARK_UNBOUND: 'rc:mark-unbound',
+    // producer 全删解绑的 request_id 幂等链路（方案 §4.5.4 / ADR-011 D12）。
+    // 注意：preload 维护着一份独立的通道表，新增通道必须同时改
+    // `main/config/constants.ts` 和这里，否则 preload 侧取到 undefined。
+    RC_BEGIN_UNBIND: 'rc:begin-unbind',
+    RC_GET_PENDING_UNBIND: 'rc:get-pending-unbind',
+    RC_RESOLVE_UNBIND: 'rc:resolve-unbind',
     RC_PUBLISH_SESSION_COMPOSER_MODE: 'rc:publish-session-composer-mode',
     RC_SESSION_COMPOSER_MODE_CHANGED: 'rc:session-composer-mode-changed',
     // 外部链接
@@ -114,7 +125,7 @@ const IPC_CHANNELS = {
     SYSTEM_OPEN_LOG_FILE: 'system:open-log-file',
     SYSTEM_GET_LOG_FILE_PATH: 'system:get-log-file-path',
     SYSTEM_UPLOAD_LOG: 'system:upload-log',
-    SYSTEM_UPLOAD_FEEDBACK_LOG: 'system:upload-feedback-log',
+    SYSTEM_ENQUEUE_FEEDBACK_LOG: 'system:enqueue-feedback-log',
     SYSTEM_RELAUNCH: 'system:relaunch',
     // 桌面设置
     DESKTOP_RELAUNCH: 'desktop:relaunch',
@@ -124,24 +135,37 @@ const IPC_CHANNELS = {
     DESKTOP_GET_RUN_ON_STARTUP: 'desktop:get-run-on-startup',
     DESKTOP_SET_KEEP_AWAKE: 'desktop:set-keep-awake',
     DESKTOP_GET_KEEP_AWAKE: 'desktop:get-keep-awake',
+    DESKTOP_SET_FILE_OPEN_WITH_ENHANCED: 'desktop:set-file-open-with-enhanced',
+    DESKTOP_GET_FILE_OPEN_WITH_ENHANCED: 'desktop:get-file-open-with-enhanced',
     DESKTOP_START_COMPUTER_USE_RUNTIME: 'desktop:start-computer-use-runtime',
     DESKTOP_APPEARANCE_CHANGED: 'desktop:appearance-changed',
     // 全局快捷键
     DESKTOP_SET_GLOBAL_ACCESS_SHORTCUT: 'desktop:set-global-access-shortcut',
     DESKTOP_GET_GLOBAL_ACCESS_SHORTCUT: 'desktop:get-global-access-shortcut',
     DESKTOP_SET_SHORTCUT_OVERRIDES: 'desktop:set-shortcut-overrides',
+    DESKTOP_SHORTCUTS_CHANGED: 'desktop:shortcuts-changed',
     DESKTOP_OPEN_NOTIFICATION_SETTINGS: 'desktop:open-notification-settings',
     DESKTOP_SET_LANGUAGE: 'desktop:set-language',
     DESKTOP_GET_LOCAL_RUNTIME_DATA_DIR_INFO: 'desktop:get-local-runtime-data-dir-info',
     DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR: 'desktop:relocate-local-runtime-data-dir',
     // FilePanel embedded browser
+    BROWSER_BACKEND_BEGIN_REFRESH: 'browser-backend:begin-refresh',
+    BROWSER_BACKEND_APPLY_REFRESH: 'browser-backend:apply-refresh',
+    BROWSER_BACKEND_GET_DIAGNOSTICS: 'browser-backend:get-diagnostics',
+    BROWSER_BACKEND_GET_LAUNCH: 'browser-backend:get-launch',
+    BROWSER_BACKEND_LAUNCH_DECIDED: 'browser-backend:launch-decided',
+    BROWSER_TELEMETRY_REPORT: 'browser-telemetry:report',
+    BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST: 'browser-telemetry:diagnostics-request',
+    BROWSER_TELEMETRY_DIAGNOSTICS_RESPONSE: 'browser-telemetry:diagnostics-response',
     EMBEDDED_BROWSER_CREATE: 'embedded-browser:create',
     EMBEDDED_BROWSER_SHOW: 'embedded-browser:show',
     EMBEDDED_BROWSER_SET_BOUNDS: 'embedded-browser:set-bounds',
     EMBEDDED_BROWSER_SET_DEVICE_PREVIEW_MODE: 'embedded-browser:set-device-preview-mode',
+    EMBEDDED_BROWSER_UPDATE_DEVICE_PREVIEW: 'embedded-browser:update-device-preview',
     EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION: 'embedded-browser:set-native-overlay-occlusion',
     EMBEDDED_BROWSER_HIDE: 'embedded-browser:hide',
     EMBEDDED_BROWSER_DESTROY: 'embedded-browser:destroy',
+    EMBEDDED_BROWSER_ADOPT_SESSION: 'embedded-browser:adopt-session',
     EMBEDDED_BROWSER_GET_STATE: 'embedded-browser:get-state',
     EMBEDDED_BROWSER_EXECUTE_TOOL: 'embedded-browser:execute-tool',
     EMBEDDED_BROWSER_NAVIGATE: 'embedded-browser:navigate',
@@ -155,24 +179,60 @@ const IPC_CHANNELS = {
     EMBEDDED_BROWSER_CLEAR_CACHE: 'embedded-browser:clear-cache',
     EMBEDDED_BROWSER_SET_COMMENT_MODE: 'embedded-browser:set-comment-mode',
     EMBEDDED_BROWSER_CLEAR_COMMENTS: 'embedded-browser:clear-comments',
+    EMBEDDED_BROWSER_RESOLVE_SENT_COMMENTS: 'embedded-browser:resolve-sent-comments',
+    EMBEDDED_BROWSER_REMOVE_COMMENT: 'embedded-browser:remove-comment',
+    /** main → renderer: the page composer's mic was pressed. */
+    EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST: 'embedded-browser:comment-voice-request',
+    /** renderer → main: ASR state/transcript for the page composer. */
+    EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE: 'embedded-browser:comment-voice-update',
+    EMBEDDED_BROWSER_COMMENT_HOST_OBSTACLE: 'embedded-browser:comment-host-obstacle',
     EMBEDDED_BROWSER_ACK_COMMENT_EVENTS: 'embedded-browser:ack-comment-events',
     EMBEDDED_BROWSER_OPEN_EXTERNAL: 'embedded-browser:open-external',
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
     EMBEDDED_BROWSER_CAPTURE_FRAME: 'embedded-browser:capture-frame',
     EMBEDDED_BROWSER_AGENT_ACTION: 'embedded-browser:agent-action',
+    /** renderer → main: find text in a Browser tab page (shared Cmd/Ctrl+F bar). */
+    EMBEDDED_BROWSER_FIND_IN_PAGE: 'embedded-browser:find-in-page',
+    EMBEDDED_BROWSER_STOP_FIND_IN_PAGE: 'embedded-browser:stop-find-in-page',
+    /** main → renderer: progress of a tab's latest find request. */
+    EMBEDDED_BROWSER_FIND_RESULT: 'embedded-browser:find-result',
+    /** main → renderer: Cmd/Ctrl+F was pressed inside a Browser page. */
+    EMBEDDED_BROWSER_FIND_REQUESTED: 'embedded-browser:find-requested',
+    EMBEDDED_BROWSER_TAB_RECOVERED: 'embedded-browser:tab-recovered',
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
     MINIAPP_REFRESH: 'miniapp:refresh',
     MINIAPP_STOP: 'miniapp:stop',
+    MINIAPP_CLOSE: 'miniapp:close',
+    MINIAPP_DETACH: 'miniapp:detach',
+    MINIAPP_ATTACH: 'miniapp:attach',
+    MINIAPP_APPLY_UPDATE: 'miniapp:apply-update',
+    MINIAPP_PERMISSIONS_LIST: 'miniapp:permissions-list',
+    MINIAPP_PERMISSIONS_SET: 'miniapp:permissions-set',
+    MINIAPP_HOST_HANDSHAKE: 'miniapp:host-handshake',
+    MINIAPP_HOST_PUBLISH: 'miniapp:host-publish',
+    MINIAPP_HOST_OPEN_REQUEST: 'miniapp:host-open-request',
+    MINIAPP_HOST_OPEN_REPLY: 'miniapp:host-open-reply',
+    MINIAPP_HOST_OPEN_CANCEL: 'miniapp:host-open-cancel',
+    MINIAPP_SLEPT: 'miniapp:slept',
     MINIAPP_COMPOSER_REQUEST: 'miniapp:composer-request',
     MINIAPP_COMPOSER_REPLY: 'miniapp:composer-reply',
+    MINIAPP_TOOL_PERMISSION_REQUEST: 'miniapp:tool-permission-request',
+    MINIAPP_TOOL_PERMISSION_REPLY: 'miniapp:tool-permission-reply',
+    MINIAPP_TOOL_PERMISSION_CANCEL: 'miniapp:tool-permission-cancel',
+    MINIAPP_AGENT_OPEN_SESSION: 'miniapp:agent-open-session',
+    MINIAPP_AGENT_OPEN_SESSION_REPLY: 'miniapp:agent-open-session-reply',
+    MINIAPP_AGENT_PANEL_CLOSED: 'miniapp:agent-panel-closed',
     BROWSER_PROFILE_IMPORT_LIST: 'browser-profile-import:list',
     BROWSER_PROFILE_IMPORT_START: 'browser-profile-import:start',
     BROWSER_PROFILE_IMPORT_CANCEL: 'browser-profile-import:cancel',
     BROWSER_PROFILE_IMPORT_PROGRESS: 'browser-profile-import:progress',
     // 更新器
     UPDATER_CHECK: 'updater:check',
+    UPDATER_BRANCH_INFO: 'updater:branch-info',
+    UPDATER_BRANCH_QUERY: 'updater:branch-query',
+    UPDATER_BRANCH_SWITCH: 'updater:branch-switch',
     UPDATER_DOWNLOAD: 'updater:download',
     UPDATER_INSTALL: 'updater:install',
     UPDATER_GET_VERSION: 'updater:get-version',
@@ -181,6 +241,7 @@ const IPC_CHANNELS = {
     UPDATER_OPEN_MODAL: 'updater:open-modal',
     // Deep Link
     DEEPLINK_RECEIVED: 'deeplink:received',
+    DEEPLINK_TAKE_WORKSPACE_OPEN: 'deeplink:take-workspace-open',
     // file api
     // file tools
     FILE_READ: 'file:read',
@@ -207,6 +268,7 @@ const IPC_CHANNELS = {
     TERMINAL_INPUT: 'terminal:input',
     TERMINAL_RESIZE: 'terminal:resize',
     TERMINAL_DISPOSE: 'terminal:dispose',
+    TERMINAL_REASSIGN: 'terminal:reassign',
     TERMINAL_OUTPUT: 'terminal:output',
     TERMINAL_EXIT: 'terminal:exit',
     TERMINAL_TITLE: 'terminal:title',
@@ -239,6 +301,7 @@ const IPC_CHANNELS = {
     DOCUMENT_PREVIEW_PPTX_CORE_CANCEL: 'document-preview:pptx-core-cancel',
     DOCUMENT_PREVIEW_PPTX_CORE_PORT: 'document-preview:pptx-core-port',
     PREVIEW_CLIPBOARD_WRITE: 'preview-clipboard:write',
+    PREVIEW_CLIPBOARD_WRITE_FILES: 'preview-clipboard:write-files',
     // PPT Preview WebContentsView
     PPT_PREVIEW_CREATE: 'ppt-preview:create',
     PPT_PREVIEW_LOAD: 'ppt-preview:load',
@@ -259,6 +322,7 @@ const IPC_CHANNELS = {
     RUNTIME_FAILED: 'runtime:failed',
     RUNTIME_CHECK_READY: 'runtime:check-ready',
     RUNTIME_SET_RUNAWAY_GUARD_CONFIG: 'runtime:set-runaway-guard-config',
+    RUNTIME_SET_PROMPT_SUGGESTION_POLICY: 'runtime:set-prompt-suggestion-policy',
     RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG: 'runtime:set-tool-result-compaction-config',
     RUNTIME_SET_COLLECTION_POLICY_CONFIG: 'runtime:set-collection-policy-config',
     // Always-on Electron utility-process runtime transport.
@@ -266,6 +330,34 @@ const IPC_CHANNELS = {
     RUNTIME_TRANSPORT_GET_CURRENT: 'runtime:transport-get-current',
     RUNTIME_TRANSPORT_REQUEST_SWITCH: 'runtime:transport-request-switch',
     RUNTIME_TRANSPORT_LOST: 'runtime:transport-lost',
+    SSH_CONNECTIONS_LIST: 'ssh-connections:list',
+    SSH_CONNECTIONS_OPERATION_STATES: 'ssh-connections:operation-states',
+    SSH_CONNECTIONS_OPERATION_STATE: 'ssh-connections:operation-state',
+    SSH_CONNECTIONS_ADD: 'ssh-connections:add',
+    SSH_CONNECTIONS_CANCEL_ADD: 'ssh-connections:cancel-add',
+    SSH_CONNECTIONS_ADD_PROGRESS: 'ssh-connections:add-progress',
+    SSH_CONNECTIONS_UPDATE: 'ssh-connections:update',
+    SSH_CONNECTIONS_SET_ENABLED: 'ssh-connections:set-enabled',
+    SSH_CONNECTIONS_REMOTE_ACCOUNT: 'ssh-connections:remote-account',
+    SSH_CONNECTIONS_REMOVE: 'ssh-connections:remove',
+    SSH_CONNECTIONS_DISCOVER: 'ssh-connections:discover',
+    SSH_CONNECTIONS_PROBE: 'ssh-connections:probe',
+    SSH_CONNECTIONS_CONNECT: 'ssh-connections:connect',
+    SSH_CONNECTIONS_SETUP_CLI: 'ssh-connections:setup-cli',
+    SSH_CONNECTIONS_LIST_DIRECTORIES: 'ssh-connections:list-directories',
+    SSH_PROJECTS_LIST: 'ssh-projects:list',
+    SSH_PROJECTS_CREATE: 'ssh-projects:create',
+    SSH_PROJECTS_UPDATE: 'ssh-projects:update',
+    SSH_PROJECTS_REMOVE: 'ssh-projects:remove',
+    SSH_PROJECTS_UPLOAD_ATTACHMENT: 'ssh-projects:upload-attachment',
+    PROJECT_RUNTIME_TRANSPORT_REQUEST_PORT: 'project-runtime:transport-request-port',
+    PROJECT_RUNTIME_TRANSPORT_DISCONNECT: 'project-runtime:transport-disconnect',
+    PROJECT_RUNTIME_GET_STATUS: 'project-runtime:get-status',
+    PROJECT_RUNTIME_TRANSPORT_LOST: 'project-runtime:transport-lost',
+    PROJECT_RUNTIME_FAILED: 'project-runtime:failed',
+    PROJECT_RUNTIME_STATUS: 'project-runtime:status',
+    PROJECT_RUNTIME_NETWORK_ONLINE: 'project-runtime:network-online',
+    PROJECT_RUNTIME_ACTIVE_PROJECT: 'project-runtime:active-project',
     LOCAL_ASR_SESSION_OPEN: 'local-asr:session-open',
     LOCAL_ASR_SESSION_FRAME: 'local-asr:session-frame',
     LOCAL_ASR_SESSION_AUDIO: 'local-asr:session-audio',
@@ -315,10 +407,14 @@ const IPC_CHANNELS = {
     APP_QUIT_CONFIRMATION_REQUEST: 'app:quit-confirmation-request',
     APP_QUIT_CONFIRMATION_RESULT: 'app:quit-confirmation-result',
     APP_QUIT_CONFIRMATION_ABORT: 'app:quit-confirmation-abort',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST: 'miniapp:window-transfer-confirmation-request',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT: 'miniapp:window-transfer-confirmation-result',
+    MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT: 'miniapp:window-transfer-confirmation-abort',
     APP_CONFIRM_QUIT: 'app:confirm-quit',
     APP_BRING_TO_FRONT: 'app:bring-to-front',
     // Dock file drop (macOS)
     DOCK_FILE_OPENED: 'dock:file-opened',
+    DOCK_FILE_RECEIVER_READY: 'dock:file-receiver-ready',
 };
 const pendingNotificationClicks = [];
 const notificationClickListeners = new Set();
@@ -465,6 +561,16 @@ try {
 catch {
     // 主进程可能还没准备好，忽略错误
 }
+// 安装包版本（app.getVersion()，含 -preview/-inside 等通道后缀）。热更新只替换渲染资源，
+// 渲染包构建时写入的版本号不带通道后缀，接口上报的桌面端版本必须取安装包版本。
+let appVersion = null;
+try {
+    const value = ipcRenderer.sendSync(IPC_CHANNELS.SYSTEM_GET_APP_VERSION_SYNC);
+    appVersion = typeof value === 'string' && value ? value : null;
+}
+catch {
+    // 主进程可能还没准备好，渲染进程回落到构建时版本
+}
 const platformInfo = {
     platform: process.platform,
     arch: process.arch,
@@ -475,6 +581,7 @@ const platformInfo = {
     windowKind: desktopWindowKind,
     capabilities: desktopWindowCapabilities,
     hotUpdateVersion,
+    appVersion,
 };
 let appInstanceId = `app_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
 try {
@@ -517,6 +624,7 @@ const terminalAPI = {
     input: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_INPUT, params),
     resize: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_RESIZE, params),
     dispose: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_DISPOSE, params),
+    reassign: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_REASSIGN, params),
     onOutput: (cb) => {
         const handler = (_, e) => cb(e);
         ipcRenderer.on(IPC_CHANNELS.TERMINAL_OUTPUT, handler);
@@ -556,6 +664,7 @@ const electronAPI = {
     },
     openDir: (dirPath) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_OPEN_DIR, dirPath),
     createDir: (dirPath) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_CREATE_DIR, dirPath),
+    ensureDefaultProjectDir: (projectName) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_ENSURE_DEFAULT_PROJECT_DIR, projectName),
     openFileInFolder: (filePath) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_OPEN_FILE_IN_FOLDER, filePath),
     showImageContextMenu: (params) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_SHOW_IMAGE_CONTEXT_MENU, params),
     getHomePath: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_HOME_PATH),
@@ -599,6 +708,8 @@ const electronAPI = {
     startRuntimeHeapSampling: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_MEMORY_MONITOR_START_HEAP_SAMPLING),
     stopRuntimeHeapSampling: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_MEMORY_MONITOR_STOP_HEAP_SAMPLING),
     revealRuntimeHeapProfile: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_MEMORY_MONITOR_REVEAL_PROFILE),
+    exportGoalDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.GOAL_DIAGNOSTICS_EXPORT),
+    revealGoalDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.GOAL_DIAGNOSTICS_REVEAL),
     onFullScreenChanged: (callback) => {
         const handler = (_, isFullScreen) => callback(isFullScreen);
         ipcRenderer.on(IPC_CHANNELS.WINDOW_FULL_SCREEN_CHANGED, handler);
@@ -762,7 +873,7 @@ const electronAPI = {
     openLogFile: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_OPEN_LOG_FILE),
     getLogFilePath: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_LOG_FILE_PATH),
     uploadLog: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_UPLOAD_LOG),
-    uploadFeedbackLog: (data) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_UPLOAD_FEEDBACK_LOG, data),
+    enqueueFeedbackLogUpload: (task) => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_ENQUEUE_FEEDBACK_LOG, task),
     // 重启应用（支持指定启动后跳转的页面）
     relaunch: (options) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_RELAUNCH, options),
     // ============================================
@@ -777,20 +888,29 @@ const electronAPI = {
     // 保持唤醒
     setKeepAwake: (enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_KEEP_AWAKE, enabled),
     getKeepAwake: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_KEEP_AWAKE),
+    // Windows 文本类型“打开方式”增强登记
+    setFileOpenWithEnhanced: (enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_FILE_OPEN_WITH_ENHANCED, enabled),
+    getFileOpenWithEnhanced: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_FILE_OPEN_WITH_ENHANCED),
     startComputerUseRuntime: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_START_COMPUTER_USE_RUNTIME),
     // 快捷键
     setGlobalAccessShortcut: (globalAccessShortcut) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_GLOBAL_ACCESS_SHORTCUT, globalAccessShortcut),
     getGlobalAccessShortcut: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_GLOBAL_ACCESS_SHORTCUT),
-    setShortcutOverrides: (overrides) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_SHORTCUT_OVERRIDES, overrides),
+    setShortcutOverrides: (overrides, enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_SHORTCUT_OVERRIDES, overrides, enabled),
+    onShortcutsChanged: (callback) => {
+        const handler = (_event, settings) => callback(settings);
+        ipcRenderer.on(IPC_CHANNELS.DESKTOP_SHORTCUTS_CHANGED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.DESKTOP_SHORTCUTS_CHANGED, handler);
+    },
     // 通知设置
     openNotificationSettings: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_OPEN_NOTIFICATION_SETTINGS),
     // 语言设置（需要重启）
     setLanguage: (language) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_LANGUAGE, language),
     getLocalRuntimeDataDirInfo: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_LOCAL_RUNTIME_DATA_DIR_INFO),
-    relocateLocalRuntimeDataDir: (parentDir) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, parentDir),
+    relocateLocalRuntimeDataDir: (parentDir, options) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_RELOCATE_LOCAL_RUNTIME_DATA_DIR, parentDir, options),
     // Runtime lifecycle
     checkRuntimeReady: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_CHECK_READY),
     setRunawayGuardConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_RUNAWAY_GUARD_CONFIG, config),
+    setPromptSuggestionPolicy: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_PROMPT_SUGGESTION_POLICY, config),
     setToolResultCompactionConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG, config),
     // `config` is the raw Apollo value (object, JSON string, or `undefined` when
     // the key is absent). Main owns validation and the last-valid fallback.
@@ -964,6 +1084,64 @@ const electronAPI = {
             ipcRenderer.removeListener(IPC_CHANNELS.APP_QUIT_CONFIRMATION_ABORT, abort);
         };
     },
+    onMiniAppWindowTransferConfirmationRequest: (callback) => {
+        const pending = new Map();
+        const handler = (_event, requestId) => {
+            if (typeof requestId !== 'string' || !requestId || pending.has(requestId))
+                return;
+            const controller = new AbortController();
+            pending.set(requestId, controller);
+            const reply = (confirmed) => {
+                pending.delete(requestId);
+                if (!controller.signal.aborted) {
+                    ipcRenderer.send(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT, {
+                        requestId,
+                        confirmed,
+                    });
+                }
+            };
+            try {
+                const result = callback((listener) => {
+                    if (controller.signal.aborted) {
+                        listener();
+                        return () => undefined;
+                    }
+                    controller.signal.addEventListener('abort', listener, { once: true });
+                    return () => controller.signal.removeEventListener('abort', listener);
+                });
+                if (typeof result === 'boolean')
+                    reply(result);
+                else {
+                    ipcRenderer.send(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT, {
+                        requestId,
+                        pending: true,
+                    });
+                    void result.then(reply, () => reply(false));
+                }
+            }
+            catch {
+                reply(false);
+            }
+        };
+        const abort = (_event, requestId) => {
+            pending.get(requestId)?.abort();
+            pending.delete(requestId);
+        };
+        ipcRenderer.on(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST, handler);
+        ipcRenderer.on(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT, abort);
+        return () => {
+            for (const [requestId, controller] of pending) {
+                ipcRenderer.send(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_RESULT, {
+                    requestId,
+                    confirmed: false,
+                });
+                controller.abort();
+            }
+            pending.clear();
+            ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_REQUEST, handler);
+            ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_WINDOW_TRANSFER_CONFIRMATION_ABORT, abort);
+        };
+    },
     /**
      * 确认退出应用
      * 渲染进程处理完退出前的清理工作后调用此方法确认退出
@@ -986,10 +1164,18 @@ const electronAPI = {
                 : data.filePath
                     ? [data.filePath]
                     : [];
-            callback({ filePaths });
+            callback({
+                filePaths,
+                ...(data.selectedFileTokens ? { selectedFileTokens: data.selectedFileTokens } : {}),
+            });
         };
         ipcRenderer.on(IPC_CHANNELS.DOCK_FILE_OPENED, handler);
-        return () => ipcRenderer.removeListener(IPC_CHANNELS.DOCK_FILE_OPENED, handler);
+        // The React consumer now exists; DOM load alone does not guarantee this.
+        ipcRenderer.send(IPC_CHANNELS.DOCK_FILE_RECEIVER_READY, true);
+        return () => {
+            ipcRenderer.removeListener(IPC_CHANNELS.DOCK_FILE_OPENED, handler);
+            ipcRenderer.send(IPC_CHANNELS.DOCK_FILE_RECEIVER_READY, false);
+        };
     },
     // Sidebar terminal panel (interactive PTY)
     terminal: terminalAPI,
@@ -1124,19 +1310,380 @@ const runtimeTransportAPI = {
     },
 };
 contextBridge.exposeInMainWorld('runtimeTransportAPI', runtimeTransportAPI);
+const sshConnectionsAPI = {
+    getOperationStates: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_OPERATION_STATES),
+    onOperationState: (listener) => {
+        const handler = (_event, state) => listener(state);
+        ipcRenderer.on(IPC_CHANNELS.SSH_CONNECTIONS_OPERATION_STATE, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.SSH_CONNECTIONS_OPERATION_STATE, handler);
+    },
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_LIST),
+    add: (input, request) => request === undefined
+        ? ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_ADD, input)
+        : ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_ADD, input, request),
+    cancelAdd: (requestId) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_CANCEL_ADD, requestId),
+    onAddProgress: (listener) => {
+        const handler = (_event, progress) => listener(progress);
+        ipcRenderer.on(IPC_CHANNELS.SSH_CONNECTIONS_ADD_PROGRESS, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.SSH_CONNECTIONS_ADD_PROGRESS, handler);
+    },
+    update: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_UPDATE, input),
+    setEnabled: (alias, enabled) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_SET_ENABLED, alias, enabled),
+    remoteAccount: (alias, input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_REMOTE_ACCOUNT, alias, input),
+    remove: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_REMOVE, alias),
+    discover: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_DISCOVER),
+    probe: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_PROBE, alias),
+    connect: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_CONNECT, alias),
+    setupCli: (alias) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_SETUP_CLI, alias),
+    listDirectories: (alias, path) => ipcRenderer.invoke(IPC_CHANNELS.SSH_CONNECTIONS_LIST_DIRECTORIES, alias, path),
+};
+contextBridge.exposeInMainWorld('sshConnectionsAPI', sshConnectionsAPI);
+const sshProjectsAPI = {
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_LIST),
+    create: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_CREATE, input),
+    update: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_UPDATE, input),
+    remove: (projectId) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_REMOVE, projectId),
+    uploadAttachment: (input) => ipcRenderer.invoke(IPC_CHANNELS.SSH_PROJECTS_UPLOAD_ATTACHMENT, input),
+};
+contextBridge.exposeInMainWorld('sshProjectsAPI', sshProjectsAPI);
+// Project-scoped SSH runtimes are independent from the process-owned local
+// Runtime above. One preload may therefore hold several isolated ports.
+const PROJECT_RUNTIME_TRANSPORT_PORT_CHANNEL = 'project-runtime:transport-port';
+const projectRuntimePorts = new Map();
+const projectRuntimeConnectionIds = new Map();
+const projectRuntimeIntents = new Map();
+// A fresh preload context must not accept a previous context's queued port.
+const projectRuntimeIntentPrefix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+let projectRuntimeIntentSequence = 0;
+const projectRuntimeReadyListeners = new Map();
+const projectRuntimeStatusListeners = new Map();
+const projectRuntimeFrameListeners = new Map();
+const projectRuntimeLostListeners = new Map();
+const projectRuntimeFailedListeners = new Map();
+const projectRuntimePortWaiters = new Map();
+function readProjectRuntimeEvent(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return null;
+    const record = value;
+    if (typeof record.runtimeId !== 'string')
+        return null;
+    return {
+        runtimeId: record.runtimeId,
+        ...(typeof record.message === 'string' ? { message: record.message } : {}),
+        ...(typeof record.reasonCode === 'string' ? { reasonCode: record.reasonCode } : {}),
+        ...(typeof record.connectionId === 'string' ? { connectionId: record.connectionId } : {}),
+        ...(typeof record.transportIntentId === 'string'
+            ? { transportIntentId: record.transportIntentId }
+            : {}),
+    };
+}
+function dropProjectRuntimePort(runtimeId, info) {
+    const port = projectRuntimePorts.get(runtimeId);
+    projectRuntimePorts.delete(runtimeId);
+    projectRuntimeConnectionIds.delete(runtimeId);
+    if (port) {
+        try {
+            port.close();
+        }
+        catch {
+            // Already closed with its renderer context.
+        }
+    }
+    if (!info)
+        return;
+    for (const listener of [...(projectRuntimeLostListeners.get(runtimeId) ?? [])]) {
+        try {
+            listener(info);
+        }
+        catch {
+            // Listener errors must not break other project runtimes.
+        }
+    }
+}
+ipcRenderer.on(PROJECT_RUNTIME_TRANSPORT_PORT_CHANNEL, (event, payload) => {
+    const metadata = readProjectRuntimeEvent(payload);
+    const port = event.ports[0];
+    if (!port)
+        return;
+    if (!metadata?.transportIntentId ||
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId ||
+        (metadata.connectionId &&
+            projectRuntimeConnectionIds.get(metadata.runtimeId) === metadata.connectionId)) {
+        port.close();
+        return;
+    }
+    // A genuine replacement also terminates pending requests on the old pipe.
+    // This produces one false/true edge so EventBus replaces its stream once.
+    dropProjectRuntimePort(metadata.runtimeId, projectRuntimePorts.has(metadata.runtimeId)
+        ? { reasonCode: 'runtime_connection_replaced' }
+        : undefined);
+    projectRuntimePorts.set(metadata.runtimeId, port);
+    if (metadata.connectionId) {
+        projectRuntimeConnectionIds.set(metadata.runtimeId, metadata.connectionId);
+    }
+    port.onmessage = (messageEvent) => {
+        if (projectRuntimePorts.get(metadata.runtimeId) !== port)
+            return;
+        for (const listener of [...(projectRuntimeFrameListeners.get(metadata.runtimeId) ?? [])]) {
+            try {
+                listener(messageEvent.data);
+            }
+            catch {
+                // Listener errors must not break the pipe for other listeners.
+            }
+        }
+    };
+    for (const listener of [...(projectRuntimeReadyListeners.get(metadata.runtimeId) ?? [])]) {
+        try {
+            listener(metadata.connectionId ? { connectionId: metadata.connectionId } : {});
+        }
+        catch {
+            // One observer must not interrupt the port handoff.
+        }
+    }
+    for (const notify of [...(projectRuntimePortWaiters.get(metadata.runtimeId) ?? [])])
+        notify(true);
+    projectRuntimePortWaiters.delete(metadata.runtimeId);
+});
+function handleProjectRuntimeLost(_event, payload) {
+    const metadata = readProjectRuntimeEvent(payload);
+    if (!metadata)
+        return;
+    if (metadata.transportIntentId &&
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId)
+        return;
+    if (metadata.connectionId &&
+        projectRuntimePorts.has(metadata.runtimeId) &&
+        metadata.connectionId !== projectRuntimeConnectionIds.get(metadata.runtimeId))
+        return;
+    dropProjectRuntimePort(metadata.runtimeId, {
+        ...(metadata.message ? { message: metadata.message } : {}),
+        ...(metadata.reasonCode ? { reasonCode: metadata.reasonCode } : {}),
+    });
+}
+function handleProjectRuntimeFailed(_event, payload) {
+    const metadata = readProjectRuntimeEvent(payload);
+    if (!metadata)
+        return;
+    if (metadata.transportIntentId &&
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId)
+        return;
+    // Older Main builds call this field `type`. Keep it on the failure path only.
+    const legacyType = payload.type;
+    const reasonCode = metadata.reasonCode ?? (typeof legacyType === 'string' ? legacyType : undefined);
+    const info = {
+        ...(metadata.message ? { message: metadata.message } : {}),
+        ...(reasonCode ? { reasonCode } : {}),
+    };
+    for (const listener of [...(projectRuntimeFailedListeners.get(metadata.runtimeId) ?? [])]) {
+        try {
+            listener(info);
+        }
+        catch {
+            // One recovery observer must not interrupt other observers.
+        }
+    }
+}
+ipcRenderer.on(IPC_CHANNELS.PROJECT_RUNTIME_STATUS, (_event, payload) => {
+    const metadata = readProjectRuntimeEvent(payload);
+    if (!metadata?.transportIntentId ||
+        projectRuntimeIntents.get(metadata.runtimeId) !== metadata.transportIntentId)
+        return;
+    const status = { ...payload };
+    delete status.transportIntentId;
+    for (const listener of [...(projectRuntimeStatusListeners.get(metadata.runtimeId) ?? [])]) {
+        try {
+            listener(status);
+        }
+        catch {
+            // Status observers are isolated from each other and from transport readiness.
+        }
+    }
+});
+ipcRenderer.on(IPC_CHANNELS.PROJECT_RUNTIME_TRANSPORT_LOST, handleProjectRuntimeLost);
+ipcRenderer.on(IPC_CHANNELS.PROJECT_RUNTIME_FAILED, handleProjectRuntimeFailed);
+const projectRuntimeTransportAPI = {
+    requestPort: async (runtimeId) => {
+        let intent = projectRuntimeIntents.get(runtimeId);
+        if (!intent) {
+            intent = `${projectRuntimeIntentPrefix}:${++projectRuntimeIntentSequence}`;
+            projectRuntimeIntents.set(runtimeId, intent);
+        }
+        const isCurrent = () => projectRuntimeIntents.get(runtimeId) === intent;
+        const hasPort = () => isCurrent() && projectRuntimePorts.has(runtimeId);
+        const result = await requestRuntimeTransport({
+            invoke: async () => {
+                const ack = await ipcRenderer.invoke(IPC_CHANNELS.PROJECT_RUNTIME_TRANSPORT_REQUEST_PORT, runtimeId, { transportIntentId: intent });
+                if (!isCurrent())
+                    return { mode: 'direct', enabled: true, connected: false };
+                // Main can deliver a recovery port before an older request ACK settles.
+                return hasPort() ? { mode: 'direct', enabled: true, connected: true } : ack;
+            },
+            hasPort,
+            waitForPort: () => new Promise((resolve) => {
+                let portReadyTimeout = null;
+                const onPortReady = (ready) => {
+                    if (portReadyTimeout)
+                        clearTimeout(portReadyTimeout);
+                    projectRuntimePortWaiters.get(runtimeId)?.delete(onPortReady);
+                    resolve(ready && hasPort());
+                };
+                const waiters = projectRuntimePortWaiters.get(runtimeId) ?? new Set();
+                waiters.add(onPortReady);
+                projectRuntimePortWaiters.set(runtimeId, waiters);
+                portReadyTimeout = setTimeout(() => onPortReady(hasPort()), 10000);
+            }),
+        });
+        return isCurrent() ? result : { mode: 'direct', enabled: true, connected: false };
+    },
+    disconnect: async (runtimeId) => {
+        const transportIntentId = projectRuntimeIntents.get(runtimeId);
+        projectRuntimeIntents.delete(runtimeId);
+        for (const notify of [...(projectRuntimePortWaiters.get(runtimeId) ?? [])])
+            notify(false);
+        projectRuntimePortWaiters.delete(runtimeId);
+        dropProjectRuntimePort(runtimeId, { reasonCode: 'runtime_connection_stopped' });
+        await ipcRenderer.invoke(IPC_CHANNELS.PROJECT_RUNTIME_TRANSPORT_DISCONNECT, runtimeId, {
+            transportIntentId,
+        });
+    },
+    networkOnline: () => ipcRenderer.send(IPC_CHANNELS.PROJECT_RUNTIME_NETWORK_ONLINE),
+    setActiveRuntime: (runtimeId) => ipcRenderer.send(IPC_CHANNELS.PROJECT_RUNTIME_ACTIVE_PROJECT, runtimeId),
+    subscribeReady: (runtimeId, listener) => {
+        const listeners = projectRuntimeReadyListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeReadyListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeReadyListeners.delete(runtimeId);
+        };
+    },
+    subscribeStatus: (runtimeId, listener) => {
+        const listeners = projectRuntimeStatusListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeStatusListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeStatusListeners.delete(runtimeId);
+        };
+    },
+    getStatus: (runtimeId) => ipcRenderer.invoke(IPC_CHANNELS.PROJECT_RUNTIME_GET_STATUS, runtimeId),
+    post: (runtimeId, frame) => {
+        const port = projectRuntimePorts.get(runtimeId);
+        if (!port)
+            throw new Error('project runtime transport port unavailable');
+        port.postMessage(frame);
+    },
+    subscribe: (runtimeId, listener) => {
+        const listeners = projectRuntimeFrameListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeFrameListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeFrameListeners.delete(runtimeId);
+        };
+    },
+    subscribeLost: (runtimeId, listener) => {
+        const listeners = projectRuntimeLostListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeLostListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeLostListeners.delete(runtimeId);
+        };
+    },
+    subscribeFailed: (runtimeId, listener) => {
+        const listeners = projectRuntimeFailedListeners.get(runtimeId) ?? new Set();
+        listeners.add(listener);
+        projectRuntimeFailedListeners.set(runtimeId, listeners);
+        return () => {
+            listeners.delete(listener);
+            if (listeners.size === 0)
+                projectRuntimeFailedListeners.delete(runtimeId);
+        };
+    },
+};
+contextBridge.exposeInMainWorld('projectRuntimeTransportAPI', projectRuntimeTransportAPI);
+// The sandbox's browser global is intentionally structural: preload is compiled without DOM lib.
+const networkEventTarget = globalThis;
+networkEventTarget.addEventListener?.('online', projectRuntimeTransportAPI.networkOnline);
 // ============================================
 // 同步暴露平台信息（无需 IPC，立即可用）
 // 渲染进程可以通过 window.electronPlatform 同步访问
 // ============================================
 contextBridge.exposeInMainWorld('electronPlatform', platformInfo);
+if (desktopWindowKind === 'main') {
+    const browserWebviewHostAPI = {
+        onGuestInteraction: (listener) => {
+            const receive = () => listener();
+            ipcRenderer.on('browser-webview:interaction', receive);
+            return () => ipcRenderer.removeListener('browser-webview:interaction', receive);
+        },
+        onPrepareNative: (listener) => {
+            const receive = (_event, id) => {
+                void Promise.resolve()
+                    .then(listener)
+                    .then((blocked) => ipcRenderer.send('browser-webview:native-ready', id, blocked), () => ipcRenderer.send('browser-webview:native-ready', id, true));
+            };
+            ipcRenderer.on('browser-webview:prepare-native', receive);
+            return () => ipcRenderer.removeListener('browser-webview:prepare-native', receive);
+        },
+        onAgentPointer: (listener) => {
+            const receive = (_event, id) => listener(id);
+            ipcRenderer.on('browser-webview:agent-pointer', receive);
+            return () => ipcRenderer.removeListener('browser-webview:agent-pointer', receive);
+        },
+        ready: () => ipcRenderer.invoke('browser-webview:ready'),
+        applied: (id, revision) => ipcRenderer.send('browser-webview:applied', id, revision),
+        onSnapshot: (listener) => {
+            const receive = (_event, snapshot) => listener(snapshot);
+            ipcRenderer.on('browser-webview:snapshot', receive);
+            return () => ipcRenderer.removeListener('browser-webview:snapshot', receive);
+        },
+    };
+    contextBridge.exposeInMainWorld('browserWebviewHostAPI', browserWebviewHostAPI);
+    const browserBackendPolicyAPI = {
+        beginRefresh: () => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_BEGIN_REFRESH),
+        applyRefresh: (leaseId, config) => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_APPLY_REFRESH, leaseId, config),
+        getLaunchBackend: () => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_GET_LAUNCH),
+        onLaunchBackend: (listener) => {
+            const receive = (_event, backend) => listener(backend);
+            ipcRenderer.on(IPC_CHANNELS.BROWSER_BACKEND_LAUNCH_DECIDED, receive);
+            return () => ipcRenderer.removeListener(IPC_CHANNELS.BROWSER_BACKEND_LAUNCH_DECIDED, receive);
+        },
+        getDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.BROWSER_BACKEND_GET_DIAGNOSTICS),
+        reportTelemetry: (batch) => ipcRenderer.send(IPC_CHANNELS.BROWSER_TELEMETRY_REPORT, batch),
+        onDiagnosticsRequest: (provider) => {
+            const respond = (_event, requestId) => {
+                let state = null;
+                try {
+                    state = provider();
+                }
+                catch {
+                    state = null;
+                }
+                ipcRenderer.send(IPC_CHANNELS.BROWSER_TELEMETRY_DIAGNOSTICS_RESPONSE, requestId, state);
+            };
+            ipcRenderer.on(IPC_CHANNELS.BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST, respond);
+            return () => ipcRenderer.removeListener(IPC_CHANNELS.BROWSER_TELEMETRY_DIAGNOSTICS_REQUEST, respond);
+        },
+    };
+    contextBridge.exposeInMainWorld('browserBackendPolicyAPI', browserBackendPolicyAPI);
+}
 const embeddedBrowserAPI = {
     create: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_CREATE, params),
     show: (bounds, params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SHOW, bounds, params),
     setBounds: (bounds, params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_BOUNDS, bounds, params),
     setDevicePreviewMode: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_DEVICE_PREVIEW_MODE, params),
+    updateDevicePreview: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_UPDATE_DEVICE_PREVIEW, params),
     setNativeOverlayOcclusion: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_NATIVE_OVERLAY_OCCLUSION, params),
     hide: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_HIDE, params),
     destroy: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_DESTROY, params),
+    adoptSession: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_ADOPT_SESSION, params),
     getState: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_GET_STATE, params),
     executeTool: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_EXECUTE_TOOL, params),
     navigate: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_NAVIGATE, params),
@@ -1151,6 +1698,24 @@ const embeddedBrowserAPI = {
     clearCache: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_CACHE, params),
     setCommentMode: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_COMMENT_MODE, params),
     clearComments: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_CLEAR_COMMENTS, params),
+    resolveSentComments: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_RESOLVE_SENT_COMMENTS, params),
+    removeComment: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_REMOVE_COMMENT, params),
+    updateCommentVoice: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_UPDATE, params),
+    setCommentHostObstacle: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_HOST_OBSTACLE, params),
+    onCommentVoiceRequest: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, tabId, action } = payload;
+            if (typeof tabId !== 'number')
+                return;
+            if (action !== 'start' && action !== 'stop' && action !== 'cancel')
+                return;
+            callback({ sessionId: typeof sessionId === 'string' ? sessionId : null, tabId, action });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_COMMENT_VOICE_REQUEST, handler);
+    },
     ackCommentEvents: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_ACK_COMMENT_EVENTS, params),
     openExternal: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_OPEN_EXTERNAL, params),
     listLocalServers: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_LIST_LOCAL_SERVERS, params),
@@ -1166,9 +1731,148 @@ const embeddedBrowserAPI = {
         ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_ACTION, handler);
         return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_ACTION, handler);
     },
+    findInPage: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_IN_PAGE, params),
+    stopFindInPage: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_STOP_FIND_IN_PAGE, params),
+    onFindResult: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const raw = payload;
+            if (typeof raw.tabId !== 'number' ||
+                typeof raw.text !== 'string' ||
+                typeof raw.requestId !== 'number' ||
+                typeof raw.activeMatchOrdinal !== 'number' ||
+                typeof raw.matches !== 'number') {
+                return;
+            }
+            callback({
+                sessionId: typeof raw.sessionId === 'string' ? raw.sessionId : null,
+                tabId: raw.tabId,
+                text: raw.text,
+                requestId: raw.requestId,
+                activeMatchOrdinal: raw.activeMatchOrdinal,
+                matches: raw.matches,
+                finalUpdate: raw.finalUpdate === true,
+            });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_RESULT, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_RESULT, handler);
+    },
+    onFindRequested: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, tabId } = payload;
+            if (typeof tabId !== 'number')
+                return;
+            callback({ sessionId: typeof sessionId === 'string' ? sessionId : null, tabId });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_REQUESTED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_REQUESTED, handler);
+    },
+    /** Main rebuilt (or failed to rebuild) a tab whose webview page was lost. */
+    onTabRecovered: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, tabId, recovered } = payload;
+            if (typeof tabId !== 'number')
+                return;
+            callback({
+                sessionId: typeof sessionId === 'string' ? sessionId : null,
+                tabId,
+                recovered: recovered === true,
+            });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_TAB_RECOVERED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_TAB_RECOVERED, handler);
+    },
 };
 contextBridge.exposeInMainWorld('embeddedBrowserAPI', embeddedBrowserAPI);
 const openMiniApp = (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_OPEN, params);
+// Host-only bridge. This file is an unbundled sandbox preload: keep imports type-only.
+let miniAppHostEpoch = null;
+let miniAppHostHandshakeSequence = 0;
+let miniAppHostOpenHandler = null;
+let miniAppHostCancelHandler = null;
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_HOST_OPEN_REQUEST, async (_event, request) => {
+    if (!request || typeof request.epoch !== 'string' || typeof request.requestId !== 'string')
+        return;
+    const epoch = request.epoch;
+    let result = { success: false, code: 'host_unavailable' };
+    try {
+        if (epoch === miniAppHostEpoch && miniAppHostOpenHandler) {
+            result = await miniAppHostOpenHandler({
+                requestId: request.requestId,
+                target: request.target,
+            });
+        }
+    }
+    catch {
+        result = { success: false, code: 'result_unknown' };
+    }
+    try {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_HOST_OPEN_REPLY, {
+            epoch,
+            requestId: request.requestId,
+            result,
+        });
+    }
+    catch {
+        // Main settles the original call when this document ends.
+    }
+});
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_HOST_OPEN_CANCEL, (_event, request) => {
+    if (request?.epoch !== miniAppHostEpoch || typeof request?.requestId !== 'string')
+        return;
+    try {
+        miniAppHostCancelHandler?.(request.requestId);
+    }
+    catch {
+        /* cancellation is best-effort */
+    }
+});
+const miniAppHost = {
+    async handshake() {
+        const sequence = ++miniAppHostHandshakeSequence;
+        miniAppHostEpoch = null;
+        let response;
+        try {
+            response = await ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_HOST_HANDSHAKE);
+        }
+        catch {
+            return { success: false, code: 'host_unavailable' };
+        }
+        if (sequence !== miniAppHostHandshakeSequence) {
+            return { success: false, code: 'host_unavailable' };
+        }
+        if (response?.success === true && typeof response.epoch === 'string') {
+            miniAppHostEpoch = response.epoch;
+            return { success: true, epoch: response.epoch };
+        }
+        miniAppHostEpoch = null;
+        return { success: false, code: 'host_unavailable' };
+    },
+    publish(epoch, state) {
+        if (epoch !== miniAppHostEpoch)
+            return;
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_HOST_PUBLISH, { epoch, state });
+    },
+    onOpenRequest(handler) {
+        miniAppHostOpenHandler = handler;
+        return () => {
+            if (miniAppHostOpenHandler === handler)
+                miniAppHostOpenHandler = null;
+        };
+    },
+    onCancelOpen(handler) {
+        miniAppHostCancelHandler = handler;
+        return () => {
+            if (miniAppHostCancelHandler === handler)
+                miniAppHostCancelHandler = null;
+        };
+    },
+};
 let miniAppAppendHandler = null;
 // Install before React mounts so an unavailable receiver returns a result instead of losing a request.
 ipcRenderer.on(IPC_CHANNELS.MINIAPP_COMPOSER_REQUEST, async (_event, request) => {
@@ -1200,12 +1904,143 @@ const miniAppComposer = {
         };
     },
 };
+let miniAppToolPermissionHandler = null;
+let miniAppToolPermissionCancelHandler = null;
+// Install before React mounts so Main learns "no Host UI" (null) instead of waiting.
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_TOOL_PERMISSION_REQUEST, async (_event, request) => {
+    let result = null;
+    try {
+        if (miniAppToolPermissionHandler)
+            result = await miniAppToolPermissionHandler(request);
+    }
+    catch {
+        // A Host UI failure never allows; Main reads a malformed answer as a deny.
+        result = { decision: 'deny' };
+    }
+    try {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_TOOL_PERMISSION_REPLY, {
+            requestId: request.requestId,
+            result,
+        });
+    }
+    catch {
+        // The Host document may be exiting. Main settles its outstanding request on document teardown.
+    }
+});
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_TOOL_PERMISSION_CANCEL, (_event, message) => {
+    const requestId = message?.requestId;
+    if (typeof requestId === 'string')
+        miniAppToolPermissionCancelHandler?.(requestId);
+});
+const miniAppToolPermission = {
+    onRequest: (handler) => {
+        miniAppToolPermissionHandler = handler;
+        return () => {
+            if (miniAppToolPermissionHandler === handler)
+                miniAppToolPermissionHandler = null;
+        };
+    },
+    onCancel: (handler) => {
+        miniAppToolPermissionCancelHandler = handler;
+        return () => {
+            if (miniAppToolPermissionCancelHandler === handler)
+                miniAppToolPermissionCancelHandler = null;
+        };
+    },
+};
+let miniAppOpenSessionHandler = null;
+const isNonEmptyString = (value) => typeof value === 'string' && value.length > 0;
+// Install before React mounts so Main learns "no Host UI yet" instead of waiting out its bound.
+// The sandboxed preload cannot load `@mavis/shared` at runtime, so the field checks mirror
+// `MiniAppAgentOpenSessionMessage` by hand.
+ipcRenderer.on(IPC_CHANNELS.MINIAPP_AGENT_OPEN_SESSION, async (_event, message) => {
+    const { requestId, hostSessionId, sessionId } = (message ?? {});
+    if (!isNonEmptyString(requestId))
+        return;
+    if (!isNonEmptyString(hostSessionId) || !isNonEmptyString(sessionId))
+        return;
+    let result;
+    try {
+        const handler = miniAppOpenSessionHandler;
+        const shown = handler ? await handler({ hostSessionId, sessionId }) : false;
+        result = shown === true ? { ok: true } : { ok: false, code: 'target_unavailable' };
+    }
+    catch {
+        // A Host UI failure must not surface in the preload; the tab may or may not be shown.
+        result = { ok: false, code: 'result_unknown' };
+    }
+    try {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_AGENT_OPEN_SESSION_REPLY, {
+            requestId,
+            result,
+        });
+    }
+    catch {
+        // The Host document may be exiting. Main settles its outstanding request on document teardown.
+    }
+});
+const miniAppAgentSessions = {
+    onOpenRequest: (handler) => {
+        miniAppOpenSessionHandler = handler;
+        return () => {
+            if (miniAppOpenSessionHandler === handler)
+                miniAppOpenSessionHandler = null;
+        };
+    },
+    notifyClosed: ({ hostSessionId, sessionId }) => {
+        ipcRenderer.send(IPC_CHANNELS.MINIAPP_AGENT_PANEL_CLOSED, { hostSessionId, sessionId });
+    },
+};
+// Hand-written mirror of `MiniAppSleptEvent` (see the sandbox note above); only contract fields
+// reach the Host UI. `satisfies` keeps the reason set in step with `MiniAppSleepReason`.
+const MINIAPP_SLEEP_REASON_SET = {
+    'count-cap': true,
+    'pressure-moderate': true,
+    'pressure-critical': true,
+};
+const isMiniAppSleepReasonValue = (value) => typeof value === 'string' &&
+    Object.prototype.hasOwnProperty.call(MINIAPP_SLEEP_REASON_SET, value);
+const readMiniAppSleptEvent = (value) => {
+    if (!value || typeof value !== 'object')
+        return null;
+    const { pluginId, displayName, reason, unit, notify } = value;
+    if (!isNonEmptyString(pluginId))
+        return null;
+    if (displayName !== undefined && typeof displayName !== 'string')
+        return null;
+    if (!isMiniAppSleepReasonValue(reason))
+        return null;
+    if ((unit !== 'page' && unit !== 'app') || typeof notify !== 'boolean')
+        return null;
+    return { pluginId, ...(displayName !== undefined ? { displayName } : {}), reason, unit, notify };
+};
+const onMiniAppSlept = (listener) => {
+    const forward = (_event, message) => {
+        const event = readMiniAppSleptEvent(message);
+        if (event)
+            listener(event);
+    };
+    ipcRenderer.on(IPC_CHANNELS.MINIAPP_SLEPT, forward);
+    return () => {
+        ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_SLEPT, forward);
+    };
+};
 const miniAppAPI = {
+    host: miniAppHost,
+    agentSessions: miniAppAgentSessions,
     composer: miniAppComposer,
+    toolPermission: miniAppToolPermission,
     list: () => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_LIST),
     open: openMiniApp,
     refresh: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_REFRESH, params),
     stop: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_STOP, params),
+    close: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_CLOSE, params),
+    detach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_DETACH, params),
+    attach: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_ATTACH, params),
+    applyUpdate: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_APPLY_UPDATE, params),
+    listPermissions: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PERMISSIONS_LIST, params),
+    setPermission: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PERMISSIONS_SET, params),
+    onSlept: onMiniAppSlept,
 };
 contextBridge.exposeInMainWorld('miniAppAPI', miniAppAPI);
 const browserProfileImportAPI = {
@@ -1236,6 +2071,9 @@ ipcRenderer.on(IPC_CHANNELS.UPDATER_OPEN_MODAL, () => {
         callback();
 });
 const updaterAPI = {
+    getTestBranchInfo: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_BRANCH_INFO),
+    queryTestBranch: (branch) => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_BRANCH_QUERY, branch),
+    switchTestBranch: (branch) => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_BRANCH_SWITCH, branch),
     // 检查更新
     checkForUpdates: (options) => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_CHECK, options),
     // 用户确认后下载更新
@@ -1276,6 +2114,8 @@ const deepLinkAPI = {
         ipcRenderer.on(IPC_CHANNELS.DEEPLINK_RECEIVED, handler);
         return () => ipcRenderer.removeListener(IPC_CHANNELS.DEEPLINK_RECEIVED, handler);
     },
+    // Claim the directory from the latest `workspace/open` link; null once taken.
+    takePendingWorkspaceOpen: () => ipcRenderer.invoke(IPC_CHANNELS.DEEPLINK_TAKE_WORKSPACE_OPEN),
 };
 contextBridge.exposeInMainWorld('deepLinkAPI', deepLinkAPI);
 // ============================================
@@ -1406,6 +2246,23 @@ ipcRenderer.on(IPC_CHANNELS.DOCUMENT_PREVIEW_PPTX_CORE_PORT, (event, payload) =>
     };
 });
 const documentPreviewAPI = {
+    pptxEditing: {
+        request: (input) => ipcRenderer.invoke('pptx-edit:request', input),
+        onStatus: (callback) => {
+            const handler = (_event, input) => callback(input);
+            ipcRenderer.on('pptx-edit:status', handler);
+            return () => ipcRenderer.removeListener('pptx-edit:status', handler);
+        },
+    },
+    pptxEditingHost: {
+        ready: () => ipcRenderer.invoke('pptx-edit-host:ready'),
+        onRequest: (callback) => {
+            const handler = (_event, input) => callback(input);
+            ipcRenderer.on('pptx-edit-host:request', handler);
+            return () => ipcRenderer.removeListener('pptx-edit-host:request', handler);
+        },
+        reply: (input) => ipcRenderer.send('pptx-edit-host:reply', input),
+    },
     openSource: (input) => ipcRenderer.invoke(IPC_CHANNELS.DOCUMENT_PREVIEW_OPEN_SOURCE, input),
     savePptxNotes: (input) => ipcRenderer.invoke(IPC_CHANNELS.DOCUMENT_PREVIEW_SAVE_PPTX_NOTES, input),
     openInSystem: (claim) => ipcRenderer.invoke(IPC_CHANNELS.DOCUMENT_PREVIEW_OPEN_IN_SYSTEM, claim),
@@ -1456,6 +2313,7 @@ const documentPreviewAPI = {
 };
 contextBridge.exposeInMainWorld('documentPreviewAPI', documentPreviewAPI);
 const previewClipboardAPI = {
+    writeFiles: (sessionId, paths) => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CLIPBOARD_WRITE_FILES, sessionId, paths),
     write: (payload) => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CLIPBOARD_WRITE, payload),
 };
 contextBridge.exposeInMainWorld('previewClipboardAPI', previewClipboardAPI);
@@ -1537,6 +2395,13 @@ function toUIStatus(s) {
         pairingCode: s.pairing_code,
         pairingExpiresAt: s.expires_in !== undefined ? Date.now() + s.expires_in * 1000 : undefined,
         ...(typeof s.binding_id === 'number' ? { bindingId: s.binding_id } : {}),
+        ...(typeof s.request_epoch === 'number' ? { requestEpoch: s.request_epoch } : {}),
+        ...(typeof s.producer_generation === 'number'
+            ? { producerGeneration: s.producer_generation }
+            : {}),
+        ...(typeof s.pending_unbind_request_id === 'string'
+            ? { pendingUnbindRequestId: s.pending_unbind_request_id }
+            : {}),
     };
 }
 function isErrorResult(v) {
@@ -1545,6 +2410,10 @@ function isErrorResult(v) {
 const remoteControlAPI = {
     getDeviceId: () => ipcRenderer.invoke(IPC_CHANNELS.RC_GET_DEVICE_ID),
     getDeviceName: () => ipcRenderer.invoke(IPC_CHANNELS.RC_GET_DEVICE_NAME),
+    getStatus: async () => {
+        const status = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_STATUS);
+        return toUIStatus(status);
+    },
     onStatusChanged: (callback) => {
         const handler = (_event, status) => {
             callback(toUIStatus(status));
@@ -1593,6 +2462,27 @@ const remoteControlAPI = {
         const status = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_STATUS);
         return toUIStatus(status);
     },
+    beginUnbind: async () => {
+        const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_BEGIN_UNBIND);
+        if (!raw || raw.success === false || !raw.pending) {
+            return { code: 'begin_unbind_failed', message: raw?.error ?? 'Begin unbind failed' };
+        }
+        return raw.pending;
+    },
+    getPendingUnbind: async () => {
+        const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_PENDING_UNBIND);
+        if (!raw || raw.success === false)
+            return undefined;
+        return raw.pending;
+    },
+    resolveUnbind: async (input) => {
+        const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_RESOLVE_UNBIND, input);
+        if (raw && raw.success === false) {
+            return { code: 'resolve_unbind_failed', message: raw.error ?? 'Resolve unbind failed' };
+        }
+        const status = await ipcRenderer.invoke(IPC_CHANNELS.RC_GET_STATUS);
+        return toUIStatus(status);
+    },
     cancelBind: async () => {
         const raw = await ipcRenderer.invoke(IPC_CHANNELS.RC_DISCONNECT);
         if (raw && !raw.success) {
@@ -1623,34 +2513,22 @@ catch {
 }
 contextBridge.exposeInMainWorld('cuPreviewAPI', {
     inspect: (sessionId, capture) => ipcRenderer.invoke('cu:preview:inspect', sessionId, capture),
+    desktopPermission: () => ipcRenderer.invoke('cu:preview:desktopPermission'),
+    openDesktopPermissionSettings: () => ipcRenderer.invoke('cu:preview:openDesktopPermissionSettings'),
 });
-contextBridge.exposeInMainWorld('wordEditorAPI', {
-    register: (input) => ipcRenderer.invoke('word-editor:register', input),
-    unregister: (documentId) => ipcRenderer.send('word-editor:unregister', documentId),
-    onRequest: (callback) => {
+contextBridge.exposeInMainWorld('pptPreviewAPI', {
+    listArtifacts: (sessionId) => ipcRenderer.invoke('ppt-preview:list-artifacts', sessionId),
+    ready: () => ipcRenderer.invoke('ppt-preview-render:ready'),
+    onPrepare: (callback) => {
         const handler = (_event, request) => callback(request);
-        ipcRenderer.on('word-editor:request', handler);
-        return () => ipcRenderer.removeListener('word-editor:request', handler);
+        ipcRenderer.on('ppt-preview-render:prepare', handler);
+        return () => ipcRenderer.removeListener('ppt-preview-render:prepare', handler);
     },
     onCancel: (callback) => {
         const handler = (_event, requestId) => callback(requestId);
-        ipcRenderer.on('word-editor:cancel', handler);
-        return () => ipcRenderer.removeListener('word-editor:cancel', handler);
+        ipcRenderer.on('ppt-preview-render:cancel', handler);
+        return () => ipcRenderer.removeListener('ppt-preview-render:cancel', handler);
     },
-    reply: (result) => ipcRenderer.send('word-editor:result', result),
-});
-contextBridge.exposeInMainWorld('excelEditorAPI', {
-    register: (input) => ipcRenderer.invoke('excel-editor:register', input),
-    unregister: (documentId) => ipcRenderer.send('excel-editor:unregister', documentId),
-    onRequest: (callback) => {
-        const handler = (_event, request) => callback(request);
-        ipcRenderer.on('excel-editor:request', handler);
-        return () => ipcRenderer.removeListener('excel-editor:request', handler);
-    },
-    onCancel: (callback) => {
-        const handler = (_event, requestId) => callback(requestId);
-        ipcRenderer.on('excel-editor:cancel', handler);
-        return () => ipcRenderer.removeListener('excel-editor:cancel', handler);
-    },
-    reply: (result) => ipcRenderer.send('excel-editor:result', result),
+    reply: (result) => ipcRenderer.send('ppt-preview-render:result', result),
+    openVersion: (input) => ipcRenderer.invoke('ppt-preview:open-version', input),
 });

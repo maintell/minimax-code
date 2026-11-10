@@ -99,10 +99,8 @@ function isSessionArtifactFile(name, relativeName) {
  *   uploads without the feedback-only selected Session report.
  * - CLI incident reports under `v2/observability/cli/incidents`.
  *
- * Log sources run in error-context mode because real-world dev machines
- * accumulate hundreds of MB of INFO chatter for only ~10 ERROR lines per
- * file — keeping the full tail would waste upload bandwidth without adding
- * diagnostic signal.
+ * 当前 v2 目录下的 runtime 日志整份带：打包版里 runtime 的日志只写在这些文件里，main 日志不再抄一份，
+ * 只截报错附近的行会丢掉排查要用的普通日志。迁移期旧目录 `logs/` 下的 runtime 日志仍只带报错前后的行。
  *
  * Uploads are user-triggered from the desktop sidebar, Settings -> About, or
  * the app menu. The canonical `messages.jsonl` conversation/tool-call file is
@@ -119,13 +117,6 @@ export function getExtraLogSources() {
             match: isRuntimeLogFile,
             prefix: 'mavis-runtime/',
             recursive: true,
-            errorContext: {
-                contextLines: RUNTIME_ERROR_CONTEXT_LINES,
-                maxOutputBytes: RUNTIME_ERROR_MAX_OUTPUT_BYTES,
-                fallbackRecentMs: RUNTIME_FALLBACK_RECENT_MS,
-                fallbackTailBytes: RUNTIME_FALLBACK_TAIL_BYTES,
-                errorRegex: LOCAL_RUNTIME_ERROR_LEVEL_REGEX,
-            },
         },
         {
             dir: legacyLogsDir,
@@ -157,6 +148,24 @@ export function getExtraLogSources() {
             match: (name) => name.endsWith('.json'),
             prefix: 'mavis-cli-incidents/',
         },
+        ...(process.platform === 'win32' && process.env.LOCALAPPDATA
+            ? [
+                {
+                    dir: path.join(process.env.LOCALAPPDATA, 'MiniMax', 'installer-logs'),
+                    match: (name) => /^nsis-[A-Za-z0-9.+_-]+-\d+\.log$/.test(name),
+                    prefix: 'windows-installer/',
+                    maxBytesPerFile: 1024 * 1024,
+                },
+                {
+                    // Chrome Cookie 导入的 ABE broker 诊断日志（broker 自身限制在 64 KiB）。
+                    // 提权失败时宿主只能拿到退出码，阶段名和 Win32 错误都在这个文件里。
+                    dir: path.join(process.env.LOCALAPPDATA, 'MiniMax Code', 'logs'),
+                    match: (name) => name === 'abe-broker.log',
+                    prefix: 'abe-broker/',
+                    maxBytesPerFile: 128 * 1024,
+                },
+            ]
+            : []),
     ];
 }
 /**

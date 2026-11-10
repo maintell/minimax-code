@@ -273,7 +273,7 @@ export class LocalSandboxService {
             finished = true;
             if (handle)
                 active.backendInvocationHandle = handle;
-            let cleanup = 'success';
+            let cleanup = outcome.cleanup;
             try {
                 if (active.backendInvocationHandle) {
                     await backendRecord.backend.onInvocationEnd(active.backendInvocationHandle);
@@ -301,6 +301,7 @@ export class LocalSandboxService {
             const sessionTempDir = await this.#tempManager.sessionDir(input.identity.sessionId);
             const context = await resolveSandboxInvocationContext({
                 workspaceRoot: input.workspaceRoot,
+                workspaceRoots: input.workspaceRoots,
                 cwd: input.cwd,
                 sessionTempDir,
                 runtimeTempInstanceDir: this.#tempManager.instanceDir,

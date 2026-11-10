@@ -70,7 +70,7 @@
  * Streaming cmds (send/resume) ack first, then hand the SSE Response to the
  * injected RcStreamPump (T3) — the router never reads stream bodies.
  *
- * cmd dedupe: 5-min LRU on cmd.id — a duplicate re-sends the cached ack/err
+ * cmd dedupe: 5-min LRU on command owner + cmd.id — a duplicate re-sends the cached ack/err
  * and never re-invokes downstream (protocol §5; prevents double send/create).
  * While the original is still in flight the duplicate is dropped (logged).
  *
@@ -94,7 +94,7 @@ const RC_FILE_CONTENT_MAX_BYTES_HEADER = 'X-MCode-Remote-Control-File-Content-Ma
 const ROUTE_HEADER_ALLOWLIST = new Set([RC_FILE_CONTENT_MAX_BYTES_HEADER.toLowerCase()]);
 export function createCommandRouter(deps) {
     const nowMs = deps.nowMs ?? Date.now;
-    // cmd.id → cached reply frame (ack or err), 5min TTL LRU (Map keeps
+    // owner + cmd.id → cached reply frame (ack or err), 5min TTL LRU (Map keeps
     // insertion order; refreshed entries are re-inserted at the tail).
     const replyCache = new Map();
     const inFlight = new Set();
@@ -120,6 +120,9 @@ export function createCommandRouter(deps) {
     }
     return {
         async handleCommand(cmd, reply, context) {
+            if (context?.signal?.aborted)
+                return;
+            const commandKey = JSON.stringify([context?.commandScope ?? '', cmd.id]);
             const startedAtMs = nowMs();
             const traceId = cmd.trace_id;
             const correlation = correlationForCmd(cmd);
@@ -138,7 +141,7 @@ export function createCommandRouter(deps) {
                 stage: 'command_received',
                 outcome: 'started',
             });
-            const cached = cachedReply(cmd.id);
+            const cached = cachedReply(commandKey);
             if (cached) {
                 logRcCase(deps.logger, 'info', {
                     ...caseBase,
@@ -150,7 +153,7 @@ export function createCommandRouter(deps) {
                 reply(cached);
                 return;
             }
-            if (inFlight.has(cmd.id)) {
+            if (inFlight.has(commandKey)) {
                 logRcCase(deps.logger, 'warn', {
                     ...caseBase,
                     stage: 'command_deduplicated',
@@ -160,16 +163,39 @@ export function createCommandRouter(deps) {
                 deps.logger.warn(`[rc.router] duplicate cmd id=${cmd.id} still in flight → dropped`);
                 return;
             }
-            inFlight.add(cmd.id);
+            inFlight.add(commandKey);
             if (!traceId) {
                 deps.logger.warn(`[rc.router] event=missing_trace_id trace_id= rc_cmd_id=${cmd.id} rc_operation_id=${correlation.rcOperationId ?? ''} session_id=${correlation.sessionId ?? ''} cmd_type=${cmd.type}`);
             }
             const replyOnce = (frame) => {
-                cacheReply(cmd.id, frame);
-                reply(frame);
+                // Keep a completed command's dedup fact across reconnects, even when
+                // its original socket has gone. Never replay its side effects.
+                cacheReply(commandKey, frame);
+                if (!context?.signal?.aborted)
+                    reply(frame);
             };
             try {
-                const outcome = await dispatch(deps, cmd, context);
+                const signal = context?.signal;
+                const scopedDeps = signal
+                    ? {
+                        ...deps,
+                        invoke: (request) => {
+                            signal.throwIfAborted();
+                            return deps.invoke(new Request(request, {
+                                signal: AbortSignal.any([signal, request.signal]),
+                            }));
+                        },
+                        ...(deps.onSessionComposerModeChange
+                            ? {
+                                onSessionComposerModeChange: (change) => {
+                                    signal.throwIfAborted();
+                                    return deps.onSessionComposerModeChange(change);
+                                },
+                            }
+                            : {}),
+                    }
+                    : deps;
+                const outcome = await dispatch(scopedDeps, cmd, context);
                 const elapsedMs = Math.max(0, nowMs() - startedAtMs);
                 if (outcome.kind === 'ack') {
                     const disposition = readString(outcome.payload.disposition);
@@ -201,6 +227,10 @@ export function createCommandRouter(deps) {
                     // Ack precedes the final stream (§6 rule 1). Each outcome carries
                     // one final response, so the pump starts once after the disposition.
                     if (outcome.stream) {
+                        if (signal?.aborted) {
+                            void outcome.stream.response.body?.cancel().catch(() => undefined);
+                            return;
+                        }
                         deps.pump.start({
                             sessionId: outcome.stream.sessionId,
                             cmdId: cmd.id,
@@ -208,6 +238,7 @@ export function createCommandRouter(deps) {
                             response: outcome.stream.response,
                             traceId,
                             streamScope: context?.streamScope,
+                            signal,
                         });
                     }
                 }
@@ -216,6 +247,16 @@ export function createCommandRouter(deps) {
                 }
             }
             catch (err) {
+                if (context?.signal?.aborted) {
+                    // The runtime may already have committed a send before observing
+                    // cancellation. Do not turn reconnect replay into a second send.
+                    cacheReply(commandKey, makeFrame(errTypeForCmd(cmd.type), {
+                        code: 'COMMAND_CANCELLED',
+                        message: 'connection ended before command completion; refresh session state',
+                        retryable: false,
+                    }, { inReplyTo: cmd.id, traceId }));
+                    return;
+                }
                 const message = redactLogValue(err instanceof Error ? err.message : String(err));
                 logRcCase(deps.logger, 'error', {
                     ...caseBase,
@@ -228,7 +269,7 @@ export function createCommandRouter(deps) {
                 replyOnce(makeFrame(errTypeForCmd(cmd.type), { code: 'INTERNAL_ERROR', message, retryable: true }, { inReplyTo: cmd.id, traceId }));
             }
             finally {
-                inFlight.delete(cmd.id);
+                inFlight.delete(commandKey);
             }
         },
     };
@@ -472,6 +513,9 @@ async function sessionSend(deps, cmd, payload) {
     const sessionId = readString(payload.session_id);
     if (!sessionId)
         return missingField('session_id');
+    const action = readSideMessageAction(payload);
+    if (action)
+        return sessionSideMessageAction(deps, cmd, sessionId, action, payload);
     const content = readString(payload.content);
     if (content === undefined)
         return missingField('content');
@@ -480,6 +524,11 @@ async function sessionSend(deps, cmd, payload) {
     const desktopBody = { content, ...modelBody(payload.model) };
     const legacyBody = { content, ...modelBody(payload.model) };
     const clientIntent = readString(payload.client_intent);
+    if (clientIntent === 'plan-entry') {
+        const modelError = await ensureRcContinuationModel(deps, cmd, sessionId, payload.model);
+        if (modelError)
+            return { kind: 'err', err: modelError };
+    }
     if (clientIntent === 'plan-entry' ||
         clientIntent === 'plan-exit' ||
         clientIntent === 'retry-continuation') {
@@ -523,7 +572,8 @@ async function sessionSend(deps, cmd, payload) {
         };
     }
     const sendErr = await readErrorBody(sendResponse);
-    if (sendResponse.status === 409 && isBusyCode(sendErr.rawCode)) {
+    if (sendResponse.status === 409 &&
+        isQueueFallbackCode(sendErr.rawCode, desktopBody.client_intent !== undefined)) {
         // D-8: busy path — enqueue instead (Desktop queue keeps turn ordering).
         const desktopQueuePath = `${DESKTOP_API}/session/${encodeURIComponent(sessionId)}/queue`;
         const legacyQueuePath = `${LEGACY_MAVIS_API}/session/${encodeURIComponent(sessionId)}/queue`;
@@ -542,8 +592,60 @@ async function sessionSend(deps, cmd, payload) {
     }
     return { kind: 'err', err: errShapeFrom(sendResponse.status, sendErr, 'session') };
 }
+function readSideMessageAction(payload) {
+    const retry = readString(payload.retry_message_id) ?? readString(payload.retryMessageId);
+    const discard = readString(payload.discard_message_id) ?? readString(payload.discardMessageId);
+    if (retry && discard)
+        return { kind: 'conflict' };
+    if (retry)
+        return { kind: 'retry', messageId: retry };
+    if (discard)
+        return { kind: 'discard', messageId: discard };
+    return undefined;
+}
+/**
+ * Retry / discard of an undelivered side message: the same Desktop send route
+ * with `retry_message_id` / `discard_message_id`; the runtime ignores content.
+ * Forwarded as-is: never a legacy fallback (a 404 means the row is gone) and
+ * never a Queue fallback (the runtime already applied the side-message rules).
+ * Both conflicting ids still reach the runtime, which owns that rejection.
+ */
+async function sessionSideMessageAction(deps, cmd, sessionId, action, payload) {
+    const body = {
+        content: typeof payload.content === 'string' ? payload.content : '',
+        ...modelBody(payload.model),
+    };
+    if (action.kind === 'conflict') {
+        body.retry_message_id = readString(payload.retry_message_id) ?? payload.retryMessageId;
+        body.discard_message_id = readString(payload.discard_message_id) ?? payload.discardMessageId;
+    }
+    else if (action.kind === 'retry') {
+        body.retry_message_id = action.messageId;
+    }
+    else {
+        body.discard_message_id = action.messageId;
+    }
+    const response = await invokeLocal(deps, cmd, postJson(`${DESKTOP_API}/session/${encodeURIComponent(sessionId)}/message`, body));
+    if (response.ok) {
+        deps.logger.info(`[rc.router] ${cmd.type} id=${cmd.id} side_message_action=${action.kind} status=${response.status} disposition=sent`);
+        return {
+            kind: 'ack',
+            payload: { disposition: 'sent' },
+            stream: { sessionId, response },
+        };
+    }
+    return { kind: 'err', err: await toErrShape(response, 'session') };
+}
 // ─── 4. cmd.session.new (create-only, AD-5 — no content leg) ────────────
 async function sessionNew(deps, cmd, payload) {
+    // An RC Home session has no producer session model yet. Resolve it before
+    // creation so a stale config default cannot reject the session itself.
+    const resolved = isPayload(payload.model)
+        ? { model: payload.model }
+        : await rcCatalogModel(deps, cmd);
+    if ('error' in resolved)
+        return { kind: 'err', err: resolved.error };
+    const { model } = resolved;
     const agent = readString(payload.agent) ?? DEFAULT_AGENT_NAME;
     const workspace = readString(payload.workspace) ?? readString(payload.workspace_dir);
     const title = readString(payload.title);
@@ -570,9 +672,39 @@ async function sessionNew(deps, cmd, payload) {
         ...(runLocation && typeof runLocation === 'object' && !Array.isArray(runLocation)
             ? { run_location: runLocation }
             : {}),
-        ...modelBody(payload.model),
+        model,
     };
     return oneShot(deps, cmd, postJson(`${DESKTOP_API}/agent/${encodeURIComponent(agent)}/session`, body), 'session');
+}
+async function rcCatalogModel(deps, cmd) {
+    const response = await invokeLocal(deps, cmd, new Request(`${LOCAL_ORIGIN}${DESKTOP_API}/models/list`));
+    if (!response.ok)
+        return { error: await toErrShape(response, 'model') };
+    const models = (await readJson(response)).models;
+    const available = Array.isArray(models)
+        ? models.filter((item) => isPayload(item) && item.enabled !== false)
+        : [];
+    const selected = available.find((item) => item.selected === true) ?? available[0];
+    const providerId = readString(selected?.provider_id ?? selected?.providerId);
+    const modelId = readString(selected?.model_id ?? selected?.modelId);
+    if (!providerId || !modelId) {
+        return {
+            error: {
+                code: 'MODEL_SELECTION_UNAVAILABLE',
+                message: 'No available model for this Remote Control session',
+                retryable: false,
+            },
+        };
+    }
+    return {
+        model: {
+            provider_id: providerId,
+            model_id: modelId,
+            ...(selected?.variant !== undefined ? { variant: selected.variant } : {}),
+            ...(selected?.thinking !== undefined ? { thinking: selected.thinking } : {}),
+            ...(selected?.context_limit !== undefined ? { context_limit: selected.context_limit } : {}),
+        },
+    };
 }
 // ─── 5. cmd.session.resume (SSE, true resume) ───────────────────────────
 async function sessionResume(deps, cmd, payload) {
@@ -1100,6 +1232,14 @@ async function genericExecute(deps, cmd) {
         if (!materializedPayload.ok)
             return { kind: 'err', err: materializedPayload.err };
     }
+    const goalSessionId = route.method.toUpperCase() === 'POST'
+        ? /\/session\/([^/?]+)\/goal$/.exec(route.path)?.[1]
+        : undefined;
+    if (goalSessionId) {
+        const modelError = await ensureRcContinuationModel(deps, cmd, decodeURIComponent(goalSessionId));
+        if (modelError)
+            return { kind: 'err', err: modelError };
+    }
     const url = `${LOCAL_ORIGIN}${route.path}`;
     const request = buildRequest(route.method, url, materializedPayload.payload, route.headers, deps.getRemoteControlFileContentMaxBytes?.());
     const response = await invokeLocal(deps, cmd, request);
@@ -1450,6 +1590,71 @@ function modelBody(model) {
         return {};
     return { model: model };
 }
+/** RC continuations run without a message model; retain the producer's session choice. */
+async function ensureRcContinuationModel(deps, cmd, sessionId, requested) {
+    const sessionResponse = await invokeLocal(deps, cmd, new Request(`${LOCAL_ORIGIN}${DESKTOP_API}/session/${encodeURIComponent(sessionId)}`));
+    if (!sessionResponse.ok)
+        return toErrShape(sessionResponse, 'session');
+    const sessionBody = await readJson(sessionResponse);
+    const session = isPayload(sessionBody.session) ? sessionBody.session : sessionBody;
+    const saved = isPayload(session.model) ? session.model : undefined;
+    const wanted = isPayload(requested) ? requested : undefined;
+    const providerId = readString(wanted?.provider_id ?? wanted?.providerId);
+    const modelId = readString(wanted?.model_id ?? wanted?.modelId);
+    if (saved && (!providerId || !modelId))
+        return undefined;
+    let selection = providerId && modelId ? wanted : undefined;
+    if (!selection) {
+        const listResponse = await invokeLocal(deps, cmd, new Request(withQuery(`${DESKTOP_API}/models/list`, { session_id: sessionId })));
+        if (!listResponse.ok)
+            return toErrShape(listResponse, 'model');
+        const models = (await readJson(listResponse)).models;
+        if (Array.isArray(models)) {
+            selection = models.find((item) => isPayload(item) && item.selected === true);
+            selection ??= models.find((item) => isPayload(item) && item.enabled !== false);
+        }
+    }
+    const selectedProvider = isPayload(selection)
+        ? readString(selection.provider_id ?? selection.providerId)
+        : undefined;
+    const selectedModel = isPayload(selection)
+        ? readString(selection.model_id ?? selection.modelId)
+        : undefined;
+    if (!selectedProvider || !selectedModel) {
+        return {
+            code: 'MODEL_SELECTION_UNAVAILABLE',
+            message: 'No available model for this Remote Control session',
+            retryable: false,
+        };
+    }
+    const selectResponse = await invokeLocal(deps, cmd, postJson(`${DESKTOP_API}/models/select`, {
+        session_id: sessionId,
+        provider_id: selectedProvider,
+        model_id: selectedModel,
+        ...(isPayload(selection) && selection.variant !== undefined
+            ? { variant: selection.variant }
+            : {}),
+        ...(isPayload(selection) && selection.reasoning !== undefined
+            ? { reasoning: selection.reasoning }
+            : {}),
+        ...(isPayload(selection) && selection.thinking !== undefined
+            ? { thinking: selection.thinking }
+            : {}),
+        ...(isPayload(selection) && (selection.context_limit ?? selection.contextLimit) !== undefined
+            ? { context_limit: selection.context_limit ?? selection.contextLimit }
+            : {}),
+    }));
+    if (!selectResponse.ok)
+        return toErrShape(selectResponse, 'model');
+    if ((await readJson(selectResponse)).success === false) {
+        return {
+            code: 'MODEL_SELECTION_REJECTED',
+            message: 'The producer rejected the session model',
+            retryable: false,
+        };
+    }
+    return undefined;
+}
 /**
  * Downloaded attachment → generated Desktop AttachmentInput wire.
  */
@@ -1507,6 +1712,21 @@ async function readJson(response) {
 function isBusyCode(rawCode) {
     return rawCode === 'local_session_busy' || rawCode === 'local_session_has_queued_messages';
 }
+/**
+ * Turn-switch races a plain send can lose: the target Turn ingress conflicted
+ * or its continuation became unavailable. Like a busy session they belong in
+ * the Queue. Intent sends (plan entry/exit, continuation retry) keep only the
+ * busy codes: their own rejection must not turn into a queued plain message.
+ */
+const TURN_SWITCH_RACE_CODES = new Set([
+    'local_turn_ingress_conflict',
+    'local_turn_continuation_unavailable',
+]);
+function isQueueFallbackCode(rawCode, hasClientIntent) {
+    if (isBusyCode(rawCode))
+        return true;
+    return !hasClientIntent && rawCode !== undefined && TURN_SWITCH_RACE_CODES.has(rawCode);
+}
 function toDesktopBatchPermissionDecision(decision) {
     switch (decision) {
         case 'allowOnce':
@@ -1522,11 +1742,13 @@ function toDesktopBatchPermissionDecision(decision) {
 async function readErrorBody(response) {
     const body = await readJson(response);
     const rawCode = readString(body.key) ?? readString(body.code);
+    const detail = readString(body.detail);
     return {
         ...(rawCode ? { rawCode } : {}),
         ...((readString(body.error) ?? readString(body.message))
             ? { message: readString(body.error) ?? readString(body.message) }
             : {}),
+        ...(detail ? { detail } : {}),
         body,
     };
 }
@@ -1544,7 +1766,12 @@ export function errShapeFrom(status, body, domain) {
     if (status === 503)
         return { code: 'DAEMON_UNAVAILABLE', message, retryable: true };
     if (body.rawCode) {
-        return { code: body.rawCode.replace(/^local_/, '').toUpperCase(), message, retryable };
+        return {
+            code: body.rawCode.replace(/^local_/, '').toUpperCase(),
+            message,
+            retryable,
+            ...(body.detail ? { detail: body.detail } : {}),
+        };
     }
     switch (status) {
         case 400:

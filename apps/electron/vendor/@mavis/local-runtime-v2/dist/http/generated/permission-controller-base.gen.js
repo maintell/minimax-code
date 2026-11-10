@@ -15,6 +15,16 @@ export class PermissionControllerBase {
         void req;
         throw new NotImplementedError('rejectQuestion');
     }
+    async getPermissionMode(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getPermissionMode');
+    }
+    async setPermissionMode(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('setPermissionMode');
+    }
     async listPendingPermissions(ctx, req) {
         void ctx;
         void req;

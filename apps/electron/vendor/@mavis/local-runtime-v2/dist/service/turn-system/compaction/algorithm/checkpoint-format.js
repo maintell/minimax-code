@@ -1,17 +1,22 @@
 import { appendCompactionState, readCompactionCompatibility, } from '../compat.js';
-import { ContextCompactionError } from '../contracts.js';
+import { ContextCompactionError, } from '../contracts.js';
+import { CHECKPOINT_SYSTEM_PROMPT, parseCheckpointHeadings } from './checkpoint-protocol.js';
+import { readGenuineUserQueryText } from './genuine-user-query.js';
 import { projectTodoHistory } from './todo-cadence.js';
 import { projectBackgroundHistory } from './background-cadence.js';
-const CHECKPOINT_HEADINGS = [
-    'Goal',
-    'Constraints & Preferences',
-    'Completed Work',
-    'Current State',
-    'Blockers',
-    'Key Decisions',
-    'Pending User Asks',
-    'Critical Context & Relevant Files',
-];
+/** Derived from the prompt's own heading list so the protocol cannot drift. */
+const CHECKPOINT_HEADINGS = parseCheckpointHeadings(CHECKPOINT_SYSTEM_PROMPT);
+/**
+ * Backstop for a checkpoint that drops the newest typed ask. The note only
+ * states what the host can verify: questionnaire answers and automated
+ * messages carry no genuine-query provenance, so the last listed query is not
+ * necessarily the user's latest decision and must not override the sections
+ * above. Withdrawn and superseded asks also leave Pending, so the prompt
+ * records them under Key Decisions and the note checks that section before
+ * reviving a query. The note sits outside the versioned appendix, whose
+ * format is unchanged.
+ */
+const RECENT_QUERY_PRECEDENCE_NOTE = 'Host note: `Recent user queries` below are the latest typed user messages the host could verify, copied verbatim, oldest first. Questionnaire answers and automated messages are not listed, so a later user decision may appear only in the sections above, and any such decision takes precedence over this list. Before acting, check `Completed Work`, `Current State`, `Key Decisions`, and `Pending User Asks`; treat the last query as the current request only if none of them shows it done, withdrawn, superseded, or already pending.';
 export function validateCheckpointGeneration(generation, maxOutputTokens) {
     if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 0) {
         throw new TypeError('Checkpoint maxOutputTokens must be a non-negative safe integer.');
@@ -57,13 +62,26 @@ export function buildCheckpointMessage(h0, summary, tokensBefore, options) {
     }
     const previous = readCompactionCompatibility(h0[0]);
     const state = buildVerifiedCheckpointState(h0, previous?.recentUserQueries ?? [], options.subagents);
+    const body = [
+        summary,
+        ...(options.earlierFiles ? [earlierFilesText(options.earlierFiles)] : []),
+        ...(state.recentUserQueries.length > 0 ? [RECENT_QUERY_PRECEDENCE_NOTE] : []),
+    ].join('\n\n');
     const checkpoint = {
         role: 'compactionSummary',
-        summary: appendCompactionState(summary, state),
+        summary: appendCompactionState(body, state),
         tokensBefore,
         timestamp: options.timestamp,
     };
     return checkpoint;
+}
+function earlierFilesText(files) {
+    return [
+        'Files from before this compaction:',
+        `- Full conversation history before each compaction, one JSONL file per compaction (the highest g<generation> is the latest): ${files.snapshots}`,
+        `- Tool images and oversized tool outputs: ${files.toolOutputs}`,
+        'Read them when you need exact details that the summary above leaves out.',
+    ].join('\n');
 }
 function buildVerifiedCheckpointState(h0, inheritedQueries, subagents) {
     const todo = projectTodoHistory(h0);
@@ -72,6 +90,9 @@ function buildVerifiedCheckpointState(h0, inheritedQueries, subagents) {
         recentUserQueries: collectRecentUserQueries(h0, inheritedQueries),
         ...(todo.todoState === undefined ? {} : { todoState: todo.todoState }),
         ...(todo.todoCadence === undefined ? {} : { todoCadence: todo.todoCadence }),
+        ...(todo.userMessagesSinceTodoWrite === undefined
+            ? {}
+            : { todoUserMessagesSinceWrite: todo.userMessagesSinceTodoWrite }),
         ...(background.hasBackgroundState
             ? {
                 backgroundCadence: {
@@ -97,42 +118,6 @@ function collectRecentUserQueries(messages, inherited) {
         collected.push({ text, ...(timestampMs === undefined ? {} : { timestampMs }) });
     });
     return collected.slice(-2);
-}
-export function readGenuineUserQueryText(message) {
-    if (Object.hasOwn(message, 'genuineUserQueryText')) {
-        const text = Reflect.get(message, 'genuineUserQueryText');
-        return typeof text === 'string' ? text : undefined;
-    }
-    if (!Object.hasOwn(message, 'canonicalTextRange'))
-        return undefined;
-    return readCanonicalRangeText(message);
-}
-function readCanonicalRangeText(message) {
-    const content = readSingleText(message);
-    const range = Reflect.get(message, 'canonicalTextRange');
-    if (!content || !range || typeof range !== 'object')
-        return undefined;
-    const startOffset = Reflect.get(range, 'startOffset');
-    const endOffset = Reflect.get(range, 'endOffset');
-    if (!Number.isSafeInteger(startOffset) ||
-        !Number.isSafeInteger(endOffset) ||
-        startOffset < 0 ||
-        endOffset < startOffset ||
-        endOffset > content.length) {
-        return undefined;
-    }
-    return content.slice(startOffset, endOffset);
-}
-function readSingleText(message) {
-    const content = Reflect.get(message, 'content');
-    if (typeof content === 'string')
-        return content;
-    if (!Array.isArray(content))
-        return undefined;
-    const texts = content.flatMap((block) => block && typeof block === 'object' && Reflect.get(block, 'type') === 'text'
-        ? [Reflect.get(block, 'text')]
-        : []);
-    return texts.length === 1 && typeof texts[0] === 'string' ? texts[0] : undefined;
 }
 function readFiniteNumber(value, key) {
     const field = Reflect.get(value, key);

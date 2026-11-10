@@ -21,8 +21,8 @@ export class SessionLifecycleService {
         return this.options.maintenance.runExclusive(sessionId, (lane) => this.archiveSessionInMaintenanceLane(sessionId, lane));
     }
     /** 在持久化时核对原标题，保留并发写入的用户名称。 */
-    async renameSession(sessionId, title, expectedTitle) {
-        const updated = await this.options.records.mutateSession(sessionId, { title }, undefined, expectedTitle);
+    async renameSession(sessionId, title, expectedTitle, signal) {
+        const updated = await this.options.records.mutateSession(sessionId, { title, titleSource: 'auto' }, undefined, { title: expectedTitle, ...(signal ? { signal } : {}) });
         this.emitMutationFacts(updated, { title });
     }
     async archiveSessionInMaintenanceLane(sessionId, lane) {

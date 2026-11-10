@@ -2,6 +2,7 @@
  * 对话框相关工具函数
  */
 import { BrowserWindow } from "electron";
+import { browserGuestRegistry } from "../modules/browser/browser-guest-registry.js";
 /**
  * 显示对话框而不产生遮罩层
  *
@@ -31,6 +32,11 @@ export async function showDialogWithoutOverlay(parentWindow, dialogFn) {
  * 支持主窗口和 WebContentsView
  */
 export function getWindowFromEvent(event) {
+    const guestOwner = browserGuestRegistry.owner(event.sender);
+    if (guestOwner && !guestOwner.isDestroyed())
+        return guestOwner;
+    if (event.sender.getType?.() === 'webview')
+        return null;
     // 尝试从 event.sender 获取窗口
     const senderWindow = BrowserWindow.fromWebContents(event.sender);
     if (senderWindow) {
@@ -71,6 +77,8 @@ export function resolveParentWindow(event, getMainWindow) {
     const fromEvent = getWindowFromEvent(event);
     if (fromEvent)
         return fromEvent;
+    if (event.sender.getType?.() === 'webview')
+        return null;
     // 2. 尝试获取当前焦点窗口（自动处理所有窗口类型，包括 MiniChat）
     const focused = BrowserWindow.getFocusedWindow();
     if (focused && !focused.isDestroyed())

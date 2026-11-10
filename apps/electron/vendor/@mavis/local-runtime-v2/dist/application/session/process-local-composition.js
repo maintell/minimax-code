@@ -1,11 +1,12 @@
 import { createProcessLocalApplication } from '../index.js';
+import { createProcessLocalMiniAppAgentApplication } from './process-local-miniapp-agent-application.js';
 import { createProcessLocalMiniAppApplication } from './process-local-miniapp-application.js';
 /**
  * Wires the process-local Application facade over owners the runtime has already
  * initialized, keeping that wiring out of the services composition root.
  */
 export function composeProcessLocalApplication(input) {
-    return createProcessLocalApplication({
+    const application = createProcessLocalApplication({
         eventBus: input.eventBus,
         usageCommits: input.usageCommits,
         skills: {
@@ -13,13 +14,32 @@ export function composeProcessLocalApplication(input) {
             listRuntimeSkills: (request) => input.listRuntimeSkills(request),
         },
         plugins: input.plugins,
-        miniApps: createProcessLocalMiniAppApplication(input.pluginControl, input.miniApp),
+        miniApps: createProcessLocalMiniAppApplication(input.pluginControl, input.miniApp, input.miniAppMemory),
         workspace: { ...input.compatibility.peripherals.workspace },
         plan: { isEntryEnabled: input.planEntryEnabled },
         ...(input.sessionReports ? { sessionReports: input.sessionReports } : {}),
         instructions: input.instructions,
-        peripherals: { ...input.compatibility.peripherals, mcp: input.mcp },
+        peripherals: { ...input.compatibility.peripherals, mcp: input.mcp, goals: input.goals },
         modelProvider: input.modelProvider,
+        ...(input.modelAccess ? { modelAccess: input.modelAccess } : {}),
     });
+    const tools = input.miniAppTools;
+    return {
+        ...application,
+        ...(input.mcpAuth ? { mcpAuth: input.mcpAuth } : {}),
+        ...(input.miniAppAgent
+            ? { miniAppAgent: createProcessLocalMiniAppAgentApplication(input.miniAppAgent) }
+            : {}),
+        ...(tools
+            ? {
+                miniAppTools: {
+                    request: ({ signal, ...request }) => tools.requestForPlugin({
+                        ...request,
+                        signal: signal ?? new AbortController().signal,
+                    }),
+                },
+            }
+            : {}),
+    };
 }
 //# sourceMappingURL=process-local-composition.js.map

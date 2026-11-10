@@ -1,6 +1,11 @@
+import { setupPptPreviewQueryIPC } from "./pptPreviewQuery.ipc";
+import { setupPptxEditingIPC } from "./pptxEditing.ipc";
 /**
  * IPC 处理模块入口
  */
+import { markDesktopAuthorizationUrl } from "@mavis/shared/desktop-authorization-url";
+import { resolveSshRuntimeEnvironment } from "../modules/ssh-runtime/ssh-command";
+import { openExternalTarget } from "../utils/open-external-target";
 import { setupWindowIPC } from "./window.ipc";
 import { setupSystemIPC } from "./system.ipc";
 import { setupDialogIPC } from "./dialog.ipc";
@@ -10,9 +15,15 @@ import { setupAuthIPC } from "./auth.ipc";
 import { setupUpdaterIPC } from "./updater.ipc";
 import { setupDesktopSettingsIPC } from "./settings.ipc";
 import { setupTerminalIPC } from "./terminal.ipc";
+import { getTerminalManager } from "../modules/terminal";
+import { sshProjectRuntimeId } from "@mavis/shared/desktop-runtime";
 import { setupMiniChatIPC } from "./miniChat.ipc";
 import { setupArchonChatIPC } from "./archonChat.ipc";
 import { setupRuntimeTransportIPC } from "./runtime-transport.ipc";
+import { setupSshConnectionsIPC } from "./ssh-connections.ipc";
+import { setupSshProjectsIPC } from "./ssh-projects.ipc";
+import { createPersistentSshProjectRepository } from "../modules/ssh-runtime/project-repository";
+import { createPersistentSshConnectionRepository } from "../modules/ssh-runtime/connection-repository";
 import { setupScreenshotIPC } from "./screenshot.ipc";
 import { setupTrackingRecorderIPC } from "./trackingRecorder.ipc";
 import { setupLogViewerIPC } from "./logViewer.ipc";
@@ -25,13 +36,21 @@ import { setupPPTPreviewIPC } from "./pptPreview.ipc";
 import { setupDocumentPreviewIPC } from "./documentPreview.ipc";
 import { setupPreviewClipboardIPC } from "./previewClipboard.ipc";
 import { setupEmbeddedBrowserIPC } from "./embeddedBrowser.ipc";
+import { setupBrowserBackendIPC } from "./browserBackend.ipc.js";
+import { setupBrowserWebviewIPC } from "./browserWebview.ipc.js";
+import { setupBrowserTelemetryIPC } from "./browserTelemetry.ipc.js";
 import { setupMiniAppIPC } from "./miniApp.ipc";
 import { setupMiniAppComposerIPC } from "./miniAppComposer.ipc";
+import { setupMiniAppAgentIPC } from "./miniAppAgent.ipc";
+import { setupMiniAppHostIPC } from "./miniAppHost.ipc.js";
+import { setupMiniAppToolIPC } from "./miniAppTool.ipc";
+import { setupMiniAppSpeechIPC } from "./miniAppSpeech.ipc";
 import { setupBrowserProfileImportIPC } from "./browserProfileImport.ipc";
 import { setupFileIPC } from "./file.ipc";
 import { setupDevToolsIPC } from "./devtools.ipc";
 import { setupRemoteControlBridgeIPC } from "../modules/remote-control-bridge/ipc";
 import { configureOSSSharedAuthSession } from "../modules/oss";
+import { setupFeedbackLogQueue } from "../modules/diagnostics/feedback-log-queue";
 import { refreshSharedRuntimeProjection, projectSharedAccessTokenLeaseToRuntime } from "../modules/auth/runtime-projection";
 import { getDeveloperOptions } from "../modules/developer-options";
 import { setupModelMenuPopupIPC } from "../windows/model-menu-popup";
@@ -87,7 +106,12 @@ export async function setupAllIPC(options) {
     setupAuthIPC({ sharedAuthSession: options.sharedAuthSession });
     setupDialogIPC();
     setupUpdaterIPC(options);
-    setupTerminalIPC();
+    const sshProjectRepository = createPersistentSshProjectRepository();
+    const sshConnectionRepository = createPersistentSshConnectionRepository();
+    setupTerminalIPC({
+        sshProjects: sshProjectRepository,
+        sshConnections: sshConnectionRepository,
+    });
     setupFileIPC();
     setupDevToolsIPC();
     setupArchonChatIPC(options.runtimeTransportMode ?? 'direct');
@@ -95,6 +119,51 @@ export async function setupAllIPC(options) {
         mode: options.runtimeTransportMode ?? 'direct',
         requestQuit: options.requestQuit,
     });
+    const sshConnections = setupSshConnectionsIPC({
+        connectHost: (alias, options) => sshProjects.ensureHost(alias, options),
+        disconnectHost: (alias) => sshProjects.releaseHost(alias),
+        listDirectories: (alias, path) => sshProjects.listDirectories(alias, path),
+        onConnectionEnabled: (alias) => sshProjects.retryHost(alias),
+        getReadyProbe: (alias) => sshProjects.getReadyProbe(alias),
+        onManualReconnect: (alias) => sshProjects.retryHost(alias),
+        onCliSetupVerified: (alias, probe) => sshProjects.cliSetupVerified(alias, probe?.mcodePath),
+        repository: sshConnectionRepository,
+        projects: sshProjectRepository,
+        onConnectionDisabled: (alias) => {
+            for (const project of sshProjectRepository.list()) {
+                if (project.host === alias)
+                    getTerminalManager().disposeByRuntime(project.runtimeId);
+            }
+            return sshProjects.releaseHost(alias);
+        },
+        onConnectionUpdated: (alias) => {
+            for (const project of sshProjectRepository.list()) {
+                if (project.host === alias)
+                    getTerminalManager().disposeByRuntime(project.runtimeId);
+            }
+            return sshProjects.reconfigureHost(alias);
+        },
+        onConnectionRemoved: (alias, removedProjectIds) => {
+            // The mappings have already been removed from this profile. Use the
+            // captured identities to close local PTYs/transport, not remote tasks.
+            for (const projectId of removedProjectIds) {
+                getTerminalManager().disposeByRuntime(sshProjectRuntimeId(projectId));
+            }
+            return sshProjects.releaseHost(alias, removedProjectIds);
+        },
+        remoteAccount: (alias, input) => sshProjects.remoteAccount(alias, input),
+    });
+    const sshProjects = setupSshProjectsIPC({
+        onHostSnapshot: (alias, snapshot, probe) => sshConnections.observeRuntimeSnapshot?.(alias, snapshot, probe),
+        openAuthorizationUrl: (url) => openExternalTarget(markDesktopAuthorizationUrl(url, {
+            buildEnv: resolveSshRuntimeEnvironment().buildEnv,
+            downloadSource: process.env.VITE_DOWNLOAD_SOURCE,
+        })),
+        appVersion: options.appVersion ?? 'unknown',
+        repository: sshProjectRepository,
+        connections: sshConnectionRepository,
+    });
+    sshProjects.restoreEnabledHosts();
     setupMiniChatIPC();
     setupScreenshotIPC();
     setupTrackingRecorderIPC();
@@ -102,14 +171,31 @@ export async function setupAllIPC(options) {
     setupNotificationIPC();
     setupHotUpdateIPC();
     setupContextMenuIPC();
-    const shutdownCuPermission = setupCuPermissionIPC();
-    setupCuPreviewIPC();
+    const shutdownCuPermissionIPC = setupCuPermissionIPC();
+    const shutdownCuPreview = setupCuPreviewIPC();
+    const shutdownCuPermission = () => {
+        shutdownCuPermissionIPC();
+        shutdownCuPreview();
+    };
     setupPreviewClipboardIPC();
     const disposeOSSSharedAuth = configureOSSSharedAuthSession(options.sharedAuthSession, {
         onAccessTokenInvalidated: resyncSharedRuntimeProjection,
     });
+    // 回填接口复用上面配置的 Shared OAuth，必须在它之后启动。
+    const disposeFeedbackLogQueue = setupFeedbackLogQueue({
+        authSession: options.sharedAuthSession,
+    });
     let documentPreview;
+    let disposePptQueries;
+    let disposePptEditing;
     let disposeMiniAppComposer;
+    let disposeMiniAppTool;
+    let disposeMiniAppHost;
+    let disposeMiniAppAgent;
+    let disposeMiniAppSpeech;
+    let disposeBrowserBackend;
+    let disposeBrowserWebview;
+    let disposeBrowserTelemetry;
     const disposeModelMenuPopup = setupModelMenuPopupIPC();
     try {
         documentPreview = setupDocumentPreviewIPC({
@@ -119,46 +205,80 @@ export async function setupAllIPC(options) {
             ...(options.releaseTrustedAssetSender
                 ? { releaseTrustedAssetSender: options.releaseTrustedAssetSender }
                 : {}),
-            onSenderDestroyed: options.onDocumentPreviewSenderDestroyed,
+            onSenderDestroyed: (senderId) => {
+                options.onDocumentPreviewSenderDestroyed?.(senderId);
+                void sshProjects.releasePreviewSender(senderId);
+            },
+            stageRemoteWorkspaceSource: (input) => sshProjects.stageRemotePreviewSource(input),
             ...(options.documentPreviewLogger ? { logger: options.documentPreviewLogger } : {}),
         });
         setupPPTPreviewIPC();
         setupEmbeddedBrowserIPC();
+        disposeBrowserBackend = setupBrowserBackendIPC();
+        disposeBrowserWebview = setupBrowserWebviewIPC();
+        disposeBrowserTelemetry = setupBrowserTelemetryIPC();
+        disposePptQueries = setupPptPreviewQueryIPC();
+        disposePptEditing = setupPptxEditingIPC();
         setupMiniAppIPC();
         disposeMiniAppComposer = setupMiniAppComposerIPC();
+        disposeMiniAppAgent = setupMiniAppAgentIPC();
+        disposeMiniAppHost = setupMiniAppHostIPC();
+        disposeMiniAppTool = setupMiniAppToolIPC();
+        disposeMiniAppSpeech = setupMiniAppSpeechIPC();
         setupBrowserProfileImportIPC();
         await setupRemoteControlBridgeIPC();
     }
     catch (setupError) {
         shutdownCuPermission();
+        disposePptQueries?.();
+        await disposePptEditing?.();
         disposeMiniAppComposer?.();
+        disposeMiniAppAgent?.();
+        disposeMiniAppHost?.();
+        disposeMiniAppTool?.();
+        disposeMiniAppSpeech?.();
+        disposeBrowserBackend?.();
+        disposeBrowserWebview?.();
+        disposeBrowserTelemetry?.();
         disposeModelMenuPopup();
+        disposeFeedbackLogQueue();
         disposeOSSSharedAuth();
-        if (!documentPreview)
-            throw setupError;
         try {
-            await documentPreview.shutdown();
+            await Promise.all([
+                ...(documentPreview ? [documentPreview.shutdown()] : []),
+                sshProjects.shutdown(),
+            ]);
         }
         catch (shutdownError) {
-            throw Object.assign(new Error('IPC registration failed and Document Preview rollback also failed'), {
+            throw Object.assign(new Error('IPC registration failed and resource rollback also failed'), {
                 name: 'AggregateError',
                 errors: [setupError, shutdownError],
             });
         }
         throw setupError;
     }
-    return createLifecycleIPCHandle(documentPreview, () => {
+    return createLifecycleIPCHandle(documentPreview, sshProjects, async () => {
+        disposePptQueries?.();
+        await disposePptEditing?.();
         disposeMiniAppComposer?.();
+        disposeMiniAppAgent?.();
+        disposeMiniAppHost?.();
+        disposeMiniAppTool?.();
+        disposeMiniAppSpeech?.();
+        disposeBrowserBackend?.();
+        disposeBrowserWebview?.();
+        disposeBrowserTelemetry?.();
         disposeModelMenuPopup();
+        disposeFeedbackLogQueue();
         disposeOSSSharedAuth();
     }, shutdownCuPermission);
 }
-function createLifecycleIPCHandle(documentPreview, disposeOSSSharedAuth, shutdownCuPermission) {
+function createLifecycleIPCHandle(documentPreview, sshProjects, disposeIPCResources, shutdownCuPermission) {
     return Object.freeze({
         shutdown: async () => {
             shutdownCuPermission();
-            disposeOSSSharedAuth();
-            await documentPreview.shutdown();
+            await disposeIPCResources();
+            await Promise.all([documentPreview.shutdown(), sshProjects.shutdown()]);
         },
     });
 }
@@ -214,4 +334,8 @@ export { setupBrowserProfileImportIPC } from "./browserProfileImport.ipc";
 export { setupFileIPC } from "./file.ipc";
 
 export { setupDevToolsIPC } from "./devtools.ipc";
+
+export { setupSshConnectionsIPC } from "./ssh-connections.ipc";
+
+export { setupSshProjectsIPC } from "./ssh-projects.ipc";
 

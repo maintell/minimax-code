@@ -99,6 +99,7 @@ export function startLocalRuntimeUtilityServer(options) {
     let pendingAuthContext = null;
     let pendingContextWindowUsageEnabled = null;
     let pendingRunawayGuardConfig = null;
+    let pendingPromptSuggestionPolicy = null;
     let pendingToolResultCompactionConfig = null;
     let pendingCollectionPolicy = null;
     let pendingComputerUseChannel = null;
@@ -331,6 +332,10 @@ export function startLocalRuntimeUtilityServer(options) {
                 surface.setRunawayGuardConfig(pendingRunawayGuardConfig);
                 pendingRunawayGuardConfig = null;
             }
+            if (pendingPromptSuggestionPolicy !== null) {
+                surface.setPromptSuggestionPolicy(pendingPromptSuggestionPolicy);
+                pendingPromptSuggestionPolicy = null;
+            }
             if (pendingToolResultCompactionConfig !== null) {
                 surface.setToolResultCompactionConfig(pendingToolResultCompactionConfig);
                 pendingToolResultCompactionConfig = null;
@@ -407,17 +412,19 @@ export function startLocalRuntimeUtilityServer(options) {
             await authRotationTail;
             await surface?.shutdown();
         })();
+        let drainTimer;
         const timedOut = await Promise.race([
             drain.then(() => false, () => {
                 log('drain failed');
-                return false;
+                return true;
             }),
             new Promise((resolve) => {
-                setTimeout(() => resolve(true), drainGraceMs);
+                drainTimer = setTimeout(() => resolve(true), drainGraceMs);
             }),
         ]);
+        clearTimeout(drainTimer);
         if (timedOut) {
-            log(`drain exceeded ${drainGraceMs}ms grace; exiting anyway`);
+            log(`drain failed or exceeded ${drainGraceMs}ms grace; exiting`);
             exit(1);
             return;
         }
@@ -497,6 +504,16 @@ export function startLocalRuntimeUtilityServer(options) {
                 }
                 else if (phase === 'idle' || phase === 'starting') {
                     pendingRunawayGuardConfig = message.config;
+                }
+                return;
+            case 'runtime-prompt-suggestion-policy':
+                // Apply as soon as the surface exists: startup keeps `starting` while it
+                // awaits the identity sync, and a policy buffered then would be lost.
+                if (surface && (phase === 'starting' || phase === 'ready')) {
+                    surface.setPromptSuggestionPolicy(message.policy);
+                }
+                else if (phase === 'idle' || phase === 'starting') {
+                    pendingPromptSuggestionPolicy = message.policy;
                 }
                 return;
             case 'runtime-tool-result-compaction-config':
@@ -607,6 +624,39 @@ export function startLocalRuntimeUtilityServer(options) {
                     catch {
                         // Main has its own deadline; a torn-down port must not terminate Utility.
                         log('runtime-session-report response post failed');
+                    }
+                })();
+                return;
+            }
+            case 'runtime-workspace-snapshot-request': {
+                const { requestId, sessionId, outputDir } = message;
+                void (async () => {
+                    let response;
+                    if (phase !== 'ready' || !surface) {
+                        response = {
+                            type: 'runtime-workspace-snapshot-error',
+                            requestId,
+                            message: 'workspace_snapshot_runtime_unavailable',
+                        };
+                    }
+                    else {
+                        try {
+                            const snapshot = await surface.captureWorkspaceSnapshot(sessionId, outputDir);
+                            response = { type: 'runtime-workspace-snapshot-result', requestId, snapshot };
+                        }
+                        catch (error) {
+                            response = {
+                                type: 'runtime-workspace-snapshot-error',
+                                requestId,
+                                message: reportErrorMessage(error),
+                            };
+                        }
+                    }
+                    try {
+                        parentPort.postMessage(response);
+                    }
+                    catch {
+                        log('runtime-workspace-snapshot response post failed');
                     }
                 })();
                 return;

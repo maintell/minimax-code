@@ -1,5 +1,5 @@
-import { UtilityWordEditorClient } from "./word-editor-broker";
-import { UtilityOfficeEditorClient } from "./office-editor-broker";
+import { UtilityPptPreviewQueryServer } from "./ppt-preview-query-broker";
+import { UtilityPptPreviewRenderClient } from "./ppt-preview-render-broker";
 /**
  * Local-runtime utility process entry.
  *
@@ -25,16 +25,20 @@ import { UtilityOfficeEditorClient } from "./office-editor-broker";
 import dns from "dns";
 import { getHeapStatistics } from "node:v8";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
+import { resolveProductBuildIdentity } from "@mavis/shared/product-build-identity";
 import { resolveLocalRuntimeV2DirectoryContract } from "../v2-paths";
 import { loadWeChatRuntimeSdk } from "../wechat-sdk-wire";
 import { startLocalRuntimeUtilityServer } from "./utility-server";
 import { UtilityBrowserBrokerClient } from "./browser-broker";
 import { UtilityDiagnosticsBrokerClient } from "./diagnostics-broker";
 import { UtilityAuthRecoveryBrokerClient } from "./auth-recovery-broker";
+import { UtilityRemoteSessionBrokerClient } from "./remote-session-broker";
 import { UtilityMiniAppBrokerServer } from "./miniapp-broker";
 import { UtilityMiniAppSurfaceClient } from "./miniapp-surface-broker";
+import { UtilityMiniAppToolBroker } from "./miniapp-tool-broker";
 import { createUtilityProxyFetch } from "./proxy-fetch";
 import { resolveElectronNetFetch } from "../electron-net-fetch";
+import { createNetworkServiceAwareFetch, isRuntimeNetworkServiceGoneMessage } from "./network-service-fetch";
 import { UtilityRuntimeMemoryMonitor } from "./runtime-memory-monitor";
 import { createReconnectingComputerUseClient, UtilityComputerUseBrokerClient } from "./computer-use-broker";
 /**
@@ -113,15 +117,34 @@ async function prepareRuntime(init, brokers, transferredPorts) {
         throw error;
     }
 }
+let networkServiceGone = false;
+let networkServiceAwareFetch = null;
 function createUtilityFetchAdapter() {
     const electronFetch = resolveElectronNetFetch(reportElectronNetFetchDiagnostic);
     if (electronFetch) {
-        return {
-            fetch: electronFetch,
-            close: async () => { },
-        };
+        networkServiceAwareFetch = createNetworkServiceAwareFetch(electronFetch, () => createUtilityProxyFetch(process.env, warn));
+        if (networkServiceGone && networkServiceAwareFetch.fallbackToNodeFetch()) {
+            warn('network service gone before prepare; runtime fetch switched to Node fetch');
+        }
+        return networkServiceAwareFetch;
     }
     return createUtilityProxyFetch(process.env, warn);
+}
+/**
+ * The Network Service restarted under this utility; Electron `net` here may be
+ * bound to the dead NetworkContext, so later runtime requests use Node fetch.
+ */
+function handleNetworkServiceGone(message) {
+    if (!isRuntimeNetworkServiceGoneMessage(message))
+        return false;
+    networkServiceGone = true;
+    if (!networkServiceAwareFetch) {
+        warn('network service gone before prepare; runtime fetch will use Node fetch');
+    }
+    else if (networkServiceAwareFetch.fallbackToNodeFetch()) {
+        warn('network service gone; runtime fetch switched to Node fetch');
+    }
+    return true;
 }
 async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferredPorts) {
     // The dominant cold-start cost: two dynamic ESM graphs plus the native
@@ -140,7 +163,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             reportBootstrapProgress('modules-runtime-v2-done');
             return module;
         }),
-        importEsm('@mavis/local-runtime/common').then((module) => {
+        importEsm('@mavis/local-runtime-v2/logging').then((module) => {
             reportBootstrapProgress('modules-common-done');
             return module;
         }),
@@ -152,14 +175,22 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     runtime.resetDefaultLocalRuntimeConfig?.();
     const runtimeMode = runtime.resolveLocalRuntimeMode();
     const runtimeLogsDir = resolveLocalRuntimeV2DirectoryContract(init.dataDir).logs;
+    // 打包版的 runtime 日志只写日志文件，每行当场写进去，崩溃也不丢；写文件失败的那一行才打到终端，
+    // 由 main 记下来。开发时照旧全部打到终端：和 main 一样按 NEXT_PUBLIC_BUILD_ENV 判断，
+    // 开发时 main 本来就不写日志文件，只往终端打。
+    const loggerOptions = {
+        diskOnly: !resolveProductBuildIdentity({ buildEnv: process.env.NEXT_PUBLIC_BUILD_ENV }).isDev,
+    };
     try {
         common.configureLocalRuntimeLogging({
             dir: runtimeLogsDir,
-            onError: () => warn('runtime disk logger write failed'),
+            onError: (err) => warn('runtime disk logger write failed', diskLogErrorFields(err)),
+            loggerOptions,
         });
         common.configureImLogger({
             dir: runtimeLogsDir,
-            onError: () => warn('IM disk logger write failed'),
+            onError: (err) => warn('IM disk logger write failed', diskLogErrorFields(err)),
+            loggerOptions,
         });
     }
     catch {
@@ -169,6 +200,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     let routingContext = init.routingContext;
     let contextWindowUsageEnabled = init.contextWindowUsageEnabled !== false;
     let runawayGuardConfig = init.runawayGuardConfig ?? {};
+    let promptSuggestionPolicy = init.promptSuggestionPolicy ?? {};
     let toolResultCompactionConfig = init.toolResultCompactionConfig ?? {};
     // Main only ever sends a complete, validated policy. An older main that sends
     // none leaves the built-in policy in force — never an empty one.
@@ -240,6 +272,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         skillRegistryDiagnostics: brokers.reportSkillRegistryDiagnostic,
         isContextWindowUsageEnabled: () => contextWindowUsageEnabled,
         getRunawayGuardConfig: () => runawayGuardConfig,
+        getPromptSuggestionPolicy: () => promptSuggestionPolicy,
         getToolResultCompactionConfig: () => toolResultCompactionConfig,
         getCollectionPolicy: () => collectionPolicy,
         createWorkspaceIndexingObservationSink: () => {
@@ -311,15 +344,26 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             warn: (message, fields) => common.logger.warn({ ...(fields ?? {}) }, `utility MCP: ${message}`),
             error: (message, fields) => common.logger.error({ ...(fields ?? {}) }, `utility MCP: ${message}`),
         },
-        ...(brokers.excelEditor ? { excelEditor: brokers.excelEditor.port } : {}),
-        ...(brokers.wordEditor ? { wordEditor: brokers.wordEditor.port } : {}),
+        ...(brokers.pptPreview
+            ? {
+                pptPreviewRenderHost: {
+                    prepare: (input, signal) => brokers.pptPreview.port.execute(input.sessionId, { ...input }, signal),
+                },
+            }
+            : {}),
         ...(init.hostCapabilities.browser ? { browserAdapter: brokers.browser.adapter } : {}),
         ...(init.hostCapabilities.diagnostics
             ? { hostDiagnosticsProvider: brokers.diagnostics.provider }
             : {}),
         ...(init.hostCapabilities.miniAppSurface
-            ? { miniAppSurface: brokers.miniAppSurface.port }
+            ? {
+                miniAppSurface: {
+                    ...brokers.miniAppSurface.port,
+                    requestToolApproval: brokers.miniAppTool.requestApproval,
+                },
+            }
             : {}),
+        remoteSessionHost: brokers.remoteSession.host,
         enableLiveMcp: true,
         ...(wechatRuntimeSdk ? { wechatRuntimeSdk } : {}),
     });
@@ -327,7 +371,9 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     // background infra all completed by the time this resolves.
     reportBootstrapProgress('sqlite-ready');
     await host.apiHost.ensureBuiltinAgents();
-    brokers.miniApp.bind(host.application?.miniApps);
+    brokers.pptQueries.bind(host.application?.pptPreview);
+    brokers.miniApp.bind(host.application?.miniApps, host.application?.miniAppAgent);
+    brokers.miniAppTool.bind(host.application?.miniAppTools);
     return {
         handleRequest: (request) => host.apiHost.handleRequest(request),
         createTransportHost: runtime.createRuntimeTransportHost,
@@ -339,6 +385,9 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
             }
             return diagnostics.collectSessionReport(sessionId);
         },
+        captureWorkspaceSnapshot: async (sessionId, outputDir) => ({
+            ...(await host.apiHost.captureWorkspaceFeedbackSnapshot(sessionId, outputDir)),
+        }),
         setAuthContext: async (next) => {
             const changed = JSON.stringify(authContext) !== JSON.stringify(next ?? null);
             authContext = (next ?? null);
@@ -356,6 +405,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         },
         setRoutingContext: (next) => {
             routingContext = next;
+            host.notifyRoutingContextChanged?.();
         },
         setContextWindowUsageEnabled: (enabled) => {
             contextWindowUsageEnabled = enabled;
@@ -373,6 +423,9 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         setRunawayGuardConfig: (config) => {
             runawayGuardConfig = config;
         },
+        setPromptSuggestionPolicy: (policy) => {
+            promptSuggestionPolicy = policy;
+        },
         setToolResultCompactionConfig: (config) => {
             toolResultCompactionConfig = config;
         },
@@ -383,11 +436,14 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         shutdown: async () => {
             brokers.auth.close();
             brokers.browser.close();
-            brokers.wordEditor?.close();
-            brokers.excelEditor?.close();
+            brokers.pptPreview?.close();
+            brokers.pptQueries.close();
             brokers.diagnostics.close();
+            brokers.remoteSession.close();
             brokers.miniApp.close();
             brokers.miniAppSurface.close();
+            brokers.miniAppTool.close();
+            let shutdownFailure;
             try {
                 try {
                     await host.apiHost.shutdownChannelSubsystem?.();
@@ -400,7 +456,8 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
                     // unified apiHost.close() drains services before closing the v1 host.
                     await host.apiHost.close?.();
                 }
-                catch {
+                catch (error) {
+                    shutdownFailure = error;
                     warn('runtime API host close failed');
                 }
                 try {
@@ -420,6 +477,8 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
                 await Promise.allSettled([common.flushLocalRuntimeLogging(), common.flushImLogger()]);
                 await Promise.allSettled([common.shutdownLocalRuntimeLogging(), common.shutdownImLogger()]);
             }
+            if (shutdownFailure)
+                throw shutdownFailure;
         },
     };
 }
@@ -432,13 +491,22 @@ function warn(message, fields) {
     else
         console.warn(`[LocalRuntimeUtility] ${message}`);
 }
+/** 写日志文件失败时带上的字段：错误码和系统调用，取不到的就不带；不带文件路径。 */
+function diskLogErrorFields(err) {
+    const { code, syscall } = err;
+    const fields = {
+        ...(typeof code === 'string' ? { code } : {}),
+        ...(typeof syscall === 'string' ? { syscall } : {}),
+    };
+    return Object.keys(fields).length > 0 ? fields : undefined;
+}
 const parentPort = process.parentPort;
 if (parentPort) {
     const auth = new UtilityAuthRecoveryBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
-    const excelEditor = new UtilityOfficeEditorClient((message) => parentPort.postMessage(message), 'excel-editor');
-    const wordEditor = new UtilityWordEditorClient((message) => parentPort.postMessage(message));
+    const pptPreview = new UtilityPptPreviewRenderClient((message) => parentPort.postMessage(message));
+    const pptQueries = new UtilityPptPreviewQueryServer((message) => parentPort.postMessage(message));
     const browser = new UtilityBrowserBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
@@ -451,10 +519,16 @@ if (parentPort) {
     const miniAppSurface = new UtilityMiniAppSurfaceClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
+    const miniAppTool = new UtilityMiniAppToolBroker({
+        postMessage: (message) => parentPort.postMessage(message),
+    });
     const memoryMonitor = new UtilityRuntimeMemoryMonitor({
         postMessage: (message) => parentPort.postMessage(message),
     });
     const computerUse = new UtilityComputerUseBrokerClient({
+        postMessage: (message) => parentPort.postMessage(message),
+    });
+    const remoteSession = new UtilityRemoteSessionBrokerClient({
         postMessage: (message) => parentPort.postMessage(message),
     });
     startLocalRuntimeUtilityServer({
@@ -464,10 +538,11 @@ if (parentPort) {
             const surface = await prepareRuntime(init, {
                 auth,
                 browser,
-                wordEditor,
-                excelEditor,
+                pptPreview,
+                pptQueries,
                 diagnostics,
                 computerUse,
+                remoteSession,
                 reportSkillRegistryDiagnostic: (event) => {
                     try {
                         const message = {
@@ -482,6 +557,7 @@ if (parentPort) {
                 },
                 miniApp,
                 miniAppSurface,
+                miniAppTool,
                 reportWorkspaceIndexingObservation: (message) => {
                     try {
                         parentPort.postMessage(message);
@@ -500,14 +576,17 @@ if (parentPort) {
             };
         },
         handleMainMessage: (message) => auth.handleMessage(message) ||
-            wordEditor.handleMessage(message) ||
-            excelEditor.handleMessage(message) ||
+            pptPreview.handleMessage(message) ||
+            pptQueries.handleMessage(message) ||
             browser.handleMessage(message) ||
             diagnostics.handleMessage(message) ||
             computerUse.handleMessage(message) ||
+            remoteSession.handleMessage(message) ||
             miniApp.handleMessage(message) ||
             miniAppSurface.handleMessage(message) ||
-            memoryMonitor.handleMessage(message),
+            miniAppTool.handleMessage(message) ||
+            memoryMonitor.handleMessage(message) ||
+            handleNetworkServiceGone(message),
         exit: (code) => process.exit(code),
         sampleHealth: () => {
             const memory = process.memoryUsage();
@@ -534,7 +613,7 @@ if (parentPort) {
             // The dynamic import is cached after the first call; before the
             // runtime ever loaded the module, both flush functions are safe
             // no-ops (disk transports not configured yet).
-            const common = await importEsm('@mavis/local-runtime/common');
+            const common = await importEsm('@mavis/local-runtime-v2/logging');
             await Promise.allSettled([common.flushLocalRuntimeLogging(), common.flushImLogger()]);
         },
         log: (message, fields) => {

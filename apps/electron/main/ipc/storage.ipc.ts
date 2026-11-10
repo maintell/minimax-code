@@ -7,13 +7,14 @@ import fs from "fs";
 import { app, BrowserWindow, session, ipcMain } from "electron";
 import electronStore from "electron-store";
 import { isProd, isStaging, isTest, isDev, isZh, LOCALE, isEn } from "../config/env";
-import { SHORTCUT_KEYS, DEFAULT_SHORTCUT, IPC_CHANNELS } from "../config/constants";
+import { IPC_CHANNELS, SHORTCUT_KEYS } from "../config/constants";
 import { setLocalRuntimeAuthContext, setLocalRuntimeContextWindowUsageEnabled, syncLocalRuntimeAuthContext } from "../modules/local-runtime";
 import { logger } from "../utils";
 import { scheduleMcodeToolsAuthorization, clearMcodeToolsAuthorization } from "../modules/mcode-tools";
 import { resolveAccountOnboardingInstallCohort, resolveDesktopOnboardingMode } from "../windows/accountOnboardingEligibility";
 import { DEFAULT_DESKTOP_TYPOGRAPHY, getDesktopTypographySnapshot, desktopTypographyEquals } from "../modules/desktop-typography";
 import { DEFAULT_DESKTOP_APPEARANCE_STATE, getDesktopAppearanceState, desktopAppearanceStatesEqual, mergeDesktopAppearancePatch, emitDesktopAppearanceCommitted } from "../modules/desktop-appearance";
+import { OFFLINE_USER_ID, buildOfflineUser, isOffline } from "../modules/connectivity/offline-mode";
 /**
  * 根据国内/海外版本和环境区分存储配置名称
  * 这样不同版本和环境可以共存而不互相影响
@@ -65,10 +66,9 @@ function getDefaultLanguage() {
     // 其他情况使用构建时的语言环境
     return LOCALE;
 }
+const LEGACY_MINI_CHAT_SHORTCUT = 'Alt+A';
 export function getDefaultShortcut() {
-    return {
-        [SHORTCUT_KEYS.MINI_CHAT_CREATE]: DEFAULT_SHORTCUT.MINI_CHAT_CREATE,
-    };
+    return {};
 }
 const defaultConfig = {
     language: getDefaultLanguage(),
@@ -81,13 +81,16 @@ const defaultConfig = {
     localLinkOpenDestination: 'embedded',
     fileLineWrapEnabled: true,
     fileOpenInNewTabEnabled: true,
+    fileOpenWithEnhancedEnabled: false,
     contextWindowUsageEnabled: true,
     uiBaseFontSize: DEFAULT_DESKTOP_TYPOGRAPHY.uiBaseFontSize,
     codeFontSize: DEFAULT_DESKTOP_TYPOGRAPHY.codeFontSize,
     appearance: DEFAULT_DESKTOP_APPEARANCE_STATE,
     plainTextEditorEnabled: true,
+    activityGroupsExpandedByDefault: false,
     globalAccessShortcut: getDefaultShortcut(),
     shortcutOverrides: {},
+    shortcutsEnabled: true,
     developerOptions: {
         enabled: true,
         autoOpenNativeDevTools: false,
@@ -118,6 +121,7 @@ const store = new electronStore({
         localStorageConfig: defaultLocalStorageConfig,
         tokens: {},
         mainWindowState: null,
+        miniAppWindowBounds: {},
     },
 });
 let appearanceSyncRevision = 0;
@@ -141,6 +145,22 @@ export function getStoredMainWindowState() {
  */
 export function setStoredMainWindowState(state) {
     store.set('mainWindowState', state);
+}
+/**
+ * 读取某个 pluginId 上次弹出窗口的屏幕 bounds（未记录时为 null）。
+ * 返回原始值，由调用方负责校验与"是否落在可见屏幕内"的兜底。
+ */
+export function getStoredMiniAppWindowBounds(pluginId) {
+    const all = store.get('miniAppWindowBounds') || {};
+    return all[pluginId] ?? null;
+}
+/**
+ * 记录某个 pluginId 上次弹出窗口的屏幕 bounds。按 pluginId 覆盖写入，
+ * 不影响其它 pluginId 的记忆。
+ */
+export function setStoredMiniAppWindowBounds(pluginId, bounds) {
+    const all = store.get('miniAppWindowBounds') || {};
+    store.set('miniAppWindowBounds', { ...all, [pluginId]: bounds });
 }
 /**
  * 获取 tokens
@@ -352,7 +372,7 @@ export function getDesktopConfig() {
                 [SHORTCUT_KEYS.MINI_CHAT_TOGGLE]: null,
             };
         }
-        else if (legacyMiniChat === DEFAULT_SHORTCUT.MINI_CHAT_CREATE) {
+        else if (legacyMiniChat === LEGACY_MINI_CHAT_SHORTCUT) {
             config.shortcutOverrides = {};
         }
         else {
@@ -360,6 +380,12 @@ export function getDesktopConfig() {
                 [SHORTCUT_KEYS.MINI_CHAT_TOGGLE]: legacyMiniChat,
             };
         }
+        changed = true;
+    }
+    // Retire the old default while retaining explicitly customized bindings.
+    if (!Object.prototype.hasOwnProperty.call(config.shortcutOverrides, SHORTCUT_KEYS.MINI_CHAT_TOGGLE) &&
+        config.globalAccessShortcut[SHORTCUT_KEYS.MINI_CHAT_CREATE] === LEGACY_MINI_CHAT_SHORTCUT) {
+        delete config.globalAccessShortcut[SHORTCUT_KEYS.MINI_CHAT_CREATE];
         changed = true;
     }
     /** 确保 scheduleNotification 有默认值，或者目录不存在时重新创建 */
@@ -386,6 +412,10 @@ export function getDesktopConfig() {
     }
     if (typeof config.plainTextEditorEnabled !== 'boolean') {
         config.plainTextEditorEnabled = true;
+    }
+    if (typeof config.activityGroupsExpandedByDefault !== 'boolean') {
+        config.activityGroupsExpandedByDefault = defaultConfig.activityGroupsExpandedByDefault;
+        changed = true;
     }
     if (typeof config.fileLineWrapEnabled !== 'boolean') {
         config.fileLineWrapEnabled = defaultConfig.fileLineWrapEnabled;
@@ -471,15 +501,23 @@ export function clearDesktopConfig() {
         codeFontSize: current.codeFontSize ?? defaultConfig.codeFontSize,
         appearance: current.appearance ?? defaultConfig.appearance,
         plainTextEditorEnabled: current.plainTextEditorEnabled ?? true,
+        activityGroupsExpandedByDefault: current.activityGroupsExpandedByDefault ?? defaultConfig.activityGroupsExpandedByDefault,
         fileOpenInNewTabEnabled: current.fileOpenInNewTabEnabled ?? defaultConfig.fileOpenInNewTabEnabled,
+        sidePanelEntryLayout: current.sidePanelEntryLayout,
+        // Mirrors registry state that outlives the signed-in account.
+        fileOpenWithEnhancedEnabled: current.fileOpenWithEnhancedEnabled ?? defaultConfig.fileOpenWithEnhancedEnabled,
         globalAccessShortcut: current.globalAccessShortcut ?? defaultConfig.globalAccessShortcut,
         shortcutOverrides: current.shortcutOverrides ?? defaultConfig.shortcutOverrides,
+        shortcutsEnabled: current.shortcutsEnabled ?? defaultConfig.shortcutsEnabled,
         loginItemInitialized: current.loginItemInitialized,
         workingDirectory: current.workingDirectory ?? defaultConfig.workingDirectory,
         swimLaneName: current.swimLaneName ?? defaultConfig.swimLaneName,
         scheduleNotification: current.scheduleNotification ?? defaultConfig.scheduleNotification,
         localRuntimeDataParentDir: current.localRuntimeDataParentDir,
         localRuntimePreviousDataParentDirs: current.localRuntimePreviousDataParentDirs,
+        // Sign-out must not end the post-relocation health check or drop its pending notice.
+        localRuntimeDataDirPendingVerification: current.localRuntimeDataDirPendingVerification,
+        localRuntimeDataDirRollbackNotice: current.localRuntimeDataDirRollbackNotice,
         developerOptions: current.developerOptions ?? defaultConfig.developerOptions,
         // Remote collection policy, not user data. Dropping it on sign-out would
         // silently re-open collection until Apollo is reachable again.
@@ -667,22 +705,51 @@ export function setupStorageIPC(options = {}) {
         return { success: true };
     });
     // 用户信息相关
-    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_USER, () => {
+    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_USER, async () => {
         const user = getUserInfo();
+        // Offline: the account backend cannot be reached, so a real user is
+        // never populated. Return a COMPLETE synthetic user at read time (never
+        // written to the store) so useInitFetch can finish and the main UI
+        // renders instead of dereferencing missing identity fields (white
+        // screen). Online, or when a real user already exists, behave as before.
+        if (await isOffline()) {
+            const hasIdentity = Boolean(user && (user.userID || user.realUserID));
+            if (!hasIdentity) {
+                return options.sharedAuthEnabled ? withoutCredentialFields(buildOfflineUser()) : buildOfflineUser();
+            }
+        }
         return options.sharedAuthEnabled ? withoutCredentialFields(user) : user;
     });
     ipcMain.handle(IPC_CHANNELS.STORAGE_SET_USER, async (_, user) => {
         if (options.sharedAuthEnabled && hasCredentialFields(user))
             return sharedCredentialError;
-        const currentAccount = getUserInfo().realUserID;
-        if (options.sharedAuthEnabled &&
-            currentAccount &&
-            user.realUserID &&
-            user.realUserID !== currentAccount) {
-            return { success: false, error: 'Desktop account changed. Refresh account information.' };
+        const offline = await isOffline();
+        if (!offline) {
+            const currentAccount = getUserInfo().realUserID;
+            // An offline session leaves the OFFLINE_USER_ID sentinel in the store.
+            // It is not a real account, so it must never block a later real login
+            // ("Desktop account changed" would otherwise reject it).
+            const currentIsOfflineSentinel = currentAccount === OFFLINE_USER_ID;
+            if (options.sharedAuthEnabled &&
+                currentAccount &&
+                !currentIsOfflineSentinel &&
+                user.realUserID &&
+                user.realUserID !== currentAccount) {
+                return { success: false, error: 'Desktop account changed. Refresh account information.' };
+            }
         }
+        logger.info(`[Storage] setUser offline=${offline} realUserID=${user.realUserID ?? ""}`);
         setUserInfo(user);
-        if (options.sharedAuthEnabled) {
+        if (offline) {
+            // The shared identity projection calls refreshSharedRuntimeProjection
+            // WITHOUT allowAnonymous; offline its getAccessToken throws
+            // AuthRequiredError, which would reject this IPC and make
+            // useInitFetch.d() set authInitFailed (the account-unavailable card).
+            // Skip all cloud projection while offline; the local runtime was
+            // already warmed up anonymously at startup.
+            logger.info('[Storage] setUser: offline, skipping shared identity projection');
+        }
+        else if (options.sharedAuthEnabled) {
             await options.onSharedIdentityChanged?.(getUserInfo());
         }
         else {
@@ -721,7 +788,15 @@ export function setupStorageIPC(options = {}) {
     ipcMain.handle(IPC_CHANNELS.STORAGE_GET_LOCAL_STORAGE_CONFIG, () => {
         return getLocalStorageConfig();
     });
-    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_DESKTOP_ONBOARDING_MODE, () => {
+    ipcMain.handle(IPC_CHANNELS.STORAGE_GET_DESKTOP_ONBOARDING_MODE, async () => {
+        // Offline the account-onboarding flow cannot complete: it fetches
+        // agent_desktop_onboarding_config from the cloud and throws
+        // "Invalid desktop onboarding config" when the offline stub has no such
+        // key (observed on a fresh no-network install). Skip the flow entirely.
+        if (await isOffline()) {
+            logger.info('[Storage] onboarding mode: offline, using main');
+            return 'main';
+        }
         return resolveDesktopOnboardingMode({
             installCohort: getAccountOnboardingInstallCohort(),
         });

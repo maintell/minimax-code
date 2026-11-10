@@ -1,11 +1,19 @@
 import { miniAppErrorCode, miniAppFailureReasonCode } from '../errors.js';
 import { sanitizeMiniAppRuntimeLogEvent } from '../runtime-log.js';
 import { clearAfterSettlement } from './cleanup-settlement.js';
+import { miniAppStartupFailureLogDetail } from './startup-failure-log.js';
 const HOST_EVENTS = {
     'runtime.start_requested': 'Host requested a new Mini App runtime.',
     'runtime.ready': 'Mini App runtime passed Host readiness checks.',
     'runtime.exited': 'Host observed the Mini App process exit.',
     'runtime.failed': 'Host observed a Mini App runtime failure.',
+    ...{
+        'memory.page_slept': 'Host put a hidden Mini App page to sleep to free memory.',
+        'memory.app_slept': 'Host put the Mini App to sleep to free memory or a runtime slot.',
+        'memory.sleep_skipped': 'Host could not put the Mini App to sleep and skipped it for now.',
+        'memory.restored': 'Mini App was restored after the Host put it to sleep.',
+        'memory.admission_denied': 'Host found no runtime slot to free for the Mini App.',
+    },
 };
 const FAILURE_MESSAGES = {
     ACTIVATION_FAILED: 'Host could not activate the Mini App runtime.',
@@ -18,6 +26,7 @@ const FAILURE_MESSAGES = {
     ENTRY_OUTSIDE_ARTIFACT: 'Mini App entry is outside its package.',
     HOST_CONNECTOR_PROTOCOL_VIOLATION: 'Mini App violated the Host Connector protocol.',
     HOST_CONNECTOR_UNAVAILABLE: 'The required Host Connector is unavailable.',
+    LISTEN_EACCES: 'The operating system refused to bind the selected runtime port.',
     NO_CANDIDATE_PORT: 'No Host-approved runtime port is available.',
     PERSISTENCE_COMPENSATION_FAILED: 'Host could not restore the previous Mini App state.',
     PERSISTENCE_WRITE_FAILED: 'Host could not save Mini App state.',
@@ -62,9 +71,16 @@ export class MiniAppSupervisorDiagnostics {
         try {
             const runtime = await this.options.nodeRuntime.prepare({
                 ...input,
+                onProcessGeneration: (processGeneration) => {
+                    record.run = { ...record.run, runId: processGeneration };
+                },
                 onLog: (event) => this.appendRuntimeLog(pluginId, miniAppGeneration, event, record),
             });
-            record.run = { ...record.run, readyAtMs: this.options.nowMs() };
+            record.run = {
+                ...record.run,
+                runId: runtime.processGeneration,
+                readyAtMs: this.options.nowMs(),
+            };
             this.appendHostLog(record, 'runtime.ready');
             const observed = clearAfterSettlement(this.observeExit(runtime, record), () => this.observations.delete(observed));
             this.observations.add(observed);
@@ -72,8 +88,15 @@ export class MiniAppSupervisorDiagnostics {
         }
         catch (error) {
             this.recordFailure(record, error);
+            this.logStartupFailure(input, miniAppGeneration, record, error);
             throw error;
         }
+    }
+    /** Appends a fixed-message memory event to the plugin's latest run; no-op before its first run. */
+    recordMemoryEvent(pluginId, code) {
+        const record = this.records.get(pluginId)?.at(-1);
+        if (record)
+            this.appendHostLog(record, code);
     }
     pluginIds() {
         return this.records.keys();
@@ -115,6 +138,25 @@ export class MiniAppSupervisorDiagnostics {
         const candidate = miniAppFailureReasonCode(error) ?? miniAppErrorCode(error);
         record.run = { ...record.run, failure: publicFailure(candidate) };
         this.appendHostLog(record, 'runtime.failed');
+    }
+    logStartupFailure(input, miniAppGeneration, record, error) {
+        if (!this.options.logger)
+            return;
+        try {
+            this.options.logger.error({
+                event: 'miniapp.runtime_start_failed',
+                pluginId: input.candidate.pluginId,
+                miniAppGeneration,
+                processGeneration: record.run.runId,
+                nodeDigest: input.candidate.nodeDigest,
+                reasonCode: record.run.failure?.code,
+                durationMs: Math.max(0, this.options.nowMs() - record.run.preparationStartedAtMs),
+                ...miniAppStartupFailureLogDetail(error),
+            }, 'Mini App runtime startup failed');
+        }
+        catch {
+            // Diagnostic formatting or logging must never replace the startup failure.
+        }
     }
     appendHostLog(record, code) {
         record.logs.push({

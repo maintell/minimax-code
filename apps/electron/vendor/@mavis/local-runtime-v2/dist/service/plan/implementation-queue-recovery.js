@@ -16,7 +16,7 @@ export async function recoverPlanLifecycleAndImplementationQueue(options) {
     catch (error) {
         failures.push(error);
     }
-    if (options.dispatch) {
+    if (options.dispatch && !options.signal?.aborted) {
         try {
             await options.recoverImplementationQueue();
         }
@@ -34,6 +34,8 @@ export async function recoverPlanLifecycleAndImplementationQueue(options) {
 export async function recoverPlanImplementationQueue(options) {
     const failures = [];
     for (const sessionId of await options.queue.listPendingSessionIds()) {
+        if (options.signal?.aborted)
+            return;
         try {
             await recoverPlanImplementationQueueSession(options, sessionId);
         }
@@ -49,15 +51,19 @@ export async function recoverPlanImplementationQueue(options) {
 }
 async function recoverPlanImplementationQueueSession(options, sessionId) {
     const items = await options.queue.list(sessionId);
+    if (options.signal?.aborted)
+        return;
     if (!options.entryEnabled()) {
-        await cancelQueuedPlanEntries(options.queue, sessionId, items);
+        await cancelQueuedPlanEntries(options.queue, sessionId, items, options.signal);
     }
-    if (items.some(isApprovedPlanImplementation)) {
+    if (!options.signal?.aborted && items.some(isApprovedPlanImplementation)) {
         await options.dispatchQueue(sessionId);
     }
 }
-async function cancelQueuedPlanEntries(queue, sessionId, items) {
+async function cancelQueuedPlanEntries(queue, sessionId, items, signal) {
     for (const item of items) {
+        if (signal?.aborted)
+            return;
         if (item.message.clientIntent !== 'plan-entry')
             continue;
         const cancelled = await queue.cancel(sessionId, item.itemId);

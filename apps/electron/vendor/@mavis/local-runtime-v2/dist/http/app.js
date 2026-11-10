@@ -8,12 +8,15 @@ import { filterBindings, migratedMethodsForHost, } from './routing/allowlist.js'
 import { makeBindings } from './routing/bindings.gen.js';
 import { withMcpRequestParseErrorPolicy } from './routing/mcp-request-policy.js';
 import { withModelProviderResponsePolicy } from './routing/model-provider-response-policy.js';
+import { withPreferenceRequestParseErrorPolicy } from './routing/preference-request-policy.js';
 import { mountProviderAuthRoutes } from './routing/provider-auth.js';
 import { abortAllComputerUse, snapshotComputerUseState, } from '../service/computer-use/index.js';
 import { mountWorkspaceHtmlPreviewRoutes } from './routing/workspace-html-preview.js';
 import { mountBrowserTurnContextRoutes } from './routing/browser-turn-context.js';
 import { mountChannelCompatRoutes } from './routing/channel-compat.js';
 export { createV2AgentRuntimeManagementPort } from './controllers/agent-runtime-port.js';
+export { createLocalRuntimeHost } from './host/initialize.js';
+export { cleanupFailedV1Startup, createV1RuntimeCompatibility, withAgentStorageScope, } from './host/composition.js';
 const CRON_UNAVAILABLE_ERROR = {
     code: 'CRON_UNAVAILABLE',
     message: 'Cron is not available on this runtime host',
@@ -52,7 +55,7 @@ export function createLocalRuntimeV2FrontDoor(deps) {
 }
 function createFrontDoorAppDeps(deps, controllers, ownerCapabilities) {
     return {
-        bindings: filterBindings(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(makeBindings(controllers))), migratedMethodsForHost(ownerCapabilities)),
+        bindings: filterBindings(withPreferenceRequestParseErrorPolicy(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(makeBindings(controllers)))), migratedMethodsForHost(ownerCapabilities)),
         logger: deps.logger,
         metrics: deps.metrics,
         forceLegacy: () => false,
@@ -85,13 +88,18 @@ export function ownerCapabilitiesForServices(services) {
         plugin: Boolean(services),
         session: Boolean(services?.applications || services?.conversation || services?.cronDelivery),
         workspaceGit: Boolean(services?.workspace?.git),
+        workspaceFile: Boolean(services?.workspace?.file),
+        workspaceLocalActions: Boolean(services?.workspace?.localActions),
+        interaction: Boolean(services?.application?.questionnaires && services.application.permissions),
         workspaceIndexing: Boolean(services?.workspace?.indexing),
         modelProvider: Boolean(services?.modelSystem && services.modelProviderApplication),
+        modelAccess: Boolean(services?.modelAccessApplication),
         sessionApplications: Boolean(services?.applications),
         // Mount the Inspector only where it was actually composed; other hosts keep
         // falling through to the v1 fail-closed stubs.
         llmContextInspector: Boolean(services?.llmContextInspector),
         preference: Boolean(services?.composerSendBehavior),
+        agentShell: Boolean(services?.agentShell),
         sandbox: Boolean(services?.sandbox),
         globalInstructions: Boolean(services?.globalInstructions),
         // Channel routes mount only where the channel owner is really assembled
@@ -101,6 +109,8 @@ export function ownerCapabilitiesForServices(services) {
         // Memory V2 管理面只在 memory.v2 分支装配出 application 时接管；
         // 其余宿主回落 v1 的 memory-v2-disabled 降级实现。
         memoryV2: Boolean(services?.memoryV2),
+        goal: Boolean(services?.goal),
+        sessionActivity: Boolean(services?.sessionActivity),
     };
 }
 function inferOwnerCapabilities(services) {
@@ -207,6 +217,32 @@ function mountComputerUseRoutes(app, client) {
             ok: true,
             ...snapshotComputerUseState(),
         });
+    });
+    // Read-only host permission status for remote (SSH) Desktop clients. The
+    // user grants permissions on the host itself; this route never prompts.
+    app.get('/mavis/api/computer-use/status', async (c) => {
+        if (!client.getStatus)
+            return c.json({ ok: true, supported: false });
+        try {
+            const status = await client.getStatus();
+            return c.json({
+                ok: true,
+                supported: status.supported,
+                ready: status.ready,
+                granted: status.granted,
+                accessibility: status.accessibility,
+                screenRecording: status.screenRecording,
+                ...(status.code ? { code: status.code } : {}),
+                ...(status.message ? { message: status.message } : {}),
+            });
+        }
+        catch (error) {
+            return c.json({
+                ok: false,
+                error: 'computer_use_status_unavailable',
+                message: error instanceof Error ? error.message : String(error),
+            }, 503);
+        }
     });
     app.put('/mavis/api/computer-use/enabled', (c) => c.json({ ok: false, error: 'computer_use_managed_by_plugin' }, 410));
     app.post('/mavis/api/computer-use/abort', (c) => {

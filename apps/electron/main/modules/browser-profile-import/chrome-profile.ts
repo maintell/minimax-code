@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { stat, lstat, readFile, realpath, readdir } from "node:fs/promises";
+import { stat, open, lstat, readFile, realpath, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BrowserProfileImportFailure } from "./errors";
@@ -24,6 +24,32 @@ export async function isChromeInstalled(platform = process.platform, homeDirecto
         }
     }
     return false;
+}
+/**
+ * 探测 Cookies 库当前是否被独占锁住，通常意味着 Chrome 正在运行。
+ *
+ * 这里刻意不去枚举进程，而是直接试开文件：枚举进程是这件事的代理信号，
+ * 而「能不能打开」就是导入自己会遇到的那个条件。Chrome 以无共享方式持有
+ * 该文件，因此它运行期间这个 open 必然失败 —— 本机实测 `fs.open` 返回 EBUSY。
+ *
+ * 拿不到结论时一律返回 false：它只用来提前给一句提示，
+ * 宁可少提示一次，也不要因为探测本身出问题就拦住导入。
+ */
+export async function isCookieDatabaseLocked(databasePath) {
+    let handle = null;
+    try {
+        handle = await open(databasePath, 'r');
+        return false;
+    }
+    catch (error) {
+        const code = error.code;
+        // EBUSY/EPERM/EACCES are how the platforms report an exclusive holder.
+        // ENOENT and friends are a different problem this hint cannot help with.
+        return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES';
+    }
+    finally {
+        await handle?.close().catch(() => undefined);
+    }
 }
 export function defaultChromeUserDataDirectory(platform = process.platform, homeDirectory = os.homedir(), environment = process.env) {
     if (platform === 'darwin') {

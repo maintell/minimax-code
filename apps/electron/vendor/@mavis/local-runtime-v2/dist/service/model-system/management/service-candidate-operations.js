@@ -1,18 +1,25 @@
 import { CUSTOM_PROVIDER_ID_PREFIX, formatModelKey } from '../resolution/model-key.js';
+import { resolveProviderCredential } from '@mavis/config';
+import { normalizeProviderIdentityBaseUrl, isApiKeyProvider } from '../provider-identity.js';
 import { LocalModelProviderError, } from '../contracts.js';
 import { modelConfigFingerprint } from '../catalog/model-cache.js';
+import { isModelAccessProvider } from '../model-access/projection.js';
 import { ModelProviderServiceContext, } from './service-context.js';
-import { modelParametersMatch, patchModelParameters, removeLegacyCustomProviderNpm, resetUnavailableCustomDefaultModel, requireCacheStatusView, } from './service-helpers.js';
+import { modelParametersMatch, modelAccessProviderReadOnlyError, patchModelParameters, removeLegacyCustomProviderNpm, resetUnavailableCustomDefaultModel, requireCacheStatusView, } from './service-helpers.js';
 import { modelsFromInputs } from './service-input.js';
+import { readApiKeys } from '../byok-keys/key-list.js';
+import { byokTestKeyLabel, forgetDroppedApiKeys } from '../byok-keys/operations.js';
 export async function testUserModelCandidate(context, candidate, modelId) {
     const resolved = context.resolveUserProviderCandidate(candidate);
     const target = context.resolveTestTarget(resolved.providerId, modelId, {
         customProviderOverride: resolved.provider,
     });
     const result = await context.testResolvedTarget(target);
+    const keyLabel = byokTestKeyLabel(resolved.provider);
     return {
         ok: result.ok,
         status: requireCacheStatusView(context.toCacheEntry(result, target.fingerprint)),
+        ...(keyLabel ? { keyLabel } : {}),
     };
 }
 export async function discoverUserModelsCandidate(context, candidate) {
@@ -29,6 +36,12 @@ export async function discoverUserModelsCandidate(context, candidate) {
 }
 export async function saveUserModelProviderCandidate(context, input) {
     const resolved = context.resolveUserProviderCandidate(input.candidate);
+    if (input.apiImport) {
+        resolved.provider.options = {
+            ...resolved.provider.options,
+            modelAccessImport: { kind: 'imported-api', ...input.apiImport },
+        };
+    }
     const modelId = input.modelId?.trim();
     const test = await prepareCandidateTest(context, resolved, input, modelId);
     if (test.failed)
@@ -37,6 +50,7 @@ export async function saveUserModelProviderCandidate(context, input) {
         candidateCacheWritten: false,
     };
     const transaction = { resolved, input, modelId, test, commit };
+    const keysBefore = readApiKeys(context.deps.configGetter().custom_provider?.[resolved.providerKey]);
     try {
         await persistCandidate(context, transaction);
     }
@@ -44,11 +58,13 @@ export async function saveUserModelProviderCandidate(context, input) {
         await restoreCandidateAfterFailure(context, transaction, error);
     }
     throwCandidateCommitError(commit.blocked, input.skipConnectionTest === true);
+    if (!transaction.existingProviderId)
+        forgetDroppedApiKeys(context, resolved.providerKey, keysBefore);
     return {
         ok: true,
         ...(test.status ? { status: test.status } : {}),
         ...(input.skipConnectionTest ? { skippedTest: true } : {}),
-        provider: context.requireCustomProviderView(resolved.providerKey),
+        provider: context.requireCustomProviderView(transaction.existingProviderId ?? resolved.providerKey),
     };
 }
 async function prepareCandidateTest(context, resolved, input, modelId) {
@@ -76,18 +92,75 @@ function requirePreparedCandidateStatus(test) {
 }
 async function persistCandidate(context, transaction) {
     await context.deps.updateByokConfig(async (draft, currentConfig) => {
+        transaction.input.beforeCommit?.();
         const tree = (draft.custom_provider ?? {});
+        if (transaction.input.importIfExisting) {
+            const existingProviderId = transaction.input.apiImport
+                ? findExactApiImport(context, currentConfig, transaction.input.candidate)
+                : findMatchingByokProvider(currentConfig, transaction.input.candidate);
+            if (existingProviderId) {
+                transaction.existingProviderId = existingProviderId;
+                return;
+            }
+        }
         if (candidateRevisionChanged(transaction.resolved, tree, currentConfig)) {
             transaction.commit.blocked = 'config_changed';
             return;
         }
         if (!(await persistCandidateCache(context, transaction)))
             return;
+        transaction.input.beforeCommit?.();
         tree[transaction.resolved.providerKey] = transaction.resolved.provider;
         draft.custom_provider = tree;
         activateSavedCandidate(draft, transaction);
-        resetUnavailableCustomDefaultModel(draft);
-    });
+        resetUnavailableCustomDefaultModel(draft, currentConfig);
+    }, transaction.input.beforeCommit);
+}
+function apiImportIdentity(api, baseUrl, key, headers) {
+    return JSON.stringify([
+        api,
+        normalizeProviderIdentityBaseUrl(baseUrl ?? ''),
+        key,
+        Object.entries(headers ?? {})
+            .map(([name, value]) => [name.toLowerCase(), value])
+            .sort(([a], [b]) => a.localeCompare(b)),
+    ]);
+}
+function findExactApiImport(context, config, candidate) {
+    const identity = apiImportIdentity(candidate.apiFormat, candidate.baseUrl, candidate.apiKey, candidate.headers);
+    for (const [id, provider] of Object.entries(config.custom_provider ?? {})) {
+        if (!isApiKeyProvider(provider) || context.deps.modelAccess?.requests.owns(id))
+            continue;
+        if (apiImportIdentity(provider.api, provider.options?.baseURL, provider.options?.apiKey, provider.options?.headers) === identity)
+            return id;
+    }
+    return undefined;
+}
+function findMatchingByokProvider(config, candidate) {
+    const key = candidate.apiKey?.trim();
+    const baseUrl = normalizeProviderIdentityBaseUrl(candidate.baseUrl);
+    if (!key || !baseUrl)
+        return undefined;
+    for (const [id, provider] of Object.entries(config.custom_provider ?? {})) {
+        if (!isApiKeyProvider(provider))
+            continue;
+        let providerKey;
+        try {
+            providerKey = resolveProviderCredential({
+                field: 'custom_provider options.apiKey',
+                provider: id,
+                value: provider.options?.apiKey,
+            })?.trim();
+        }
+        catch {
+            continue;
+        }
+        if (providerKey === key &&
+            provider.options?.baseURL &&
+            normalizeProviderIdentityBaseUrl(provider.options.baseURL) === baseUrl)
+            return id;
+    }
+    return undefined;
 }
 function candidateRevisionChanged(resolved, tree, currentConfig) {
     // `draft` comes directly from YAML and can omit loader defaults. Compare an
@@ -166,6 +239,9 @@ function prepareModelParameterUpdate(context, input) {
     if (!currentProvider) {
         throw new LocalModelProviderError(404, 'Model provider not found', 'PROVIDER_NOT_FOUND');
     }
+    // Limits come from the extension catalog; a user override would not reach its transport.
+    if (isModelAccessProvider(currentProvider))
+        throw modelAccessProviderReadOnlyError();
     const modelId = input.modelId?.trim();
     const currentModel = modelId ? currentProvider?.models?.[modelId] : undefined;
     if (!modelId || !currentModel) {

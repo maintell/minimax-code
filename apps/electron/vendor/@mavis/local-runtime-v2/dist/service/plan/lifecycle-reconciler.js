@@ -63,9 +63,9 @@ export function createPlanLifecycleReconciler(options) {
         }
     };
     return {
-        recoverStartup: async () => {
+        recoverStartup: async (signal) => {
             try {
-                return await options.recover(true);
+                return await (signal ? options.recover(true, signal) : options.recover(true));
             }
             catch (error) {
                 options.reportFailure(error);

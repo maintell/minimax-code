@@ -34,7 +34,7 @@ export function redactWsUrl(url) {
         return '<unparseable-ws-url>';
     }
 }
-/** Log-safe one-liner for a GET /binding result (no ticket material). */
+/** Log-safe one-liner for a GET /desktop/bindings result (no ticket material). */
 export function describeBindingForLog(info) {
     const parts = [`state=${info.state ?? 'unknown'}`];
     if (info.binding_id !== undefined)

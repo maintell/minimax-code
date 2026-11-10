@@ -1,3 +1,4 @@
+import { isOffline } from "../modules/connectivity/offline-mode";
 export let REQUIRED_LIFECYCLE_MODULES = Object.freeze([
     'protocol-scheme',
     'deep-link-single-instance',
@@ -95,6 +96,9 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
             name: 'document-preview-protocol-handler',
             phase: 'whenReady',
             init: dependencies.setupDocumentPreviewProtocolHandler,
+            dispose: dependencies.disposeDocumentPreview,
+            disposeStage: 'parallel',
+            disposeTimeoutMs: 3000,
             onInitError: 'fatal',
         },
         {
@@ -120,7 +124,12 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
                     dependencies.cleanupPPTPreviewCache();
                 }
                 finally {
-                    dependencies.disconnectRemoteControlBridgeBeforeQuit();
+                    try {
+                        dependencies.flushBrowserTelemetryBeforeQuit?.();
+                    }
+                    finally {
+                        dependencies.disconnectRemoteControlBridgeBeforeQuit();
+                    }
                 }
             },
             dispose: () => ipcHandle?.shutdown(),
@@ -191,8 +200,12 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
         {
             name: 'local-runtime-warmup',
             phase: 'whenReady',
-            init: () => {
-                if (!authenticatedAtStartup)
+            init: async () => {
+                // prepareLocalRuntime only starts the local utility process; it
+                // does not require a token. Offline there is no login, so
+                // authenticatedAtStartup is false — but chat must still work.
+                const offline = await isOffline();
+                if (!authenticatedAtStartup && !offline)
                     return;
                 void dependencies.prepareLocalRuntime().then((ready) => {
                     if (!ready)
@@ -241,7 +254,10 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
         {
             name: 'hot-update-auto-check',
             phase: 'whenReady',
-            init: () => undefined,
+            init: () => {
+                if (!dependencies.isDev)
+                    dependencies.startHotUpdateAutoCheck();
+            },
             onInitError: 'continue',
             dispose: dependencies.stopHotUpdateAutoCheck,
             disposeStage: 'pre',

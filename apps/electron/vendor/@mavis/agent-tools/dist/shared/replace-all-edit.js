@@ -10,7 +10,8 @@
  * here; pi does the read-verify-write on the (now unique) full content
  * edit.
  */
-import { readFile as fsReadFile } from 'fs/promises';
+import { normalizeToLF, stripBom } from '@earendil-works/pi-coding-agent/tools';
+import { readFile as fsReadFile } from './physical-fs.js';
 export class ReplaceAllError extends Error {
     code;
     constructor(message, code) {
@@ -26,6 +27,12 @@ export class ReplaceAllError extends Error {
  * `replacedCount` lets the caller surface a meaningful success message
  * (the model's UX is "I replaced N occurrences") even though pi only ever
  * sees one edit.
+ *
+ * Counting and replacing happen in pi's edit space: BOM stripped and line
+ * endings normalized to LF, exactly like pi's edit does before matching.
+ * The returned edit lives in that space too, so pi matches it against the
+ * whole normalized file and restores the original BOM and line endings
+ * when it writes.
  */
 export async function buildReplaceAllEdit(absolutePath, oldString, newString) {
     if (oldString === '') {
@@ -40,22 +47,38 @@ export async function buildReplaceAllEdit(absolutePath, oldString, newString) {
         const code = err?.code;
         throw new ReplaceAllError(`Could not read file for replace_all: ${absolutePath}. ${code ?? String(err)}.`, 'READ_FAILED');
     }
+    const content = normalizeToLF(stripBom(rawContent).text);
+    const needle = normalizeToLF(oldString);
+    const replacement = normalizeToLF(newString);
     let replacedCount = 0;
     {
         let cursor = 0;
-        while ((cursor = rawContent.indexOf(oldString, cursor)) !== -1) {
+        while ((cursor = content.indexOf(needle, cursor)) !== -1) {
             replacedCount += 1;
-            cursor += oldString.length;
+            cursor += needle.length;
         }
     }
     if (replacedCount === 0) {
         throw new ReplaceAllError(`replace_all: old_string was not found in ${absolutePath}.`, 'OLD_STRING_NOT_FOUND');
     }
-    const newContent = rawStringReplaceAll(rawContent, oldString, newString);
+    const newContent = rawStringReplaceAll(content, needle, replacement);
     return {
         path: absolutePath,
-        edits: [{ oldText: rawContent, newText: newContent }],
+        edits: [{ oldText: content, newText: newContent }],
         replacedCount,
+    };
+}
+/**
+ * pi reports the collapsed full-file edit as "Successfully replaced 1
+ * block(s)", which tells the model only one spot changed. Replace pi's
+ * success text with the real occurrence count; non-text content and
+ * details (diff / patch) are kept as-is.
+ */
+export function withReplaceAllCount(result, path, replacedCount) {
+    const text = `Successfully replaced ${replacedCount} occurrence(s) in ${path}.`;
+    return {
+        ...result,
+        content: [{ type: 'text', text }, ...result.content.filter((item) => item.type !== 'text')],
     };
 }
 /**

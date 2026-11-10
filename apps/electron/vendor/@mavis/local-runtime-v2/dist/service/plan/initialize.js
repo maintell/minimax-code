@@ -30,15 +30,17 @@ export function initializePlanService(options) {
     });
     let questionnaireService;
     const lifecycleReconciler = createPlanLifecycleReconciler({
-        recover: async (dispatch) => {
+        recover: async (dispatch, signal) => {
             const service = (questionnaireService ??= options.questionnaires.createService());
             return recoverPlanLifecycleAndImplementationQueue({
                 dispatch,
+                ...(signal ? { signal } : {}),
                 recoverLifecycle: () => service.reconcileOwnedActions(dispatch),
                 recoverImplementationQueue: () => recoverPlanImplementationQueue({
                     queue: options.queue,
                     dispatchQueue: options.dispatchQueue,
                     entryEnabled: options.entryEnabled,
+                    ...(signal ? { signal } : {}),
                 }),
             });
         },
@@ -68,6 +70,7 @@ export function initializePlanService(options) {
                 exit: (input) => application.exitFromAgent(input),
             },
             agentEntryEnabled: options.agentEntryEnabled,
+            onReviewFallbackFailed: options.reportReviewFallbackFailure ?? options.reportFailure,
         }),
         questionnaireActionHandler,
         lifecycleReconciler,

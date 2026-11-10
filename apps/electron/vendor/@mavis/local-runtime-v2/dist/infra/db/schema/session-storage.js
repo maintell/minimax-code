@@ -1,10 +1,11 @@
+import { pptPreviewArtifacts, pptPreviewRequests, pptPreviewEvents } from './ppt-preview.js';
 import { getTableConfig, SQLiteSyncDialect } from 'drizzle-orm/sqlite-core';
 import { fileHistoryMigrations, legacyMigrations, legacyOwnerMigrations, legacyPiHistoryRowMigrations, legacyPiHistoryRows, } from './legacy-session.js';
 import { legacyMessages, messageRowMigrations, messageRows, sessionAssetIndexState, sessionAssets, } from './messages.js';
 import { preferences } from './preferences.js';
 import { PROJECT_V5_TRIGGERS, PROJECT_V5_TRIGGERS_SQL, projectMigrations, projects, } from './projects.js';
 import { legacyQueues, queueItems, queueMigrationQuarantine, queuePauses, queueRowMigrations, } from './queue.js';
-import { SESSION_FTS_SQL, SESSION_FTS_TABLE, sessionAgentState, sessionAgentDefinitions, taskSessionBindings, sessionFtsKeys, sessionSchemaMigrations, sessions, } from './sessions.js';
+import { SESSION_FTS_SQL, SESSION_FTS_TABLE, sessionAgentState, sessionAgentDefinitions, sessionSideChats, taskSessionBindings, sessionFtsKeys, sessionSchemaMigrations, sessions, } from './sessions.js';
 import { sessionLocks, turnIngress, turnIngressClientRequests, turnIngressSequences, } from './turn.js';
 import { tokenUsage } from './usage.js';
 import { canonicalizeSqlExpression } from '../sql-contract.js';
@@ -21,6 +22,7 @@ export const SESSION_STORAGE_SCHEMA = {
         sessionFtsKeys,
         sessionAgentState,
         sessionAgentDefinitions,
+        sessionSideChats,
         taskSessionBindings,
         projects,
         messageRows,
@@ -96,6 +98,11 @@ export const SESSION_STORAGE_TABLE_METADATA = {
     optionalDiagnostic: SESSION_STORAGE_SCHEMA.legacyDiagnostic.map(tableMetadata),
     conditionalLegacyInput: SESSION_STORAGE_SCHEMA.conditionalLegacyInput.map(tableMetadata),
 };
+export const PPT_PREVIEW_TABLE_METADATA = [
+    pptPreviewArtifacts,
+    pptPreviewRequests,
+    pptPreviewEvents,
+].map(tableMetadata);
 const finalProjectMetadata = tableMetadata(projects);
 export const SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA = [
     {
@@ -115,7 +122,8 @@ export const SESSION_STORAGE_TRANSITIONAL_TABLE_METADATA = [
             'project_kind',
         ],
         columnDefinitions: [
-            ...finalProjectMetadata.columnDefinitions.filter(({ name }) => name !== 'project_kind'),
+            // The m0006 shape predates both project_kind and m0053's display_name.
+            ...finalProjectMetadata.columnDefinitions.filter(({ name }) => name !== 'project_kind' && name !== 'display_name'),
             {
                 ...requireColumn(finalProjectMetadata.columnDefinitions, 'project_kind'),
                 notNull: false,

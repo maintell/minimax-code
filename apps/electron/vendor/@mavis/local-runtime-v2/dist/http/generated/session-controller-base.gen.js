@@ -75,6 +75,21 @@ export class SessionControllerBase {
         void req;
         throw new NotImplementedError('compressSession');
     }
+    async createSideChat(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('createSideChat');
+    }
+    async createSideChatFromQueue(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('createSideChatFromQueue');
+    }
+    async promoteSideChat(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('promoteSideChat');
+    }
     async getMessages(ctx, req) {
         void ctx;
         void req;
@@ -125,15 +140,35 @@ export class SessionControllerBase {
         void req;
         throw new NotImplementedError('inspectTurnContinuation');
     }
+    async getSessionActivity(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getSessionActivity');
+    }
     async abortSession(ctx, req) {
         void ctx;
         void req;
         throw new NotImplementedError('abortSession');
     }
+    async cancelPromptSuggestion(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('cancelPromptSuggestion');
+    }
+    async getPromptSuggestion(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getPromptSuggestion');
+    }
     async steerSession(ctx, req) {
         void ctx;
         void req;
         throw new NotImplementedError('steerSession');
+    }
+    async sendRemoteMessage(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('sendRemoteMessage');
     }
     async listQueueMessages(ctx, req) {
         void ctx;
@@ -194,6 +229,16 @@ export class SessionControllerBase {
         void ctx;
         void req;
         throw new NotImplementedError('listSessionFiles');
+    }
+    async getSessionFileSyncs(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getSessionFileSyncs');
+    }
+    async recordSessionFileSync(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('recordSessionFileSync');
     }
     async deliverCron(ctx, req) {
         void ctx;

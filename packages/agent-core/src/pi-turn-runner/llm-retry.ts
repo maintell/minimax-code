@@ -1,10 +1,11 @@
 import type { StreamFn } from '@earendil-works/pi-agent-core';
-import type {
-  AssistantMessage,
-  AssistantMessageEvent,
-  AssistantMessageEventStream,
-  ProviderResponse,
-  SimpleStreamOptions,
+import {
+  isContextOverflow,
+  type AssistantMessage,
+  type AssistantMessageEvent,
+  type AssistantMessageEventStream,
+  type ProviderResponse,
+  type SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import {
   isLLMDeterministicRequestRejection,
@@ -36,31 +37,16 @@ export const LLM_RETRY_REQUEST_SETTLED_OBSERVER: unique symbol = Symbol(
 
 export interface LLMRetryPolicy {
   maxRetries: number;
-  /**
-   * Fixed interval between retry attempts. The framework retries unstable
-   * upstreams on this cadence and never backs off: a transient failure is
-   * retried three seconds later, every time.
-   */
   baseDelayMs: number;
-  /** Upper bound for a server-directed `Retry-After` wait. */
   maxDelayMs: number;
   maxRetryElapsedMs: number;
 }
 
-/**
- * Provider errors are retried without a practical limit, on a fixed cadence:
- * an unstable upstream (connection resets, incomplete chunked encoding, 5xx,
- * overload) must recover on its own, and a three-second interval keeps a
- * transient blip invisible. The attempt budget stays a serialisable integer
- * for retry events (one million attempts is ~35 days at this cadence) and the
- * wall-clock budget is unlimited. Only user cancellation, model refusals and
- * deterministic request rejections stay terminal — see `failureResult`.
- */
 export const DEFAULT_LLM_RETRY_POLICY: Readonly<LLMRetryPolicy> = {
-  maxRetries: 1_000_000,
-  baseDelayMs: 3_000,
+  maxRetries: 5,
+  baseDelayMs: 1_000,
   maxDelayMs: 30_000,
-  maxRetryElapsedMs: Number.POSITIVE_INFINITY,
+  maxRetryElapsedMs: 120_000,
 };
 
 export interface LLMRetryError {
@@ -146,6 +132,7 @@ export interface LLMRetryOptions {
   onCallSettled?: (event: LLMCallSettledEvent) => void | Promise<void>;
   generateCallId?: () => string;
   nowMs?: () => number;
+  random?: () => number;
   sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -205,6 +192,7 @@ const PUBLIC_ERROR_MESSAGES: Record<LLMMetricErrorKind, string> = {
 export function withLLMRetry(inner: StreamFn, input: LLMRetryOptions): StreamFn {
   const policy = resolvePolicy(input.policy);
   const nowMs = input.nowMs ?? Date.now;
+  const random = input.random ?? Math.random;
   const sleep = input.sleep ?? abortableSleep;
 
   return (async (model, context, options) => {
@@ -287,7 +275,7 @@ export function withLLMRetry(inner: StreamFn, input: LLMRetryOptions): StreamFn 
 
       lastFailure = preflight.failure;
       const retryAttempt = requestAttempt;
-      const delayMs = retryDelayMs(lastFailure.retryAfterMs, policy);
+      const delayMs = retryDelayMs(lastFailure.retryAfterMs, retryAttempt, policy, random);
       const failureAtMs = nowMs();
       retryStartedAtMs ??= failureAtMs;
       const retryDeadlineExceeded =
@@ -585,11 +573,20 @@ function failureResult(input: {
   nowMs: () => number;
   retryAllErrors?: boolean;
 }): PreflightResult {
+  // A 2xx response status only says the stream opened; a gateway that reports
+  // the rejection inside the stream (an SSE `error` event after HTTP 200) has
+  // no HTTP status for it. Classify such a failure by its own payload, so a
+  // wrapped size rejection is not vetoed as "status 200" and resent.
+  const responseStatus = input.response?.status;
+  const failureStatus =
+    responseStatus !== undefined && (responseStatus < 200 || responseStatus >= 300)
+      ? responseStatus
+      : undefined;
   const normalized = normalizeLLMError({
     ...(input.thrown !== undefined ? { raw: input.thrown } : {}),
     ...(input.final?.stopReason ? { finishReason: input.final.stopReason } : {}),
     ...(input.final?.errorMessage ? { errorMessage: input.final.errorMessage } : {}),
-    ...(input.response ? { statusCode: input.response.status } : {}),
+    ...(failureStatus !== undefined ? { statusCode: failureStatus } : {}),
     explicitAbort: input.final?.stopReason === 'aborted',
   });
   // BYOK retries every pre-output failure because custom gateways report errors
@@ -598,12 +595,14 @@ function failureResult(input: {
   // 400 `invalid_request_error`). Retrying those only re-sends the same request,
   // repeats (and may re-bill) the rejection and delays the actionable error by
   // the whole backoff window. The deterministic check excludes anything that
-  // also looks transient (timeout, network, 408/429/5xx).
+  // also looks transient (timeout, network, 408/429/5xx). A context overflow,
+  // by tokens or by request bytes, is left to context management as in Pi.
   const decision =
     input.retryAllErrors &&
     !normalized.facts.explicitAbort &&
     !normalized.facts.signals.has('refusal') &&
-    !isLLMDeterministicRequestRejection(normalized)
+    !isLLMDeterministicRequestRejection(normalized) &&
+    !(input.final && isContextOverflow(input.final))
       ? { retryable: true, reason: 'network' as const }
       : toLLMRetryDecision(normalized);
   if (!decision.retryable) {
@@ -903,12 +902,19 @@ function resolvePolicy(policy: Partial<LLMRetryPolicy> | undefined): LLMRetryPol
   return { ...DEFAULT_LLM_RETRY_POLICY, ...(policy ?? {}) };
 }
 
-function retryDelayMs(retryAfterMs: number | undefined, policy: LLMRetryPolicy): number {
-  // A server-directed wait (`Retry-After` / `Retry-After-Ms`) is an explicit
-  // provider instruction and still wins. Framework retries themselves never
-  // back off or jitter: the delay is the fixed `baseDelayMs` cadence.
+function retryDelayMs(
+  retryAfterMs: number | undefined,
+  retryAttempt: number,
+  policy: LLMRetryPolicy,
+  random: () => number,
+): number {
   if (retryAfterMs !== undefined) return Math.min(policy.maxDelayMs, Math.max(0, retryAfterMs));
-  return policy.baseDelayMs;
+  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retryAttempt - 1));
+  return Math.floor(exponential / 2 + (clampRandom(random()) * exponential) / 2);
+}
+
+function clampRandom(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
 }
 
 function parseRetryAfterMs(

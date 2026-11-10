@@ -26,6 +26,20 @@ export const GOAL_FINAL_REPLY_INSTRUCTION = 'The completion proposal was accepte
     'Now write one final reply to the user: say what was accomplished, where each deliverable file is, and how to use it when that is not obvious. ' +
     'Declare every deliverable file of this goal, including files produced in earlier turns, with delivery markup (<media /> tags inside <deliver-assets>...</deliver-assets>), and also write each file path in the reply text. ' +
     'The host verifies the goal only after this reply, so do not claim that verification has passed or that the result is verified or confirmed; describe checks you ran yourself as checks you ran, not as verification.';
+/**
+ * Instruction for a wrap-up request: sent without tools once the Goal's work
+ * request budget is used up and no completion proposal was accepted in this
+ * Turn. It only describes existing results; it starts no new work.
+ */
+export const GOAL_BUDGET_WRAP_UP_INSTRUCTION = "This Goal has used its work request budget, so this turn's work is over. Tools are not available for this response. " +
+    'Using only what this conversation already shows, write a brief final reply to the user: what has been completed, what remains incomplete, and that execution stopped because the Goal reached its request budget. ' +
+    'Do not continue the objective, do not describe new steps as done, and do not claim the goal is complete. ' +
+    'To continue, the user can create a new goal.';
+/** The same wrap-up when the Goal's token budget, not its request budget, closed the Turn. */
+export const GOAL_TOKEN_BUDGET_WRAP_UP_INSTRUCTION = "This Goal has used its token budget, so this turn's work is over. Tools are not available for this response. " +
+    'Using only what this conversation already shows, write a brief final reply to the user: what has been completed, what remains incomplete, and that execution stopped because the Goal reached its token budget. ' +
+    'Do not continue the objective, do not describe new steps as done, and do not claim the goal is complete. ' +
+    'To continue, the user can raise or clear the token budget.';
 /** Result of every tool call refused after this Turn's completion proposal was accepted. */
 export const GOAL_COMPLETION_TOOL_REFUSAL = 'GOAL_COMPLETION_PROPOSED: This turn already proposed completion and the proposal was accepted. Do not call another tool; write the final reply to the user now.';
 /** Hidden follow-up sent once when the response after the accepted proposal is empty. */
@@ -46,27 +60,29 @@ export function isAcceptedGoalCompletionResult(result) {
     const { status, accepted } = proposal;
     return status === 'complete' && accepted === true;
 }
-export function createGoalFinalReplyGate() {
+export function createGoalFinalReplyGate(options = {}) {
     const turns = new Map();
-    const acceptedRuns = new WeakSet();
+    const acceptedRuns = new WeakMap();
     const keyOf = (turn) => `${turn.sessionId}\u0000${turn.turnId}`;
+    const worksForGoal = (turn) => options.worksForGoal?.(turn) ?? true;
     return {
         observeToolResult(turn, run, result) {
             if (!isAcceptedGoalCompletionResult(result))
                 return;
-            acceptedRuns.add(run);
+            acceptedRuns.set(run, { sessionId: turn.sessionId, turnId: turn.turnId });
             const state = turns.get(keyOf(turn)) ?? { retried: false, runs: new Set() };
             state.runs.add(run);
             turns.set(keyOf(turn), state);
         },
         refuseToolCall(run) {
-            return acceptedRuns.has(run)
+            const turn = acceptedRuns.get(run);
+            return turn && worksForGoal(turn)
                 ? { block: true, reason: GOAL_COMPLETION_TOOL_REFUSAL }
                 : undefined;
         },
         reviewResponse(turn, response) {
             const state = turns.get(keyOf(turn));
-            if (!state || state.retried)
+            if (!state || state.retried || !worksForGoal(turn))
                 return { type: 'continue' };
             if (response.stopReason === 'error' || response.stopReason === 'aborted') {
                 return { type: 'continue' };

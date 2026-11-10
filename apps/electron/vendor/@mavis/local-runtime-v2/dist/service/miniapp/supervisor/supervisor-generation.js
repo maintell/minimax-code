@@ -2,9 +2,14 @@ import { MiniAppError } from '../errors.js';
 export function activeStatusPhase(active, hasFailure) {
     if (active.runtime)
         return 'active';
-    if (hasFailure)
-        return 'failed';
-    return active.startPromise ? 'starting' : 'cold';
+    return hasFailure ? 'failed' : 'cold';
+}
+export function requireActiveGeneration(active, pluginId) {
+    const generation = active.get(pluginId);
+    if (!generation) {
+        throw new MiniAppError('NO_ACTIVE_GENERATION', 'Mini App has no active generation');
+    }
+    return generation;
 }
 export function publishedView(candidate, miniAppGeneration, runtime) {
     return {
@@ -14,10 +19,15 @@ export function publishedView(candidate, miniAppGeneration, runtime) {
         packageDigest: candidate.packageDigest,
         clientDigest: candidate.clientDigest,
         surfacePath: candidate.surfacePath,
+        ...(candidate.surfaceWindow ? { surfaceWindow: candidate.surfaceWindow } : {}),
         nodeDigest: candidate.nodeDigest,
         lifecycle: candidate.lifecycle,
         ...(runtime ? { processGeneration: runtime.processGeneration, origin: runtime.origin } : {}),
     };
+}
+/** Keeps the loopback credential beside, never inside, the published view. */
+export function runtimeLoopbackToken(runtime) {
+    return runtime ? { loopbackToken: runtime.loopbackToken } : {};
 }
 export function persistedState(candidate, runtime, updatedAtMs) {
     return {
@@ -34,9 +44,9 @@ export function persistedState(candidate, runtime, updatedAtMs) {
     };
 }
 export function isReusableGeneration(generation, candidate) {
-    if (!generation.runtime || hasRuntimeTransition(generation))
+    if (!generation.runtime)
         return false;
-    return (sameProcessContract(generation.candidate, candidate) &&
+    return (sameMiniAppProcessContract(generation.candidate, candidate) &&
         generation.runtime.nodeDigest === candidate.nodeDigest);
 }
 export function assertReusableRuntimeCurrent(active, candidate, reusable) {
@@ -61,22 +71,37 @@ export function assertGenerationRunCurrent(input) {
     }
     throw new MiniAppError('SERVICE_RESTARTED', 'Mini App service changed before this operation could be dispatched');
 }
-export function scheduleTimeout(delayMs, callback) {
-    const timer = setTimeout(callback, Math.max(0, delayMs));
-    timer.unref();
-    return { cancel: () => clearTimeout(timer) };
-}
-function sameProcessContract(current, candidate) {
+/** Node process contract: the parts of a candidate a running root cannot change under. */
+function sameMiniAppProcessContract(current, candidate) {
     return (current.nodeDigest === candidate.nodeDigest &&
         current.nodeEntry === candidate.nodeEntry &&
         canonicalMcpEndpoints(current) === canonicalMcpEndpoints(candidate) &&
-        canonicalHostConnectorPolicy(current) === canonicalHostConnectorPolicy(candidate));
+        sameMiniAppAccessPolicy(current, candidate));
 }
-function hasRuntimeTransition(generation) {
-    return Boolean(generation.startPromise ||
-        generation.startController ||
-        generation.idleTimer ||
-        generation.idleStopPromise);
+/**
+ * The manifest-level grants a process was started with: Host Connector, Agent and tool access.
+ * Every role that reuses a process compares through this one place.
+ */
+function sameMiniAppAccessPolicy(left, right) {
+    return (canonicalHostConnectorPolicy(left) === canonicalHostConnectorPolicy(right) &&
+        canonicalAgentPolicy(left) === canonicalAgentPolicy(right) &&
+        canonicalToolPolicy(left) === canonicalToolPolicy(right));
+}
+/**
+ * `reuse`: only ordinary package content moved (root/digest); a running root keeps serving.
+ * `restart`: the process contract, client assets or surface changed; a running root must be
+ * replaced, which a marketplace sync never does on its own.
+ */
+export function classifyMiniAppCandidateChange(current, next) {
+    if (JSON.stringify(current) === JSON.stringify(next))
+        return 'none';
+    if (sameMiniAppProcessContract(current, next) &&
+        current.clientDigest === next.clientDigest &&
+        current.surfacePath === next.surfacePath &&
+        JSON.stringify(current.surfaceWindow ?? null) === JSON.stringify(next.surfaceWindow ?? null)) {
+        return 'reuse';
+    }
+    return 'restart';
 }
 function canonicalMcpEndpoints(candidate) {
     return JSON.stringify(candidate.mcpEndpoints
@@ -88,5 +113,17 @@ function canonicalHostConnectorPolicy(candidate) {
     return policy.kind === 'deny-all'
         ? policy.kind
         : JSON.stringify([policy.kind, [...policy.providers].sort()]);
+}
+function canonicalAgentPolicy(candidate) {
+    const policy = candidate.agentPolicy ?? { kind: 'deny-all' };
+    return policy.kind === 'deny-all'
+        ? policy.kind
+        : JSON.stringify([policy.kind, [...policy.capabilities].sort(), policy.maxConcurrent]);
+}
+function canonicalToolPolicy(candidate) {
+    const policy = candidate.toolPolicy ?? { kind: 'deny-all' };
+    return policy.kind === 'deny-all'
+        ? policy.kind
+        : JSON.stringify([policy.kind, [...policy.capabilities].sort()]);
 }
 //# sourceMappingURL=supervisor-generation.js.map

@@ -1,6 +1,4 @@
 import { prepareCaptureHistory, truncateToTokenBudget } from './capture-history.js';
-/** 已结束的会话状态；`started` 之外都视为终态（Mavis 语义里 idle 即 finished）。 */
-const TERMINAL_STATUSES = new Set(['idle', 'error', 'aborted', 'interrupted']);
 export function createProductionSessionSystemPort(deps) {
     async function readSnapshot(sessionId, maxInputTokens) {
         const session = await deps.sessions.get(sessionId);
@@ -44,7 +42,7 @@ export function createProductionSessionSystemPort(deps) {
                 workspaceDir: session.workspaceDir || undefined,
                 createdAtMs: session.createdAtMs,
                 updatedAtMs: session.updatedAtMs,
-                rootConversation: isTopLevelConversation(session),
+                rootConversation: isUserConversation(session),
                 ...(session.memoryPolicy ? { memoryPolicy: session.memoryPolicy } : {}),
             };
         },
@@ -73,14 +71,14 @@ export function createProductionSessionSystemPort(deps) {
             const now = deps.nowMs();
             const excluded = new Set(input.excludeSessionIds);
             const maxAgeMs = input.maxAgeDays * 86_400_000;
-            const eligible = page.sessions.filter((session) => isTopLevelConversation(session) &&
+            const eligible = page.sessions.filter((session) => isCaptureSource(session) &&
                 // 候选必须早于触发 Turn 的开始时刻，且不是触发会话自身(§2.3)。
                 session.createdAtMs < input.createdBeforeMs &&
                 !excluded.has(session.sessionId) &&
                 // 年龄窗：updatedAtMs 超窗的会话退出候选资格(§2.3)。
                 now - session.updatedAtMs <= maxAgeMs &&
-                // 终态会话立即具备时间资格；运行中的会话要空闲达标(§5.10)。
-                (TERMINAL_STATUSES.has(session.status) || now - session.updatedAtMs >= input.idleForMs));
+                // idle/error 等状态只表示两轮之间，用户随时可能继续；一律按距最后更新的时长判定(§5.10)。
+                now - session.updatedAtMs >= input.idleForMs);
             const candidates = [];
             for (const session of eligible) {
                 // 只对通过元数据过滤的会话付出一次 History 读取,换取 sourceRevision。
@@ -107,15 +105,28 @@ export function createProductionSessionSystemPort(deps) {
         },
     };
 }
-function isTopLevelConversation(session) {
+/**
+ * §2.3.1 用户对话身份，供唤醒、召回与笔记使用。
+ *
+ * 未提升的 SideChat 以 hidden 存储，它仍是用户直接对话的会话；排除它会让 SideChat 缺少记忆工具，
+ * 而它从主会话复制来的历史里留有这些工具的调用。
+ */
+function isUserConversation(session) {
     return (
     // root 仅兼容历史会话；新建用户规划使用 branch。
     (session.sessionType === 'branch' || session.sessionType === 'root') &&
         !session.parentSessionId &&
         session.sessionKind === 'conversation' &&
-        session.visibility !== 'hidden' &&
+        (session.visibility !== 'hidden' || session.sideChatOrigin !== undefined) &&
         !session.archived &&
         !session.originCronId);
+}
+/**
+ * §2.3.1 抽取候选：未提升的 SideChat 由主会话的冻结副本与临时讨论组成，不作为记忆来源；
+ * 提升为可见后按普通顶层对话处理。
+ */
+function isCaptureSource(session) {
+    return isUserConversation(session) && session.visibility !== 'hidden';
 }
 /** 项目标注名：workspace 项目取目录 basename；default 项目不标注（§2.2）。 */
 function projectDisplayName(project) {

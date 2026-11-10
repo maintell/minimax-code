@@ -86,6 +86,13 @@ async function dispose(pendingInitialization) {
     await pendingInitialization?.catch(() => undefined);
     const integration = activeIntegration;
     activeIntegration = null;
+    // integration.dispose() removes <dataDir>/bin/mcode-tools*.cmd, and nothing
+    // reinstalls them until the next app start. Record the launcher before the
+    // removal so a disposal that runs without a matching re-init is attributable
+    // instead of silently leaving the bin directory without mcode-tools.
+    logger.info(integration
+        ? `[mcode-tools] dispose removing launcher=${integration.launcherPath} broker=${integration.brokerEndpoint} version=${integration.version}`
+        : '[mcode-tools] dispose requested without an active integration');
     await integration?.dispose();
 }
 function integrationPaths() {

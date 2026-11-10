@@ -1,6 +1,7 @@
+import { totalmem } from 'node:os';
 import { detectPluginReferencesForMessages } from '@mavis/system-reminder';
 import { pluginMcpNameKey } from '@mavis/mcp';
-import { MAX_RUNNING_MINIAPP_SERVICES, miniAppBusyReason } from '../../../../miniapp/index.js';
+import { deviceMiniAppCapacity, miniAppBusyReason } from '../../../../miniapp/index.js';
 import { PluginSystemError } from '../../../errors.js';
 /** Resolves only explicitly selected, enabled MiniApp managed MCP dependencies. */
 export async function prepareMiniAppTurn(miniApps, input, readCurrent) {
@@ -20,6 +21,11 @@ export async function prepareMiniAppTurn(miniApps, input, readCurrent) {
     assertReady();
     return assertReady;
 }
+/**
+ * Starts every referenced Mini App the turn depends on. They stay in the memory manager's
+ * foreground tier until the turn settles (the Turn system calls `releaseTurn`); a turn the local
+ * user started also counts as attention and may put another Mini App to sleep for room.
+ */
 async function prepareReferencedMiniApps(miniApps, input) {
     const messages = input.messages.map(({ content }) => ({
         content: miniAppDependencyText(content),
@@ -29,14 +35,26 @@ async function prepareReferencedMiniApps(miniApps, input) {
     input.signal?.throwIfAborted();
     const selected = await resolveReferencedMiniApps(miniApps, messages);
     input.signal?.throwIfAborted();
-    if (selected.length > MAX_RUNNING_MINIAPP_SERVICES)
+    const memory = miniApps.memory;
+    const limit = memory ? memory.view().capacity.limit : deviceMiniAppCapacity(totalmem());
+    if (selected.length > limit)
         throw dependencyError('miniapp_dependency_limit');
     if (selected.length === 0)
         return [];
+    const pluginIds = selected.map(({ candidate }) => candidate.pluginId);
+    memory?.holdForTurn({ sessionId: input.sessionId, turnId: input.turnId, pluginIds });
+    if (input.initiator === 'user') {
+        for (const pluginId of pluginIds)
+            memory?.recordAttention(pluginId);
+    }
     try {
-        await Promise.all(selected.map(async ({ candidate }) => {
+        await Promise.all(pluginIds.map(async (pluginId) => {
             input.signal?.throwIfAborted();
-            await miniApps.ensureStarted({ pluginId: candidate.pluginId, signal: input.signal });
+            await miniApps.ensureStarted({
+                pluginId,
+                initiator: input.initiator,
+                ...(input.signal ? { signal: input.signal } : {}),
+            });
         }));
         input.signal?.throwIfAborted();
         return Object.freeze(selected.flatMap(({ candidate }) => candidate.mcpEndpoints.map(({ id }) => Object.freeze({ pluginName: candidate.pluginId, serverName: id }))));

@@ -13,6 +13,25 @@ export const TurnContinuationState = {
     Running: 2,
     WaitingForUser: 3,
 };
+export const SessionActivityState = {
+    Idle: 0,
+    Running: 1,
+    WaitingForUser: 2,
+    Scheduled: 3,
+};
+export const SessionActivityKind = {
+    Turn: 1,
+    QueuedMessages: 2,
+    BackgroundTask: 3,
+    TaskNotification: 4,
+    ThreadGoal: 5,
+    TeamPlan: 6,
+    CronRun: 7,
+    CronSchedule: 8,
+    Questionnaire: 9,
+    Permission: 10,
+    PausedQueue: 11,
+};
 export const SessionTypeView = {
     Branch: 0,
     Root: 1,
@@ -38,6 +57,10 @@ export const SessionKind = {
 };
 export const SessionCollaborationKind = {
     LocalCloudHandoff: 1,
+};
+export const SideChatMutationState = {
+    Pending: 0,
+    Committed: 1,
 };
 export const AppId = {
     Glow: 1,
@@ -95,6 +118,10 @@ export const PluginInstallationPolicy = {
 export const PluginShowcaseMediaType = {
     IMAGE: 1,
     VIDEO: 2,
+    PPT: 3,
+    WORD: 4,
+    EXCEL: 5,
+    PDF: 6,
 };
 export const InstalledPluginSource = {
     OFFICIAL: 1,
@@ -104,6 +131,12 @@ export const PluginCapabilityType = {
     APP: 1,
     MCP: 2,
     SKILL: 3,
+};
+export const PluginMarketplaceSourceKind = {
+    OFFICIAL: 1,
+    LOCAL: 2,
+    GIT: 3,
+    DIRECTORY: 4,
 };
 export const SkillScope = {
     AGENT: 1,
@@ -176,6 +209,15 @@ export const CronTriggerSource = {
     Manual: 0,
     Scheduled: 1,
 };
+export const DesktopBackgroundTaskStatus = {
+    Queued: 0,
+    Running: 1,
+    Stopping: 2,
+    Succeeded: 3,
+    Failed: 4,
+    Canceled: 5,
+    Lost: 6,
+};
 export const PinnedItemType = {
     Session: 1,
     Agent: 2,
@@ -206,21 +248,51 @@ export const QuestionnaireStatus = {
     Superseded: 3,
     Dismissed: 4,
 };
+export const QuestionnaireReopenReason = {
+    ContentRecall: 1,
+};
 export const LocalMcpTransport = {
     Stdio: 1,
     Http: 2,
     StreamableHttp: 3,
     Sse: 4,
 };
+export const LocalHookScope = {
+    USER: 1,
+    PROJECT: 2,
+};
+export const LocalHookSource = {
+    USER: 1,
+    PROJECT: 2,
+    PLUGIN: 3,
+};
 export const FeedbackStatus = {
     FEEDBACK_STATUS_UNSPECIFIED: 0,
     PROCESSING: 1,
     RESOLVED: 2,
+    SUBMITTED: 3,
 };
 export const FeedbackClientType = {
     FEEDBACK_CLIENT_UNSPECIFIED: 0,
     DESKTOP: 1,
     WEB: 2,
+};
+export const FeedbackCategory = {
+    FEEDBACK_CATEGORY_UNSPECIFIED: 0,
+    MODEL_QUALITY: 1,
+    APP_BUG: 2,
+    OTHER: 3,
+    SESSION_ISSUE: 4,
+    APP_ISSUE: 5,
+    SUGGESTION: 6,
+    MESSAGE_DISLIKE: 7,
+};
+export const FeedbackDiagnosticLogStatus = {
+    FEEDBACK_DIAGNOSTIC_LOG_STATUS_UNSPECIFIED: 0,
+    NOT_REQUIRED: 1,
+    UPLOADING: 2,
+    UPLOADED: 3,
+    FAILED: 4,
 };
 export const WebsiteManagementCode = {
     OK: 0,
@@ -355,5 +427,44 @@ export const AgentShellFamily = {
     PWSH: 1,
     WINDOWS_POWERSHELL: 2,
     GIT_BASH: 3,
+};
+export const WorkShareKind = {
+    UNSPECIFIED: 0,
+    PLUGIN: 1,
+    SKILL: 2,
+};
+export const WorkShareStatus = {
+    UNSPECIFIED: 0,
+    ACTIVE: 1,
+    REVOKED: 2,
+    TAKEN_DOWN: 3,
+};
+export const WorkShareCreateResult = {
+    UNSPECIFIED: 0,
+    OK: 1,
+    UNCHANGED: 2,
+    PACKAGE_INVALID: 3,
+    SECRET_DETECTED: 4,
+    MODERATION_REJECTED: 5,
+    MODERATION_UNAVAILABLE: 6,
+    CONTENT_BLOCKED: 7,
+    NAME_TAKEN_DOWN: 8,
+    QUOTA_EXCEEDED: 9,
+    CONTENT_TOO_LARGE: 10,
+    DISABLED: 11,
+};
+export const WorkSharePackDiagnosticCode = {
+    UNSPECIFIED: 0,
+    NOT_SHAREABLE: 1,
+    UNREADABLE: 2,
+    LIMIT_EXCEEDED: 3,
+    INVALID_PATH: 4,
+    SYMLINK_REJECTED: 5,
+    INVALID_SKILL: 6,
+};
+export const WorkShareConflictKind = {
+    NONE: 0,
+    OVERWRITABLE: 1,
+    BLOCKED: 2,
 };
 //# sourceMappingURL=types.js.map

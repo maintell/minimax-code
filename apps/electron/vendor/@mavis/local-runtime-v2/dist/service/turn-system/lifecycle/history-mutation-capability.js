@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { canonicalActiveHistoryRevision, inspectCanonicalHistorySequence, } from '../../session-system/index.js';
+import { canonicalActiveHistoryRevision, canonicalHistoryRevision, inspectCanonicalHistorySequence, createSideChatModeMessage, isSideChatModeMessage, } from '../../session-system/index.js';
 import { readBackgroundTaskOriginMetadata } from '../agent-host/history/background/host-metadata.js';
 import { BACKGROUND_CADENCE_REMINDER_CUSTOM_TYPE } from '../agent-host/history/background/reminder-protocol.js';
 import { isBackgroundTaskReadSettlement } from '../agent-host/history/background/task-read-settlement.js';
@@ -15,24 +15,113 @@ export class HistoryMutationError extends Error {
 }
 export function createHistoryMutationCapability(options) {
     return {
+        prepareSideChat: (input) => prepareSideChat(options, input),
         fork: (input) => fork(options, input),
+        inspectForkBoundary: (input) => inspectForkBoundary(options, input),
         rewind: (input) => rewind(options, input),
     };
 }
+async function prepareSideChat(options, input) {
+    const frozen = await options.sessions.readFrozen(input.sourceSessionId, async (source) => {
+        const inspection = inspectCanonicalHistorySequence(source.active);
+        const prefix = withoutSourceBackgroundReminders(source.active.slice(0, inspection.status === 'settled' ? source.active.length : inspection.settledPrefixLength));
+        const sourceMessageId = prefix.at(-1)?.message_id;
+        const snapshot = {
+            active: prefix,
+            snapshots: source.snapshots.map(copySnapshot),
+            historyRevision: canonicalActiveHistoryRevision(prefix),
+            ...(sourceMessageId ? { sourceMessageId } : {}),
+        };
+        return {
+            ...snapshot,
+            generation: source.activeGeneration,
+            ...(await input.captureDisplay(snapshot)),
+        };
+    }, input.signal);
+    input.signal?.throwIfAborted();
+    const copied = rewriteSideChatAssets(frozen, frozen.replacements);
+    const boundary = createHiddenContextBoundaryEnvelope(`sidechat:${input.target.sessionId}`, {
+        kind: 'sidechat_context_boundary',
+        content: '<system-reminder>Messages above this boundary are a frozen copy from another conversation and are reference context only. Do not resume its unfinished tasks or treat its approvals as authorization. Answer the current user request under the current session settings. This historical boundary does not constrain the current session mode or available tools.</system-reminder>',
+    });
+    const mode = createSideChatModeMessage(0);
+    const active = [
+        ...copied.active.filter(({ message }) => !isSideChatModeMessage(message)),
+        boundary,
+        createHiddenContextBoundaryEnvelope(`sidechat:${input.target.sessionId}`, {
+            kind: mode.customType,
+            content: mode.content,
+        }),
+    ];
+    const staged = await options.sessions.stageUnpersisted({
+        target: input.target,
+        generation: frozen.generation,
+        active,
+        snapshots: copied.snapshots,
+    });
+    try {
+        input.signal?.throwIfAborted();
+    }
+    catch (error) {
+        await staged.rollback();
+        throw error;
+    }
+    return {
+        ...staged,
+        targetRevision: canonicalActiveHistoryRevision(active),
+        messageCount: active.length,
+        historyRevision: frozen.historyRevision,
+        ...(frozen.sourceMessageId ? { sourceMessageId: frozen.sourceMessageId } : {}),
+        display: frozen.display,
+    };
+}
+function rewriteSideChatAssets(frozen, replacements) {
+    if (!replacements?.size)
+        return frozen;
+    const revisions = new Map();
+    const rewrite = (records) => records.map((record, index) => {
+        const message = JSON.parse(JSON.stringify(record.message, (_key, value) => typeof value === 'string' ? (replacements.get(value) ?? value) : value));
+        const copied = { ...record, message };
+        if (index !== 0)
+            return copied;
+        if (copied.history_artifact) {
+            const parent = copied.history_artifact.parentSnapshot;
+            copied.history_artifact = {
+                ...copied.history_artifact,
+                parentSnapshot: {
+                    ...parent,
+                    revision: revisions.get(parent.revision) ?? parent.revision,
+                },
+            };
+        }
+        const marker = message.archonCompaction;
+        if (isRecord(marker) &&
+            isRecord(marker.parentSnapshot) &&
+            typeof marker.parentSnapshot.revision === 'string') {
+            const parent = marker.parentSnapshot;
+            copied.message = {
+                ...message,
+                archonCompaction: {
+                    ...marker,
+                    parentSnapshot: {
+                        ...parent,
+                        revision: revisions.get(parent.revision) ?? parent.revision,
+                    },
+                },
+            };
+        }
+        return copied;
+    });
+    const snapshots = frozen.snapshots.map((snapshot) => {
+        const records = rewrite(snapshot.records);
+        const revision = canonicalHistoryRevision(records);
+        revisions.set(snapshot.revision, revision);
+        return { ...snapshot, records, revision };
+    });
+    return { active: rewrite(frozen.active), snapshots };
+}
 async function fork(options, input) {
-    const inclusiveBoundary = input.throughMessageId ?? input.throughAssistantMessageId;
-    const boundary = inclusiveBoundary ?? input.beforeUserMessageId;
-    const source = await readBoundarySource(options, input.sourceSessionId, boundary, input.beforeUserMessageId);
-    const sourceArtifact = findForkArtifact(source, boundary, Boolean(input.throughMessageId));
-    if (!sourceArtifact)
-        boundaryNotFound(boundary);
-    const index = boundary
-        ? sourceArtifact.records.findIndex((envelope) => envelope.message_id === boundary)
-        : sourceArtifact.records.length;
-    if (index < 0)
-        boundaryNotFound(boundary);
-    const prefixEnd = inclusiveBoundary ? index + 1 : index;
-    const prefix = withoutSourceBackgroundReminders(sourceArtifact.records.slice(0, prefixEnd));
+    const { source, sourceArtifact, boundary, prefix } = await selectForkPrefix(options, input);
     if (boundary && !isSettledPrefix(prefix)) {
         throw new HistoryMutationError('boundary-invalid', 'History fork target prefix is not settled');
     }
@@ -61,6 +150,70 @@ async function fork(options, input) {
         generation: sourceArtifact.generation,
         historyRevision: canonicalActiveHistoryRevision(active),
     };
+}
+/** Read-only preflight: reports whether `fork()` would accept this boundary, without staging. */
+async function inspectForkBoundary(options, input) {
+    const { boundary, prefix } = await selectForkPrefix(options, input);
+    return { settled: !boundary || isSettledPrefix(prefix) };
+}
+/** Single source of the Fork prefix rule shared by `fork()` and its preflight. */
+async function selectForkPrefix(options, input) {
+    const inclusiveBoundary = input.throughMessageId ?? input.throughAssistantMessageId;
+    const boundary = inclusiveBoundary ?? input.beforeUserMessageId;
+    const source = await readBoundarySource(options, input.sourceSessionId, boundary, input.beforeUserMessageId);
+    const sourceArtifact = findForkArtifact(source, boundary, Boolean(input.throughMessageId));
+    if (!sourceArtifact)
+        boundaryNotFound(boundary);
+    const index = boundary
+        ? sourceArtifact.records.findIndex((envelope) => envelope.message_id === boundary)
+        : sourceArtifact.records.length;
+    if (index < 0)
+        boundaryNotFound(boundary);
+    const prefixEnd = forkPrefixEnd(sourceArtifact.records, index, input);
+    const prefix = withoutSourceBackgroundReminders(sourceArtifact.records.slice(0, prefixEnd));
+    return { source, sourceArtifact, boundary, prefix };
+}
+function forkPrefixEnd(records, index, input) {
+    if (input.throughMessageId)
+        return index + 1;
+    if (input.throughAssistantMessageId)
+        return assistantBoundaryEnd(records, index);
+    return index;
+}
+/**
+ * An Assistant boundary owns the results of its own tool calls. Pi commits each result as a
+ * separate record right after the call, so cutting between them would leave an unsettled prefix
+ * (e.g. Fork from a `task_output` or ask_user card). Only contiguous results for this Assistant's
+ * calls are included; any other record ends the boundary.
+ */
+function assistantBoundaryEnd(records, index) {
+    const pendingCallIds = new Set(assistantToolCallIds(records[index]?.message));
+    let end = index + 1;
+    while (pendingCallIds.size > 0) {
+        const callId = toolResultCallId(records[end]?.message);
+        if (!callId || !pendingCallIds.delete(callId))
+            break;
+        end += 1;
+    }
+    return end;
+}
+function assistantToolCallIds(message) {
+    if (!message || Reflect.get(message, 'role') !== 'assistant')
+        return [];
+    const content = Reflect.get(message, 'content');
+    if (!Array.isArray(content))
+        return [];
+    return content.flatMap((block) => {
+        if (!isRecord(block) || block.type !== 'toolCall')
+            return [];
+        return typeof block.id === 'string' && block.id ? [block.id] : [];
+    });
+}
+function toolResultCallId(message) {
+    if (!message || Reflect.get(message, 'role') !== 'toolResult')
+        return undefined;
+    const callId = Reflect.get(message, 'toolCallId');
+    return typeof callId === 'string' && callId ? callId : undefined;
 }
 function createForkActiveHistory(prefix, input) {
     return [

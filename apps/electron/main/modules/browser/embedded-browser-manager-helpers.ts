@@ -1,11 +1,41 @@
 import { serializeSemanticTreePage } from "@mavis/browser-core";
+const MAX_COMMENT_STYLE_CHANGES = 32;
+export function normalizeCommentStyleChanges(value) {
+    if (!Array.isArray(value))
+        return [];
+    const changes = [];
+    for (const entry of value.slice(0, MAX_COMMENT_STYLE_CHANGES)) {
+        const record = asRecord(entry);
+        const property = asString(record.property).slice(0, 60);
+        const cssProperty = asString(record.cssProperty).slice(0, 60);
+        if (!property || !/^[a-z-]+$/.test(cssProperty))
+            continue;
+        changes.push({
+            property,
+            cssProperty,
+            from: asString(record.from).slice(0, 200),
+            to: asString(record.to).slice(0, 200),
+        });
+    }
+    return changes;
+}
 export let DEFAULT_BOUNDS = { x: -10000, y: -10000, width: 800, height: 600 };
 export let OFFSCREEN_BOUNDS = { x: -10000, y: -10000, width: 800, height: 600 };
 export let PENDING_COMMENT_EVENT_LIMIT = 500;
+export let COMMENT_KEY_MAX_ENTRIES = 500;
+export let COMMENT_KEY_MAX_LENGTH = 200;
 export let HIDDEN_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 export let HIDDEN_LOADING_GRACE_MS = 2 * 60 * 1000;
 export let HIDDEN_SWEEP_INTERVAL_MS = 60 * 1000;
 export let MAX_HIDDEN_TABS = 3;
+/**
+ * How long a tab stays protected from hidden-tab suspension and background
+ * throttling after an agent tool operation settles. Suspending between two
+ * consecutive agent actions destroys the WebContents and cold-resumes the
+ * page, which drops SPA in-memory state, invalidates element refs handed to
+ * the model, and freezes page timers while the panel is hidden or occluded.
+ */
+export let AGENT_OPERATION_KEEPALIVE_MS = 5 * 60 * 1000;
 export let ENABLE_BROWSER_INPUT_DIAGNOSTICS = process.env.NODE_ENV !== 'production';
 export let MAX_AGENT_SNAPSHOT_ELEMENTS = 500;
 export let MAX_AGENT_SNAPSHOTS_PER_TAB = 3;
@@ -25,6 +55,7 @@ export let AGENT_BROWSER_ACTIONS = new Set([
     'click',
     'click_and_wait_for_navigation',
     'double_click',
+    'triple_click',
     'drag',
     'hover',
     'fill',
@@ -129,7 +160,12 @@ export function asCommentRenumberMap(value) {
         const record = asRecord(item);
         const oldId = asNumber(record.oldId);
         const newId = asNumber(record.newId);
-        return oldId > 0 && newId > 0 ? { oldId, newId } : null;
+        if (oldId <= 0 || newId <= 0)
+            return null;
+        const commentKey = typeof record.commentKey === 'string' && record.commentKey
+            ? record.commentKey.slice(0, 200)
+            : null;
+        return commentKey ? { oldId, newId, commentKey } : { oldId, newId };
     })
         .filter((item) => Boolean(item));
 }
@@ -164,6 +200,79 @@ export function isMainDocumentNavigation(args) {
 }
 export function normalizeCommentSelectionMode(value) {
     return value === 'free_rect' ? 'free_rect' : 'dom_node';
+}
+/**
+ * Validate a single stable comment key supplied by the host. The key is
+ * the only field the bridge matches by once a renumber has happened, so
+ * any transformation here would risk turning a bad key into a different
+ * key that happens to look valid. We therefore refuse to trim, slice, or
+ * normalise whitespace — an invalid key is rejected as a whole.
+ */
+export function validateCommentKey(entry) {
+    if (typeof entry !== 'string') {
+        return { ok: false, error: 'commentKeys entries must be strings' };
+    }
+    if (entry.length === 0) {
+        return { ok: false, error: 'commentKeys entries must be non-empty' };
+    }
+    if (entry.length > COMMENT_KEY_MAX_LENGTH) {
+        return {
+            ok: false,
+            error: `commentKeys entries must be at most ${COMMENT_KEY_MAX_LENGTH} chars`,
+        };
+    }
+    if (entry !== entry.trim()) {
+        return { ok: false, error: 'commentKeys entries must not have surrounding whitespace' };
+    }
+    return { ok: true, key: entry };
+}
+/**
+ * Validate the host-supplied `commentKeys` argument.
+ *
+ * The contract is fail-closed: when the field is present but malformed
+ * (not an array, contains non-strings, empty strings, overlong entries,
+ * or anything with surrounding whitespace) the handler must NOT silently
+ * fall back to a full-page clear or full resolve. Only a missing field
+ * is allowed to preserve the legacy "clear/resolve everything" path.
+ *
+ * Shared between the IPC layer and the manager so that the contract is
+ * the same on both sides — and so that direct manager callers (e.g.
+ * tests) get the same fail-closed behaviour as the IPC layer.
+ */
+export function normalizeCommentKeys(value) {
+    if (!Array.isArray(value)) {
+        return { ok: false, error: 'commentKeys must be an array' };
+    }
+    if (value.length > COMMENT_KEY_MAX_ENTRIES) {
+        return {
+            ok: false,
+            error: `commentKeys has more than ${COMMENT_KEY_MAX_ENTRIES} entries`,
+        };
+    }
+    const keys = [];
+    for (const entry of value) {
+        const result = validateCommentKey(entry);
+        if (!result.ok)
+            return result;
+        keys.push(result.key);
+    }
+    return { ok: true, selective: true, keys };
+}
+/** Explicit revision maps must never degrade to an unversioned or full-page clear. */
+export function normalizeCommentRevisions(value, keys) {
+    if (!keys || !value || typeof value !== 'object' || Array.isArray(value)) {
+        return { ok: false, error: 'commentRevisions requires a commentKeys array and a revision map' };
+    }
+    const entries = Object.entries(value);
+    const allowed = new Set(keys);
+    if (entries.length > COMMENT_KEY_MAX_ENTRIES ||
+        entries.some(([key, revision]) => !allowed.has(key) || !Number.isSafeInteger(revision) || revision <= 0)) {
+        return {
+            ok: false,
+            error: 'commentRevisions must contain positive safe integers for listed keys',
+        };
+    }
+    return { ok: true, revisions: Object.fromEntries(entries) };
 }
 function asStringRecord(value) {
     const record = asRecord(value);
@@ -205,6 +314,9 @@ export function normalizeCommentPayload(value) {
     if (!commentId || !feedback)
         return null;
     const domCandidates = normalizeDomCandidates(payload.domCandidates);
+    const styleChanges = normalizeCommentStyleChanges(payload.styleChanges);
+    const commentKeyRaw = asString(payload.commentKey).slice(0, 200);
+    const commentKey = commentKeyRaw ? commentKeyRaw : null;
     return {
         selectionMode: normalizeCommentSelectionMode(payload.selectionMode),
         selector: asString(payload.selector).slice(0, 1000),
@@ -224,8 +336,15 @@ export function normalizeCommentPayload(value) {
         pageUrl: asString(payload.pageUrl, 'about:blank').slice(0, 4000),
         targetPath: asString(payload.targetPath).slice(0, 2000),
         commentId,
+        ...(commentKey ? { commentKey } : {}),
+        ...(typeof payload.commentRevision === 'number' &&
+            Number.isSafeInteger(payload.commentRevision) &&
+            payload.commentRevision > 0
+            ? { commentRevision: payload.commentRevision }
+            : {}),
         feedback,
         ...(domCandidates.length > 0 ? { domCandidates } : {}),
+        ...(styleChanges.length > 0 ? { styleChanges } : {}),
     };
 }
 export function agentElementPriority(element) {

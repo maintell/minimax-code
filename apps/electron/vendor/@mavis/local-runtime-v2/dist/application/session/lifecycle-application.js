@@ -8,7 +8,7 @@ import { publishBestEffort } from '../events.js';
 import { countApplicationMetric } from './metrics.js';
 import { toSessionInfoView } from './wire.js';
 const ARCHIVE_PLUGIN_HOOK_FOREGROUND_BUDGET_MS = 5_000;
-function publishModelUpdated(publish, session) {
+function publishModelUpdated(publish, session, replacedFrom) {
     const model = toSessionInfoView(session).model;
     if (!model?.providerId || !model.modelId)
         return;
@@ -23,6 +23,7 @@ function publishModelUpdated(publish, session) {
             ...(model.thinking?.effort !== undefined
                 ? { thinking: { effort: model.thinking.effort } }
                 : {}),
+            ...(replacedFrom ? { replacedFrom } : {}),
         },
     });
 }
@@ -72,7 +73,7 @@ export class SessionLifecycleEventProjector {
                 });
                 break;
             case 'model-updated':
-                publishModelUpdated(this.options.publish, fact.session);
+                publishModelUpdated(this.options.publish, fact.session, fact.replacedFrom);
                 break;
             case 'interaction-mode-updated':
                 publishBestEffort(this.options.publish, {
@@ -86,7 +87,7 @@ export class SessionLifecycleEventProjector {
             case 'deleted':
                 publishBestEffort(this.options.publish, {
                     type: 'session.deleted',
-                    payload: { sessionId: fact.sessionId },
+                    payload: { sessionId: fact.sessionId, previousMainSessionId: fact.previousMainSessionId },
                 });
                 break;
             case 'archive-changed':

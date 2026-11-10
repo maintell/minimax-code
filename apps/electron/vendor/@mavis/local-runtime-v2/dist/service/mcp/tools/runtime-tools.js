@@ -15,6 +15,7 @@ export async function listMcpRuntimeToolEntriesForTurn(input) {
         const ctx = {
             sessionId: input.sessionId,
             workspaceRoot: input.workspaceRoot,
+            ...(input.turnId ? { turnId: input.turnId } : {}),
             ...(input.authContext ? { authContext: input.authContext } : {}),
             ...(input.routingContextGetter ? { routingContext: input.routingContextGetter() } : {}),
         };

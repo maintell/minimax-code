@@ -14,6 +14,8 @@ import { windowManager } from "../windows/manager";
 import { isNativeUpdateReady, hasUpdateReady, isAutoUpdateEnabled, getDownloadedFilePath, resetUpdateCache, setUpdateStatus, getUpdateStatus, getCachedUpdateInfo, setUserTriggeredCheck, getCachedProgress, setAutoUpdateEnabled, initUpdater } from "../modules/updater";
 import { isPendingUpdateCheck, checkPendingUpdate } from "../modules/updater/pending-check";
 import { triggerNativeUpdaterFetch, isNativeUpdaterFetchInFlight } from "../modules/updater/native-fetch";
+import { isTestBranchUpdateBuild, readTestBuild, isNewerTestBuild } from "../modules/updater/test-branch";
+import { isSwitchingTestBranch, getTestBranchInfo, queryTestBranch, testBranchErrorCode, switchTestBranch } from "../modules/updater/test-branch-switch";
 const logger = getCategoryLogger('update');
 /**
  * 轮询等待 macOS Squirrel.Mac 原生更新就绪。
@@ -38,9 +40,18 @@ function waitForNativeReady(timeoutMs) {
         }, POLL_MS);
     });
 }
+/** 已有待安装包时，远端候选是否更新：普通 test 包比较分支构建开始时间，其他包比较版本号。 */
+function isNewerThanPending(remote, pending) {
+    const remoteBuild = isTestBranchUpdateBuild() ? readTestBuild(remote) : null;
+    const pendingBuild = remoteBuild ? readTestBuild(pending) : null;
+    return remoteBuild && pendingBuild
+        ? isNewerTestBuild(remoteBuild, pendingBuild)
+        : isVersionLower(pending?.version, remote.version);
+}
 /** Resolve the normal application-quit plan without claiming lifecycle ownership. */
 export function resolveNormalUpdatePlan() {
-    if (!hasUpdateReady() || !isAutoUpdateEnabled())
+    // 切换测试分支未完成时，普通退出不安装目标分支的包。
+    if (!hasUpdateReady() || !isAutoUpdateEnabled() || isSwitchingTestBranch())
         return { kind: 'exit', code: 0 };
     const installerPath = getDownloadedFilePath();
     if (installerPath && !fs.existsSync(installerPath)) {
@@ -119,6 +130,14 @@ function setupUpdaterIPCHandlers(options) {
         if (isDev) {
             return { success: true, status: 'not-available' };
         }
+        // 切换测试分支期间由切换流程独占更新器。
+        if (isSwitchingTestBranch()) {
+            return {
+                success: true,
+                status: getUpdateStatus(),
+                updateInfo: getCachedUpdateInfo() || undefined,
+            };
+        }
         const userTriggered = options?.userTriggered ?? true;
         const currentStatus = getUpdateStatus();
         const cachedInfo = getCachedUpdateInfo();
@@ -174,7 +193,7 @@ function setupUpdaterIPCHandlers(options) {
                     !isNativeUpdaterFetchInFlight() &&
                     result?.isUpdateAvailable &&
                     latestVersion &&
-                    isVersionLower(cachedInfo?.version, latestVersion)) {
+                    isNewerThanPending(result.updateInfo, cachedInfo)) {
                     // 必须在启动下载前清理，避免覆盖快速完成的下载事件。
                     resetUpdateCache();
                     autoUpdater.emit('update-available', result.updateInfo);
@@ -255,6 +274,8 @@ function setupUpdaterIPCHandlers(options) {
     ipcMain.handle(IPC_CHANNELS.UPDATER_DOWNLOAD, async () => {
         if (isDev)
             return { success: false, error: 'dev mode' };
+        if (isSwitchingTestBranch())
+            return { success: false, error: 'TEST_BRANCH_BUSY' };
         logger.info('[Updater] 用户触发下载更新');
         try {
             await autoUpdater.downloadUpdate();
@@ -267,7 +288,7 @@ function setupUpdaterIPCHandlers(options) {
         }
     });
     // 安装更新并重启
-    ipcMain.handle(IPC_CHANNELS.UPDATER_INSTALL, async () => {
+    const requestInstall = async () => {
         if (isDev)
             return { success: false, error: 'dev mode' };
         if (!options.requestQuit) {
@@ -299,6 +320,27 @@ function setupUpdaterIPCHandlers(options) {
         }
         logger.info('[Updater] installer terminal action dispatched by lifecycle coordinator');
         return { success: true };
+    };
+    ipcMain.handle(IPC_CHANNELS.UPDATER_INSTALL, async () => isSwitchingTestBranch() ? { success: false, error: 'TEST_BRANCH_BUSY' } : requestInstall());
+    // 普通 test 包：查看当前分支、查询目标分支、确认切换（下载后走同一安装流程）
+    ipcMain.handle(IPC_CHANNELS.UPDATER_BRANCH_INFO, () => getTestBranchInfo());
+    ipcMain.handle(IPC_CHANNELS.UPDATER_BRANCH_QUERY, async (_event, branch) => {
+        try {
+            return { success: true, target: await queryTestBranch(branch) };
+        }
+        catch (error) {
+            return { success: false, error: testBranchErrorCode(error) };
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.UPDATER_BRANCH_SWITCH, async (_event, branch) => {
+        if (isDev || windowManager.isAppQuitting())
+            return { success: false, error: 'TEST_BRANCH_BUSY' };
+        try {
+            return await switchTestBranch(branch, requestInstall);
+        }
+        catch (error) {
+            return { success: false, error: testBranchErrorCode(error) };
+        }
     });
     // 设置是否自动安装更新（由渲染进程从 Apollo agentConfig 推送）
     ipcMain.handle(IPC_CHANNELS.UPDATER_SET_AUTO_UPDATE, (_event, enabled) => {

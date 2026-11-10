@@ -1,5 +1,13 @@
 import { Type } from '@sinclair/typebox';
 import { defineRuntimeTool } from '@mavis/agent-core/tools';
+/**
+ * Last sentence of both tool_search descriptions on a PTC Turn. There the
+ * hidden tools are run_code children: mcp_invoke does not route them, so the
+ * mcp_invoke sentence would send the model into a rejected call. A name such
+ * as `mcp__context7__resolve-library-id` is not a JS identifier, hence the
+ * bracket form.
+ */
+export const TOOL_SEARCH_PTC_CALL_SENTENCE = 'Then call the chosen tool inside run_code like any other tool: await tools.<name>(args), or await tools["<name>"](args) when the name contains characters such as "-".';
 export function createToolSearchTool(index, opts) {
     const schema = Type.Object({
         query: Type.Optional(Type.String({
@@ -20,9 +28,13 @@ export function createToolSearchTool(index, opts) {
     });
     return defineRuntimeTool({
         name: 'tool_search',
-        description: 'Discover additional integration tools provided by configured MCP servers that are NOT listed in your tools. ' +
-            'Search by keyword `query` and/or `regex`; returns the full definitions (name, description, input_schema) of the top matches. ' +
-            'Then call `mcp_invoke` with the chosen tool_name and arguments to use one.',
+        description: [
+            'Discover additional integration tools provided by configured MCP servers that are NOT listed in your tools.',
+            'Search by keyword `query` and/or `regex`; returns the full definitions (name, description, input_schema) of the top matches.',
+            opts.ptc
+                ? TOOL_SEARCH_PTC_CALL_SENTENCE
+                : 'Then call `mcp_invoke` with the chosen tool_name and arguments to use one.',
+        ].join(' '),
         schema,
         execute: async (_ctx, input) => {
             if (!input.query?.trim() && !input.regex?.trim())

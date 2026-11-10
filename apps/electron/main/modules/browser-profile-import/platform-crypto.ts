@@ -5,8 +5,14 @@ const MAX_SECRET_OUTPUT_BYTES = 1024 * 1024;
 const MAX_LOCAL_STATE_BYTES = 16 * 1024 * 1024;
 const MAC_KEYCHAIN_TIMEOUT_MS = 120000;
 const WINDOWS_DPAPI_TIMEOUT_MS = 15000;
+// Windows PowerShell 5.1 runs on .NET Framework, where ProtectedData lives in
+// System.Security.dll and is not loaded by default. Without this line the type
+// does not resolve, the script exits non-zero, and the helper's stderr is
+// discarded, so the failure surfaces only as "DPAPI helper failed with exit
+// code 1" with nothing to say it was a missing assembly.
 const WINDOWS_DPAPI_SCRIPT = `
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
 $inputText = [Console]::In.ReadToEnd()
 $encrypted = [Convert]::FromBase64String($inputText)
 $decrypted = [Security.Cryptography.ProtectedData]::Unprotect(

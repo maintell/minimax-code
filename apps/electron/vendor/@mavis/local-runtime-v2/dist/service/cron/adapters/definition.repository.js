@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, isNull, isNotNull, lt, or, sql } from 'drizzle-orm';
 import { cronDefinitions } from '../../../infra/db/schema/cron.js';
+import { normalizeAbsolutePath } from '../../session-system/index.js';
 import { CronRepositoryError } from '../errors.js';
 import {} from '../contracts.js';
 export class SqliteCronDefinitionRepository {
@@ -29,7 +30,7 @@ export class SqliteCronDefinitionRepository {
                 prompt,
                 sessionTargetMode: storedTarget.mode,
                 targetSessionId: storedTarget.sessionId,
-                project: optionalText(input.project),
+                project: optionalProject(input.project),
                 model: optionalText(input.model),
                 revision: 0,
                 deletedAtMs: null,
@@ -197,7 +198,7 @@ function definitionUpdateValues(current, patch, nowMs) {
         sessionTargetMode: storedTarget.mode,
         targetSessionId: storedTarget.sessionId,
         model: patch.model === undefined ? current.model : optionalText(patch.model),
-        project: patch.project === undefined ? current.project : optionalText(patch.project),
+        project: patch.project === undefined ? current.project : optionalProject(patch.project),
         revision: sql `${cronDefinitions.revision} + 1`,
         updatedAtMs: nowMs,
     };
@@ -254,6 +255,13 @@ function optionalText(value) {
         return null;
     return value.trim();
 }
+function optionalProject(value) {
+    const project = optionalText(value);
+    if (project !== null && !normalizeAbsolutePath(project)) {
+        invalid('Cron project must be an absolute workspace path');
+    }
+    return project;
+}
 export function text(value, field) {
     if (value.trim().length === 0)
         invalid(`${field} must be non-empty`);
@@ -285,6 +293,7 @@ export function listCronTargetSessionIds(db) {
         .from(cronDefinitions)
         .where(and(isNull(cronDefinitions.deletedAtMs), isNotNull(cronDefinitions.targetSessionId)))
         .all()
-        .map((row) => row.id);
+        .map((row) => row.id)
+        .filter((id) => id !== null);
 }
 //# sourceMappingURL=definition.repository.js.map

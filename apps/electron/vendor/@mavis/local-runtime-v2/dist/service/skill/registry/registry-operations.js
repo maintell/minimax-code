@@ -1,12 +1,12 @@
 import { readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { renderLocalSkillsCatalogResult, } from '@mavis/context-manager';
 import { SkillRegistry } from '@mavis/skills';
 import {} from '@mavis/thrift-gen/generated/desktop-service/types';
 import { resolveDataDirVariables } from '@mavis/shared/data-dir-variables';
 import { getBuiltinAgentsDirCandidates } from '../assets/builtin.js';
 import { normalizeLimit, normalizeOptionalNumber, parseCursor, toSkillInfo, } from './registry-views.js';
-import { renderLocalSkillsCatalogResult, } from './catalog.js';
 import { ambiguousLegacyLocations, ambiguousLegacySkillNames, ambiguousSkillNameError, filterInjectableRegistrySkills, filterSkillsVisibleToAgent, getManagementEntries, isSkillAllowedByBetaFlags, isVisibleLocalSkill, LocalSkillResolutionError, readShippedBuiltinSkillNames, } from './registry-family.js';
 export function listRegistrySkillSummaries(registry, options) {
     const offset = parseCursor(options.cursor);

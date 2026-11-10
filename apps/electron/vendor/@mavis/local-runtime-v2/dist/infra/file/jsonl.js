@@ -3,8 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { link, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
-const RENAME_RETRY_DELAYS_MS = [50, 100, 150];
-const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+import { logger } from '../logging/logger.js';
+// Windows reports a handle held by another process (scanner, indexer, backup) as one of these
+// codes; the holder usually lets go within a second, so wait about 1.5s in total before failing.
+const FILE_LOCK_RETRY_DELAYS_MS = [50, 100, 200, 400, 800];
+const TRANSIENT_FILE_LOCK_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 export class JsonlAppendCommitUncertainError extends Error {
     filePath;
     cause;
@@ -15,12 +18,11 @@ export class JsonlAppendCommitUncertainError extends Error {
         this.cause = cause;
     }
 }
-export async function readJsonl(filePath, decode, onMalformedLine, 
-/** Strict private reads return immutable arrays when a cache is supplied. */
-readCache) {
-    // Tolerant readers must still report every malformed line on every read.
-    if (readCache && !onMalformedLine)
-        return readCachedJsonl(filePath, decode, readCache);
+const JSONL_PREFIX_SAMPLE_BYTES = 4 * 1024;
+export function createJsonlReadCache() {
+    return { records: [], size: 0 };
+}
+export async function readJsonl(filePath, decode, onMalformedLine) {
     const contents = await readFile(filePath, 'utf-8');
     const records = [];
     const lines = contents.split('\n');
@@ -41,47 +43,113 @@ readCache) {
     }
     return records;
 }
-async function readCachedJsonl(filePath, decode, cache) {
-    // Always read fresh bytes: timestamps and file size cannot prove an unchanged
-    // prefix. Compare before decoding to avoid allocating a whole-history string.
-    const bytes = await readFile(filePath);
-    if (bytes.equals(cache.bytes))
-        return cache.records;
-    const reuse = canReusePrefix(bytes, cache.bytes);
-    const records = reuse ? [...cache.records] : [];
-    let offset = reuse ? cache.bytes.length : 0;
-    const limit = 4 * 1024 * 1024;
-    let retainedEnd = offset;
-    let retainedRecords = records.length;
-    while (offset < bytes.length) {
-        const newline = bytes.indexOf(10, offset);
-        const end = newline === -1 ? bytes.length : newline;
-        // Decode each line separately so values cannot retain whole-file strings.
-        records.push(decodeCachedLine(bytes.toString('utf8', offset, end), decode, {
-            path: filePath,
-            lineNo: records.length + 1,
-        }));
-        offset = newline === -1 ? bytes.length : newline + 1;
-        if (newline !== -1 && offset <= limit) {
-            retainedEnd = offset;
-            retainedRecords = records.length;
-        }
+/**
+ * Strict read that decodes only bytes appended since the cached read. The cached prefix is
+ * reused when the file identity matches, the file did not shrink, an unchanged size keeps its
+ * mtime, and the first and last bytes of the prefix still match; otherwise the whole file is
+ * decoded again. The caller must serialize reads and writes of one file.
+ */
+export async function readJsonlIncrementally(filePath, decode, cache) {
+    const handle = await open(filePath, 'r');
+    try {
+        const info = await handle.stat();
+        const reused = await canReuseCachedPrefix(handle, info, cache);
+        const start = reused ? cache.size : 0;
+        const bytes = await readFileRange(handle, start, Math.max(0, info.size - start));
+        return decodeIncrement({ filePath, decode, cache, info }, { reused, start, bytes });
     }
-    if (bytes.length <= limit) {
-        cache.bytes = bytes;
-        cache.records = Object.freeze(records);
+    finally {
+        await handle.close();
     }
-    else {
-        // Copy the bounded prefix so it cannot retain the entire file's buffer.
-        cache.bytes = Buffer.from(bytes.subarray(0, retainedEnd));
-        cache.records = Object.freeze(records.slice(0, retainedRecords));
-    }
-    return Object.freeze(records);
 }
-function canReusePrefix(bytes, prefix) {
-    return (prefix.at(-1) === 10 &&
-        bytes.length >= prefix.length &&
-        bytes.subarray(0, prefix.length).equals(prefix));
+async function canReuseCachedPrefix(handle, info, cache) {
+    const identity = cache.identity;
+    if (!identity || cache.size === 0)
+        return false;
+    if (info.dev !== identity.dev || info.ino !== identity.ino || info.size < cache.size)
+        return false;
+    if (info.size === cache.size && info.mtimeMs !== identity.mtimeMs)
+        return false;
+    const head = await readFileRange(handle, 0, identity.head.length);
+    if (!head.equals(identity.head))
+        return false;
+    const tail = await readFileRange(handle, cache.size - identity.tail.length, identity.tail.length);
+    return tail.equals(identity.tail);
+}
+function decodeIncrement(target, read) {
+    const { cache } = target;
+    const previous = read.reused ? cache.records : [];
+    const completeEnd = read.bytes.lastIndexOf(10) + 1;
+    const decoded = decodeLines(target, read.bytes.subarray(0, completeEnd), previous.length);
+    const cached = decoded.length === 0 ? previous : Object.freeze([...previous, ...decoded]);
+    if (completeEnd > 0 || !read.reused) {
+        rememberCachedPrefix(target, {
+            records: cached,
+            previousIdentity: read.reused ? cache.identity : undefined,
+            covered: read.bytes.subarray(0, completeEnd),
+            size: read.start + completeEnd,
+        });
+    }
+    if (completeEnd === read.bytes.length) {
+        return { records: cached, reusedCount: previous.length, cachedCount: cached.length };
+    }
+    const trailing = decodeCachedLine(read.bytes.toString('utf8', completeEnd), target.decode, {
+        path: target.filePath,
+        lineNo: cached.length + 1,
+    });
+    return {
+        records: Object.freeze([...cached, trailing]),
+        reusedCount: previous.length,
+        cachedCount: cached.length,
+    };
+}
+function decodeLines(target, bytes, lineOffset) {
+    const records = [];
+    let offset = 0;
+    while (offset < bytes.length) {
+        const end = bytes.indexOf(10, offset);
+        // Decode each line separately so values cannot retain whole-file strings. On real histories
+        // the decoded records then take about 1.1x the file bytes; decoding the whole file as one
+        // string and splitting it measured about 3x.
+        records.push(decodeCachedLine(bytes.toString('utf8', offset, end), target.decode, {
+            path: target.filePath,
+            lineNo: lineOffset + records.length + 1,
+        }));
+        offset = end + 1;
+    }
+    return records;
+}
+function rememberCachedPrefix(target, prefix) {
+    const previousHead = prefix.previousIdentity?.head ?? Buffer.alloc(0);
+    const previousTail = prefix.previousIdentity?.tail ?? Buffer.alloc(0);
+    target.cache.records = prefix.records;
+    target.cache.size = prefix.size;
+    target.cache.identity = {
+        dev: target.info.dev,
+        ino: target.info.ino,
+        mtimeMs: target.info.mtimeMs,
+        // Copy the samples so the cache never retains the read buffer.
+        // Concatenate at most one sample of new bytes so a full read is never copied whole.
+        head: Buffer.concat([
+            previousHead,
+            prefix.covered.subarray(0, JSONL_PREFIX_SAMPLE_BYTES - previousHead.length),
+        ]),
+        tail: Buffer.concat([
+            previousTail,
+            prefix.covered.subarray(-JSONL_PREFIX_SAMPLE_BYTES),
+        ]).subarray(-JSONL_PREFIX_SAMPLE_BYTES),
+    };
+}
+async function readFileRange(handle, position, length) {
+    const contents = Buffer.alloc(length);
+    let offset = 0;
+    while (offset < length) {
+        const { bytesRead } = await handle.read(contents, offset, length - offset, position + offset);
+        if (bytesRead === 0)
+            break;
+        offset += bytesRead;
+    }
+    return offset === length ? contents : contents.subarray(0, offset);
 }
 function decodeCachedLine(line, decode, location) {
     try {
@@ -358,7 +426,8 @@ function jsonSerializationError(reason) {
 async function openExistingAppendTarget(filePath) {
     try {
         // String append flags include O_CREAT; numeric flags let an absent target take the staged path.
-        return await open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND);
+        // Nothing has been written yet, so waiting out a held target cannot duplicate records.
+        return await withFileLockRetries('append-open', filePath, () => open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND));
     }
     catch (error) {
         if (hasErrorCode(error, 'ENOENT'))
@@ -491,23 +560,56 @@ function hasErrorCode(error, code) {
     return (typeof error === 'object' && error !== null && error.code === code);
 }
 async function renameWithRetries(temporaryPath, filePath) {
-    for (let attempt = 0;; attempt += 1) {
+    await withFileLockRetries('rename', filePath, () => rename(temporaryPath, filePath));
+}
+async function withFileLockRetries(operation, filePath, run) {
+    let waitedMs = 0;
+    let lockCode;
+    for (let attempt = 1;; attempt += 1) {
+        const retry = (outcome, code) => ({
+            operation,
+            filePath,
+            code,
+            attempts: attempt,
+            waitedMs,
+            outcome,
+        });
         try {
-            await rename(temporaryPath, filePath);
-            return;
+            const result = await run();
+            logFileLockRetry(retry('recovered', lockCode));
+            return result;
         }
         catch (error) {
-            const delayMs = RENAME_RETRY_DELAYS_MS[attempt];
-            if (!isTransientRenameError(error) || delayMs === undefined)
+            const code = transientFileLockCode(error);
+            const delayMs = code === undefined ? undefined : FILE_LOCK_RETRY_DELAYS_MS[attempt - 1];
+            if (delayMs === undefined) {
+                logFileLockRetry(retry(code ? 'exhausted' : 'failed', code ?? lockCode));
                 throw error;
+            }
+            lockCode = code;
             await sleep(delayMs);
+            waitedMs += delayMs;
         }
     }
 }
-function isTransientRenameError(error) {
-    return (typeof error === 'object' &&
-        error !== null &&
-        TRANSIENT_RENAME_CODES.has(error.code ?? ''));
+function transientFileLockCode(error) {
+    if (typeof error !== 'object' || error === null)
+        return undefined;
+    const code = error.code;
+    return code !== undefined && TRANSIENT_FILE_LOCK_CODES.has(code) ? code : undefined;
+}
+/** Logs one line per wait; an operation that never met a lock logs nothing. */
+function logFileLockRetry(retry) {
+    if (retry.code === undefined)
+        return;
+    logger.warn({
+        operation: retry.operation,
+        code: retry.code,
+        attempts: retry.attempts,
+        waited_ms: retry.waitedMs,
+        outcome: retry.outcome,
+        file: basename(retry.filePath),
+    }, '[jsonl] file held by another process');
 }
 async function sleep(delayMs) {
     await new Promise((resolve) => {

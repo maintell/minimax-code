@@ -1,22 +1,74 @@
+export function createSessionHistoryCompactionBarrier() {
+    const lane = createSessionHistoryIoLane();
+    const active = new Map();
+    return {
+        async begin(sessionId, attemptId, turnId) {
+            const release = await lane.acquire(sessionId);
+            active.set(sessionId, { attemptId, turnId, release });
+        },
+        end: (sessionId, attemptId) => {
+            const entry = active.get(sessionId);
+            if (entry?.attemptId !== attemptId)
+                return;
+            active.delete(sessionId);
+            entry.release();
+        },
+        endTurn: (sessionId, turnId) => {
+            const entry = active.get(sessionId);
+            if (entry?.turnId !== turnId)
+                return;
+            active.delete(sessionId);
+            entry.release();
+        },
+        async run(sessionId, capture, signal) {
+            if (!signal)
+                return lane.run(sessionId, capture);
+            signal.throwIfAborted();
+            let aborted;
+            const cancelled = new Promise((_resolve, reject) => {
+                aborted = () => reject(signal.reason);
+                signal.addEventListener('abort', aborted, { once: true });
+            });
+            const pending = lane.run(sessionId, async () => {
+                signal.removeEventListener('abort', aborted);
+                signal.throwIfAborted();
+                return capture();
+            });
+            try {
+                return await Promise.race([pending, cancelled]);
+            }
+            finally {
+                signal.removeEventListener('abort', aborted);
+            }
+        },
+    };
+}
 /** Serializes physical history I/O shared by the canonical provider and mutation adapter. */
 export function createSessionHistoryIoLane() {
     const lanes = new Map();
+    async function acquire(sessionId) {
+        const previous = lanes.get(sessionId) ?? Promise.resolve();
+        let release;
+        const current = new Promise((resolve) => {
+            release = resolve;
+        });
+        lanes.set(sessionId, current);
+        await previous;
+        return () => {
+            release();
+            if (lanes.get(sessionId) === current)
+                lanes.delete(sessionId);
+        };
+    }
     return {
+        acquire,
         async run(sessionId, operation) {
-            const previous = lanes.get(sessionId) ?? Promise.resolve();
-            let release;
-            const current = new Promise((resolve) => {
-                release = resolve;
-            });
-            lanes.set(sessionId, current);
+            const release = await acquire(sessionId);
             try {
-                await previous;
                 return await operation();
             }
             finally {
                 release();
-                if (lanes.get(sessionId) === current)
-                    lanes.delete(sessionId);
             }
         },
     };

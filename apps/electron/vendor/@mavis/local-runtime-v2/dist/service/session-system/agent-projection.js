@@ -1,5 +1,10 @@
 import { CONTEXT_USAGE_COMPONENT_KINDS, RuntimeEventStatus, RuntimeStopReasonType, RuntimeEventType, } from '@mavis/agent-core/protocol';
 import { RespDataType, Role } from '@mavis/agent-core/protocol/agent-message';
+import { projectCanonicalAssistantBoundaries, } from './messages/query/canonical-assistant-boundaries.js';
+import { mergePtcDisplayToolCalls, ptcToolCallDisplayMessage, } from './messages/ptc/display-tool-calls.js';
+import { projectPtcSafetyDisplay } from './messages/ptc/safety-reconcile.js';
+import { describeRetractedInput } from './messages/retracted-input.js';
+import { refreshToolCallModeAfterCompaction, } from './sessions/support/tool-call-mode.js';
 export function createSessionSystemAgentProjection(options) {
     const compactionLane = createCompactionProjectionLane();
     const startedCompactions = new Map();
@@ -17,14 +22,15 @@ export function createSessionSystemAgentProjection(options) {
         },
         messages: {
             projectRuntimeEvent: async (input) => {
-                const message = displayMessage(input.event);
+                const message = displayMessage(input.event) ?? ptcToolCallDisplayMessage(streamResponseData(input.event));
                 if (message && !isTerminalAssistantDisplayError(message)) {
                     const queryKey = await queryKeyForTurn(options, input.context);
+                    const merged = await mergePtcDisplayToolCalls(options.messages, input.context.sessionId, message);
                     await options.messages.upsert({
                         sessionId: input.context.sessionId,
                         turnId: input.context.turnId,
                         message: {
-                            ...message,
+                            ...merged,
                             turn_id: input.context.turnId,
                             ...(queryKey ? { query_key: queryKey } : {}),
                         },
@@ -33,10 +39,11 @@ export function createSessionSystemAgentProjection(options) {
                             ? { sourceContext: input.context.provenance.sourceContext }
                             : {}),
                     }, 
-                    // Complete tool messages describe work already executed, including
-                    // abort cleanup. Persist these facts within the write-lock budget
-                    // even when the lease is cancelled; text-only waits may stop early.
-                    message.tool_calls?.length ? undefined : { signal: input.signal });
+                    // Tool results and approved abort partials are cleanup facts. Persist
+                    // them within the write-lock budget even when the lease is cancelled.
+                    merged.tool_calls?.length || merged.finish_reason === 'aborted'
+                        ? undefined
+                        : { signal: input.signal });
                 }
                 await projectQueryCollapse(() => options.queryCollapse?.projectRuntimeEvent(input));
             },
@@ -124,11 +131,26 @@ export function createSessionSystemAgentProjection(options) {
             completeCommittedHistory: (input) => compactionLane.run(input.attemptId, async () => {
                 await writeCompactionFact(options, input, 'compaction');
                 recordCompletedCompactionMetrics(options, input, startedCompactions.get(input.attemptId));
+                // Reached only after AgentHost durably committed the replacement history (automatic
+                // and manual alike); failed, skipped or deferred compactions never get here. The mode
+                // follows the switch only when the method is a summary (`llm_checkpoint`).
+                await refreshToolCallModeAfterCompaction(options.toolCallMode, input.context.sessionId, readCompactionMethod(input.metadata));
             }),
             failCommittedHistory: (input) => compactionLane.run(input.attemptId, () => writeCompactionFact(options, input, 'compaction_failed')),
         },
         compactionObserver: {
             observe: (input) => compactionLane.run(input.attemptId, async () => {
+                // Manual compaction never settles Session state; mark it idle before its start is shown.
+                if (input.status === 'started' && input.reason === 'manual') {
+                    const { sessionId, turnId, turnSequence } = input.context;
+                    const eventId = `compaction:${input.attemptId}:started`;
+                    try {
+                        await options.state.markIdle({ sessionId, turnId, turnSequence, eventId });
+                    }
+                    catch {
+                        // Best-effort like this observation path (no logger here); never block the display.
+                    }
+                }
                 await projectCompactionObservation(options, startedCompactions, input);
             }),
         },
@@ -145,59 +167,6 @@ async function terminalConversationActions(options, context) {
         // Transient action projection must never suppress the durable terminal boundary.
         return [];
     }
-}
-async function projectCanonicalAssistantBoundaries(options, input) {
-    const canonicalMessageIds = canonicalAssistantMessageIds(input.change);
-    if (canonicalMessageIds.length === 0)
-        return;
-    try {
-        const displayMessages = await options.messages.listTurn(input.context.sessionId, input.context.turnId);
-        const assistants = displayMessages.filter(isCanonicalAssistantDisplayMessage);
-        if (assistants.length < canonicalMessageIds.length)
-            return;
-        const targets = assistants.slice(-canonicalMessageIds.length);
-        await Promise.all(targets.flatMap((message, index) => {
-            const canonicalMessageId = canonicalMessageIds[index];
-            return canonicalMessageId
-                ? [
-                    options.messages.upsert({
-                        sessionId: input.context.sessionId,
-                        turnId: input.context.turnId,
-                        message: {
-                            ...message,
-                            canonical_message_id: canonicalMessageId,
-                        },
-                    }),
-                ]
-                : [];
-        }));
-    }
-    catch {
-        // The canonical commit is authoritative. This Display-side Fork anchor is
-        // best-effort and old rows retain the next-User compatibility boundary.
-    }
-}
-function canonicalAssistantMessageIds(change) {
-    const messages = change.messages;
-    const identities = change.committedIdentityVector;
-    if (change.reason !== 'messageDelta' ||
-        !messages ||
-        !identities ||
-        identities.length < messages.length) {
-        return [];
-    }
-    const offset = identities.length - messages.length;
-    return messages.flatMap((message, index) => {
-        const identity = identities[offset + index];
-        return message.role === Role.Assistant && typeof identity === 'string' && identity.length > 0
-            ? [identity]
-            : [];
-    });
-}
-function isCanonicalAssistantDisplayMessage(message) {
-    return (message.role === Role.Assistant &&
-        !(typeof message.kind === 'string' && message.kind.length > 0) &&
-        !(typeof message.displayKind === 'string' && message.displayKind.length > 0));
 }
 async function recallAssistantAttempt(options, input) {
     const displayMessages = await options.messages.listTurn(input.sessionId, input.turnId);
@@ -233,11 +202,19 @@ async function recallAssistantAttempt(options, input) {
     });
 }
 async function projectCommittedConversation(options, input) {
+    if (input.change.operation.kind === 'safety-reconcile') {
+        await projectPtcSafetyDisplay(options.messages, options.stream, input.context);
+        return;
+    }
+    const slowNetworkRead = input.change.operation.slowNetworkRead
+        ? { slowNetworkRead: true }
+        : {};
     if (input.change.operation.kind === 'network-reconcile') {
         await options.conversationFacts.handle({
             kind: 'network-stopped',
             sessionId: input.context.sessionId,
             turnId: input.context.turnId,
+            ...slowNetworkRead,
         });
         return;
     }
@@ -245,9 +222,12 @@ async function projectCommittedConversation(options, input) {
         return;
     const displayMessages = await options.messages.listTurn(input.context.sessionId, input.context.turnId);
     const messageIds = displayMessages.flatMap((message) => typeof message.msg_id === 'string' && message.msg_id.length > 0 ? [message.msg_id] : []);
-    const lastUserMsgId = displayMessages.reduce((latest, message) => message.role === Role.User && typeof message.msg_id === 'string' && message.msg_id.length > 0
-        ? message.msg_id
+    const lastUser = displayMessages.reduce((latest, message) => message.role === Role.User && typeof message.msg_id === 'string' && message.msg_id.length > 0
+        ? message
         : latest, undefined);
+    const lastUserMsgId = lastUser?.msg_id;
+    const retractedInput = describeRetractedInput(lastUser);
+    const variant = input.change.operation.variant ?? 'content';
     await options.messages.rewind({
         sessionId: input.context.sessionId,
         messageIds,
@@ -257,14 +237,18 @@ async function projectCommittedConversation(options, input) {
         sessionId: input.context.sessionId,
         turnId: input.context.turnId,
         kind: 'messages-rewound',
-        data: { messageIds },
+        data: { messageIds, variant },
     });
     await options.conversationFacts.handle({
         kind: 'turn-retracted',
         sessionId: input.context.sessionId,
         turnId: input.context.turnId,
-        variant: input.change.operation.variant ?? 'content',
+        variant,
         ...(lastUserMsgId ? { lastUserMsgId } : {}),
+        // 界面收到撤回时这些消息行已经删了；还没加载这一轮的界面（比如从首页发起的目标）
+        // 只能用 `lastUserContent` 回填输入框。
+        ...retractedInput,
+        ...slowNetworkRead,
     });
 }
 async function projectCompactionObservation(options, startedCompactions, input) {
@@ -380,16 +364,20 @@ function terminalCompactionOutcome(input) {
         return input.status;
     return input.reason === 'internal-context-filter' ? 'filter_only' : 'below_trigger';
 }
+function readCompactionMethod(value) {
+    if (!isRecord(value))
+        return undefined;
+    return value.method === 'llm_checkpoint' ? 'llm_checkpoint' : undefined;
+}
 function readCompactionMetricMetadata(value) {
     if (!isRecord(value))
         return undefined;
     const phase = value.phase;
     if (phase !== 'initial' && phase !== 'iteration' && phase !== 'manual')
         return undefined;
-    const method = value.method;
-    if (method !== 'tool_archive' && method !== 'tool_trim' && method !== 'llm_checkpoint') {
+    const method = readCompactionMethod(value);
+    if (!method)
         return undefined;
-    }
     const counts = readCompactionMetricCounts(value);
     const tokenUsage = readCompactionTokenUsage(value.tokenUsage);
     return counts
@@ -398,7 +386,7 @@ function readCompactionMetricMetadata(value) {
             method,
             ...counts,
             ...compactionTokenUsageMetadata(tokenUsage),
-            hmidOverflowRecovered: method === 'llm_checkpoint' && Reflect.get(value, 'hmidOverflowRecovered') === true,
+            hmidOverflowRecovered: Reflect.get(value, 'hmidOverflowRecovered') === true,
         }
         : undefined;
 }

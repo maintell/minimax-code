@@ -1,5 +1,6 @@
 /** Versioned contracts shared by document preview hosts and renderers. */
 import { PPTX_PREVIEW_LIMITS_V1 } from './pptx-preview-limits.generated.js';
+import { normalizePptxErrorTraceV1 } from './pptx-telemetry.js';
 export { PPTX_PREVIEW_LIMITS_SCHEMA_V1, PPTX_PREVIEW_LIMITS_VERSION_V1, PPTX_PREVIEW_LIMITS_V1, } from './pptx-preview-limits.generated.js';
 /** Product-owned identity for the renderer that exposes PPTX as selectable DOM. */
 export const PPTX_DOM_BACKEND_ID_V1 = 'pptx-dom';
@@ -69,6 +70,8 @@ export function sanitizePptxRendererMessageV1(message) {
     void message;
     return 'PPTX DOM renderer failed';
 }
+/** Producer-owned snake_case sub-reason; it can never carry a path, message or document text. */
+export const PREVIEW_ERROR_DETAIL_V1 = /^[a-z][a-z0-9_]{0,63}$/u;
 const ARTIFACT_KINDS = new Set([
     'html-document.v1',
     'pdf.v1',
@@ -400,6 +403,12 @@ export function assertPreviewErrorV1(value) {
         fail('retryable must be boolean');
     if (v.backendId !== undefined && !isPreviewBackendIdV1(v.backendId))
         fail('invalid error backendId');
+    if (v.detail !== undefined &&
+        (typeof v.detail !== 'string' || !PREVIEW_ERROR_DETAIL_V1.test(v.detail)))
+        fail('invalid error detail');
+    if (v.trace !== undefined &&
+        (!Array.isArray(v.trace) || normalizePptxErrorTraceV1(v.trace)?.length !== v.trace.length))
+        fail('invalid error trace');
 }
 export function assertPreviewProgressEventV1(value) {
     const v = object(value, 'progress');
@@ -902,12 +911,17 @@ export function decodePreviewErrorV1(value) {
     const v = object(value, 'error');
     const code = canonicalPreviewErrorCode(v.code, 'error code');
     const backendId = v.backendId === undefined ? undefined : canonicalBackendId(v.backendId, 'error backendId');
+    const trace = normalizePptxErrorTraceV1(v.trace);
     const decoded = {
         schema: v.schema,
         code,
         message: canonicalPreviewDiagnostic(v.message, 'message', code, backendId),
         retryable: v.retryable,
         ...(backendId === undefined ? {} : { backendId }),
+        ...(typeof v.detail === 'string' && PREVIEW_ERROR_DETAIL_V1.test(v.detail)
+            ? { detail: v.detail }
+            : {}),
+        ...(trace ? { trace } : {}),
     };
     assertPreviewErrorV1(decoded);
     return decoded;

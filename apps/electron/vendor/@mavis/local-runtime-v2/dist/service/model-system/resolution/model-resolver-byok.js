@@ -1,6 +1,7 @@
 import { resolveProviderCredential, minimaxApiModels, getRuntimeRegion } from '@mavis/config';
 import { mergeProviderHeaders } from '../connectivity/provider-request.js';
-import { isModelProviderApi, MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID, } from '../identity.js';
+import { enabledApiKeys, resolveApiKeyValue } from '../byok-keys/key-list.js';
+import { isModelProviderApi, MINIMAX_API_PROVIDER_ID, MODEL_ACCESS_PROVIDER_KIND, } from '../identity.js';
 const BYOK_FALLBACK_MODEL_LIMITS = {
     contextWindow: 200_000,
     maxTokens: 16_384,
@@ -34,6 +35,7 @@ export function planMinimaxApiResolution(input) {
 }
 export function planCustomProviderResolution(input) {
     const config = input.byok?.custom_provider?.[input.providerKey];
+    assertNotUnboundExtensionProvider(config, input.provider);
     if (!config || config.enabled === false)
         return undefined;
     const modelConfig = config.models?.[input.modelId];
@@ -49,27 +51,66 @@ export function planCustomProviderResolution(input) {
         ...customProviderLimits(modelConfig),
         ...(configHeaders ? { configHeaders } : {}),
         ...(modelCompat ? { modelCompat } : {}),
+        ...(modelConfig.reasoning === true ? { thinkingCapable: true } : {}),
     };
+}
+/**
+ * Owned bindings are routed before this point. An extension entry reaching
+ * the BYOK planner has lost its binding: never route a stray stored key/URL.
+ */
+function assertNotUnboundExtensionProvider(config, provider) {
+    if (config?.kind !== MODEL_ACCESS_PROVIDER_KIND)
+        return;
+    throw new Error(`LocalModelResolver: extension provider "${provider}" has no current binding.`);
 }
 function resolveCustomProviderCredentials(config, input) {
     const authProvider = config.kind === 'oauth' || config.options?.authMode === 'oauth' ? input.providerKey : undefined;
-    const apiKey = resolveProviderCredential({
-        field: 'custom_provider options.apiKey',
-        provider: input.provider,
-        value: config.options?.apiKey,
-    });
+    const keys = authProvider ? [] : resolveEnabledApiKeys(config, input.provider);
+    const apiKey = keys[0]?.value ?? configuredApiKey(config, input.provider);
     if (!apiKey && !authProvider) {
         throw new Error(`LocalModelResolver: api_key not configured for provider "${input.provider}".`);
-    }
-    const baseUrl = config.options?.baseURL?.trim();
-    if (!baseUrl) {
-        throw new Error(`LocalModelResolver: base_url not configured for provider "${input.provider}".`);
     }
     return {
         ...(apiKey ? { apiKey } : {}),
         ...(authProvider ? { authProvider, runtimeProvider: authProvider } : {}),
-        baseUrl,
+        ...(keys.length > 1 ? { apiKeys: { providerKey: input.providerKey, keys } } : {}),
+        baseUrl: requireCustomProviderBaseUrl(config, input.provider),
     };
+}
+function requireCustomProviderBaseUrl(config, provider) {
+    const baseUrl = config.options?.baseURL?.trim();
+    if (!baseUrl) {
+        throw new Error(`LocalModelResolver: base_url not configured for provider "${provider}".`);
+    }
+    return baseUrl;
+}
+function configuredApiKey(config, provider) {
+    return resolveProviderCredential({
+        field: 'custom_provider options.apiKey',
+        provider,
+        value: config.options?.apiKey,
+    });
+}
+/**
+ * The enabled keys whose value resolves. A key whose `${VAR}` is unset is skipped while another
+ * resolves; when none does, the first error stands, as for a single key.
+ */
+function resolveEnabledApiKeys(config, provider) {
+    const keys = [];
+    let firstError;
+    for (const key of enabledApiKeys(config)) {
+        try {
+            const value = resolveApiKeyValue(key, provider)?.trim();
+            if (value)
+                keys.push({ id: key.id, value });
+        }
+        catch (error) {
+            firstError ??= error;
+        }
+    }
+    if (keys.length === 0 && firstError !== undefined)
+        throw firstError;
+    return keys;
 }
 function customProviderLimits(modelConfig) {
     return {
@@ -91,15 +132,6 @@ function resolveCustomProviderApi(value) {
         return value;
     }
     return 'anthropic-messages';
-}
-export function firstBuiltinModel(providerConfig) {
-    const preferredModelId = Object.keys(providerConfig?.[MANAGED_MINIMAX_PROVIDER_ID]?.models ?? {})[0];
-    if (preferredModelId)
-        return { provider: MANAGED_MINIMAX_PROVIDER_ID, modelId: preferredModelId };
-    return Object.entries(providerConfig ?? {}).flatMap(([provider, config]) => {
-        const modelId = Object.keys(config.models ?? {})[0];
-        return modelId ? [{ provider, modelId }] : [];
-    })[0];
 }
 export function readStringRecord(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value))

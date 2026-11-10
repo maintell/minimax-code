@@ -2,7 +2,7 @@ export function newHistory(turn, agent) {
     // Cursor into agent.state.messages. Initial history belongs to the caller
     // and must not be re-sent through onHistoryChangedHook.
     let lastSnapshotLength = turn.initialMessages.length;
-    let deliveryFailed = false;
+    let deliveryFailure;
     const notify = async (change) => {
         if (turn.hooks.onHistory.length === 0)
             return;
@@ -11,14 +11,14 @@ export function newHistory(turn, agent) {
         }
     };
     const deliver = async (change) => {
-        if (deliveryFailed)
-            return false;
+        if (deliveryFailure)
+            throw deliveryFailure;
         try {
             await notify(change);
             return true;
         }
         catch (err) {
-            deliveryFailed = true;
+            deliveryFailure = err instanceof Error ? err : new Error(String(err));
             turn.metrics.tryRecordTerminalFailure({
                 errorSource: 'history',
                 errorKind: 'persistence',
@@ -75,7 +75,7 @@ export function newHistory(turn, agent) {
                 lastSnapshotLength = messages.length;
         },
         async flushTail() {
-            if (deliveryFailed)
+            if (deliveryFailure)
                 return;
             const total = agent.state.messages.length;
             if (total <= lastSnapshotLength)

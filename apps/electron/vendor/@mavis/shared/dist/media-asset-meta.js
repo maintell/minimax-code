@@ -23,15 +23,23 @@ const IMAGE_EXTENSIONS = new Set([
     'bmp',
     'svg',
     'ico',
+    'tif',
+    'tiff',
     'avif',
 ]);
 /**
  * Image formats that the workspace file preview and Canvas surfaces can render.
  * Keep this narrower than `IMAGE_EXTENSIONS`: formats added here must be
- * supported by both the local Runtime media boundary and Chromium decoding.
+ * supported by the local Runtime media boundary and browser preview pipeline
+ * (TIFF uses a bounded worker conversion to PNG; AVIF relies on Chromium's
+ * native decoder).
  */
 export const WORKSPACE_IMAGE_PREVIEW_MIME_TYPES = {
+    avif: 'image/avif',
     bmp: 'image/bmp',
+    ico: 'image/x-icon',
+    tif: 'image/tiff',
+    tiff: 'image/tiff',
     gif: 'image/gif',
     jpg: 'image/jpeg',
     jpeg: 'image/jpeg',
@@ -49,6 +57,8 @@ export const MIME_BY_EXTENSION = {
     bmp: 'image/bmp',
     svg: 'image/svg+xml',
     ico: 'image/x-icon',
+    tif: 'image/tiff',
+    tiff: 'image/tiff',
     avif: 'image/avif',
     pdf: 'application/pdf',
     doc: 'application/msword',
@@ -80,6 +90,7 @@ export const MIME_BY_EXTENSION = {
     scss: 'text/x-scss',
     sql: 'application/sql',
     mp4: 'video/mp4',
+    m4v: 'video/x-m4v',
     webm: 'video/webm',
     mov: 'video/quicktime',
     mp3: 'audio/mpeg',
@@ -213,11 +224,11 @@ const KIND_IMAGE_EXTENSIONS = new Set([
     'heic',
 ]);
 const KIND_AUDIO_EXTENSIONS = new Set(['mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac', 'opus', 'silk']);
-const KIND_VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi']);
+const KIND_VIDEO_EXTENSIONS = new Set(['mp4', 'm4v', 'webm', 'mov', 'mkv', 'avi']);
 /** Semantic `type` tokens the agent emits that map to a non-file kind. */
 const IMAGE_TYPE_TOKENS = new Set(['image', 'img', 'photo']);
 const AUDIO_TYPE_TOKENS = new Set(['audio', 'voice', 'mp3']);
-const VIDEO_TYPE_TOKENS = new Set(['video', 'mp4', 'mov']);
+const VIDEO_TYPE_TOKENS = new Set(['video', 'mp4', 'm4v', 'mov']);
 /**
  * Derive the coarse outbound media kind, in precedence order:
  *

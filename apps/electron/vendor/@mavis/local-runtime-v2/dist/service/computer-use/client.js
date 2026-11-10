@@ -1,3 +1,7 @@
+import { withProgrammaticResult } from '@mavis/agent-core/tools';
+import { COMPUTER_ACTION_TOOLS, computerActionData } from './result/action-data.js';
+import { appListData, appListPage } from './result/app-list.js';
+import { computerObservationData } from './result/observation-data.js';
 /** Fail-closed client for sessions where the CUA utility is not connected. */
 export function createUnavailableComputerUseClient(reason = 'computer_unavailable') {
     return {
@@ -32,7 +36,10 @@ export function createComputerUsePortClient(input) {
             waiter.resolve(response.result);
         }
         else {
-            waiter.reject(new Error(response.error?.code ?? 'computer_driver_error'));
+            waiter.reject(Object.assign(new Error(response.error?.message ?? response.error?.code ?? 'computer_driver_error'), {
+                code: response.error?.code ?? 'computer_driver_error',
+                completion: response.error?.completion ?? 'unknown',
+            }));
         }
     });
     input.port.on('close', () => {
@@ -86,6 +93,7 @@ export function createComputerUsePortClient(input) {
                         requestId,
                         kind: request.kind,
                         sessionId: request.sessionId,
+                        ...(request.sessionTitle !== undefined ? { sessionTitle: request.sessionTitle } : {}),
                         ...(request.turnId ? { turnId: request.turnId } : {}),
                         generation: input.generation,
                         ...(request.leaseId ? { leaseId: request.leaseId } : {}),
@@ -114,34 +122,69 @@ export function createComputerUsePortClient(input) {
         },
     };
 }
-export function computerUseToolResult(name, value) {
+export function computerUseToolResult(name, value, input) {
     const record = isRecord(value) ? value : undefined;
     const unresolved = name === 'computer_app_state' && isUnresolvedWindow(record);
-    let text = computerUseResultText(name, value, record);
+    const view = hostAppListPage(name, record, input) ?? computerUseResultText(name, value, record);
+    let text = view.text;
     const content = [{ type: 'text', text }];
     const images = trustedResultImages(record, unresolved);
     for (const image of images) {
         const resolved = computerUseResultImage(image);
-        if (!resolved)
-            continue;
-        // Never inflate an oversized binary into the text field. The SDK normally
-        // returns bounded screenshots; this fallback keeps malformed/unsupported
-        // formats fail-closed while retaining ordinary image results.
-        if (resolved.data.length <= 7_000_000)
+        // Oversized screenshots are re-encoded after the call like every tool image;
+        // a request leaves out any image still above the per-image provider limit.
+        if (resolved)
             content.push({ type: 'image', ...resolved });
     }
     text = describeScreenshotAvailability(name, text, content);
     content[0] = { type: 'text', text };
+    return assembleComputerUseResult(name, record, { ...view, text, content, unresolved, input });
+}
+/** scope installed or all of computer_app_list: a host page replaces the native summary. */
+function hostAppListPage(name, record, input) {
+    if (name !== 'computer_app_list' || !record || record.isError === true)
+        return undefined;
+    const page = appListPage(parseStructuredRecord(record) ?? record, input);
+    return page && { ...page, menuOmitted: false, treeTruncated: false };
+}
+function assembleComputerUseResult(name, record, view) {
+    const { text, content, input } = view;
+    const failed = record?.isError === true || view.unresolved || view.failed === true;
     const result = {
         tool_name: name,
         text,
         content,
-        ...(record?.isError === true || unresolved ? { isError: true } : {}),
+        ...(failed ? { isError: true } : {}),
         ...(record?.structuredJson !== undefined
             ? { details: { structuredJson: record.structuredJson } }
             : {}),
     };
-    return result;
+    // PTC side channel only: the model, history and UI see the fields above.
+    // Omitting a large application menu is the one cut this tool makes.
+    return withProgrammaticResult(result, {
+        data: view.data ?? computerUseResultData(name, record, { ...view, failed, input }),
+        completeness: { truncated: view.menuOmitted },
+    });
+}
+function computerUseResultData(name, record, view) {
+    // A display list is a plain object; driver results carry structuredJson.
+    const structured = record ? (parseStructuredRecord(record) ?? record) : undefined;
+    if (COMPUTER_ACTION_TOOLS.has(name))
+        return computerActionData(name, structured);
+    if (name === 'computer_app_list') {
+        return appListData({ structured, failed: view.failed, input: view.input });
+    }
+    const image = view.content.find((item) => item.type === 'image');
+    return computerObservationData({
+        name,
+        ...(structured ? { structured } : {}),
+        text: view.text,
+        ...(image && 'mimeType' in image ? { image: { mimeType: image.mimeType } } : {}),
+        failed: view.failed,
+        menuOmitted: view.menuOmitted,
+        treeTruncated: view.treeTruncated,
+        geometryConflict: structured ? hasWindowGeometryConflict(structured) : false,
+    });
 }
 function describeScreenshotAvailability(name, text, content) {
     if (name !== 'computer_app_state' || content.some((item) => item.type === 'image'))
@@ -162,15 +205,14 @@ function isUnresolvedWindow(record) {
 function computerUseResultText(name, value, record) {
     const sourceText = baseComputerUseResultText(value, record);
     const verification = verificationResultText(name, sourceText, record);
-    if (verification !== undefined)
-        return verification;
+    if (verification !== undefined) {
+        return { text: verification, menuOmitted: false, treeTruncated: false };
+    }
     const rawText = name === 'computer_window_list' ? formatWindowList(sourceText, record) : sourceText;
     const nativeText = name === 'computer_desktop_state' ? desktopCoordinateText(rawText, record) : rawText;
     const stateText = name === 'computer_app_state' ? exposeElementState(nativeText, record) : nativeText;
     const tokenText = exposeElementTokens(stateText, record);
-    const baseText = name === 'computer_app_state'
-        ? summarizeWindowButtons(compactApplicationMenus(tokenText, record), record)
-        : tokenText;
+    const body = windowObservationBody(name, tokenText, nativeText, record);
     const coverage = name === 'computer_app_state'
         ? [
             truncatedObservationText(nativeText),
@@ -182,9 +224,25 @@ function computerUseResultText(name, value, record) {
             .join('\n\n')
         : '';
     const appActivity = name === 'computer_app_list' ? appActivityText(record) : '';
-    const observation = [appActivity, coverage, baseText].filter(Boolean).join('\n\n');
+    const observation = [appActivity, coverage, body.text].filter(Boolean).join('\n\n');
     const guidance = computerUseOperationalGuidance(record, name) || missingClickEffectGuidance(name, record);
-    return guidance ? `${observation}\n${guidance}` : observation;
+    return { ...body, text: guidance ? `${observation}\n${guidance}` : observation };
+}
+/** The window tree of app_state, and whether it was cut or reported incomplete. */
+function windowObservationBody(name, tokenText, nativeText, record) {
+    if (name !== 'computer_app_state') {
+        return { text: tokenText, menuOmitted: false, treeTruncated: false };
+    }
+    const compacted = compactApplicationMenus(tokenText, record);
+    // A walk cut by the driver's time budget reports truncated: true and has no
+    // node-limit sentence; the sentence alone would report a partial tree as whole.
+    // truncation_reason stays in details only; data exposes just the boolean.
+    const state = record ? parseStructuredRecord(record) : undefined;
+    return {
+        text: summarizeWindowButtons(compacted, record),
+        menuOmitted: compacted !== tokenText,
+        treeTruncated: truncatedObservationText(nativeText) !== '' || state?.truncated === true,
+    };
 }
 /** An SDK receipt without effect metadata cannot establish a UI postcondition. */
 function missingClickEffectGuidance(name, record) {
@@ -232,7 +290,7 @@ function editableSnapshotFidelityText(record) {
             ['AXTextArea', 'AXTextField', 'AXComboBox'].includes(String(element.role)))) {
         return '';
     }
-    return "Text fidelity limitation: CUA Driver 0.22.1 macOS AX snapshots may trim leading/trailing whitespace, including the final newline. The displayed value is not a lossless copy of the document. For a partial edit, use the application's targeted find/replace or a verified selection; do not rebuild the entire document from this snapshot. Whole-value replacement is appropriate only when the user explicitly supplies or authorizes the complete replacement. AX readback alone cannot prove that untouched whitespace was preserved.";
+    return "Text fidelity limitation: macOS AX snapshots may trim leading/trailing whitespace, including the final newline. The displayed value is not a lossless copy of the document. For a partial edit, use the application's targeted find/replace or a verified selection; do not rebuild the entire document from this snapshot. Whole-value replacement is appropriate only when the user explicitly supplies or authorizes the complete replacement. AX readback alone cannot prove that untouched whitespace was preserved.";
 }
 /** Window prerequisites do not prove a particular element's ancestry or writability. */
 /** Keep current per-window state adjacent to its identity, without dropping native fields. */

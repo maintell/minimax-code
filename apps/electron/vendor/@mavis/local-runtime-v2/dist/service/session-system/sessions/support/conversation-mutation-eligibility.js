@@ -6,6 +6,7 @@ export function isConversationMutationEligibleSession(session, minimumDataVersio
         (session.sessionDataVersion ?? 0) >= minimumDataVersion &&
         isPrimarySessionAgentName(session.agentName) &&
         session.parentSessionId == null &&
+        !(session.sideChatOrigin && session.visibility === 'hidden') &&
         (session.sessionKind === 'conversation' || session.sessionKind === 'cron'));
 }
 //# sourceMappingURL=conversation-mutation-eligibility.js.map

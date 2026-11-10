@@ -12,6 +12,15 @@ const WINDOW_CAPABILITIES = {
 };
 const registeredDesktopRenderers = new Map();
 let appearanceBroadcastingInitialized = false;
+export function isRegisteredMainRenderer(contents) {
+    const registered = registeredDesktopRenderers.get(contents.id);
+    return (registered?.kind === 'main' && registered.webContents === contents && !contents.isDestroyed());
+}
+export function listRegisteredMainRenderers() {
+    return [...registeredDesktopRenderers.values()]
+        .filter(({ kind, webContents }) => kind === 'main' && !webContents.isDestroyed())
+        .map(({ webContents }) => webContents);
+}
 function ensureAppearanceBroadcasting() {
     if (appearanceBroadcastingInitialized)
         return;

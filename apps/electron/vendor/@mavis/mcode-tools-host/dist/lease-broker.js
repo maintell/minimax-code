@@ -3,12 +3,13 @@ import { chmod, mkdir, open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { AUTH_LEASE_AUDIENCE, AUTH_LEASE_PROTOCOL_VERSION, AUTH_LEASE_SCOPES, AuthLeaseProtocolError, startNodeAuthLeaseServer, } from '@mavis/oauth-lease-protocol';
 import { allocateBrokerEndpoint } from './broker-endpoint.js';
+import { authFailureFields } from './auth-failure.js';
 const NOOP_LOGGER = {
     info: () => undefined,
     warn: () => undefined,
 };
 export async function startMcodeToolsAuthLeaseBroker(options) {
-    const endpoint = await allocateBrokerEndpoint(options.dataDir);
+    const endpoint = await allocateBrokerEndpoint(options.dataDir, process.platform, options.isolateInstance);
     const capability = randomBytes(32).toString('base64url');
     const now = options.now ?? Date.now;
     const brokerLogger = options.logger ?? NOOP_LOGGER;
@@ -16,6 +17,11 @@ export async function startMcodeToolsAuthLeaseBroker(options) {
     let inFlight;
     let epoch = 0;
     let minimumGeneration = 0;
+    let pendingGeneration;
+    let statusRevision = 0;
+    const waitTimeoutMs = options.leaseWaitTimeoutMs ?? 25_000;
+    if (!Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs <= 0 || waitTimeoutMs > 25_000)
+        throw new TypeError('Invalid auth lease wait timeout.');
     let admissionOpen = true;
     let disposed = false;
     let server;
@@ -27,52 +33,94 @@ export async function startMcodeToolsAuthLeaseBroker(options) {
     async function loadValidatedLease(minValidityMs, requestEpoch) {
         const lease = await loadLease(options.session, minValidityMs);
         assertFixedLease(lease);
-        if (disposed)
-            throw new AuthLeaseProtocolError('BROKER_UNAVAILABLE');
-        if (requestEpoch !== epoch || !admissionOpen || lease.generation < minimumGeneration) {
-            throw new AuthLeaseProtocolError('AUTH_REQUIRED');
+        if (lease.generation < (pendingGeneration ?? 0)) {
+            const revision = statusRevision;
+            const status = await options.session.getStatus();
+            assertRequestCurrent(requestEpoch);
+            if (revision === statusRevision) {
+                if (isSignedOut(status.status))
+                    throw new AuthLeaseProtocolError('AUTH_REQUIRED');
+                if (status.status === 'authenticated' && status.generation === lease.generation) {
+                    pendingGeneration = undefined;
+                }
+            }
         }
+        assertLeaseCurrent(lease, requestEpoch);
         cachedLease = lease;
         return lease;
     }
-    async function acquireLease(minValidityMs) {
+    function assertLeaseCurrent(lease, requestEpoch) {
+        assertRequestCurrent(requestEpoch);
+        if (lease.generation < minimumGeneration)
+            throw new AuthLeaseProtocolError('AUTH_REQUIRED');
+        if (lease.generation < (pendingGeneration ?? 0))
+            throw new AuthLeaseProtocolError('BROKER_UNAVAILABLE');
+    }
+    function assertRequestCurrent(requestEpoch) {
         if (disposed)
             throw new AuthLeaseProtocolError('BROKER_UNAVAILABLE');
-        if (!admissionOpen)
+        if (requestEpoch !== epoch || !admissionOpen) {
             throw new AuthLeaseProtocolError('AUTH_REQUIRED');
+        }
+    }
+    async function acquireLease(minValidityMs) {
+        const requestEpoch = epoch;
+        const deadline = performance.now() + waitTimeoutMs;
+        const remaining = () => Math.max(0, deadline - performance.now());
+        assertRequestCurrent(requestEpoch);
         if (cachedLease &&
+            !inFlight &&
             admissionOpen &&
             cachedLease.generation >= minimumGeneration &&
+            cachedLease.generation >= (pendingGeneration ?? 0) &&
             isUsableLease(cachedLease, minValidityMs, now())) {
-            return cachedLease;
+            const candidate = cachedLease;
+            // A different process may have reserved/committed a refresh before the
+            // polling watch runs. Never let the memory cache bypass that shared fence.
+            const status = await waitForLease(options.session.getStatus(), remaining());
+            assertRequestCurrent(requestEpoch);
+            if (!inFlight &&
+                cachedLease === candidate &&
+                status.status === 'authenticated' &&
+                status.generation === candidate.generation &&
+                isUsableLease(candidate, minValidityMs, now()))
+                return candidate;
+            cachedLease = undefined;
         }
-        for (;;) {
-            if (inFlight) {
-                const lease = await inFlight.promise;
-                if (admissionOpen &&
-                    lease.generation >= minimumGeneration &&
-                    isUsableLease(lease, minValidityMs, now())) {
-                    return lease;
-                }
-                continue;
-            }
-            const requestEpoch = epoch;
-            const request = loadValidatedLease(minValidityMs, requestEpoch);
-            const current = { epoch: requestEpoch, promise: request };
-            inFlight = current;
-            try {
-                const lease = await request;
-                if (admissionOpen &&
-                    lease.generation >= minimumGeneration &&
-                    isUsableLease(lease, minValidityMs, now())) {
-                    return lease;
-                }
-            }
-            finally {
-                if (inFlight === current)
-                    inFlight = undefined;
-            }
+        // A lower-validity request may return an existing token without refreshing.
+        // Its stricter waiter gets one bounded acquisition at its own requirement;
+        // a response already requested at that requirement must never loop/rotate again.
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            if (remaining() <= 0)
+                throw new AuthLeaseProtocolError('BROKER_UNAVAILABLE');
+            const current = getOrStartLeaseRequest(minValidityMs);
+            const lease = await waitForLease(current.promise, remaining());
+            assertRequestCurrent(requestEpoch);
+            // Watch notifications may invalidate a validated grant before its waiter
+            // resumes. Check the original epoch as well as the current admission floor.
+            assertLeaseCurrent(lease, current.epoch);
+            if (isUsableLease(lease, minValidityMs, now()))
+                return lease;
+            if (current.minValidityMs >= minValidityMs)
+                break;
         }
+        throw new AuthLeaseProtocolError('BROKER_UNAVAILABLE');
+    }
+    function getOrStartLeaseRequest(minValidityMs) {
+        if (inFlight)
+            return inFlight;
+        cachedLease = undefined;
+        const requestEpoch = epoch;
+        const request = loadValidatedLease(minValidityMs, requestEpoch);
+        const current = { epoch: requestEpoch, minValidityMs, promise: request };
+        inFlight = current;
+        void request
+            .finally(() => {
+            if (inFlight === current)
+                inFlight = undefined;
+        })
+            .catch(() => undefined);
+        return current;
     }
     async function handleRequest(request) {
         if (disposed)
@@ -105,16 +153,29 @@ export async function startMcodeToolsAuthLeaseBroker(options) {
         server = await startNodeAuthLeaseServer({
             endpoint: endpoint.endpoint,
             capability,
-            handler: handleRequest,
+            handler: async (request) => {
+                try {
+                    return await handleRequest(request);
+                }
+                catch (error) {
+                    brokerLogger.warn(`[auth-lease-broker] request_failed ${JSON.stringify({ requestId: request.requestId, method: request.method, pid: process.pid, ...authFailureFields(error) })}`);
+                    throw error;
+                }
+            },
         });
         stopWatching = options.session.watch((status) => {
-            minimumGeneration = Math.max(minimumGeneration, status.generation);
+            statusRevision += 1;
+            // A refreshing generation is a reservation. A failed HTTP request may
+            // restore the still-valid prior generation; do not make its floor permanent.
+            pendingGeneration = status.status === 'refreshing' ? status.generation : undefined;
+            if (status.status === 'authenticated' || isSignedOut(status.status))
+                minimumGeneration = Math.max(minimumGeneration, status.generation);
             const generationChanged = cachedLease !== undefined && cachedLease.generation < minimumGeneration;
-            const admissionClosed = status.status !== 'authenticated' && status.status !== 'refreshing';
+            const admissionClosed = isSignedOut(status.status);
             admissionOpen = !admissionClosed;
             if (admissionClosed)
                 invalidate();
-            else if (generationChanged)
+            else if (generationChanged || status.status !== 'authenticated')
                 cachedLease = undefined;
         });
     }
@@ -170,11 +231,44 @@ async function loadLease(session, minValidityMs) {
         return await session.getAccessToken(minValidityMs);
     }
     catch (error) {
+        const code = error && typeof error === 'object' ? error.code : undefined;
+        if (typeof code === 'string' &&
+            !['AUTH_REQUIRED', 'AUTH_SCOPE_UPGRADE_REQUIRED', 'AUTH_RESOURCE_CONTRACT_MISMATCH'].includes(code))
+            throw error;
         const status = await readStatusAfterLeaseFailure(session);
-        if (!status || status.status !== 'authenticated') {
-            throw new AuthLeaseProtocolError('AUTH_REQUIRED');
+        if (code || (status && isSignedOut(status.status))) {
+            const mapped = new AuthLeaseProtocolError('AUTH_REQUIRED');
+            mapped.cause = error;
+            throw mapped;
         }
         throw error;
+    }
+}
+function isSignedOut(status) {
+    return [
+        'anonymous',
+        'authorizing',
+        'logging_out',
+        'logout_pending',
+        'scope_upgrade_required',
+    ].includes(status);
+}
+async function waitForLease(promise, timeoutMs) {
+    let timer;
+    const timeout = new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+            const error = new AuthLeaseProtocolError('BROKER_UNAVAILABLE');
+            error.cause = Object.assign(new Error('Authentication credential wait timed out.'), {
+                code: 'AUTH_LEASE_WAIT_TIMEOUT',
+            });
+            reject(error);
+        }, timeoutMs);
+    });
+    try {
+        return await Promise.race([promise, timeout]);
+    }
+    finally {
+        clearTimeout(timer);
     }
 }
 async function readStatusAfterLeaseFailure(session) {

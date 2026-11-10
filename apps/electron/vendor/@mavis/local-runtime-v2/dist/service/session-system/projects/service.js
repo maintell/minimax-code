@@ -1,7 +1,9 @@
+import { parseProjectIcon } from '@mavis/shared/project-icon';
 import { canonicalProjectWorkspaceDir } from '../shared/workspace.js';
 import { projectPrimarySessionAgentName } from '../sessions/agent-name.js';
 import { DEFAULT_PROJECT_KEY } from './contracts.js';
 import { ProjectServiceError } from './errors.js';
+import { hasStoredWorkspaceRoots, projectWorkspaceRoots, validateWorkspaceRoots, } from './workspace-roots.js';
 export class ProjectService {
     options;
     nowMs;
@@ -55,6 +57,54 @@ export class ProjectService {
             sessions: projectPrimarySessions(roots.sessions, input.agentName),
             childrenByParent: projectPrimaryChildren(childrenByParent, input.agentName),
         };
+    }
+    async updateIcon(reference, extraDataJson) {
+        return this.updateMetadata(reference, { extraDataJson });
+    }
+    /** Empty (after trim) restores the directory default; the folder itself never changes. */
+    async updateDisplayName(reference, raw) {
+        return this.updateMetadata(reference, { displayName: raw });
+    }
+    /** Validates every requested field before one atomic write; absent fields stay unchanged. */
+    async updateMetadata(reference, input) {
+        const displayName = input.displayName === undefined ? undefined : normalizeProjectDisplayName(input.displayName);
+        const iconJson = input.extraDataJson === undefined ? undefined : parseIconPatch(input.extraDataJson);
+        const project = await this.resolve(reference, true);
+        if (displayName !== undefined && project.projectKind === 'default') {
+            throw new ProjectServiceError('default-project-name', 'The default project name cannot be changed');
+        }
+        const workspaceRoots = input.workspaceRoots === undefined
+            ? undefined
+            : await replacementWorkspaceRoots(project, input.workspaceRoots);
+        return requireProject(await this.options.projects.setMetadata(project.projectId, {
+            ...(displayName !== undefined ? { displayName } : {}),
+            ...(iconJson !== undefined ? { iconJson } : {}),
+            ...(workspaceRoots !== undefined ? { workspaceRoots } : {}),
+        }, this.nowMs()));
+    }
+    /**
+     * Creates a workspace Project keyed by its primary folder. A row that only
+     * exists implicitly (created by an earlier conversation and never set up by
+     * the user) or was removed from the sidebar is taken over; a project the
+     * user already set up is a conflict.
+     */
+    async create(input) {
+        const workspaceDir = createWorkspaceDir(input);
+        const displayName = normalizeProjectDisplayName(input.displayName);
+        const iconJson = input.extraDataJson ? parseIconPatch(input.extraDataJson) : undefined;
+        const requestedRoots = input.workspaceRoots?.length ? input.workspaceRoots : [workspaceDir];
+        const workspaceRoots = await validateWorkspaceRoots(withCanonicalPrimary(requestedRoots, workspaceDir), workspaceDir);
+        const existing = await this.options.projects.getByWorkspaceDir(workspaceDir);
+        assertCreatable(existing, workspaceDir);
+        const project = existing ??
+            requireProject(await this.options.projects.ensureByWorkspaceDir(workspaceDir, this.nowMs()));
+        return requireProject(await this.options.projects.setMetadata(project.projectId, {
+            // An empty name keeps the name a taken-over row already had.
+            displayName: displayName ?? project.displayName,
+            workspaceRoots,
+            ...(iconJson !== undefined ? { iconJson } : {}),
+            ...(project.hidden ? { unhide: true } : {}),
+        }, this.nowMs()));
     }
     async setPinned(reference, pinned) {
         const project = await this.resolve(reference, true);
@@ -229,10 +279,87 @@ function canonicalProjectReference(lookup) {
     }
     return { projectKey: `workspace:${workspaceDir}` };
 }
+/** Mirrors the Desktop project-name limit (`MAX_PROJECT_NAME_LENGTH` in the UI modals). */
+export const PROJECT_DISPLAY_NAME_MAX_LENGTH = 50;
+const CONTROL_CHARACTER = /\p{Cc}/u;
+function normalizeProjectDisplayName(raw) {
+    const trimmed = raw.trim();
+    if (!trimmed)
+        return null;
+    if (trimmed.length > PROJECT_DISPLAY_NAME_MAX_LENGTH) {
+        throw new ProjectServiceError('invalid-project-name', `Project name cannot exceed ${PROJECT_DISPLAY_NAME_MAX_LENGTH} characters`);
+    }
+    if (CONTROL_CHARACTER.test(trimmed)) {
+        throw new ProjectServiceError('invalid-project-name', 'Project name contains control characters');
+    }
+    return trimmed;
+}
+function parseIconPatch(extraDataJson) {
+    let patch;
+    try {
+        if (extraDataJson.length > 1024)
+            throw new Error('oversized');
+        patch = JSON.parse(extraDataJson);
+    }
+    catch {
+        throw new ProjectServiceError('invalid-project-icon', 'Invalid project icon metadata');
+    }
+    if (!patch ||
+        typeof patch !== 'object' ||
+        Array.isArray(patch) ||
+        Object.keys(patch).length !== 1 ||
+        !Object.hasOwn(patch, 'projectIcon')) {
+        throw new ProjectServiceError('invalid-project-icon', 'Only projectIcon metadata may be updated');
+    }
+    const raw = patch.projectIcon;
+    const icon = parseProjectIcon(raw);
+    if (raw !== null && !icon) {
+        throw new ProjectServiceError('invalid-project-icon', 'Invalid project icon');
+    }
+    return JSON.stringify(icon);
+}
 function requireProject(project) {
     if (!project)
         throw new ProjectServiceError('project-not-found', 'project not found');
     return project;
+}
+/** Set up by the user through CreateProject / a folder edit. */
+function isUserProject(project) {
+    return hasStoredWorkspaceRoots(project);
+}
+function createWorkspaceDir(input) {
+    const workspaceDir = canonicalProjectWorkspaceDir(input.workspaceDir?.trim() || input.workspaceRoots?.[0]);
+    if (!workspaceDir) {
+        throw new ProjectServiceError('invalid-workspace-dir', 'workspace_dir must be absolute');
+    }
+    return workspaceDir;
+}
+/** The primary folder may arrive as a worktree path that keys to its repository. */
+function withCanonicalPrimary(roots, primary) {
+    const [first, ...rest] = roots;
+    return first !== undefined && canonicalProjectWorkspaceDir(first) === primary
+        ? [primary, ...rest]
+        : roots;
+}
+/** A visible project the user already set up owns its primary folder. */
+function assertCreatable(existing, workspaceDir) {
+    if (!existing || existing.hidden || !isUserProject(existing))
+        return;
+    throw new ProjectServiceError('project-conflict', `This folder is already the project ${existing.displayName ?? projectFolderName(workspaceDir)}`);
+}
+/**
+ * The primary folder is the project key and stays locked; only the additional
+ * folders can be added or removed.
+ */
+async function replacementWorkspaceRoots(project, requested) {
+    if (project.projectKind !== 'workspace') {
+        throw new ProjectServiceError('invalid-workspace-roots', 'The default project has no folders');
+    }
+    const primary = requireWorkspaceProjectDir(project);
+    return validateWorkspaceRoots(withCanonicalPrimary(requested, primary), primary, projectWorkspaceRoots(project));
+}
+function projectFolderName(workspaceDir) {
+    return workspaceDir.split(/[\\/]+/u).filter(Boolean).at(-1) ?? workspaceDir;
 }
 function normalizeLimit(value, fallback) {
     if (!Number.isFinite(value))

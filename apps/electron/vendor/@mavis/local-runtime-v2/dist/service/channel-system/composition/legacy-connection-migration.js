@@ -29,7 +29,13 @@ export async function migrateLegacyImConnectionState(input) {
             legacyImCredentialAgent: credentialAgent,
         })
         : [];
+    logger.info({
+        stage: 'legacy_wechat_route_filter',
+        bindingRouteCount: bindingRoutes.length,
+        credentialRouteCount: credentialRoutes.length,
+    }, 'IM startup stage entered');
     const legacyRoutes = await filterUnconfirmedLegacyWeChatRoutes([...bindingRoutes, ...credentialRoutes], input.isUsableWeChatRoute);
+    logger.info({ stage: 'legacy_connection_store_migration', legacyRouteCount: legacyRoutes.length }, 'IM startup stage entered');
     await input.imConnectionStore.migrateLegacy({
         legacyRoutes,
         ...(input.resolveActiveClient ? { resolveActiveClient: input.resolveActiveClient } : {}),

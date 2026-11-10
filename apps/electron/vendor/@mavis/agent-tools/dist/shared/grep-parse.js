@@ -135,6 +135,7 @@ export function parseGrepOutput(stdout, opts) {
     const details = {};
     let bytesTruncated = false;
     let linesTruncated = false;
+    let capSkipped = false;
     const rawLines = output.length > 0 ? output.split('\n') : [];
     if (limitedOutput.matchLimitReached) {
         details.matchLimitReached = opts.limit;
@@ -143,13 +144,20 @@ export function parseGrepOutput(stdout, opts) {
         .map((line) => {
         const restored = restoreNulSeparator(line).replace(/^\.\//, '');
         if (restored.length > MAX_LINE_LENGTH) {
+            if (opts.uncapped) {
+                capSkipped = true;
+                return restored;
+            }
             linesTruncated = true;
             return `${restored.slice(0, MAX_LINE_LENGTH)}...`;
         }
         return restored;
     })
         .join('\n');
-    if (Buffer.byteLength(output, 'utf-8') > MAX_TOTAL_BYTES) {
+    if (opts.uncapped && Buffer.byteLength(output, 'utf-8') > MAX_TOTAL_BYTES) {
+        capSkipped = true;
+    }
+    else if (Buffer.byteLength(output, 'utf-8') > MAX_TOTAL_BYTES) {
         // Cutting at a raw byte offset lands mid-line: the tail row is torn and
         // may end on a partial multi-byte sequence (→ U+FFFD). Drop everything
         // after the last complete line so the model never sees a half path/match
@@ -163,6 +171,10 @@ export function parseGrepOutput(stdout, opts) {
     const retainedSourceLineCount = output.length > 0 ? output.split('\n').length : 0;
     const retainedRawLines = rawLines.slice(0, retainedSourceLineCount);
     const matchLineIndexes = retainedRawLines.flatMap((line, index) => isRipgrepMatchLine(line) ? [index] : []);
+    const matchEntries = matchLineIndexes.flatMap((index) => {
+        const entry = parseMatchLine(retainedRawLines[index] ?? '', opts.uncapped ? Number.POSITIVE_INFINITY : MAX_LINE_LENGTH);
+        return entry ? [{ lineIndex: index, ...entry }] : [];
+    });
     const filenames = uniqueStrings(retainedRawLines.flatMap(ripgrepLinePath));
     if (linesTruncated)
         details.linesTruncated = true;
@@ -181,6 +193,8 @@ export function parseGrepOutput(stdout, opts) {
         text: output,
         details,
         matchLineIndexes,
+        matchEntries,
+        ...(capSkipped ? { uncappedOutput: true } : {}),
         facts: {
             filenames,
             numFiles: filenames.length,
@@ -257,9 +271,7 @@ export function parseCountOutput(stdout, opts) {
     const pageEntries = page.flatMap((entry) => {
         const idx = entry.lastIndexOf(':');
         const count = Number.parseInt(entry.slice(idx + 1), 10);
-        return idx > 0 && !Number.isNaN(count)
-            ? [{ filename: entry.slice(0, idx), count }]
-            : [];
+        return idx > 0 && !Number.isNaN(count) ? [{ filename: entry.slice(0, idx), count }] : [];
     });
     const truncated = entries.length > offset + page.length;
     let text = page.join('\n');
@@ -276,8 +288,25 @@ export function parseCountOutput(stdout, opts) {
             numFiles: pageEntries.length,
             numMatches: pageEntries.reduce((sum, { count }) => sum + count, 0),
             totalFiles: fileCount,
+            counts: pageEntries.map(({ filename, count }) => ({ path: filename, count })),
         },
     };
+}
+/**
+ * Splits one rg match line (`path\0line:text`, or legacy `path:line:text`)
+ * the way the output shows it: `./` dropped and the text cut so that
+ * `path:line:text` stays within MAX_LINE_LENGTH, like the model-visible line.
+ */
+function parseMatchLine(raw, maxLineLength) {
+    const nul = raw.indexOf('\u0000');
+    const located = nul > 0 ? raw.slice(nul + 1).match(/^(\d+):/) : raw.match(/^(.+?):(\d+):/);
+    if (!located)
+        return undefined;
+    const path = (nul > 0 ? raw.slice(0, nul) : (located[1] ?? '')).replace(/^\.\//, '');
+    const line = Number(nul > 0 ? located[1] : located[2]);
+    const text = nul > 0 ? raw.slice(nul + 1 + located[0].length) : raw.slice(located[0].length);
+    const prefixLength = `${path}:${line}:`.length;
+    return { path, line, text: text.slice(0, Math.max(0, maxLineLength - prefixLength)) };
 }
 function ripgrepLinePath(line) {
     if (line === '--')

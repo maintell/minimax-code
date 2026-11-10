@@ -84,6 +84,7 @@ export function createLocalMavisCronAdapter(client, options = {}) {
             const sessionTarget = mapCreationSessionTarget(req.session);
             const resp = await client.createCronDefinition({
                 name: req.cronName,
+                ...executionConfig(req),
                 agentName: req.agentName,
                 schedule: recurringSchedule(req.schedule, req.timezone),
                 prompt: req.prompt,
@@ -106,6 +107,7 @@ export function createLocalMavisCronAdapter(client, options = {}) {
             const resp = await client.createCronDefinition({
                 name,
                 agentName,
+                ...executionConfig(req),
                 schedule: recurringSchedule(everyToCronExpression(req.every), req.timezone),
                 prompt: appendQuietOnSkipPromptSuffix(req.prompt, req.quietOnSkip ?? true),
                 sessionTarget: { mode: CronSessionTargetMode.SessionId, sessionId: req.sessionId },
@@ -128,6 +130,7 @@ export function createLocalMavisCronAdapter(client, options = {}) {
             const runAtMs = parseOnceRunAtMs(req, nowMs());
             const resp = await client.createCronDefinition({
                 name: req.cronName?.trim() || onceName(),
+                ...executionConfig(req),
                 agentName: req.agentName,
                 schedule: { kind: CronScheduleKind.Once, runAtMs },
                 prompt: req.prompt,
@@ -154,6 +157,8 @@ export function createLocalMavisCronAdapter(client, options = {}) {
             const targetFields = req.session === undefined ? {} : { sessionTarget: mapSessionTarget(req.session) };
             const resp = await client.updateCronDefinition({
                 cronId: req.cronId,
+                ...(req.cronName === undefined ? {} : { name: req.cronName }),
+                ...executionConfig(req),
                 ...(req.schedule === undefined
                     ? {}
                     : { schedule: recurringSchedule(req.schedule, req.timezone) }),
@@ -275,6 +280,7 @@ function toCronTask(definition) {
     const once = definition.schedule.kind === CronScheduleKind.Once;
     return {
         cronId: definition.cronId,
+        ...executionConfig(definition),
         cronName: definition.name,
         agentName: definition.agentName,
         scheduleType: once ? 'once' : 'cron',
@@ -292,6 +298,12 @@ function toCronTask(definition) {
         ...(definition.model ? { model: definition.model } : {}),
         ...(definition.nextRunAt === undefined ? {} : { nextRun: definition.nextRunAt }),
         status: definitionStatus(definition),
+    };
+}
+function executionConfig(input) {
+    return {
+        ...(input.project === undefined ? {} : { project: input.project }),
+        ...(input.model === undefined ? {} : { model: input.model }),
     };
 }
 /**

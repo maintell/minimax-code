@@ -1,6 +1,6 @@
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
 // Codex model discovery negotiates against the Codex client version, independent of our app version.
-const CODEX_CATALOG_CLIENT_VERSION = '0.153.0';
+const CODEX_CATALOG_CLIENT_VERSION = '0.200.0';
 export class CodexModelDiscoveryClient {
     fetchImpl;
     timeoutMs;

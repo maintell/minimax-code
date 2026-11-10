@@ -8,7 +8,9 @@
  * desktop client without exposing a public webhook URL (the dual mechanism,
  * `setWebhook`, requires HTTPS reachable from telegram.org). We long-poll
  * with `timeout=25` so each call holds the connection up to 25s server-side
- * before responding, then immediately re-issue with the new offset.
+ * before responding, then immediately re-issue with the new offset. Until
+ * the first successful round of a start the poller short-polls
+ * (`timeout=0`) so the token is confirmed at once (`firstSuccessPending`).
  *
  * Design mirrors the historical iLink monitor in
  * `apps/electron/main/modules/imGateway/wechat-sdk/ilink-monitor.ts` ported
@@ -44,6 +46,7 @@
  */
 import { detach, settleOr } from '../../settle.js';
 import { EventEmitter } from 'node:events';
+import { isNetworkTimeoutError } from '../../ingress/channel-transport-status.js';
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -72,6 +75,13 @@ export class TelegramPoller extends EventEmitter {
     running = false;
     abortController = new AbortController();
     consecutiveFailures = 0;
+    /**
+     * True from `start()` until the first successful round. Those rounds use
+     * `timeout=0` — Bot API short polling answers at once — so a valid token
+     * is confirmed within about a second instead of after a 25 s long-poll
+     * hold, also when the first attempts failed and the network came back.
+     */
+    firstSuccessPending = true;
     constructor(options) {
         super();
         this.options = {
@@ -105,6 +115,7 @@ export class TelegramPoller extends EventEmitter {
             return;
         this.running = true;
         this.abortController = new AbortController();
+        this.firstSuccessPending = true;
         this.emit('status', 'starting');
         // Detached poll loop; a crashed loop surfaces via the 'error' event.
         detach(this.runLoopEmittingErrors());
@@ -114,6 +125,7 @@ export class TelegramPoller extends EventEmitter {
             await this.loop();
         }
         catch (err) {
+            this.emit('poll', { outcome: 'crashed' });
             this.emit('error', new TelegramPollerError('TELEGRAM_NETWORK_ERROR', `poll loop crashed: ${err instanceof Error ? err.message : String(err)}`, false));
             this.running = false;
             this.emit('status', 'stopped');
@@ -161,6 +173,8 @@ export class TelegramPoller extends EventEmitter {
             if (!result)
                 continue;
             this.consecutiveFailures = 0;
+            this.firstSuccessPending = false;
+            this.emit('poll', { outcome: 'ok' });
             this.emitUpdateBatch(result);
         }
     }
@@ -192,7 +206,7 @@ export class TelegramPoller extends EventEmitter {
     }
     buildGetUpdatesUrl() {
         const params = new URLSearchParams();
-        params.set('timeout', String(LONG_POLL_TIMEOUT_SECONDS));
+        params.set('timeout', String(this.firstSuccessPending ? 0 : LONG_POLL_TIMEOUT_SECONDS));
         if (this.offset > 0)
             params.set('offset', String(this.offset));
         if (this.options.allowedUpdates.length > 0) {
@@ -209,6 +223,7 @@ export class TelegramPoller extends EventEmitter {
      * out-of-band intervention.
      */
     async handleConflictResponse(response) {
+        this.emit('poll', { outcome: 'conflict' });
         const description = await readDescription(response);
         const webhookActive = /webhook/i.test(description);
         if (webhookActive) {
@@ -223,6 +238,7 @@ export class TelegramPoller extends EventEmitter {
     }
     async handleErrorResponse(response) {
         if (response.status === 401) {
+            this.emit('poll', { outcome: 'token_invalid' });
             this.emit('error', new TelegramPollerError('TELEGRAM_TOKEN_INVALID', 'getUpdates returned 401: bot token is invalid', false));
             return 'fatal';
         }
@@ -230,6 +246,7 @@ export class TelegramPoller extends EventEmitter {
             return this.handleConflictResponse(response);
         }
         if (response.status === 429) {
+            this.emit('poll', { outcome: 'rate_limited' });
             const body = (await settleOr(response.json(), null));
             const retryAfterMs = (body?.parameters?.retry_after ?? 5) * 1000;
             this.emit('error', new TelegramPollerError('TELEGRAM_RATE_LIMITED', `getUpdates rate limited, retry_after=${retryAfterMs}ms`, true));
@@ -237,12 +254,14 @@ export class TelegramPoller extends EventEmitter {
             await this.options.sleep(retryAfterMs || RATE_LIMIT_FALLBACK_MS);
             return 'retry';
         }
+        this.emit('poll', { outcome: 'http_error', httpStatus: response.status });
         this.emit('error', new TelegramPollerError('TELEGRAM_SERVER_ERROR', `getUpdates returned ${response.status}`, true));
         await this.backoffOnce();
         return 'retry';
     }
     async handleNetworkError(err) {
         this.consecutiveFailures += 1;
+        this.emit('poll', { outcome: 'network_error', timeout: isNetworkTimeoutError(err) });
         this.emit('error', new TelegramPollerError('TELEGRAM_NETWORK_ERROR', `getUpdates network error: ${err instanceof Error ? err.message : String(err)}`, true));
         if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
             // Stay running but back off hard to give the network time to recover.

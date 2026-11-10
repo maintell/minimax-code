@@ -1,10 +1,13 @@
 import { getRuntimeRegion } from '@mavis/config';
 import { normalizeProviderBaseUrl } from '../../connectivity/provider-request.js';
+import { isGeminiRejectedEffort } from '../../resolution/model-ref.js';
 import { fetchModelsDevCatalog, fetchPinnedProviderIdsConfig, MODELS_DEV_URL, } from './provider-presets.client.js';
 import { readProviderPresetSnapshotCandidates, resolveProviderPresetLocalCatalogPath, writeProviderPresetSnapshot, } from './provider-presets.repository.js';
+import { buildModelRecencyIndex, rankModelIdsByRecency, } from './model-recency.js';
 const OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const MESSAGES_API_BASE_URL = 'https://api.anthropic.com';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 // No provider id is filtered out of the catalog: MiniMax presets are offered
 // through BYOK like any other vendor, alongside the built-in managed provider
 // and the first-party `minimax_api` key entry. Display order (including whether
@@ -23,15 +26,56 @@ const PROVIDER_PLAN_NAMES = new Map([
     ['zhipuai-coding-plan', 'Zhipu AI Coding Plan'],
 ]);
 const refreshInFlight = new Map();
+const refreshAttemptedAt = new Map();
+/** Longest a model ranking waits for a catalog refresh before using the current snapshot. */
+const MODEL_RECENCY_REFRESH_WAIT_MS = 3_000;
+/** A snapshot older than this is refreshed before ranking; failures retry after the throttle. */
+const MODEL_RECENCY_STALE_MS = 6 * 60 * 60_000;
+const MODEL_RECENCY_RETRY_MS = 10 * 60_000;
 export class ProviderPresetCatalog {
     options;
+    refreshKey;
+    recency;
     constructor(options = {}) {
         this.options = options;
-        const refreshKey = resolveProviderPresetLocalCatalogPath(options) ?? options.bundledCatalogPath ?? 'default';
-        if (!refreshInFlight.has(refreshKey)) {
-            const refresh = refreshModelsDevSnapshotInBackground(options, refreshKey);
-            refreshInFlight.set(refreshKey, refresh);
+        this.refreshKey =
+            resolveProviderPresetLocalCatalogPath(options) ?? options.bundledCatalogPath ?? 'default';
+        this.startRefresh();
+    }
+    startRefresh() {
+        if (refreshInFlight.has(this.refreshKey))
+            return;
+        refreshAttemptedAt.set(this.refreshKey, (this.options.now ?? Date.now)());
+        refreshInFlight.set(this.refreshKey, refreshModelsDevSnapshotInBackground(this.options, this.refreshKey));
+    }
+    /**
+     * Orders model ids newest first by models.dev `last_updated`. Refreshes a
+     * stale snapshot first, waiting at most a few seconds; offline or failed
+     * refreshes fall back to the cached or bundled snapshot.
+     */
+    async rankModelsByRecency(input) {
+        const now = (this.options.now ?? Date.now)();
+        let latest = await latestCatalogSnapshot(this.options);
+        const lastAttempt = refreshAttemptedAt.get(this.refreshKey) ?? 0;
+        if ((!latest || now - latest.snapshot.updatedAt > MODEL_RECENCY_STALE_MS) &&
+            now - lastAttempt > MODEL_RECENCY_RETRY_MS) {
+            this.startRefresh();
         }
+        const pending = refreshInFlight.get(this.refreshKey);
+        if (pending) {
+            await waitBounded(pending, MODEL_RECENCY_REFRESH_WAIT_MS, input.signal);
+            latest = await latestCatalogSnapshot(this.options);
+        }
+        input.signal?.throwIfAborted();
+        if (!latest)
+            return [...new Set(input.modelIds)];
+        if (this.recency?.updatedAt !== latest.snapshot.updatedAt) {
+            this.recency = {
+                updatedAt: latest.snapshot.updatedAt,
+                index: buildModelRecencyIndex(latest.snapshot.catalog),
+            };
+        }
+        return rankModelIdsByRecency(this.recency.index, input);
     }
     async listProviderPresets() {
         const latest = await latestCatalogSnapshot(this.options);
@@ -74,7 +118,7 @@ function parseProvider(providerId, value, iconBaseUrl) {
     if (!transport)
         return undefined;
     const models = Object.entries(value.models)
-        .map(([modelId, model]) => parseModel(modelId, model))
+        .map(([modelId, model]) => parseModel(modelId, model, transport.apiFormat))
         .filter((model) => model !== undefined)
         .sort((left, right) => (left.displayName ?? left.modelId).localeCompare(right.displayName ?? right.modelId));
     if (models.length === 0)
@@ -112,6 +156,15 @@ const TRANSPORTS_BY_NPM = new Map([
             canonical: { providerId: 'openrouter', baseUrl: OPENROUTER_BASE_URL },
         },
     ],
+    // `@ai-sdk/google-vertex` stays unmapped: Vertex uses project/location and
+    // Google Cloud credentials, not a base URL plus API key.
+    [
+        '@ai-sdk/google',
+        {
+            apiFormat: 'google-generative-ai',
+            canonical: { providerId: 'google', baseUrl: GEMINI_BASE_URL },
+        },
+    ],
 ]);
 function resolveTransport(providerId, provider) {
     const transport = TRANSPORTS_BY_NPM.get(stringValue(provider.npm) ?? '');
@@ -125,14 +178,14 @@ function resolveTransport(providerId, provider) {
         return undefined;
     return { baseUrl: normalizeProviderBaseUrl(apiFormat, baseUrl), apiFormat };
 }
-function parseModel(modelId, value) {
+function parseModel(modelId, value, apiFormat) {
     if (!modelId.trim() || !isRecord(value) || value.tool_call !== true)
         return undefined;
     return {
         modelId,
         displayName: stringValue(value.name) ?? modelId,
         ...parseModelCapabilities(value),
-        ...parseModelEffortOptions(value),
+        ...parseModelEffortOptions(value, apiFormat),
         ...parseModelModalities(value),
         ...parseModelLimit(value),
     };
@@ -152,9 +205,10 @@ function parseModelCapabilities(value) {
  * selection. A bare `reasoning: true` or a `toggle` entry only means the model
  * can think, so neither one produces `effortOptions` here. Declared strings
  * are preserved as-is (trimmed, de-duplicated, in catalog order) so levels the
- * CLI does not know about still reach validation and the wire unchanged.
+ * CLI does not know about still reach validation and the wire unchanged, except
+ * levels the protocol rejects (Gemini has nothing below `low`).
  */
-function parseModelEffortOptions(value) {
+function parseModelEffortOptions(value, apiFormat) {
     if (!Array.isArray(value.reasoning_options))
         return {};
     for (const option of value.reasoning_options) {
@@ -164,7 +218,7 @@ function parseModelEffortOptions(value) {
             ...new Set(option.values
                 .filter((candidate) => typeof candidate === 'string')
                 .map((candidate) => candidate.trim())
-                .filter(Boolean)),
+                .filter((candidate) => candidate && !isGeminiRejectedEffort(apiFormat, candidate))),
         ];
         if (effortOptions.length > 0)
             return { effortOptions };
@@ -317,6 +371,37 @@ function isHttpUrl(value) {
 function resolveProviderIconUrl(iconBaseUrl, providerId) {
     const prefix = iconBaseUrl.endsWith('/') ? iconBaseUrl : `${iconBaseUrl}/`;
     return `${prefix}${encodeURIComponent(providerId)}.svg`;
+}
+async function settled(task) {
+    try {
+        await task;
+    }
+    catch {
+        // A failed refresh leaves the current snapshot in place.
+    }
+}
+/** Resolves when `task` settles or `ms` elapses; rejects only when `signal` aborts. */
+async function waitBounded(task, ms, signal) {
+    signal?.throwIfAborted();
+    let timer;
+    let onAbort;
+    try {
+        await Promise.race([
+            settled(task),
+            new Promise((resolve) => {
+                timer = setTimeout(resolve, ms);
+            }),
+            new Promise((_, reject) => {
+                onAbort = () => reject(signal?.reason);
+                signal?.addEventListener('abort', onAbort, { once: true });
+            }),
+        ]);
+    }
+    finally {
+        clearTimeout(timer);
+        if (onAbort)
+            signal?.removeEventListener('abort', onAbort);
+    }
 }
 function isRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);

@@ -1,6 +1,7 @@
 import { asNumber, asString, byteLength, evaluate, getBrowserSnapshot, isRecord, stringArray, } from './browser-state.js';
 import { BrowserSnapshotSupport } from './browser-snapshot.js';
 import { exposeElement } from './browser-snapshot-helpers.js';
+import { diagnoseSelectorMiss, selectorMissRecovery, } from './browser-selector-diagnostics.js';
 import { sanitizeConsoleDiagnosticUrl, } from './cdp-helper.js';
 import { isBrowserOperationInterruption } from './operation-timeout.js';
 const NON_EDITABLE_INPUT_TYPES = new Set([
@@ -14,6 +15,15 @@ const NON_EDITABLE_INPUT_TYPES = new Set([
     'submit',
 ]);
 export class BrowserQuerySupport extends BrowserSnapshotSupport {
+    /** Count consecutive misses per page so repeated blind guesses get a firmer redirect. */
+    async selectorMiss(session, selector) {
+        const diagnostics = await diagnoseSelectorMiss(session, selector);
+        const url = diagnostics.url ?? '';
+        const previous = session.selectorMissStreak;
+        const count = previous && previous.url === url ? previous.count + 1 : 1;
+        session.selectorMissStreak = { url, count };
+        return selectorNotFound(selector, { ...diagnostics, consecutiveMisses: count });
+    }
     async query(session, input) {
         const kind = asString(input.kind);
         if (kind === 'snapshot')
@@ -28,7 +38,7 @@ export class BrowserQuerySupport extends BrowserSnapshotSupport {
                     throw new Error('STALE_SNAPSHOT: editable query continuation is no longer available');
                 }
                 if ((snapshot.continuationKind ?? 'inspect') !== 'query-editable') {
-                    throw new Error('SNAPSHOT_KIND_MISMATCH: continue the snapshot with the action returned by its continuation');
+                    throw new Error('SNAPSHOT_KIND_MISMATCH: this snapshotId was not produced by query kind "editable"; continue it with the action named in its own continuation (an inspect snapshot continues with action "inspect" and the same snapshotId/offset)');
                 }
                 const current = snapshot.editableQuery;
                 if (!current) {
@@ -65,7 +75,8 @@ export class BrowserQuerySupport extends BrowserSnapshotSupport {
           return { found: true, text: text.slice(0, ${maxChars}), totalLength: text.length, url: location.href, title: document.title };
         })()`);
                 if (!result.found)
-                    return selectorNotFound(selector);
+                    return this.selectorMiss(session, selector);
+                session.selectorMissStreak = undefined;
                 const { found: _found, ...content } = result;
                 return {
                     success: true,
@@ -76,7 +87,7 @@ export class BrowserQuerySupport extends BrowserSnapshotSupport {
             catch (error) {
                 if (isBrowserOperationInterruption(error))
                     throw error;
-                return browserQueryFailure(error);
+                return browserQueryFailure(error, selector);
             }
         }
         if (kind === 'dom') {
@@ -85,7 +96,8 @@ export class BrowserQuerySupport extends BrowserSnapshotSupport {
             try {
                 const result = await evaluate(session, sanitizedDomQueryExpression(selector));
                 if (!result.found)
-                    return selectorNotFound(selector);
+                    return this.selectorMiss(session, selector);
+                session.selectorMissStreak = undefined;
                 return {
                     success: true,
                     html: result.html.slice(0, maxChars),
@@ -98,7 +110,7 @@ export class BrowserQuerySupport extends BrowserSnapshotSupport {
             catch (error) {
                 if (isBrowserOperationInterruption(error))
                     throw error;
-                return browserQueryFailure(error);
+                return browserQueryFailure(error, selector);
             }
         }
         if (kind === 'console') {
@@ -204,24 +216,90 @@ function sanitizedDomQueryExpression(selector) {
     return { found: true, html: clone.outerHTML || '' };
   })()`;
 }
-function selectorNotFound(selector) {
+function selectorNotFound(selector, diagnostics) {
+    const hint = nonCssTextSelectorHint(selector);
+    const recovery = selectorMissRecovery(diagnostics);
     return {
         success: false,
         code: 'QUERY_FAILED',
         error: `Element not found: ${selector}`,
-        recovery: 'Inspect the current page and retry with a selector that matches the current DOM.',
+        ...(diagnostics.url ? { url: diagnostics.url } : {}),
+        ...(diagnostics.selectorTail ? { selectorTail: diagnostics.selectorTail } : {}),
+        ...(diagnostics.pageControls ? { pageControls: diagnostics.pageControls } : {}),
+        ...(diagnostics.missingLandmark
+            ? { missingLandmark: diagnostics.missingLandmark.selector }
+            : {}),
+        ...(diagnostics.consecutiveMisses && diagnostics.consecutiveMisses > 1
+            ? { consecutiveMisses: diagnostics.consecutiveMisses }
+            : {}),
+        recovery: hint ? `${hint} ${recovery}` : recovery,
     };
 }
-function browserQueryFailure(error) {
+/**
+ * Playwright/jQuery text engines that look like pseudo-classes but are not CSS,
+ * so `querySelector` rejects them outright. The selector itself is the useful
+ * diagnosis here: the model wanted a text match, which is `kind: "semantic"`.
+ */
+function nonCssTextSelectorHint(selector) {
+    // `text=` only counts as a selector engine prefix at a compound boundary, so
+    // attribute selectors such as `[data-text=foo]` are never misdiagnosed.
+    // An escaped colon or a longer identifier (`hover\\:text-red-600`, eval
+    // 777827) is a utility class name, not the `:text` engine.
+    const fragment = selector
+        .match(/(?<!\\):(?:has-)?text(?![\w-])|(?<!\\):contains(?![\w-])|(?:^|[\s>+~,(])text\s*=/iu)?.[0]
+        ?.trim()
+        .replace(/^[>+~,(]\s*/u, '');
+    if (!fragment)
+        return undefined;
+    return `The selector uses ${JSON.stringify(fragment)}, which is not valid CSS. For text matching use query with kind: "semantic" and input.text ("contains" matching), or query kind: "text" with a real CSS selector.`;
+}
+/**
+ * Eval 774252: utility class names such as `hover:bg-gray-50` or `bg-black/50`
+ * were sent as `.hover\\:bg-gray-50` (two backslashes after JSON decoding). CSS
+ * reads `\\` as an escaped backslash, leaving the `:` or `/` unescaped, so the
+ * selector is invalid; the model repeated this four times because the generic
+ * recovery did not name the cause.
+ */
+function doubledBackslashSelectorHint(selector) {
+    const fragment = /\\\\[^\\\s]/u.exec(selector)?.[0];
+    if (!fragment)
+        return undefined;
+    return `The selector contains a doubled backslash (${JSON.stringify(fragment)}); CSS reads "\\\\" as a literal backslash, so the next character stays unescaped. Escape special characters in class names with a single backslash (for example .hover\\:bg-gray-50), or act through an inspect ref instead.`;
+}
+const INVALID_SELECTOR_MESSAGE = /(?:failed to execute ['"]?queryselector|not a valid selector|invalid selector|selector[^\n]*syntaxerror|syntaxerror[^\n]*selector)/iu;
+/** True when a page-side error message is the browser rejecting selector syntax. */
+export function isInvalidSelectorMessage(message) {
+    return INVALID_SELECTOR_MESSAGE.test(message);
+}
+/**
+ * Cause-specific advice for a selector the browser rejected, shared by query
+ * and by actions that target `input.selector`. Eval 777827: a click with
+ * `button.hover\\:text-red-600` surfaced only the raw SyntaxError because the
+ * doubled-backslash hint lived on the query path alone.
+ */
+export function invalidSelectorHint(selector) {
+    return nonCssTextSelectorHint(selector) ?? doubledBackslashSelectorHint(selector);
+}
+function browserQueryFailure(error, selector) {
     const message = error instanceof Error ? error.message : String(error);
-    const invalidSelector = /(?:failed to execute ['"]?queryselector|not a valid selector|invalid selector|selector[^\n]*syntaxerror|syntaxerror[^\n]*selector)/iu.test(message);
+    const invalidSelector = isInvalidSelectorMessage(message);
+    const hint = selector === undefined ? undefined : nonCssTextSelectorHint(selector);
+    if (!invalidSelector) {
+        const recovery = 'Inspect the current page state and retry the query once; if navigation occurred, continue from the new snapshot.';
+        return {
+            success: false,
+            code: 'QUERY_FAILED',
+            error: message,
+            recovery: hint ? `${hint} ${recovery}` : recovery,
+        };
+    }
     return {
         success: false,
-        code: invalidSelector ? 'INVALID_SELECTOR' : 'QUERY_FAILED',
+        code: 'INVALID_SELECTOR',
         error: message,
-        recovery: invalidSelector
-            ? 'Use query with kind: "text" for text matching, or continue inspect and act through a returned opaque ref. CSS selectors must use standard CSS syntax.'
-            : 'Inspect the current page state and retry the query once; if navigation occurred, continue from the new snapshot.',
+        recovery: hint ??
+            (selector === undefined ? undefined : doubledBackslashSelectorHint(selector)) ??
+            'Use query with kind: "text" for text matching, or continue inspect and act through a returned opaque ref. CSS selectors must use standard CSS syntax.',
     };
 }
 function editablePage(snapshot, query, offset, input) {

@@ -22,6 +22,24 @@ export const RUNTIME_TRANSPORT_PROTOCOL_VERSION = 2;
 export const RUNTIME_TRANSPORT_DEFAULT_STREAM_WINDOW = 16;
 /** Trust-boundary cap for one window/credit grant. */
 export const RUNTIME_TRANSPORT_MAX_STREAM_WINDOW = 256;
+/**
+ * Consumer scope for a long-lived runtime stream. Requests that carry
+ * different scopes are independent consumers of the same endpoint, so a newer
+ * one never supersedes an older one. Same meaning as the `_mavis_stream_scope`
+ * query used by event streams; the header form serves generated clients that
+ * cannot append query parameters.
+ */
+export const RUNTIME_TRANSPORT_STREAM_SCOPE_HEADER = 'x-mavis-stream-scope';
+/**
+ * Adds the stream-scope header to request options when `scope` is set and
+ * returns the options unchanged otherwise, so unscoped requests keep their
+ * exact shape.
+ */
+export function withRuntimeTransportStreamScope(options, scope) {
+    return scope
+        ? { ...options, headers: { [RUNTIME_TRANSPORT_STREAM_SCOPE_HEADER]: scope } }
+        : options;
+}
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

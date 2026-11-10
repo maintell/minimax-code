@@ -1,4 +1,4 @@
-import { RespDataType, ToolCallStatus } from '@mavis/agent-core/protocol/agent-message';
+import { MsgType, RespDataType, Role, ToolCallStatus, } from '@mavis/agent-core/protocol/agent-message';
 import { RuntimeEventStatus, RuntimeEventType } from '@mavis/protocol';
 const BYOK_ERROR_PREFIX = 'BYOK upstream error';
 const BYOK_UPSTREAM_ERROR_SOURCE = 'byok_upstream';
@@ -16,13 +16,57 @@ export function deriveLocalTurnRuntimeOutcome(events) {
         ...(state.errorDetail ? { errorDetail: state.errorDetail } : {}),
         ...(state.errorProviderId ? { errorProviderId: state.errorProviderId } : {}),
         ...(state.messageId ? { messageId: state.messageId } : {}),
+        ...(state.replyMessageId ? { replyMessageId: state.replyMessageId } : {}),
         ...(state.waitingForUser ? { waitingForUser: true } : {}),
     };
 }
+/**
+ * waitingForUser reflects only the tail of the turn: it is set by a finished
+ * waiting ask_user result and cleared once a different assistant message
+ * produces further output (text, thinking, or tool calls). Repeated frames of
+ * the waiting message itself, user-role frames, and frames without msg_id
+ * never clear it.
+ */
+function updateWaitingForUser(state, event, eventMessageId) {
+    const parsed = parseStreamResponse(event);
+    if (hasWaitingForUserToolResult(parsed)) {
+        state.waitingForUser = true;
+        state.waitingForUserMessageId = eventMessageId ?? state.waitingForUserMessageId;
+        return;
+    }
+    if (!state.waitingForUser || eventMessageId === undefined)
+        return;
+    if (eventMessageId === state.waitingForUserMessageId)
+        return;
+    if (!hasAssistantOutput(parsed))
+        return;
+    state.waitingForUser = false;
+    state.waitingForUserMessageId = undefined;
+}
+function readParsedAgentMessage(parsed) {
+    if (parsed?.type === RespDataType.AgentMessage)
+        return parsed.agent_message;
+    if (parsed?.type === RespDataType.AgentMessageChunk)
+        return parsed.agent_message_chunk;
+    return undefined;
+}
+function hasAssistantOutput(parsed) {
+    const message = readParsedAgentMessage(parsed);
+    if (!message || message.role === Role.User)
+        return false;
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
+        return true;
+    return isNonEmptyString(message.msg_content) || isNonEmptyString(message.thinking_content);
+}
+function isNonEmptyString(value) {
+    return typeof value === 'string' && value.trim().length > 0;
+}
 function updateOutcome(state, event) {
     if (event.type === RuntimeEventType.STREAM_RESP) {
-        state.messageId = readAssistantMessageId(event) ?? state.messageId;
-        state.waitingForUser = hasWaitingForUserToolResult(event) || state.waitingForUser;
+        const eventMessageId = readAssistantMessageId(event);
+        state.messageId = eventMessageId ?? state.messageId;
+        state.replyMessageId = readReplyMessageId(event) ?? state.replyMessageId;
+        updateWaitingForUser(state, event, eventMessageId);
         return;
     }
     if (event.type !== RuntimeEventType.SESSION_STATUS)
@@ -146,8 +190,20 @@ function readAssistantMessageId(event) {
     }
     return undefined;
 }
-function hasWaitingForUserToolResult(event) {
-    const calls = readToolCalls(parseStreamResponse(event));
+/** msg_id of an assistant frame with visible text; see `replyMessageId`. */
+function readReplyMessageId(event) {
+    const message = readParsedAgentMessage(parseStreamResponse(event));
+    if (!message ||
+        message.role !== Role.Assistant ||
+        message.msg_type === MsgType.SystemEvent ||
+        !isNonEmptyString(message.msg_content) ||
+        typeof message.msg_id !== 'string' ||
+        !message.msg_id)
+        return undefined;
+    return message.msg_id;
+}
+function hasWaitingForUserToolResult(parsed) {
+    const calls = readToolCalls(parsed);
     if (!Array.isArray(calls))
         return false;
     return calls.some(isWaitingForUserCall);

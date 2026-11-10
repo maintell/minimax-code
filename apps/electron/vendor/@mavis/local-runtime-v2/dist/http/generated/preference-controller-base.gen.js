@@ -20,6 +20,16 @@ export class PreferenceControllerBase {
         void req;
         throw new NotImplementedError('putWorkspaceIndexingPreference');
     }
+    async getComputerUseDefaultPreference(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getComputerUseDefaultPreference');
+    }
+    async putComputerUseDefaultPreference(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('putComputerUseDefaultPreference');
+    }
     async getComposerSendBehavior(ctx, req) {
         void ctx;
         void req;

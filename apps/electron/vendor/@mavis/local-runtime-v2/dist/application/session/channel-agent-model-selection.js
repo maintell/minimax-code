@@ -1,4 +1,5 @@
 import yaml from 'yaml';
+import { logger } from '@mavis/shared/local-runtime-logging';
 import { AgentServiceError, } from '../../service/agent/index.js';
 import { AgentModelSelectionError, freezeManagedQueueModel, formatModelKey, isMiniMaxM3ModelId, LocalModelProviderError, modelConfigForRef, normalizeModelThinkingEffort, normalizeModelThinkingEffortOptions, parseSourceQualifiedModelKey, previewAgentModelSelection, resolveModelThinkingMiddleEffort, resolveEffectiveAgentModelSelection, } from '../../service/model-system/index.js';
 /** Stable rejection that the Queue boundary can project without exposing an internal cause. */
@@ -30,6 +31,11 @@ export async function resolveChannelAgentQueueModel(input) {
     const modelSource = sourceForDocument(document);
     const configured = configuredSelection(document);
     const resolved = resolveStrictSelection(input.config, configured, modelSource);
+    // Only an Agent-owned model is written back; an AUTO Agent stays AUTO and its
+    // retired Runtime default is rewritten by the official catalog sync.
+    if (resolved.replacedFrom && modelSource === 'agent') {
+        await persistReplacedAgentModel(input, document, resolved);
+    }
     const requested = queueModelFromResolved(resolved, modelSource);
     try {
         const frozen = freezeManagedQueueModel(input.config, { sessionKind: 'channel' }, requested);
@@ -44,6 +50,43 @@ export async function resolveChannelAgentQueueModel(input) {
         throw modelSelectionError(error, input.config, configured, modelSource);
     }
 }
+/**
+ * Lazily writes a retired-model replacement back to the bound Agent through the
+ * canonical CAS writer, so the Agent file stops naming the retired model.
+ * Best effort: a conflict or write failure keeps the read-time replacement.
+ */
+async function persistReplacedAgentModel(input, document, resolved) {
+    const replacedFrom = resolved.replacedFrom;
+    if (!replacedFrom || !input.agents.putConfigDocument)
+        return;
+    try {
+        await input.agents.putConfigDocument({
+            requestRef: `agent:${document.exactOwnerName}`,
+            content: patchChannelAgentModelContent(document, input.config, {
+                providerId: resolved.providerId,
+                modelId: resolved.modelId,
+                replaceSelection: true,
+            }),
+            expectedRevision: document.revision,
+            ...(document.ownerKind === 'custom' && document.ownerInstanceId
+                ? { expectedOwnerInstanceId: document.ownerInstanceId }
+                : {}),
+        });
+        logger.info({
+            event: 'agent_model_replaced',
+            agent_name: document.exactOwnerName,
+            from_model: formatModelKey(replacedFrom.providerId, replacedFrom.modelId),
+            to_model: formatModelKey(resolved.providerId, resolved.modelId),
+        }, 'Persisted retired Agent model replacement');
+    }
+    catch (error) {
+        logger.warn({
+            event: 'agent_model_replacement_persist_failed',
+            agent_name: document.exactOwnerName,
+            error: error instanceof Error ? error.message : String(error),
+        }, 'Keeping read-time Agent model replacement');
+    }
+}
 /** Read-only model presentation for a channel Session; invalid stale config remains unselected. */
 export async function previewChannelAgentModelSelection(input) {
     try {
@@ -51,6 +94,8 @@ export async function previewChannelAgentModelSelection(input) {
         const configured = configuredSelection(document);
         return previewAgentModelSelection({
             config: input.config,
+            // Show what the next channel Turn will run; that Turn persists it.
+            replaceRetired: true,
             sources: configured.model !== undefined
                 ? [
                     {
@@ -127,6 +172,7 @@ function resolveStrictSelection(config, configured, modelSource) {
     try {
         const resolved = resolveEffectiveAgentModelSelection({
             config,
+            replaceRetired: true,
             sources: configured.model !== undefined
                 ? [
                     {

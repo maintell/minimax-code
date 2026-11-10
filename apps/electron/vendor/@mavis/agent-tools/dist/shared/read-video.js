@@ -15,7 +15,7 @@
  * lock-step: caps semantics, error strings, and `details.media` shape are
  * the single source of truth here.
  */
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat } from './physical-fs.js';
 import { extname } from 'node:path';
 import { isSupportedNativeVideoMime } from './multimodal-attachments.js';
 // Extension -> MIME map for read-path inference. The supported-MIME allowlist

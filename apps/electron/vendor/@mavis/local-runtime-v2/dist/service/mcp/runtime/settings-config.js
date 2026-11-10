@@ -1,6 +1,7 @@
 import { Type } from '@sinclair/typebox';
 import fs from 'node:fs';
 import { inferTransport, readRecord } from './config.js';
+import { assertOAuthHeaderExclusive, McpOAuthConfigError, parseMcpOAuthConfig, } from '../auth/oauth-config.js';
 import { LocalMcpSettingsError } from '../errors.js';
 const DEFAULT_INPUT_SCHEMA = Type.Object({}, { additionalProperties: true });
 export function validateConfiguredServerName(name) {
@@ -34,14 +35,27 @@ export function configuredInputFromStored(config) {
     }
     if ((transport === 'http' || transport === 'streamable-http' || transport === 'sse') &&
         config.url) {
-        return {
-            transport,
-            url: config.url,
-            ...(config.headers ? { headers: { ...config.headers } } : {}),
-            ...common,
-        };
+        return remoteInputFromStored(transport, config.url, config, common);
     }
     return undefined;
+}
+/** A stored `oauth` block that is no longer valid makes the entry unprojectable. */
+function remoteInputFromStored(transport, url, config, common) {
+    let oauth;
+    try {
+        oauth = config.oauth === undefined ? undefined : parseMcpOAuthConfig(config.oauth, 'user');
+        assertOAuthHeaderExclusive(oauth, config.headers);
+    }
+    catch {
+        return undefined;
+    }
+    return {
+        transport,
+        url,
+        ...(config.headers ? { headers: { ...config.headers } } : {}),
+        ...(oauth ? { oauth } : {}),
+        ...common,
+    };
 }
 function configuredCommon(config) {
     return {
@@ -95,11 +109,38 @@ function storedTransportFields(input, common) {
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
         throw new LocalMcpSettingsError(400, 'A valid HTTP or HTTPS URL is required for remote MCP servers.', 'MCP_CONFIG_INVALID');
     }
-    return {
-        ...common,
-        url: url.toString(),
-        ...(input.headers ? { headers: normalizeConfiguredKeyValues(input.headers, 'header') } : {}),
-    };
+    return { ...common, url: url.toString(), ...storedCredentialFields(input) };
+}
+function storedCredentialFields(input) {
+    const headers = input.headers ? normalizeConfiguredKeyValues(input.headers, 'header') : undefined;
+    const oauth = input.oauth === undefined ? undefined : settingsOAuthConfig(input.oauth, headers);
+    return { ...(headers ? { headers } : {}), ...(oauth ? { oauth: { ...oauth } } : {}) };
+}
+/**
+ * Old runtime upsert applies the settings OAuth rules, so it can never store a
+ * client secret or an entry that later fails its server's projection.
+ */
+export function withValidatedOAuth(config) {
+    if (config.oauth === undefined)
+        return config;
+    const { oauth: raw, ...rest } = config;
+    const oauth = settingsOAuthConfig(raw, config.headers);
+    return oauth ? { ...rest, oauth: { ...oauth } } : rest;
+}
+/** An empty block adds nothing over zero-config OAuth discovery, so it is not stored. */
+function settingsOAuthConfig(value, headers) {
+    try {
+        const oauth = parseMcpOAuthConfig(value, 'user');
+        if (Object.keys(oauth).length === 0)
+            return undefined;
+        assertOAuthHeaderExclusive(oauth, headers);
+        return oauth;
+    }
+    catch (error) {
+        if (!(error instanceof McpOAuthConfigError))
+            throw error;
+        throw new LocalMcpSettingsError(400, error.message, 'MCP_CONFIG_INVALID');
+    }
 }
 export class ConfiguredMcpConnectionTimeoutError extends Error {
     constructor() {
@@ -197,6 +238,7 @@ export function assertStoredMcpServerConfig(config) {
     assertOptionalPositiveInteger(config, 'timeout');
     assertOptionalStoredTransport(config['type']);
     assertOptionalStoredTools(config['tools']);
+    // `oauth` is never checked here: an invalid block breaks only that server's projection.
 }
 function assertOptionalString(config, key) {
     if (config[key] !== undefined && typeof config[key] !== 'string')
@@ -321,7 +363,8 @@ export function toManagedServerSummary(name, rawConfig, config) {
         enabled: config.enabled !== false,
         transport: inferTransport(config),
         ...(config.description ? { description: config.description } : {}),
-        configJson: JSON.stringify(rawConfig),
+        // The ignored legacy `auth` block may hold tokens and is never projected.
+        configJson: JSON.stringify({ ...rawConfig, auth: undefined }),
     };
 }
 //# sourceMappingURL=settings-config.js.map

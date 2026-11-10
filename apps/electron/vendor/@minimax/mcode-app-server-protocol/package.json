@@ -1,0 +1,20 @@
+{
+  "name": "@minimax/mcode-app-server-protocol",
+  "version": "0.1.0",
+  "description": "Fixed V1 wire contract for the MCode SSH app-server.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mavis/shared": "file:../../@mavis/shared"
+  }
+}

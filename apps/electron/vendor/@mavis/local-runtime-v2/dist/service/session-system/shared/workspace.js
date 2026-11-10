@@ -63,8 +63,7 @@ function hasLegacyAgentDataDirectoryAlias(active, legacy) {
         return (active.dataDirBase.toLowerCase() === NEW_DATA_DIR_BASENAME &&
             legacy.dataDirBase.toLowerCase() === LEGACY_DATA_DIR_BASENAME);
     }
-    return (active.dataDirBase === NEW_DATA_DIR_BASENAME &&
-        legacy.dataDirBase === LEGACY_DATA_DIR_BASENAME);
+    return (active.dataDirBase === NEW_DATA_DIR_BASENAME && legacy.dataDirBase === LEGACY_DATA_DIR_BASENAME);
 }
 function parseAgentWorkspacePath(value, agentName) {
     const flavor = pathFlavor(value);

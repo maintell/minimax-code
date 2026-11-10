@@ -2,7 +2,7 @@ import { createReadStream } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, isAbsolute } from 'node:path';
 import { Readable } from 'node:stream';
-import { resolveWorkspacePath } from './operations/workspace-path.js';
+import { resolveWorkspacePath } from './operations/filesystem/workspace-path.js';
 // 超过 8 MiB 的 HTML 保持流式读取，避免为选区 bridge 缓冲过大的文档。
 const HTML_PREVIEW_INJECTABLE_MAX_BYTES = 8 * 1024 * 1024;
 const HTML_PREVIEW_MIME_TYPES = new Map([

@@ -368,28 +368,6 @@ function toResultSegment(items) {
     }
     return { type: 'deliver-assets', items };
 }
-function toResultSegments(items) {
-    const segments = [];
-    let currentItems = [];
-    let currentKind = null;
-    const flush = () => {
-        if (currentItems.length > 0) {
-            segments.push(toResultSegment(currentItems));
-        }
-        currentItems = [];
-        currentKind = null;
-    };
-    for (const item of items) {
-        const kind = !item.deleted && isImageAsset(item) ? 'image' : 'asset';
-        if (currentKind && currentKind !== kind) {
-            flush();
-        }
-        currentKind = kind;
-        currentItems.push(item);
-    }
-    flush();
-    return segments;
-}
 export function parseDeliverAssetsContent(content, options = {}) {
     const cloudDrivePathDetection = options.cloudDrivePathDetection ?? false;
     const recoveredContent = normalizeNestedFilePathMediaSources(content);
@@ -471,7 +449,7 @@ export function parseDeliverAssetsContent(content, options = {}) {
         if (pendingMediaItems.length === 0) {
             return;
         }
-        segments.push(...toResultSegments(pendingMediaItems));
+        segments.push(toResultSegment(pendingMediaItems));
         pendingMediaItems = [];
     };
     for (const segment of rawSegments) {
@@ -483,7 +461,9 @@ export function parseDeliverAssetsContent(content, options = {}) {
         if (segment.type === 'deliver-assets') {
             const uniqueItems = filterNewItems(segment.items);
             if (uniqueItems.length > 0) {
-                segments.push(...toResultSegments(uniqueItems));
+                // Keep one delivery together, including interleaved images, videos and files.
+                // Rendering decides how to present each run without losing the group boundary.
+                segments.push(toResultSegment(uniqueItems));
             }
             continue;
         }

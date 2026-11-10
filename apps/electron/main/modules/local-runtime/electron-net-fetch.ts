@@ -44,7 +44,7 @@ export function createElectronNetFetch(electronApi, options = {}) {
         if (!isHttpFetchInput(input)) {
             return electronFetch.call(electronNet, input, init) ?? globalThis.fetch(input, init);
         }
-        return fetchHttpResource(electronNet, electronRequest, input, init, options.onResponseHeaderRejected);
+        return fetchHttpResource(electronNet, electronRequest, input, init, options.onResponseHeaderRejected, options.captureTransportObserver);
     };
 }
 export function isElectronNetFetchByteStringError(error) {
@@ -52,8 +52,21 @@ export function isElectronNetFetchByteStringError(error) {
         typeof error === 'object' &&
         error.code === ELECTRON_NET_FETCH_BYTESTRING_CODE);
 }
-function fetchHttpResource(electronNet, electronRequest, input, init, onResponseHeaderRejected) {
+function fetchHttpResource(electronNet, electronRequest, input, init, onResponseHeaderRejected, captureTransportObserver) {
     return new Promise((resolve, reject) => {
+        // Captured synchronously so native callbacks report into the caller's
+        // context. Every notification is isolated from the request lifecycle.
+        const observer = captureObserver(captureTransportObserver);
+        const notify = (event) => {
+            if (!observer)
+                return;
+            try {
+                event(observer);
+            }
+            catch {
+                // Diagnostics must never affect the fetch result.
+            }
+        };
         let request;
         let fetchRequest;
         let signal;
@@ -97,6 +110,7 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
         function onAbort() {
             locallyAborted = true;
             const reason = getAbortReason(signal);
+            notify((target) => target.failed('signal_abort', reason));
             // Reject before aborting because Electron can synchronously emit a late
             // request error from abort(). The fetch contract should still report the signal reason.
             settleReject(reason);
@@ -106,24 +120,28 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
             cleanupSignal();
         }
         function onRequestError(error) {
+            notify((target) => target.failed('request', error));
             cleanupSignal();
             cancelRequestBody(error);
             destroyResponse(response, toResponseError(error));
             settleReject(normalizeRequestError(error));
         }
         function onResponseError(error) {
+            notify((target) => target.failed('response', error));
             cleanupSignal();
             cancelRequestBody(error);
             settleReject(normalizeRequestError(error));
         }
         function onResponseAborted() {
             const error = new Error('Electron net.request response aborted');
+            notify((target) => target.failed('response_aborted', error));
             cleanupSignal();
             cancelRequestBody(error);
             destroyResponse(response, error);
             settleReject(error);
         }
         function onResponseEnd() {
+            notify((target) => target.bodyRead());
             cleanupSignal();
         }
         function onResponse(nextResponse) {
@@ -137,6 +155,11 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
                 destroyResponse(response, createAbortError());
                 return;
             }
+            notify((target) => target.headersReceived({
+                status: nextResponse.statusCode,
+                contentType: nextResponse.headers?.['content-type'],
+                contentLength: nextResponse.headers?.['content-length'],
+            }));
             try {
                 if (!fetchRequest)
                     throw new Error('Electron net.request missing Request');
@@ -161,6 +184,7 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
                 else {
                     settleReject(error);
                 }
+                notify((target) => target.failed('adapter', error));
                 cancelRequestBody(error);
                 destroyResponse(response, toResponseError(error));
                 abortRequest();
@@ -171,18 +195,22 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
                 return;
             if (!fetchRequest.body) {
                 request.end();
+                notify((target) => target.requestBodyFinished());
                 return;
             }
             const writable = Writable.toWeb(request);
             void fetchRequest.body
                 .pipeTo(writable, { preventClose: true, signal: requestBodyAbortController.signal })
                 .then(() => {
-                if (!locallyAborted)
+                if (!locallyAborted) {
                     request?.end();
+                    notify((target) => target.requestBodyFinished());
+                }
             })
                 .catch((error) => {
                 if (locallyAborted)
                     return;
+                notify((target) => target.failed('adapter', error));
                 cleanupSignal();
                 cancelRequestBody(error);
                 settleReject(error);
@@ -198,6 +226,7 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
                 return;
             }
             request = electronRequest.call(electronNet, buildHttpRequestOptions(fetchRequest));
+            notify((target) => target.requestCreated());
             request.on('response', onResponse);
             request.on('error', onRequestError);
             signal.addEventListener('abort', onAbort, { once: true });
@@ -210,6 +239,7 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
             endRequestBody();
         }
         catch (error) {
+            notify((target) => target.failed('adapter', error));
             cleanupSignal();
             cancelRequestBody(error);
             destroyResponse(response, toResponseError(error));
@@ -217,6 +247,16 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
             abortRequest();
         }
     });
+}
+function captureObserver(capture) {
+    if (!capture)
+        return undefined;
+    try {
+        return capture() ?? undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 function buildHttpRequestOptions(request) {
     const origin = request.headers.get('origin') ?? undefined;
@@ -252,6 +292,10 @@ function setRequestHeaders(request, fetchRequest) {
     }
     const setHeader = request.setHeader.bind(request);
     fetchRequest.headers.forEach((value, name) => {
+        // Chromium calculates the upload length; setting it explicitly makes
+        // net.request reject the upload with net::ERR_INVALID_ARGUMENT.
+        if (name === 'content-length')
+            return;
         setHeader(name, value);
     });
 }
@@ -562,12 +606,15 @@ function createAbortError() {
  * should omit the override and let local-runtime fall back to `globalThis.fetch`
  * when this returns undefined.
  */
-export function resolveElectronNetFetch(onResponseHeaderRejected) {
+export function resolveElectronNetFetch(onResponseHeaderRejected, transportOptions = {}) {
     if (!process.versions.electron)
         return undefined;
     try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
-        return createElectronNetFetch(require('electron'), { onResponseHeaderRejected });
+        return createElectronNetFetch(require('electron'), {
+            onResponseHeaderRejected,
+            ...transportOptions,
+        });
     }
     catch {
         return undefined;

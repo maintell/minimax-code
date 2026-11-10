@@ -20,13 +20,17 @@
  *   streams and re-request ports.
  */
 
+import { pathToFileURL } from "node:url";
 import { getConfig } from "@mavis/config";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
 import logger from "../../../utils/logger";
-import { destroyAllManagedMiniAppTabs } from "../../browser/embedded-browser-manager";
+import { recordAuthRefreshExecutionGap } from "../../auth/refresh-environment";
+import { managedMiniAppAttentionSnapshot, subscribeManagedMiniAppAttention, destroyAllManagedMiniAppTabs } from "../../browser/embedded-browser-manager";
+import { MiniAppAttentionReporter } from "../../browser/miniapp-attention";
 import { enqueueElectronObservabilityEvent, isElectronObservabilityShuttingDown, getElectronObservabilityAppInstanceId } from "../../observability/outbox";
 import { recordElectronStartupRuntimeReady } from "../../observability/startup-performance";
 import { resolveLocalRuntimeDataDir } from "../data-dir";
+import { notifyDataDirRuntimeReady, notifyDataDirRuntimeTerminalFailure, notifyDataDirRuntimeStartAttempt } from "../data-dir-relocation-guard";
 import { prepareLocalRuntimeNativeSqliteEnv } from "../native-sqlite-env";
 import { resolveLocalRuntimeLaunchPlan } from "../test-data-isolation";
 import { resetUtilityRuntimeStartBlockForTests, isUtilityRuntimeStartBlocked } from "../runtime-start-guard";
@@ -45,6 +49,10 @@ import { DEFAULT_RUNTIME_MEMORY_MONITOR_INTERVAL_MS, MIN_RUNTIME_MEMORY_MONITOR_
 let hooks = null;
 let routingContext;
 configureUtilityRuntimeDiagnosticsLogger(logger);
+// Main's Mini App tab report, coalesced over bursts of changes. A runtime that is not ready skips
+// it and receives the full snapshot when it becomes ready.
+const miniAppAttentionReporter = new MiniAppAttentionReporter(managedMiniAppAttentionSnapshot, reportMiniAppAttention);
+subscribeManagedMiniAppAttention(() => miniAppAttentionReporter.changed());
 export function registerUtilityRuntimeMainHooks(next) {
     hooks = next;
 }
@@ -107,7 +115,8 @@ function importEsm(specifier) {
     }
     // eslint-disable-next-line no-new-func -- Preserve native dynamic import in Electron's CJS main process.
     const dynamicImport = new Function('specifier', 'return import(specifier)');
-    return dynamicImport(specifier);
+    // Resolve from Electron main even if V8 reuses an import callback from another package.
+    return dynamicImport(pathToFileURL(require.resolve(specifier)).href);
 }
 /**
  * Lazy dynamic import for `@mavis/shared/runtime-transport`: `@mavis/shared`
@@ -177,15 +186,44 @@ function failureTypeForReasonCode(reasonCode) {
     }
     return 'startup_error';
 }
+let networkServiceGoneListenerInstalled = false;
+/**
+ * Forwards Network Service exits to the utility runtime. After Chromium
+ * restarts the Network Service, the utility's Electron `net` factory can stay
+ * bound to the dead context, so the runtime switches to Node fetch.
+ */
+function installNetworkServiceGoneListener() {
+    if (networkServiceGoneListenerInstalled)
+        return;
+    networkServiceGoneListenerInstalled = true;
+    void import('electron').then(({ app }) => {
+        app.on('child-process-gone', (_event, details) => {
+            if (details.type !== 'Utility' || details.serviceName !== 'network.mojom.NetworkService') {
+                return;
+            }
+            logger.warn(`[UtilityRuntime] network service gone (reason=${details.reason}); notifying runtime`);
+            manager?.notifyNetworkServiceGone();
+        });
+    })
+        .catch(() => {
+        logger.warn('[UtilityRuntime] network service listener install failed');
+    });
+}
 function getManager() {
     if (manager)
         return manager;
+    installNetworkServiceGoneListener();
     const launchPlan = resolveLocalRuntimeLaunchPlan(process.env.NEXT_PUBLIC_BUILD_ENV, process.env.MAVIS_LOCAL_RUNTIME_ISOLATION);
     const lifecycleObserver = new UtilityRuntimeObserver({
         emit: enqueueElectronObservabilityEvent,
         isQuitInProgress: isElectronObservabilityShuttingDown,
     });
-    executionContinuityController ?? (executionContinuityController = createExecutionContinuity());
+    if (!executionContinuityController) {
+        executionContinuityController = createExecutionContinuity();
+        // Read-only breadcrumb for OAuth refresh summaries; listener errors are
+        // already isolated by the continuity controller.
+        executionContinuityController.continuity.onGap((observation) => recordAuthRefreshExecutionGap(observation.executionGapMs));
+    }
     manager = new LocalRuntimeUtilityProcessManager({
         bootstrapTimeoutMs: launchPlan.utilityBootstrapTimeoutMs,
         ...(isUtilityRuntimeHealthRecoveryDisabled() ? { runtimeHealthTimeoutMs: false } : {}),
@@ -215,6 +253,7 @@ function getManager() {
             connectRuntimeChannel: (channel) => manager?.connectComputerUseChannel(channel) ?? false,
         }),
         getRunawayGuardConfig: () => hooks?.getRunawayGuardConfig?.() ?? {},
+        getPromptSuggestionPolicy: () => hooks?.getPromptSuggestionPolicy?.() ?? {},
         getToolResultCompactionConfig: () => hooks?.getToolResultCompactionConfig?.() ?? {},
         getCollectionPolicy: () => hooks?.getCollectionPolicy?.() ?? DEFAULT_COLLECTION_POLICY,
         getStartupExecutionPolicy: () => hooks?.getStartupExecutionPolicy?.(),
@@ -225,6 +264,10 @@ function getManager() {
         getBrowserAdapter: () => hooks?.getBrowserAdapter(),
         ...(hooks?.openMiniAppSurface ? { openMiniAppSurface: hooks.openMiniAppSurface } : {}),
         ...(hooks?.closeMiniAppSurface ? { closeMiniAppSurface: hooks.closeMiniAppSurface } : {}),
+        ...(hooks?.sleepMiniAppSurface ? { sleepMiniAppSurface: hooks.sleepMiniAppSurface } : {}),
+        ...(hooks?.requestMiniAppToolApproval
+            ? { requestMiniAppToolApproval: hooks.requestMiniAppToolApproval }
+            : {}),
         isMiniAppSurfaceEnabled: () => getConfig().beta.filePanelBrowser === true,
         onMiniAppGenerationLost: () => {
             destroyAllManagedMiniAppTabs();
@@ -247,6 +290,7 @@ function getManager() {
         },
         onRuntimeReady: () => {
             runtimeFailReason = null;
+            notifyDataDirRuntimeReady();
             // CUA may finish first while local-runtime is still starting. Reconcile
             // the pending transferred port as soon as the runtime publishes ready;
             // otherwise the CUA activation would report success but leave v2 on the
@@ -261,12 +305,15 @@ function getManager() {
                     .catch(() => logger.warn('[UtilityRuntime] memory monitor resume failed'));
             }
             recordElectronStartupRuntimeReady();
+            // A new runtime knows nothing about the tabs Main holds; give it the full picture.
+            miniAppAttentionReporter.flush();
         },
         onRuntimeFailed: ({ message, terminal, reasonCode }) => {
             runtimeFailReason = message;
             // A terminal verdict must reach windows that are already open; the
             // once-per-window startup push cannot see a mid-session latch.
             if (terminal) {
+                notifyDataDirRuntimeTerminalFailure(reasonCode);
                 broadcastRuntimeFailed({
                     type: failureTypeForReasonCode(reasonCode),
                     message,
@@ -291,6 +338,7 @@ export function isUtilityRuntimeHealthRecoveryDisabled(env = process.env) {
 export async function ensureUtilityRuntimeStarted(options = {}) {
     if (isUtilityRuntimeStartBlocked())
         return false;
+    notifyDataDirRuntimeStartAttempt();
     return getManager().ensureStarted(options);
 }
 /** Lazily starts the sibling CUA utility after a conversation explicitly opts
@@ -303,13 +351,95 @@ export async function ensureComputerUseUtilityStarted() {
         connectRuntimeChannel: (channel) => getManager().connectComputerUseChannel(channel),
     });
 }
+export async function proposeUtilityPptEdits(input, signal) {
+    if (isUtilityRuntimeStartBlocked())
+        throw new Error('proposal_failed');
+    return getManager().proposePptEdits(input, signal);
+}
+export async function listUtilityPptArtifacts(sessionId) {
+    if (isUtilityRuntimeStartBlocked())
+        throw new Error('PPT preview runtime unavailable');
+    return getManager().listPptArtifacts(sessionId);
+}
 export async function requestUtilityMiniApp(method, pluginId, signal) {
+    assertMiniAppRuntimeStartable();
+    return getManager().requestMiniApp(method, pluginId, signal);
+}
+export async function setUtilityMiniAppPermission(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().setMiniAppPermission(input);
+}
+/**
+ * Fire-and-forget: never starts the runtime. A report lost to a restart is replaced by the full
+ * snapshot sent on the next ready.
+ */
+function reportMiniAppAttention(snapshot) {
+    void manager?.reportMiniAppAttention(snapshot).catch(() => {
+        logger.warn('[UtilityRuntime] Mini App attention report failed');
+    });
+}
+export async function runUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().runMiniAppAgent(input, options);
+}
+export async function replyUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().replyMiniAppAgent(input);
+}
+export async function openUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().openMiniAppAgent(input);
+}
+export async function modelsUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().modelsMiniAppAgent(input);
+}
+export async function agentsUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().agentsMiniAppAgent(input);
+}
+/** Page-path `tool.request`; `pluginId` was resolved by Main from the sending tab. */
+export async function requestUtilityMiniAppTools(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().requestMiniAppTools(input);
+}
+export async function createUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().createMiniAppAgent(input);
+}
+/** Host side panel now shows `sessionId`, so its asks can wait for an answer there. */
+export async function panelOpenedUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().reportMiniAppAgentPanel('agent.panelOpened', input);
+}
+/** Host side panel no longer shows `sessionId`. */
+export async function panelClosedUtilityMiniAppAgent(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().reportMiniAppAgentPanel('agent.panelClosed', input);
+}
+export async function answerUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().answerMiniAppAgent(input, options);
+}
+/** Page-path observer; settles when the subscription ends. */
+export async function observeUtilityMiniAppAgent(input, options) {
+    assertMiniAppRuntimeStartable();
+    return getManager().observeMiniAppAgent(input, options);
+}
+export async function listUtilityMiniAppAgentSessions(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().listMiniAppAgentSessions(input);
+}
+export async function getUtilityMiniAppAgentSession(input) {
+    assertMiniAppRuntimeStartable();
+    return getManager().getMiniAppAgentSession(input);
+}
+function assertMiniAppRuntimeStartable() {
     if (isUtilityRuntimeStartBlocked()) {
         throw Object.assign(new Error('Mini App runtime is unavailable'), {
             code: 'runtime_unavailable',
         });
     }
-    return getManager().requestMiniApp(method, pluginId, signal);
 }
 export function isUtilityRuntimeReady() {
     return manager?.isReady() ?? false;
@@ -402,6 +532,9 @@ export function setUtilityRuntimeContextWindowUsageEnabled(enabled) {
 export function setUtilityRuntimeRunawayGuardConfig(config) {
     manager?.setRunawayGuardConfig(config);
 }
+export function setUtilityRuntimePromptSuggestionPolicy(policy) {
+    manager?.setPromptSuggestionPolicy(policy);
+}
 export function setUtilityRuntimeToolResultCompactionConfig(config) {
     manager?.setToolResultCompactionConfig(config);
 }
@@ -425,21 +558,38 @@ export async function collectUtilityRuntimeSessionReport(sessionId) {
         throw new Error('session_report_runtime_unavailable');
     return manager.collectSessionReport(sessionId);
 }
+/** Internal-build feedback: the utility writes the Session's Workspace snapshot into `outputDir`. */
+export async function captureUtilityRuntimeWorkspaceSnapshot(sessionId, outputDir) {
+    if (!manager)
+        throw new Error('workspace_snapshot_runtime_unavailable');
+    return manager.captureWorkspaceSnapshot(sessionId, outputDir);
+}
 export async function stopUtilityRuntime() {
     if (!manager) {
-        stopComputerUseUtility();
+        await stopComputerUseUtilitySafely();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
         return { status: 'exited' };
     }
+    // Computer Use drains alongside the runtime so a slow runtime stop does not consume the
+    // quit budget the bridge needs to stop its native daemon.
+    const computerUseStopped = stopComputerUseUtilitySafely();
     try {
         return await manager.stop();
     }
     finally {
-        stopComputerUseUtility();
+        await computerUseStopped;
+        // The draining runtime may have requested Computer Use again; stop that generation too.
+        await stopComputerUseUtilitySafely();
         runtimeFailReason = null;
         runtimeHeapSamplingStartedAtMs = null;
     }
+}
+/** A Computer Use stop failure is logged and never changes the runtime stop result. */
+function stopComputerUseUtilitySafely() {
+    return stopComputerUseUtility().catch((error) => {
+        logger.warn(`[UtilityRuntime] computer use stop failed: ${error instanceof Error ? error.name : 'unknown'}`);
+    });
 }
 /**
  * Renderer port hand-off: returns whether a MessagePort pair was delivered.

@@ -31,11 +31,8 @@
  *
  * Schema passthrough
  * ------------------
- * `def.schema` is the raw `inputSchema` from the MCP server, cast to
- * `TSchema`. cloud-runtime never introspects it; pi-agent forwards it to
- * the LLM provider as a JSON Schema fragment, which is the same wire shape
- * MCP servers publish. Mismatches would surface as LLM call-side parameter
- * errors rather than crashing the bridge.
+ * `def.schema` retains the raw JSON Schema from the MCP server. The same
+ * schema drives model disclosure and host argument validation before dispatch.
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -132,9 +129,7 @@ function buildRuntimeTool(cfg, connection, remote, identityProvider) {
     const def = {
         name: localName,
         description: remote.description ?? '',
-        // `inputSchema` is a JSON Schema fragment per MCP spec; cloud-runtime
-        // never introspects it. The cast bridges into agent-core's typebox-
-        // flavoured slot which pi-agent forwards to the LLM as JSON Schema.
+        // Retain the provider schema for both disclosure and dispatch validation.
         schema: (remote.inputSchema ?? { type: 'object', properties: {} }),
     };
     const impl = {
@@ -158,7 +153,7 @@ function buildRuntimeTool(cfg, connection, remote, identityProvider) {
             }
         },
     };
-    return { def, impl };
+    return { def, impl, source: 'configured' };
 }
 /**
  * Flatten an MCP `tools/call` result into a cloud-runtime `ToolResult`.

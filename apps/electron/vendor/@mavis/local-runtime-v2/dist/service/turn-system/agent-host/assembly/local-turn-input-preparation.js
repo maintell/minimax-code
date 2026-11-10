@@ -1,6 +1,8 @@
+import { detectReferencedOfficialHostCapabilityPlugins } from './local-turn-plugin-capabilities.js';
 import { createCanonicalAgentHostSteeringInput, createCanonicalAgentHostUserInput, } from '../canonical-user-input.js';
 import { createBackgroundTaskHostMetadata } from '../history/background/host-metadata.js';
 import { assertAgentHostCapabilityAvailable } from '../empty-dependencies.js';
+import { messagesCarrySessionId } from '../compaction/session-identity.js';
 import { prepareLocalInlineMedia, } from '../preparation/inline-media.js';
 import { projectLocalAgentReferencesForModel, } from '../preparation/agent-prompt-surface.js';
 /**
@@ -22,27 +24,18 @@ export class LocalTurnInputPreparer {
         const { batchInputs, canonicalUserInput, promptText, promptTexts, genuineUserQueryText, genuineUserQueryTexts, } = await this.prepareInitialPromptBatch(input, projectAgentReferences);
         const attachments = await this.prepareAttachments({
             lease: input.lease,
-            preparation: input.preparation,
             messages: canonicalUserInput.messages,
             messageIndexOffset: 0,
         });
         const capabilities = modelCapabilities(input.preparation.agentConfig);
-        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities);
-        const systemValue = await this.options.reminders.buildSystem({
-            session: input.session,
-            agent: input.agent,
-            agentConfig: input.preparation.agentConfig,
-            promptText,
-            turnId: input.lease.turnId,
-            ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
-        });
-        const system = validateSystemReminder(systemValue);
+        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities, this.options.getImageEncoding?.());
+        const system = validateSystemReminder(await this.options.reminders.buildSystem(systemReminderInput(input, promptText)));
         const systemBlock = optionalReminderBlock('system', system.content);
         system.finalizeTelemetry?.({
             content: systemBlock,
             ...(system.diagnostic !== undefined ? { diagnostic: system.diagnostic } : {}),
         });
-        const attachmentBlock = buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities);
+        const attachmentBlock = buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities, selectedMedia.dimensionNotes);
         const skillBlock = buildSlashSkillReminder(canonicalUserInput, input.preparation.agentConfig);
         const channelContext = canonicalUserInput.messages.find((message) => message.channelContext)?.channelContext;
         return {
@@ -56,7 +49,7 @@ export class LocalTurnInputPreparer {
                             .filter((item) => keys.has(item.key))
                             .map((item) => item.attachment);
                         return {
-                            text: promptTexts[index],
+                            text: peerSessionEnvelope(member.messages, promptTexts[index]),
                             ...(inline.length > 0 ? { attachments: inline } : {}),
                             ...backgroundTaskOrigin(member.messages),
                         };
@@ -64,7 +57,11 @@ export class LocalTurnInputPreparer {
                     initialBatchGenuineUserQueryTexts: genuineUserQueryTexts,
                 }
                 : {}),
-            promptText,
+            // The executor sends initialBatchMessages and drops this joined prompt
+            // whenever a batch exists, so wrapping it would label text nobody reads.
+            promptText: batchInputs
+                ? promptText
+                : peerSessionEnvelope(canonicalUserInput.messages, promptText),
             genuineUserQueryText,
             userMessage: {
                 ...(selectedMedia.attachments.length > 0 ? { attachments: selectedMedia.attachments } : {}),
@@ -136,14 +133,13 @@ export class LocalTurnInputPreparer {
         });
         const attachments = await this.prepareAttachments({
             lease: input.lease,
-            preparation: input.preparation,
             messages: canonical.messages,
             messageIndexOffset: input.messageIndexOffset,
         });
         const capabilities = modelCapabilities(input.preparation.agentConfig);
-        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities);
+        const selectedMedia = await prepareLocalInlineMedia(inlineMediaCandidates(attachments), capabilities, this.options.getImageEncoding?.());
         const reminderBlocks = [
-            buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities),
+            buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities, selectedMedia.dimensionNotes),
             buildSlashSkillReminder(canonical, input.preparation.agentConfig),
         ].filter((block) => Boolean(block));
         const projected = await this.projectCanonicalUserInput({
@@ -152,9 +148,26 @@ export class LocalTurnInputPreparer {
             provenance: input.provenance,
             projectAgentReferences,
         });
+        // Persist only after accepted input preparation succeeds; the frozen tool set stays unchanged.
+        if (input.computerUseAvailable === true &&
+            input.message.computerUse?.enable === true &&
+            input.provenance.source === 'api' &&
+            !canonical.messages.some((message) => message.origin || message.channelContext) &&
+            input.desktopCapabilities?.plugins.some((plugin) => plugin.name === 'computer-use' &&
+                plugin.source === 'official' &&
+                plugin.hostCapabilities?.includes('computer-use')) &&
+            detectReferencedOfficialHostCapabilityPlugins({
+                capabilities: input.desktopCapabilities,
+                capability: 'computer-use',
+                userInput: input.message,
+            }).includes('computer-use')) {
+            await this.options.persistComputerUseSelection?.({
+                sessionId: input.lease.sessionId,
+            });
+        }
         return {
             userMessage: {
-                text: [...reminderBlocks, projected.content].filter(Boolean).join('\n\n'),
+                text: peerSessionEnvelope(canonical.messages, [...reminderBlocks, projected.content].filter(Boolean).join('\n\n')),
                 ...(selectedMedia.attachments.length > 0 ? { attachments: selectedMedia.attachments } : {}),
                 ...backgroundTaskOrigin(canonical.messages),
             },
@@ -230,9 +243,7 @@ export class LocalTurnInputPreparer {
         })));
         if (raw.length === 0)
             return [];
-        const imageAttachmentCount = raw.filter(({ attachment }) => isImageAttachment(attachment)).length;
         const assets = this.options.assets;
-        const capabilities = modelCapabilities(input.preparation.agentConfig);
         assertAgentHostCapabilityAvailable('attachment-materializer', typeof assets?.materialize === 'function');
         if (!assets) {
             throw new TypeError('Attachment materializer is unavailable.');
@@ -244,9 +255,7 @@ export class LocalTurnInputPreparer {
                 turnId: input.lease.turnId,
                 messageIndex: entry.messageIndex,
                 attachmentIndex: entry.attachmentIndex,
-                imageAttachmentCount,
                 attachment: entry.attachment,
-                ...(capabilities ? { modelCapabilities: capabilities } : {}),
             })),
         })));
     }
@@ -301,6 +310,46 @@ function validateBackgroundReminder(value) {
     }
     return value;
 }
+/**
+ * The stored message stays the original text. The model sees who sent it only
+ * here, from the origin frozen at send time. A sender can otherwise close the
+ * envelope and open a second one naming any session, so those tags are
+ * neutralized inside the body.
+ */
+function peerSessionEnvelope(messages, text) {
+    const origin = messages.map((message) => message.origin).find(isPeerSessionOrigin);
+    if (!origin)
+        return text;
+    const title = origin.fromTitle?.trim();
+    const device = origin.fromDevice?.trim();
+    const attributes = [
+        `from_session_id="${escapeXmlAttribute(origin.fromSession)}"`,
+        ...(origin.fromAgent ? [`from_agent="${escapeXmlAttribute(origin.fromAgent)}"`] : []),
+        ...(title ? [`from_title="${escapeXmlAttribute(title)}"`] : []),
+        ...(device ? [`from_device="${escapeXmlAttribute(device)}"`] : []),
+    ];
+    const envelope = `<cross-session-message ${attributes.join(' ')}>\n${neutralizeEnvelope(text)}\n</cross-session-message>`;
+    return origin.remote === true ? `${envelope}\n${REMOTE_SENDER_REPLY_NOTE}` : envelope;
+}
+/** A remote sender cannot be reached from this runtime; its reply is read back from here. */
+const REMOTE_SENDER_REPLY_NOTE = 'The sender is a session on another device, so session send cannot reach it. Reply directly in this conversation; the sender reads your reply from here.';
+/** Narrows the union only; trust was already decided in `createCanonicalUserInput`. */
+function isPeerSessionOrigin(origin) {
+    return (origin !== undefined &&
+        'command' in origin &&
+        origin.command === 'session send' &&
+        origin.fromSession.trim().length > 0);
+}
+function neutralizeEnvelope(content) {
+    return content.replace(/<\s*\/?\s*cross-session-message/gi, (tag) => tag.replace('<', '&lt;'));
+}
+function escapeXmlAttribute(value) {
+    return value
+        .replaceAll('&', '&amp;')
+        .replaceAll('"', '&quot;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+}
 function backgroundTaskOrigin(messages) {
     const origins = messages.flatMap((message) => message.origin?.kind === 'background-task-terminal' ? [message.origin] : []);
     if (origins.length === 0)
@@ -314,6 +363,20 @@ function backgroundTaskOrigin(messages) {
             ],
             ...(observedCounts.length > 0 ? { observedTerminalCount: Math.max(...observedCounts) } : {}),
         }),
+    };
+}
+/** Turn facts the system reminder owner needs; optional facts are omitted, not undefined. */
+function systemReminderInput(input, promptText) {
+    return {
+        session: input.session,
+        agent: input.agent,
+        agentConfig: input.preparation.agentConfig,
+        promptText,
+        turnId: input.lease.turnId,
+        ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
+        ...(input.history && messagesCarrySessionId(input.history, input.session.sessionId)
+            ? { sessionIdInContext: true }
+            : {}),
     };
 }
 function validateSystemReminder(value) {
@@ -349,32 +412,50 @@ function hasValidInlineMedia(media) {
         media.sizeBytes >= 0 &&
         (media.data === undefined || typeof media.data === 'string'));
 }
-function buildAttachmentReminder(entries, inlinedKeys, capabilities) {
+function buildAttachmentReminder(entries, inlinedKeys, capabilities, dimensionNotes = new Map()) {
     if (entries.length === 0)
         return '';
+    // 内联序号按清单里 inline="true" 的条目顺序从 1 开始，与模型收到的媒体顺序一致。一次发多条消息
+    // (immediate-send batch)时，发给模型前会按消息顺序合并成一条，所以序号不分消息、连续编号。
+    let inlineCount = 0;
     const lines = entries.map(({ messageIndex, prepared }) => {
-        const inline = inlinedKeys.has(attachmentKey(messageIndex, prepared)) ? 'true' : 'false';
+        const key = attachmentKey(messageIndex, prepared);
+        const inlined = inlinedKeys.has(key);
+        if (inlined)
+            inlineCount += 1;
+        const inline = inlined ? 'true' : 'false';
+        const dimensionNote = dimensionNotes.get(key);
         return [
             `<attachment name="${escapeAttribute(prepared.fileName)}" mime="${escapeAttribute(prepared.mimeType)}" path="${escapeAttribute(prepared.filePath)}" message_index="${messageIndex + 1}" kind="${prepared.kind}" inline="${inline}">`,
-            attachmentWorkflowInstruction(prepared.kind, inline === 'true', capabilities),
+            attachmentWorkflowInstruction(prepared.kind, inlined ? inlineCount : undefined, capabilities),
+            ...(dimensionNote ? [dimensionNote] : []),
             '</attachment>',
         ].join('\n');
     });
     return [
         '<system-reminder>',
         'The user provided local attachments for this turn. Use the exact file paths below and do not guess filenames.',
+        'Attachments marked inline="true" are also attached to this message as media, in the order listed.',
         ...lines,
         '</system-reminder>',
     ].join('\n');
 }
-function attachmentWorkflowInstruction(kind, inlined, capabilities) {
-    if (inlined)
-        return 'This media attachment is also provided inline to the resolved model.';
+function attachmentWorkflowInstruction(kind, inlineIndex, capabilities) {
+    if (inlineIndex !== undefined) {
+        const position = `This media attachment is also provided inline as media item ${inlineIndex} of this message.`;
+        return kind === 'image'
+            ? `${position} The inline copy may be resized or re-encoded; the file at path is the original.`
+            : position;
+    }
     if (kind === 'image' && capabilities?.support_image !== true) {
         return 'The current model cannot read this image inline. Do not use the read tool to infer its visual contents. If images_understand is available, pass the exact path to it; otherwise explain the limitation and ask the user to switch to a multimodal model or provide a text description.';
     }
     if (kind === 'video' && capabilities?.support_video !== true) {
         return 'The current model cannot read this video inline. Do not use the read tool to infer its visual contents. If videos_understand is available, pass the exact path to it; otherwise explain the limitation and ask the user to switch to a multimodal model or provide a text description.';
+    }
+    // 模型支持图片但没内联：超限、超数量、格式不支持、无法解码都用同一句。
+    if (kind === 'image') {
+        return "This image is not provided inline because it exceeds this model's inline media limits or its format is not supported. To view it, use the read tool on the exact path first. If read rejects it as too large or in an unsupported format, save a compressed or converted copy inside the workspace and read that copy.";
     }
     return 'Use the exact local path with an appropriate file/tool workflow when its contents are needed.';
 }
@@ -439,7 +520,7 @@ export function prepareSteeringTeardownCanonicalInput(input) {
     });
     const reminder = buildAttachmentReminder(entries, inlinedKeys, TEARDOWN_ATTACHMENT_CAPABILITIES);
     return {
-        text: [reminder, canonical.text].filter(Boolean).join('\n\n'),
+        text: peerSessionEnvelope(canonical.messages, [reminder, canonical.text].filter(Boolean).join('\n\n')),
         attachments: inline,
     };
 }
@@ -500,19 +581,19 @@ function modelCapabilities(agentConfig) {
     return readRecord(readRecord(agentConfig.model)?.capabilities);
 }
 function buildSlashSkillReminder(canonical, agentConfig) {
-    const requested = canonical.messages.reduce((found, message) => {
-        if (found)
-            return found;
-        return /^\/([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?)(?:\s|$)/u.exec(message.text.trimStart())?.[1];
-    }, undefined);
-    if (!requested)
-        return '';
     const skills = Array.isArray(agentConfig.skills) ? agentConfig.skills : [];
-    const match = skills.find((skill) => {
-        const name = readString(readRecord(skill), 'name');
-        return name?.toLowerCase() === requested.toLowerCase();
-    });
-    const name = readString(readRecord(match), 'name');
+    const names = skills
+        .map((skill) => readString(readRecord(skill), 'name'))
+        .filter((name) => name !== undefined);
+    let name;
+    for (const message of canonical.messages) {
+        const requested = /^\/([A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?)(?:\s|$)/u.exec(message.text.trimStart())?.[1];
+        if (!requested)
+            continue;
+        name = names.find((candidate) => candidate.toLowerCase() === requested.toLowerCase());
+        if (name)
+            break;
+    }
     return name
         ? [
             '<system-reminder>',

@@ -1,4 +1,5 @@
 import { EventBus } from './infra/event-bus/index.js';
+import { startHeapUsageMetrics } from './infra/observability/heap-usage-metrics.js';
 import { createForkWorktreeAdapter } from './infra/git/fork-worktree-adapter.js';
 import { createProcessLocalRuntimeOwnerIdentity, createRuntimeOwnerIdentity, } from './infra/runtime-owner/index.js';
 import { Scheduler } from './infra/scheduler/index.js';
@@ -30,6 +31,7 @@ export async function createBackgroundRuntime(options) {
     let maintenancePromise;
     let stopPromise;
     let closePromise;
+    let heapUsageMetrics;
     const maintenanceTasks = [];
     if (options.dataDir) {
         maintenanceTasks.push({
@@ -73,6 +75,7 @@ export async function createBackgroundRuntime(options) {
     }
     async function stopBackgroundInfrastructure() {
         try {
+            heapUsageMetrics?.stop();
             if (scheduler)
                 scheduler.stop();
         }
@@ -109,6 +112,9 @@ export async function createBackgroundRuntime(options) {
                 scheduler.start({
                     restorePersistedJobExecution: options.restorePersistedJobExecution !== false,
                 });
+            }
+            if (options.enableHeapUsageMetrics && options.metrics) {
+                heapUsageMetrics ??= startHeapUsageMetrics({ metrics: options.metrics });
             }
         }
         catch (error) {

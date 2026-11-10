@@ -1,8 +1,9 @@
-import { DEFAULT_MODEL_PRESETS, getRuntimePresetKey } from '@mavis/config';
+import { DEFAULT_MODEL_PRESETS, deliveredDefaultModelId, getRuntimePresetKey } from '@mavis/config';
 import { parseProviderId, parseSourceQualifiedModelKey } from '../resolution/model-key.js';
 import { cacheStatusView, minimaxApiModels, } from '../catalog/list-models.js';
 import { modelConfigFingerprint } from '../catalog/model-cache.js';
 import { LocalModelProviderError } from '../contracts.js';
+import { assertGeminiEffortOptions } from '../resolution/model-ref.js';
 const providerMutationTails = new Map();
 export function patchModelParameters(model, normalizedPatch) {
     return {
@@ -13,8 +14,18 @@ export function patchModelParameters(model, normalizedPatch) {
 export function removeLegacyCustomProviderNpm(provider) {
     delete provider.npm;
 }
-/** Keep the global default callable after a custom Provider/model mutation. */
-export function resetUnavailableCustomDefaultModel(draft) {
+/** Validates against the final protocol, so switching an existing provider to Gemini is covered too. */
+export function assertCustomProviderEffortOptions(provider) {
+    for (const model of Object.values(provider.models ?? {})) {
+        assertGeminiEffortOptions(provider.api, model.thinking?.effortOptions);
+    }
+}
+/**
+ * Keep the global default callable after a custom Provider/model mutation.
+ * The replacement is the delivered default, the same rule used when an
+ * official snapshot retires the default.
+ */
+export function resetUnavailableCustomDefaultModel(draft, currentConfig) {
     const selected = parseSourceQualifiedModelKey(draft.defaultModel);
     if (selected?.source !== 'custom_provider')
         return false;
@@ -22,7 +33,10 @@ export function resetUnavailableCustomDefaultModel(draft) {
     const model = provider?.models?.[selected.modelId];
     if (provider?.enabled !== false && model && model.enabled !== false)
         return false;
-    draft.defaultModel = DEFAULT_MODEL_PRESETS[getRuntimePresetKey()].defaultModel;
+    const deliveredDefault = deliveredDefaultModelId(currentConfig?.provider?.minimax);
+    draft.defaultModel = deliveredDefault
+        ? `minimax/${deliveredDefault}`
+        : DEFAULT_MODEL_PRESETS[getRuntimePresetKey()].defaultModel;
     draft.defaultModelVariant = undefined;
     return true;
 }
@@ -101,5 +115,21 @@ async function ignoreMutationOutcome(value) {
     catch {
         // A failed mutation releases the queue for the next caller.
     }
+}
+export function customProviderViewOptions(deps) {
+    const bindings = deps.modelAccess?.bindings;
+    return {
+        ...(deps.byokKeyPool ? { byokKeyPool: deps.byokKeyPool } : {}),
+        ...(bindings
+            ? { modelAccessBinding: (providerKey) => bindings.peek(providerKey) }
+            : {}),
+    };
+}
+/** Owned by an extension, but its binding is gone: never fall back to legacy credentials. */
+export function modelAccessBindingMissingError() {
+    return new LocalModelProviderError(409, 'Extension provider has no current binding; sign in again or remove it', 'MODEL_ACCESS_BINDING_MISSING');
+}
+export function modelAccessProviderReadOnlyError() {
+    return new LocalModelProviderError(400, 'Extension provider credentials, base_url and api format cannot be edited', 'MODEL_ACCESS_READ_ONLY');
 }
 //# sourceMappingURL=service-helpers.js.map

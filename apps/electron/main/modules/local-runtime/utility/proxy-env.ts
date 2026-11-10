@@ -92,6 +92,8 @@ export async function resolveUtilityProxyEnv(resolver, env = process.env, warn =
         if (proxyUrl) {
             result.HTTPS_PROXY = proxyUrl;
             result.HTTP_PROXY = proxyUrl;
+            // Tells the model access host this proxy is the system's, read once, not the user's.
+            result.MCODE_SYSTEM_PROXY_INJECTED = '1';
         }
     }
     catch {

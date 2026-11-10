@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { and, asc, desc, eq, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { cronDefinitions, cronRuns } from '../../../infra/db/schema/cron.js';
 import { CronRepositoryError } from '../errors.js';
@@ -31,6 +32,9 @@ export class SqliteCronRunRepository {
             failedAtMs: sql `NULL`.as('failed_at_ms'),
             errorCode: sql `NULL`.as('error_code'),
             error: sql `NULL`.as('error'),
+            deliveryInputJson: sql `NULL`.as('delivery_input_json'),
+            retryAtMs: sql `NULL`.as('retry_at_ms'),
+            retryAttempt: sql `0`.as('retry_attempt'),
         })
             .from(cronDefinitions)
             .where(and(eq(cronDefinitions.cronId, activeCronId), isNull(cronDefinitions.deletedAtMs)));
@@ -136,12 +140,12 @@ export class SqliteCronRunRepository {
             .run();
         return changes(result) === 1 ? this.require(runId) : undefined;
     }
-    attachSession(runId, sessionId) {
+    attachSession(runId, sessionId, deliveryInput) {
         text(runId, 'runId');
         text(sessionId, 'sessionId');
         const result = this.db
             .update(cronRuns)
-            .set({ sessionId })
+            .set({ sessionId, deliveryInputJson: deliveryInput ? JSON.stringify(deliveryInput) : null })
             .where(and(eq(cronRuns.runId, runId), eq(cronRuns.status, 'pending'), isNull(cronRuns.sessionId), isNotNull(cronRuns.executionClaimedAtMs)))
             .run();
         if (changes(result) === 1)
@@ -151,12 +155,20 @@ export class SqliteCronRunRepository {
             current.sessionId === sessionId &&
             current.executionClaimedAtMs !== undefined);
     }
+    deferDelivery(runId, retryAtMs) {
+        timestamp(retryAtMs, 'retryAtMs');
+        return (changes(this.db
+            .update(cronRuns)
+            .set({ retryAtMs, retryAttempt: sql `${cronRuns.retryAttempt} + 1` })
+            .where(and(eq(cronRuns.runId, runId), eq(cronRuns.status, 'pending'), isNotNull(cronRuns.sessionId), isNotNull(cronRuns.deliveryInputJson)))
+            .run()) === 1);
+    }
     markDelivered(runId, deliveredAtMs) {
         text(runId, 'runId');
         timestamp(deliveredAtMs, 'deliveredAtMs');
         const result = this.db
             .update(cronRuns)
-            .set({ status: 'delivered', deliveredAtMs })
+            .set({ status: 'delivered', deliveredAtMs, retryAtMs: null })
             .where(and(eq(cronRuns.runId, runId), eq(cronRuns.status, 'pending'), isNotNull(cronRuns.sessionId), isNotNull(cronRuns.executionClaimedAtMs)))
             .run();
         if (changes(result) === 1)
@@ -171,6 +183,7 @@ export class SqliteCronRunRepository {
             .update(cronRuns)
             .set({
             status: 'failed',
+            retryAtMs: null,
             failedAtMs: input.failedAtMs,
             errorCode: input.errorCode,
             error: input.error ?? null,
@@ -233,6 +246,9 @@ function mapRun(value) {
         status,
         createdAtMs: storedTimestamp(row.createdAtMs, 'createdAtMs'),
         ...optionalRunFields(row),
+        ...(row.deliveryInputJson ? { deliveryInput: parseDeliveryInput(row.deliveryInputJson) } : {}),
+        ...(row.retryAtMs !== null ? { retryAtMs: storedTimestamp(row.retryAtMs, 'retryAtMs') } : {}),
+        ...(row.retryAttempt > 0 ? { retryAttempt: row.retryAttempt } : {}),
     };
 }
 function optionalRunFields(row) {
@@ -292,5 +308,19 @@ function storedTimestamp(value, field) {
 }
 function sameTerminal(run, status) {
     return run?.status === status;
+}
+const deliveryInputSchema = z.object({
+    agentName: z.string().min(1),
+    cronName: z.string().min(1),
+    prompt: z.string().min(1),
+    sessionTarget: z.discriminatedUnion('mode', [
+        z.object({ mode: z.literal('new') }),
+        z.object({ mode: z.literal('sessionId'), sessionId: z.string().optional() }),
+    ]),
+    model: z.string().nullable().optional(),
+    project: z.string().nullable().optional(),
+});
+function parseDeliveryInput(json) {
+    return deliveryInputSchema.parse(JSON.parse(json));
 }
 //# sourceMappingURL=run.repository.js.map

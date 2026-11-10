@@ -35,6 +35,462 @@ function createDesktopServiceRouter(service) {
         console.error(error);
         return new Response('Internal Server Error', { status: 500 });
     });
+    app.get(DESKTOP_SERVICE_ROUTES.listBackgroundTasks.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listBackgroundTasks, c.req.raw, c.req.param());
+        const resp = await service.listBackgroundTasks(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listBackgroundTasks, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.getBackgroundTask.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getBackgroundTask, c.req.raw, c.req.param());
+        const resp = await service.getBackgroundTask(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getBackgroundTask, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput, c.req.raw, c.req.param());
+        const resp = await service.readBackgroundTaskOutput(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.readBackgroundTaskOutput, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.stopBackgroundTask.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.stopBackgroundTask, c.req.raw, c.req.param());
+        const resp = await service.stopBackgroundTask(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.stopBackgroundTask, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.delete(DESKTOP_SERVICE_ROUTES.deleteBackgroundTask.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.deleteBackgroundTask, c.req.raw, c.req.param());
+        const resp = await service.deleteBackgroundTask(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.deleteBackgroundTask, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.listModelAccess.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listModelAccess, c.req.raw, c.req.param());
+        const resp = await service.listModelAccess(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listModelAccess, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.previewModelAccessPackage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.previewModelAccessPackage, c.req.raw, c.req.param());
+        const resp = await service.previewModelAccessPackage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.previewModelAccessPackage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.importModelAccessPackage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.importModelAccessPackage, c.req.raw, c.req.param());
+        const resp = await service.importModelAccessPackage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.importModelAccessPackage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.enableModelAccessPackage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.enableModelAccessPackage, c.req.raw, c.req.param());
+        const resp = await service.enableModelAccessPackage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.enableModelAccessPackage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.disableModelAccessPackage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.disableModelAccessPackage, c.req.raw, c.req.param());
+        const resp = await service.disableModelAccessPackage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.disableModelAccessPackage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.rollbackModelAccessPackage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.rollbackModelAccessPackage, c.req.raw, c.req.param());
+        const resp = await service.rollbackModelAccessPackage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.rollbackModelAccessPackage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.uninstallModelAccessPackage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.uninstallModelAccessPackage, c.req.raw, c.req.param());
+        const resp = await service.uninstallModelAccessPackage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.uninstallModelAccessPackage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.startModelAccessDevSession.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.startModelAccessDevSession, c.req.raw, c.req.param());
+        const resp = await service.startModelAccessDevSession(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.startModelAccessDevSession, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.approveModelAccessDevRequest.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.approveModelAccessDevRequest, c.req.raw, c.req.param());
+        const resp = await service.approveModelAccessDevRequest(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.approveModelAccessDevRequest, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.dismissModelAccessDevRequest.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.dismissModelAccessDevRequest, c.req.raw, c.req.param());
+        const resp = await service.dismissModelAccessDevRequest(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.dismissModelAccessDevRequest, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.reloadModelAccessDevSession.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.reloadModelAccessDevSession, c.req.raw, c.req.param());
+        const resp = await service.reloadModelAccessDevSession(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.reloadModelAccessDevSession, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.stopModelAccessDevSession.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.stopModelAccessDevSession, c.req.raw, c.req.param());
+        const resp = await service.stopModelAccessDevSession(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.stopModelAccessDevSession, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.promoteModelAccessDevSession.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.promoteModelAccessDevSession, c.req.raw, c.req.param());
+        const resp = await service.promoteModelAccessDevSession(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.promoteModelAccessDevSession, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.getModelAccessExtensionStatus.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getModelAccessExtensionStatus, c.req.raw, c.req.param());
+        const resp = await service.getModelAccessExtensionStatus(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getModelAccessExtensionStatus, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.exportModelAccessPackage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.exportModelAccessPackage, c.req.raw, c.req.param());
+        const resp = await service.exportModelAccessPackage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.exportModelAccessPackage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.setModelAccessGlobal.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setModelAccessGlobal, c.req.raw, c.req.param());
+        const resp = await service.setModelAccessGlobal(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setModelAccessGlobal, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.setModelAccessTarget.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setModelAccessTarget, c.req.raw, c.req.param());
+        const resp = await service.setModelAccessTarget(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setModelAccessTarget, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.syncModelAccessDelivery.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.syncModelAccessDelivery, c.req.raw, c.req.param());
+        const resp = await service.syncModelAccessDelivery(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.syncModelAccessDelivery, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.setModelAccessDeliveryOptIn.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setModelAccessDeliveryOptIn, c.req.raw, c.req.param());
+        const resp = await service.setModelAccessDeliveryOptIn(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setModelAccessDeliveryOptIn, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.beginModelAccessLogin.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.beginModelAccessLogin, c.req.raw, c.req.param());
+        const resp = await service.beginModelAccessLogin(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.beginModelAccessLogin, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.getModelAccessLoginStatus.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getModelAccessLoginStatus, c.req.raw, c.req.param());
+        const resp = await service.getModelAccessLoginStatus(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getModelAccessLoginStatus, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.submitModelAccessLogin.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.submitModelAccessLogin, c.req.raw, c.req.param());
+        const resp = await service.submitModelAccessLogin(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.submitModelAccessLogin, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.cancelModelAccessLogin.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.cancelModelAccessLogin, c.req.raw, c.req.param());
+        const resp = await service.cancelModelAccessLogin(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.cancelModelAccessLogin, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.discoverModelAccessBorrow.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.discoverModelAccessBorrow, c.req.raw, c.req.param());
+        const resp = await service.discoverModelAccessBorrow(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.discoverModelAccessBorrow, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.useModelAccessBorrow.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.useModelAccessBorrow, c.req.raw, c.req.param());
+        const resp = await service.useModelAccessBorrow(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.useModelAccessBorrow, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.scanModelAccessApi.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.scanModelAccessApi, c.req.raw, c.req.param());
+        const resp = await service.scanModelAccessApi(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.scanModelAccessApi, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.listModelAccessApiCandidates.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listModelAccessApiCandidates, c.req.raw, c.req.param());
+        const resp = await service.listModelAccessApiCandidates(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listModelAccessApiCandidates, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.importModelAccessApi.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.importModelAccessApi, c.req.raw, c.req.param());
+        const resp = await service.importModelAccessApi(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.importModelAccessApi, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.queryModelAccessUsage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.queryModelAccessUsage, c.req.raw, c.req.param());
+        const resp = await service.queryModelAccessUsage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.queryModelAccessUsage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.enableModelAccessPublicProvider.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.enableModelAccessPublicProvider, c.req.raw, c.req.param());
+        const resp = await service.enableModelAccessPublicProvider(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.enableModelAccessPublicProvider, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.disableModelAccessPublicProvider.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.disableModelAccessPublicProvider, c.req.raw, c.req.param());
+        const resp = await service.disableModelAccessPublicProvider(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.disableModelAccessPublicProvider, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.getModelAccessFailover.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getModelAccessFailover, c.req.raw, c.req.param());
+        const resp = await service.getModelAccessFailover(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getModelAccessFailover, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.setModelAccessFailover.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setModelAccessFailover, c.req.raw, c.req.param());
+        const resp = await service.setModelAccessFailover(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setModelAccessFailover, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.post(DESKTOP_SERVICE_ROUTES.ping.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.ping, c.req.raw, c.req.param());
@@ -227,6 +683,30 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.post(DESKTOP_SERVICE_ROUTES.removeCanvasImageBackground.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.removeCanvasImageBackground, c.req.raw, c.req.param());
+        const resp = await service.removeCanvasImageBackground(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.removeCanvasImageBackground, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.enhanceCanvasImage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.enhanceCanvasImage, c.req.raw, c.req.param());
+        const resp = await service.enhanceCanvasImage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.enhanceCanvasImage, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.get(DESKTOP_SERVICE_ROUTES.listMarketplacePlugins.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listMarketplacePlugins, c.req.raw, c.req.param());
@@ -359,6 +839,150 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.post(DESKTOP_SERVICE_ROUTES.updatePlugin.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.updatePlugin, c.req.raw, c.req.param());
+        const resp = await service.updatePlugin(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.updatePlugin, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.listPluginMarketplaces.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listPluginMarketplaces, c.req.raw, c.req.param());
+        const resp = await service.listPluginMarketplaces(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listPluginMarketplaces, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.addPluginMarketplace.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.addPluginMarketplace, c.req.raw, c.req.param());
+        const resp = await service.addPluginMarketplace(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.addPluginMarketplace, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.refreshPluginMarketplaces.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.refreshPluginMarketplaces, c.req.raw, c.req.param());
+        const resp = await service.refreshPluginMarketplaces(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.refreshPluginMarketplaces, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.setPluginMarketplaceAutoUpdate.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setPluginMarketplaceAutoUpdate, c.req.raw, c.req.param());
+        const resp = await service.setPluginMarketplaceAutoUpdate(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setPluginMarketplaceAutoUpdate, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.removePluginMarketplace.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.removePluginMarketplace, c.req.raw, c.req.param());
+        const resp = await service.removePluginMarketplace(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.removePluginMarketplace, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.packShareWork.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.packShareWork, c.req.raw, c.req.param());
+        const resp = await service.packShareWork(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.packShareWork, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.publishShareWork.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.publishShareWork, c.req.raw, c.req.param());
+        const resp = await service.publishShareWork(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.publishShareWork, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.prepareSharedInstall.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.prepareSharedInstall, c.req.raw, c.req.param());
+        const resp = await service.prepareSharedInstall(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.prepareSharedInstall, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.commitSharedInstall.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.commitSharedInstall, c.req.raw, c.req.param());
+        const resp = await service.commitSharedInstall(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.commitSharedInstall, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.discardSharedInstall.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.discardSharedInstall, c.req.raw, c.req.param());
+        const resp = await service.discardSharedInstall(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.discardSharedInstall, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.listShareInstallations.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listShareInstallations, c.req.raw, c.req.param());
+        const resp = await service.listShareInstallations(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listShareInstallations, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.get(DESKTOP_SERVICE_ROUTES.listLocalMcpServers.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listLocalMcpServers, c.req.raw, c.req.param());
@@ -436,6 +1060,162 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.testLocalMcpServer, c.req.raw, c.req.param());
         const resp = await service.testLocalMcpServer(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.testLocalMcpServer, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.put(DESKTOP_SERVICE_ROUTES.setLocalMcpServerOAuthClientSecret.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setLocalMcpServerOAuthClientSecret, c.req.raw, c.req.param());
+        const resp = await service.setLocalMcpServerOAuthClientSecret(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setLocalMcpServerOAuthClientSecret, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.listLocalMcpAuthStates.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listLocalMcpAuthStates, c.req.raw, c.req.param());
+        const resp = await service.listLocalMcpAuthStates(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listLocalMcpAuthStates, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.testLocalMcpAuthTarget.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.testLocalMcpAuthTarget, c.req.raw, c.req.param());
+        const resp = await service.testLocalMcpAuthTarget(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.testLocalMcpAuthTarget, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.startLocalMcpAuth.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.startLocalMcpAuth, c.req.raw, c.req.param());
+        const resp = await service.startLocalMcpAuth(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.startLocalMcpAuth, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.cancelLocalMcpAuth.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.cancelLocalMcpAuth, c.req.raw, c.req.param());
+        const resp = await service.cancelLocalMcpAuth(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.cancelLocalMcpAuth, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.completeLocalMcpAuth.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.completeLocalMcpAuth, c.req.raw, c.req.param());
+        const resp = await service.completeLocalMcpAuth(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.completeLocalMcpAuth, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.clearLocalMcpAuth.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.clearLocalMcpAuth, c.req.raw, c.req.param());
+        const resp = await service.clearLocalMcpAuth(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.clearLocalMcpAuth, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.listLocalHooks.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listLocalHooks, c.req.raw, c.req.param());
+        const resp = await service.listLocalHooks(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listLocalHooks, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.createLocalHook.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.createLocalHook, c.req.raw, c.req.param());
+        const resp = await service.createLocalHook(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.createLocalHook, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.put(DESKTOP_SERVICE_ROUTES.updateLocalHook.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.updateLocalHook, c.req.raw, c.req.param());
+        const resp = await service.updateLocalHook(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.updateLocalHook, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.delete(DESKTOP_SERVICE_ROUTES.deleteLocalHook.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.deleteLocalHook, c.req.raw, c.req.param());
+        const resp = await service.deleteLocalHook(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.deleteLocalHook, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.patch(DESKTOP_SERVICE_ROUTES.setLocalHookEnabled.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setLocalHookEnabled, c.req.raw, c.req.param());
+        const resp = await service.setLocalHookEnabled(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setLocalHookEnabled, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.patch(DESKTOP_SERVICE_ROUTES.setLocalHookScopeEnabled.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setLocalHookScopeEnabled, c.req.raw, c.req.param());
+        const resp = await service.setLocalHookScopeEnabled(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setLocalHookScopeEnabled, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -604,6 +1384,18 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.selectModel, c.req.raw, c.req.param());
         const resp = await service.selectModel(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.selectModel, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.selectAdvisorModel.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.selectAdvisorModel, c.req.raw, c.req.param());
+        const resp = await service.selectAdvisorModel(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.selectAdvisorModel, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -808,6 +1600,30 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.discoverUserModels, c.req.raw, c.req.param());
         const resp = await service.discoverUserModels(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.discoverUserModels, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.testUserModelApiKey.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.testUserModelApiKey, c.req.raw, c.req.param());
+        const resp = await service.testUserModelApiKey(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.testUserModelApiKey, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.unrestUserModelApiKey.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.unrestUserModelApiKey, c.req.raw, c.req.param());
+        const resp = await service.unrestUserModelApiKey(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.unrestUserModelApiKey, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -1079,6 +1895,30 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.get(DESKTOP_SERVICE_ROUTES.getComputerUseDefaultPreference.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getComputerUseDefaultPreference, c.req.raw, c.req.param());
+        const resp = await service.getComputerUseDefaultPreference(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getComputerUseDefaultPreference, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.put(DESKTOP_SERVICE_ROUTES.putComputerUseDefaultPreference.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.putComputerUseDefaultPreference, c.req.raw, c.req.param());
+        const resp = await service.putComputerUseDefaultPreference(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.putComputerUseDefaultPreference, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.get(DESKTOP_SERVICE_ROUTES.getComposerSendBehavior.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getComposerSendBehavior, c.req.raw, c.req.param());
@@ -1324,6 +2164,18 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.patchGoal, c.req.raw, c.req.param());
         const resp = await service.patchGoal(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.patchGoal, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.dismissGoal.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.dismissGoal, c.req.raw, c.req.param());
+        const resp = await service.dismissGoal(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.dismissGoal, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -1588,6 +2440,18 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getLatestPlanReview, c.req.raw, c.req.param());
         const resp = await service.getLatestPlanReview(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getLatestPlanReview, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.recordPluginRecommendationDecline.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.recordPluginRecommendationDecline, c.req.raw, c.req.param());
+        const resp = await service.recordPluginRecommendationDecline(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.recordPluginRecommendationDecline, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -1919,6 +2783,18 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.post(DESKTOP_SERVICE_ROUTES.createProject.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.createProject, c.req.raw, c.req.param());
+        const resp = await service.createProject(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.createProject, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.patch(DESKTOP_SERVICE_ROUTES.updateProject.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.updateProject, c.req.raw, c.req.param());
@@ -2243,6 +3119,42 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.post(DESKTOP_SERVICE_ROUTES.createSideChat.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.createSideChat, c.req.raw, c.req.param());
+        const resp = await service.createSideChat(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.createSideChat, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.createSideChatFromQueue.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.createSideChatFromQueue, c.req.raw, c.req.param());
+        const resp = await service.createSideChatFromQueue(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.createSideChatFromQueue, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.promoteSideChat.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.promoteSideChat, c.req.raw, c.req.param());
+        const resp = await service.promoteSideChat(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.promoteSideChat, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.get(DESKTOP_SERVICE_ROUTES.getMessages.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getMessages, c.req.raw, c.req.param());
@@ -2363,6 +3275,18 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.get(DESKTOP_SERVICE_ROUTES.getSessionActivity.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getSessionActivity, c.req.raw, c.req.param());
+        const resp = await service.getSessionActivity(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getSessionActivity, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.post(DESKTOP_SERVICE_ROUTES.abortSession.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.abortSession, c.req.raw, c.req.param());
@@ -2375,11 +3299,47 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.post(DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion, c.req.raw, c.req.param());
+        const resp = await service.cancelPromptSuggestion(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.cancelPromptSuggestion, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.getPromptSuggestion.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getPromptSuggestion, c.req.raw, c.req.param());
+        const resp = await service.getPromptSuggestion(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getPromptSuggestion, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.post(DESKTOP_SERVICE_ROUTES.steerSession.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.steerSession, c.req.raw, c.req.param());
         const resp = await service.steerSession(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.steerSession, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.sendRemoteMessage.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.sendRemoteMessage, c.req.raw, c.req.param());
+        const resp = await service.sendRemoteMessage(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.sendRemoteMessage, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -2524,6 +3484,30 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listSessionFiles, c.req.raw, c.req.param());
         const resp = await service.listSessionFiles(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listSessionFiles, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.getSessionFileSyncs.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getSessionFileSyncs, c.req.raw, c.req.param());
+        const resp = await service.getSessionFileSyncs(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getSessionFileSyncs, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.recordSessionFileSync.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.recordSessionFileSync, c.req.raw, c.req.param());
+        const resp = await service.recordSessionFileSync(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.recordSessionFileSync, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -2975,6 +3959,30 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.post(DESKTOP_SERVICE_ROUTES.getMemoryV2Onboarding.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getMemoryV2Onboarding, c.req.raw, c.req.param());
+        const resp = await service.getMemoryV2Onboarding(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getMemoryV2Onboarding, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.completeMemoryV2Onboarding.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.completeMemoryV2Onboarding, c.req.raw, c.req.param());
+        const resp = await service.completeMemoryV2Onboarding(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.completeMemoryV2Onboarding, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.post(DESKTOP_SERVICE_ROUTES.replyPermission.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.replyPermission, c.req.raw, c.req.param());
@@ -3004,6 +4012,30 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.rejectQuestion, c.req.raw, c.req.param());
         const resp = await service.rejectQuestion(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.rejectQuestion, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.get(DESKTOP_SERVICE_ROUTES.getPermissionMode.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getPermissionMode, c.req.raw, c.req.param());
+        const resp = await service.getPermissionMode(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getPermissionMode, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.put(DESKTOP_SERVICE_ROUTES.setPermissionMode.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.setPermissionMode, c.req.raw, c.req.param());
+        const resp = await service.setPermissionMode(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.setPermissionMode, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -3059,6 +4091,18 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.get(DESKTOP_SERVICE_ROUTES.getWorkspaceFileMetadata.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getWorkspaceFileMetadata, c.req.raw, c.req.param());
+        const resp = await service.getWorkspaceFileMetadata(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getWorkspaceFileMetadata, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.get(DESKTOP_SERVICE_ROUTES.readWorkspaceFile.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.readWorkspaceFile, c.req.raw, c.req.param());
@@ -3088,6 +4132,18 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.searchWorkspaceFiles, c.req.raw, c.req.param());
         const resp = await service.searchWorkspaceFiles(ctx, req);
         const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.searchWorkspaceFiles, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.stopWorkspaceFileSearch.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.stopWorkspaceFileSearch, c.req.raw, c.req.param());
+        const resp = await service.stopWorkspaceFileSearch(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.stopWorkspaceFileSearch, resp));
         return new Response(body, {
             status: 200,
             headers: responseHeadersFromHttpServiceContext(ctx, {
@@ -3899,6 +4955,90 @@ function createDesktopServiceRouter(service) {
             }),
         });
     });
+    app.post(DESKTOP_SERVICE_ROUTES.suggestMiniAppCreationIdeas.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.suggestMiniAppCreationIdeas, c.req.raw, c.req.param());
+        const resp = await service.suggestMiniAppCreationIdeas(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.suggestMiniAppCreationIdeas, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.startMiniAppCreation.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.startMiniAppCreation, c.req.raw, c.req.param());
+        const resp = await service.startMiniAppCreation(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.startMiniAppCreation, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.stopMiniAppCreation.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.stopMiniAppCreation, c.req.raw, c.req.param());
+        const resp = await service.stopMiniAppCreation(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.stopMiniAppCreation, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.removeMiniAppCreation.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.removeMiniAppCreation, c.req.raw, c.req.param());
+        const resp = await service.removeMiniAppCreation(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.removeMiniAppCreation, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.maintainMiniAppCreation.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.maintainMiniAppCreation, c.req.raw, c.req.param());
+        const resp = await service.maintainMiniAppCreation(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.maintainMiniAppCreation, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.getMiniAppCreation.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.getMiniAppCreation, c.req.raw, c.req.param());
+        const resp = await service.getMiniAppCreation(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.getMiniAppCreation, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
+    app.post(DESKTOP_SERVICE_ROUTES.listMiniAppLaunchpad.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_ROUTES.listMiniAppLaunchpad, c.req.raw, c.req.param());
+        const resp = await service.listMiniAppLaunchpad(ctx, req);
+        const body = JSON.stringify(encodeHttpResponse(DESKTOP_SERVICE_ROUTES.listMiniAppLaunchpad, resp));
+        return new Response(body, {
+            status: 200,
+            headers: responseHeadersFromHttpServiceContext(ctx, {
+                'Content-Type': 'application/json',
+            }),
+        });
+    });
     app.post(DESKTOP_SERVICE_SSE_CONTRACTS.streamEcho.path, async (c) => {
         const ctx = httpServiceContextFromHeaders(c.req.raw.headers, c.req.raw.signal);
         const req = await parseHttpRequest(DESKTOP_SERVICE_SSE_CONTRACTS.streamEcho, c.req.raw, c.req.param());
@@ -3928,6 +5068,18 @@ function createDesktopServiceRouter(service) {
         const req = await parseHttpRequest(DESKTOP_SERVICE_SSE_CONTRACTS.continueTurn, c.req.raw, c.req.param());
         const result = await service.continueTurn(ctx, req);
         return createSseResponse(DESKTOP_SERVICE_SSE_CONTRACTS.continueTurn, ctx, result);
+    });
+    app.post(DESKTOP_SERVICE_SSE_CONTRACTS.watchWorkspaceFiles.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers, c.req.raw.signal);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_SSE_CONTRACTS.watchWorkspaceFiles, c.req.raw, c.req.param());
+        const result = await service.watchWorkspaceFiles(ctx, req);
+        return createSseResponse(DESKTOP_SERVICE_SSE_CONTRACTS.watchWorkspaceFiles, ctx, result);
+    });
+    app.post(DESKTOP_SERVICE_SSE_CONTRACTS.streamWorkspaceFileSearch.path, async (c) => {
+        const ctx = httpServiceContextFromHeaders(c.req.raw.headers, c.req.raw.signal);
+        const req = await parseHttpRequest(DESKTOP_SERVICE_SSE_CONTRACTS.streamWorkspaceFileSearch, c.req.raw, c.req.param());
+        const result = await service.streamWorkspaceFileSearch(ctx, req);
+        return createSseResponse(DESKTOP_SERVICE_SSE_CONTRACTS.streamWorkspaceFileSearch, ctx, result);
     });
     app.notFound(() => new Response(null, {
         status: 404,

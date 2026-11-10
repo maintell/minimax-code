@@ -75,18 +75,21 @@ export const CloudBashToolDef = {
         '',
         '# Git',
         '- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.',
-        '- Use the `gh` CLI for GitHub operations (PRs, issues, API).',
-        '- Commit or push only when the user asks. If on the default branch, branch first.',
+        '- Commit or push only when the user asks.',
     ].join('\n'),
     schema: Type.Object({
         command: Type.String({ description: 'Shell command line to execute in the sandbox.' }),
-        timeout: Type.Optional(Type.Number({ description: 'Timeout in seconds. Default is host-defined.' })),
+        timeout: Type.Optional(Type.Number({
+            // sandbox-control ExecShell default 60s; archon_server clamps to 600s
+            // (internal/domain/shell/service/service.go defaultMaxTimeoutSeconds).
+            description: 'Timeout in seconds. Default 60, max 600.',
+        })),
     }),
 };
 export const CloudGrepToolDef = {
     name: 'grep',
     executionMode: 'parallel',
-    description: 'Search file contents inside the cloud sandbox workspace using ripgrep. ALWAYS use this tool for content search — NEVER invoke `grep`/`rg` via bash (that would bypass sensitive-file filtering and permission review). Returns only the paths of matching files by default (`output_mode="files_with_matches"`) — use it to locate relevant files, then use `read` to view their contents and `edit` to change them. Set `output_mode="content"` to get matching lines (supports `context` and paging) or `"count"` for per-file match counts. Respects .gitignore (use bash `rg --no-ignore` for ignored files); sensitive files are always excluded. Results are truncated at `limit`; page through more with `offset`.',
+    description: 'Search file contents inside the cloud sandbox workspace using ripgrep. ALWAYS use this tool for content search — NEVER invoke `grep`/`rg` via bash (that would bypass sensitive-file filtering). Returns only the paths of matching files by default (`output_mode="files_with_matches"`) — use it to locate relevant files, then use `read` to view their contents and `edit` to change them. Set `output_mode="content"` to get matching lines (supports `context` and paging) or `"count"` for per-file match counts. Respects .gitignore (use bash `rg --no-ignore` for ignored files); sensitive files are always excluded. Results are truncated at `limit`; page through more with `offset`.',
     schema: Type.Object({
         pattern: Type.String({ description: 'Regex pattern (or literal if `literal=true`).' }),
         path: Type.Optional(Type.String({ description: 'Workspace-contained directory or file to search.' })),
@@ -108,7 +111,7 @@ export const CloudGrepToolDef = {
 export const CloudGlobToolDef = {
     name: 'glob',
     executionMode: 'parallel',
-    description: 'Search for files by glob pattern inside the cloud sandbox workspace. ALWAYS use this tool to find files by name/pattern — NEVER use `find`/`ls -R` via bash (that would bypass sensitive-file filtering and permission review). Gitignored files ARE listed (build artifacts stay findable); sensitive files are always excluded. Returns workspace-relative file paths, truncated when results exceed the limit; pass sort="modified" to list recently changed files first.',
+    description: 'Search for files by glob pattern inside the cloud sandbox workspace. ALWAYS use this tool to find files by name/pattern — NEVER use `find`/`ls -R` via bash (that would bypass sensitive-file filtering). Gitignored files ARE listed (build artifacts stay findable); sensitive files are always excluded. Returns workspace-relative file paths, truncated when results exceed the limit; pass sort="modified" to list recently changed files first.',
     schema: Type.Object({
         pattern: Type.String({ description: "Glob pattern, e.g. '**/*.ts' or 'src/**/*.tsx'." }),
         path: Type.Optional(Type.String({ description: 'Workspace-contained search root.' })),
@@ -140,11 +143,21 @@ export const CloudTodoWriteToolDef = {
         }),
     }),
 };
+/**
+ * Shared by the background-capable and gated sync `task` descriptions: the
+ * coordinator limits foreground and background child Agents alike. Same
+ * wording as the Desktop task description. The started-result snapshot
+ * (`active_child_tasks` / `child_task_limit`) is shown only when archon_server
+ * returns it at admission.
+ */
+export const CLOUD_TASK_CONCURRENCY_GUIDANCE = "The Runtime enforces each parent Session's configured child-Agent concurrency limit. Start the tasks the work needs without guessing the limit or pre-splitting batches. A started result may report active_child_tasks and child_task_limit as a point-in-time snapshot. If task returns SUBAGENT_CONCURRENCY_LIMIT, wait for an existing task to finish before retrying.";
 export const CLOUD_TASK_TOOL_DESCRIPTION = `Launch a cloud sub-agent to handle complex, multistep tasks autonomously.
 
 Use this for broad research, parallelizable investigation, or delegated implementation. Do not use it for targeted file reads, grep-style code searches, or work that is simpler to do directly.
 
-When background execution is enabled, invocations start in the background by default and return a task id immediately. A started task is not a completed result. Set run_in_background=false when you need the child agent's final result before continuing. Use the background task control tools to query, read output, or stop background work.`;
+When background execution is enabled, invocations start in the background by default and return a task id immediately. A started task is not a completed result. To run several child agents at once, start them all in one response and omit run_in_background, even when you need every result before continuing; then read each result with task_output. Set run_in_background=false only for a single child whose result you need before doing anything else. Use the background task control tools to query, read output, or stop background work.
+
+${CLOUD_TASK_CONCURRENCY_GUIDANCE}`;
 export const CloudTaskToolDef = {
     name: 'task',
     executionMode: 'sequential',
@@ -163,7 +176,7 @@ export const CloudTaskToolDef = {
             description: 'Legacy specialized-agent alias. Prefer agent_name for new calls.',
         })),
         run_in_background: Type.Optional(Type.Boolean({
-            description: 'Optional; defaults to background execution when it is enabled. Set false to wait for the final result. True starts background execution and returns a task id immediately. Inspect or control a background task with task_query, task_output, and task_stop.',
+            description: "Optional; defaults to background execution when it is enabled. Omit it when starting several child agents in parallel. Set false only to wait for a single child's final result. True starts background execution and returns a task id immediately. Inspect or control a background task with task_query, task_output, and task_stop.",
         })),
     }),
 };

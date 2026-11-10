@@ -15,6 +15,7 @@ const CRASH_DUMP_INCIDENT_LOOKBACK_MS = 5000;
 const UNCLEAN_SESSION_CRASH_SOURCE = 'unclean_previous_session';
 const MAX_MARKER_APP_VERSION_LENGTH = 32;
 const MAX_MARKER_APP_INSTANCE_ID_LENGTH = 64;
+const BROWSER_BACKENDS = new Set(['webview', 'web-contents-view']);
 function isCrashDumpName(fileName) {
     return path.extname(fileName).toLowerCase() === '.dmp';
 }
@@ -119,6 +120,7 @@ export class CrashEvidence {
                     app_instance_id: this.dependencies.appInstanceId,
                     app_version: this.dependencies.appVersion,
                     ...this.systemSessionEnd,
+                    ...(this.browserBackend ? { browser_backend: this.browserBackend } : {}),
                 };
                 this.dependencies.fileSystem.writeTextFileSync(markerPath, JSON.stringify(this.currentSessionMarker));
             }
@@ -148,6 +150,8 @@ export class CrashEvidence {
             payload.crashed_app_version = previous.appVersion;
         if (previous.appInstanceId !== null)
             payload.crashed_app_instance_id = previous.appInstanceId;
+        if (previous.browserBackend)
+            payload.crashed_browser_backend = previous.browserBackend;
         Object.assign(payload, previous.systemSessionEnd);
         try {
             this.dependencies.enqueue('app.crash', payload);
@@ -196,6 +200,24 @@ export class CrashEvidence {
         }
     }
     /**
+     * Records the Browser page backend chosen for this launch, so a native crash
+     * reported by the next launch can be attributed to webview or native pages.
+     */
+    recordBrowserBackend(backend) {
+        try {
+            if (this.quitStarted || !BROWSER_BACKENDS.has(backend))
+                return;
+            this.browserBackend = backend;
+            if (!this.currentSessionMarker)
+                return;
+            this.currentSessionMarker.browser_backend = backend;
+            this.dependencies.fileSystem.writeTextFileSync(this.dependencies.getSessionMarkerFilePath(), JSON.stringify(this.currentSessionMarker));
+        }
+        catch {
+            this.safeWarn({ msg: '[CrashEvidence] Failed to persist browser backend' });
+        }
+    }
+    /**
      * Bounded read of the dead session's marker. Every field is independently
      * optional: a marker written by an older build, or one truncated by the
      * crash itself, still yields whatever remains usable. Unparseable content
@@ -214,7 +236,11 @@ export class CrashEvidence {
         const startedAt = marker?.session_started_at;
         const appVersion = marker?.app_version;
         const appInstanceId = marker?.app_instance_id;
+        const browserBackend = marker?.browser_backend;
         const result = {
+            ...(typeof browserBackend === 'string' && BROWSER_BACKENDS.has(browserBackend)
+                ? { browserBackend }
+                : {}),
             systemSessionEnd: marker && typeof marker === 'object' ? readSystemSessionEndEvidence(marker) : undefined,
             sessionStartedAt: typeof startedAt === 'number' && Number.isFinite(startedAt) ? startedAt : null,
             appVersion: typeof appVersion === 'string' && appVersion.length <= MAX_MARKER_APP_VERSION_LENGTH

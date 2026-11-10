@@ -68,15 +68,16 @@ function decodeFrozenDefinition(value) {
         throw new Error('Frozen Session Agent owner is invalid.');
     const model = decodeModel(value.model);
     const project = decodeProject(value.project);
-    const ownerInstanceId = optionalNonEmptyString(value.ownerInstanceId, 'ownerInstanceId');
-    return freezeDefinition({
+    const definition = {
         definitionVersion: 2,
         exactOwnerName,
-        ...(ownerInstanceId ? { ownerInstanceId } : {}),
+        ...frozenOwnerFields(optionalNonEmptyString(value.ownerInstanceId, 'ownerInstanceId'), value.pluginSource),
         model,
         project,
         ...base,
-    });
+    };
+    validatePluginSourceOwner(definition);
+    return freezeDefinition(definition);
 }
 function validateFrozenDefinition(definition) {
     if (typeof definition.systemPrompt !== 'string') {
@@ -84,12 +85,7 @@ function validateFrozenDefinition(definition) {
     }
     if (definition.promptSnapshot !== undefined)
         decodeAgentPromptSnapshot(definition.promptSnapshot);
-    for (const field of REQUIRED_FROZEN_CAPABILITY_FIELDS) {
-        validateStringArray(definition.capabilities[field]);
-    }
-    if (definition.capabilities.disallowedTools !== undefined) {
-        validateStringArray(definition.capabilities.disallowedTools);
-    }
+    validateCapabilities(definition.capabilities);
     if (definition.definitionVersion === 1)
         return;
     if (definition.definitionVersion !== 2 || !definition.exactOwnerName.trim()) {
@@ -100,6 +96,34 @@ function validateFrozenDefinition(definition) {
     if (definition.ownerInstanceId !== undefined && !definition.ownerInstanceId.trim()) {
         throw new Error('Frozen Session Agent owner instance is invalid.');
     }
+    validatePluginSourceOwner(definition);
+}
+function validateCapabilities(capabilities) {
+    for (const field of REQUIRED_FROZEN_CAPABILITY_FIELDS) {
+        validateStringArray(capabilities[field]);
+    }
+    if (capabilities.disallowedTools !== undefined)
+        validateStringArray(capabilities.disallowedTools);
+    if (capabilities.preloadSkills !== undefined)
+        validateStringArray(capabilities.preloadSkills);
+    decodeSelectorVersion(capabilities.selectorVersion);
+}
+/** A Plugin Agent has no Custom Agent incarnation and is owned by its scoped name. */
+function validatePluginSourceOwner(definition) {
+    if (definition.pluginSource === undefined)
+        return;
+    const source = decodePluginSource(definition.pluginSource);
+    if (definition.ownerInstanceId || source.scopedName !== definition.exactOwnerName) {
+        throw new Error('Frozen Session Agent Plugin source is invalid.');
+    }
+}
+function frozenOwnerFields(ownerInstanceId, pluginSource) {
+    return {
+        ...(ownerInstanceId ? { ownerInstanceId } : {}),
+        ...(pluginSource === undefined
+            ? {}
+            : { pluginSource: Object.freeze(decodePluginSource(pluginSource)) }),
+    };
 }
 function freezeDefinition(definition) {
     const base = {
@@ -107,15 +131,7 @@ function freezeDefinition(definition) {
         ...(definition.promptSnapshot === undefined
             ? {}
             : { promptSnapshot: decodeAgentPromptSnapshot(definition.promptSnapshot) }),
-        capabilities: Object.freeze({
-            tools: Object.freeze([...definition.capabilities.tools]),
-            ...(definition.capabilities.disallowedTools === undefined
-                ? {}
-                : { disallowedTools: Object.freeze([...definition.capabilities.disallowedTools]) }),
-            mcpServers: Object.freeze([...definition.capabilities.mcpServers]),
-            skills: Object.freeze([...definition.capabilities.skills]),
-            extensionSkills: Object.freeze([...definition.capabilities.extensionSkills]),
-        }),
+        capabilities: freezeCapabilities(definition.capabilities),
     };
     if (definition.definitionVersion === 1) {
         return Object.freeze({ definitionVersion: 1, ...base });
@@ -123,7 +139,7 @@ function freezeDefinition(definition) {
     return Object.freeze({
         definitionVersion: 2,
         exactOwnerName: definition.exactOwnerName,
-        ...(definition.ownerInstanceId ? { ownerInstanceId: definition.ownerInstanceId } : {}),
+        ...frozenOwnerFields(definition.ownerInstanceId, definition.pluginSource),
         model: Object.freeze({
             providerId: definition.model.providerId,
             modelId: definition.model.modelId,
@@ -143,14 +159,41 @@ function freezeDefinition(definition) {
         ...base,
     });
 }
+function freezeCapabilities(capabilities) {
+    return Object.freeze({
+        tools: Object.freeze([...capabilities.tools]),
+        ...(capabilities.disallowedTools === undefined
+            ? {}
+            : { disallowedTools: Object.freeze([...capabilities.disallowedTools]) }),
+        mcpServers: Object.freeze([...capabilities.mcpServers]),
+        skills: Object.freeze([...capabilities.skills]),
+        extensionSkills: Object.freeze([...capabilities.extensionSkills]),
+        ...(capabilities.preloadSkills === undefined
+            ? {}
+            : { preloadSkills: Object.freeze([...capabilities.preloadSkills]) }),
+        ...(capabilities.selectorVersion === undefined
+            ? {}
+            : { selectorVersion: capabilities.selectorVersion }),
+    });
+}
 function decodeCapabilities(capabilities) {
+    const selectorVersion = decodeSelectorVersion(capabilities.selectorVersion);
     return {
         tools: requiredStringArray(capabilities, 'tools'),
         ...optionalStringArray(capabilities, 'disallowedTools'),
         mcpServers: requiredStringArray(capabilities, 'mcpServers'),
         skills: requiredStringArray(capabilities, 'skills'),
         extensionSkills: requiredStringArray(capabilities, 'extensionSkills'),
+        ...optionalStringArray(capabilities, 'preloadSkills'),
+        ...(selectorVersion === undefined ? {} : { selectorVersion }),
     };
+}
+function decodeSelectorVersion(value) {
+    if (value === undefined)
+        return undefined;
+    if (value !== 2)
+        throw new Error('Frozen Task Agent capability selectorVersion is invalid.');
+    return value;
 }
 function decodeModel(value) {
     if (!isRecord(value))
@@ -206,6 +249,28 @@ function validateModel(model) {
         optionalPositiveInteger(model.contextWindow, 'contextWindow');
     if (model.maxOutputTokens !== undefined)
         optionalPositiveInteger(model.maxOutputTokens, 'maxOutputTokens');
+}
+const PLUGIN_SOURCE_FORMATS = new Set(['minimax', '\u0063\u006c\u0061\u0075\u0064\u0065']);
+const PLUGIN_SOURCE_ORIGINS = {
+    official: true,
+    local: true,
+};
+function decodePluginSource(value) {
+    if (!isRecord(value) ||
+        value.kind !== 'plugin' ||
+        !PLUGIN_SOURCE_FORMATS.has(String(value.format)) ||
+        (value.origin !== undefined && !Object.hasOwn(PLUGIN_SOURCE_ORIGINS, String(value.origin)))) {
+        throw new Error('Frozen Session Agent Plugin source is invalid.');
+    }
+    return {
+        kind: 'plugin',
+        pluginName: requiredNonEmptyString(value.pluginName, 'pluginSource.pluginName'),
+        format: value.format,
+        agentName: requiredNonEmptyString(value.agentName, 'pluginSource.agentName'),
+        scopedName: requiredNonEmptyString(value.scopedName, 'pluginSource.scopedName'),
+        packageDigest: requiredNonEmptyString(value.packageDigest, 'pluginSource.packageDigest'),
+        ...(value.origin === undefined ? {} : { origin: value.origin }),
+    };
 }
 function validateProject(project) {
     requiredNonEmptyString(project.workspaceDir, 'workspaceDir');

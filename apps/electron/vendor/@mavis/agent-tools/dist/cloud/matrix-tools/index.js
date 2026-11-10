@@ -37,7 +37,7 @@ import { MatrixWebSearchTool } from './tools/web-search.js';
 export { callMatrixTool, callMatrixToolRaw, } from './client.js';
 export * from './tool-defs.js';
 export { inferAigcMimeType, registerAigcIfPresent } from './aigc-helpers.js';
-export { MatrixMediaError, readMatrixMediaErrorKind } from './types.js';
+export { MatrixAuthRequiredError, MatrixMediaError, readMatrixAuthRequiredReason, readMatrixGatewayBackend, readMatrixMediaErrorKind, } from './types.js';
 export { workspaceRootOf } from './path-guard.js';
 export { FileTransferError, fileTransferFailureResult, uploadInputFile, uploadInputFiles, uploadedInputFileToMediaInfo, requireUploadedInputFileUrl, downloadOutputFile, writeOutputText, } from './file-transfer.js';
 export { MatrixAudiosUnderstandTool } from './tools/audios-understand.js';
@@ -155,7 +155,7 @@ export { MATRIX_TOOL_PATHS };
  * real effective surface instead of keeping stale fallback tools around.
  *
  * Shared by both cloud-runtime (`packages/cloud-runtime/src/tools/index.ts`)
- * and local-runtime (`packages/local-runtime/src/api/local-native-tools.ts`)
+ * and local-runtime (`packages/local-runtime-v2/src/service/turn-system/agent-host/assembly/local-turn-tool-catalog.ts`)
  * so the two runtimes apply the same gate against the same `IModelCapabilities`
  * shape.
  */

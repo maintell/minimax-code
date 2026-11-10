@@ -1,65 +1,60 @@
-import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import JSZip from 'jszip';
 import { PluginSystemError } from '../../errors.js';
-import { computePluginContentDigest, PLUGIN_PACKAGE_V1_LIMITS, } from '../package/package-contract.js';
+import { computePluginContentDigest, computePluginDirectoryDigest, PLUGIN_PACKAGE_V1_LIMITS, } from '../package/package-contract.js';
+import { checkout } from '../source/git-checkout.js';
+import { GitRemote } from '../source/git-remote.js';
+import { GitCommandError } from '../source/git-runner.js';
 import { githubArchiveUrl } from './github-source.js';
-const DOWNLOAD_TIMEOUT_MS = 60_000;
+const DOWNLOAD_TIMEOUT_MS = 300_000;
 // A repository archive is only the transport envelope. The selected Plugin
 // subtree still uses the stricter 64 MiB / 1,024-file package contract below.
-const MAX_GITHUB_ARCHIVE_BYTES = 128 * 1024 * 1024;
+const MAX_GITHUB_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const MAX_GITHUB_ARCHIVE_ENTRIES = 100_000;
-const execFileAsync = promisify(execFile);
-const GIT_CLONE_TIMEOUT_MS = 120_000;
 export async function cloneGitRepositoryPlugin(dataDir, source, signal) {
-    const stagingParent = path.join(dataDir, 'v2', 'plugin-import');
-    await mkdir(stagingParent, { recursive: true });
-    const temporaryRoot = await mkdtemp(path.join(stagingParent, 'git-'));
-    const cloneRoot = path.join(temporaryRoot, 'repo');
-    const rootPath = source.subPath ? path.join(cloneRoot, ...source.subPath.split('/')) : cloneRoot;
+    const parsed = GitRemote.parse(source.repositoryUrl);
+    if (!parsed)
+        fail('GIT_REPOSITORY_URL_INVALID', 'Git repository URL is invalid');
+    let checkedOut;
     try {
-        await execFileAsync('git', [
-            'clone',
-            '--no-checkout',
-            '--filter=blob:none',
-            '--no-tags',
-            source.repositoryUrl,
-            cloneRoot,
-        ], {
-            timeout: GIT_CLONE_TIMEOUT_MS,
+        checkedOut = await checkout(parsed.remote, {
+            stagingParent: path.join(dataDir, 'v2', 'plugin-import'),
+            sha: source.commitSha,
+            subPath: source.subPath,
             signal,
-            windowsHide: true,
-            maxBuffer: 256 * 1024,
         });
-        await execFileAsync('git', ['-C', cloneRoot, 'fetch', '--depth', '1', 'origin', source.commitSha], {
-            timeout: GIT_CLONE_TIMEOUT_MS,
-            signal,
-            windowsHide: true,
-            maxBuffer: 256 * 1024,
+    }
+    catch (error) {
+        if (signal?.aborted)
+            throw error;
+        throw gitCloneError(error);
+    }
+    try {
+        const digest = await computePluginDirectoryDigest(checkedOut.path, {
+            pathPolicy: 'unrestricted',
         });
-        await execFileAsync('git', ['-C', cloneRoot, 'checkout', '--detach', source.commitSha], {
-            timeout: GIT_CLONE_TIMEOUT_MS,
-            signal,
-            windowsHide: true,
-            maxBuffer: 256 * 1024,
-        });
-        await rm(path.join(cloneRoot, '.git'), { recursive: true, force: true });
-        const { computePluginDirectoryDigest } = await import('../package/package-contract.js');
-        const digest = await computePluginDirectoryDigest(rootPath, { pathPolicy: 'unrestricted' });
         return {
-            rootPath,
+            rootPath: checkedOut.path,
             packageSizeBytes: digest.totalBytes,
-            discard: async () => rm(temporaryRoot, { recursive: true, force: true }),
+            discard: checkedOut.discard,
         };
     }
     catch (error) {
-        await rm(temporaryRoot, { recursive: true, force: true });
+        await checkedOut.discard();
         if (signal?.aborted)
             throw error;
         fail('GIT_REPOSITORY_UNAVAILABLE', 'Git repository clone failed');
     }
+}
+function gitCloneError(error) {
+    const category = error instanceof GitCommandError ? error.category : undefined;
+    if (category === 'PATH_NOT_FOUND') {
+        return new PluginSystemError('GITHUB_SUB_PATH_NOT_FOUND', 'Selected Git directory is missing');
+    }
+    return new PluginSystemError('GIT_REPOSITORY_UNAVAILABLE', 'Git repository clone failed', {
+        ...(category ? { reasonCode: category } : {}),
+    });
 }
 export async function downloadGithubPlugin(dataDir, source, fetchImpl, signal) {
     const buffer = await downloadBounded(githubArchiveUrl(source), fetchImpl, signal);
@@ -124,7 +119,7 @@ function validateArchiveResponse(response) {
     }
     const declared = Number(response.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > MAX_GITHUB_ARCHIVE_BYTES) {
-        fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 128 MiB');
+        fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 512 MiB');
     }
 }
 async function readResponseBounded(body, signal) {
@@ -136,7 +131,7 @@ async function readResponseBounded(body, signal) {
         total += result.value.byteLength;
         if (total > MAX_GITHUB_ARCHIVE_BYTES) {
             await reader.cancel();
-            fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 128 MiB');
+            fail('GITHUB_ARCHIVE_TOO_LARGE', 'GitHub repository archive exceeds 512 MiB');
         }
         chunks.push(Buffer.from(result.value));
         result = await readArchiveChunk(reader, signal);

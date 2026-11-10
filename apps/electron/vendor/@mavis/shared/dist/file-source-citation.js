@@ -9,12 +9,23 @@ export function collapseAdjacentDuplicateFileCitations(markdown) {
     if (!markdown.includes('#mavis-source=file:'))
         return markdown;
     return mapMarkdownOutsideProtected(markdown, (text) => {
-        const citationPattern = /(?<![!\\])\[([^[\]\n]+)\]\([ \t]*(#mavis-source=file:[A-Za-z0-9_-]+)[ \t]*\)/gu;
+        const citationPattern = (() => {
+            try {
+                // eslint-disable-next-line prefer-regex-literals -- Old WebKit must catch unsupported syntax at runtime.
+                return new RegExp('(?<![!\\\\])\\[([^[\\]\\n]+)\\]\\([ \\t]*(#mavis-source=file:[A-Za-z0-9_-]+)[ \\t]*\\)', 'gu');
+            }
+            catch {
+                return /\[([^[\]\n]+)\]\([ \t]*(#mavis-source=file:[A-Za-z0-9_-]+)[ \t]*\)/gu;
+            }
+        })();
         let previous;
         let cursor = 0;
         const parts = [];
         for (const match of text.matchAll(citationPattern)) {
             const start = match.index;
+            // Check the preceding character without lookbehind for iOS < 16.4.
+            if (start > 0 && /[!\\]/u.test(text.charAt(start - 1)))
+                continue;
             const end = start + match[0].length;
             const lineStart = text.lastIndexOf('\n', start - 1) + 1;
             // Be conservative around indented code (and deeply nested lists).

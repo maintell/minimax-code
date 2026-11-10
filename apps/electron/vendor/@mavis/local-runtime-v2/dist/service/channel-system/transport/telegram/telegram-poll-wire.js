@@ -20,14 +20,35 @@
  */
 import { detach } from '../../settle.js';
 import { parseLocalTelegramUpdate } from './telegram-events.js';
-import { TelegramPoller } from './telegram-poller.js';
+import { TelegramPoller, } from './telegram-poller.js';
+import { ChannelTransportStatusTracker, } from '../../ingress/channel-transport-status.js';
 import { downloadAttachmentsForUnifiedInbound, ensureUnifiedInboundText, } from './telegram-adapter-shared.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
+/**
+ * How long a 409 keeps the channel on `error` / `poll_conflict` although
+ * polls succeed in between. Telegram serves one getUpdates per token at a
+ * time: with a second consumer (another client, a stale long-poll, a
+ * webhook) both sides get terminated in turn and each still wins some
+ * rounds, so a single success proves nothing — messages keep being split.
+ * Only 90 s without a new 409 count as resolved.
+ */
+const POLL_CONFLICT_HOLD_MS = 90_000;
 export class LocalTelegramPollWire {
     poller = null;
     options;
+    nowMs;
+    /** Live receive-channel state (see `channel-transport-status.ts`); held after the poller stops. */
+    transport;
+    /** Time of the latest 409 since the current start; drives the hold window. */
+    lastConflictAtMs;
     constructor(options) {
         this.options = options;
+        this.nowMs = options.nowMs ?? (() => Date.now());
+        this.transport = new ChannelTransportStatusTracker({
+            platform: 'telegram',
+            agentName: options.defaultAgentName,
+            clientName: options.clientName,
+        });
     }
     start() {
         if (this.poller?.isRunning())
@@ -50,10 +71,29 @@ export class LocalTelegramPollWire {
         poller.on('status', (status) => {
             logger.info({ status, agentName, clientName }, 'Telegram poller status changed');
         });
+        poller.on('poll', (result) => {
+            // A stopped poller can still finish an in-flight round; only the
+            // current poller may move the state.
+            if (this.poller === poller) {
+                this.onPollResult(result);
+                return;
+            }
+            // Logged so a dropped verdict (e.g. a late 401 after a rebind) is
+            // visible. Fixed fields only — never the request URL, which carries
+            // the bot token, nor the platform's text. At most once per stop: the
+            // old loop exits after its in-flight round.
+            logger.info({ agentName, clientName, outcome: result.outcome, reason: 'poller_not_current' }, 'Telegram poll verdict ignored: poller no longer current');
+        });
         this.poller = poller;
+        // A new start forgets the previous verdict (a held `token_invalid`
+        // included) and the conflict window.
+        this.lastConflictAtMs = undefined;
+        this.transport.toConnecting('start_requested');
         poller.start();
     }
     stop() {
+        // Our own stop turns the channel off; nothing it held is a failure now.
+        this.transport.toIdle('stop_requested');
         if (!this.poller)
             return;
         const agentName = this.options.defaultAgentName;
@@ -64,6 +104,54 @@ export class LocalTelegramPollWire {
     }
     isRunning() {
         return this.poller?.isRunning() === true;
+    }
+    /** Live receive-channel state; held after the poller stops (401, crash) until the next start. */
+    transportStatus() {
+        return this.transport.snapshot();
+    }
+    /**
+     * One getUpdates verdict → receive-channel state. Only an answered round
+     * counts as `connected`; the poller's `status: 'polling'` fires before
+     * every request.
+     */
+    onPollResult(result) {
+        switch (result.outcome) {
+            case 'ok':
+                this.onPollSucceeded();
+                break;
+            case 'conflict':
+                this.lastConflictAtMs = this.nowMs();
+                this.transport.toError('poll_conflict', 'poll_conflict');
+                break;
+            case 'token_invalid':
+                // The poller stops for good; the verdict is held until the next start.
+                this.transport.toError('token_rejected', 'token_invalid');
+                break;
+            case 'rate_limited':
+                // Our own polling is throttled; that says nothing about the channel.
+                break;
+            case 'http_error':
+                this.transport.toError('poll_http_error', 'http_error', result.httpStatus);
+                break;
+            case 'network_error':
+                this.transport.toError('poll_request_failed', result.timeout ? 'network_timeout' : 'network_error');
+                break;
+            case 'crashed':
+                this.transport.toError('loop_crashed', 'unknown');
+                break;
+        }
+    }
+    onPollSucceeded() {
+        const lastConflictAtMs = this.lastConflictAtMs;
+        if (lastConflictAtMs !== undefined && this.nowMs() - lastConflictAtMs < POLL_CONFLICT_HOLD_MS) {
+            // Inside the hold window a success is not proof the other consumer is
+            // gone (see POLL_CONFLICT_HOLD_MS); report the conflict, also after a
+            // different failure in between.
+            this.transport.toError('poll_conflict_held', 'poll_conflict');
+            return;
+        }
+        this.lastConflictAtMs = undefined;
+        this.transport.toConnected('poll_succeeded');
     }
     /** Detached per-update dispatch; failures log and never stop the poller. */
     async handleUpdateLogged(update, agentName, clientName) {

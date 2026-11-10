@@ -1,4 +1,4 @@
-import { PermissionReply, QuestionnairePurpose, QuestionnaireSelectionMode, QuestionnaireStatus, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { PermissionReply, QuestionnairePurpose, QuestionnaireReopenReason, QuestionnaireSelectionMode, QuestionnaireStatus, } from '@mavis/thrift-gen/generated/desktop-service/types';
 /** Process-local entrypoint that reuses generated wire contracts and existing Applications. */
 export class CliService {
     options;
@@ -26,6 +26,32 @@ export class CliService {
         if (!workspaceRoot)
             throw new Error('Session has no workspace for project MCP.');
         return { sessionId, workspaceRoot };
+    }
+    /** Only a `sessionId` resolves that Session's workspace; both are used as given. */
+    async listMcpAuthStates(input) {
+        const mcpAuth = this.requireCapability('mcpAuth', 'MCP Auth');
+        const context = input.sessionId && !input.workspaceRoot
+            ? await this.projectMcpContext(input.sessionId)
+            : input;
+        return { states: await mcpAuth.listStates(context) };
+    }
+    testMcpAuthTarget(target) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').test(target);
+    }
+    startMcpAuth(target, options) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').start(target, options);
+    }
+    cancelMcpAuth(attemptId) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').cancel(attemptId);
+    }
+    completeMcpAuth(attemptId, callbackUrl) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').complete(attemptId, callbackUrl);
+    }
+    clearMcpAuth(target) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').clear(target);
+    }
+    setMcpUserClientSecret(serverName, secret) {
+        return this.requireCapability('mcpAuth', 'MCP Auth').setUserClientSecret(serverName, secret);
     }
     clearSessionMcpServers(sessionId) {
         return this.requireCapability('mcp', 'MCP').clearSessionServers(sessionId);
@@ -98,26 +124,44 @@ export class CliService {
     async getPendingQuestionnaire(req, ctx = {}) {
         void ctx;
         const questionnaires = this.requireQuestionnaires();
-        const request = await questionnaires.getPending({
-            agentName: req.name,
-            sessionId: req.sessionId,
-        });
-        return request ? { request: toQuestionnaireRequestView(request) } : {};
+        const scope = { agentName: req.name, sessionId: req.sessionId };
+        let unanswered;
+        if (req.includeUnanswered) {
+            if (!questionnaires.listUnanswered) {
+                throw new Error('Runtime does not expose unanswered Questionnaire recovery.');
+            }
+            unanswered = await questionnaires.listUnanswered(scope);
+        }
+        const request = await questionnaires.getPending(scope);
+        return {
+            ...(request ? { request: toQuestionnaireRequestView(request) } : {}),
+            ...(unanswered ? { unansweredRequests: unanswered.map(toQuestionnaireRequestView) } : {}),
+        };
     }
     async getLatestPlanReview(req, ctx = {}) {
         void ctx;
-        const request = await this.requireQuestionnaires().getLatestPlanReview({
+        const record = await this.requireQuestionnaires().getLatestPlanReview({
             agentName: req.name,
             sessionId: req.sessionId,
         });
-        return request ? { request: toQuestionnaireRequestView(request) } : {};
+        if (!record)
+            return {};
+        return {
+            request: toQuestionnaireRequestView(record.request),
+            status: toQuestionnaireStatus(record.status),
+            sessionId: record.sessionId,
+            ...(record.agentName ? { agentName: record.agentName } : {}),
+            createdAt: record.createdAt,
+            ...(record.answeredAt !== undefined ? { answeredAt: record.answeredAt } : {}),
+            ...(record.dismissedAt !== undefined ? { dismissedAt: record.dismissedAt } : {}),
+        };
     }
     getPlanModeCapabilities() {
         return { entryEnabled: this.requireCapability('plan', 'Plan').isEntryEnabled() };
     }
     async replyQuestionnaire(req, ctx = {}) {
         void ctx;
-        return this.requireQuestionnaires().reply({
+        const result = await this.requireQuestionnaires().reply({
             agentName: req.name,
             requestId: req.requestId,
             answers: req.answers.map((answer) => ({
@@ -126,9 +170,16 @@ export class CliService {
                 selectedOther: answer.selectedOther === true,
                 ...(answer.otherText ? { otherText: answer.otherText } : {}),
                 ...(answer.skipped === true ? { skipped: true } : {}),
+                ...(answer.contextImages?.length ? { contextImages: answer.contextImages } : {}),
             })),
             submittedAt: req.submittedAt ?? Date.now(),
         });
+        return {
+            ...result,
+            state: result.state
+                ? { ...result.state, status: toQuestionnaireStatus(result.state.status) }
+                : undefined,
+        };
     }
     dismissQuestionnaire(req, ctx = {}) {
         void ctx;
@@ -187,6 +238,21 @@ export class CliService {
     getActiveTurn(sessionId) {
         return this.options.conversation.getActiveTurn(sessionId);
     }
+    beginProcessDrain() {
+        const drain = this.options.processLifecycle.beginDrain();
+        return { accepted: true, ...drain };
+    }
+    tryBeginProcessDrainIfIdle() {
+        const result = this.options.processLifecycle.tryBeginDrainIfIdle();
+        if (!result.acquired) {
+            return {
+                accepted: false,
+                activeTurnCount: result.activeTurnCount,
+                pendingAdmissionCount: result.pendingAdmissionCount,
+            };
+        }
+        return { accepted: true, ...result.drain };
+    }
     watchEvents(signal) {
         return this.options.application.events.watch(signal);
     }
@@ -205,8 +271,14 @@ export class CliService {
     patchGoal(sessionId, patch) {
         return this.requireCapability('goals', 'Goal').patch(sessionId, patch);
     }
+    resumeGoal(sessionId) {
+        return this.requireCapability('goals', 'Goal').resume(sessionId);
+    }
     clearGoal(sessionId) {
         return this.requireCapability('goals', 'Goal').clear(sessionId);
+    }
+    getRunningGoalTurnId(sessionId) {
+        return this.requireCapability('goals', 'Goal').runningTurnId(sessionId);
     }
     getWorkspaceGitMetadata(workspaceDir) {
         return this.requireCapability('workspace', 'Workspace').git.getMetadata(workspaceDir);
@@ -273,11 +345,45 @@ export class CliService {
     uninstallPlugin(req) {
         return this.options.application.plugins.uninstallPlugin(req);
     }
+    updatePlugin(req) {
+        return this.options.application.plugins.updatePlugin(req);
+    }
+    listPluginMarketplaces(req) {
+        return this.options.application.plugins.listPluginMarketplaces(req);
+    }
+    addPluginMarketplace(req) {
+        return this.options.application.plugins.addPluginMarketplace(req);
+    }
+    refreshPluginMarketplaces(req) {
+        return this.options.application.plugins.refreshPluginMarketplaces(req);
+    }
+    setPluginMarketplaceAutoUpdate(req) {
+        return this.options.application.plugins.setPluginMarketplaceAutoUpdate(req);
+    }
+    removePluginMarketplace(req) {
+        return this.options.application.plugins.removePluginMarketplace(req);
+    }
     getPermissionMode() {
         return this.requireCapability('configuration', 'Configuration').getPermissionMode();
     }
     setPermissionMode(input) {
         return this.requireCapability('configuration', 'Configuration').setPermissionMode(input);
+    }
+    /** Undefined when this host cannot read the next-message suggestion switch. */
+    getPromptSuggestionEnabled() {
+        return this.options.application.configuration?.getPromptSuggestionEnabled?.();
+    }
+    /** Undefined when this host cannot persist the next-message suggestion switch. */
+    setPromptSuggestionEnabled(enabled) {
+        return this.options.application.configuration?.setPromptSuggestionEnabled?.({ enabled });
+    }
+    /** Undefined when this host cannot read the PTC switch. */
+    getPtcEnabled() {
+        return this.options.application.configuration?.getPtcEnabled?.();
+    }
+    /** Undefined when this host cannot persist the PTC switch. */
+    setPtcEnabled(enabled) {
+        return this.options.application.configuration?.setPtcEnabled?.({ enabled });
     }
     listModels(input) {
         return this.requireCapability('models', 'Model').list(input);
@@ -287,13 +393,20 @@ export class CliService {
     }
     /** Resolves false when the host has no model-favorite store. */
     async setModelFavorite(input) {
-        const models = this.requireCapability("models", "Model");
+        const models = this.requireCapability('models', 'Model');
         if (!models.setFavorite)
             return false;
         return models.setFavorite(input);
     }
     listUserModelProviders() {
         return this.requireCapability('modelProviders', 'Model Provider').listUser();
+    }
+    /** Synchronous: false when this build does not ship agent model access (`beta.modelAccess`). */
+    hasModelAccess() {
+        return this.options.application.modelAccess !== undefined;
+    }
+    getModelAccess() {
+        return this.requireCapability('modelAccess', 'Model Access');
     }
     listProviderPresets() {
         return this.requireCapability('modelProviders', 'Model Provider').listProviderPresets();
@@ -411,6 +524,25 @@ function toQuestionnaireRequestView(request) {
         ...(request.modePayload
             ? { modePayload: toQuestionnaireModePayloadView(request.modePayload) }
             : {}),
+        ...toQuestionnaireLifecycleView(request),
+    };
+}
+function toQuestionnaireLifecycleView(request) {
+    return {
+        ...(request.responseMode ? { responseMode: request.responseMode } : {}),
+        ...(request.countdownSeconds !== undefined
+            ? { countdownSeconds: request.countdownSeconds }
+            : {}),
+        ...(request.syncWaiting !== undefined ? { syncWaiting: request.syncWaiting } : {}),
+        ...(request.originTurnRunning !== undefined
+            ? { originTurnRunning: request.originTurnRunning }
+            : {}),
+        ...(request.answeredAt !== undefined ? { answeredAt: request.answeredAt } : {}),
+        ...(request.injectedAt !== undefined ? { injectedAt: request.injectedAt } : {}),
+        ...(request.reopenReason === 'content_recall'
+            ? { reopenReason: QuestionnaireReopenReason.ContentRecall }
+            : {}),
+        ...(request.prefillAnswers ? { prefillAnswers: request.prefillAnswers } : {}),
     };
 }
 function toQuestionnaireStepView(step) {

@@ -3,14 +3,16 @@ import { ChannelTurnLifecycle } from './delivery/channel-turn-lifecycle.js';
 /** Initializes the v2 owner for Channel ingress, routing and delivery capabilities. */
 function initializeChannelSystem(options) {
     const turnLifecycle = new ChannelTurnLifecycle({ typing: options.product.typing });
+    const terminalReplies = new ChannelFinalReplyObserver({
+        messages: options.messages,
+        sessions: options.sessions,
+        delivery: options.product.finalReplies,
+        turnLifecycle,
+    });
     return {
         turnLifecycle,
-        terminalReplies: new ChannelFinalReplyObserver({
-            messages: options.messages,
-            sessions: options.sessions,
-            delivery: options.product.finalReplies,
-            turnLifecycle,
-        }),
+        terminalReplies,
+        resolveTurnReplyChannel: (sessionId, turnId) => terminalReplies.resolvePersistedTurnChannel(sessionId, turnId),
     };
 }
 export function initializeOptionalChannelSystem(enabled, options) {

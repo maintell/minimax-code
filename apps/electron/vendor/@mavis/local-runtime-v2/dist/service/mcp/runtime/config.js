@@ -1,4 +1,5 @@
 import { buildMcpToolRuntimeName } from '@mavis/mcp';
+import { MCP_DEFAULTS } from '@mavis/mcp/runtime/types';
 import { isBuiltinMatrixConfig } from './builtin-matrix.js';
 export function hasLocalCallAdapter(config) {
     return !!readRecord(config.metadata?.['mockResponses']) || !!configToTransportConfig(config);
@@ -50,7 +51,7 @@ export function normalizeServerConfig(config) {
         ...(readRecord(config['env']) ? { env: readStringRecord(config['env']) } : {}),
         ...(readString(config['url']) ? { url: readString(config['url']) } : {}),
         ...(readTransport(config['type']) ? { type: readTransport(config['type']) } : {}),
-        ...(readRecord(config['auth']) ? { auth: readRecord(config['auth']) } : {}),
+        ...(readRecord(config['oauth']) ? { oauth: readRecord(config['oauth']) } : {}),
         enabled: config['enabled'] !== false,
         configured: config['configured'] !== false,
         builtin: config['builtin'] === true,
@@ -83,27 +84,12 @@ export function inferTransport(config) {
         return 'stdio';
     return 'none';
 }
-export function inferAuthStatus(config) {
-    if (!config.auth)
-        return 'none';
-    if (readString(config.auth['token']) || readString(config.auth['accessToken'])) {
-        return 'authenticated';
-    }
-    if (config.auth['type'] === 'oauth2')
-        return 'pending_auth';
-    return 'configured';
-}
 function readString(value) {
     return typeof value === 'string' && value.trim() ? value : undefined;
 }
 export function readRecord(value) {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value
-        : undefined;
-}
-export function readStringArray(value) {
-    return Array.isArray(value)
-        ? value.filter((item) => typeof item === 'string')
         : undefined;
 }
 export function buildNativeToolName(server, tool, config) {
@@ -139,5 +125,19 @@ function readTransport(value) {
     return value === 'stdio' || value === 'http' || value === 'sse' || value === 'streamable-http'
         ? value
         : undefined;
+}
+export function stdioDiscoveryTimeoutFromEnv() {
+    const value = process.env.MCODE_MCP_STDIO_DISCOVERY_TIMEOUT_MS?.trim() ?? '';
+    const timeout = Number(value);
+    // Node timers overflow beyond signed int32 and would fire after 1 ms instead.
+    return /^\d+$/.test(value) &&
+        Number.isSafeInteger(timeout) &&
+        timeout > 0 &&
+        timeout <= 2_147_483_647
+        ? timeout
+        : 30_000;
+}
+export function configuredTimeout(config) {
+    return config.timeout && config.timeout > 0 ? config.timeout : MCP_DEFAULTS.timeout;
 }
 //# sourceMappingURL=config.js.map

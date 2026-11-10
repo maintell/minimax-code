@@ -67,6 +67,15 @@ export function staleToolWireError() {
         retryable: false,
     };
 }
+/** The user switched the tool's provider off for this Mini App; nothing was sent. */
+export function notPermittedWireError() {
+    return {
+        code: 'CONNECTOR_NOT_PERMITTED',
+        message: 'The user switched this Connector off for the Mini App',
+        disposition: 'not_dispatched',
+        retryable: false,
+    };
+}
 export function providerWireError(invocationId) {
     return {
         code: 'CONNECTOR_PROVIDER_ERROR',

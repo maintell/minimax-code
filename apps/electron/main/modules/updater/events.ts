@@ -38,6 +38,10 @@ function primeNativeUpdateAfterDownload() {
         logger.warn(`[Updater] 预热 Squirrel.Mac 原生更新失败，退出时将回退为普通退出: ${result.error}`);
     }
 }
+/** 普通 test 包分支指针携带的构建身份；比较待安装包时再校验。 */
+function testBuildOf(info) {
+    return info.testBuild;
+}
 /**
  * 设置 autoUpdater 事件监听
  */
@@ -45,7 +49,10 @@ export function setupAutoUpdaterEvents() {
     const sendStatusToRenderer = (event) => {
         // WindowManager's current window (single-tab 'archon' window)
         if (windowManager.isWindowValid()) {
-            logger.info(`[Updater] sendStatusToRenderer via window: status=${event.status}`);
+            // 下载中每个进度回调都会发一次，进度已由「下载进度」日志记录，这里不再逐条记录
+            if (event.status !== 'downloading') {
+                logger.info(`[Updater] sendStatusToRenderer via window: status=${event.status}`);
+            }
             windowManager.sendToWindow(IPC_CHANNELS.UPDATER_STATUS, event);
             return;
         }
@@ -73,7 +80,7 @@ export function setupAutoUpdaterEvents() {
             return;
         logger.info(`[Updater] 发现新版本: ${info.version}`);
         setUpdateStatus('available');
-        setCachedUpdateInfo({ version: info.version });
+        setCachedUpdateInfo({ version: info.version, testBuild: testBuildOf(info) });
         // 发现新版本意味着即将开始新的下载 → Squirrel.Mac 会重新处理，
         // 之前的 nativeUpdateReady 状态不再可靠，需要重置。
         // 注意：不能在 checking-for-update 重置，因为"已下载 → 手动检查 → 同版本"
@@ -126,7 +133,7 @@ export function setupAutoUpdaterEvents() {
         logger.info(`[Updater] 更新下载完成: ${info.version}, file: ${downloadedFile || 'unknown'}`);
         setUpdateStatus('downloaded');
         markUpdateDownloaded(downloadedFile);
-        setCachedUpdateInfo({ version: info.version });
+        setCachedUpdateInfo({ version: info.version, testBuild: testBuildOf(info) });
         setCachedProgress(null);
         sendStatusToRenderer({
             status: 'downloaded',

@@ -1,3 +1,4 @@
+import { recoverPtcCrashState, } from '../../messages/ptc/crash-recovery.js';
 export const SESSION_INTERRUPTION_MESSAGE = 'This session was interrupted because the previous local runtime stopped.';
 const DEFAULT_RECOVERY_BATCH_SIZE = 1000;
 /**
@@ -18,6 +19,7 @@ export class SessionRecoveryService {
             throw new TypeError('processStartedAtMs must be finite');
         }
         const interruptedSessionIds = [];
+        const recoveredPtcTurnIds = new Set();
         let candidates;
         do {
             candidates = await this.options.sessions.listStalePiSessions({
@@ -27,6 +29,16 @@ export class SessionRecoveryService {
                     : {}),
                 limit: this.batchSize,
             });
+            // Do this before changing `started` to `interrupted`. If the process
+            // stops between the two durable stores, the next startup still sees the
+            // Session as stale and retries the PTC closure instead of losing facts.
+            for (const turnId of await this.recoverInterruptedPtcState({
+                processStartedAtMs: input.processStartedAtMs,
+                interruptedSessionIds: candidates.map((candidate) => candidate.sessionId),
+                terminalFacts: input.terminalFacts,
+            })) {
+                recoveredPtcTurnIds.add(turnId);
+            }
             for (const candidate of candidates) {
                 const updated = await this.options.sessions.update(candidate.sessionId, {
                     status: 'interrupted',
@@ -41,7 +53,24 @@ export class SessionRecoveryService {
                 }
             }
         } while (candidates.length === this.batchSize);
-        return { interruptedSessionIds };
+        for (const turnId of await this.recoverInterruptedPtcState({
+            processStartedAtMs: input.processStartedAtMs,
+            interruptedSessionIds: [],
+            terminalFacts: input.terminalFacts,
+        })) {
+            recoveredPtcTurnIds.add(turnId);
+        }
+        return {
+            interruptedSessionIds,
+            ...(recoveredPtcTurnIds.size > 0 ? { recoveredPtcTurnIds: [...recoveredPtcTurnIds] } : {}),
+        };
+    }
+    async recoverInterruptedPtcState(input) {
+        const { messages, canonicalHistory } = this.options;
+        if (!messages || !canonicalHistory)
+            return [];
+        return (await recoverPtcCrashState({ messages, history: canonicalHistory }, input))
+            .recoveredTurnIds;
     }
 }
 function normalizeBatchSize(value) {

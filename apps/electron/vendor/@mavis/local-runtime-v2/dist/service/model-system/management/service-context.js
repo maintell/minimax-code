@@ -8,9 +8,11 @@ import { generateProviderKey } from './provider-key.js';
 import { buildCustomProviderView } from '../catalog/provider-views.js';
 import { mergeProviderHeaders, normalizeProviderBaseUrl, } from '../connectivity/provider-request.js';
 import { mergeModelsFromInputs, normalizeApiFormat, applyProviderCredentialUpdate, normalizeProviderCredentialUpdate, normalizeHeaderNames, normalizeHeaders, removeHeaderCaseInsensitive, } from './service-input.js';
-import { customProviderKeyFromId, removeLegacyCustomProviderNpm } from './service-helpers.js';
+import { assertCustomProviderEffortOptions, customProviderKeyFromId, customProviderViewOptions, modelAccessBindingMissingError, modelAccessProviderReadOnlyError, removeLegacyCustomProviderNpm, } from './service-helpers.js';
+import { isModelAccessProvider } from '../model-access/projection.js';
 import { isMiniMaxM3ModelId, normalizeModelThinkingEffortOptions, } from '../resolution/model-ref.js';
 import { byokEffectiveOutputLimit } from '../resolution/model-resolver-byok.js';
+import { mergeApiKeyDrafts, readApiKeys, replaceFirstApiKey, writeApiKeys, } from '../byok-keys/key-list.js';
 function requireCandidateBaseUrl(value) {
     const baseUrl = value?.trim();
     if (!baseUrl) {
@@ -24,12 +26,31 @@ function candidateOptions(current, input, baseUrl) {
     // A new provider needs a credential it can actually use; an existing one
     // keeps whatever it already has when the request carries none. `keep` on an
     // edit is a no-op, not a missing-key error.
-    if (!current && apiKeyUpdate.kind !== 'set') {
+    if (!current && apiKeyUpdate.kind !== 'set' && !input.apiKeys?.length) {
         throw new LocalModelProviderError(400, 'API key must not be empty', 'INVALID_API_KEY');
     }
-    applyProviderCredentialUpdate(options, apiKeyUpdate);
+    applyCandidateApiKeys(options, current, input, apiKeyUpdate);
     applyCandidateHeaderUpdates(options, current, input);
     return options;
+}
+/**
+ * `apiKeys` drafts, when sent, are the whole list. Without them an `apiKey` replaces only the
+ * first key (an older client keeps the others) and a blank one clears every key.
+ */
+function applyCandidateApiKeys(options, current, input, apiKeyUpdate) {
+    if (input.apiKeys !== undefined) {
+        writeApiKeys(options, mergeApiKeyDrafts(readApiKeys(current), input.apiKeys));
+        return;
+    }
+    if (apiKeyUpdate.kind === 'set' && current) {
+        writeApiKeys(options, replaceFirstApiKey(readApiKeys(current), apiKeyUpdate.apiKey));
+        return;
+    }
+    if (apiKeyUpdate.kind === 'clear') {
+        writeApiKeys(options, []);
+        return;
+    }
+    applyProviderCredentialUpdate(options, apiKeyUpdate);
 }
 function applyCandidateHeaderUpdates(options, current, input) {
     const removeHeaders = normalizeHeaderNames(input.removeHeaders);
@@ -148,6 +169,8 @@ export class ModelProviderServiceContext {
     resolveUserProviderCandidate(input) {
         const config = this.deps.configGetter();
         const identity = this.resolveCandidateIdentity(input, config);
+        if (isModelAccessProvider(identity.current))
+            throw modelAccessProviderReadOnlyError();
         const baseUrl = requireCandidateBaseUrl(input.baseUrl);
         const options = candidateOptions(identity.current, input, baseUrl);
         const apiFormat = candidateApiFormat(identity.current, input);
@@ -163,6 +186,7 @@ export class ModelProviderServiceContext {
         if (!apiFormat)
             delete provider.api;
         removeLegacyCustomProviderNpm(provider);
+        assertCustomProviderEffortOptions(provider);
         return {
             providerKey: identity.providerKey,
             providerId: `${CUSTOM_PROVIDER_ID_PREFIX}${identity.providerKey}`,
@@ -183,6 +207,9 @@ export class ModelProviderServiceContext {
         }
         const providerKey = this.requireExistingProviderKey(requestedProviderId);
         const current = config.custom_provider?.[providerKey];
+        // Read-only ownership is stable regardless of the caller's revision.
+        if (isModelAccessProvider(current))
+            throw modelAccessProviderReadOnlyError();
         const expectedRevision = input.expectedRevision?.trim();
         if (!current || !expectedRevision || modelConfigFingerprint(current) !== expectedRevision) {
             throw new LocalModelProviderError(409, 'Provider configuration changed', 'CONFIG_CHANGED');
@@ -190,6 +217,9 @@ export class ModelProviderServiceContext {
         return { providerKey, current, expectedRevision };
     }
     discoveryTargetForProvider(provider) {
+        // An extension provider without a current binding has no stored route to fall back to.
+        if (isModelAccessProvider(provider))
+            throw modelAccessBindingMissingError();
         // Discovery talks to the upstream, so it needs the same credential the turn
         // path uses. Reading the raw field sent a `${VAR}` literal as the key.
         const apiKey = resolveProviderCredential({
@@ -247,6 +277,8 @@ export class ModelProviderServiceContext {
             ? customProviderKeyFromId(providerId)
             : this.requireExistingProviderKey(providerId);
         const provider = options.customProviderOverride ?? config.custom_provider?.[providerKey];
+        if (isModelAccessProvider(provider))
+            throw modelAccessBindingMissingError();
         const { apiKey, baseUrl } = requireCustomProviderCredentials(provider, options.apiKeyOverride, `${CUSTOM_PROVIDER_ID_PREFIX}${providerKey}`);
         const chosenModelId = requireCustomProviderModelId(provider, modelId);
         const fullProviderId = `${CUSTOM_PROVIDER_ID_PREFIX}${providerKey}`;
@@ -336,7 +368,7 @@ export class ModelProviderServiceContext {
         if (!provider) {
             throw new LocalModelProviderError(404, 'Model provider not found', 'PROVIDER_NOT_FOUND');
         }
-        return buildCustomProviderView(config, this.deps.cache.load(), providerKey, provider);
+        return buildCustomProviderView(config, this.deps.cache.load(), { providerKey, provider }, customProviderViewOptions(this.deps));
     }
 }
 //# sourceMappingURL=service-context.js.map

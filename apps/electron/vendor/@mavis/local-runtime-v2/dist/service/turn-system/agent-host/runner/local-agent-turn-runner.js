@@ -1,13 +1,18 @@
 import { PiTurnRunner, } from '@mavis/agent-core/pi-turn-runner';
 import { buildCompletedTerminalStatusEvent, buildAbortedTerminalStatusEvent, } from '@mavis/agent-core/event-bridge';
 import { getRuntimeBuildEnv } from '@mavis/config';
-import { RuntimeEventStatus, RuntimeEventType } from '@mavis/protocol';
+import { RespDataType } from '@mavis/agent-core/protocol/agent-message';
+import { RUNTIME_EVENT_SCHEMA, RuntimeEventStatus, RuntimeEventType } from '@mavis/protocol';
 import { isInputSafetyDecisionFor, reviewBlocks, reviewBlocksInput, } from '../../../content-safety/index.js';
-import { LocalOutputSafetyEventWriter } from './output-safety-event-writer.js';
+import { LocalOutputSafetyEventWriter, SAFETY_REVIEW_SLOW_READ_MS, } from './output-safety-event-writer.js';
 import { runWithLocalEvalReporter } from './eval-reporter.js';
 import { deriveLocalTurnRuntimeOutcome } from './turn-outcome.js';
 import { appendSafetyReplacement } from './safety-replacement.js';
 import { DEFAULT_OUTPUT_REVISION_INSTRUCTION } from '../preparation/config/prompt-templates.js';
+import { readPtcChildTools } from '../execution/ptc/catalog.js';
+import { prepareDirectCallArguments, withDirectCallArguments, } from './ptc/direct-call-arguments.js';
+import { createDirectCallReminder } from './ptc/direct-call-reminder.js';
+import { callableTurnToolNames } from './computer-use-capture/reporter.js';
 const OUTPUT_SAFETY_MAX_REGENERATIONS = 3;
 /** V2 production runner: direct Pi invocation plus local input/output safety policy. */
 export class LocalAgentTurnRunner {
@@ -25,12 +30,31 @@ export class LocalAgentTurnRunner {
             (input.caller === undefined || input.caller === 'chat' || input.caller === 'channel_feishu');
         const observation = { regenerations: 0 };
         try {
-            return await runWithLocalEvalReporter(this.options.evalReporterFactory, input, (reportedInput) => this.runTurnCore(reportedInput, observation), this.options.logger);
+            const capture = this.resolveComputerUseCapture(input);
+            return await runWithLocalEvalReporter(this.options.evalReporterFactory, { ...input, computerUseCapture: capture ? await capture : undefined }, (reportedInput) => this.runTurnCore(reportedInput, observation), this.options.logger);
         }
         finally {
             if (isUserTurn)
                 this.recordRegenerations(input, observation.regenerations);
+            // A PTC Turn ends with one `ptc turn summary` line; no-op on other Turns.
+            input.toolContext?.ptcObserver?.finishTurn();
         }
+    }
+    resolveComputerUseCapture(input) {
+        // computer_* may be run_code children on a PTC Turn; capture still applies.
+        const toolNames = callableTurnToolNames(input.tools);
+        if (input.signal?.aborted || !toolNames.some((name) => name.startsWith('computer_')))
+            return undefined;
+        return this.options.resolveComputerUseCapture?.({
+            sessionId: input.sessionId,
+            turnId: input.turnId,
+            model: {
+                id: input.llm.model.id,
+                provider: input.llm.model.provider,
+                api: input.llm.model.api,
+            },
+            toolNames,
+        });
     }
     async runTurnCore(input, observation) {
         const baseToolContext = requireToolContext(input);
@@ -80,8 +104,22 @@ export class LocalAgentTurnRunner {
             }
             if (rejected || state.inputCorrectionPending)
                 state.activeWriter?.block();
-        });
+        }, (slow) => {
+            state.slowNetworkRead = slow;
+        }, () => this.notifySlowReview(input, state));
         return state;
+    }
+    /** 本轮第一次出现慢送审时通知一次；通知只用于展示，出错也不能影响本轮。 */
+    notifySlowReview(input, state) {
+        if (state.slowReviewNotified)
+            return;
+        state.slowReviewNotified = true;
+        try {
+            this.options.onSlowReview?.({ sessionId: input.sessionId, turnId: input.turnId });
+        }
+        catch {
+            // 慢送审提示只是展示用，不能改变本轮结果。
+        }
     }
     async runAttempts(scope) {
         const { input, toolContext, observedLlm, state, observation } = scope;
@@ -145,6 +183,7 @@ export class LocalAgentTurnRunner {
                         : this.options.reviewContent,
                 }),
             onBlocked: () => safetyAbort.abort(state.inputRejected ? 'input_safety' : 'output_safety'),
+            onSlowReview: () => this.notifySlowReview(input, state),
             ...(this.options.outputSafetyRetryDelay
                 ? { retryDelay: this.options.outputSafetyRetryDelay }
                 : {}),
@@ -153,6 +192,7 @@ export class LocalAgentTurnRunner {
             ...(input.persistApprovedPartialOnNetworkStop === false
                 ? { persistApprovedPartialOnNetworkStop: false }
                 : {}),
+            ptcEnabled: input.ptcTools !== undefined || readPtcChildTools(input.tools) !== undefined,
         });
     }
     async runPiAttempt(scope) {
@@ -161,8 +201,11 @@ export class LocalAgentTurnRunner {
         state.pendingRevisionInstruction = undefined;
         observeLlmAttempt(input, scope.attemptIndex, systemPrompt);
         const contextUsageAttempt = this.prepareContextUsageAttempt(input, observedLlm, safetyWriter);
+        const ptcTools = input.ptcTools ?? readPtcChildTools(input.tools);
+        const direct = directPtcChildCallWiring(input, ptcTools, toolContext);
         await this.piRunner.runTurn({
             ...toPiRunTurnInput(input),
+            ...direct.input,
             llm: contextUsageAttempt?.llm ?? observedLlm,
             systemPrompt,
             eventWriter: contextUsageAttempt?.eventWriter ?? safetyWriter,
@@ -172,6 +215,8 @@ export class LocalAgentTurnRunner {
             runtimeSeqGenerator: state.runtimeSeqGenerator,
             toolConfig: {
                 tools: input.tools ?? [],
+                ...direct.toolConfig,
+                missingToolMessage: (toolName) => missingTurnToolMessage(toolName, ptcTools),
                 disableBuiltinToolFallback: input.disableBuiltinToolFallback ?? true,
                 context: toolContext,
             },
@@ -204,9 +249,16 @@ export class LocalAgentTurnRunner {
     async settleAttempt(scope) {
         const { input, state, safetyWriter, regenerationCount, attemptIndex } = scope;
         if (input.signal?.aborted) {
+            // Cancellation still settles canonical history from the already released prefix.
+            // A rejected or superseded attempt must not be resurrected by that settlement.
+            if (!safetyWriter.blocked) {
+                state.approvedPartial = safetyWriter.getApprovedPartial();
+            }
             await appendCancelledTurn(input, state);
             return 'break';
         }
+        if (await this.settlePtcSafetyStop(input, state, safetyWriter))
+            return 'break';
         if (state.inputRejected)
             return 'break';
         const inputCorrection = await settleInputCorrection(input, state, safetyWriter, attemptIndex + 1);
@@ -228,6 +280,21 @@ export class LocalAgentTurnRunner {
         await recallAttempt(input, safetyWriter, attemptIndex + 1);
         return 'continue';
     }
+    async settlePtcSafetyStop(input, state, writer) {
+        if (!writer.hasPtcChildCalls() || !requiresSafetyStop(state, writer))
+            return false;
+        const inputSafetyStopped = state.inputRejected || state.inputCorrectionPending;
+        state.ptcSafetyStopped = true;
+        state.inputCorrectionPending = false;
+        if (writer.networkStopped)
+            await settleNetworkStop(input, state, writer, this.options.logger);
+        else if (!state.inputRejected) {
+            await settleOutputRetraction(input, state);
+            if (inputSafetyStopped)
+                state.retractionSource = 'input-review';
+        }
+        return true;
+    }
     async settleInputReview(input, state, inputRejected) {
         if (!inputRejected || state.retracted)
             return;
@@ -235,7 +302,11 @@ export class LocalAgentTurnRunner {
         state.retractionVariant ??= 'content';
         await appendSyntheticCompleted(input, `local-input-retracted-${input.turnId}-status`);
     }
-    async reviewInput(input, observe) {
+    async reviewInput(input, observe, 
+    // 只在输入审核失败、走网络撤回时调用：告诉调用方这次审核是否等了 15 秒以上。
+    observeNetworkFailure, 
+    // 审核返回或抛错时等了 15 秒以上就调用，不管成功失败。
+    observeSlowReview) {
         if (input.signal?.aborted)
             return false;
         if (input.contentReviewRequired === false) {
@@ -250,23 +321,111 @@ export class LocalAgentTurnRunner {
         }
         if (!input.reviewUserInput?.trim())
             return false;
+        const startMs = Date.now();
         try {
             const result = normalizeInputReviewResult(await this.options.reviewContent(input.reviewUserInput, 300));
             if (input.signal?.aborted)
                 return false;
+            const slow = observeReviewElapsed(startMs, observeSlowReview);
             const rejected = reviewBlocksInput(result);
-            observe(rejected, inputReviewVariant(rejected, result.errorKind, input.contentReviewRequired === true), result.errorKind === 'api_error', result);
+            const variant = inputReviewVariant(rejected, result.errorKind, input.contentReviewRequired === true);
+            if (variant === 'network')
+                observeNetworkFailure(slow);
+            observe(rejected, variant, result.errorKind === 'api_error', result);
             reportInputReviewResolution(input, reviewBlocks(result));
             return rejected;
         }
         catch {
             if (input.signal?.aborted)
                 return false;
+            observeNetworkFailure(observeReviewElapsed(startMs, observeSlowReview));
             observe(true, 'network', false);
             reportInputReviewResolution(input, true);
             return true;
         }
     }
+}
+function missingTurnToolMessage(toolName, childTools) {
+    if (!childTools && toolName === 'run_code')
+        return 'run_code is disabled for this turn. Use the current native tool catalog.';
+    return undefined;
+}
+/**
+ * PTC-Turn wiring for direct calls of run_code children: the resolver, and the reminder
+ * hook placed after every other after-tool hook so it ends the final result. Empty when
+ * the Turn has no PTC.
+ */
+function directPtcChildCallWiring(input, ptcTools, context) {
+    if (!ptcTools)
+        return { input: {}, toolConfig: {} };
+    const reminder = createDirectCallReminder((fields) => {
+        writePtcDirectCallEvent(context, 'ptc hidden tool reminder', fields);
+        context.ptcObserver?.directCallSettled(fields.tool, fields.tool_call_id, fields.appended);
+    });
+    return {
+        input: {
+            hooks: {
+                ...input.hooks,
+                afterToolCallHook: [...(input.hooks?.afterToolCallHook ?? []), reminder.afterToolCall],
+            },
+        },
+        toolConfig: {
+            ptcTools,
+            resolveMissingTool: (toolCall) => resolveDirectPtcChildTool(toolCall, ptcTools, context, reminder),
+        },
+    };
+}
+/**
+ * A run_code child the model called directly although the top-level catalog omits it runs
+ * as that native tool, as it would with PTC off, after the argument repair in
+ * `ptc/direct-call-arguments.ts`; the last such call of a reply gets the reminder of
+ * `ptc/direct-call-reminder.ts`. The events name the tool, the call, the repair kinds and
+ * whether the reminder was appended, never argument values or content.
+ */
+function resolveDirectPtcChildTool(toolCall, childTools, context, reminder) {
+    const tool = childTools.find((candidate) => candidate.def.name === toolCall.name);
+    if (!tool)
+        return undefined;
+    const call = { tool: toolCall.name, tool_call_id: toolCall.id };
+    writePtcDirectCallEvent(context, 'ptc hidden tool called directly', call);
+    let prepared;
+    try {
+        prepared = prepareDirectCallArguments(tool, toolCall.arguments);
+    }
+    catch {
+        // The tool's own preparation threw; Pi reports that error when it prepares the call.
+        prepared = { fixes: [], valid: false };
+    }
+    writePtcDirectCallEvent(context, 'ptc hidden tool arguments prepared', {
+        ...call,
+        fixes: [...prepared.fixes],
+        valid: prepared.valid,
+    });
+    // Before noteResolved: an invalid call is settled (and logged) inside it.
+    context.ptcObserver?.directCallResolved(toolCall.id, prepared.valid);
+    reminder.noteResolved(toolCall, prepared.valid);
+    return withDirectCallArguments(tool);
+}
+function writePtcDirectCallEvent(context, event, fields) {
+    try {
+        context.ptcLogger?.info?.({ session_id: context.sessionId, turn_id: context.turnId, ...fields }, event);
+    }
+    catch {
+        // Diagnostics must not change the tool call.
+    }
+}
+function requiresSafetyStop(state, writer) {
+    return (state.inputRejected || state.inputCorrectionPending || writer.blocked || writer.networkStopped);
+}
+function isSlowReview(startMs) {
+    return Date.now() - startMs >= SAFETY_REVIEW_SLOW_READ_MS;
+}
+/** 审核返回（或抛错）时看耗时：等了 15 秒以上先通知慢送审，再把是否慢交给调用方。 */
+function observeReviewElapsed(startMs, observeSlowReview) {
+    const slow = isSlowReview(startMs);
+    if (slow)
+        observeSlowReview();
+    return slow;
 }
 function reportInputReviewResolution(input, rejected) {
     if (input.deferInputReviewResolution !== true) {
@@ -304,7 +463,10 @@ function createMutableRunnerState(input) {
         inputReview: Promise.resolve(false),
         retracted: false,
         networkStopped: false,
+        slowNetworkRead: false,
+        slowReviewNotified: false,
         inputSafetyReviewUnknown: false,
+        ptcSafetyStopped: false,
         finalAttemptEventStart: input.eventWriter.events.length,
         eventIdGenerator: input.eventIdGenerator ??
             ((kind) => `evt_${input.turnId}_${kind}_${++eventIdentitySequence}`),
@@ -395,6 +557,32 @@ function withTurnEventReporter(context, state) {
 async function appendCancelledTurn(input, state) {
     if (deriveLocalTurnRuntimeOutcome(input.eventWriter.events).status === 'aborted')
         return;
+    const partial = state.approvedPartial;
+    if (partial?.msgId && partial.content.trim()) {
+        // Pi suppresses the final assistant frame on abort. Persist the released text
+        // under its streaming identity before the terminal closes Display delivery.
+        await input.eventWriter.appendEvents([
+            {
+                schema: RUNTIME_EVENT_SCHEMA,
+                event_id: state.eventIdGenerator('aborted-partial'),
+                runtime_seq: state.runtimeSeqGenerator(),
+                session_id: input.sessionId,
+                turn_id: input.turnId,
+                type: RuntimeEventType.STREAM_RESP,
+                payload: {
+                    stream_resp: JSON.stringify({
+                        type: RespDataType.AgentMessage,
+                        agent_message: {
+                            msg_id: partial.msgId,
+                            role: 'assistant',
+                            msg_content: partial.content,
+                            finish_reason: 'aborted',
+                        },
+                    }),
+                },
+            },
+        ]);
+    }
     await input.eventWriter.appendEvents([
         buildAbortedTerminalStatusEvent({
             sessionId: input.sessionId,
@@ -445,6 +633,7 @@ async function settleNetworkStop(input, state, safetyWriter, logger) {
     }, '[content-safety] output review stopped turn');
     state.networkStopped = true;
     state.retractionVariant = safetyWriter.reviewStopVariant;
+    state.slowNetworkRead = safetyWriter.slowNetworkRead;
     state.approvedPartial = safetyWriter.getApprovedPartial();
     await appendSyntheticCompleted(input, `local-output-network-stopped-${input.turnId}-status`);
 }
@@ -502,15 +691,23 @@ function buildRunnerResult(input, state) {
     };
 }
 function deriveReconcile(state, status) {
+    if (state.ptcSafetyStopped)
+        return { kind: 'safety-reconcile', approvedContent: '' };
     if (state.retracted) {
+        const variant = state.retractionVariant ?? 'content';
         return {
             kind: 'output-recall',
             source: state.retractionSource ?? 'output-review',
-            variant: state.retractionVariant ?? 'content',
+            variant,
+            ...(variant === 'network' && state.slowNetworkRead ? { slowNetworkRead: true } : {}),
         };
     }
     if (state.networkStopped) {
-        return { kind: 'network-reconcile', approvedContent: state.approvedPartial?.content };
+        return {
+            kind: 'network-reconcile',
+            approvedContent: state.approvedPartial?.content,
+            ...(state.slowNetworkRead ? { slowNetworkRead: true } : {}),
+        };
     }
     if (status === 'aborted') {
         return { kind: 'abort-reconcile', approvedContent: state.approvedPartial?.content };
@@ -559,7 +756,11 @@ function toPiControlInput(input) {
             ? { shouldStopAfterSteering: input.shouldStopAfterSteering }
             : {}),
         ...(input.shouldStopAfterTurn ? { shouldStopAfterTurn: input.shouldStopAfterTurn } : {}),
+        ...(input.isWorkClosed ? { isWorkClosed: input.isWorkClosed } : {}),
         ...(input.tryBeginClose ? { tryBeginClose: input.tryBeginClose } : {}),
+        ...(input.unexpectedToolCallFallback
+            ? { unexpectedToolCallFallback: input.unexpectedToolCallFallback }
+            : {}),
     };
 }
 function combineAbortSignals(...signals) {

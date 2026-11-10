@@ -2,9 +2,9 @@ import * as cleanup from './cleanup-settlement.js';
 import * as errors from '../errors.js';
 import { MiniAppError } from '../errors.js';
 const EXPLICIT_START_REQUIRED_FIELD = 'requiresExplicitStart';
-/** Cold startup cannot take custody from a running, starting, or retiring generation. */
-export function assertColdStartupAvailable(current, runtimeOwners) {
-    if (current?.startPromise || current?.idleStopPromise || runtimeOwners.length > 0) {
+/** Cold startup cannot take custody from a running or retiring generation. */
+export function assertColdStartupAvailable(runtimeOwners) {
+    if (runtimeOwners.length > 0) {
         throw new MiniAppError('BUSY', 'MiniApp start cannot replace an owned runtime', {
             busyReason: 'operation_busy',
         });
@@ -104,12 +104,7 @@ export async function rollbackCommittedGeneration(input) {
     if (input.active.get(input.pluginId) !== input.committedGeneration) {
         throw new MiniAppError('SUPERSEDED', 'Mini App generation changed before publication rollback');
     }
-    if (input.committedGeneration.leases.size !== 0) {
-        throw new MiniAppError('SUPERSEDED', 'Mini App generation leases must be released before publication rollback');
-    }
     input.committedGeneration.accepting = false;
-    input.committedGeneration.idleTimer?.cancel();
-    input.committedGeneration.idleTimer = undefined;
     if (input.previousGeneration) {
         removeRetiringGeneration(input.retiring, input.pluginId, input.previousGeneration);
         input.previousGeneration.accepting = input.previousAccepting;

@@ -157,7 +157,9 @@ async function settleFeishuAttempts(attempts) {
             logger.error({ err: result.reason, agentName, platform: 'feishu' }, 'Feishu WS restore failed');
             return;
         }
-        // `startFeishuWs` resolves `true` when the transport actually started;
+        // `startFeishuWs` resolves `true` when the transport was dispatched (SDK
+        // client started; the handshake verdict is tracked separately in the
+        // adapter's `getWsStatus`, see `FeishuPlatformAdapter.startWebSocket`);
         // `false` / `undefined` mean "did not start" (disabled / precondition
         // miss / error already logged by the host wrapper) — count as failed
         // so the summary reflects the real transport state.

@@ -1,10 +1,11 @@
 import { and, eq } from 'drizzle-orm';
 import { sessions } from '../../../../infra/db/schema/sessions.js';
+import { sessionLocks, isDeletionOwnerKind } from '../../../../infra/db/schema/turn.js';
 /**
  * Coordinates deletion only inside the owning local-runtime process.
  *
  * Durable Turn settlement remains in TurnSystem. The Session gate deliberately
- * does not persist deletion state or fence unrelated Session tree mutations.
+ * reads the existing durable Turn deletion fence but does not persist another state.
  */
 export class SessionDeletionGate {
     options;
@@ -35,7 +36,14 @@ export class SessionDeletionGate {
     turnRejection(db, sessionId) {
         if (!sessionExists(db, sessionId))
             return 'invalid-session';
-        return this.deleting.has(sessionId) ? 'session-deleting' : undefined;
+        const lock = db
+            .select({ ownerKind: sessionLocks.ownerKind })
+            .from(sessionLocks)
+            .where(eq(sessionLocks.sessionId, sessionId))
+            .get();
+        return this.deleting.has(sessionId) || isDeletionOwnerKind(lock?.ownerKind)
+            ? 'session-deleting'
+            : undefined;
     }
     queueRejection(db, sessionId) {
         const rejection = this.turnRejection(db, sessionId);

@@ -1,6 +1,7 @@
 import { observeCompactionBestEffort, readCompactionAttemptId, readCompactionLifecycleMetadata, } from '../compaction/context-compaction.js';
 import { AgentHostDependencyUnavailableError } from '../empty-dependencies.js';
 import { SemanticReplayRegistry } from '../events/semantic-replay-registry.js';
+import { resetPtcPrefixBaseline } from '../runner/policy/ptc-prefix-fingerprint.js';
 import { captureSemanticSnapshot, estimateSemanticValueSize } from './semantic-identity.js';
 const DEFAULT_COMMITTED_HISTORY_REPLAYS = 2_048;
 const DEFAULT_COMMITTED_HISTORY_REPLAY_BYTES = 64 * 1_024 * 1_024;
@@ -34,7 +35,7 @@ export class AgentHostCommittedHistoryWriter {
             measureSettledBytes: estimateSemanticValueSize,
         });
     }
-    commit(context, change, options = {}) {
+    async commit(context, change, options = {}) {
         const explicitAttemptId = normalizeAttemptId(options.compactionAttemptId);
         const trustedContext = captureSemanticSnapshot(context).value;
         let snapshot;
@@ -70,25 +71,34 @@ export class AgentHostCommittedHistoryWriter {
         catch (error) {
             return Promise.reject(error);
         }
-        return this.replay.run({
-            identity: JSON.stringify([snapshot.value.context.sessionId, operationId]),
-            fingerprint: snapshot.fingerprint,
-            execute: () => this.commitSnapshot({
-                context: snapshot.value.context,
-                change: snapshot.value.change,
-                metadata,
-                compaction,
-                ...(options.onDurableCommitted ? { onDurableCommitted: options.onDurableCommitted } : {}),
-            }),
-            conflict: () => new AgentCommittedHistoryIdentityError('conflict', operationId),
-            handleConflict: (error) => this.failCommit({
-                context: snapshot.value.context,
-                change: snapshot.value.change,
-                error,
-                metadata,
-                compaction,
-            }),
-        });
+        try {
+            return await this.replay.run({
+                identity: JSON.stringify([snapshot.value.context.sessionId, operationId]),
+                fingerprint: snapshot.fingerprint,
+                execute: () => this.commitSnapshot({
+                    context: snapshot.value.context,
+                    change: snapshot.value.change,
+                    metadata,
+                    compaction,
+                    ...(options.onDurableCommitted
+                        ? { onDurableCommitted: options.onDurableCommitted }
+                        : {}),
+                }),
+                conflict: () => new AgentCommittedHistoryIdentityError('conflict', operationId),
+                handleConflict: (error) => this.failCommit({
+                    context: snapshot.value.context,
+                    change: snapshot.value.change,
+                    error,
+                    metadata,
+                    compaction,
+                }),
+            });
+        }
+        finally {
+            if (attemptId && metadata?.phase !== 'manual') {
+                this.dependencies.compaction?.barrier?.end(trustedContext.sessionId, attemptId);
+            }
+        }
     }
     commitTurnMutation(context, mutation, options = {}) {
         let snapshot;
@@ -230,6 +240,8 @@ export class AgentHostCommittedHistoryWriter {
     async completeCompaction(context, delivered, metadata, compaction) {
         if (!metadata || !compaction)
             return;
+        // The replacement history is durable: the next Turn may assemble a new prefix.
+        resetPtcPrefixBaseline(context.sessionId);
         await compaction.lifecycle.completeCommittedHistory({
             context,
             attemptId: metadata.attemptId,

@@ -2,6 +2,8 @@ import { json, notFound, readFirstString, readJsonBody } from '../http-helpers.j
 import { AgentContractHttpError, isAgentContractLikeError } from '../agent-contract-error.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 import { DEFAULT_PROJECT_KEY, normalizeAbsolutePath, projectKeyForWorkspace, workspaceDirFromProjectKey, } from '../project-key.js';
+import { feishuBindingTransport } from '../platform-api/feishu-connection-transport.js';
+import { polledBindingTransport, } from '../platform-api/connection-transport.js';
 import { LocalImConnectionError, } from '../../../binding/im-connection-types.js';
 export async function routeLocalChannelConnectionsApi(input) {
     if (input.parts[0] !== 'channel' || input.parts[1] !== 'connections')
@@ -192,27 +194,54 @@ async function requireConnectionView(list, connectionId) {
 }
 async function viewForConnection(input, list, connectionId) {
     const view = await requireConnectionView(list, connectionId);
-    return serializeConnectionView(view, await feishuStatusSnapshot(input, [view]));
+    return serializeConnectionView(view, await transportSnapshots(input, [view]));
 }
 async function serializeConnectionViews(input, views) {
-    const feishuClients = await feishuStatusSnapshot(input, views);
-    return views.map((view) => serializeConnectionView(view, feishuClients));
+    const snapshots = await transportSnapshots(input, views);
+    return views.map((view) => serializeConnectionView(view, snapshots));
+}
+async function transportSnapshots(input, views) {
+    const [feishu, telegram, wechat] = await Promise.all([
+        feishuStatusSnapshot(input, views),
+        polledTransportSnapshot(input.telegram, 'telegram', views),
+        polledTransportSnapshot(input.wechat, 'wechat', views),
+    ]);
+    return { feishu, feishuWsRuns: input.feishu?.runsWsTransport() ?? false, telegram, wechat };
 }
 async function feishuStatusSnapshot(input, views) {
     if (!input.feishu || !views.some((view) => view.binding?.channel === 'feishu'))
         return undefined;
+    const feishu = input.feishu;
+    return readSnapshot(() => feishu.statusClients(), {
+        operation: 'feishu_status_snapshot',
+        subject: 'Feishu Connection status snapshot',
+    });
+}
+/** `transportClients()` of the WeChat / Telegram Api, read only when a binding needs it. */
+async function polledTransportSnapshot(api, channel, views) {
+    if (!api || !views.some((view) => view.binding?.channel === channel))
+        return undefined;
+    return readSnapshot(() => api.transportClients(), {
+        operation: `${channel}_transport_snapshot`,
+        subject: `${channel === 'wechat' ? 'WeChat' : 'Telegram'} Connection transport snapshot`,
+    });
+}
+/**
+ * One snapshot read. A failure or a non-object result only drops the live
+ * fields of this response (the Connection list must still render); it is
+ * logged with the error name / result type only — never the thrown text.
+ */
+async function readSnapshot(read, log) {
     try {
-        const clients = await input.feishu.statusClients();
-        if (clients && typeof clients === 'object' && !Array.isArray(clients))
+        const clients = await read();
+        if (clients && typeof clients === 'object' && !Array.isArray(clients)) {
             return clients;
-        logger.warn({
-            operation: 'feishu_status_snapshot',
-            resultType: describeStatusSnapshotType(clients),
-        }, 'Feishu Connection status snapshot returned an invalid shape');
+        }
+        logger.warn({ operation: log.operation, resultType: describeStatusSnapshotType(clients) }, `${log.subject} returned an invalid shape`);
         return undefined;
     }
     catch (error) {
-        logger.warn({ operation: 'feishu_status_snapshot', errorName: safeErrorName(error) }, 'Feishu Connection status snapshot failed');
+        logger.warn({ operation: log.operation, errorName: safeErrorName(error) }, `${log.subject} failed`);
         return undefined;
     }
 }
@@ -240,10 +269,10 @@ function logConnectionMutationUnexpectedFailure(operation, connectionId, error) 
 function safeErrorName(error) {
     return error instanceof Error && error.name ? error.name : typeof error;
 }
-function serializeConnectionView(view, feishuClients) {
+function serializeConnectionView(view, snapshots) {
     const connection = view.connection;
     const project = connection.projectKey ? projectRef(connection.projectKey) : undefined;
-    const label = feishuBindingLabel(view.binding, feishuClients);
+    const label = feishuBindingLabel(view.binding, snapshots.feishu);
     const binding = view.binding
         ? {
             bindingId: view.binding.bindingId,
@@ -258,6 +287,10 @@ function serializeConnectionView(view, feishuClients) {
             ...(view.binding.currentSessionId !== undefined
                 ? { currentSessionId: view.binding.currentSessionId }
                 : {}),
+            // Live receive-channel state; unset unless this binding reports it.
+            // Each helper answers only for its own channel(s).
+            ...feishuBindingTransport(connection.connectionId, view.binding, snapshots.feishu, snapshots.feishuWsRuns),
+            ...polledBindingTransport(connection.connectionId, view.binding, snapshots),
         }
         : undefined;
     return {

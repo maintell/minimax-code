@@ -1,7 +1,8 @@
 import path from 'node:path';
 import { and, asc, eq } from 'drizzle-orm';
+import { parseMiniAppPermissionId, } from '@mavis/shared/miniapp-surface';
 import { PluginInstallationPolicy, } from '@mavis/thrift-gen/generated/desktop-service/types';
-import { pluginDisabledLocalRoots, pluginOfficialStates, } from '../../../../infra/db/schema/plugin.js';
+import { pluginDisabledLocalRoots, pluginMiniAppPermissions, pluginOfficialStates, } from '../../../../infra/db/schema/plugin.js';
 const CONTENT_DIGEST = /^sha256-tree-v1:[0-9a-f]{64}$/u;
 const ARCHIVE_DIGEST = /^[0-9a-f]{64}$/u;
 const CACHE_KEY = /^sha256-tree-v1-[0-9a-f]{64}$/u;
@@ -23,6 +24,11 @@ class PluginRepositoryError extends Error {
 export class SqlitePluginRepository {
     db;
     nowMs;
+    /**
+     * Disabled Mini App permissions per `source\0pluginId`, filled on first read. Gateways read
+     * them at every call; this repository is the table's only writer, so writes keep it exact.
+     */
+    disabledMiniAppPermissions = new Map();
     constructor(db, nowMs = Date.now) {
         this.db = db;
         this.nowMs = nowMs;
@@ -152,6 +158,69 @@ export class SqlitePluginRepository {
             }
         }
     }
+    listDisabledMiniAppPermissions(pluginName, source) {
+        return new Set(this.disabledMiniAppPermissionSet(assertPermissionPluginId(pluginName), source));
+    }
+    /** Only a disabled permission keeps a row; enabling one restores the declared default. */
+    setMiniAppPermissionEnabled(pluginName, source, permission, enabled) {
+        const pluginId = assertPermissionPluginId(pluginName);
+        if (!parseMiniAppPermissionId(permission)) {
+            fail('MINIAPP_PERMISSION_IDENTITY_INVALID', 'Mini App permission is invalid');
+        }
+        const disabled = this.disabledMiniAppPermissionSet(pluginId, source);
+        const identity = and(eq(pluginMiniAppPermissions.pluginId, pluginId), eq(pluginMiniAppPermissions.pluginSource, source), eq(pluginMiniAppPermissions.permission, permission));
+        if (enabled) {
+            this.db.delete(pluginMiniAppPermissions).where(identity).run();
+            disabled.delete(permission);
+            return;
+        }
+        const updatedAtMs = this.nowMs();
+        this.db
+            .insert(pluginMiniAppPermissions)
+            .values({ pluginId, pluginSource: source, permission, enabled: 0, updatedAtMs })
+            .onConflictDoUpdate({
+            target: [
+                pluginMiniAppPermissions.pluginId,
+                pluginMiniAppPermissions.pluginSource,
+                pluginMiniAppPermissions.permission,
+            ],
+            set: { enabled: 0, updatedAtMs },
+        })
+            .run();
+        disabled.add(permission);
+    }
+    deleteMiniAppPermissions(pluginName, source) {
+        const pluginId = assertPermissionPluginId(pluginName);
+        this.db
+            .delete(pluginMiniAppPermissions)
+            .where(and(eq(pluginMiniAppPermissions.pluginId, pluginId), eq(pluginMiniAppPermissions.pluginSource, source)))
+            .run();
+        this.disabledMiniAppPermissions.delete(miniAppPermissionKey(pluginId, source));
+    }
+    /** Local plugin ids with stored switches; official ones are kept across accounts and reinstalls. */
+    listLocalMiniAppPermissionOwners() {
+        return this.db
+            .selectDistinct({ pluginId: pluginMiniAppPermissions.pluginId })
+            .from(pluginMiniAppPermissions)
+            .where(eq(pluginMiniAppPermissions.pluginSource, 'local'))
+            .orderBy(asc(pluginMiniAppPermissions.pluginId))
+            .all()
+            .map(({ pluginId }) => pluginId);
+    }
+    disabledMiniAppPermissionSet(pluginId, source) {
+        const key = miniAppPermissionKey(pluginId, source);
+        let disabled = this.disabledMiniAppPermissions.get(key);
+        if (!disabled) {
+            const rows = this.db
+                .select({ permission: pluginMiniAppPermissions.permission })
+                .from(pluginMiniAppPermissions)
+                .where(and(eq(pluginMiniAppPermissions.pluginId, pluginId), eq(pluginMiniAppPermissions.pluginSource, source), eq(pluginMiniAppPermissions.enabled, 0)))
+                .all();
+            disabled = new Set(rows.map(({ permission }) => permission));
+            this.disabledMiniAppPermissions.set(key, disabled);
+        }
+        return disabled;
+    }
 }
 function assertScope(scope) {
     if (!scope.principalId.trim() || !scope.deployment.trim()) {
@@ -264,6 +333,15 @@ function assertSnapshot(value) {
         value.packageContentDigests.some((digest) => typeof digest !== 'string' || !CONTENT_DIGEST.test(digest))) {
         fail('STATE_CORRUPT', 'published Plugin snapshot metadata is invalid');
     }
+}
+function miniAppPermissionKey(pluginId, source) {
+    return `${source}\0${pluginId}`;
+}
+function assertPermissionPluginId(value) {
+    if (!value.trim() || value.length > 256) {
+        fail('MINIAPP_PERMISSION_IDENTITY_INVALID', 'Mini App permission owner is invalid');
+    }
+    return value;
 }
 function assertCanonicalRoot(value) {
     if (!path.isAbsolute(value))

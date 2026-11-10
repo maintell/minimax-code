@@ -26,12 +26,35 @@
 import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ErrorCode, ListRootsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { findMcpAuthRequiredError } from './auth.js';
 import { createTransport } from './transport/factory.js';
 import { MCP_DEFAULTS, NOOP_MCP_RUNTIME_LOGGER, } from './types.js';
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
 const IDLE_CHECK_INTERVAL_MS = 60_000;
 const STDERR_BUFFER_SAFETY_VALVE = 64 * 1024;
+/**
+ * The call provably never reached the server (aborted before or while waiting for a permit).
+ * Callers decide "safe to retry" with `instanceof`, never by matching the message.
+ */
+export class McpToolCallNotDispatchedError extends Error {
+    constructor(serverName, toolName) {
+        super(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+        this.name = 'McpToolCallNotDispatchedError';
+    }
+}
+/**
+ * The call was dispatched and the server did not answer within its timeout (the pool's own bound
+ * or the SDK request timeout), while the caller's signal was not aborted. The tool may have run.
+ */
+export class McpToolCallTimeoutError extends Error {
+    timeoutMs;
+    constructor(serverName, toolName, timeoutMs, options) {
+        super(`MCP tool call failed: MCP tool call "${toolName}" on "${serverName}" timed out after ${timeoutMs}ms`, options);
+        this.timeoutMs = timeoutMs;
+        this.name = 'McpToolCallTimeoutError';
+    }
+}
 class Semaphore {
     max;
     // Each waiter holds its own resolve/reject pair so `acquire(signal)` can
@@ -196,7 +219,7 @@ export class McpConnectionPool {
         // would otherwise sit until an in-flight callTool releases it — turning an
         // "immediate cancel" into "wait for the head of the queue to finish".
         if (options?.signal?.aborted) {
-            throw new Error(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+            throw new McpToolCallNotDispatchedError(serverName, toolName);
         }
         // Abortable acquire: while queued behind an in-flight long-running call
         // (e.g. `image_synthesize`), an abort on `options.signal` splices this
@@ -212,7 +235,7 @@ export class McpConnectionPool {
             // Normalise to the same wire-shape as the other pre-dispatch aborts so
             // callers see a consistent "aborted before dispatch" surface regardless
             // of whether the abort landed on the pre-check or on the queue splice.
-            throw new Error(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+            throw new McpToolCallNotDispatchedError(serverName, toolName);
         }
         // Metrics cover DISPATCHED calls only (permit acquired): the pre-acquire
         // abort short-circuits above never reached a connection and are pure
@@ -223,7 +246,7 @@ export class McpConnectionPool {
         const startMs = Date.now();
         try {
             if (options?.signal?.aborted) {
-                throw new Error(`MCP tool call aborted before dispatch: ${serverName}/${toolName}`);
+                throw new McpToolCallNotDispatchedError(serverName, toolName);
             }
             const conn = await this.ensureConnection(serverName, connectionKey, tokenOverrides);
             conn.lastUsed = Date.now();
@@ -257,7 +280,17 @@ export class McpConnectionPool {
                 return shaped;
             }
             catch (err) {
-                throw new Error(`MCP tool call failed: ${err instanceof Error ? err.message : String(err)}`);
+                // Authorization failures surface as-is so hosts can mark the server as needing auth.
+                const authError = conn.lastAuthFailure ?? findMcpAuthRequiredError(err);
+                if (authError)
+                    throw authError;
+                // Keep the SDK error as `cause`: its JSON-RPC `code`/`data` (McpError)
+                // or connection `code` is the only machine-readable reason, and
+                // programmatic callers hand it to scripts as a raw error.
+                if (!options?.signal?.aborted && isToolCallTimeout(err)) {
+                    throw new McpToolCallTimeoutError(serverName, toolName, timeoutMs, { cause: err });
+                }
+                throw new Error(`MCP tool call failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
             }
         }
         catch (err) {
@@ -403,7 +436,12 @@ export class McpConnectionPool {
                 // and surface that to the caller of THIS `ensureConnection` as a
                 // disconnected error rather than handing back a stale child.
                 await closeConnectionSafely(connection, this.logger, serverName);
-                throw new Error(`MCP server "${serverName}" was disconnected while connecting`);
+                throw (connection.lastAuthFailure ??
+                    new Error(`MCP server "${serverName}" was disconnected while connecting`));
+            }
+            if (connection.lastAuthFailure) {
+                await closeConnectionSafely(connection, this.logger, serverName);
+                throw connection.lastAuthFailure;
             }
             this.connections.set(connectionKey, connection);
             return connection;
@@ -459,11 +497,28 @@ export class McpConnectionPool {
         if (!server.enabled) {
             throw new Error(`MCP server "${serverName}" is disabled`);
         }
+        let connection = null;
+        let authFailure;
         const transportOverrides = { ...(tokenOverrides ?? {}) };
         delete transportOverrides.serverOverride;
         const transport = createTransport(server.transport, {
             ...transportOverrides,
             ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+            ...(tokenOverrides?.authorizer
+                ? {
+                    // Close only this connection: stops SSE reconnects and makes the next call
+                    // reconnect with whatever credentials are stored by then.
+                    onAuthRequired: (error) => {
+                        authFailure = error;
+                        if (!connection)
+                            return;
+                        connection.lastAuthFailure = error;
+                        if (this.connections.get(connectionKey) === connection) {
+                            void this.disconnectConnection(connectionKey);
+                        }
+                    },
+                }
+                : {}),
         });
         const client = new Client({ name: 'mavis-local-runtime-mcp', version: '1.0.0' }, { capabilities: { roots: { listChanged: false } } });
         // Respond to roots/list so MCP servers (e.g. Playwright) know the
@@ -476,7 +531,6 @@ export class McpConnectionPool {
                 },
             ],
         }));
-        let connection = null;
         const connectStartedAtMs = Date.now();
         this.logger.info(`Connecting MCP server`, {
             serverName,
@@ -488,6 +542,8 @@ export class McpConnectionPool {
             this.attachStderrLogging(serverName, transport);
             this.attachTransportLifecycleLogging(serverName, connectionKey, transport, () => connection);
             await client.connect(transport, { timeout: timeoutMs, signal });
+            if (authFailure)
+                throw authFailure;
             // Connect outcome is labeled by transport kind only — the server name
             // is user-defined (unbounded cardinality) and stays in logger fields.
             this.metrics?.incr('mcp_connect_total', {
@@ -532,6 +588,9 @@ export class McpConnectionPool {
                     error: toErrorMessage(closeError),
                 });
             }
+            const authError = authFailure ?? findMcpAuthRequiredError(error);
+            if (authError)
+                throw authError;
             throw new Error(`Failed to connect to MCP server "${serverName}": ${toErrorMessage(error)}`);
         }
     }
@@ -627,6 +686,9 @@ export class McpConnectionPool {
             return tools;
         }
         catch (error) {
+            const authError = conn.lastAuthFailure ?? findMcpAuthRequiredError(error);
+            if (authError)
+                throw authError;
             throw new Error(`MCP list tools failed: ${toErrorMessage(error)}`);
         }
     }
@@ -750,12 +812,19 @@ async function closeConnectionSafely(connection, logger, serverName) {
         });
     }
 }
+/** Raised by `withTimeout` when the pool's own bound fires. */
+class PoolTimeoutError extends Error {
+}
+function isToolCallTimeout(error) {
+    return (error instanceof PoolTimeoutError ||
+        (error instanceof McpError && error.code === ErrorCode.RequestTimeout));
+}
 function withTimeout(promise, ms, message) {
     if (ms <= 0 || !Number.isFinite(ms))
         return promise;
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-            reject(new Error(message));
+            reject(new PoolTimeoutError(message));
         }, ms);
         promise.then((value) => {
             clearTimeout(timer);

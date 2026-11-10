@@ -326,6 +326,8 @@ export class DocumentPreviewOrchestrator {
             return failure('cancelled', 'Document preview source opening was cancelled');
         if (!isRecord(input))
             return failure('invalid_request', 'Invalid document preview source request');
+        if ('savedFileToken' in input)
+            return failure('invalid_request', 'Saved file authority must be resolved by Main');
         const openInput = input;
         return ownerToken === undefined
             ? this.options.sourceRegistry.open(senderId, openInput)
@@ -340,6 +342,8 @@ export class DocumentPreviewOrchestrator {
         if (typeof openLegacy !== 'function') {
             return failure('invalid_request', 'Legacy document preview source is unavailable');
         }
+        if ('savedFileToken' in input)
+            return failure('invalid_request', 'Saved file authority must be resolved by Main');
         const openInput = input;
         return ownerToken === undefined
             ? openLegacy.call(this.options.sourceRegistry, senderId, openInput)

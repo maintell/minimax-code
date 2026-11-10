@@ -9,6 +9,7 @@ export * from './browser-keyboard.js';
 export * from './clipboard.js';
 export * from './browser-query.js';
 export * from './browser-snapshot-helpers.js';
+export * from './browser-script.js';
 export * from './cdp-file-upload.js';
 export * from './cdp-helper.js';
 export * from './cdp-helper-contracts.js';
@@ -17,5 +18,5 @@ export * from './dom-serializer.js';
 export * from './element-map-manager.js';
 export * from './operation-timeout.js';
 export { BrowserSnapshotSupport, } from './browser-snapshot.js';
-export { cdp, evaluate, asNumber, asString, byteLength, delay, isRecord, stringArray, } from './browser-state.js';
+export { cdp, describeCdpException, evaluate, asNumber, asString, byteLength, delay, isRecord, stringArray, } from './browser-state.js';
 //# sourceMappingURL=index.js.map

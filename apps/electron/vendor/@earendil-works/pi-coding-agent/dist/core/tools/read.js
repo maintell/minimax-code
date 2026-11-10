@@ -12,7 +12,7 @@ import { formatPathRelativeToCwdOrAbsolute } from "../../utils/paths.js";
 import { resolveReadPathAsync, resolveToCwd } from "./path-utils.js";
 import { getTextOutput, renderToolPath, replaceTabs, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "./truncate.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, } from "./truncate.js";
 const readSchema = Type.Object({
     path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
     offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
@@ -130,6 +130,19 @@ function formatReadResult(args, result, options, theme, showImages, _cwd, isErro
 export function createReadToolDefinition(cwd, options) {
     const autoResizeImages = options?.autoResizeImages ?? true;
     const ops = options?.operations ?? defaultReadOperations;
+    // Custom reads must not probe another filesystem before reaching ops.access.
+    // Keep the default F_OK probe unchanged for hosts without custom operations.
+    const pathExistenceProbe = options?.operations
+        ? async (filePath) => {
+            try {
+                await ops.access(filePath);
+                return true;
+            }
+            catch {
+                return false;
+            }
+        }
+        : undefined;
     return {
         name: "read",
         label: "read",
@@ -151,7 +164,7 @@ export function createReadToolDefinition(cwd, options) {
                 signal?.addEventListener("abort", onAbort, { once: true });
                 (async () => {
                     try {
-                        const absolutePath = await resolveReadPathAsync(path, cwd);
+                        const absolutePath = await resolveReadPathAsync(path, cwd, pathExistenceProbe);
                         if (aborted)
                             return;
                         // Check if file exists and is readable.
@@ -237,12 +250,12 @@ export function createReadToolDefinition(cwd, options) {
                                 selectedContent = allLines.slice(startLine).join("\n");
                             }
                             // Apply truncation, respecting both line and byte limits.
-                            const truncation = truncateHead(selectedContent);
+                            const truncation = truncateHead(selectedContent, options?.truncation);
                             let outputText;
                             if (truncation.firstLineExceedsLimit) {
                                 // First line alone exceeds the byte limit. Point the model at a bash fallback.
                                 const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
-                                outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+                                outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(truncation.maxBytes)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${truncation.maxBytes}]`;
                                 details = { truncation };
                             }
                             else if (truncation.truncated) {
@@ -254,7 +267,7 @@ export function createReadToolDefinition(cwd, options) {
                                     outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines}. Use offset=${nextOffset} to continue.]`;
                                 }
                                 else {
-                                    outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
+                                    outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(truncation.maxBytes)} limit). Use offset=${nextOffset} to continue.]`;
                                 }
                                 details = { truncation };
                             }

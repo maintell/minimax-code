@@ -1,5 +1,6 @@
 import { SidebarQueryError, ProjectServiceError, sessionTreeFilterFromRequest, } from '../../service/session-system/index.js';
 import { AppError } from '../errors.js';
+import { publishBestEffort } from '../events.js';
 import { toSessionInfoView, toSessionTreeChildView } from '../session/wire.js';
 import { toProjectDetail, toProjectReference } from './wire.js';
 export class ProjectApplication {
@@ -130,6 +131,53 @@ export class ProjectApplication {
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
     }
+    async createProject(_context, req) {
+        const project = await this.invoke(() => this.options.service.create({
+            displayName: req.displayName,
+            ...(req.workspaceDir !== undefined ? { workspaceDir: req.workspaceDir } : {}),
+            ...(req.workspaceRoots !== undefined ? { workspaceRoots: req.workspaceRoots } : {}),
+            ...(req.extraDataJson !== undefined ? { extraDataJson: req.extraDataJson } : {}),
+        }));
+        this.publishMetadataUpdated(project);
+        return mutationResponse(project);
+    }
+    async updateProject(_context, req) {
+        const { displayName, extraDataJson, workspaceRoots } = projectUpdateFields(req);
+        const project = await this.invoke(() => this.options.service.updateMetadata(toProjectReference(req.project), {
+            ...(displayName !== undefined ? { displayName } : {}),
+            ...(extraDataJson !== undefined ? { extraDataJson } : {}),
+            ...(workspaceRoots !== undefined ? { workspaceRoots } : {}),
+        }));
+        // Both events project the committed row only; publishing is best-effort.
+        if (extraDataJson !== undefined) {
+            publishBestEffort(this.options.publishGlobalEvent, {
+                type: 'project.icon_updated',
+                payload: {
+                    ...projectEventIdentity(project),
+                    extraDataJson: toProjectDetail(project, project.sessionCount).extraDataJson ?? '{}',
+                    updatedAt: project.updatedAtMs,
+                },
+            });
+        }
+        if (displayName !== undefined || workspaceRoots !== undefined) {
+            this.publishMetadataUpdated(project);
+        }
+        return mutationResponse(project);
+    }
+    publishMetadataUpdated(project) {
+        const detail = toProjectDetail(project, project.sessionCount);
+        publishBestEffort(this.options.publishGlobalEvent, {
+            type: 'project.metadata_updated',
+            payload: {
+                ...projectEventIdentity(project),
+                projectKey: detail.key,
+                displayName: project.displayName,
+                extraDataJson: detail.extraDataJson ?? '{}',
+                ...(detail.workspaceRoots ? { workspaceRoots: detail.workspaceRoots } : {}),
+                updatedAt: project.updatedAtMs,
+            },
+        });
+    }
     async setProjectPinned(_context, req) {
         const project = await this.invoke(() => this.options.pinService.pinProject(toProjectReference(req.project), req.pinned));
         return mutationResponse(project);
@@ -227,25 +275,44 @@ function toProjectSessionPage(page) {
         childSessions: (page.childrenByParent.get(session.sessionId) ?? []).map(toSessionTreeChildView),
     }));
 }
+function projectEventIdentity(project) {
+    return {
+        projectId: project.projectId,
+        ...(project.workspaceDir ? { workspaceDir: project.workspaceDir } : {}),
+    };
+}
+function projectUpdateFields(req) {
+    if (req.archived !== undefined) {
+        throw new AppError(400, 'UNSUPPORTED_PROJECT_UPDATE', 'Only project name, icon and folder updates are supported');
+    }
+    const fields = {
+        ...(typeof req.displayName === 'string' ? { displayName: req.displayName } : {}),
+        ...(typeof req.extraDataJson === 'string' ? { extraDataJson: req.extraDataJson } : {}),
+        ...(Array.isArray(req.workspaceRoots) ? { workspaceRoots: req.workspaceRoots } : {}),
+    };
+    if (Object.keys(fields).length === 0) {
+        throw new AppError(400, 'PROJECT_UPDATE_REQUIRED', 'Project name, icon or folders are required');
+    }
+    return fields;
+}
 function mutationResponse(project) {
     return { success: true, project: toProjectDetail(project, project.sessionCount) };
 }
+const PROJECT_FAILURE_MAPPINGS = {
+    'invalid-project-icon': { status: 400, key: 'INVALID_PROJECT_ICON' },
+    'invalid-project-name': { status: 400, key: 'INVALID_PROJECT_NAME' },
+    'default-project-name': { status: 400, key: 'DEFAULT_PROJECT_NAME_IMMUTABLE' },
+    'invalid-project-id': { status: 400, key: 'INVALID_PROJECT_ID' },
+    'project-required': { status: 400, key: 'PROJECT_REQUIRED' },
+    'invalid-workspace-dir': { status: 400, key: 'INVALID_WORKSPACE_DIR' },
+    'invalid-workspace-roots': { status: 400, key: 'INVALID_WORKSPACE_ROOTS' },
+    'project-conflict': { status: 409, key: 'PROJECT_CONFLICT' },
+    'project-not-found': { status: 404, key: 'PROJECT_NOT_FOUND' },
+    'duplicate-project': { status: 400, key: 'DUPLICATE_PROJECT' },
+    'invalid-project-row': { status: 500, key: 'INVALID_PROJECT_ROW' },
+    'session-cursor-missing': { status: 500, key: 'PROJECT_SESSION_CURSOR_MISSING' },
+};
 function projectFailureMapping(reason) {
-    switch (reason) {
-        case 'invalid-project-id':
-            return { status: 400, key: 'INVALID_PROJECT_ID' };
-        case 'project-required':
-            return { status: 400, key: 'PROJECT_REQUIRED' };
-        case 'invalid-workspace-dir':
-            return { status: 400, key: 'INVALID_WORKSPACE_DIR' };
-        case 'project-not-found':
-            return { status: 404, key: 'PROJECT_NOT_FOUND' };
-        case 'duplicate-project':
-            return { status: 400, key: 'DUPLICATE_PROJECT' };
-        case 'invalid-project-row':
-            return { status: 500, key: 'INVALID_PROJECT_ROW' };
-        case 'session-cursor-missing':
-            return { status: 500, key: 'PROJECT_SESSION_CURSOR_MISSING' };
-    }
+    return PROJECT_FAILURE_MAPPINGS[reason];
 }
 //# sourceMappingURL=project-application.js.map

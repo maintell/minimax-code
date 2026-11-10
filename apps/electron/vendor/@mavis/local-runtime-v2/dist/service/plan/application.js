@@ -4,8 +4,11 @@ import { translateRuntimeText } from '@mavis/shared/runtime-i18n';
 import { createInternalTurnId } from '@mavis/shared/turn-identity';
 const PLAN_SNAPSHOT_MAX_BYTES = 512 * 1024;
 const APPROVED_PLAN_MARKDOWN_INSTRUCTION = `Implement the approved plan below.
-Treat the Markdown after the "Approved plan:" line as the immutable plan snapshot for this implementation turn; it is authoritative.
+Treat the Markdown after the "Approved plan:" line as the immutable plan snapshot for this implementation turn. It is authoritative for the plan's decisions, not for expanding authorization.
 Do not read the canonical Plan file and do not re-derive the plan from anywhere else.
+
+The user's applicable scope, tool, test, network, delegation, and write restrictions still govern implementation. Plan approval does not waive them unless the user explicitly changes them. If the plan conflicts with those restrictions, stop and report the conflict instead of treating approval as permission to bypass it.
+Verify implementation only with permitted tools or trusted execution receipts already available in context. A requirement to verify a deliverable does not authorize a forbidden shell command, test, network request, delegated task, or file access. Report unavailable verification honestly.
 
 If implementation reveals the plan is infeasible or materially wrong — a premise fails, a referenced component does not exist, or the work is fundamentally riskier than planned — stop and report the mismatch to the user instead of redesigning on your own.
 Mechanical adjustments that keep the plan's decisions intact do not require stopping.
@@ -13,10 +16,19 @@ Mechanical adjustments that keep the plan's decisions intact do not require stop
 Approved plan:
 `;
 // Rolling upgrade: durable implementation Queue items enqueued by an earlier
-// build carry the previous instruction text. Identity validation accepts them
+// build carry previous instruction texts. Identity validation accepts them
 // so an approved Plan crossing an upgrade window is reused instead of failing
 // closed; their persisted content still executes as-is.
 const LEGACY_APPROVED_PLAN_MARKDOWN_INSTRUCTIONS = [
+    `Implement the approved plan below.
+Treat the Markdown after the "Approved plan:" line as the immutable plan snapshot for this implementation turn; it is authoritative.
+Do not read the canonical Plan file and do not re-derive the plan from anywhere else.
+
+If implementation reveals the plan is infeasible or materially wrong — a premise fails, a referenced component does not exist, or the work is fundamentally riskier than planned — stop and report the mismatch to the user instead of redesigning on your own.
+Mechanical adjustments that keep the plan's decisions intact do not require stopping.
+
+Approved plan:
+`,
     `Implement the approved plan below.
 Treat the Markdown after the marker as the immutable plan snapshot for this implementation Turn.
 Do not read the Plan file and do not re-derive the plan from anywhere else; this snapshot is authoritative.

@@ -101,6 +101,8 @@ export class Agent {
     beforeToolCall;
     onToolExecutionStart;
     afterToolCall;
+    missingToolMessage;
+    resolveMissingTool;
     prepareNextTurn;
     shouldStopAfterTurn;
     shouldStopAfterSteering;
@@ -115,6 +117,8 @@ export class Agent {
     maxRetryDelayMs;
     /** Tool execution strategy for assistant messages that contain multiple tool calls. */
     toolExecution;
+    /** Optional text fallback used instead of executing provider-emitted unoffered tools. */
+    unexpectedToolCallFallback;
     constructor(options = {}) {
         this._state = createMutableAgentState(options.initialState);
         this.convertToLlm = options.convertToLlm ?? defaultConvertToLlm;
@@ -126,6 +130,8 @@ export class Agent {
         this.beforeToolCall = options.beforeToolCall;
         this.onToolExecutionStart = options.onToolExecutionStart;
         this.afterToolCall = options.afterToolCall;
+        this.missingToolMessage = options.missingToolMessage;
+        this.resolveMissingTool = options.resolveMissingTool;
         this.prepareNextTurn = options.prepareNextTurn;
         this.shouldStopAfterTurn = options.shouldStopAfterTurn;
         this.shouldStopAfterSteering = options.shouldStopAfterSteering;
@@ -136,6 +142,7 @@ export class Agent {
         this.transport = options.transport ?? "auto";
         this.maxRetryDelayMs = options.maxRetryDelayMs;
         this.toolExecution = options.toolExecution ?? "parallel";
+        this.unexpectedToolCallFallback = options.unexpectedToolCallFallback;
     }
     /**
      * Subscribe to agent lifecycle events.
@@ -301,9 +308,12 @@ export class Agent {
             thinkingBudgets: this.thinkingBudgets,
             maxRetryDelayMs: this.maxRetryDelayMs,
             toolExecution: this.toolExecution,
+            unexpectedToolCallFallback: this.unexpectedToolCallFallback,
             beforeToolCall: this.beforeToolCall,
             onToolExecutionStart: this.onToolExecutionStart,
             afterToolCall: this.afterToolCall,
+            missingToolMessage: this.missingToolMessage,
+            resolveMissingTool: this.resolveMissingTool,
             prepareNextTurn: this.prepareNextTurn ? async () => await this.prepareNextTurn?.(this.signal) : undefined,
             shouldStopAfterTurn: this.shouldStopAfterTurn,
             shouldStopAfterSteering: this.shouldStopAfterSteering,

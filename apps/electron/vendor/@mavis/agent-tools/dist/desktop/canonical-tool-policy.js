@@ -1,4 +1,3 @@
-import { MatrixWebSearchToolDef } from '../cloud/matrix-tools/tool-defs.js';
 import { isCanonicalSubagentRole } from './subagent-roles.js';
 /**
  * Starting a task and continuing one are the same delegation entry point, so
@@ -7,6 +6,7 @@ import { isCanonicalSubagentRole } from './subagent-roles.js';
 export const DELEGATION_TOOL_NAMES = new Set(['task', 'task_append']);
 const READ_ONLY_CANONICAL_BLOCKED_TOOL_NAMES = new Set([
     'write',
+    'ppt_preview',
     'edit',
     'website_deploy',
     'todowrite',
@@ -36,20 +36,6 @@ export function filterCanonicalNativeToolCeiling(tools, canonicalRole, builtinAg
         !isComputerUseRuntimeToolName(tool.def.name) &&
         (canonicalRole !== 'explore' ||
             !['task_query', 'task_output', 'task_stop'].includes(tool.def.name)));
-}
-/**
- * Apply the canonical builtin role MCP ceiling to source-tagged entries.
- * Explore and Verifier retain only Matrix web search; Worker and custom or
- * untrusted agents retain the configured entry set.
- */
-export function filterCanonicalBuiltinMcpEntries(entries, canonicalRole, builtinAgent) {
-    if (builtinAgent !== true ||
-        canonicalRole === undefined ||
-        !isCanonicalSubagentRole(canonicalRole) ||
-        (canonicalRole !== 'explore' && canonicalRole !== 'verifier')) {
-        return [...entries];
-    }
-    return entries.filter((entry) => entry.source === 'builtin-matrix' && entry.tool.def.name === MatrixWebSearchToolDef.name);
 }
 export function isCanonicalBuiltinTurn(canonicalRole, builtinAgent) {
     return (builtinAgent === true && canonicalRole !== undefined && isCanonicalSubagentRole(canonicalRole));

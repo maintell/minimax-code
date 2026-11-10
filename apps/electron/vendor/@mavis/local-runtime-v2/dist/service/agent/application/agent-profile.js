@@ -1,10 +1,14 @@
+import { dirname, join } from 'node:path';
 import { toAgentRequestRef } from '@mavis/agent-tools/desktop/subagent-roles';
+import { isPtcTurnEnabled } from '@mavis/config';
 import { BuiltinAgentCatalog, canonicalBuiltinName, resolveCanonicalCapabilities, } from '../builtin/catalog.js';
 import { AgentServiceError } from '../errors.js';
 import { toBuiltinProfile, toBuiltinRenderInput, } from './listing/index.js';
 import { applyBuiltinSubagentTaskChildCeiling, resolveLocale, toCapabilityCeiling, } from '../domain/validation.js';
 import { PRIMARY_AGENT_NAME, normalizeRequestRef, parseExplicitNameOrStable, } from '../domain/names.js';
+import { FROZEN_MCP_SERVERS_NONE, FROZEN_SELECTOR_VERSION, } from '../contracts.js';
 import { AgentConfigError } from '../storage/canonical-agent-config.js';
+import { isPerAgentReadAccessError } from '../storage/canonical-agent-patch.js';
 import { isPromptSnapshotInvalidError, } from '../../prompt-config/index.js';
 const NO_AGENT_MEMORY = Object.freeze([]);
 export async function buildAgentGreetingReminder(input, promptRead) {
@@ -129,7 +133,9 @@ export async function renderFrozenAgentProfile(dependencies, input, definition) 
         surface,
     });
     const snapshot = definition.promptSnapshot;
-    const renderInput = frozenProfileRenderInput(snapshot ? { ...input, promptMode: snapshot.mode } : input, canonicalViewName, surface, capabilities);
+    // Frozen definitions belong to Task Sessions; they follow the Session mode
+    // like every other profile path.
+    const renderInput = await withPtcRender(dependencies.catalog, input, frozenProfileRenderInput(snapshot ? { ...input, promptMode: snapshot.mode } : input, canonicalViewName, surface, capabilities));
     const [surfacePrompt, sharedBase, renderedDefinition] = await Promise.all([
         // Agent-private surface overrides were never part of the saved definition.
         snapshot && canonicalViewName === PRIMARY_AGENT_NAME && surface !== 'task-child'
@@ -241,17 +247,44 @@ export async function readBuiltinAgentContent(catalog, view, canonicalName, defi
     };
 }
 async function renderBuiltinProfile(dependencies, context) {
-    const renderInput = withPromptReadContext(toBuiltinRenderInput(context, resolveLocale), context.input);
+    const baseRenderInput = withPromptReadContext(toBuiltinRenderInput(context, resolveLocale), context.input);
+    const renderInput = await withPtcRender(dependencies.catalog, context.input, baseRenderInput);
     const read = dependencies.repository.getBuiltinCanonicalConfig;
     if (!read) {
         throw new AgentServiceError('AGENT_CONFIG_NOT_FOUND', 'Canonical Built-in Agent configuration storage is unavailable.');
     }
+    const name = context.canonicalViewName;
     let managed;
     try {
-        managed = await read.call(dependencies.repository, context.canonicalViewName);
+        managed = await read.call(dependencies.repository, name);
     }
     catch (error) {
-        throw asAgentConfigServiceError(error);
+        if (!isBuiltinConfigReadFailure(error))
+            throw asAgentConfigServiceError(error);
+        if (!isMissingBuiltinConfig(error) || !dependencies.reseedMissingBuiltinConfig) {
+            throw await builtinConfigBrokenError(dependencies, name, error);
+        }
+        // The file can disappear while the runtime is running: old
+        // `@minimax-ai/code` ACP clients share the data directory and delete
+        // `.builtin/<name>/agent.md` on every launch, and startup is the only
+        // other place that recreates it. Write it back exactly as startup seeds a
+        // missing file (bundled template, never over existing content), then read
+        // it again. Rendering from an in-memory baseline without the file on disk
+        // is not allowed, so a failed write stops this Turn with an instruction.
+        try {
+            await dependencies.reseedMissingBuiltinConfig(name);
+        }
+        catch (reseedError) {
+            throw await builtinConfigBrokenError(dependencies, name, reseedError, 'missing');
+        }
+        try {
+            managed = await read.call(dependencies.repository, name);
+        }
+        catch (rereadError) {
+            if (!isBuiltinConfigReadFailure(rereadError))
+                throw asAgentConfigServiceError(rereadError);
+            throw await builtinConfigBrokenError(dependencies, name, rereadError);
+        }
     }
     const rendered = await dependencies.catalog.render(renderInput, managed.systemPrompt);
     return {
@@ -260,8 +293,73 @@ async function renderBuiltinProfile(dependencies, context) {
         configSelection: toConfigSelection(managed),
     };
 }
+function isBuiltinConfigReadFailure(error) {
+    return error instanceof AgentConfigError || isPerAgentReadAccessError(error);
+}
+function isMissingBuiltinConfig(error) {
+    return error instanceof AgentConfigError && error.code === 'AGENT_CONFIG_NOT_FOUND';
+}
+/**
+ * Startup already archived and rewrote every Builtin source it could, and a
+ * missing file was just reseeded. A file that is still corrupted or unreadable
+ * is not replaced by the bundled baseline on the hot path (that would silently
+ * drop the user's edits); a file that could not be regenerated is not rendered
+ * from memory either. The message itself is a copyable instruction that the
+ * user can hand to another Agent to fix the file.
+ */
+async function builtinConfigBrokenError(dependencies, name, error, state = isMissingBuiltinConfig(error) ? 'missing' : 'corrupted') {
+    const chinese = resolveLocale().toLowerCase().startsWith('zh');
+    const filePath = join(builtinAgentDir(dependencies.repository, name), 'agent.md');
+    const displayName = await builtinDisplayName(dependencies.catalog, name);
+    const reason = builtinConfigFailureReason(error, chinese);
+    const message = (state === 'missing' ? missingBuiltinConfigMessage : brokenBuiltinConfigMessage)({ displayName, filePath, reason }, chinese);
+    return new AgentServiceError('BUILTIN_AGENT_CONFIG_BROKEN', message, undefined, {
+        agentName: name,
+        path: filePath,
+        reason,
+    });
+}
+function brokenBuiltinConfigMessage(facts, chinese) {
+    const { displayName, filePath, reason } = facts;
+    return chinese
+        ? `内置 Agent「${displayName}」的配置文件已损坏，暂时无法回复。请复制下面这段内容，切换到其他 Agent 新建对话发送，让它帮你修复：\n\n` +
+            `请修复 MiniMax Code 内置 Agent 的配置文件 \`${filePath}\`。错误：\`${reason}\`。请检查文件开头两行 \`---\` 之间的 YAML 格式并修正；如果无法修复，删除这个文件后重启 MiniMax Code，系统会按默认配置重新生成。`
+        : `The configuration file of the built-in Agent "${displayName}" is broken, so it cannot reply right now. Copy the text below, switch to another Agent, and send it in a new conversation so that Agent can fix the file:\n\n` +
+            `Please fix the MiniMax Code built-in Agent configuration file \`${filePath}\`. Error: \`${reason}\`. Check the YAML between the two \`---\` lines at the top of the file and correct it. If it cannot be fixed, delete the file and restart MiniMax Code; the default configuration will be regenerated.`;
+}
+function missingBuiltinConfigMessage(facts, chinese) {
+    const { displayName, filePath, reason } = facts;
+    return chinese
+        ? `内置 Agent「${displayName}」的配置文件缺失，自动重新生成也失败了，暂时无法回复。请复制下面这段内容，切换到其他 Agent 新建对话发送，让它帮你修复：\n\n` +
+            `请修复 MiniMax Code 内置 Agent 的配置文件 \`${filePath}\`：文件不存在，自动重新生成失败，错误：\`${reason}\`。请检查这个文件所在目录是否存在且可写，修好后重启 MiniMax Code，系统会按默认配置重新生成。`
+        : `The configuration file of the built-in Agent "${displayName}" is missing and could not be regenerated, so it cannot reply right now. Copy the text below, switch to another Agent, and send it in a new conversation so that Agent can fix the file:\n\n` +
+            `Please fix the MiniMax Code built-in Agent configuration file \`${filePath}\`: the file does not exist and regenerating it failed with \`${reason}\`. Check that its directory exists and is writable, then restart MiniMax Code; the default configuration will be regenerated.`;
+}
+function builtinAgentDir(repository, name) {
+    return join(dirname(repository.getAgentDir(name)), '.builtin', name);
+}
+async function builtinDisplayName(catalog, name) {
+    try {
+        return (await catalog.readDefinition(name)).identity.displayName?.trim() || name;
+    }
+    catch {
+        // The repair instruction must still reach the user if the roster is unreadable.
+        return name;
+    }
+}
+/** One line so the reason stays inside the copyable inline-code span. */
+function builtinConfigFailureReason(error, chinese) {
+    if (error instanceof AgentConfigError && error.code === 'AGENT_CONFIG_NOT_FOUND') {
+        return chinese ? '文件不存在' : 'file not found';
+    }
+    let detail = error instanceof Error ? error.message : String(error);
+    if (error instanceof AgentConfigError)
+        detail = `${error.field}: ${error.message}`;
+    return detail.replace(/[\s`]+/gu, ' ').trim();
+}
 async function renderCustomProfile(dependencies, context) {
-    const renderInput = withPromptReadContext(toBuiltinRenderInput(context, resolveLocale), context.input);
+    const baseRenderInput = withPromptReadContext(toBuiltinRenderInput(context, resolveLocale), context.input);
+    const renderInput = await withPtcRender(dependencies.catalog, context.input, baseRenderInput);
     const [canonical, surfacePrompt, sharedBasePrompt] = await Promise.all([
         readCanonicalAgentConfig(dependencies.repository, context.meta.name),
         dependencies.catalog.renderSurfacePrompt({
@@ -283,6 +381,7 @@ async function renderCustomProfile(dependencies, context) {
             ...(context.input.promptReadContext === undefined
                 ? {}
                 : { promptReadContext: context.input.promptReadContext }),
+            ...(renderInput.ptc ? { ptc: renderInput.ptc } : {}),
         }),
         dependencies.catalog.renderSharedBasePrompt(renderInput, context.executionMeta.agentRole),
     ]);
@@ -312,6 +411,18 @@ async function renderCustomProfile(dependencies, context) {
             locale: context.input.locale ?? resolveLocale(),
         },
     };
+}
+/**
+ * Adds the rendered PTC section when the Session runs in PTC mode, the same
+ * isPtcTurnEnabled decision the tool catalog makes from agentConfig.ptc_enabled.
+ * A render without ptcRequested (listing, Task capture) keeps the native prompt
+ * byte for byte.
+ */
+async function withPtcRender(catalog, request, renderInput) {
+    if (!isPtcTurnEnabled({ requested: request.ptcRequested === true }))
+        return renderInput;
+    const ptc = { section: await catalog.renderPtcSection(renderInput) };
+    return { ...renderInput, ptc };
 }
 function withPromptReadContext(input, request) {
     return request.promptReadContext === undefined
@@ -354,10 +465,9 @@ function toConfigSelection(config) {
         ...(config.tools === undefined ? {} : { tools: config.tools }),
         ...(config.disallowedTools === undefined ? {} : { disallowedTools: config.disallowedTools }),
         ...(config.mcpServers === undefined ? {} : { mcpServers: config.mcpServers }),
+        // Preloaded on the first Turn only. `x-mavis.extensionSkills` is still
+        // parsed and kept in the file but no longer selects Skills.
         ...(config.skills === undefined ? {} : { skills: config.skills }),
-        ...(config.xMavis?.extensionSkills === undefined
-            ? {}
-            : { extensionSkills: config.xMavis.extensionSkills }),
     };
 }
 function frozenConfigSelection(definition) {
@@ -368,13 +478,36 @@ function frozenConfigSelection(definition) {
     if (!capabilities || typeof capabilities !== 'object') {
         throw new AgentServiceError('AGENT_CONFIG_INVALID', 'Frozen Agent definition capabilities must be an object.', undefined, { field: 'definition.capabilities', reason: 'must be an object' });
     }
+    const current = capabilities.selectorVersion === FROZEN_SELECTOR_VERSION;
     return {
         ...copyFrozenSelector(capabilities, 'tools'),
         ...copyFrozenSelector(capabilities, 'disallowedTools'),
-        ...copyFrozenSelector(capabilities, 'mcpServers'),
-        ...copyFrozenSelector(capabilities, 'skills'),
-        ...copyFrozenSelector(capabilities, 'extensionSkills'),
+        ...frozenMcpServers(copyFrozenSelector(capabilities, 'mcpServers').mcpServers, current),
+        // Frozen `skills` / `extensionSkills` record the Skills ready at capture,
+        // not a preload list, so reading them back would preload every Skill. Only
+        // `preloadSkills` is; a snapshot without it preloads none.
+        ...frozenPreloadSkills(copyFrozenSelector(capabilities, 'preloadSkills').preloadSkills),
+        frozenSelectorVersion: current ? FROZEN_SELECTOR_VERSION : 'legacy',
     };
+}
+function frozenPreloadSkills(value) {
+    return value === undefined ? {} : { skills: value };
+}
+/**
+ * Turns a frozen `mcpServers` back into an Agent selector. A version 2
+ * snapshot stores the Agent's own selector in a field releases up to v3.1.4
+ * require, so `[]` means unrestricted and `[":none"]` means no MCP. An older
+ * snapshot stored the servers ready at capture: it is used as written, so
+ * `[]` still means no MCP. See README "Desktop Local Agent 定义".
+ */
+function frozenMcpServers(value, current) {
+    if (value === undefined)
+        return {};
+    if (!current)
+        return { mcpServers: value };
+    if (value.includes(FROZEN_MCP_SERVERS_NONE))
+        return { mcpServers: [] };
+    return value.length === 0 ? {} : { mcpServers: value };
 }
 function copyFrozenSelector(capabilities, key) {
     const value = capabilities[key];
@@ -383,7 +516,9 @@ function copyFrozenSelector(capabilities, key) {
     if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
         throw new AgentServiceError('AGENT_CONFIG_INVALID', `Frozen Agent definition ${key} must be a string array.`, undefined, { field: `definition.capabilities.${key}`, reason: 'must be a string array' });
     }
-    return { [key]: [...value] };
+    const copied = {};
+    copied[key] = [...value];
+    return copied;
 }
 export function asAgentConfigServiceError(error) {
     if (!(error instanceof AgentConfigError))

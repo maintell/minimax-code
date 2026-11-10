@@ -1,3 +1,4 @@
+import { MINIMAX_CODE_USER_AGENT } from './minimax-code-user-agent.js';
 /** Go routes inference by conversation, independently of prompt cache settings. */
 export function withOpenCodeGoHeaders(baseUrl, headers, sessionId) {
     if (!isOpenCodeGoUrl(baseUrl))
@@ -11,9 +12,15 @@ export function withOpenCodeGoHeaders(baseUrl, headers, sessionId) {
     // Runtime identity wins case-insensitively over stale, static config headers.
     // Connectivity requests have no conversation and receive their own identity.
     merged['x-opencode-session'] = sessionId || crypto.randomUUID();
-    merged['user-agent'] = 'MiniMaxCode';
+    merged['user-agent'] = MINIMAX_CODE_USER_AGENT;
     return merged;
 }
+/**
+ * Official Go roots. models.dev moved Go from `/zen/go` to per-protocol
+ * `/inference/go/*` endpoints; both still require a session header, and
+ * saved providers may keep either root.
+ */
+const OPENCODE_GO_PATH_ROOTS = ['/zen/go', '/inference/go'];
 function isOpenCodeGoUrl(value) {
     if (!value)
         return false;
@@ -21,7 +28,7 @@ function isOpenCodeGoUrl(value) {
         const url = new URL(value);
         return (url.protocol === 'https:' &&
             url.hostname === 'opencode.ai' &&
-            (url.pathname === '/zen/go' || url.pathname.startsWith('/zen/go/')));
+            OPENCODE_GO_PATH_ROOTS.some((root) => url.pathname === root || url.pathname.startsWith(`${root}/`)));
     }
     catch {
         return false;

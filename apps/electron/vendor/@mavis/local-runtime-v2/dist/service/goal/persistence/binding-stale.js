@@ -1,0 +1,70 @@
+import { digestThreadGoalObjective, } from '@mavis/goal';
+/**
+ * The staleness predicate for everything bound to a `GoalTurnBinding`.
+ *
+ * A binding is admitted once per Turn and carries the epoch and objective
+ * digest it was admitted against. Four things can invalidate it before the bound
+ * work lands, checked in this order because each later check is only meaningful
+ * once the earlier one holds:
+ *
+ * 1. `missing_goal` — the row is gone (deleted mid-Turn).
+ * 2. `goal_epoch` — the CAS epoch moved; another decision won the race.
+ * 3. `objective_digest` — the objective was rewritten, so the work answered a
+ *    question nobody is asking any more.
+ * 4. `goal_status` — the Goal already left `active`.
+ *
+ * Accounting deliberately stops after check 3 — see
+ * {@link classifyThreadGoalAccountingStale}.
+ */
+export function classifyThreadGoalBindingStale(state, expected) {
+    const bindingStale = classifyThreadGoalAccountingStale(state, expected);
+    if (bindingStale)
+        return bindingStale;
+    return state?.status === 'active' ? undefined : 'goal_status';
+}
+/**
+ * Same predicate without check 4, for `bumpBoundUsage`.
+ *
+ * A non-active Goal is not stale for accounting: a Turn that reached a budget
+ * or was paused still ran, and its time must still be attributed. Charging it
+ * is required, not merely tolerated.
+ */
+export function classifyThreadGoalAccountingStale(state, expected) {
+    if (!state)
+        return 'missing_goal';
+    if (state.updatedAt !== expected.expectedEpoch)
+        return 'goal_epoch';
+    return digestThreadGoalObjective(state.objective) !== expected.objectiveDigest
+        ? 'objective_digest'
+        : undefined;
+}
+/**
+ * True while an already admitted Goal Turn may keep working although its Goal
+ * is paused: the pause came from an undelivered user side message (spec 4.4),
+ * it is the very pause this Turn was marked for, and the objective is the one
+ * the Turn was admitted for. Any later write (resume, edit, user pause,
+ * deletion) moves the epoch or the reason, and the Turn is stale again.
+ */
+export function isUndeliveredMessageDrain(state, bound) {
+    const drain = bound.undeliveredMessageDrain;
+    if (!state || !drain)
+        return false;
+    if (state.goalId !== bound.binding.goalId)
+        return false;
+    if (state.status !== 'paused' || state.statusReason !== 'paused(message_undelivered)') {
+        return false;
+    }
+    if (digestThreadGoalObjective(state.objective) !== bound.binding.objectiveDigest)
+        return false;
+    return drain.pausedEpoch === undefined
+        ? state.updatedAt > drain.fromEpoch
+        : state.updatedAt === drain.pausedEpoch;
+}
+/** Store-shaped wrapper for the two operations that must refuse a stale binding. */
+export function threadGoalStaleDecision(state, expected) {
+    const staleReason = classifyThreadGoalBindingStale(state, expected);
+    if (!staleReason)
+        return undefined;
+    return { status: 'stale', staleReason, ...(state ? { goal: state } : {}) };
+}
+//# sourceMappingURL=binding-stale.js.map

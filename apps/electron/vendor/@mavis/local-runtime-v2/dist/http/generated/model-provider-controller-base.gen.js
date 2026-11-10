@@ -10,6 +10,11 @@ export class ModelProviderControllerBase {
         void req;
         throw new NotImplementedError('selectModel');
     }
+    async selectAdvisorModel(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('selectAdvisorModel');
+    }
     async listModelProviders(ctx, req) {
         void ctx;
         void req;
@@ -94,6 +99,16 @@ export class ModelProviderControllerBase {
         void ctx;
         void req;
         throw new NotImplementedError('discoverUserModels');
+    }
+    async testUserModelApiKey(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('testUserModelApiKey');
+    }
+    async unrestUserModelApiKey(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('unrestUserModelApiKey');
     }
     async updateMinimaxModelContext(ctx, req) {
         void ctx;

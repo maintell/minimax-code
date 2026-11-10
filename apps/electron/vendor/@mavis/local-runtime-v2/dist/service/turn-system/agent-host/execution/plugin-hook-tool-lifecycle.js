@@ -1,15 +1,19 @@
-import { isRuntimeToolInputValid } from '@mavis/agent-core/tools';
+import { isRuntimeToolInputValid, } from '@mavis/agent-core/tools';
 import { getBrowserHostBinding } from '../assembly/host-capability/browser.js';
 import { composePluginHookToolResultContent, emitLocalPluginHookWarnings, localPluginHookCoordinator as pluginHookCoordinator, mergePluginHookContext, } from '../assembly/local-turn-plugin-hooks.js';
 import { authorizeDelegatedToolReference, resolveDelegatedToolTarget, revokeDelegatedToolReferenceAuthorization, } from '../assembly/local-turn-plugin-capabilities.js';
 import { buildCompatiblePostToolResponse, buildCodexPostToolResponse } from '../tools/index.js';
 import { successfulTaskOutputReadTaskId, successfulTerminalTaskOutputReadTaskId, } from './task-output-read.js';
+import { evaluatePtcChildToolPolicy } from '../runner/policy/local-turn-tool-ptc-policy.js';
+import { readAuthorizedTurnTools, readPtcChildTools } from './ptc/catalog.js';
 export function createControlledToolHooks(options) {
-    const { input, permissionGuard, pendingToolResultTailClaims, readTaskOutputTaskIds, toolsDisabled, toolSafetyGuard, toolPolicyGuard, finalizeToolResultForHistory, } = options;
+    const { input, permissionGuard, toolsDisabled, toolSafetyGuard, toolPolicyGuard, ptcFactCollector, } = options;
     const pluginToolContexts = new Map();
     const pluginToolStartedAtMs = new Map();
     const delegatedToolCalls = new Map();
     const seenToolCallIds = new Set();
+    const ptcChildTools = readPtcChildTools(input.assembly.tools);
+    const authorizedTools = readAuthorizedTurnTools(input.assembly.tools);
     return {
         beforeToolCallHook: [
             async (context, signal) => {
@@ -21,10 +25,20 @@ export function createControlledToolHooks(options) {
                     };
                 }
                 seenToolCallIds.add(toolCallId);
-                const prepared = prepareDelegatedToolCall(input, delegatedToolCalls, context);
+                const prepared = prepareDelegatedToolCall(input, authorizedTools, delegatedToolCalls, context);
                 if (prepared.decision)
                     return prepared.decision;
                 const effective = prepared.context;
+                const delegated = delegatedToolCalls.get(context.toolCall.id);
+                const ptcDecision = evaluatePtcChildToolPolicy({
+                    originalContext: context,
+                    context: effective,
+                    tools: authorizedTools,
+                    ...(ptcChildTools ? { ptcChildTools } : {}),
+                    ...(delegated ? { delegatedTarget: delegated.target.target } : {}),
+                });
+                if (ptcDecision)
+                    return ptcDecision;
                 const safetyDecision = await toolSafetyGuard?.beforeToolCall(effective, signal);
                 return (safetyDecision ??
                     runPluginPreToolHook({
@@ -33,6 +47,8 @@ export function createControlledToolHooks(options) {
                         context: effective,
                         signal,
                         delegated: delegatedToolCalls.get(context.toolCall.id),
+                        tools: authorizedTools,
+                        ...(ptcFactCollector ? { ptcFactCollector } : {}),
                     }));
             },
             (context, signal) => {
@@ -40,6 +56,7 @@ export function createControlledToolHooks(options) {
                 return toolPolicyGuard?.beforeToolCall({
                     ...(input.assemblyContext.plan ? { plan: input.assemblyContext.plan } : {}),
                     genuineUserQueryText: input.request.genuineUserQueryText,
+                    turn: { sessionId: input.lease.sessionId, turnId: input.lease.turnId },
                     toolContext: effective,
                     ...(signal ? { signal } : {}),
                 });
@@ -54,12 +71,33 @@ export function createControlledToolHooks(options) {
                     : undefined;
             },
             ...(input.assembly.hooks.beforeToolCallHook ?? []).map((hook) => (context, signal) => hook(effectiveBeforeToolContext(delegatedToolCalls, context), signal)),
+            (context) => {
+                const effective = effectiveBeforeToolContext(delegatedToolCalls, context);
+                const delegated = delegatedToolCalls.get(context.toolCall.id);
+                return evaluatePtcChildToolPolicy({
+                    originalContext: context,
+                    context: effective,
+                    tools: authorizedTools,
+                    ...(ptcChildTools ? { ptcChildTools } : {}),
+                    ...(delegated ? { delegatedTarget: delegated.target.target } : {}),
+                });
+            },
             async (context, signal) => {
                 const effective = effectiveBeforeToolContext(delegatedToolCalls, context);
                 try {
                     const decision = await permissionGuard(effective, signal);
                     if (decision)
                         return decision;
+                    const delegated = delegatedToolCalls.get(context.toolCall.id);
+                    const ptcDecision = evaluatePtcChildToolPolicy({
+                        originalContext: context,
+                        context: effective,
+                        tools: authorizedTools,
+                        ...(ptcChildTools ? { ptcChildTools } : {}),
+                        ...(delegated ? { delegatedTarget: delegated.target.target } : {}),
+                    });
+                    if (ptcDecision)
+                        return ptcDecision;
                     const authorization = authorizeDelegatedToolCall(delegatedToolCalls.get(context.toolCall.id));
                     if (authorization)
                         return authorization;
@@ -84,73 +122,78 @@ export function createControlledToolHooks(options) {
             ...(input.assembly.hooks.onToolExecutionStartHook ?? []).map((hook) => (context) => hook(effectiveToolExecutionStartContext(delegatedToolCalls, context))),
         ],
         afterToolCallHook: [
-            async (context, signal) => {
-                const authoritativeToolCallId = context.toolCall.id;
-                const delegated = delegatedToolCalls.get(authoritativeToolCallId);
-                const effectiveContext = effectiveAfterToolContext(delegated, context);
-                const startedAtMs = pluginToolStartedAtMs.get(authoritativeToolCallId);
-                pluginToolStartedAtMs.delete(authoritativeToolCallId);
-                const toolDurationMs = startedAtMs === undefined ? undefined : Math.max(0, Date.now() - startedAtMs);
-                let deliveryClosed = false;
-                try {
-                    await observeRawToolResultSafety(toolSafetyGuard, input.assembly.tools, effectiveContext, signal);
-                    const applied = await runAfterToolHooks(input.assembly.hooks.afterToolCallHook ?? [], effectiveContext, signal ?? input.lease.signal);
-                    const pluginDecision = await runPluginPostToolHook({
-                        input,
-                        signal,
-                        context: applied.context,
-                        priorContext: pluginToolContexts.get(authoritativeToolCallId),
-                        durationMs: toolDurationMs,
-                        delegated,
-                    });
-                    pluginToolContexts.delete(authoritativeToolCallId);
-                    const effectiveDecision = pluginDecision
-                        ? mergeAfterToolDecision(applied.decision, pluginDecision)
-                        : applied.decision;
-                    const finalized = await finalizeAfterToolCallForHistory({
-                        input,
-                        context: applied.context,
-                        decision: effectiveDecision,
-                        finalizer: finalizeToolResultForHistory,
-                        signal: signal ?? input.lease.signal,
-                    });
-                    recordSuccessfulTaskOutputRead(readTaskOutputTaskIds, finalized.context, finalized.decision, options.terminalTaskOutputReadIds);
-                    deliveryClosed = true;
-                    const claimed = input.control.closeAndClaimToolResultTail(authoritativeToolCallId);
-                    const tail = toToolResultTail(claimed);
-                    if (tail.length > 0)
-                        pendingToolResultTailClaims.add(authoritativeToolCallId);
-                    return tail.length === 0
-                        ? finalized.decision
-                        : mergeAfterToolDecision(finalized.decision, {
-                            content: [
-                                ...(finalized.decision?.content ?? finalized.context.result.content),
-                                ...tail,
-                            ],
-                        });
-                }
-                finally {
-                    delegatedToolCalls.delete(authoritativeToolCallId);
-                    input.pluginHostApprovalTargets?.delete(authoritativeToolCallId);
-                    if (!deliveryClosed)
-                        input.control.closeAndClaimToolResultTail(authoritativeToolCallId);
-                }
-            },
+            createAfterToolHook(options, { pluginToolContexts, pluginToolStartedAtMs, delegatedToolCalls }, authorizedTools),
         ],
     };
 }
-function prepareDelegatedToolCall(input, calls, context) {
-    if (context.toolCall.name !== 'mcp_invoke' || !hasHostToolReference(context.args)) {
-        const binding = directBrowserHostBinding(input.assembly.tools, context.toolCall.name);
+function createAfterToolHook(options, state, authorizedTools) {
+    const { input, toolSafetyGuard, finalizeToolResultForHistory, ptcFactCollector, readTaskOutputTaskIds, pendingToolResultTailClaims, } = options;
+    const { pluginToolContexts, pluginToolStartedAtMs, delegatedToolCalls } = state;
+    return async (context, signal) => {
+        const authoritativeToolCallId = context.toolCall.id;
+        const delegated = delegatedToolCalls.get(authoritativeToolCallId);
+        const effectiveContext = effectiveAfterToolContext(delegated, context);
+        const startedAtMs = pluginToolStartedAtMs.get(authoritativeToolCallId);
+        pluginToolStartedAtMs.delete(authoritativeToolCallId);
+        const toolDurationMs = startedAtMs === undefined ? undefined : Math.max(0, Date.now() - startedAtMs);
+        let deliveryClosed = false;
+        try {
+            await observeRawToolResultSafety(toolSafetyGuard, authorizedTools, effectiveContext, signal);
+            const applied = await runAfterToolHooks(input.assembly.hooks.afterToolCallHook ?? [], effectiveContext, signal ?? input.lease.signal);
+            const pluginDecision = await runPluginPostToolHook({
+                input,
+                signal,
+                context: applied.context,
+                priorContext: pluginToolContexts.get(authoritativeToolCallId),
+                durationMs: toolDurationMs,
+                delegated,
+                tools: authorizedTools,
+                ...(ptcFactCollector ? { ptcFactCollector } : {}),
+            });
+            pluginToolContexts.delete(authoritativeToolCallId);
+            const effectiveDecision = pluginDecision
+                ? mergeAfterToolDecision(applied.decision, pluginDecision)
+                : applied.decision;
+            const finalized = await finalizeAfterToolCallForHistory({
+                input,
+                context: applied.context,
+                decision: effectiveDecision,
+                finalizer: finalizeToolResultForHistory,
+                signal: signal ?? input.lease.signal,
+            });
+            recordSuccessfulTaskOutputRead(readTaskOutputTaskIds, finalized.context, finalized.decision, options.terminalTaskOutputReadIds);
+            deliveryClosed = true;
+            return appendToolResultTail(input, authoritativeToolCallId, finalized, pendingToolResultTailClaims);
+        }
+        finally {
+            delegatedToolCalls.delete(authoritativeToolCallId);
+            input.pluginToolApprovalTargets?.delete(authoritativeToolCallId);
+            if (!deliveryClosed)
+                input.control.closeAndClaimToolResultTail(authoritativeToolCallId);
+        }
+    };
+}
+function appendToolResultTail(input, toolCallId, finalized, pendingClaims) {
+    const tail = toToolResultTail(input.control.closeAndClaimToolResultTail(toolCallId));
+    if (tail.length === 0)
+        return finalized.decision;
+    pendingClaims.add(toolCallId);
+    return mergeAfterToolDecision(finalized.decision, {
+        content: [...(finalized.decision?.content ?? finalized.context.result.content), ...tail],
+    });
+}
+function prepareDelegatedToolCall(input, tools, calls, context) {
+    if (context.toolCall.name !== 'mcp_invoke') {
+        const binding = directBrowserHostBinding(tools, context.toolCall.name);
         if (binding)
-            input.pluginHostApprovalTargets?.set(context.toolCall.id, binding);
+            input.pluginToolApprovalTargets?.set(context.toolCall.id, binding);
         return { context };
     }
-    const gateway = input.assembly.tools.find((tool) => tool.def.name === 'mcp_invoke');
+    const gateway = tools.find((tool) => tool.def.name === 'mcp_invoke');
     if (!gateway) {
         return {
             context,
-            decision: { block: true, reason: 'Host-bound gateway is unavailable for this turn.' },
+            decision: { block: true, reason: 'On-demand tool gateway is unavailable for this turn.' },
         };
     }
     const resolution = resolveDelegatedToolTarget(gateway, context.args);
@@ -159,13 +202,11 @@ function prepareDelegatedToolCall(input, calls, context) {
             context,
             decision: {
                 block: true,
-                reason: resolution?.message ?? 'Host-bound gateway could not resolve the requested tool_ref.',
+                reason: resolution?.message ?? 'On-demand tool gateway could not resolve the requested target.',
             },
         };
     }
-    if (resolution.selectorKind !== 'tool_ref')
-        return { context };
-    if (!resolution.pluginName) {
+    if (resolution.selectorKind === 'tool_ref' && !resolution.pluginName) {
         return {
             context,
             decision: { block: true, reason: 'Host-bound tool_ref has no trusted Plugin owner.' },
@@ -177,15 +218,12 @@ function prepareDelegatedToolCall(input, calls, context) {
         target: resolution,
     };
     calls.set(context.toolCall.id, delegated);
-    input.pluginHostApprovalTargets?.set(context.toolCall.id, {
+    input.pluginToolApprovalTargets?.set(context.toolCall.id, {
         tool: resolution.target,
         inputSchema: resolution.inputSchema,
-        pluginName: resolution.pluginName,
+        ...(resolution.selectorKind === 'tool_ref' ? { pluginName: resolution.pluginName } : {}),
     });
     return { context: effectiveBeforeToolContext(calls, context) };
-}
-function hasHostToolReference(value) {
-    return isRecord(value) && typeof value.tool_ref === 'string' && value.tool_ref.length > 0;
 }
 function effectiveBeforeToolContext(calls, context) {
     const delegated = calls.get(context.toolCall.id);
@@ -193,12 +231,7 @@ function effectiveBeforeToolContext(calls, context) {
         return context;
     return {
         ...context,
-        toolCall: {
-            ...context.toolCall,
-            name: delegated.target.target.def.name,
-            arguments: delegated.target.arguments,
-            ...(delegated.target.target.source ? { source: delegated.target.target.source } : {}),
-        },
+        toolCall: effectiveDelegatedToolIdentity(delegated, context.toolCall),
         args: delegated.target.arguments,
     };
 }
@@ -207,12 +240,7 @@ function effectiveAfterToolContext(delegated, context) {
         return context;
     return {
         ...context,
-        toolCall: {
-            ...context.toolCall,
-            name: delegated.target.target.def.name,
-            arguments: delegated.target.arguments,
-            ...(delegated.target.target.source ? { source: delegated.target.target.source } : {}),
-        },
+        toolCall: effectiveDelegatedToolIdentity(delegated, context.toolCall),
         args: delegated.target.arguments,
     };
 }
@@ -222,13 +250,16 @@ function effectiveToolExecutionStartContext(calls, context) {
         return context;
     return {
         ...context,
-        toolCall: {
-            ...context.toolCall,
-            name: delegated.target.target.def.name,
-            arguments: delegated.target.arguments,
-            ...(delegated.target.target.source ? { source: delegated.target.target.source } : {}),
-        },
+        toolCall: effectiveDelegatedToolIdentity(delegated, context.toolCall),
         args: delegated.target.arguments,
+    };
+}
+function effectiveDelegatedToolIdentity(delegated, toolCall) {
+    return {
+        ...toolCall,
+        name: delegated.target.target.def.name,
+        arguments: delegated.target.arguments,
+        source: delegated.target.target.source,
     };
 }
 function authorizeDelegatedToolCall(delegated) {
@@ -296,7 +327,7 @@ async function runPluginPreToolHook(invocation) {
         turnId: input.lease.turnId,
         cwd: input.session.workspaceDir,
         ...input.pluginHookRuntimeContext,
-        ...pluginToolProvenance(input, context.toolCall.name, delegated),
+        ...pluginToolProvenance(input, invocation.tools, context.toolCall.name, delegated),
         matcherValue: context.toolCall.name,
         payload: {
             tool_name: context.toolCall.name,
@@ -314,8 +345,8 @@ async function runPluginPreToolHook(invocation) {
     return applyPluginPreToolDecision(invocation, result);
 }
 function applyPluginPreToolDecision(invocation, result) {
-    const { input, pluginToolContexts, context, delegated } = invocation;
-    const direct = directBrowserHostBinding(input.assembly.tools, context.toolCall.name);
+    const { input, pluginToolContexts, context, delegated, ptcFactCollector, tools: authorizedTools, } = invocation;
+    const direct = directBrowserHostBinding(authorizedTools, context.toolCall.name);
     const tools = direct
         ? [
             {
@@ -327,7 +358,7 @@ function applyPluginPreToolDecision(invocation, result) {
                 },
             },
         ]
-        : input.assembly.tools;
+        : authorizedTools;
     const invalidRewrite = applyPluginToolRewrite(delegated ? [delegatedValidationTool(delegated)] : tools, context, result.decision.updatedInput);
     if (invalidRewrite) {
         input.pluginApprovalRequests?.delete(context.toolCall.id);
@@ -336,8 +367,17 @@ function applyPluginPreToolDecision(invocation, result) {
     }
     recordPluginApprovalRequest(input, context, result);
     const hookContext = result.decision.additionalContext?.trim();
-    if (hookContext)
+    if (hookContext) {
         pluginToolContexts.set(context.toolCall.id, hookContext);
+        recordPtcPluginFacts(ptcFactCollector, context, [
+            {
+                kind: 'plugin_feedback',
+                child_tool_call_id: context.toolCall.id,
+                phase: 'additional_context',
+                text: hookContext,
+            },
+        ]);
+    }
     const blockDecision = pluginPreToolBlockDecision(result, hookContext);
     if (blockDecision)
         pluginToolContexts.delete(context.toolCall.id);
@@ -380,7 +420,7 @@ function isDeferredPluginToolDecision(result) {
         result.decision.toolPermissionDecision === 'defer');
 }
 async function runPluginPostToolHook(invocation) {
-    const { input, context, signal, priorContext } = invocation;
+    const { input, context, signal, priorContext, ptcFactCollector } = invocation;
     if (!input.pluginHooks?.length)
         return undefined;
     const failed = isFailedToolResult(context);
@@ -396,6 +436,7 @@ async function runPluginPostToolHook(invocation) {
         event: 'PostToolUse',
         result: pluginResult,
     });
+    recordPtcPluginFacts(ptcFactCollector, context, pluginPostToolFacts(context.toolCall.id, pluginResult));
     return buildPluginPostToolDecision(context, priorContext, pluginResult);
 }
 function selectPostToolHandlers(handlers) {
@@ -410,7 +451,7 @@ function priorPluginToolContextDecision(context, priorContext) {
 }
 function buildPluginPostToolEvent(invocation, failed) {
     const { input, context, durationMs } = invocation;
-    const toolProvenance = pluginToolProvenance(input, context.toolCall.name, invocation.delegated);
+    const toolProvenance = pluginToolProvenance(input, invocation.tools, context.toolCall.name, invocation.delegated);
     const toolResponseInput = {
         toolName: context.toolCall.name,
         args: recordValue(context.args),
@@ -463,9 +504,51 @@ function buildPluginPostToolDecision(context, priorContext, pluginResult) {
             : {}),
     };
 }
-function pluginToolProvenance(input, toolName, delegated) {
-    const hostOwner = delegated?.target.pluginName ??
-        directBrowserHostBinding(input.assembly.tools, toolName)?.pluginName;
+function pluginPostToolFacts(childToolCallId, result) {
+    const additionalContext = result.decision.additionalContext?.trim();
+    const updatedResult = typeof result.decision.updatedResult === 'string' ? result.decision.updatedResult : undefined;
+    const postToolFeedback = result.decision.postToolFeedback?.trim();
+    return [
+        ...(additionalContext
+            ? [
+                {
+                    kind: 'plugin_feedback',
+                    child_tool_call_id: childToolCallId,
+                    phase: 'additional_context',
+                    text: additionalContext,
+                },
+            ]
+            : []),
+        ...(updatedResult
+            ? [
+                {
+                    kind: 'plugin_feedback',
+                    child_tool_call_id: childToolCallId,
+                    phase: 'updated_result',
+                    text: updatedResult,
+                },
+            ]
+            : []),
+        ...(postToolFeedback
+            ? [
+                {
+                    kind: 'plugin_feedback',
+                    child_tool_call_id: childToolCallId,
+                    phase: 'post_tool_feedback',
+                    text: postToolFeedback,
+                },
+            ]
+            : []),
+    ];
+}
+function recordPtcPluginFacts(collector, context, facts) {
+    if (!collector || !context.parentToolCallId || facts.length === 0)
+        return;
+    collector.record(context.toolCall.id, facts);
+}
+function pluginToolProvenance(input, tools, toolName, delegated) {
+    const hostOwner = (delegated?.target.selectorKind === 'tool_ref' ? delegated.target.pluginName : undefined) ??
+        directBrowserHostBinding(tools, toolName)?.pluginName;
     if (hostOwner) {
         return {
             toolProvenance: {
@@ -485,9 +568,6 @@ function recordValue(value) {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value
         : {};
-}
-function isRecord(value) {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 function replaceRecord(target, value) {
     if (!target || typeof target !== 'object' || Array.isArray(target))

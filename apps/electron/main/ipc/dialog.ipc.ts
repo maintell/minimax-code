@@ -7,6 +7,7 @@ import { resolveParentWindow, showDialogWithoutOverlay } from "../utils/dialog";
 import { runWhileKeepingMiniChatVisible } from "../windows/archonMiniChatWindow";
 import { getMainWindow } from "../windows/mainWindow";
 import { inspectSessionHandoffPaths } from "./session-handoff-paths";
+import { captureSelectedFileIssuer } from "../modules/document-preview/selected-file-authority";
 /**
  * 设置对话框 IPC 处理器
  */
@@ -47,28 +48,38 @@ export function setupDialogIPC() {
     // 选择工作目录
     ipcMain.handle(IPC_CHANNELS.DIALOG_SELECT_DIRECTORY, async (event, options) => {
         const parentWindow = resolveParentWindow(event, getMainWindow);
+        const properties = [
+            'openDirectory',
+            'createDirectory',
+        ];
+        if (options?.multiSelections)
+            properties.push('multiSelections');
         const dialogOptions = {
             title: options?.title || 'Select Directory',
             defaultPath: options?.defaultPath,
             buttonLabel: options?.buttonLabel || 'Select',
-            properties: ['openDirectory', 'createDirectory'],
+            properties,
         };
         const showDialogFn = (win) => win ? dialog.showOpenDialog(win, dialogOptions) : dialog.showOpenDialog(dialogOptions);
         const result = await runWhileKeepingMiniChatVisible(parentWindow, () => options?.withoutOverlay
             ? showDialogWithoutOverlay(parentWindow, showDialogFn)
             : showDialogFn(parentWindow ?? undefined));
         if (result.canceled || result.filePaths.length === 0) {
-            return { success: false, path: null, canceled: true };
+            return { success: false, path: null, paths: [], canceled: true };
         }
         return {
             success: true,
             path: result.filePaths[0],
+            paths: result.filePaths,
             canceled: false,
         };
     });
     // 选择文件
     ipcMain.handle(IPC_CHANNELS.DIALOG_SELECT_FILE, async (event, options) => {
         const parentWindow = resolveParentWindow(event, getMainWindow);
+        const issueSelectedFiles = event.senderFrame === event.sender.mainFrame
+            ? captureSelectedFileIssuer(event.sender)
+            : () => ({});
         const properties = ['openFile'];
         if (options?.multiSelections) {
             properties.push('multiSelections');
@@ -90,6 +101,7 @@ export function setupDialogIPC() {
         return {
             success: true,
             paths: result.filePaths,
+            selectedFileTokens: issueSelectedFiles(result.filePaths),
             canceled: false,
         };
     });

@@ -1,12 +1,12 @@
 import { randomBytes } from 'node:crypto';
-import fs, { existsSync, readFileSync } from 'node:fs';
+import fs, { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import yaml from 'js-yaml';
 import lockfile from 'proper-lockfile';
 import { getConfig, getConfigPath, resetConfig } from './config.js';
 import { minimaxApiModels } from './byok-config.js';
 import { serializeConfigPreservingComments } from './comment-preserving-config-write.js';
-import { MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID } from './model-availability.js';
+import { MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID, deliveredDefaultModelId, } from './model-availability.js';
 const LOCAL_CONFIG_FILE_MODE = 0o600;
 const DANGEROUS_CONFIG_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 const LOCAL_BYOK_CONFIG_ROOTS = ['minimax_api', 'custom_provider'];
@@ -22,7 +22,14 @@ export async function removeLocalProviderConfig(providerId) {
         return { write: true, value: undefined };
     }).then(({ config }) => ({ config }));
 }
-/** Replace the official MiniMax snapshot without taking ownership of BYOK roots. */
+/**
+ * Replace the official MiniMax snapshot without taking ownership of BYOK roots.
+ *
+ * A saved Runtime default that the new snapshot no longer lists is rewritten
+ * in the same locked write to the delivered default, so the user stays pinned
+ * to a concrete callable model. Its variant/effort/context belonged to the
+ * retired model and are dropped.
+ */
 export async function replaceLocalManagedMinimaxProvider(provider) {
     if (!isPlainRecord(provider) || !isPlainRecord(provider.models)) {
         throw new LocalModelProviderConfigValidationError('Invalid managed MiniMax provider snapshot');
@@ -33,8 +40,40 @@ export async function replaceLocalManagedMinimaxProvider(provider) {
             ...(isPlainRecord(raw.provider) ? raw.provider : {}),
             [MANAGED_MINIMAX_PROVIDER_ID]: structuredClone(provider),
         };
-        return { write: true, value: undefined };
-    }).then(({ config }) => ({ config }));
+        const replacedDefaults = replaceRetiredDefaultModels(raw, provider);
+        return { write: true, value: replacedDefaults };
+    }).then(({ config, value }) => ({ config, replacedDefaults: value }));
+}
+function replaceRetiredDefaultModels(raw, provider) {
+    const providerView = provider;
+    const deliveredDefault = deliveredDefaultModelId(providerView);
+    if (!deliveredDefault)
+        return [];
+    const listed = new Set(Object.entries(provider.models)
+        .filter(([, model]) => !(isPlainRecord(model) && model.enabled === false))
+        .map(([modelId]) => modelId));
+    const replaced = [];
+    for (const field of ['defaultModel', 'defaultLightModel']) {
+        const value = raw[field];
+        if (typeof value !== 'string')
+            continue;
+        const slash = value.indexOf('/');
+        const providerId = slash > 0 ? value.slice(0, slash) : '';
+        const modelId = value.slice(slash + 1).trim();
+        if (providerId !== MANAGED_MINIMAX_PROVIDER_ID && providerId !== MINIMAX_API_PROVIDER_ID)
+            continue;
+        if (!modelId || listed.has(modelId))
+            continue;
+        const to = `${providerId}/${deliveredDefault}`;
+        raw[field] = to;
+        if (field === 'defaultModel') {
+            delete raw.defaultModelVariant;
+            delete raw.defaultModelThinking;
+            delete raw.defaultModelContextWindow;
+        }
+        replaced.push({ field, from: value, to });
+    }
+    return replaced;
 }
 class LocalModelProviderConfigValidationError extends Error {
     name = 'LocalModelProviderConfigValidationError';
@@ -49,8 +88,8 @@ class LocalModelProviderConfigWriteError extends Error {
  * Lock-protected write path for the secret-bearing BYOK trees. The generic
  * config update API deliberately cannot reach these roots.
  */
-export async function updateLocalByokConfig(mutate) {
-    return withLockedConfig(async (raw, currentConfig) => {
+export async function updateLocalByokConfig(mutate, beforeCommit) {
+    const { config } = await withLockedConfig(async (raw, currentConfig) => {
         const draft = {
             minimax_api: isPlainRecord(raw.minimax_api) ? raw.minimax_api : undefined,
             custom_provider: withoutEmptyEntries(isPlainRecord(raw.custom_provider) ? raw.custom_provider : undefined),
@@ -81,7 +120,8 @@ export async function updateLocalByokConfig(mutate) {
         setOptionalString(raw, 'defaultModel', draft.defaultModel);
         setOptionalString(raw, 'defaultModelVariant', draft.defaultModelVariant);
         return { write: true, value: undefined };
-    }).then(({ config }) => ({ config }));
+    }, beforeCommit);
+    return { config };
 }
 /** Atomically persist the default model and its optional variant. */
 export async function updateLocalModelSelection(input) {
@@ -144,7 +184,7 @@ export async function compareAndSetLocalModelContext(input, beforeCommit) {
     });
     return { config: outcome.config, updated: outcome.value };
 }
-async function withLockedConfig(operation) {
+async function withLockedConfig(operation, beforeCommit) {
     const configPath = getConfigPath();
     let release;
     try {
@@ -161,7 +201,7 @@ async function withLockedConfig(operation) {
         const outcome = await operation(previous, getConfig());
         if (outcome.write) {
             assertSafeConfigRecord(previous);
-            await atomicWriteFile(configPath, serializeConfigPreservingComments(readFileSync(configPath, 'utf-8'), previousRaw, previous));
+            await atomicWriteFile(configPath, serializeConfigPreservingComments(readFileSync(configPath, 'utf-8'), previousRaw, previous), beforeCommit);
             resetConfig();
         }
         return { config: getConfig(), value: outcome.value };
@@ -177,7 +217,7 @@ async function withLockedConfig(operation) {
         await release?.().catch(() => undefined);
     }
 }
-async function atomicWriteFile(filePath, content) {
+async function atomicWriteFile(filePath, content, beforeCommit) {
     const tmpPath = join(dirname(filePath), `.config-tmp-${randomBytes(6).toString('hex')}`);
     let created = false;
     try {
@@ -191,6 +231,8 @@ async function atomicWriteFile(filePath, content) {
         finally {
             await temporary.close();
         }
+        // Last synchronous admission before dispatching the atomic pointer replacement.
+        beforeCommit?.();
         await fs.promises.rename(tmpPath, filePath);
     }
     catch {

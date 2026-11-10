@@ -24,22 +24,36 @@ export function detectPluginReferencesForMessages(messages, fallbackText, plugin
     }
     return selected;
 }
+const PTC_RUN_CODE_CALL = 'inside run_code like any other tool: `await tools.<name>(args)`, or `await tools["<name>"](args)` when the name contains characters such as `-`.';
+/** The `via ...` marker of a capability discovered through Tool Search. */
+function toolSearchAccess(ptc) {
+    return ptc ? 'via `tool_search` + `run_code`' : 'via `tool_search` + `mcp_invoke`';
+}
 /** Render one self-contained reminder for every Plugin selected in this turn. */
-export function buildPluginReferenceReminder(plugins, unavailablePluginIds = []) {
+export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [], options = {}) {
     if (plugins.length === 0 && unavailablePluginIds.length === 0)
         return undefined;
+    const ptc = options.ptc === true;
     const blocks = plugins.slice(0, 8).map((plugin) => {
         const name = inlineCode(plugin.name);
+        const displayName = pluginDisplayName(plugin);
+        const displayNameAttribute = displayName ? ` display_name="${escapeXml(displayName)}"` : '';
+        const nameAttributes = `name="${escapeXml(plugin.name)}"${displayNameAttribute}`;
         const detail = [
-            `<selected-plugin name="${escapeXml(plugin.name)}">`,
+            `<selected-plugin ${nameAttributes}>`,
             `Referenced as \`@${name}\`.`,
+            ...(displayName
+                ? [
+                    `Its display name is ${escapeXml(displayName)}. \`${name}\` is only an identifier; call this Plugin ${escapeXml(displayName)} in replies and do not equate it with any other service.`,
+                ]
+                : []),
             '',
             ...(plugin.appCliProviders?.length
                 ? [
                     '<app-cli-providers>',
                     ...[...new Set(plugin.appCliProviders)]
                         .sort()
-                        .map((provider) => `- app \`${inlineCode(provider)}\` via mcode-tools`),
+                        .map((provider) => `- app \`${inlineCode(provider)}\`${displayName && provider === plugin.name ? ` (${escapeXml(displayName)})` : ''} via mcode-tools`),
                     'These are Plugin declarations, not proof of a current connection.',
                     'After loading mcode-tools-master, discover tools for each listed App relevant to the request by running `mcode-tools connector tools --keyword "app_name"` through Bash. Replace app_name with the exact App identifier listed above, not the Plugin name or a translated display name. Use the App identifier alone to list all matching tool names and descriptions before selecting a tool.',
                     'The keyword matches tool names and descriptions, so verify that each selected tool belongs to the intended App. Inspect its schema with `mcode-tools connector tool <tool_name>` before calling it. An empty or partial result does not prove the App is disconnected; check provider_failures and, if needed, retry discovery without a keyword.',
@@ -47,18 +61,18 @@ export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [])
                 ]
                 : [
                     '<connected-app-tools>',
-                    formatAppToolGroups(plugin.appTools),
+                    formatToolGroups(plugin.appTools, 'app', ptc),
                     '</connected-app-tools>',
                 ]),
             '',
             '<plugin-mcp-tools>',
-            formatToolGroups(plugin.mcpTools, 'server'),
+            formatToolGroups(plugin.mcpTools, 'server', ptc),
             '</plugin-mcp-tools>',
             '',
             ...(plugin.hostTools
                 ? [
                     '<plugin-host-tools>',
-                    formatToolGroups(plugin.hostTools, 'host'),
+                    formatToolGroups(plugin.hostTools, 'host', ptc),
                     '</plugin-host-tools>',
                     '',
                 ]
@@ -70,7 +84,7 @@ export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [])
         ].join('\n');
         return detail.length <= 4096
             ? detail
-            : `<selected-plugin name="${escapeXml(plugin.name).slice(0, 512)}">\nCapability details omitted to fit the context limit. Use this Plugin's tool provenance and Skill namespace in the available catalogs.\n</selected-plugin>`;
+            : `<selected-plugin name="${escapeXml(plugin.name).slice(0, 512)}"${displayNameAttribute}>\nCapability details omitted to fit the context limit. Use this Plugin's tool provenance and Skill namespace in the available catalogs.\n</selected-plugin>`;
     });
     const bounded = [];
     let remaining = 12_288;
@@ -104,9 +118,11 @@ export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [])
                 'When the selected Plugin declares an App relevant to the request, discover that App before substituting general web search. Do not treat an empty direct App tool list as absence of App capabilities.',
             ]
             : []),
-        ...(plugins.some((plugin) => [...plugin.appTools, ...plugin.mcpTools].some((group) => group.access === 'tool_search'))
+        ...(plugins.some((plugin) => [...plugin.appTools, ...plugin.mcpTools, ...(plugin.hostTools ?? [])].some((group) => group.access === 'tool_search'))
             ? [
-                'For tools marked `via tool_search + mcp_invoke`, discover the exact tool with `tool_search` before calling it through `mcp_invoke`.',
+                ptc
+                    ? `For capabilities marked \`via tool_search + run_code\`, discover the exact tool with \`tool_search\`, read its complete parameter schema, then call it ${PTC_RUN_CODE_CALL}`
+                    : 'For capabilities marked `via tool_search + mcp_invoke`, discover the exact tool with `tool_search`, read its complete parameter schema, then call it through `mcp_invoke`.',
             ]
             : []),
         'Before following a listed Skill, call the `skill` tool with its exact name.',
@@ -114,23 +130,9 @@ export function buildPluginReferenceReminder(plugins, unavailablePluginIds = [])
         '</system-reminder>',
     ].join('\n');
 }
-function formatAppToolGroups(groups) {
-    if (groups.length === 0)
-        return 'none';
-    return [...groups]
-        .slice(0, 16)
-        .sort((left, right) => {
-        const sourceOrder = normalizedName(left.source).localeCompare(normalizedName(right.source));
-        if (sourceOrder !== 0)
-            return sourceOrder;
-        return (left.access ?? 'direct').localeCompare(right.access ?? 'direct');
-    })
-        .map((group) => {
-        const tools = formatToolNames(group.tools);
-        const access = group.access === 'tool_search' ? ' via `tool_search` + `mcp_invoke`' : '';
-        return `- app \`${inlineCode(group.source)}\`${access}: ${tools || 'none'}`;
-    })
-        .join('\n');
+function pluginDisplayName(plugin) {
+    const displayName = plugin.displayName?.trim();
+    return displayName && displayName !== plugin.name ? displayName.slice(0, 256) : undefined;
 }
 function detectReferencesInText(text, plugins) {
     const linked = parsePluginMentions(text);
@@ -158,15 +160,20 @@ function detectReferencesInText(text, plugins) {
     matches.sort((left, right) => left.index - right.index);
     return matches.map((match) => match.plugin);
 }
-function formatToolGroups(groups, label) {
+function formatToolGroups(groups, label, ptc) {
     if (groups.length === 0)
         return 'none';
     return [...groups]
         .slice(0, 16)
-        .sort((left, right) => normalizedName(left.source).localeCompare(normalizedName(right.source)))
+        .sort((left, right) => {
+        const sourceOrder = normalizedName(left.source).localeCompare(normalizedName(right.source));
+        if (sourceOrder !== 0)
+            return sourceOrder;
+        return (left.access ?? 'direct').localeCompare(right.access ?? 'direct');
+    })
         .map((group) => {
         const tools = formatToolNames(group.tools);
-        const access = group.access === 'tool_search' ? ' via `tool_search` + `mcp_invoke`' : '';
+        const access = group.access === 'tool_search' ? ` ${toolSearchAccess(ptc)}` : '';
         return `- ${label} \`${inlineCode(group.source)}\`${access}: ${tools || 'none'}`;
     })
         .join('\n');

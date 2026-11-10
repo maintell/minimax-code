@@ -1,38 +1,55 @@
-import { withOpenCodeGoHeaders, withOpenRouterAttributionHeaders } from '@mavis/shared';
+import { withMiniMaxCodeUserAgent, withOpenCodeGoHeaders, withOpenRouterAttributionHeaders, } from '@mavis/shared';
 const MESSAGES_VERSION_HEADER = 'anthropic-messages'.replace('-messages', '-version');
+/** Gemini API version segment pi's Google transport expects inside the base URL. */
+const GEMINI_DEFAULT_API_VERSION = 'v1beta';
+/** Largest page the Gemini `models.list` endpoint accepts. */
+const GEMINI_MODELS_PAGE_SIZE = 1000;
 export function buildProviderHeaders(input) {
-    const defaults = input.api === 'anthropic-messages'
-        ? {
-            'content-type': 'application/json',
-            'x-api-key': input.apiKey,
-            [MESSAGES_VERSION_HEADER]: '2023-06-01',
-        }
-        : {
-            'content-type': 'application/json',
-            Authorization: `Bearer ${input.apiKey}`,
-        };
+    const defaults = defaultProviderHeaders(input.api, input.apiKey);
     const headers = new Headers(defaults);
-    const attributedHeaders = withOpenCodeGoHeaders(input.baseUrl, withOpenRouterAttributionHeaders(input.baseUrl, input.headers));
-    for (const [name, value] of Object.entries(attributedHeaders ?? {})) {
+    const attributedHeaders = withMiniMaxCodeUserAgent(withOpenCodeGoHeaders(input.baseUrl, withOpenRouterAttributionHeaders(input.baseUrl, input.headers)));
+    for (const [name, value] of Object.entries(attributedHeaders)) {
         headers.set(name, value);
     }
     return headers;
 }
+function defaultProviderHeaders(api, apiKey) {
+    if (api === 'anthropic-messages') {
+        return {
+            'content-type': 'application/json',
+            'x-api-key': apiKey,
+            [MESSAGES_VERSION_HEADER]: '2023-06-01',
+        };
+    }
+    if (api === 'google-generative-ai') {
+        return { 'content-type': 'application/json', 'x-goog-api-key': apiKey };
+    }
+    return { 'content-type': 'application/json', Authorization: `Bearer ${apiKey}` };
+}
 export function buildModelDiscoveryHeaders(input) {
     const headers = buildProviderHeaders(input);
+    // Google rejects a non-OAuth bearer token even when an API key is present.
+    if (input.api === 'google-generative-ai')
+        return headers;
     if (!headers.has('authorization'))
         headers.set('authorization', `Bearer ${input.apiKey}`);
     if (!headers.has('x-api-key'))
         headers.set('x-api-key', input.apiKey);
     return headers;
 }
-export function providerCompletionUrl(api, baseUrl) {
+export function providerCompletionUrl(api, baseUrl, modelId) {
     const base = normalizeProviderBaseUrl(api, baseUrl);
     if (api === 'anthropic-messages')
         return `${base}/v1/messages`;
     if (api === 'openai-responses')
         return `${base}/responses`;
+    if (api === 'google-generative-ai')
+        return `${base}/${geminiModelPath(modelId)}:generateContent`;
     return `${base}/chat/completions`;
+}
+/** Same resource naming as `@google/genai`: bare ids live under `models/`. */
+function geminiModelPath(modelId) {
+    return modelId.includes('/') ? modelId : `models/${modelId}`;
 }
 /**
  * 模型列表候选地址，按尝试顺序排列，首项是该协议的原生端点。Anthropic Messages
@@ -42,6 +59,8 @@ export function providerCompletionUrl(api, baseUrl) {
  */
 export function providerModelsUrls(api, baseUrl) {
     const base = normalizeProviderBaseUrl(api, baseUrl);
+    if (api === 'google-generative-ai')
+        return [`${base}/models?pageSize=${GEMINI_MODELS_PAGE_SIZE}`];
     if (api !== 'anthropic-messages')
         return [`${base}/models`];
     const primary = `${base}/v1/models`;
@@ -67,11 +86,24 @@ export function normalizeProviderBaseUrl(api, baseUrl) {
             base = base.slice(0, -'/v1'.length);
         return base;
     }
+    if (api === 'google-generative-ai')
+        return normalizeGeminiBaseUrl(base);
     if (base.endsWith('/chat/completions'))
         base = base.slice(0, -'/chat/completions'.length);
     else if (base.endsWith('/responses'))
         base = base.slice(0, -'/responses'.length);
     return base;
+}
+/**
+ * Pi's Google transport appends `/models/{id}:streamGenerateContent` to the base
+ * as is, so the base keeps its version segment. A pasted method or models URL is
+ * cut back to the version, and a bare origin gets Gemini's default version.
+ */
+function normalizeGeminiBaseUrl(baseUrl) {
+    const base = baseUrl.replace(/\/models(?:\/[^/]+)?$/u, '');
+    return URL.canParse(base) && new URL(base).pathname === '/'
+        ? `${base}/${GEMINI_DEFAULT_API_VERSION}`
+        : base;
 }
 export function mergeProviderHeaders(...records) {
     const merged = new Map();

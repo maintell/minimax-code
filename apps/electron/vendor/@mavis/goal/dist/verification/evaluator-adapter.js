@@ -80,72 +80,108 @@ export function createEvaluatorVerifierAdapter(options) {
     const maxTokens = positiveInteger(options.maxTokens);
     const timeoutMs = positiveInteger(options.timeoutSeconds) * 1_000;
     const maxRetries = Math.min(1, nonNegativeInteger(options.maxRetries));
+    // One total budget covers all physical attempts and recovery, not one fresh timeout per try.
+    const retryWindowMs = timeoutMs;
     return {
         async dispatch(attempt, signal) {
             if (attempt.backend !== 'evaluator' || !sameRoute(options.model)) {
                 throw new VerificationDispatchError('route_unavailable', 'The evaluator has no small-fast model on the worker data route.', emptyUsage());
             }
             const samples = [];
+            const deadlineAt = options.lifecycle?.deadlineAt ?? Date.now() + retryWindowMs;
+            const lease = options.lifecycle?.lease;
+            const ownedSignal = lease ? AbortSignal.any([signal, lease.signal]) : signal;
+            const close = async () => {
+                if (lease)
+                    await lease.close();
+            };
             let serializedTail = attempt.evidence.mode === 'brief'
                 ? attempt.evidence.serializedEvaluatorTail
                 : attempt.evidence.serializedTranscript;
             let lastVerdict;
             let lastFailure;
-            for (let physicalCall = 0; physicalCall <= maxRetries; physicalCall += 1) {
-                if (signal.aborted) {
-                    throw dispatchFailure('aborted', 'Evaluator dispatch was aborted.', samples, signal.reason);
-                }
-                const startedAt = nowMs();
-                const timeoutSignal = AbortSignal.timeout(timeoutMs);
-                const callSignal = AbortSignal.any([signal, timeoutSignal]);
-                try {
-                    const response = await options.model.call({
-                        systemPrompt: SYSTEM_PROMPT,
-                        userPrompt: buildEvaluatorPrompt(attempt, serializedTail),
-                        ...(attempt.objectiveImages?.length ? { images: attempt.objectiveImages } : {}),
-                        outputSchema: VERDICT_SCHEMA,
-                        maxTokens,
-                        timeoutMs,
-                        tools: [],
-                        thinking: 'off',
-                        signal: callSignal,
-                    });
-                    samples.push({
-                        tokens: nonNegativeTokens(response.tokens),
-                        incomplete: response.incomplete || response.tokens === null,
-                        activeSeconds: elapsedSeconds(startedAt, nowMs()),
-                    });
-                    const parsed = parseVerdict(response.text);
-                    if (!parsed) {
-                        lastFailure = { code: 'schema_error', error: new Error('Invalid evaluator JSON') };
-                        continue;
+            try {
+                for (let physicalCall = 0; physicalCall <= maxRetries; physicalCall += 1) {
+                    if (ownedSignal.aborted) {
+                        const timedOut = ownedSignal.reason instanceof Error && ownedSignal.reason.name === 'TimeoutError';
+                        throw dispatchFailure(timedOut ? 'timeout' : 'aborted', timedOut ? 'Evaluator dispatch timed out.' : 'Evaluator dispatch was aborted.', samples, ownedSignal.reason);
                     }
-                    lastVerdict = parsed;
-                    if (parsed.verdict === 'inconclusive' && physicalCall < maxRetries)
-                        continue;
-                    return { backend: 'evaluator', verdict: parsed, usage: aggregateUsage(samples) };
-                }
-                catch (error) {
-                    const failure = classifyCallFailure(error, signal, timeoutSignal);
-                    samples.push({
-                        tokens: failure.tokens,
-                        incomplete: failure.incomplete,
-                        activeSeconds: elapsedSeconds(startedAt, nowMs()),
-                    });
-                    if (failure.code === 'aborted') {
-                        throw dispatchFailure('aborted', failure.message, samples, error);
+                    if (Date.now() >= deadlineAt) {
+                        throw dispatchFailure('timeout', 'Evaluator dispatch timed out.', samples);
                     }
-                    lastFailure = { code: failure.code, error };
-                    if (failure.code === 'input_too_large' && physicalCall < maxRetries) {
-                        serializedTail = shrinkSerializedMessages(serializedTail);
+                    const startedAt = nowMs();
+                    const remainingMs = Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now()));
+                    const timeoutSignal = AbortSignal.timeout(remainingMs);
+                    const callSignal = AbortSignal.any([ownedSignal, timeoutSignal]);
+                    try {
+                        const response = await options.model.call({
+                            systemPrompt: SYSTEM_PROMPT,
+                            userPrompt: buildEvaluatorPrompt(attempt, serializedTail),
+                            ...(attempt.objectiveImages?.length ? { images: attempt.objectiveImages } : {}),
+                            outputSchema: VERDICT_SCHEMA,
+                            maxTokens,
+                            timeoutMs: remainingMs,
+                            tools: [],
+                            thinking: 'off',
+                            signal: callSignal,
+                        });
+                        samples.push({
+                            tokens: nonNegativeTokens(response.tokens),
+                            incomplete: response.incomplete || response.tokens === null,
+                            activeSeconds: elapsedSeconds(startedAt, nowMs()),
+                        });
+                        const parsed = parseVerdict(response.text);
+                        if (!parsed) {
+                            lastFailure = { code: 'schema_error', error: new Error('Invalid evaluator JSON') };
+                            continue;
+                        }
+                        lastVerdict = parsed;
+                        if (parsed.verdict === 'inconclusive' && physicalCall < maxRetries)
+                            continue;
+                        return { backend: 'evaluator', verdict: parsed, usage: aggregateUsage(samples) };
+                    }
+                    catch (error) {
+                        const failure = classifyCallFailure(error, ownedSignal, timeoutSignal);
+                        samples.push({
+                            tokens: failure.tokens,
+                            incomplete: failure.incomplete,
+                            activeSeconds: elapsedSeconds(startedAt, nowMs()),
+                        });
+                        if (failure.code === 'aborted') {
+                            throw dispatchFailure('aborted', failure.message, samples, error);
+                        }
+                        lastFailure = { code: failure.code, error };
+                        const decision = await lease?.classifyFailure?.(error);
+                        const recover = decision?.kind === 'recover' ? lease?.recover : undefined;
+                        const retryable = decision?.kind === 'retry' || !!recover || !decision;
+                        if (failure.code === 'input_too_large' && physicalCall < maxRetries) {
+                            serializedTail = shrinkSerializedMessages(serializedTail);
+                        }
+                        if (retryable && physicalCall < maxRetries && Date.now() < deadlineAt) {
+                            if (recover)
+                                await recover({ signal: callSignal, deadlineAt });
+                            const retryDelayMs = normalizedRetryAfterMs(decision?.retryAfterMs);
+                            const waitResult = await waitForRetry(retryDelayMs, ownedSignal, deadlineAt);
+                            if (waitResult === 'aborted') {
+                                throw dispatchFailure('aborted', 'Evaluator dispatch was aborted during retry backoff.', samples, ownedSignal.reason);
+                            }
+                            if (waitResult === 'deadline') {
+                                throw dispatchFailure('timeout', 'Evaluator dispatch timed out before retry.', samples);
+                            }
+                            continue;
+                        }
+                        break;
                     }
                 }
+                if (lastVerdict?.verdict === 'inconclusive') {
+                    return { backend: 'evaluator', verdict: lastVerdict, usage: aggregateUsage(samples) };
+                }
+                const code = lastFailure?.code ?? 'api_error';
+                throw dispatchFailure(code, `Evaluator ${code.replaceAll('_', ' ')} after ${samples.length} physical call(s).`, samples, lastFailure?.error);
             }
-            if (lastVerdict?.verdict === 'inconclusive') {
-                return { backend: 'evaluator', verdict: lastVerdict, usage: aggregateUsage(samples) };
+            finally {
+                await close();
             }
-            const code = lastFailure?.code ?? 'api_error';
-            throw dispatchFailure(code, `Evaluator ${code.replaceAll('_', ' ')} after ${samples.length} physical call(s).`, samples, lastFailure?.error);
         },
     };
 }
@@ -254,9 +290,10 @@ function classifyCallFailure(error, parentSignal, timeoutSignal) {
         };
     }
     if (parentSignal.aborted) {
+        const timedOut = parentSignal.reason instanceof Error && parentSignal.reason.name === 'TimeoutError';
         return {
-            code: 'aborted',
-            message: 'Evaluator dispatch was aborted.',
+            code: timedOut ? 'timeout' : 'aborted',
+            message: timedOut ? 'Evaluator dispatch timed out.' : 'Evaluator dispatch was aborted.',
             tokens: null,
             incomplete: true,
         };
@@ -275,6 +312,39 @@ function classifyCallFailure(error, parentSignal, timeoutSignal) {
         tokens: null,
         incomplete: true,
     };
+}
+function normalizedRetryAfterMs(value) {
+    return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.ceil(value)) : 0;
+}
+/** Never shorten a provider backoff to squeeze another request into the budget. */
+async function waitForRetry(delayMs, signal, deadlineAt) {
+    const stopped = () => {
+        if (signal.aborted) {
+            return signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
+                ? 'deadline'
+                : 'aborted';
+        }
+        return Date.now() >= deadlineAt ? 'deadline' : undefined;
+    };
+    const initial = stopped();
+    if (initial)
+        return initial;
+    if (Date.now() + delayMs >= deadlineAt)
+        return 'deadline';
+    if (delayMs > 0) {
+        await new Promise((resolve) => {
+            const finish = () => {
+                clearTimeout(timer);
+                signal.removeEventListener('abort', finish);
+                resolve();
+            };
+            const timer = setTimeout(finish, delayMs);
+            signal.addEventListener('abort', finish, { once: true });
+            if (signal.aborted)
+                finish();
+        });
+    }
+    return stopped() ?? 'ready';
 }
 function elapsedSeconds(startedAt, endedAt) {
     return Math.max(0, Math.ceil((endedAt - startedAt) / 1_000));

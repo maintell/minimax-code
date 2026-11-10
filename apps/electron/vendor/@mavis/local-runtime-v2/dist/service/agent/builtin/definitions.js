@@ -9,6 +9,11 @@ export const FEATURE_FILES = {
     cron: 'cron.md.hbs',
     memory: 'memory.md.hbs',
 };
+/**
+ * Local-only V2 section rendered for a PTC Turn and inserted before
+ * `# Harness` via the `ptc.section` context field (prompt-exemptions.json).
+ */
+export const PTC_SECTION_FILE = '_v2/PTC_TOOL_CALLS.md.hbs';
 export function surfacePromptFiles(surface) {
     return surface === 'task-child'
         ? {
@@ -37,6 +42,7 @@ export function toSurfaceRenderInput(input) {
         ...(input.promptReadContext === undefined
             ? {}
             : { promptReadContext: input.promptReadContext }),
+        ...(input.ptc === undefined ? {} : { ptc: input.ptc }),
     };
 }
 export function defaultLocale() {

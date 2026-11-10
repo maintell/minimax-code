@@ -1,28 +1,46 @@
-import { readGenuineUserQueryText } from './checkpoint-format.js';
+import { readPtcExecutionDetails } from '@mavis/agent-core/tools';
+import { readGenuineUserQueryText } from './genuine-user-query.js';
 const TOOL_RESULT_REMOVED_TEXT = '[Tool result removed by context compaction.]';
+const PTC_RETURN_REMOVED_TEXT = '[run_code return removed by context compaction.]';
 const MEDIA_REMOVED_TEXT = '[Media removed by context compaction.]';
-const PROTECTED_TOOL_ROUND_RATIO = 0.3;
-const ELIGIBLE_TOOL_NAMES = new Set([
-    'read',
-    'bash',
-    'grep',
-    'glob',
-    'web_search',
-    'web_fetch',
-    'edit',
-    'write',
-]);
-export function buildToolTrimCandidate(messages) {
-    const rounds = parseToolRounds(messages);
-    const protectedRoundCount = Math.ceil(rounds.length * PROTECTED_TOOL_ROUND_RATIO);
-    const protectedRounds = new Set(rounds.slice(-protectedRoundCount));
-    return buildToolResultCandidate(messages, rounds, (round, _message, toolName) => {
-        return !protectedRounds.has(round) && ELIGIBLE_TOOL_NAMES.has(canonicalToolName(toolName));
-    });
-}
+/** Hall: every tool result body is replaced; ToolRound pairing stays intact. */
 export function buildAllToolResultsCandidate(messages) {
-    const rounds = parseToolRounds(messages);
-    return buildToolResultCandidate(messages, rounds, () => true);
+    const replacements = new Map();
+    let trimmedRoundCount = 0;
+    parseToolRounds(messages).forEach((round) => {
+        const replacementCountBeforeRound = replacements.size;
+        round.resultIndexes.forEach((index) => {
+            const message = messages[index];
+            if (!message || message.role !== 'toolResult') {
+                throw new TypeError('Context compaction history contains an invalid tool result.');
+            }
+            const callId = readNonEmpty(message, 'toolCallId');
+            if (!callId || !round.toolCallsById.get(callId)?.name)
+                return;
+            if (isRemovedToolResult(message))
+                return;
+            const ptcDetails = readPtcExecutionDetails(message);
+            if (ptcDetails) {
+                const replacement = trimPtcToolReturn(message, ptcDetails);
+                if (replacement)
+                    replacements.set(index, replacement);
+                return;
+            }
+            replacements.set(index, {
+                ...message,
+                content: [{ type: 'text', text: TOOL_RESULT_REMOVED_TEXT }],
+            });
+        });
+        if (replacements.size > replacementCountBeforeRound)
+            trimmedRoundCount += 1;
+    });
+    return {
+        messages: replacements.size === 0
+            ? messages
+            : messages.map((message, index) => replacements.get(index) ?? message),
+        trimmedResultCount: replacements.size,
+        trimmedRoundCount,
+    };
 }
 export function buildAttachmentFreeCandidate(messages) {
     const replacements = new Map();
@@ -94,43 +112,34 @@ function collectProtectedClosures(messages, closures) {
     });
     return protectedClosures;
 }
-function buildToolResultCandidate(messages, rounds, eligible) {
-    const replacements = new Map();
-    let trimmedRoundCount = 0;
-    rounds.forEach((round) => {
-        const replacementCountBeforeRound = replacements.size;
-        round.resultIndexes.forEach((index) => {
-            const message = messages[index];
-            if (!message || message.role !== 'toolResult') {
-                throw new TypeError('Context compaction history contains an invalid tool result.');
-            }
-            const callId = readNonEmpty(message, 'toolCallId');
-            const toolName = callId ? round.toolCallsById.get(callId)?.name : undefined;
-            if (!toolName || !eligible(round, message, toolName))
-                return;
-            if (isRemovedToolResult(message))
-                return;
-            replacements.set(index, {
-                ...message,
-                content: [{ type: 'text', text: TOOL_RESULT_REMOVED_TEXT }],
-            });
-        });
-        if (replacements.size > replacementCountBeforeRound)
-            trimmedRoundCount += 1;
-    });
-    return {
-        messages: replacements.size === 0
-            ? messages
-            : messages.map((message, index) => replacements.get(index) ?? message),
-        trimmedResultCount: replacements.size,
-        trimmedRoundCount,
-    };
-}
 function isRemovedToolResult(message) {
     const onlyBlock = message.content.length === 1 ? message.content[0] : undefined;
-    return onlyBlock?.type === 'text' && onlyBlock.text === TOOL_RESULT_REMOVED_TEXT;
+    return (onlyBlock?.type === 'text' &&
+        (onlyBlock.text === TOOL_RESULT_REMOVED_TEXT || onlyBlock.text === PTC_RETURN_REMOVED_TEXT));
 }
-export function parseToolRounds(messages, options = {}) {
+function trimPtcToolReturn(message, details) {
+    const forced = details.host_forced_content;
+    const hasNonReturnFact = details.retained_facts.some((fact) => fact.kind !== 'plugin_feedback' && fact.kind !== 'approval');
+    if (!forced) {
+        if (hasNonReturnFact)
+            return undefined;
+        return {
+            ...message,
+            content: [{ type: 'text', text: PTC_RETURN_REMOVED_TEXT }],
+        };
+    }
+    const onlyBlock = message.content.length === 1 ? message.content[0] : undefined;
+    if (onlyBlock?.type !== 'text')
+        return undefined;
+    const prefix = forced.endsWith('\n') ? forced : `${forced}\n`;
+    if (!onlyBlock.text.startsWith(prefix) || onlyBlock.text.length === prefix.length)
+        return undefined;
+    return {
+        ...message,
+        content: [{ type: 'text', text: `${prefix}${PTC_RETURN_REMOVED_TEXT}` }],
+    };
+}
+export function parseToolRounds(messages) {
     const rounds = [];
     for (let index = 0; index < messages.length; index += 1) {
         const message = messages[index];
@@ -140,13 +149,8 @@ export function parseToolRounds(messages, options = {}) {
         if (!calls)
             continue;
         const toolCallsById = indexToolCalls(calls);
-        const { resultIndexes, settled } = settleToolRound(messages, {
-            assistantIndex: index,
-            callCount: calls.length,
-            toolCallsById,
-            allowIncompleteTail: options.allowIncompleteTail === true,
-        });
-        rounds.push({ assistantIndex: index, resultIndexes, toolCallsById, settled });
+        const resultIndexes = settleToolRound(messages, index, calls.length, toolCallsById);
+        rounds.push({ assistantIndex: index, resultIndexes, toolCallsById });
         index += resultIndexes.length;
     }
     return rounds;
@@ -225,19 +229,15 @@ function indexToolCalls(calls) {
     });
     return toolCallsById;
 }
-function settleToolRound(messages, input) {
+function settleToolRound(messages, assistantIndex, callCount, toolCallsById) {
     const resultIndexes = [];
     const matched = new Set();
-    while (resultIndexes.length < input.callCount) {
-        const resultIndex = input.assistantIndex + resultIndexes.length + 1;
-        const result = messages[resultIndex];
-        if (!result && input.allowIncompleteTail)
-            return { resultIndexes, settled: false };
-        const callId = readSettledCallId(result, input.toolCallsById, matched);
-        matched.add(callId);
+    while (resultIndexes.length < callCount) {
+        const resultIndex = assistantIndex + resultIndexes.length + 1;
+        matched.add(readSettledCallId(messages[resultIndex], toolCallsById, matched));
         resultIndexes.push(resultIndex);
     }
-    return { resultIndexes, settled: true };
+    return resultIndexes;
 }
 function readSettledCallId(result, toolCallsById, matched) {
     if (!result || result.role !== 'toolResult') {
@@ -260,15 +260,6 @@ function readToolCalls(message) {
         }
         return [{ id, name, arguments: Reflect.get(block, 'arguments') }];
     });
-}
-function canonicalToolName(name) {
-    const normalized = name.trim().toLowerCase();
-    return normalized === 'powershell' ||
-        normalized === 'powershell.exe' ||
-        normalized === 'pwsh' ||
-        normalized === 'pwsh.exe'
-        ? 'bash'
-        : normalized;
 }
 function isStructuredMediaBlock(block) {
     if (!block || typeof block !== 'object')

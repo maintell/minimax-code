@@ -5,6 +5,8 @@ export class SessionController extends SessionControllerBase {
     applications;
     cronDelivery;
     conversation;
+    sessionActivity;
+    remoteMessage;
     constructor(options = {}) {
         super();
         if (options.applications)
@@ -13,6 +15,24 @@ export class SessionController extends SessionControllerBase {
             this.cronDelivery = options.cronDelivery;
         if (options.conversation)
             this.conversation = options.conversation;
+        if (options.sessionActivity)
+            this.sessionActivity = options.sessionActivity;
+        if (options.remoteMessage)
+            this.remoteMessage = options.remoteMessage;
+    }
+    async getSessionActivity(ctx, req) {
+        if (!this.sessionActivity)
+            throw new NotImplementedError('session activity');
+        return this.sessionActivity.getSessionActivity(ctx, req);
+    }
+    createSideChat(ctx, req) {
+        return this.requireApplications().session.sideChat.createSideChat(ctx, req);
+    }
+    createSideChatFromQueue(ctx, req) {
+        return this.requireApplications().session.sideChat.createSideChatFromQueue(ctx, req);
+    }
+    promoteSideChat(ctx, req) {
+        return this.requireApplications().session.sideChat.promoteSideChat(ctx, req);
     }
     async getRootSession(ctx, req) {
         return this.requireApplications().session.root.getRootSession(ctx, req);
@@ -88,6 +108,17 @@ export class SessionController extends SessionControllerBase {
     }
     async abortSession(ctx, req) {
         return this.requireConversation().abortSession(ctx, req);
+    }
+    async cancelPromptSuggestion(ctx, req) {
+        return this.requireConversation().cancelPromptSuggestion(ctx, req);
+    }
+    async getPromptSuggestion(ctx, req) {
+        return this.requireConversation().getPromptSuggestion(ctx, req);
+    }
+    async sendRemoteMessage(_ctx, req) {
+        if (!this.remoteMessage)
+            throw new NotImplementedError('remote message delivery');
+        return this.remoteMessage.deliver(req);
     }
     async steerSession(ctx, req) {
         return this.requireConversation().steerSession(ctx, req);

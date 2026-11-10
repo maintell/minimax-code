@@ -1,6 +1,11 @@
-import { createDiskLogTransport, createStructuredLogger, wrapTraceContextLogger, } from '../logging/index.js';
+import path from 'node:path';
+import { createDiskLogTransport, createSessionLogger, createSessionLogTransport, createStructuredLogger, readLogSessionId, SESSION_LOG_DIR, wrapTraceContextLogger, } from '../logging/index.js';
+// Layout of the per-Session files, for readers such as diagnostic bundles.
+export { isSessionLogFile, SESSION_LOG_DIR } from '../logging/index.js';
 let activeDisk = null;
+let activeSessionDisk = null;
 let baseLogger = wrapTraceContextLogger(createStructuredLogger());
+let sessionLogger = null;
 /**
  * Install (or re-install) the local-runtime engineering logger. Called by
  * the host wiring during boot. Safe to call more than once — the previous
@@ -13,7 +18,10 @@ let baseLogger = wrapTraceContextLogger(createStructuredLogger());
  */
 export function configureLocalRuntimeLogging(opts = {}) {
     const previous = activeDisk;
+    const previousSession = activeSessionDisk;
     activeDisk = null;
+    activeSessionDisk = null;
+    sessionLogger = null;
     if (opts.dir) {
         const { dir, prefix, maxBytesPerFile, maxTotalBytes, retentionMs, now, onError, loggerOptions, } = opts;
         const diskOpts = { dir };
@@ -32,26 +40,39 @@ export function configureLocalRuntimeLogging(opts = {}) {
         const disk = createDiskLogTransport(diskOpts);
         activeDisk = disk;
         baseLogger = wrapTraceContextLogger(createStructuredLogger({ ...loggerOptions, disk }));
+        // Session files use the same limits as the hourly log, counted separately.
+        const sessionDiskOpts = { dir: path.join(dir, SESSION_LOG_DIR) };
+        if (maxBytesPerFile !== undefined)
+            sessionDiskOpts.maxBytesPerFile = maxBytesPerFile;
+        if (maxTotalBytes !== undefined)
+            sessionDiskOpts.maxTotalBytes = maxTotalBytes;
+        if (retentionMs !== undefined)
+            sessionDiskOpts.retentionMs = retentionMs;
+        if (now !== undefined)
+            sessionDiskOpts.now = now;
+        if (onError !== undefined)
+            sessionDiskOpts.onError = onError;
+        const sessionDisk = createSessionLogTransport(sessionDiskOpts);
+        activeSessionDisk = sessionDisk;
+        sessionLogger = wrapTraceContextLogger(createSessionLogger(sessionDisk, loggerOptions));
     }
     else {
         baseLogger = wrapTraceContextLogger(createStructuredLogger(opts.loggerOptions ?? {}));
     }
-    if (previous) {
-        // Fire-and-forget: the previous transport keeps draining its own write
-        // chain in the background. Any close errors already routed through the
-        // transport's `onError` sink; we just prevent an unhandled rejection.
+    // Fire-and-forget: the previous transports keep draining their own write
+    // chains in the background. Any close errors already routed through the
+    // transports' `onError` sink; we just prevent an unhandled rejection.
+    if (previous)
         void previous.close().catch(() => { });
-    }
+    if (previousSession)
+        void previousSession.close().catch(() => { });
 }
 /**
- * Flush pending disk writes without tearing down the base logger. Callers
- * (feedback upload path, forced diagnostics dump) invoke this before reading
- * the log directory to make sure the tail of the file is on disk.
+ * 日志已经是当场写进文件的；这里等 Session 文件的后台清理跑完，不拆掉 logger。上传日志、
+ * 导出诊断包之前调用，读日志目录时不会碰上正在删的文件。
  */
 export async function flushLocalRuntimeLogging() {
-    if (!activeDisk)
-        return;
-    await activeDisk.flush();
+    await Promise.all([activeDisk?.flush(), activeSessionDisk?.flush()]);
 }
 /**
  * Close the disk transport (flush + retention sweep + stop accepting new
@@ -65,33 +86,45 @@ export async function shutdownLocalRuntimeLogging() {
     if (!activeDisk)
         return;
     const old = activeDisk;
+    const oldSession = activeSessionDisk;
     activeDisk = null;
-    try {
-        await old.close();
-    }
-    catch {
-        // Already surfaced via onError.
-    }
+    activeSessionDisk = null;
+    sessionLogger = null;
+    // Close errors were already surfaced via onError.
+    await Promise.allSettled([old.close(), oldSession?.close()]);
     baseLogger = wrapTraceContextLogger(createStructuredLogger());
+}
+/**
+ * Permission records that name a Session go to that Session's file instead of
+ * the terminal and the hourly runtime log; warnings and errors go to both.
+ */
+function write(level, fields, message) {
+    const isPermission = message.startsWith('permission.') || message.startsWith('[permission] ');
+    if (sessionLogger && isPermission && readLogSessionId(fields)) {
+        sessionLogger[level](fields, message);
+        if (level === 'info')
+            return;
+    }
+    baseLogger[level](fields, message);
 }
 export const logger = {
     info(fields, message) {
-        baseLogger.info(fields, message);
+        write('info', fields, message);
     },
     warn(fields, message) {
-        baseLogger.warn(fields, message);
+        write('warn', fields, message);
     },
     error(fields, message) {
-        baseLogger.error(fields, message);
+        write('error', fields, message);
     },
     ctxInfo(ctx, fields, message) {
-        baseLogger.info({ ctx, ...fields }, message);
+        write('info', { ctx, ...fields }, message);
     },
     ctxWarn(ctx, fields, message) {
-        baseLogger.warn({ ctx, ...fields }, message);
+        write('warn', { ctx, ...fields }, message);
     },
     ctxError(ctx, fields, message) {
-        baseLogger.error({ ctx, ...fields }, message);
+        write('error', { ctx, ...fields }, message);
     },
 };
 /**

@@ -2,10 +2,12 @@ import path from 'node:path';
 import { getRuntimeBuildEnv, getRuntimeRegion } from '@mavis/config';
 import { initializeHostConnectorSystem } from '../host-connector-system/index.js';
 import { ConnectorCloudClient } from './app/cloud-client.js';
-import { DesktopConnectorRuntime } from './app/runtime.js';
 import { PluginSystemCloudTransport } from './cloud-transport.js';
+import { createMiniAppPluginMcpTools } from './mcp/miniapp-plugin-mcp-tools.js';
+import { createPluginMcpAuthPort, PluginMcpCredentials } from './mcp/oauth.js';
 import { PluginMcpRuntime } from './mcp/runtime.js';
 import { GithubPluginImporter } from './plugin/import/github-plugin-importer.js';
+import { createPluginMarketplaceService } from './plugin/marketplace/marketplace-service.js';
 import { PluginDesktopFacade } from './plugin/runtime/desktop-facade.js';
 import { OfficialPluginAuthBarrier, resolveOfficialPluginAuthState, } from './plugin/runtime/official-operations.js';
 import { OfficialPluginReconciler } from './plugin/runtime/official-reconciler.js';
@@ -26,19 +28,33 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         isLoggedOut: () => officialAuthState() === 'logged_out',
         metrics: metricTags,
     });
+    const mcpCredentials = dependencies.mcpOAuth
+        ? new PluginMcpCredentials({
+            service: dependencies.mcpOAuth,
+            ...(dependencies.publishAuthRequired
+                ? { publishAuthRequired: dependencies.publishAuthRequired }
+                : {}),
+            logger: dependencies.logger,
+        })
+        : undefined;
+    // Bound by the runtime composition: it holds the plugin for the calling turn and tells a Mini
+    // App's own sessions apart (it needs the session repository for that).
+    let managedMiniAppToolCall;
     const createPluginMcpRuntime = () => new PluginMcpRuntime({
         names: dependencies.mcp.getRuntimeNameRegistry(),
+        ...(mcpCredentials ? { auth: mcpCredentials } : {}),
         logger: {
             info: (message, fields) => dependencies.logger.info(fields ?? {}, message),
             warn: (message, fields) => dependencies.logger.warn(fields ?? {}, message),
             error: (message, fields) => dependencies.logger.error(fields ?? {}, message),
         },
         metrics: metricTags,
+        onManagedMiniAppToolCall: (call) => managedMiniAppToolCall?.(call),
     });
     const pluginMcpRuntime = createPluginMcpRuntime();
     const repository = new SqlitePluginRepository(dependencies.database);
     const cloudTransport = new PluginSystemCloudTransport({
-        baseUrl: resolveCloudBaseUrl(),
+        baseUrl: resolvePluginCloudBaseUrl(),
         fetchImpl: dependencies.fetchImpl,
         authContextGetter: dependencies.authContextGetter,
         appVersion: dependencies.appVersion,
@@ -59,31 +75,22 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         },
         onAuditFailure: (error) => dependencies.logger.warn({ errorType: error instanceof Error ? error.name : typeof error }, 'Host-process Connector audit failed'),
     });
-    const connectorRuntime = new DesktopConnectorRuntime({
-        client: connectorClient,
-        logger: {
-            warn: (message, fields) => dependencies.logger.warn(fields ?? {}, message),
-        },
-        metrics: metricTags,
-        scopeKeyGetter: () => {
-            const principalId = dependencies.authContextGetter()?.realUserID?.trim();
-            const deployment = `${getRuntimeRegion()}-${getRuntimeBuildEnv()}`;
-            return principalId ? JSON.stringify([principalId, deployment]) : 'custom-only';
-        },
-    });
     const officialCacheRoot = path.join(dependencies.dataDir, 'v2', 'plugin-cache', 'official');
     const system = new PluginSystem({
         onPluginDeactivated,
         onOfficialPluginRevoked: dependencies.onOfficialPluginRevoked,
         onCapabilitiesChanged: dependencies.onCapabilitiesChanged,
         mcpNames: dependencies.mcp.getRuntimeNameRegistry(),
+        ...(dependencies.miniAppHostVersion
+            ? { miniAppHostVersion: dependencies.miniAppHostVersion }
+            : {}),
         dataDir: dependencies.dataDir,
         officialCacheRoot,
         repository,
         authContextGetter: dependencies.authContextGetter,
+        ...(mcpCredentials ? { mcpCredentials } : {}),
         deploymentGetter,
         listReservations: dependencies.listReservations,
-        connectorRuntime,
         mcpRuntime: pluginMcpRuntime,
         mcpRuntimeFactory: createPluginMcpRuntime,
         officialReconciler: new OfficialPluginReconciler({
@@ -98,6 +105,16 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
     const unsubscribeSkillChanges = dependencies.skill.onDidChangeRuntimeSkills?.(() => system.markReservationsDirty()) ??
         (() => undefined);
     system.attachPublicationPort(turnCapabilities.attach(system));
+    const marketplaces = createPluginMarketplaceService({
+        dataDir: dependencies.dataDir,
+        installer: system.localInstaller,
+        isEnabled: () => dependencies.configGetter().beta?.pluginMarketplaces === true,
+        logger: {
+            info: (message, fields) => dependencies.logger.info(fields ?? {}, message),
+            warn: (message, fields) => dependencies.logger.warn(fields ?? {}, message),
+        },
+        metrics: { incr: metricTags.incr, latency: metricTags.latency },
+    });
     const plugin = new PluginDesktopFacade({
         system,
         registryClient,
@@ -105,6 +122,8 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         standaloneSkillIdentities: dependencies.standaloneSkillIdentities,
         waitForOfficialAuth: () => officialAuthBarrier.waitUntilReady(),
         githubImporter,
+        marketplaces,
+        connectorCatalog: connectorClient,
         metrics: metricTags,
     });
     let readyPromise;
@@ -112,30 +131,52 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
     return {
         plugin,
         mcp: dependencies.mcp,
+        mcpAuthPort: createPluginMcpAuthPort({
+            get currentSnapshot() {
+                return system.currentSnapshot;
+            },
+            waitUntilReady: () => system.waitUntilReady(),
+            probeMcpServer: (serverName) => system.probeMcpServer(serverName),
+            rediscoverMcpServers: (serverNames) => system.rediscoverMcpServers(serverNames),
+        }),
         skill: dependencies.skill,
         hostConnectorGateway: hostConnectorSystem.gateway,
+        miniAppPermissionSwitches: system.miniAppPublication.permissionSwitches,
+        miniAppPluginMcp: createMiniAppPluginMcpTools(system),
         attachMiniAppPublication: (input) => system.miniAppPublication.attach(input),
+        bindMiniAppMemory: (coordinator) => system.miniAppPublication.bindMemory(coordinator),
+        observeManagedMiniAppToolCalls: (listener) => {
+            managedMiniAppToolCall = listener;
+        },
         listAcceptedMiniApps: () => system.miniAppPublication.listAcceptedMiniApps(),
         isAcceptedMiniAppRunning: (pluginId) => system.miniAppPublication.isAcceptedMiniAppRunning(pluginId),
         listAvailableMiniApps: () => system.miniAppPublication.listAvailableMiniApps(),
+        listAvailableMiniAppDefinitions: () => system.miniAppPublication.listAvailableDefinitions(),
+        withheldMiniAppReason: (pluginId) => system.miniAppPublication.withheldMiniAppReason(pluginId),
         activateMiniApp: (input) => system.miniAppPublication.activate(input),
         ensureMiniAppStarted: (input) => system.miniAppPublication.ensureStarted(input),
         prepareMiniAppTurn: (input) => system.prepareMiniAppTurn(input),
         initializeWorkspaceMiniApp: (input) => system.miniAppPublication.initializeWorkspace(input),
         publishWorkspaceMiniApp: (input) => system.miniAppPublication.publishWorkspace(input),
         restartMiniApp: (input) => system.miniAppPublication.restart(input),
+        applyUpdate: (input) => system.miniAppPublication.applyUpdate(input),
         stopMiniApp: (input) => system.miniAppPublication.stop(input),
+        listMiniAppPermissions: (pluginId) => system.miniAppPublication.listPermissions(pluginId),
+        setMiniAppPermission: (input) => system.miniAppPublication.setPermission(input),
         verifyMiniAppCandidate: (candidate) => system.miniAppPublication.verifyCandidate(candidate),
         materializeMiniAppRuntimePackage: (input) => system.miniAppPublication.materializeRuntimePackage(input),
         authContextChanged: () => {
             officialAuthBarrier.authContextChanged();
             hostConnectorSystem.authContextChanged();
-            connectorRuntime.authContextChanged();
             system.authContextChanged();
         },
         enabledHookPluginNames: () => new Set((system.currentSnapshot.turnCapabilities.hooks ?? []).map((handler) => handler.pluginName)),
         ready: () => {
-            readyPromise ??= system.initialize();
+            readyPromise ??= (async () => {
+                await system.initialize();
+                // Background marketplace sync installs through the initialized PluginSystem.
+                marketplaces.start();
+            })();
             return readyPromise;
         },
         close: () => {
@@ -144,7 +185,12 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
                 unsubscribeMcpChanges();
                 unsubscribeSkillChanges();
                 try {
-                    await system.dispose();
+                    try {
+                        await marketplaces.dispose();
+                    }
+                    finally {
+                        await system.dispose();
+                    }
                 }
                 finally {
                     await hostConnectorSystem.close();
@@ -154,7 +200,8 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         },
     };
 }
-function resolveCloudBaseUrl() {
+/** Desktop's archon_biz origin for the current region/build; NEXT_PUBLIC_DOMAIN_URL overrides. */
+export function resolvePluginCloudBaseUrl() {
     const configured = process.env.NEXT_PUBLIC_DOMAIN_URL?.trim();
     if (configured)
         return configured;

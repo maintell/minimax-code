@@ -1,10 +1,10 @@
 import { buildLocalBrowserRuntimeTools, CONTROL_IN_APP_BROWSER_SKILL_NAME, } from '@mavis/agent-tools/desktop';
-import { readBrowserUseBuiltinSkillAsset } from './browser-skill-asset.js';
+import { readBrowserUseBuiltinSkillAsset } from './assets/browser-skill-asset.js';
 import { createBrowserUseExtension, createBrowserUseTurnToolSafetyGuard, isBrowserUseToolingAvailable, } from './policy.js';
 import { BROWSER_CONTROL_DISABLED_GUIDANCE, buildInAppBrowserContext, hasExplicitInAppBrowserOperationIntent, } from './reminders.js';
-import { createBrowserScreenshotPreprocessor } from './screenshot-preprocessor.js';
+import { createBrowserScreenshotPreprocessor } from './assets/screenshot-preprocessor.js';
 import { BrowserSkillSessionStore, BrowserTurnContextStore } from './session-state.js';
-import { createWorkspaceBrowserAssetAdapter } from './workspace-assets.adapter.js';
+import { createWorkspaceBrowserAssetAdapter } from './assets/workspace-assets.adapter.js';
 const DESKTOP_PLUGIN_DISABLED_GUIDANCE = 'Browser control is provided by a Browser Use Plugin with an admitted Host Binding. Ask the user to enable or install that Plugin from Plugins; do not call request_feature_enable and do not claim that the legacy Browser Use switch can authorize control.';
 export class LocalBrowserUseService {
     options;
@@ -25,7 +25,7 @@ export class LocalBrowserUseService {
         this.explicitBuiltinSkill =
             options.activationMode === 'explicit-config' ? readBrowserUseBuiltinSkillAsset() : undefined;
         this.screenshotPreprocessor = createBrowserScreenshotPreprocessor({
-            compressScreenshot: options.compressScreenshot,
+            getImageEncoding: options.getImageEncoding,
             registerGeneratedAsset: options.registerGeneratedAsset,
         });
     }

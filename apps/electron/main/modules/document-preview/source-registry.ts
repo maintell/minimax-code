@@ -48,7 +48,7 @@ function loadDocumentPreviewModule() {
     }
     return documentPreviewModulePromise;
 }
-function failure(code, message, retryable = false) {
+function failure(code, message, retryable = false, detail) {
     return {
         ok: false,
         error: {
@@ -56,6 +56,7 @@ function failure(code, message, retryable = false) {
             code,
             message: safePreviewDiagnosticV1(code, message),
             retryable,
+            ...(detail ? { detail } : {}),
         },
     };
 }
@@ -293,9 +294,21 @@ export class DocumentPreviewSourceRegistry {
                 2 * 1024 * 1024) {
             return failure('invalid_request', 'Invalid notes save');
         }
+        return this.applyPptxEdit(senderId, request, (original) => updatePptxNotes(original, request.edits), ownerToken);
+    }
+    /** Main-only writer seam; renderer IPC never accepts a transform or arbitrary PPTX bytes. */
+    async applyPptxEdit(senderId, request, transform, ownerToken) {
+        if (!request ||
+            typeof request.sourceId !== 'string' ||
+            !/^sha256:[a-f0-9]{64}$/u.test(request.contentSha256) ||
+            !Number.isSafeInteger(request.sourceGeneration) ||
+            request.sourceGeneration < 0)
+            return failure('invalid_request', 'Invalid PPTX save');
         const entry = this.getOwnedEntry(senderId, request.sourceId, ownerToken);
         if (!entry)
             return failure('source_not_found', 'Notes source unavailable');
+        if (entry.readOnly)
+            return failure('invalid_request', 'Preview source is read-only');
         if (entry.source.contentSha256 !== request.contentSha256 ||
             entry.generation !== request.sourceGeneration ||
             this.notesWrites.has(entry.absolutePath)) {
@@ -311,7 +324,9 @@ export class DocumentPreviewSourceRegistry {
             if (!read.ok)
                 return read;
             const original = Buffer.from(read.value.bytes);
-            const updated = await updatePptxNotes(original, request.edits);
+            const updated = await transform(original);
+            if (original.equals(updated))
+                return { ok: true, value: { ...entry.source, sourceGeneration: entry.generation } };
             const fingerprint = await commitPptxNotes({
                 file: lease.path,
                 original,
@@ -393,7 +408,7 @@ export class DocumentPreviewSourceRegistry {
         }
         const assetResolution = input.assetResolution;
         if (assetResolution && !(await verifyTrustedAssetResolution(assetResolution, senderId))) {
-            return failure('source_outside_workspace', 'Document preview asset is not authorized');
+            return failure('source_outside_workspace', 'Document preview asset is not authorized', false, 'asset_verify_failed');
         }
         const rawFileName = assetResolution
             ? assetResolution.fileName
@@ -426,7 +441,7 @@ export class DocumentPreviewSourceRegistry {
                 realWorkspace = assetResolution.assetRoot;
                 const workspaceInfo = await lstat(realWorkspace, { bigint: true });
                 if (!workspaceInfo.isDirectory() || workspaceInfo.isSymbolicLink()) {
-                    return failure('source_outside_workspace', 'Document preview asset root is not authorized');
+                    return failure('source_outside_workspace', 'Document preview asset root is not authorized', false, 'asset_root_invalid');
                 }
                 workspaceIdentity = {
                     dev: workspaceInfo.dev.toString(),
@@ -444,7 +459,7 @@ export class DocumentPreviewSourceRegistry {
                 if (!isTrustedWorkspaceCapability(input.workspaceCapability) ||
                     claimedWorkspacePath !== input.workspaceCapability.canonicalPath ||
                     !(await verifyTrustedWorkspaceCapability(input.workspaceCapability))) {
-                    return failure('source_outside_workspace', 'Document preview workspace is not authorized');
+                    return failure('source_outside_workspace', 'Document preview workspace is not authorized', false, 'workspace_capability_invalid');
                 }
                 realWorkspace = input.workspaceCapability.canonicalPath;
                 workspaceIdentity = input.workspaceCapability.identity;
@@ -481,10 +496,10 @@ export class DocumentPreviewSourceRegistry {
         }
         if (input.workspaceCapability &&
             !(await verifyTrustedWorkspaceFile(input.workspaceCapability, realFile))) {
-            return failure('source_outside_workspace', 'Document preview file is not authorized');
+            return failure('source_outside_workspace', 'Document preview file is not authorized', false, 'file_identity_changed');
         }
         if (!isContained(realWorkspace, realFile)) {
-            return failure('source_outside_workspace', 'Document preview source is outside the workspace');
+            return failure('source_outside_workspace', 'Document preview source is outside the workspace', false, 'outside_after_realpath');
         }
         const actualExtension = officeExtension(realFile, sourceKind);
         if (!actualExtension || actualExtension !== claimedExtension) {
@@ -504,7 +519,9 @@ export class DocumentPreviewSourceRegistry {
                 if (identity.dev.toString() !== authorizedFile.dev ||
                     identity.ino.toString() !== authorizedFile.ino ||
                     identity.size.toString() !== authorizedFile.size ||
-                    identity.mtimeMs.toString() !== authorizedFile.mtimeMs) {
+                    identity.mtimeMs.toString() !== authorizedFile.mtimeMs ||
+                    (authorizedFile.ctimeMs !== undefined &&
+                        identity.ctimeMs.toString() !== authorizedFile.ctimeMs)) {
                     return failure('source_mutated', 'Document preview delivered file changed while opening');
                 }
             }
@@ -548,6 +565,10 @@ export class DocumentPreviewSourceRegistry {
                 (hashed.fingerprint.size !== assetResolution.bytes ||
                     hashed.fingerprint.sha256 !== assetResolution.sha256)) {
                 return failure('source_mutated', 'Document preview asset changed while opening');
+            }
+            if (input.workspaceCapability?.file &&
+                !(await verifyTrustedWorkspaceFile(input.workspaceCapability, realFile))) {
+                return failure('source_mutated', 'Document preview selected file changed while opening');
             }
             const containedAfterHash = await verifyOpenedFileContainment(handle, realWorkspace, realFile);
             if (!containedAfterHash) {
@@ -605,6 +626,8 @@ export class DocumentPreviewSourceRegistry {
             }
             this.pendingSources.delete(sourceReservation);
             this.entries.set(sourceId, {
+                pptEditingAllowed: input.pptEditingAllowed !== false,
+                readOnly: input.readOnly === true,
                 ...(assetResolution ? { assetSidecar: assetResolution.sidecarPath } : {}),
                 senderId,
                 ownerToken,
@@ -1304,6 +1327,29 @@ export class DocumentPreviewSourceRegistry {
      */
     getSourceGeneration(senderId, sourceId, ownerToken) {
         return this.getOwnedEntry(senderId, sourceId, ownerToken)?.generation ?? null;
+    }
+    canEditPptxSource(senderId, sourceId, ownerToken) {
+        const entry = this.getOwnedEntry(senderId, sourceId, ownerToken);
+        return Boolean(entry &&
+            entry.pptEditingAllowed !== false &&
+            !entry.readOnly &&
+            entry.sourceKind === 'ooxml' &&
+            /\.pptx$/iu.test(entry.source.fileName));
+    }
+    canOpenPptxEditor(senderId, sourceId, ownerToken) {
+        const entry = this.getOwnedEntry(senderId, sourceId, ownerToken);
+        return Boolean(entry &&
+            entry.pptEditingAllowed !== false &&
+            entry.sourceKind === 'ooxml' &&
+            /\.pptx$/iu.test(entry.source.fileName));
+    }
+    /** Main-only check whether a resolved real path is the owned source file itself. */
+    isSourceFile(senderId, sourceId, file, ownerToken) {
+        return this.getOwnedEntry(senderId, sourceId, ownerToken)?.absolutePath === file;
+    }
+    /** Main-only metadata lookup; keeps the same source ownership boundary as read. */
+    getSource(senderId, sourceId, ownerToken) {
+        return this.getOwnedEntry(senderId, sourceId, ownerToken)?.source ?? null;
     }
     /**
      * Retire a staged copy only when it is still the generation observed by the

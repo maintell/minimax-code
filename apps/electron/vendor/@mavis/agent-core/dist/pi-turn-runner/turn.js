@@ -1,5 +1,5 @@
 import { EventBridge } from '../event-bridge/index.js';
-import { composeStreamFn } from './llm.js';
+import { composeStreamFn, resolveHostOutputTokenCap } from './llm.js';
 import { withLLMRetry } from './llm-retry.js';
 import { newTools } from './tools.js';
 export function newTurn(input, deps) {
@@ -13,6 +13,9 @@ export function newTurn(input, deps) {
         const callerOnCallSettled = input.llmRetry?.onCallSettled;
         const retryingStreamFn = withLLMRetry(metricsStreamFn, {
             ...input.llmRetry,
+            // A required lifecycle must also run when retries are disabled by the host.
+            ...(!input.llmRetry && resolved.callLifecycle ? { policy: { maxRetries: 0 } } : {}),
+            lifecycle: resolved.callLifecycle ?? input.llmRetry?.lifecycle,
             sessionId: input.sessionId,
             turnId: input.turnId,
             scope,
@@ -41,12 +44,12 @@ export function newTurn(input, deps) {
             })
             : capturedStreamFn;
     };
-    const mainStreamFn = input.llmRetry || deps.llmCapture
+    const mainStreamFn = input.llmRetry || deps.llmCapture || resolved.callLifecycle
         ? retryStream('agent')
         : deps.metrics
             ? deps.metrics.wrapStreamFn(composedStreamFn)
             : composedStreamFn;
-    const auxiliaryStreamFn = input.llmRetry ? retryStream('compaction') : undefined;
+    const auxiliaryStreamFn = input.llmRetry || resolved.callLifecycle ? retryStream('compaction') : undefined;
     const syntheticResponse = {};
     let eventSeq = 0;
     let runtimeSeq = 0;
@@ -122,6 +125,8 @@ export function newTurn(input, deps) {
         blockedToolCalls: [],
         syntheticResponse,
         rejectedAssistantMessages: new Set(),
+        requestStoppedBeforeSend: false,
+        recovery: { used: false },
         nextEventId,
         nextRuntimeSeq,
     };
@@ -135,6 +140,7 @@ function withLlmCallPreparedObservers(inner, options) {
         logicalCallCount += 1;
         for (const hook of options.hooks) {
             try {
+                const hostMaxOutputTokens = resolveHostOutputTokenCap(options.llm);
                 await hook({
                     sessionId: options.input.sessionId,
                     turnId: options.input.turnId,
@@ -143,9 +149,7 @@ function withLlmCallPreparedObservers(inner, options) {
                     messages: [...context.messages],
                     model,
                     ...(options.llm.maxTokens === undefined ? {} : { maxTokens: options.llm.maxTokens }),
-                    ...(options.llm.hostMaxOutputTokens === undefined
-                        ? {}
-                        : { hostMaxOutputTokens: options.llm.hostMaxOutputTokens }),
+                    ...(hostMaxOutputTokens === undefined ? {} : { hostMaxOutputTokens }),
                     ...(options.llm.maxSerializedInputBytes === undefined
                         ? {}
                         : { maxSerializedInputBytes: options.llm.maxSerializedInputBytes }),

@@ -1,9 +1,10 @@
+import { normalizeWindowsShellBase } from '../../agent-shell/index.js';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isAgentBuiltinToolEnabled, parseAgentCapabilityConfig, } from '@mavis/config';
 import { PromptSnapshotInvalidError, } from '@mavis/agent-runtime';
-import { BUILTIN_ROSTER_FILE, FEATURE_FILES, PRIMARY_AGENT_NAME, canonicalBuiltinName, defaultLocale, legacyNamesFor, surfacePromptFiles, toSurfaceRenderInput, } from './definitions.js';
+import { BUILTIN_ROSTER_FILE, FEATURE_FILES, PRIMARY_AGENT_NAME, PTC_SECTION_FILE, canonicalBuiltinName, defaultLocale, legacyNamesFor, surfacePromptFiles, toSurfaceRenderInput, } from './definitions.js';
 import { createBuiltinPromptContext, parseFrontmatter, renderBuiltinTemplate, stripFrontmatter, } from './prompt-renderer.js';
 import { captureLocalPromptAssets } from './prompt-assets.js';
 export { canonicalBuiltinName, legacyNamesFor, resolveCanonicalCapabilities, } from './definitions.js';
@@ -53,7 +54,7 @@ export class BuiltinAgentCatalog {
         const agentDir = join(await this.assetsDir(), canonical);
         const persona = await this.readLocalizedPersona(agentDir, 'en');
         const frontmatter = parseFrontmatter(persona ?? '').frontmatter;
-        const capabilityOverride = await this.readCapabilityOverride(agentDir);
+        const { capabilityOverride, preloadSkills } = await this.readAgentSelectors(agentDir);
         const identity = {
             ...(typeof frontmatter.display_name === 'string'
                 ? { displayName: frontmatter.display_name }
@@ -69,6 +70,7 @@ export class BuiltinAgentCatalog {
             legacyNames: legacyNamesFor(canonical),
             identity,
             ...(capabilityOverride ? { capabilityOverride } : {}),
+            ...(preloadSkills ? { preloadSkills } : {}),
         };
     }
     async render(input, agentSystemTemplate) {
@@ -117,6 +119,18 @@ export class BuiltinAgentCatalog {
             }
             : undefined;
         return { persona, coreTemplate, agentPrompt, promptSnapshot };
+    }
+    /**
+     * Renders the PTC section with the Turn's own context (tool switches) before
+     * the main templates insert it. Read from the bundled assets only, never from
+     * a remote Prompt version: it is exempt from desktop_agent delivery, so a
+     * remote bundle never has to carry it and no older client ever sees it.
+     */
+    async renderPtcSection(input) {
+        const template = await this.readPromptAssetFile(undefined, PTC_SECTION_FILE);
+        if (template === undefined)
+            throw new Error(`Mandatory V2 PTC prompt is missing: ${PTC_SECTION_FILE}.`);
+        return this.renderTemplate(template, this.context(input, {}), PTC_SECTION_FILE).trim();
     }
     renderPromptSnapshot(input, snapshot) {
         return {
@@ -186,7 +200,7 @@ export class BuiltinAgentCatalog {
             if (templates.core === undefined)
                 throw new Error(`Mandatory local-runtime-v2 base prompt is missing: ${file}.md.hbs.`);
             const parts = this.renderLayerParts(input, `${root}/${file}`, templates);
-            core.push(parts.core);
+            core.push(file === 'prompt-base-windows' ? normalizeWindowsShellBase(parts.core) : parts.core);
         }
         return {
             core: core
@@ -300,17 +314,26 @@ export class BuiltinAgentCatalog {
         const names = parsed.filter((value) => typeof value === 'string');
         return names.map((name) => canonicalBuiltinName(name));
     }
-    async readCapabilityOverride(agentDir) {
+    /**
+     * `skills` is the Agent's preload list, as for every Agent: it is not a
+     * Builtin Skill override, so it does not limit Skills and may name any Skill.
+     */
+    async readAgentSelectors(agentDir) {
         const raw = await this.readOptionalFile(join(agentDir, 'agent.md'));
         if (raw === undefined)
-            return undefined;
+            return {};
+        const path = `${agentDir}/agent.md`;
         const frontmatter = parseFrontmatter(raw).frontmatter;
-        const capabilityFields = Object.fromEntries(['persona', 'tools', 'builtinTools', 'skills', 'features']
+        const capabilityFields = Object.fromEntries(['persona', 'tools', 'builtinTools', 'features']
             .filter((key) => Object.hasOwn(frontmatter, key))
             .map((key) => [key, frontmatter[key]]));
-        return Object.keys(capabilityFields).length > 0
-            ? parseAgentCapabilityConfig(capabilityFields, `${agentDir}/agent.md`)
-            : undefined;
+        const preloadSkills = parseBuiltinPreloadSkills(frontmatter.skills, path);
+        return {
+            ...(Object.keys(capabilityFields).length > 0
+                ? { capabilityOverride: parseAgentCapabilityConfig(capabilityFields, path) }
+                : {}),
+            ...(preloadSkills ? { preloadSkills } : {}),
+        };
     }
     async renderFeaturePrompts(canonical, input) {
         const result = {};
@@ -455,5 +478,14 @@ function v2PromptReadContext(input) {
 }
 function isPromptReadScope(value) {
     return Boolean(value && 'source' in value && 'snapshot' in value);
+}
+function parseBuiltinPreloadSkills(value, path) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value) ||
+        value.some((entry) => typeof entry !== 'string' || entry.trim().length === 0)) {
+        throw new Error(`Invalid configuration at ${path}.skills: must be an array of Skill names`);
+    }
+    return value.map((entry) => entry.trim());
 }
 //# sourceMappingURL=catalog.js.map

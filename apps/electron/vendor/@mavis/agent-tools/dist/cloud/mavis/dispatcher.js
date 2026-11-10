@@ -11,6 +11,7 @@ import { normalizeMavisCommand } from '../../shared/mavis-operation-classifier.j
 import { CRON_CREATE_ME_REJECTED_MESSAGE, isMeSessionSentinel, } from '../../shared/cron-schedule-input.js';
 import { AgentNameResolverError, createResolverCache, resolveAgentId, resolveAgentName, } from './agent-name-resolver.js';
 import { handleAgentCreate, handleAgentDelete, handleAgentGet, handleAgentList, handleAgentUpdate, } from './commands/agent.js';
+import { isMavisTeamCommand, teamDisabledFailure } from './commands/team.js';
 // Disabled: communication group is intentionally not registered. The
 // standalone `communicate` LLM tool owns this surface in cloud-runtime
 // (single source of truth). Handler files are kept in tree so re-enabling
@@ -27,7 +28,7 @@ import { handleDriveFilesDelete, handleDriveFilesDownload, handleDriveFilesGet, 
 // handleDriveFilesUpload,
 handleDriveNodesMove, handleDriveNodesRename, } from './commands/drive.js';
 import { handleAgentHelp, handleCronHelp, handleDriveHelp, handleSessionHelp, HELP_GROUPS, } from './commands/help.js';
-import { handleSessionDelete, handleSessionGet, handleSessionList, handleSessionMessages, handleSessionUpdate, } from './commands/session.js';
+import { handleSessionGet, handleSessionList, handleSessionMessages, handleSessionUpdate, } from './commands/session.js';
 import { errorToFailure, failure } from './output.js';
 import { COMMAND_SCHEMAS, KNOWN_COMMANDS } from './schemas.js';
 /**
@@ -62,7 +63,6 @@ const HANDLERS = {
     'session list': handleSessionList,
     'session get': handleSessionGet,
     'session update': handleSessionUpdate,
-    'session delete': handleSessionDelete,
     'session messages': handleSessionMessages,
     'session help': handleSessionHelp,
     // Disabled: communication group — see import comment above. Standalone
@@ -146,6 +146,9 @@ function substituteMe(value, deps, path) {
 }
 export async function dispatchDofld(deps, rawCommand, rawArgs, signal) {
     const command = normalizeCommand(rawCommand);
+    if (deps.teamDisabled === true && isMavisTeamCommand(command)) {
+        return teamDisabledFailure(command);
+    }
     if (!isKnownCommand(command)) {
         // Friendly fallback for help typos:
         //   - bare "help" / "-h"   → list the 4 group help entries

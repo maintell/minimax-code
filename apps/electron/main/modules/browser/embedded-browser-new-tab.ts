@@ -33,7 +33,8 @@ async function createNewEmbeddedBrowserTabOnce(manager, bounds, sessionId, optio
         selectInSession: !options.visible && initialUrl === null,
         sessionId,
     });
-    const target = { tabId: tab.tabId, sessionId };
+    // adoptSession may have moved the tab to another session while it was created.
+    const target = { tabId: tab.tabId, sessionId: tab.sessionId };
     try {
         if (initialUrl !== null) {
             await manager.navigate(initialUrl, target);

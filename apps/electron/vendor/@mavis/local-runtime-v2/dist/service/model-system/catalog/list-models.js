@@ -56,6 +56,39 @@ export function modelConfigForRef(config, provider, modelId) {
     }
     return config.provider?.[provider]?.models?.[modelId];
 }
+/** Wire protocol configured for a BYOK provider; managed and MiniMax API sources have none here. */
+function providerApiForRef(config, provider) {
+    const parsed = parseProviderId(provider);
+    if (parsed?.source === 'custom_provider') {
+        return config.custom_provider?.[parsed.providerKey]?.api;
+    }
+    if (parsed?.source === 'minimax_api')
+        return undefined;
+    return config.provider?.[provider]?.api;
+}
+/** Protocols whose wire format carries audio and PDF parts as inline data. */
+const NATIVE_AUDIO_PDF_APIS = new Set(['google-generative-ai']);
+/**
+ * Adds audio and PDF input declared in the model's `modalities.input` to the
+ * ModelRef capabilities, only when its provider's protocol sends them
+ * natively. Other protocols keep treating them as files: their transports
+ * would send the bytes as an image and the provider would reject it.
+ */
+export function withNativeAudioPdfCapabilities(model, config, provider, modelId) {
+    const api = providerApiForRef(config, provider);
+    if (!api || !NATIVE_AUDIO_PDF_APIS.has(api))
+        return model;
+    const modalities = modelConfigForRef(config, provider, modelId)?.modalities?.input ?? [];
+    const audio = modalities.includes('audio');
+    const pdf = modalities.includes('pdf');
+    if (!audio && !pdf)
+        return model;
+    const added = {
+        ...(audio ? { support_audio: true } : {}),
+        ...(pdf ? { support_pdf: true } : {}),
+    };
+    return { ...model, capabilities: { ...model.capabilities, ...added } };
+}
 export function enabledCustomProviders(config) {
     return Object.entries(config.custom_provider ?? {}).filter(([, provider]) => provider.enabled !== false);
 }

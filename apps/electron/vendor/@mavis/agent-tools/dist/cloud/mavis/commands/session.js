@@ -1,6 +1,5 @@
 /**
- * `mavis session ...` 命令组 —— 5 个 handler:4 个 CRUD + `session messages` 读
- * 历史消息。`session create` 已下线(标准入口走前端 / archon-biz),代码不再保留。
+ * `mavis session ...` 命令组 —— list / get / update / messages。模型侧 delete 已移除。
  *
  * 一期不含 abort / search / queue(见 mavis-tool-def
  * description "EXCLUDED"段);后续按需扩。
@@ -64,10 +63,6 @@ export const handleSessionUpdate = async (ctx, args, signal) => {
         ...(args.archived !== undefined ? { archived: args.archived } : {}),
     }, signal);
     return baseRespOrSuccess(ctx.command, resp, '/api/v1/sessions/update');
-};
-export const handleSessionDelete = async (ctx, args, signal) => {
-    const resp = await ctx.archonServer.callRpc('DeleteSession', { session_id: args.session_id }, signal);
-    return baseRespOrSuccess(ctx.command, resp, '/api/v1/sessions/delete');
 };
 /**
  * `mavis session messages` —— thin wrap archon-server `GetSessionMessages`

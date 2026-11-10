@@ -1,3 +1,5 @@
+import { savedPptFileAuthority } from "../modules/document-preview/saved-file-authority";
+import { sshProjectIdFromRuntimeId } from "@mavis/shared/desktop-runtime";
 import { shell, ipcMain, MessageChannelMain, BrowserWindow } from "electron";
 import { realpath, mkdir, mkdtemp, copyFile, rm } from "node:fs/promises";
 import { constants } from "node:fs";
@@ -16,14 +18,21 @@ import { PptxCoreSessionRegistry } from "../modules/document-preview/pptx-core/s
 import { streamPptxCoreSource } from "../modules/document-preview/pptx-core/source-stream";
 import { verifyTrustedAssetResolution } from "../modules/document-preview/asset-authority";
 import { openAssetPathInApp } from "../modules/document-preview/open-asset-in-app";
+import { resolveSelectedFile } from "../modules/document-preview/selected-file-authority";
 import { noopDocumentPreviewLogger } from "../modules/document-preview/logging";
 import { resolveLocalRuntimeDataDir } from "../modules/local-runtime/data-dir";
 import { issueTrustedWorkspaceCapability, isTrustedWorkspaceCapability } from "../modules/document-preview/workspace-authority";
 import { sanitizePptElementMapResolution, resolvePptSelectionElementFromSidecar } from "../modules/ppt-preview/element-map";
-function failure(code, message, retryable = false) {
+function failure(code, message, retryable = false, detail) {
     return {
         ok: false,
-        error: { schema: 'mavis.preview_error.v1', code, message, retryable },
+        error: {
+            schema: 'mavis.preview_error.v1',
+            code,
+            message,
+            retryable,
+            ...(detail ? { detail } : {}),
+        },
     };
 }
 function finiteNumber(value) {
@@ -122,7 +131,12 @@ function bindSenderLifecycle(sender, senderStates, onDestroyed, onMainFrameNavig
     const existing = senderStates.get(sender);
     if (existing)
         return existing;
-    const state = { destroyed: false, generation: 0, reads: new Map() };
+    const state = {
+        destroyed: false,
+        generation: 0,
+        reads: new Map(),
+        selectedSources: new Set(),
+    };
     senderStates.set(sender, state);
     const onNavigation = (_event, _url, isInPlace, isMainFrame) => {
         // Reload replaces the renderer and its workers without destroying the
@@ -227,7 +241,17 @@ export function setupDocumentPreviewIPC(options = {}) {
                 .finally(() => senderCleanupPromises.delete(cleanup));
             senderCleanupPromises.add(cleanup);
         }, () => {
-            const cleanup = pptxCoreSessions.releaseSender(sender.id, sender)
+            const state = senderStates.get(sender);
+            const selectedSources = [...(state?.selectedSources ?? [])];
+            const cleanup = Promise.all([
+                pptxCoreSessions.releaseSender(sender.id, sender),
+                ...selectedSources.map(async (sourceId) => {
+                    const released = await orchestrator.releaseSource(sender.id, sourceId, sender);
+                    if (released.ok)
+                        state?.selectedSources.delete(sourceId);
+                }),
+            ])
+                .then(() => undefined)
                 .catch((error) => {
                 logger.warn({
                     msg: '[DocumentPreview][ipc] navigation session cleanup failed',
@@ -264,6 +288,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                     sessionId,
                     assetClaimed: true,
                     invalidRequest: true,
+                    denialDetail: 'asset_unresolved',
                 };
             }
             const assetResolution = assetId !== undefined && resolveTrustedAsset
@@ -279,6 +304,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                 sessionId,
                 assetClaimed: true,
                 invalidRequest: false,
+                denialDetail: 'asset_unresolved',
             };
         }
         // Do not treat an IPC-supplied filesystem path as an authority boundary.
@@ -286,6 +312,7 @@ export function setupDocumentPreviewIPC(options = {}) {
         // session/workspace state can inject a narrower resolver.  No matching
         // authority means the V2 route fails closed and the renderer uses the
         // established legacy preview fallback.
+        let denialDetail = claimedWorkspaceDir ? 'authority_denied' : 'workspace_claim_missing';
         const claim = claimedWorkspaceDir
             ? {
                 senderId: event.sender.id,
@@ -294,6 +321,9 @@ export function setupDocumentPreviewIPC(options = {}) {
                     ? { claimedFilePath: input.filePath }
                     : {}),
                 ...(typeof sessionId === 'string' ? { sessionId } : {}),
+                onDenied: (detail) => {
+                    denialDetail = detail;
+                },
             }
             : null;
         const resolveClaimedWorkspace = async () => claim
@@ -314,6 +344,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                         // cannot return the same binding (teardown, sequence change,
                         // or root replacement) must fail closed; do not re-canonicalize
                         // the renderer-visible pathname here.
+                        denialDetail = 'capability_unavailable';
                         return null;
                     }
                     if (typeof resolved === 'object' && isTrustedWorkspaceCapability(resolved)) {
@@ -330,7 +361,10 @@ export function setupDocumentPreviewIPC(options = {}) {
                     }
                     return null;
                 })
-                    .catch(() => null)
+                    .catch(() => {
+                    denialDetail = 'authority_unavailable';
+                    return null;
+                })
                 : claimedWorkspaceDir
                     ? await resolveWorkspaceFromTrustedRoots(claimedWorkspaceDir, trustedWorkspaceRoots)
                     : null
@@ -341,7 +375,10 @@ export function setupDocumentPreviewIPC(options = {}) {
         // Only authorization is serialized, never source IO or Core rendering.
         const authorization = (state.workspaceAuthorizationTail ?? Promise.resolve())
             .then(() => (isCurrent() ? resolveClaimedWorkspace() : null))
-            .catch(() => null);
+            .catch(() => {
+            denialDetail = 'authority_unavailable';
+            return null;
+        });
         state.workspaceAuthorizationTail = authorization.then(() => undefined);
         const trustedWorkspace = await authorization;
         return {
@@ -350,6 +387,48 @@ export function setupDocumentPreviewIPC(options = {}) {
             sessionId,
             assetClaimed: false,
             invalidRequest: false,
+            denialDetail,
+        };
+    };
+    /**
+     * Stage a document from an SSH workspace into a main-owned local directory.
+     *
+     * Main creates that directory, so main is its authority: a capability is
+     * issued for it directly instead of replaying the session lookup, which only
+     * knows about local runtime workspaces. Returns `null` when the claim is not
+     * a remote workspace so the local path below still applies.
+     */
+    const resolveRemoteWorkspace = async (event, input) => {
+        const stageRemoteWorkspaceSource = options.stageRemoteWorkspaceSource;
+        if (!stageRemoteWorkspaceSource || !input || typeof input !== 'object')
+            return null;
+        const record = input;
+        // Asset claims keep their own authority and must never use renderer path hints.
+        if ('assetId' in record ||
+            typeof record.runtimeId !== 'string' ||
+            !sshProjectIdFromRuntimeId(record.runtimeId))
+            return null;
+        const runtimeId = record.runtimeId;
+        const workspaceDir = record.workspaceDir;
+        const filePath = record.filePath;
+        if (typeof workspaceDir !== 'string' || typeof filePath !== 'string')
+            return null;
+        const staged = await Promise.resolve()
+            .then(() => stageRemoteWorkspaceSource({
+            senderId: event.sender.id,
+            runtimeId,
+            workspaceDir,
+            filePath,
+        }))
+            .catch(() => null);
+        if (!staged)
+            return null;
+        const capability = await issueTrustedWorkspaceCapability(staged.workspaceDir);
+        if (!capability)
+            return null;
+        return {
+            trustedWorkspace: { canonicalPath: capability.canonicalPath, capability },
+            input: { ...record, workspaceDir: staged.workspaceDir, filePath: staged.filePath },
         };
     };
     const handleOpenSource = async (event, input, legacy) => {
@@ -358,14 +437,90 @@ export function setupDocumentPreviewIPC(options = {}) {
         const isCurrent = () => !state.destroyed && state.generation === generation && !shutdownPromise;
         if (!isCurrent())
             return failure('cancelled', 'Document preview source opening was cancelled');
-        const { trustedWorkspace, assetResolution, sessionId, assetClaimed, invalidRequest } = await resolveOpenWorkspace(event, input, state, isCurrent);
+        if (input &&
+            typeof input === 'object' &&
+            Object.prototype.hasOwnProperty.call(input, 'savedFileToken')) {
+            const claim = input;
+            if (legacy || event.senderFrame !== event.sender.mainFrame || Object.keys(claim).length !== 1)
+                return failure('invalid_request', 'Saved file authority must be exclusive');
+            const capability = await savedPptFileAuthority().resolve(claim.savedFileToken);
+            if (!capability?.file || !isCurrent())
+                return failure('source_outside_workspace', 'Saved file is not authorized');
+            const fileName = path.basename(capability.file.canonicalPath);
+            const opened = await orchestrator.openSource(event.sender.id, {
+                workspaceDir: capability.canonicalPath,
+                filePath: fileName,
+                fileName,
+                mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                workspaceCapability: capability,
+            }, event.sender);
+            if (!isCurrent()) {
+                if (opened.ok)
+                    await orchestrator.releaseSource(event.sender.id, opened.value.sourceId, event.sender);
+                return failure('cancelled', 'Saved file opening was cancelled');
+            }
+            return opened;
+        }
+        if (input &&
+            typeof input === 'object' &&
+            Object.prototype.hasOwnProperty.call(input, 'selectedFileToken')) {
+            const claim = input;
+            if (legacy ||
+                event.senderFrame !== event.sender.mainFrame ||
+                Object.keys(claim).some((key) => key !== 'selectedFileToken')) {
+                return failure('invalid_request', 'Selected file authority must be exclusive');
+            }
+            const capability = resolveSelectedFile(event.sender, claim.selectedFileToken);
+            if (!capability?.file)
+                return failure('source_outside_workspace', 'Selected file is not authorized');
+            const fileName = path.basename(capability.file.canonicalPath);
+            const opened = await orchestrator.openSource(event.sender.id, {
+                workspaceDir: capability.canonicalPath,
+                filePath: fileName,
+                fileName,
+                mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                workspaceCapability: capability,
+                readOnly: true,
+            }, event.sender);
+            if (!isCurrent() ||
+                resolveSelectedFile(event.sender, claim.selectedFileToken) !== capability) {
+                if (opened.ok)
+                    await orchestrator.releaseSource(event.sender.id, opened.value.sourceId, event.sender);
+                return failure('cancelled', 'Selected file opening was cancelled');
+            }
+            if (opened.ok)
+                state.selectedSources.add(opened.value.sourceId);
+            return opened;
+        }
+        const remote = await resolveRemoteWorkspace(event, input);
+        if (!isCurrent())
+            return failure('cancelled', 'Document preview source opening was cancelled');
+        const record = input && typeof input === 'object' ? input : null;
+        if (record &&
+            !('assetId' in record) &&
+            record.runtimeId !== undefined &&
+            record.runtimeId !== 'local' &&
+            !remote) {
+            return failure('source_outside_workspace', 'Remote document source is unavailable or not authorized');
+        }
+        const effectiveInput = remote ? remote.input : input;
+        const { trustedWorkspace, assetResolution, sessionId, assetClaimed, invalidRequest, denialDetail, } = remote
+            ? {
+                trustedWorkspace: remote.trustedWorkspace,
+                assetResolution: null,
+                sessionId: undefined,
+                assetClaimed: false,
+                invalidRequest: false,
+                denialDetail: undefined,
+            }
+            : await resolveOpenWorkspace(event, input, state, isCurrent);
         if (!isCurrent())
             return failure('cancelled', 'Document preview source opening was cancelled');
         if (invalidRequest) {
             return failure('invalid_request', 'Invalid document preview asset request');
         }
         if ((assetClaimed && !assetResolution) || (!assetClaimed && !trustedWorkspace)) {
-            return failure('source_outside_workspace', 'Document preview source is not authorized');
+            return failure('source_outside_workspace', 'Document preview source is not authorized', false, denialDetail);
         }
         const openMethod = legacy
             ? orchestrator.openLegacySource.bind(orchestrator)
@@ -377,7 +532,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                 assetResolution,
             }
             : {
-                ...input,
+                ...effectiveInput,
                 // Legacy path requests receive only the main-selected workspace
                 // root/capability, never renderer authority.
                 workspaceDir: trustedWorkspace?.canonicalPath ?? '',
@@ -388,7 +543,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                         : {}),
                 ...(typeof sessionId === 'string' ? { sessionId } : {}),
             };
-        const opened = await openMethod(event.sender.id, mainOwnedInput, event.sender);
+        const opened = await openMethod(event.sender.id, { ...mainOwnedInput, pptEditingAllowed: !remote }, event.sender);
         if (!isCurrent()) {
             // A new renderer may already have opened other sources on this window.
             // Release only the stale request, not the current renderer's sources.
@@ -403,6 +558,11 @@ export function setupDocumentPreviewIPC(options = {}) {
         const state = bind(event.sender);
         if (state.destroyed)
             return failure('cancelled', 'Notes save cancelled');
+        if (input &&
+            typeof input === 'object' &&
+            state.selectedSources.has(input.sourceId)) {
+            return failure('invalid_request', 'Selected draft preview does not grant write authority');
+        }
         const result = await sourceRegistry.savePptxNotes(event.sender.id, input, event.sender);
         if (!result.ok)
             logger.warn({
@@ -762,6 +922,7 @@ export function setupDocumentPreviewIPC(options = {}) {
         catch {
             return failure('invalid_request', 'Invalid PPTX selection resolution request');
         }
+        const selectedSource = state.selectedSources.has(request.sourceId);
         const lease = await sourceRegistry.acquireSelectionResolutionSource(event.sender.id, request.sourceId, request.contentSha256, request.sourceGeneration, event.sender);
         if (!lease)
             return failure('source_mutated', 'PPTX selection source is no longer current');
@@ -769,16 +930,19 @@ export function setupDocumentPreviewIPC(options = {}) {
             if (state.destroyed || !(await lease.validate())) {
                 return failure('source_mutated', 'PPTX selection source is no longer current');
             }
-            const elementResolution = sanitizePptElementMapResolution(resolvePptSelectionElementFromSidecar({
-                filePath: lease.path,
-                slideNumber: request.slide.number,
-                slideSize: { width: request.slide.width, height: request.slide.height },
-                selection: {
-                    slideRect: request.selection.slideRect,
-                    text: request.selection.text,
-                },
-                instruction: request.instruction,
-            }));
+            // A native selection authorizes only the PPTX, never an adjacent sidecar.
+            const elementResolution = sanitizePptElementMapResolution(selectedSource
+                ? { elementMapLookup: { attempted: false, found: false } }
+                : resolvePptSelectionElementFromSidecar({
+                    filePath: lease.path,
+                    slideNumber: request.slide.number,
+                    slideSize: { width: request.slide.width, height: request.slide.height },
+                    selection: {
+                        slideRect: request.selection.slideRect,
+                        text: request.selection.text,
+                    },
+                    instruction: request.instruction,
+                }));
             if (state.destroyed || !(await lease.validate())) {
                 return failure('source_mutated', 'PPTX selection source changed during resolution');
             }
@@ -825,7 +989,10 @@ export function setupDocumentPreviewIPC(options = {}) {
                     controller.abort();
             }
             await pptxCoreSessions.releaseSource(event.sender.id, request.sourceId, event.sender);
-            return orchestrator.releaseSource(event.sender.id, request.sourceId, event.sender);
+            const released = await orchestrator.releaseSource(event.sender.id, request.sourceId, event.sender);
+            if (released.ok)
+                state.selectedSources.delete(request.sourceId);
+            return released;
         }
         if (typeof request.previewId === 'string') {
             bind(event.sender);

@@ -124,16 +124,31 @@ function collectTextWebCitations(value, output) {
     if (!value.trim() || value.length > MAX_EVIDENCE_CHARS)
         return;
     const occupied = new Set();
-    for (const match of value.matchAll(/(?<!!)\[([^\]\n]+)\]\(\s*(https?:\/\/[^\s<>"')\]，。；：！？]+)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/giu)) {
-        const url = safeHttpUrl(match[2]);
+    const linkPattern = (() => {
+        try {
+            // eslint-disable-next-line prefer-regex-literals -- Old WebKit must catch unsupported syntax at runtime.
+            return new RegExp('(?<!!)\\[([^\\]\\n]+)\\]\\(\\s*(https?:\\/\\/[^\\s<>"\')\\]\uff0c\u3002\uff1b\uff1a\uff01\uff1f]+)(?:\\s+(?:"[^"]*"|\'[^\']*\'))?\\s*\\)', 'giu');
+        }
+        catch {
+            return /\[([^\]\n]+)\]\(\s*(https?:\/\/[^\s<>"')\]，。；：！？]+)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/giu;
+        }
+    })();
+    let linkMatch;
+    while ((linkMatch = linkPattern.exec(value)) !== null) {
+        if (value[linkMatch.index - 1] === '!') {
+            // Continue inside a rejected linkMatch, preserving nested-link linkMatching.
+            linkPattern.lastIndex = linkMatch.index + 1;
+            continue;
+        }
+        const url = safeHttpUrl(linkMatch[2]);
         if (!url)
             continue;
         occupied.add(url);
-        const label = match[1]?.trim();
+        const label = linkMatch[1]?.trim();
         output.push({
             name: label && !isFallbackWebSourceTitle(label, url) ? label : url,
             url,
-            evidence: evidenceLine(value, match.index ?? 0),
+            evidence: evidenceLine(value, linkMatch.index ?? 0),
         });
     }
     for (const match of value.matchAll(/https?:\/\/[^\s<>"')\]，。；：！？]+/giu)) {

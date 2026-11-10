@@ -18,6 +18,7 @@ import { newPiTurnMetrics, } from './metrics.js';
 import { _computeFailureTerminationReasonForTest } from './terminal.js';
 import { newTurn, } from './turn.js';
 import { setToolHooks } from './tools.js';
+import { createPtcToolExecutor } from './ptc-tool-executor.js';
 export { LLM_REQUEST_TIMEOUT_MS } from './defaults.js';
 export { _computeFailureTerminationReasonForTest, wrapStreamFnWithTimeout };
 /**
@@ -62,6 +63,9 @@ export class PiTurnRunner {
         let termination;
         let llmCapture;
         let unsubscribeCaptureRelay;
+        // Set only when an Inspector capture recorder exists for this Turn.
+        let relayToCapture;
+        let ptcExecutor;
         try {
             // 步骤 1 —— 构造单次 turn 的状态。`newTurn` 解析 model config，并创建所有
             // 不能跨 turn 复用的对象：tool 列表、组合后的 streamFn、EventBridge
@@ -87,7 +91,7 @@ export class PiTurnRunner {
             const agent = newAgent(turn);
             if (llmCapture) {
                 const captureListeners = new Set();
-                unsubscribeCaptureRelay = agent.subscribe((event) => {
+                relayToCapture = (event) => {
                     for (const listener of captureListeners) {
                         try {
                             listener(event);
@@ -96,7 +100,8 @@ export class PiTurnRunner {
                             // Capture observation is best-effort and cannot affect Agent delivery.
                         }
                     }
-                });
+                };
+                unsubscribeCaptureRelay = agent.subscribe(relayToCapture);
                 llmCapture.observeAgentEvents({
                     subscribe(listener) {
                         captureListeners.add(listener);
@@ -117,6 +122,16 @@ export class PiTurnRunner {
             // RuntimeEvent 的顺序与旧的单体 runner 完全一致。后面的 `events.drain()`
             // 等待的就是这个队列。
             const events = subscribeEvents(agent, turn, history, this.now);
+            ptcExecutor = createPtcToolExecutor({
+                agent,
+                turn,
+                emit: events.dispatch,
+                nowMs: this.now,
+                // PTC child events go through the serialized dispatch, not
+                // agent.subscribe, so the capture relay needs them separately.
+                ...(relayToCapture ? { observeChildLifecycle: relayToCapture } : {}),
+            });
+            input.toolConfig.context.ptcExecutor = ptcExecutor;
             // 步骤 6 —— 接好取消逻辑。如果 caller 的 signal 已经 aborted，就根本不启动
             // Agent：直接退订、drain 掉已入队的事件，然后发出 `aborted` 终止帧。否则，
             // 后续的 abort 会转发到 `agent.abort()`，让 `runAgent` 尽快收敛。
@@ -156,6 +171,9 @@ export class PiTurnRunner {
             await emitTerminal(turn, termination);
         }
         finally {
+            if (input.toolConfig.context.ptcExecutor === ptcExecutor) {
+                delete input.toolConfig.context.ptcExecutor;
+            }
             unsubscribeCaptureRelay?.();
             unsubscribeCaptureRelay = undefined;
             if (llmCapture?.drain) {

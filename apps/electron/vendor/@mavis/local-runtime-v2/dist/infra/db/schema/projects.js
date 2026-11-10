@@ -14,6 +14,8 @@ export const projects = sqliteTable('local_runtime_projects', {
     extraDataJson: text('extra_data_json').notNull().default('{}'),
     createdAtMs: integer('created_at_ms').notNull(),
     updatedAtMs: integer('updated_at_ms').notNull(),
+    /** User-chosen name; NULL falls back to the directory basename (m0053). */
+    displayName: text('display_name'),
 }, (table) => [
     check('local_runtime_projects_kind_check', sql `${table.projectKind} IN ('default', 'workspace')`),
     check('local_runtime_projects_identity_check', sql `(${table.projectKind} = 'default' AND ${table.workspaceDir} IS NULL) OR (${table.projectKind} = 'workspace' AND ${table.workspaceDir} IS NOT NULL AND trim(${table.workspaceDir}) <> '')`),

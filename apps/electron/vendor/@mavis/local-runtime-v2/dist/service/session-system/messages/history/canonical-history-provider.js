@@ -7,9 +7,9 @@ import { repairCanonicalHistory } from './canonical-history-recovery.js';
 import { deleteSessionHistory } from './session-history-paths.js';
 import { createSessionHistoryLocationResolver, } from './session-history-location.js';
 import { ensureCanonicalHistoryMaterialized, } from './canonical-history-materializer.js';
-import { CanonicalHistoryIndexWriteError, createCanonicalHistoryIndexAdapter, } from './mutation/canonical-history-index.js';
-import { HistoryScannerError, scanCanonicalHistoryArtifacts, } from './mutation/canonical-history-scanner.js';
+import { HistoryScannerError, verifyCompactionParent, } from './mutation/canonical-history-scanner.js';
 import { isUserMessageId } from '../../shared/user-message-id.js';
+import { isSideChatModeMessage } from '../../shared/sidechat-mode.js';
 import { createSessionHistoryIoLane, } from './mutation/session-history-coordination.js';
 const MAX_CANONICAL_WRITE_ATTEMPTS = 3;
 const CANONICAL_RETRY_DELAYS_MS = [25, 50];
@@ -18,20 +18,17 @@ function historySnapshot(records, useActiveRevision) {
         revision: useActiveRevision
             ? canonicalActiveHistoryRevision(records)
             : canonicalHistoryRevision(records),
-        messages: records.map(({ message }) => detached(message)),
+        // The reader's records are deeply frozen and owned by it; share them instead of copying.
+        messages: Object.freeze(records.map(({ message }) => message)),
         identityVector: records.map(({ message_id }) => message_id),
     };
 }
 function isMissingParentScannerError(error) {
     return error instanceof HistoryScannerError && error.code === 'parent-snapshot-missing';
 }
-async function scanCompactionLineageAllowingMissingParent(paths, sessionId) {
+async function verifyCompactionParentAllowingMissing(paths, activeRecords) {
     try {
-        await scanCanonicalHistoryArtifacts({
-            activePath: paths.messages,
-            snapshotsPath: paths.snapshots,
-            sessionId,
-        });
+        await verifyCompactionParent({ activeRecords, snapshotsPath: paths.snapshots });
     }
     catch (error) {
         if (!isMissingParentScannerError(error))
@@ -50,21 +47,20 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
     const ioLane = options.ioLane ?? createSessionHistoryIoLane();
     const locations = options.locations ??
         createSessionHistoryLocationResolver({ dataDir: options.dataDir, sessions: options.sessions });
-    const indexes = new Map();
     const verifiedRecovery = new WeakMap();
     return {
         read: (sessionId) => inLane(sessionId, () => readSnapshot(sessionId, false)),
         readActive: (sessionId) => inLane(sessionId, () => readSnapshot(sessionId, true)),
         inspectActive: (sessionId) => inLane(sessionId, () => inspectActiveSnapshot(sessionId)),
         initialize: (sessionId) => inLane(sessionId, async () => {
-            const paths = await ensureInitialized(sessionId, 'allocate');
-            await syncIndex(sessionId, paths);
+            await ensureInitialized(sessionId, 'allocate');
         }),
         delete: (sessionId) => inLane(sessionId, async () => {
             const located = await locations.resolveSession(sessionId);
             if (!located)
                 return;
             deleteSessionHistory(options.dataDir, located.session, located.paths);
+            files.forget?.(located.paths.messages);
             options.activity?.notify(sessionId);
         }),
         append: (change) => inLane(change.sessionId, async () => {
@@ -103,8 +99,10 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
         }),
         compact: (change) => inLane(change.sessionId, async () => {
             const paths = await ensureInitialized(change.sessionId);
+            // The snapshot and the replacement rewrite the whole file, so start from a full disk read.
+            files.forget?.(paths.messages);
             const active = await files.readActiveStrict(paths.messages);
-            await scanCompactionLineageAllowingMissingParent(paths, change.sessionId);
+            await verifyCompactionParentAllowingMissing(paths, active);
             const generation = activeGeneration(active);
             const compactionId = safeCompactionId(change.compactionId);
             const snapshotPath = join(paths.snapshots, `g${String(generation).padStart(12, '0')}--${compactionId}.jsonl`);
@@ -128,11 +126,10 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             if (committedGeneration !== generation + 1) {
                 throw new Error(`Canonical compaction generation verification failed: ${change.sessionId}`);
             }
-            await syncIndex(change.sessionId, paths, true, committed);
             const result = {
                 revision: canonicalActiveHistoryRevision(committed),
                 generation: committedGeneration,
-                messages: committed.map(({ message }) => detached(message)),
+                messages: Object.freeze(committed.map(({ message }) => message)),
                 identityVector: committed.map(({ message_id }) => message_id),
             };
             options.activity?.notify(change.sessionId);
@@ -148,7 +145,6 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             verifiedRecovery,
             notify: () => options.activity?.notify(sessionId),
         });
-        await syncIndex(sessionId, paths, true, records);
         return historySnapshot(records, allowPendingToolCallTail);
     }
     async function inspectActiveSnapshot(sessionId) {
@@ -174,28 +170,6 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
         });
         return paths;
     }
-    async function syncIndex(sessionId, paths, allowMissingParent = false, verifiedRecords) {
-        const active = verifiedRecords ?? (await files.readActiveStrict(paths.messages));
-        const adapter = indexes.get(sessionId) ?? createCanonicalHistoryIndexAdapter(paths.sessionDir);
-        indexes.set(sessionId, adapter);
-        try {
-            await adapter.loadOrRebuild({
-                sessionId,
-                activeGeneration: activeGeneration(active),
-                activeRevision: canonicalActiveHistoryRevision(active),
-            }, 
-            // Only the default reader owns reusable immutable records. Preserve the
-            // independent on-disk scanner for externally supplied adapters.
-            (scannerPaths) => scanCanonicalHistoryArtifacts(scannerPaths, options.files ? undefined : files), { activePath: paths.messages, snapshotsPath: paths.snapshots, sessionId });
-        }
-        catch (error) {
-            if (error instanceof CanonicalHistoryIndexWriteError)
-                return;
-            if (allowMissingParent && isMissingParentScannerError(error))
-                return;
-            throw error;
-        }
-    }
     async function inLane(sessionId, operation) {
         return ioLane.run(sessionId, operation);
     }
@@ -214,17 +188,30 @@ async function persistCanonical(operation, retryDelay, attempt = 1) {
     }
 }
 async function appendWithInterruptedToolRoundRecovery(input) {
-    const combined = [...input.existing, ...input.appended];
-    const recovery = repairCanonicalHistory(combined, { allowPendingToolCallTail: true });
+    if (!repairedCommittedTail(input.existing, input.appended)) {
+        await input.files.append(input.path, input.appended, input.existing);
+        return;
+    }
+    // The repair rewrites the whole file, so decide it again from a full disk read.
+    input.files.forget?.(input.path);
+    const existing = await input.files.readActiveStrict(input.path);
+    assertAppendIdentityBoundary(existing, input.appended);
+    const repaired = repairedCommittedTail(existing, input.appended);
+    if (repaired)
+        await input.files.replaceActive(input.path, repaired);
+    else
+        await input.files.append(input.path, input.appended, existing);
+}
+/** The repaired records when the only issue is an interrupted tool round already on disk. */
+function repairedCommittedTail(existing, appended) {
+    const recovery = repairCanonicalHistory([...existing, ...appended], {
+        allowPendingToolCallTail: true,
+    });
     const [issue] = recovery.issues;
     const repairsCommittedTail = recovery.issues.length === 1 &&
         issue?.kind === 'interrupted-tool-round' &&
-        issue.recordIndex < input.existing.length;
-    if (repairsCommittedTail) {
-        await input.files.replaceActive(input.path, recovery.records);
-        return;
-    }
-    await input.files.append(input.path, input.appended, input.existing);
+        issue.recordIndex < existing.length;
+    return repairsCommittedTail ? recovery.records : undefined;
 }
 function appendEnvelopes(change) {
     const identityHints = appendIdentityHints(change);
@@ -375,7 +362,8 @@ function historyMessage(value) {
         !Number.isFinite(timestamp)) {
         throw new TypeError('Canonical history contains an invalid Pi message.');
     }
-    return detached(value);
+    // Written records are decoded again from the file, so the caller's objects are never retained.
+    return value;
 }
 function readMinimalCompactionSummary(value) {
     if (Reflect.get(value, 'role') !== 'compactionSummary')
@@ -397,33 +385,16 @@ function assertChange(change, reason) {
 function compactionReplacementEnvelopes(change, active) {
     const currentUserTail = readCurrentUserTail(change, active);
     const baseMessages = currentUserTail?.baseMessages ?? change.messages;
-    if (change.method === 'llm_checkpoint') {
-        const replacement = baseMessages.map((message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }));
-        if (replacement.length !== 1 || replacement[0]?.message.role !== 'compactionSummary') {
-            throw new TypeError('Canonical checkpoint compaction must contain one native summary.');
-        }
-        return currentUserTail ? [...replacement, ...currentUserTail.envelopes] : replacement;
-    }
-    const sourceIndexes = validateToolReplacementSourceIndexes(change, active, baseMessages.length);
-    const retainedExternalUsers = new Set();
-    const replacement = baseMessages.map((message, index) => {
-        const sourceIndex = sourceIndexes[index];
-        const source = sourceIndex === undefined ? undefined : active[sourceIndex];
-        if (!source)
-            throw new TypeError('Canonical ToolResult compaction source identity is missing.');
-        const normalized = historyMessage(message);
-        assertToolReplacementMessage(source, normalized);
-        if (isUserMessageId(source.message_id))
-            retainedExternalUsers.add(source.message_id);
-        return { ...withoutHistoryArtifact(source), message: normalized };
-    });
-    if (currentUserTail)
-        retainedExternalUsers.add(currentUserTail.user.message_id);
-    const missingExternalUser = active.find(({ message_id }) => isUserMessageId(message_id) && !retainedExternalUsers.has(message_id));
-    if (missingExternalUser) {
-        throw new TypeError(`Canonical ToolResult compaction dropped an external user identity: ${missingExternalUser.message_id}`);
-    }
+    const replacement = baseMessages.map((message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }));
+    assertCheckpointReplacement(replacement);
     return currentUserTail ? [...replacement, ...currentUserTail.envelopes] : replacement;
+}
+function assertCheckpointReplacement(replacement) {
+    if (replacement[0]?.message.role !== 'compactionSummary' ||
+        (replacement.length !== 1 &&
+            !(replacement.length === 2 && isSideChatModeMessage(replacement[1]?.message)))) {
+        throw new TypeError('Canonical checkpoint compaction must contain one native summary.');
+    }
 }
 function readCurrentUserTail(change, active) {
     const sourceIndex = change.currentUserSourceIndex;
@@ -432,24 +403,30 @@ function readCurrentUserTail(change, active) {
     if (!Number.isSafeInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= active.length) {
         throw new TypeError('Canonical current-user tail source lineage is invalid.');
     }
-    if (change.messages.length < 2) {
+    const markerCount = change.placedMarkerCount ?? 1;
+    if (!Number.isSafeInteger(markerCount) || markerCount < 1) {
+        throw new TypeError('Canonical current-user tail marker count is invalid.');
+    }
+    const tailLength = markerCount + 1;
+    if (change.messages.length < tailLength) {
         throw new TypeError('Canonical current-user tail is incomplete.');
     }
-    const marker = change.messages.at(-2);
+    const baseLength = change.messages.length - tailLength;
+    const markers = change.messages.slice(baseLength, -1);
     const userMessage = change.messages.at(-1);
     const source = requireExternalCurrentUserSource(active[sourceIndex]);
-    const normalizedMarker = requireHiddenTypedCustom(marker);
+    const normalizedMarkers = markers.map(requireHiddenTypedCustom);
     const normalizedUser = requireExactCurrentUserMessage(userMessage, source);
     return {
-        baseMessages: change.messages.slice(0, -2),
+        baseMessages: change.messages.slice(0, baseLength),
         user: source,
         envelopes: [
-            envelope({
+            ...normalizedMarkers.map((message, offset) => envelope({
                 change,
-                message: normalizedMarker,
+                message,
                 turnId: `${change.turnId}:compaction`,
-                index: change.messages.length - 2,
-            }),
+                index: baseLength + offset,
+            })),
             { ...withoutHistoryArtifact(source), message: normalizedUser },
         ],
     };
@@ -483,45 +460,6 @@ function isHiddenTypedCustom(value) {
         Boolean(Reflect.get(value, 'customType').trim()) &&
         typeof Reflect.get(value, 'timestamp') === 'number' &&
         Number.isFinite(Reflect.get(value, 'timestamp')));
-}
-function validateToolReplacementSourceIndexes(change, active, expectedLength) {
-    const indexes = change.replacementSourceIndexes;
-    if (!Array.isArray(indexes) || indexes.length !== expectedLength) {
-        throw new TypeError('Canonical ToolResult compaction source lineage is incomplete.');
-    }
-    let previous = -1;
-    indexes.forEach((index) => {
-        if (!Number.isSafeInteger(index) ||
-            index <= previous ||
-            index >= active.length ||
-            index === change.currentUserSourceIndex) {
-            throw new TypeError('Canonical ToolResult compaction source lineage is invalid.');
-        }
-        previous = index;
-    });
-    return indexes;
-}
-function assertToolReplacementMessage(source, replacement) {
-    if (source.message.role !== replacement.role) {
-        throw new TypeError('Canonical ToolResult compaction changed a message role.');
-    }
-    if (isUserMessageId(source.message_id) && !sameJson(source.message, replacement)) {
-        throw new TypeError(`Canonical ToolResult compaction changed external user payload: ${source.message_id}`);
-    }
-    if (source.message.role !== 'user' &&
-        source.message.role !== 'toolResult' &&
-        !sameJson(source.message, replacement)) {
-        throw new TypeError(`Canonical ToolResult compaction changed a non-result message: ${source.message_id}`);
-    }
-    if (source.message.role === 'toolResult' &&
-        !sameJson(withoutContent(source.message), withoutContent(replacement))) {
-        throw new TypeError(`Canonical ToolResult compaction changed tool result identity: ${source.message_id}`);
-    }
-}
-function withoutContent(message) {
-    const semanticMessage = { ...message };
-    delete semanticMessage['content'];
-    return semanticMessage;
 }
 function sameJson(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
@@ -580,10 +518,12 @@ function replacementSnapshotId(metadata) {
     const value = Reflect.get(metadata, 'replacementId');
     return typeof value === 'string' && value.trim() ? value : undefined;
 }
-function detached(value) {
-    return structuredClone(value);
-}
-async function replaceRecoveredHistory(files, path, records, allowPendingToolCallTail) {
+/** The repair rewrites the whole file, so it is computed again from a full disk read. */
+async function replaceRecoveredHistory(files, path, allowPendingToolCallTail) {
+    files.forget?.(path);
+    const { records } = repairCanonicalHistory(await files.readEnvelopesStrict(path), {
+        allowPendingToolCallTail,
+    });
     if (allowPendingToolCallTail) {
         await files.replaceActive(path, records);
         return files.readActiveStrict(path);
@@ -599,8 +539,7 @@ async function recoverReadHistory(files, path, decoded, options) {
     if ((verifiedModes & recoveryMode) === 0) {
         const recovery = repairCanonicalHistory(decoded, { allowPendingToolCallTail });
         if (recovery.issues.length > 0) {
-            records = recovery.records;
-            records = await replaceRecoveredHistory(files, path, records, allowPendingToolCallTail);
+            records = await replaceRecoveredHistory(files, path, allowPendingToolCallTail);
             options.notify();
         }
         else if (reusable) {

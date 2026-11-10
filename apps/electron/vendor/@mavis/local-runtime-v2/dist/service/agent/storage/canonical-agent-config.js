@@ -5,6 +5,9 @@ import { TextDecoder } from 'node:util';
 import { isDefaultAgentAvatarMarker } from '@mavis/shared/agent-avatar';
 import yaml from 'yaml';
 import { logger } from '../../../infra/logging/index.js';
+// Leaf import on purpose: the ModelSystem barrel pulls in provider/OAuth
+// runtimes, and this parser is also loaded by the UI Agent config tests.
+import { parseSourceQualifiedModelKey } from '../../model-system/resolution/model-key.js';
 export class AgentConfigError extends Error {
     code;
     field;
@@ -779,7 +782,9 @@ function optionalText(source, field, options = {}) {
 }
 function optionalModel(source) {
     const model = optionalText(source, 'model');
-    if (model !== undefined && !/^[^/\s]+\/[^/\s]+$/u.test(model)) {
+    // Split like ModelSystem: the provider ends at the first `/` and the model
+    // id may itself contain `/` (for example `openrouter/qwen/qwen3`).
+    if (model !== undefined && (/\s/u.test(model) || !parseSourceQualifiedModelKey(model))) {
         throw invalid('model', 'model must use the provider/model form.');
     }
     return model;

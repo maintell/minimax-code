@@ -8,7 +8,8 @@ import { scheduleArchonMiniChatBlur } from "./archonMiniChatWindow";
 const CHANNEL = 'model-menu-popup';
 function validatePresentation(data) {
     if (!data ||
-        (data.kind !== undefined && !['asr-device', 'panel-add', 'browser-more'].includes(data.kind)) ||
+        (data.kind !== undefined &&
+            !['asr-device', 'panel-add', 'browser-more', 'panel-tabs'].includes(data.kind)) ||
         !Array.isArray(data.rows) ||
         data.rows.length > 500 ||
         typeof data.locale !== 'string' ||
@@ -16,16 +17,41 @@ function validatePresentation(data) {
         !data.tokens ||
         typeof data.tokens !== 'object' ||
         JSON.stringify(data).length > 256000 ||
+        (data.search !== undefined &&
+            (data.kind !== undefined ||
+                !data.search ||
+                typeof data.search.placeholder !== 'string' ||
+                typeof data.search.emptyLabel !== 'string' ||
+                data.search.placeholder.length > 100 ||
+                data.search.emptyLabel.length > 100)) ||
+        (data.panelAdd !== undefined &&
+            (data.kind !== 'panel-add' ||
+                !data.panelAdd ||
+                !['menu', 'edit'].includes(data.panelAdd.mode) ||
+                !Array.isArray(data.panelAdd.moreKeys) ||
+                !data.panelAdd.moreKeys.every((key) => data.rows.some((row) => row?.key === key)))) ||
         data.rows.some((row) => !row ||
             typeof row.key !== 'string' ||
             typeof row.label !== 'string' ||
             (row.disabled !== undefined && typeof row.disabled !== 'boolean') ||
             (row.selected !== undefined && typeof row.selected !== 'boolean') ||
+            (row.busy !== undefined && typeof row.busy !== 'boolean') ||
+            (row.permission !== undefined && typeof row.permission !== 'boolean') ||
+            (row.unread !== undefined && typeof row.unread !== 'boolean') ||
             (row.separatorBefore !== undefined && typeof row.separatorBefore !== 'boolean') ||
             (row.description !== undefined && typeof row.description !== 'string') ||
             (row.shortcut !== undefined && typeof row.shortcut !== 'string') ||
             (row.icon !== undefined &&
-                !['terminal', 'canvas', 'files', 'browser', 'miniapp', 'changes'].includes(row.icon)) ||
+                ![
+                    'terminal',
+                    'canvas',
+                    'files',
+                    'browser',
+                    'miniapp',
+                    'changes',
+                    'sidechat',
+                    'ppt',
+                ].includes(row.icon)) ||
             (row.zoom !== undefined &&
                 (data.kind !== 'browser-more' ||
                     !row.zoom ||
@@ -97,7 +123,9 @@ export function setupModelMenuPopupIPC() {
                     presentation: entry.request.presentation,
                     // Reserve shadow padding (32 DIP) plus 1 DIP for integer window rounding.
                     maxWidth: Math.max(1, (area.width - 33) / zoom / 2),
-                    maxHeight: Math.max(1, (area.height - 33) / zoom),
+                    maxHeight: Math.max(1, Math.min(area.height - 33, entry.request.presentation.kind === 'panel-tabs'
+                        ? entry.owner.getContentBounds().height * 0.8
+                        : Infinity) / zoom),
                 }
                 : null);
         }
@@ -146,6 +174,8 @@ export function setupModelMenuPopupIPC() {
             request: undefined,
             ready: false,
             measured: false,
+            menuBounds: undefined,
+            submenuBounds: undefined,
             openTimeout: undefined,
             idleTimeout: undefined,
             close: (restoreFocus = false, error = false) => {
@@ -154,6 +184,8 @@ export function setupModelMenuPopupIPC() {
                 if (!request)
                     return;
                 entry.request = undefined;
+                entry.menuBounds = undefined;
+                entry.submenuBounds = undefined;
                 if (!popup.isDestroyed())
                     popup.hide();
                 sendState(entry);
@@ -191,6 +223,15 @@ export function setupModelMenuPopupIPC() {
             },
         };
         const close = () => entry.close();
+        const isPointerInsideVisibleMenu = () => {
+            const point = screen.getCursorScreenPoint();
+            const contains = (rect) => Boolean(rect &&
+                point.x >= rect.x &&
+                point.x < rect.x + rect.width &&
+                point.y >= rect.y &&
+                point.y < rect.y + rect.height);
+            return contains(entry.menuBounds) || contains(entry.submenuBounds);
+        };
         // ponytail: close on geometry changes; continuous tracking can be added if product needs it.
         const ownerEvents = [
             'move',
@@ -204,7 +245,43 @@ export function setupModelMenuPopupIPC() {
             owner.on(name, close);
         ownerContents.on('did-start-navigation', close);
         owner.once('closed', entry.dispose);
-        popup.on('blur', close);
+        popup.on('blur', () => {
+            const request = entry.request;
+            if (request?.presentation.kind !== 'panel-tabs') {
+                // A native child window can emit blur while the pointer crosses from the
+                // main menu into its parameter submenu. Defer the decision until Electron
+                // has applied the new hover target, then keep the menu alive if the pointer
+                // is still over either visible menu surface.
+                setImmediate(() => {
+                    if (entry.request !== request)
+                        return;
+                    if (isPointerInsideVisibleMenu()) {
+                        popup.focus();
+                        return;
+                    }
+                    close();
+                });
+                return;
+            }
+            // Native blur can precede the owner's focus event when the trigger is clicked.
+            setImmediate(() => {
+                if (entry.request !== request || owner.isDestroyed())
+                    return;
+                const point = screen.getCursorScreenPoint();
+                const anchor = getScreenAnchor(owner, request.anchor);
+                if (owner.isFocused() &&
+                    point.x >= anchor.x &&
+                    point.x < anchor.x + anchor.width &&
+                    point.y >= anchor.y &&
+                    point.y < anchor.y + anchor.height) {
+                    // Keep the retained menu active: an inactive macOS child window can
+                    // stop updating hover until another click activates it.
+                    popup.focus();
+                    return;
+                }
+                close();
+            });
+        });
         popup.webContents.on('render-process-gone', () => {
             entry.close(false, true);
             entry.dispose();
@@ -247,6 +324,23 @@ export function setupModelMenuPopupIPC() {
         if (entry?.request && !scopeAllows(owner, entry.request))
             entry.close();
     });
+    ipcMain.handle(`${CHANNEL}:contains-pointer`, (event) => {
+        const owner = getOwner(event);
+        const entry = entries.get(owner.id);
+        if (!entry?.request ||
+            entry.request.presentation.kind !== 'panel-tabs' ||
+            !scopeAllows(owner, entry.request) ||
+            !owner.isVisible() ||
+            owner.isMinimized())
+            return false;
+        const point = screen.getCursorScreenPoint();
+        const contains = (rect) => point.x >= rect.x &&
+            point.x < rect.x + rect.width &&
+            point.y >= rect.y &&
+            point.y < rect.y + rect.height;
+        return (contains(getScreenAnchor(owner, entry.request.anchor)) ||
+            Boolean(entry.popup.isVisible() && entry.menuBounds && contains(entry.menuBounds)));
+    });
     ipcMain.handle(`${CHANNEL}:open`, (event, request) => {
         const owner = getOwner(event);
         if (!request ||
@@ -256,6 +350,7 @@ export function setupModelMenuPopupIPC() {
             !request.anchor ||
             !['x', 'y', 'width', 'height'].every((key) => Number.isFinite(request.anchor[key])) ||
             !['up', 'down'].includes(request.direction) ||
+            (request.horizontalOffset !== undefined && !Number.isFinite(request.horizontalOffset)) ||
             !['start', 'end'].includes(request.align)) {
             throw new TypeError('Invalid model menu request');
         }
@@ -273,6 +368,8 @@ export function setupModelMenuPopupIPC() {
             entry.close();
         clearTimeout(entry.idleTimeout);
         entry.measured = false;
+        entry.menuBounds = undefined;
+        entry.submenuBounds = undefined;
         entry.request = request;
         clearTimeout(entry.openTimeout);
         entry.openTimeout = setTimeout(() => {
@@ -346,7 +443,7 @@ export function setupModelMenuPopupIPC() {
             const zoom = entry.owner.webContents.getZoomFactor();
             const screenAnchor = getScreenAnchor(entry.owner, entry.request.anchor);
             const area = screen.getDisplayMatching(screenAnchor).workArea;
-            const geometry = positionModelMenu(screenAnchor, entry.request.direction, entry.request.align, {
+            const geometry = positionModelMenu({ ...screenAnchor, x: screenAnchor.x + (entry.request.horizontalOffset ?? 0) * zoom }, entry.request.direction, entry.request.align, {
                 menu: { width: measured.menu.width * zoom, height: measured.menu.height * zoom },
                 ...(measured.submenu
                     ? {
@@ -357,7 +454,27 @@ export function setupModelMenuPopupIPC() {
                         },
                     }
                     : {}),
-            }, area);
+            }, area,
+            // A panel can reach the display edge. Keep its 8 CSS-pixel inset
+            // instead of shifting the menu left to fit the default shadow gutter.
+            entry.request.presentation.kind === 'panel-tabs' ||
+                entry.request.presentation.kind === 'panel-add'
+                ? Math.min(16, 8 * zoom)
+                : undefined);
+            entry.menuBounds = {
+                x: geometry.bounds.x + geometry.layout.menu.x,
+                y: geometry.bounds.y + geometry.layout.menu.y,
+                width: measured.menu.width * zoom,
+                height: measured.menu.height * zoom,
+            };
+            entry.submenuBounds = measured.submenu && geometry.layout.submenu
+                ? {
+                    x: geometry.bounds.x + geometry.layout.submenu.x,
+                    y: geometry.bounds.y + geometry.layout.submenu.y,
+                    width: measured.submenu.width * zoom,
+                    height: measured.submenu.height * zoom,
+                }
+                : undefined;
             entry.popup.setBounds(geometry.bounds, false);
             entry.measured = true;
             const layout = geometry.layout;
@@ -365,6 +482,16 @@ export function setupModelMenuPopupIPC() {
                 width: layout.width / zoom,
                 height: layout.height / zoom,
                 menu: { x: layout.menu.x / zoom, y: layout.menu.y / zoom },
+                ...(entry.request.presentation.kind === 'panel-tabs'
+                    ? {
+                        trigger: {
+                            x: (screenAnchor.x - geometry.bounds.x) / zoom,
+                            y: (screenAnchor.y - geometry.bounds.y) / zoom,
+                            width: screenAnchor.width / zoom,
+                            height: screenAnchor.height / zoom,
+                        },
+                    }
+                    : {}),
                 ...(layout.submenu
                     ? { submenu: { x: layout.submenu.x / zoom, y: layout.submenu.y / zoom } }
                     : {}),
@@ -378,6 +505,7 @@ export function setupModelMenuPopupIPC() {
     ipcMain.on(`${CHANNEL}:renderer`, rendererMessage);
     return () => {
         ipcMain.removeHandler(`${CHANNEL}:open`);
+        ipcMain.removeHandler(`${CHANNEL}:contains-pointer`);
         ipcMain.removeHandler(`${CHANNEL}:modal-scope`);
         ipcMain.removeListener(`${CHANNEL}:owner`, ownerMessage);
         ipcMain.removeListener(`${CHANNEL}:renderer`, rendererMessage);

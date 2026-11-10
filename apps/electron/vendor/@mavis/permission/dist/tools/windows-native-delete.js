@@ -1,6 +1,7 @@
 const CMD_FILE_DELETE = new Set(['del', 'erase']);
 const CMD_DIRECTORY_DELETE = new Set(['rd', 'rmdir']);
-const POWERSHELL_DELETE = new Set(['remove-item', 'ri']);
+// Built-in PowerShell aliases that resolve to Remove-Item on Windows.
+const POWERSHELL_DELETE = new Set(['remove-item', 'ri', 'rm', 'del', 'erase', 'rd', 'rmdir']);
 const CMD_FILE_FLAGS = new Set(['/f', '/q']);
 const CMD_DIRECTORY_FLAGS = new Set(['/s', '/q']);
 const POWERSHELL_FLAGS = new Set(['-recurse', '-force']);
@@ -30,7 +31,7 @@ export function parseWindowsNativeDelete(command, shell) {
 }
 function parseCmdDelete(command, operands, directoryDelete) {
     const acceptedFlags = directoryDelete ? CMD_DIRECTORY_FLAGS : CMD_FILE_FLAGS;
-    const targets = [];
+    const targetTokens = [];
     let recursive = false;
     let force = false;
     for (const token of operands) {
@@ -51,20 +52,21 @@ function parseCmdDelete(command, operands, directoryDelete) {
             return undefined;
         if (!isLiteralWindowsTarget(token.value))
             return undefined;
-        targets.push(token.value);
+        targetTokens.push(token);
     }
-    if (targets.length === 0 || (directoryDelete && !recursive))
+    if (targetTokens.length === 0 || (directoryDelete && !recursive))
         return undefined;
     return {
         command,
         shell: 'cmd',
-        targets,
+        targets: targetTokens.map((token) => token.value),
+        targetTokens,
         ...(recursive ? { recursive: true } : {}),
         ...(force ? { force: true } : {}),
     };
 }
 function parsePowerShellDelete(command, operands) {
-    const targets = [];
+    const targetTokens = [];
     let recursive = false;
     let force = false;
     for (const token of operands) {
@@ -78,16 +80,21 @@ function parsePowerShellDelete(command, operands) {
                 force = true;
             continue;
         }
+        // CMD-style switches (`del /q`, `rd /s`) are drive-relative paths to
+        // Remove-Item. Refuse them rather than deleting something like `\s`.
+        if (!token.quoted && /^\/[a-z?](?::|$)/.test(lower))
+            return undefined;
         if (!isLiteralWindowsTarget(token.value) || token.value.includes(','))
             return undefined;
-        targets.push(token.value);
+        targetTokens.push(token);
     }
-    if (targets.length === 0)
+    if (targetTokens.length === 0)
         return undefined;
     return {
         command,
         shell: 'powershell',
-        targets,
+        targets: targetTokens.map((token) => token.value),
+        targetTokens,
         ...(recursive ? { recursive: true } : {}),
         ...(force ? { force: true } : {}),
     };

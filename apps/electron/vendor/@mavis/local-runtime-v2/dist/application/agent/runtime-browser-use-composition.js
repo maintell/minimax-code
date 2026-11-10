@@ -1,6 +1,11 @@
+import { parseRequestMediaConfig } from '@mavis/config';
 import { initializeBrowserUseService, } from '../../service/browser-use/index.js';
 export function ownsElectronRuntimeCapabilities(runtimeOwnerKind) {
     return runtimeOwnerKind === undefined || runtimeOwnerKind === 'electron';
+}
+/** Cron and other scheduled owners also run in the headless app-server. */
+export function ownsScheduledRuntimeCapabilities(runtimeOwnerKind) {
+    return ownsElectronRuntimeCapabilities(runtimeOwnerKind) || runtimeOwnerKind === 'app-server';
 }
 export function createRuntimeBrowserUseComposition(options) {
     const service = initializeBrowserUseService({
@@ -17,7 +22,22 @@ export function createRuntimeBrowserUseComposition(options) {
                     : { browserUseToolingEnabled: beta.browserUseTooling }),
             };
         },
-        compressScreenshot: options.compatibility.generatedAssets.compressModelImage,
+        getImageEncoding: () => {
+            let requestMedia;
+            try {
+                requestMedia =
+                    options.compatibility.agentHost.preparation.configBuilder.config().requestMedia;
+            }
+            catch {
+                requestMedia = undefined;
+            }
+            const { image } = parseRequestMediaConfig(requestMedia);
+            return {
+                maxWidth: image.max_width,
+                maxHeight: image.max_height,
+                maxBase64Bytes: image.max_base64_bytes,
+            };
+        },
         registerGeneratedAsset: options.compatibility.generatedAssets.registerGeneratedAsset,
         activationMode: ownsElectronRuntimeCapabilities(options.runtimeOwnerKind)
             ? 'desktop-plugin'

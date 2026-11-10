@@ -126,6 +126,30 @@ function vendorPackage(from, to) {
   return files;
 }
 
+const NATIVE_FILE = /\.(?:node|dll|exe|so|dylib|wasm|pdb|a|lib)$/iu;
+
+// The installed app's `app.asar.unpacked` overlay can lag behind `app.asar`: the
+// installer refreshes the archive, but the unpacked copy keeps files from the
+// previous build. Electron reads a file from the overlay only when the archive
+// marks it unpacked, so a stale overlay file is inert at runtime — but copying it
+// over the archive copy corrupts the snapshot (seen as a missing ESM export in a
+// vendored package, which stops the local runtime from booting). For code files
+// the archive wins; native binaries still come from the overlay, which is the
+// only place the installer actually writes them.
+function restoreArchiveWins(from, to) {
+  for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+    const source = path.join(from, entry.name);
+    const dest = path.join(to, entry.name);
+    if (entry.isDirectory()) {
+      if (PRUNE_DIRS.has(entry.name)) continue;
+      if (fs.existsSync(dest)) restoreArchiveWins(source, dest);
+    } else if (entry.isFile()) {
+      if (PRUNE_FILE.test(entry.name) || NATIVE_FILE.test(entry.name)) continue;
+      if (fs.existsSync(dest)) fs.copyFileSync(source, dest);
+    }
+  }
+}
+
 const vendorNames = [];
 for (const scope of VENDOR_SCOPES) {
   const scopeDir = path.join(asarNodeModules, scope);
@@ -185,7 +209,10 @@ for (const name of vendorNames) {
   const to = path.join(vendorRoot, name);
   vendorPackage(from, to);
   const overlay = path.join(unpackedDir, "node_modules", name);
-  if (fs.existsSync(overlay)) vendorPackage(overlay, to);
+  if (fs.existsSync(overlay)) {
+    vendorPackage(overlay, to);
+    restoreArchiveWins(from, to);
+  }
   if (!rewriteManifest(to, vendoredSet)) {
     fs.rmSync(to, { recursive: true, force: true });
     console.log(`  skipped (no package.json): ${name}`);

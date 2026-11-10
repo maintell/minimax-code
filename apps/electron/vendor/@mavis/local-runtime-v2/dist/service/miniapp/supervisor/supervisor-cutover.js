@@ -32,7 +32,6 @@ export class SupervisorCutoverCoordinator {
             markExplicitlyStopped: () => this.options.explicitlyStopped.add(input.pluginId),
             markCold: () => this.markCold(input.generation, runtime),
             quarantine: (error) => this.options.quarantineCleanupFailure(input.pluginId, error),
-            operationBusy: (message) => new MiniAppError('BUSY', message, { busyReason: 'operation_busy' }),
         });
     }
     runtimeOwners(pluginId) {
@@ -42,18 +41,6 @@ export class SupervisorCutoverCoordinator {
             ...(active ? [active] : []),
         ];
         return generations.filter((generation, index) => Boolean(generation.runtime) && generations.indexOf(generation) === index);
-    }
-    settleStarting(pluginId, generation, preparation, onPonr) {
-        return settleStartingGeneration({
-            generation,
-            beginQuiescing: () => this.options.quiescing.set(pluginId, preparation),
-            endQuiescing: () => this.endQuiescing(pluginId, preparation),
-            assertCurrent: () => this.options.assertCurrentPreparation(pluginId, preparation),
-            isQuarantined: () => this.options.isQuarantined(pluginId),
-            persistExplicitStartFence: () => persistExplicitStartFence(this.options.stateStore, pluginId, this.options.nowMs()),
-            markExplicitlyStopped: () => this.options.explicitlyStopped.add(pluginId),
-            onPonr,
-        });
     }
     endQuiescing(pluginId, preparation) {
         if (this.options.quiescing.get(pluginId) === preparation) {
@@ -76,8 +63,6 @@ export class SupervisorCutoverCoordinator {
     }
     markCold(generation, runtime) {
         generation.accepting = false;
-        generation.idleTimer?.cancel();
-        generation.idleTimer = undefined;
         if (generation.runtime !== runtime)
             return;
         generation.runtime = undefined;
@@ -89,18 +74,23 @@ async function prepareDestructiveCutover(input) {
     input.generation.accepting = false;
     input.beginQuiescing();
     let connectorAttempt;
+    let forced = false;
     try {
         connectorAttempt = input.runtime.hostConnectorSession?.beginQuiesce({
             deadlineMs: input.deadlineMs,
             signal: input.signal,
         });
-        if ((await (connectorAttempt?.result ?? Promise.resolve('drained'))) === 'busy') {
-            if (input.signal.aborted)
-                throw abortReason(input.signal);
-            throw input.operationBusy('Mini App Host Connector calls are still active');
-        }
+        const drain = await (connectorAttempt?.result ?? Promise.resolve('drained'));
+        // Last chance to withdraw: a cancellation during the drain (the caller's, or the memory
+        // coordinator's once a turn took the App) resumes admission instead of crossing the PONR.
+        if (input.signal.aborted)
+            throw abortReason(input.signal);
+        // Polite first, then forced: calls still running at the drain deadline are aborted at commit.
+        forced = drain === 'busy';
         input.assertCurrent();
         await input.validate();
+        if (input.signal.aborted)
+            throw abortReason(input.signal);
         input.assertCurrent();
         input.persistExplicitStartFence();
     }
@@ -109,7 +99,7 @@ async function prepareDestructiveCutover(input) {
     }
     input.markExplicitlyStopped();
     input.onPonr();
-    const connectorCommit = await cleanup.captureOperation(connectorAttempt ? () => connectorAttempt.commit() : () => undefined);
+    const connectorCommit = await cleanup.captureOperation(connectorAttempt ? () => connectorAttempt.commit({ force: forced }) : () => undefined);
     const rootCleanup = await cleanup.captureOperation(() => cleanup.cleanupRuntime(input.runtime));
     input.endQuiescing();
     if (rootCleanup.status === 'rejected' && errors.isMiniAppCleanupUnproven(rootCleanup.reason)) {
@@ -134,30 +124,6 @@ function failPrePonr(input, connectorAttempt, previousAccepting, error) {
     const failure = new MiniAppCleanupUnprovenError('Mini App Host Connector admission could not be restored before cutover', { cause: error });
     input.quarantine(failure);
     throw failure;
-}
-async function settleStartingGeneration(input) {
-    const startup = input.generation.startPromise;
-    if (!startup || input.generation.runtime)
-        return;
-    input.beginQuiescing();
-    try {
-        input.assertCurrent();
-        input.persistExplicitStartFence();
-        input.markExplicitlyStopped();
-        input.generation.accepting = false;
-        input.generation.startController?.abort(new MiniAppError('SUPERSEDED', 'Mini App startup was superseded by an explicit operation'));
-        input.onPonr();
-        await cleanup.ignoreRejected(startup);
-        input.assertCurrent();
-        if (input.isQuarantined()) {
-            throw new MiniAppError('QUARANTINED', 'Mini App cleanup ownership is unproven');
-        }
-        // An abort-insensitive startup may still publish a runtime while cleanup settles;
-        // the caller already crossed PONR and will retire it through the normal root owner.
-    }
-    finally {
-        input.endQuiescing();
-    }
 }
 function abortReason(signal) {
     return signal.reason instanceof Error

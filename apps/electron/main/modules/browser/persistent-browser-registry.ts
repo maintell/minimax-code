@@ -321,6 +321,28 @@ export class PersistentBrowserRegistry {
         this.schedulePersist();
         return true;
     }
+    /** Moves a session's persisted tabs to another session, keeping tab ids and history. */
+    renameSession(fromSessionId, toSessionId) {
+        const source = this.findMutableSession(fromSessionId);
+        const normalizedTargetId = normalizeSessionId(toSessionId);
+        if (!source || !normalizedTargetId || normalizedTargetId === source.sessionId)
+            return false;
+        const target = this.findMutableSession(normalizedTargetId);
+        if (target) {
+            target.tabs.push(...source.tabs);
+            target.selectedPersistentTabId =
+                source.selectedPersistentTabId ?? target.selectedPersistentTabId;
+            target.updatedAt = this.now();
+            this.state.sessions = this.state.sessions.filter((session) => session !== source);
+            this.prune();
+        }
+        else {
+            source.sessionId = normalizedTargetId;
+            source.updatedAt = this.now();
+        }
+        this.schedulePersist();
+        return true;
+    }
     clear() {
         this.state = { version: REGISTRY_VERSION, sessions: [] };
         this.dirty = false;

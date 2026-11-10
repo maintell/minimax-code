@@ -1,4 +1,9 @@
 // Shared first-run catalog; an existing remote snapshot remains authoritative.
+/**
+ * First-run default before any official snapshot is synced. After a sync the
+ * delivered `model_order` decides the default (see `model-availability.ts`).
+ */
+export const MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID = 'MiniMax-M3.1-Flash';
 const MINIMAX_M3_FILE_API_CAPABILITIES = {
     support_files_api: true,
     files_api_upload_endpoint: '/v1/files/upload',
@@ -6,6 +11,7 @@ const MINIMAX_M3_FILE_API_CAPABILITIES = {
     max_video_bytes_inline: 52_428_800,
     max_request_body_bytes: 67_108_864,
     max_attachments_count: 4,
+    max_images_per_request: 20,
 };
 export const MINIMAX_MODELS = {
     'MiniMax-M3': {
@@ -26,8 +32,8 @@ export const MINIMAX_MODELS = {
         },
         capabilities: MINIMAX_M3_FILE_API_CAPABILITIES,
     },
-    'MiniMax-M3.1-Flash-Preview': {
-        name: 'M3.1-Flash-Preview',
+    'MiniMax-M3.1-Flash': {
+        name: 'M3.1-Flash',
         attachment: true,
         reasoning: true,
         tool_call: true,
@@ -47,24 +53,6 @@ export const MINIMAX_MODELS = {
             thinking: { thinking: { type: 'adaptive' } },
         },
         capabilities: MINIMAX_M3_FILE_API_CAPABILITIES,
-    },
-    'MiniMax-M2.7-highspeed': {
-        name: 'MiniMax-M2.7-highspeed',
-        attachment: false,
-        reasoning: true,
-        tool_call: true,
-        temperature: true,
-        modalities: { input: ['text'], output: ['text'] },
-        limit: { context: 200000, output: 128000 },
-    },
-    'MiniMax-M2.7': {
-        name: 'MiniMax-M2.7',
-        attachment: false,
-        reasoning: true,
-        tool_call: true,
-        temperature: true,
-        modalities: { input: ['text'], output: ['text'] },
-        limit: { context: 200000, output: 128000 },
     },
 };
 //# sourceMappingURL=minimax-model-catalog.js.map

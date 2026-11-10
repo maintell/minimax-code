@@ -1,5 +1,5 @@
 import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DESKTOP_SERVICE_IDL_RELATIVE_PATH, resolveDesktopServiceIdlSource } from './idl-source.js';
 import { buildDesktopServiceDefinitionFromIr } from './desktop-service-model.js';
 import { emitDesktopService } from './emit-desktop-service.js';
@@ -103,7 +103,7 @@ async function assertOutputPathComponentsAreSafe(filePath, outputRoot) {
             throw error;
     }
     let current = root;
-    for (const component of relativePath.split('/').filter(Boolean)) {
+    for (const component of relativePath.split(sep).filter(Boolean)) {
         current = join(current, component);
         try {
             const stats = await lstat(current);

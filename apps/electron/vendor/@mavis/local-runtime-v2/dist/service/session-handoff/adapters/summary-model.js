@@ -28,6 +28,7 @@ export function createHandoffSummaryModelPort(options) {
             const final = await runHandoffModelTurn(options, {
                 session: request.session,
                 turnId: SUMMARY_TURN_ID,
+                scope: 'handoff-summary',
                 systemPrompt: SYSTEM_PROMPT,
                 userPrompt: buildSummaryPrompt(request.redactedMessages),
                 maxTokens: MAX_OUTPUT_TOKENS,

@@ -1,6 +1,6 @@
 import { WorkspaceReviewSearchTooLargeError } from '../contracts.js';
 import { gitStream } from './git-process.js';
-import { readWorkspaceFile } from './workspace-path.js';
+import { readWorkspaceFile } from './filesystem/workspace-path.js';
 const REVIEW_SEARCH_UNTRACKED_BYTES_LIMIT = 64 * 1024 * 1024;
 const REVIEW_SEARCH_UNTRACKED_CONCURRENCY = 8;
 const REVIEW_SEARCH_PAGE_SIZE_LIMIT = 10;

@@ -25,10 +25,9 @@ export const bringToFront = (options = {}) => {
         if (mainWindow.isMinimized()) {
             mainWindow.restore();
         }
-        // 显示窗口（如果隐藏了）
-        if (!mainWindow.isVisible()) {
-            mainWindow.show();
-        }
+        // 无条件 show()：Windows 上对"已隐藏且最小化"的窗口 restore() 会让 isVisible() 变为 true，
+        // 若按可见性跳过 show()，WebContents 不会重新显示，窗口内容保持隐藏（白屏）。
+        mainWindow.show();
         // macOS: 先激活应用，确保应用成为前台应用
         if (process.platform === 'darwin') {
             app.dock?.show();
@@ -63,10 +62,9 @@ export const bringToFrontAsync = async (options = {}) => {
         if (mainWindow.isMinimized()) {
             mainWindow.restore();
         }
-        // 显示窗口（如果隐藏了）
-        if (!mainWindow.isVisible()) {
-            mainWindow.show();
-        }
+        // 无条件 show()：Windows 上对"已隐藏且最小化"的窗口 restore() 会让 isVisible() 变为 true，
+        // 若按可见性跳过 show()，WebContents 不会重新显示，窗口内容保持隐藏（白屏）。
+        mainWindow.show();
         // macOS: 先激活应用，确保应用成为前台应用
         if (process.platform === 'darwin') {
             app.dock?.show();

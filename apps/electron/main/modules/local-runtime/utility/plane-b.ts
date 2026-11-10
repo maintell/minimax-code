@@ -9,7 +9,7 @@
  * "whoever needs the file reads it in its own process" — instead of
  * ferrying bytes out of the utility process.
  *
- * Semantics mirror `packages/local-runtime/src/files/api.ts#serveFilePreview`
+ * Semantics mirror `packages/local-runtime-v2/src/service/workspace/files/api.ts#serveFilePreview`
  * byte-for-byte (image-only MIME allowlist, `..` traversal gate, 403/404
  * JSON errors, private 300s cache header) so flipping the flag does not
  * change observable behavior.

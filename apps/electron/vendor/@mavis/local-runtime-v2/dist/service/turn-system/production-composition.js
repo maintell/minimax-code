@@ -1,29 +1,33 @@
+import { mutableTitleContext } from './agent-host/preparation/config/title-context.js';
 import { createProductionRunawayGuardExtension } from './runaway-guard/extension.js';
 import { streamSimple } from '@earendil-works/pi-ai';
-import { sessionReportExtension, toolOutputBudgetExtension, } from '@mavis/agent-extension';
+import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExtension, toolOutputBudgetExtension, webSearchContentBudgetExtension, } from '@mavis/agent-extension';
+import { withLLMRetry } from '@mavis/agent-core/pi-turn-runner';
 import { describeLocalBrowserToolInput } from '@mavis/agent-tools/desktop';
-import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from '@mavis/config';
-import { ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
-import { isPeekSession } from '../session-system/sessions/repo/normalization.js';
+import { TOOL_RESULT_COMPACTION_DEFAULTS, parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
+import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
+import { isPeekSession } from '../session-system/index.js';
 import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, LocalAgentHost, } from './agent-host/index.js';
 import { validateCanonicalHistoryMessages } from './agent-host/history/canonical-history-validation.js';
-import { readCompactionCommitMetadata } from './agent-host/compaction/context-compaction.js';
-import { LocalContextCompactor } from './compaction/local-context-compactor.js';
-import { AutomaticContextCompactor, createAutomaticContextRequestFilterHook, } from './compaction/automatic-context-compactor.js';
+import { readCompactionCommitMetadata } from './agent-host/compaction/compaction-commit-metadata.js';
+import { createContextCompactors } from './compaction/execution/production-context-compactors.js';
+import { createMainRequestProjection } from './compaction/execution/request-projection.js';
 import { ContextUsageAnchorState } from './compaction/execution/usage-anchor.js';
-import { ToolResultArchiver } from './compaction/algorithm/tool-result-archiver.js';
+import { CheckpointImageFileWriter } from './compaction/algorithm/checkpoint-image-file-writer.js';
 import { createFileApiUploadStoreSource } from './persistence/file-api-upload.repository.js';
 import { ToolOutputArtifactRepository } from './persistence/tool-output-artifact.repository.js';
+import { compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './agent-host/runner/policy/session-readable-grants.js';
 import { isProductionRuntimeErrorRetryable } from './runtime-error-retry-policy.js';
 import { createTodoCadenceReminderHook } from './execution/reminder/todo-cadence-reminder.js';
-import { createBackgroundCadenceReminder } from './execution/reminder/background-cadence-reminder.js';
-import { fitsReminderInFinalRequest } from './execution/reminder/reminder-admission.js';
+import { createHostTurnReminders } from './execution/reminder/host-turn-reminders.js';
+import { createSessionIdentityReminderHook } from './execution/reminder/session-identity-reminder.js';
+import { hasPtcTurnChildTodoWrite } from './agent-host/execution/ptc/catalog.js';
 import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/session-agent-execution-snapshot.js';
 import { McpToolResultHistoryExternalizer } from './agent-host/execution/mcp-tool-result-history-externalizer.js';
 import { createBrowserHostCapabilityAdapter } from './agent-host/assembly/host-capability/browser.js';
 import { createComputerUseHostCapabilityAdapter } from './agent-host/assembly/host-capability/computer.js';
 import { HostCapabilityRegistry } from './agent-host/assembly/host-capability/registry.js';
-export { createGlobalMemoryModelCompletion } from './memory-model/completion.js';
+export { createGlobalMemoryModelCompletion } from '../memory-system/index.js';
 /** Creates the one process-local AgentConfig/model preparation shared by title and AgentHost. */
 export function createProductionAgentPreparation(options) {
     return createNativeLocalAgentPreparation(options);
@@ -44,11 +48,19 @@ export function createProductionSessionTitleModel(product, nowMs) {
         },
         resolveModel: async (input) => {
             const resolved = await preparation.resolveModel(input);
-            const resolvedStream = resolved.streamFn;
+            const resolvedStream = resolved.callLifecycle
+                ? withLLMRetry(resolved.streamFn ?? streamSimple, {
+                    sessionId: input.sessionId,
+                    turnId: input.turnId,
+                    scope: 'title',
+                    lifecycle: resolved.callLifecycle,
+                })
+                : resolved.streamFn;
             return {
                 model: resolved.model,
                 ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
                 ...(resolved.headers ? { headers: resolved.headers } : {}),
+                ...(resolved.fetch ? { fetch: resolved.fetch } : {}),
                 ...(resolved.thinkingLevel ? { thinkingLevel: resolved.thinkingLevel } : {}),
                 ...(resolvedStream
                     ? {
@@ -77,17 +89,27 @@ export function createProductionRootArchiveTitleModel(product, nowMs) {
         },
         resolveModel: async (input) => {
             const resolved = await preparation.resolveModel(input);
-            const resolvedStream = resolved.streamFn;
+            const resolvedStream = resolved.callLifecycle
+                ? withLLMRetry(resolved.streamFn ?? streamSimple, {
+                    sessionId: input.sessionId,
+                    turnId: input.turnId,
+                    scope: 'archive-title',
+                    lifecycle: resolved.callLifecycle,
+                })
+                : resolved.streamFn;
             return {
                 model: resolved.model,
                 ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
                 ...(resolved.headers ? { headers: resolved.headers } : {}),
+                ...(resolved.fetch ? { fetch: resolved.fetch } : {}),
                 ...(resolved.thinkingLevel ? { thinkingLevel: resolved.thinkingLevel } : {}),
                 ...(resolvedStream
                     ? {
                         stream: (model, context, options) => resolvedStream(model, mutableTitleContext(context), options),
                     }
                     : {}),
+                // 和本轮正文同一判断：BYOK 模型生成的归档标题不送 MiniMax 审核。
+                contentReviewRequired: resolved.managedProvider === true,
             };
         },
         review: product.safety.review,
@@ -95,8 +117,11 @@ export function createProductionRootArchiveTitleModel(product, nowMs) {
         ...(nowMs ? { nowMs } : {}),
     });
 }
-/** Desktop Peek adds mutation approval; BTW shares the ordinary runtime permission policy. */
-function createHostPermissionPolicy(options) {
+/**
+ * Desktop Peek adds mutation approval; BTW shares the ordinary runtime permission policy.
+ * A Mini App Agent session's ask waits only while its run has a listener to answer it.
+ */
+function createHostPermissionPolicy(options, toolOutputArtifacts) {
     return {
         ...options.product.permission,
         sideSessions: {
@@ -105,21 +130,51 @@ function createHostPermissionPolicy(options) {
                 return session ? session.purpose !== 'peek_btw_session' && isPeekSession(session) : false;
             },
         },
+        // Paths the runtime hands the Agent inside its private data directory are
+        // granted by the runtime, never derived by the permission engine. Every
+        // such feature registers one source here (see session-readable-grants.ts).
+        resolveSessionOwnedReadablePaths: createSessionReadableGrantResolver({
+            loadSession: (sessionId) => options.sessions.sessions.execution.getExecutionSnapshot(sessionId),
+            sources: [
+                toolOutputGrantSource(toolOutputArtifacts),
+                compactionSnapshotGrantSource({
+                    inspectSnapshotsDirectory: (sessionId) => options.sessions.artifacts.inspectSnapshotsDirectory(sessionId),
+                }),
+                runtimeWorkspaceGrantSource({
+                    dataDir: () => options.product.preparation.configBuilder.config().dataDir,
+                }),
+                ...(options.product.sessionAssets
+                    ? [sessionAttachmentGrantSource(options.product.sessionAssets)]
+                    : []),
+            ],
+            ...(options.product.permission.logger ? { logger: options.product.permission.logger } : {}),
+        }),
+        ...(options.miniAppApprovals ? { miniAppApprovals: options.miniAppApprovals } : {}),
     };
 }
 /** Connects the native v2 AgentHost only to injected product, owner and observer ports. */
 export async function createLocalAgentHost(options) {
+    const isSideChat = (sessionId) => options.sessions.sideChats.relation(sessionId) !== undefined;
     const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
     const contextUsageAnchor = new ContextUsageAnchorState();
-    const toolOutputArtifacts = createToolOutputArtifactRepository(options);
+    // One request-only projection: installed in the main request's hook chain and
+    // repeated by the shared-prefix checkpoint request, so both send the same messages.
+    const mainRequest = createMainRequestProjection((sessionId, messages) => isSideChat(sessionId)
+        ? messages
+        : messages.filter((message) => !isSideChatModeMessage(message)));
+    const toolOutputArtifacts = new ToolOutputArtifactRepository({
+        resolveSessionReportsDirectory: (id) => options.sessions.artifacts.ensureReportsDirectory(id),
+        inspectSessionReportsDirectory: (id) => options.sessions.artifacts.inspectReportsDirectory(id),
+    });
     const getToolResultCompactionConfig = createToolResultCompactionConfigGetter(options);
-    const toolResultArchiver = new ToolResultArchiver({
-        writeArtifact: (input) => toolOutputArtifacts.write(input),
+    const getRequestMediaConfig = createRequestMediaConfigGetter(options);
+    const getImageEncoding = () => requestImageEncoding(getRequestMediaConfig().image);
+    const imageFileWriter = new CheckpointImageFileWriter({
+        writeImageArtifact: (input) => toolOutputArtifacts.writeImage(input),
         logger: options.product.runner.logger,
-        getConfig: getToolResultCompactionConfig,
     });
     const mcpToolResultHistoryExternalizer = createMcpToolResultHistoryExternalizer(options, toolOutputArtifacts, getToolResultCompactionConfig);
-    const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig);
+    const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding);
     const dependencies = await createNativeAgentHostProductionDependencies({
         sessions: {
             get: (sessionId) => options.sessions.sessions.execution.getExecutionSnapshot(sessionId),
@@ -130,7 +185,7 @@ export async function createLocalAgentHost(options) {
         turnRuntimeFacts: options.product.turnRuntimeFacts,
         preparation: options.preparation,
         toolCatalog: {
-            ...optionalDesktopHostCapabilities(options.cliProductPolicy),
+            hostCapabilityRegistry: createHostCapabilityRegistry(options.cliProductPolicy),
             resolveSources: async (input) => {
                 const session = await requireExecutionSession(options.sessions, input);
                 return options.product.toolSources.resolve({
@@ -151,30 +206,28 @@ export async function createLocalAgentHost(options) {
                     ...(input.agentMemoryReadNames === undefined
                         ? {}
                         : { agentMemoryReadNames: input.agentMemoryReadNames }),
-                    ...(input.allowedSkillNames === undefined
-                        ? {}
-                        : { allowedSkillNames: input.allowedSkillNames }),
-                    ...(input.allowedExtensionSkillNames === undefined
-                        ? {}
-                        : { allowedExtensionSkillNames: input.allowedExtensionSkillNames }),
                     ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
                 });
             },
             config: options.product.preparation.configBuilder.config().mcpToolSearch,
             env: process.env,
+            // run_code saves a return value over 64 KiB where oversized results are externalized.
+            writePtcReturnArtifact: (input) => toolOutputArtifacts.write(input),
         },
-        inputPreparation: options.product.inputPreparation,
-        permission: createHostPermissionPolicy(options),
+        inputPreparation: { ...options.product.inputPreparation, getImageEncoding },
+        permission: createHostPermissionPolicy(options, toolOutputArtifacts),
         runner: {
             ...options.product.runner,
+            resolveComputerUseCapture: options.resolveComputerUseCapture,
             reviewContent: options.safety.review,
+            onSlowReview: options.onSlowReview,
         },
         ...optionalToolPolicyGuard(options.toolPolicyGuard),
         executor: {
             ...options.product.executor,
+            nativeDelete: () => options.product.preparation.configBuilder.config().permission?.nativeDelete === true,
             logger: options.product.runner.logger,
-            backgroundCadenceReminder: createBackgroundCadenceReminder(contextUsageAnchor),
-            canAppendExecutionBudgetReminder: (input, marker) => fitsReminderInFinalRequest(input, marker, contextUsageAnchor),
+            ...createHostTurnReminders(contextUsageAnchor, options.memorySummaryContext),
             fileApi: {
                 uploadStores: createFileApiUploadStoreSource({
                     db: options.db,
@@ -201,30 +254,40 @@ export async function createLocalAgentHost(options) {
             preparePluginHookSessionOwnership: options.pluginHookSessionOwnership.prepare,
             activatePluginHookSessionOwnership: options.pluginHookSessionOwnership.activate,
             afterCompactionBeforeLlmCallHooks: [
-                createAutomaticContextRequestFilterHook(),
-                createTodoCadenceReminderHook(contextUsageAnchor),
+                ...mainRequest.hooks,
+                createSessionIdentityReminderHook(contextUsageAnchor),
+                createTodoCadenceReminderHook(contextUsageAnchor, hasPtcTurnChildTodoWrite),
             ],
             onSteeringConsumed: options.onSteeringConsumed,
             onInputReviewResolved: options.onInputReviewResolved,
             resolveLlmRetry: options.resolveLlmRetry,
+            ...optionalTurnAccounting(options.product),
             ...(options.outputTokenCap ? { outputTokenCap: options.outputTokenCap } : {}),
         },
         ...optionalNormalExtensions(normalExtensions),
         turnControl: options.turnControl,
-        ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
-        ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
+        ...optionalTurnHooks(options),
         canonicalHistory: adaptCanonicalHistory(options.sessions.canonicalHistory, options.sessions.sessions.historyMutation),
         compaction: {
             ...createContextCompactors({
+                // The isolated summary request drops every mode message; the replacement
+                // carries a fresh one from `checkpointReminder`.
+                checkpointRequestMessages: (messages) => messages.filter((message) => !isSideChatModeMessage(message)),
+                mainRequestMessages: mainRequest.project,
+                checkpointReminder: (sessionId, timestamp) => isSideChat(sessionId) ? createSideChatModeMessage(timestamp) : undefined,
                 contextUsageAnchor,
                 checkpointState: options.product.checkpointState,
                 logger: options.product.runner.logger,
-                toolResultArchiver,
+                imageFileWriter,
                 promptSnapshots: options.product.promptSnapshots,
+                readConfig: () => options.product.preparation.configBuilder.config(),
+                resolveEarlierFiles: createEarlierFilesResolver(options, toolOutputArtifacts),
             }),
             control: options.turnControl,
             lifecycle: options.sessions.agentProjection.compactionLifecycle,
+            barrier: options.sessions.sessions.historyMutation.compactionBarrier,
             observer: options.sessions.agentProjection.compactionObserver,
+            checkpointSharedPrefixEnabled: createCheckpointSharedPrefixSwitch(options),
             ...(options.product.runner.metricsClient
                 ? { metricsClient: options.product.runner.metricsClient }
                 : {}),
@@ -253,13 +316,26 @@ export async function createLocalAgentHost(options) {
     });
     return { host: new LocalAgentHost(dependencies), lifecycle: dependencies.lifecycle };
 }
-function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig) {
+function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding) {
     return mergeNormalExtensions([
         sessionReportExtension({
             reports: options.sessions.llmCalls,
             reportFailure: options.product.executor.reportFailure,
         }),
         createHostRunawayGuardExtension(options),
+        createHostOutputLimitRecoveryExtension(options),
+        requestMediaExtension({ getImageEncoding }),
+        // Before the output budget: each page is bounded first, so the whole result rarely needs a receipt.
+        webSearchContentBudgetExtension({
+            writeArtifact: (input) => toolOutputArtifacts.write(input),
+            // The extension swallows observer errors, so a throwing logger cannot change the result.
+            onArtifactError: (error, input) => options.product.runner.logger?.error?.({
+                event: 'web_search_content_budget_failed',
+                session_id: input.sessionId,
+                turn_id: input.turnId,
+                reason: safeErrorReason(error),
+            }, '[local-runtime-v2] web_search content kept whole: artifact write failed'),
+        }),
         toolOutputBudgetExtension({
             maxInlineBytes: TOOL_RESULT_COMPACTION_DEFAULTS.maxInlineKiB * 1_024,
             getMaxInlineBytes: () => getToolResultCompactionConfig().maxInlineBytes,
@@ -287,12 +363,72 @@ function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultC
     ], options.product.normalExtensions, options.normalExtensions);
 }
 function createHostRunawayGuardExtension(options) {
-    return createProductionRunawayGuardExtension({
+    const computerUseTurns = new Set();
+    const guard = createProductionRunawayGuardExtension({
         readLocalConfig: () => options.product.preparation.configBuilder.config().runawayGuard,
         readRemoteConfig: options.getRunawayGuardConfig,
         readVerifiedProgress: (input) => options.product.executor.fileChanges.takeToolProgress?.(input) ?? [],
         logger: options.product.runner.logger,
-        reportEvent: (sessionId, event) => options.product.runner.evalReporterFactory?.reportRuntimeEvent?.(sessionId, event),
+        reportEvent: (sessionId, event) => {
+            if (computerUseTurns.has(JSON.stringify([sessionId, event.payload.turn_id])))
+                return;
+            options.product.runner.evalReporterFactory?.reportRuntimeEvent?.(sessionId, event);
+        },
+    });
+    return {
+        ...guard,
+        async init(api) {
+            api.on('turn_start', (_event, ctx) => {
+                if (hasComputerUseHistory(ctx.history))
+                    computerUseTurns.add(computerUseTurnKey(ctx));
+            });
+            api.on('before_llm_call', (event, ctx) => {
+                if (event.tools?.some((tool) => tool.name.startsWith('computer_')) ||
+                    hasComputerUseHistory(event.messages) ||
+                    hasComputerUseHistory(ctx.history)) {
+                    computerUseTurns.add(computerUseTurnKey(ctx));
+                }
+            });
+            api.on('before_tool_call', (event, _signal, ctx) => {
+                if (event.toolCall.name.startsWith('computer_')) {
+                    computerUseTurns.add(computerUseTurnKey(ctx));
+                }
+                return undefined;
+            });
+            await guard.init(api);
+            // Registered after the guard: its turn_end summary must remain isolated too.
+            api.on('turn_end', (_event, ctx) => {
+                computerUseTurns.delete(computerUseTurnKey(ctx));
+            });
+        },
+    };
+}
+function computerUseTurnKey(ctx) {
+    return JSON.stringify([ctx.sessionId, ctx.turnId]);
+}
+function hasComputerUseHistory(messages) {
+    return messages.some((message) => (message.role === 'toolResult' && message.toolName.startsWith('computer_')) ||
+        (message.role === 'assistant' &&
+            message.content.some((part) => part.type === 'toolCall' && part.name.startsWith('computer_'))));
+}
+function createHostOutputLimitRecoveryExtension(options) {
+    const log = (outcome) => (observation) => {
+        options.product.runner.logger?.[outcome === 'exhausted' ? 'error' : 'info']?.({
+            event: 'output_limit_recovery',
+            outcome,
+            session_id: observation.sessionId,
+            turn_id: observation.turnId,
+            attempts: observation.attempts,
+            ...(observation.truncatedToolCall === undefined
+                ? {}
+                : { truncated_tool_call: observation.truncatedToolCall }),
+            ...(observation.model === undefined ? {} : { model: observation.model }),
+        }, '[local-runtime-v2] Output limit recovery');
+    };
+    return outputLimitRecoveryExtension({
+        onRetry: log('retry'),
+        onRecovered: log('recovered'),
+        onExhausted: log('exhausted'),
     });
 }
 function createMcpToolResultHistoryExternalizer(options, artifacts, getConfig) {
@@ -303,41 +439,50 @@ function createMcpToolResultHistoryExternalizer(options, artifacts, getConfig) {
         logger: options.product.runner.logger,
     });
 }
-function createToolOutputArtifactRepository(options) {
-    return new ToolOutputArtifactRepository({
-        resolveSessionReportsDirectory: (sessionId) => options.sessions.artifacts.ensureReportsDirectory(sessionId),
-    });
-}
-function createContextCompactors(input) {
-    return {
-        automatic: new AutomaticContextCompactor(input.contextUsageAnchor, input.checkpointState, input.logger, {
-            toolResultArchiver: input.toolResultArchiver,
-            promptSnapshots: input.promptSnapshots,
-        }),
-        manual: new LocalContextCompactor(input.checkpointState, input.logger, input.promptSnapshots),
+function createEarlierFilesResolver(options, toolOutputArtifacts) {
+    return async (sessionId) => {
+        const [snapshots, toolOutputs] = await Promise.all([
+            options.sessions.artifacts.resolveSnapshotsDirectory(sessionId),
+            toolOutputArtifacts.directory(sessionId),
+        ]);
+        return { snapshots, toolOutputs };
     };
+}
+function createRequestMediaConfigGetter(options) {
+    return () => {
+        let raw;
+        try {
+            raw = options.product.preparation.configBuilder.config().requestMedia;
+        }
+        catch {
+            raw = undefined;
+        }
+        return parseRequestMediaConfig(raw);
+    };
+}
+function requestImageEncoding(image) {
+    return {
+        maxWidth: image.max_width,
+        maxHeight: image.max_height,
+        maxBase64Bytes: image.max_base64_bytes,
+    };
+}
+/** Remote kill switch: only an explicit Apollo `false` restores the isolated checkpoint request. */
+function createCheckpointSharedPrefixSwitch(options) {
+    return () => readToolResultCompactionOverride(options.getToolResultCompactionConfig)
+        ?.checkpointSharedPrefix !== false;
 }
 function createToolResultCompactionConfigGetter(options) {
     const fileConfig = parseToolResultCompactionConfig(readToolResultCompactionFileConfig(options));
     const base = {
-        enabled: fileConfig.enabled,
         maxInlineBytes: fileConfig.maxInlineKiB * 1_024,
         mcpDetailsMaxInlineBytes: fileConfig.mcpDetailsMaxInlineKiB * 1_024,
-        watermarkBytes: fileConfig.watermarkKiB * 1_024,
-        minSavingsBytes: fileConfig.minSavingsKiB * 1_024,
-        minCandidateBytes: fileConfig.minCandidateKiB * 1_024,
-        keepRecentRounds: fileConfig.keepRecentRounds,
     };
     return () => {
         const override = readToolResultCompactionOverride(options.getToolResultCompactionConfig);
         return {
-            enabled: typeof override?.enabled === 'boolean' ? override.enabled : base.enabled,
             maxInlineBytes: positiveSafeInteger(override?.maxInlineBytes) ?? base.maxInlineBytes,
             mcpDetailsMaxInlineBytes: positiveSafeInteger(override?.mcpDetailsMaxInlineBytes) ?? base.mcpDetailsMaxInlineBytes,
-            watermarkBytes: positiveSafeInteger(override?.watermarkBytes) ?? base.watermarkBytes,
-            minSavingsBytes: positiveSafeInteger(override?.minSavingsBytes) ?? base.minSavingsBytes,
-            minCandidateBytes: positiveSafeInteger(override?.minCandidateBytes) ?? base.minCandidateBytes,
-            keepRecentRounds: positiveSafeInteger(override?.keepRecentRounds) ?? base.keepRecentRounds,
         };
     };
 }
@@ -422,21 +567,37 @@ function mergeNormalExtensions(builtins, product, additional) {
     ];
     return merged.length > 0 ? merged : undefined;
 }
+function optionalTurnAccounting(product) {
+    return {
+        ...(product.turnRequestControl
+            ? { resolveTurnRequestControl: product.turnRequestControl }
+            : {}),
+        ...(product.turnUsageRecorder ? { resolveTurnUsageRecorder: product.turnUsageRecorder } : {}),
+    };
+}
 function optionalToolPolicyGuard(toolPolicyGuard) {
     return toolPolicyGuard ? { toolPolicyGuard } : {};
 }
-function optionalDesktopHostCapabilities(cliProductPolicy) {
-    return cliProductPolicy
-        ? {}
-        : {
-            hostCapabilityRegistry: new HostCapabilityRegistry([
-                createBrowserHostCapabilityAdapter(describeLocalBrowserToolInput),
-                createComputerUseHostCapabilityAdapter(),
-            ]),
-        };
+function createHostCapabilityRegistry(cliProductPolicy) {
+    return new HostCapabilityRegistry([
+        // CLI keeps its native Browser path; only CU uses the shared interactive Binding.
+        ...(cliProductPolicy
+            ? []
+            : [createBrowserHostCapabilityAdapter(describeLocalBrowserToolInput)]),
+        createComputerUseHostCapabilityAdapter(),
+    ], { reserveInlineGateway: !cliProductPolicy });
 }
 function optionalNormalExtensions(normalExtensions) {
     return normalExtensions ? { normalExtensions } : {};
+}
+/** Optional per-Turn seams; absent ones are omitted rather than set to undefined. */
+function optionalTurnHooks(options) {
+    return {
+        ...(options.askUserPolicy ? { askUserPolicy: options.askUserPolicy } : {}),
+        ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
+        ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
+        ...(options.promptSuggestion ? { promptSuggestion: options.promptSuggestion } : {}),
+    };
 }
 export function combineAgentEventObservers(...observers) {
     const active = observers.filter((observer) => observer !== undefined);
@@ -453,13 +614,18 @@ export function combineAgentEventObservers(...observers) {
 /** Projects transient provider retry state from Turn execution onto the product event stream. */
 export function createSessionLLMRetryEventObserver(publish) {
     return (event) => {
-        if (event.scope === 'title')
+        // Only foreground/compaction retries belong to the Session retry UI wire contract.
+        if (event.scope !== 'agent' && event.scope !== 'compaction')
             return;
         publish({
             type: 'session.llm_retry',
-            payload: { schemaVersion: 1, ...event },
+            payload: { schemaVersion: 1, ...event, scope: event.scope },
         });
     };
+}
+/** 把运行器的慢送审通知投到产品事件流，界面据此在输入框上方提示检查电脑负荷。 */
+export function createContentReviewSlowEventObserver(publish) {
+    return ({ sessionId, turnId }) => publish({ type: 'content.review.slow', payload: { sessionId, turnId } });
 }
 async function observeAll(observers, observe) {
     const results = await Promise.allSettled(observers.map((observer) => observe(observer)));
@@ -516,28 +682,21 @@ function adaptCanonicalHistory(provider, mutation) {
             const metadata = readCompactionCommitMetadata(operation.metadata);
             if (!metadata)
                 throw new TypeError('Canonical compaction metadata is invalid.');
-            const baseChange = {
+            const committed = await provider.compact({
                 ...operation,
                 reason: 'replaceMessages',
                 operation: { id: operation.operation.id, kind: 'compaction' },
+                method: metadata.method,
                 compactionId: metadata.compactionId,
                 summary: metadata.summary,
                 ...(metadata.currentUserSourceIndex === undefined
                     ? {}
-                    : { currentUserSourceIndex: metadata.currentUserSourceIndex }),
-            };
-            if (metadata.method !== 'llm_checkpoint') {
-                const committed = await provider.compact({
-                    ...baseChange,
-                    method: metadata.method,
-                    replacementSourceIndexes: metadata.replacementSourceIndexes,
-                });
-                validateCanonicalHistoryMessages(committed.messages);
-                return { ...committed, messages: committed.messages };
-            }
-            const committed = await provider.compact({
-                ...baseChange,
-                method: metadata.method,
+                    : {
+                        currentUserSourceIndex: metadata.currentUserSourceIndex,
+                        ...(metadata.placedMarkerCount === undefined
+                            ? {}
+                            : { placedMarkerCount: metadata.placedMarkerCount }),
+                    }),
             });
             validateCanonicalHistoryMessages(committed.messages);
             return { ...committed, messages: committed.messages };
@@ -587,13 +746,6 @@ function requireHistoryOperation(change) {
     if (!change.operation)
         throw new TypeError('Canonical history operation is required.');
     return { ...change, operation: change.operation };
-}
-function mutableTitleContext(context) {
-    return {
-        systemPrompt: context.systemPrompt,
-        messages: context.messages.map((message) => ({ ...message })),
-        ...(context.tools ? { tools: [...context.tools] } : {}),
-    };
 }
 function describeError(error) {
     return error instanceof Error ? error.message : String(error);

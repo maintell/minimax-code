@@ -55,6 +55,7 @@ export function toQueuedMessageItemView(item, overrides = {}) {
         ...(item.expiresAt !== undefined ? { expiresAt: item.expiresAt } : {}),
         ...(overrides.finishedAt !== undefined ? { finishedAt: overrides.finishedAt } : {}),
         ...(item.message.source === 'code_review' ? { reviewRequest: { scope: 'local_changes' } } : {}),
+        ...(item.message.computerUse ? { computerUse: item.message.computerUse } : {}),
     };
 }
 function toQueueAttachment(input) {

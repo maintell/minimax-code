@@ -3,6 +3,7 @@
 // the outcome to `unauthorized` / `timeout` / `network` / `http_<status>` /
 // `provider_error` / `invalid_response`. Structured upstream failures retain
 // their reason after removing configured secrets and common credential shapes.
+import { getSimpleGoogleThinkingConfig, } from '@earendil-works/pi-ai/google';
 import { buildProviderHeaders, providerCompletionUrl } from './provider-request.js';
 import { resolveMiniMaxM3ThinkingProtocol, resolveModelThinkingProtocol, } from '../resolution/model-ref.js';
 import { byokEffectiveOutputLimit } from '../resolution/model-resolver-byok.js';
@@ -136,7 +137,7 @@ function normalizeProviderStatusCode(value) {
         return undefined;
     return value.trim() || undefined;
 }
-function redactConnectionTestError(value, target) {
+export function redactConnectionTestError(value, target) {
     let message = value.replace(/\s+/gu, ' ').trim();
     const secrets = [target.apiKey, ...Object.values(target.headers ?? {})]
         .map((secret) => secret.trim())
@@ -169,18 +170,37 @@ function resolveTestOutputLimit(target) {
     return configured;
 }
 function buildTestRequest(target) {
+    const url = providerCompletionUrl(target.api, target.baseUrl, target.modelId);
+    const headers = buildProviderHeaders(target);
+    const maxTokens = resolveTestOutputLimit(target);
+    if (target.api === 'google-generative-ai') {
+        const thinkingConfig = geminiProbeThinkingConfig(target);
+        return {
+            url,
+            init: {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+                    generationConfig: {
+                        maxOutputTokens: maxTokens,
+                        ...(thinkingConfig && { thinkingConfig }),
+                    },
+                }),
+            },
+        };
+    }
     const messages = [{ role: 'user', content: 'ping' }];
     const thinking = resolveModelThinkingProtocol(target.api, target.effort, target.modelId);
     const requestPatch = target.minimaxM3ThinkingMode
         ? resolveMiniMaxM3ThinkingProtocol(target.api, target.minimaxM3ThinkingMode)
         : (thinking?.requestPatch ?? {});
-    const maxTokens = resolveTestOutputLimit(target);
     if (target.api === 'anthropic-messages') {
         return {
-            url: providerCompletionUrl(target.api, target.baseUrl),
+            url,
             init: {
                 method: 'POST',
-                headers: buildProviderHeaders(target),
+                headers,
                 body: JSON.stringify({
                     model: target.modelId,
                     max_tokens: maxTokens,
@@ -193,10 +213,10 @@ function buildTestRequest(target) {
     }
     if (target.api === 'openai-responses') {
         return {
-            url: providerCompletionUrl(target.api, target.baseUrl),
+            url,
             init: {
                 method: 'POST',
-                headers: buildProviderHeaders(target),
+                headers,
                 body: JSON.stringify({
                     model: target.modelId,
                     input: 'ping',
@@ -208,10 +228,10 @@ function buildTestRequest(target) {
         };
     }
     return {
-        url: providerCompletionUrl(target.api, target.baseUrl),
+        url,
         init: {
             method: 'POST',
-            headers: buildProviderHeaders(target),
+            headers,
             body: JSON.stringify({
                 model: target.modelId,
                 max_tokens: maxTokens,
@@ -221,6 +241,32 @@ function buildTestRequest(target) {
             }),
         },
     };
+}
+/**
+ * Gemini thinking is not a request patch: Pi's Google transport derives
+ * `thinkingConfig` from the resolved model and level. Rebuild the same model
+ * fields the resolver produces so the probe sends what a real turn sends.
+ */
+function geminiProbeThinkingConfig(target) {
+    const thinking = resolveModelThinkingProtocol(target.api, target.effort, target.modelId);
+    if (!thinking)
+        return undefined;
+    const enabled = thinking.enabled !== false;
+    const model = {
+        id: target.modelId,
+        name: target.modelId,
+        api: 'google-generative-ai',
+        provider: 'byok-probe',
+        baseUrl: target.baseUrl,
+        reasoning: true,
+        ...(enabled ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 0,
+        maxTokens: resolveTestOutputLimit(target),
+    };
+    const reasoning = enabled && thinking.piLevel !== 'off' ? thinking.piLevel : undefined;
+    return getSimpleGoogleThinkingConfig(model, reasoning);
 }
 async function validateSuccessResponse(response, api, target) {
     const payload = await readJsonBody(response);
@@ -232,13 +278,7 @@ async function validateSuccessResponse(response, api, target) {
             errorMessage: redactConnectionTestError(providerError, target) ?? 'Model provider error',
         };
     }
-    if (api === 'anthropic-messages' && isMessagesResponse(payload)) {
-        return { ok: true };
-    }
-    if (api === 'openai-completions' && isOpenAiChatCompletionsResponse(payload)) {
-        return { ok: true };
-    }
-    if (api === 'openai-responses' && isOpenAiResponsesResponse(payload)) {
+    if (SUCCESS_RESPONSE_SHAPES[api](payload)) {
         return { ok: true };
     }
     return {
@@ -247,6 +287,12 @@ async function validateSuccessResponse(response, api, target) {
         errorMessage: 'Invalid response from model provider',
     };
 }
+const SUCCESS_RESPONSE_SHAPES = {
+    'anthropic-messages': isMessagesResponse,
+    'openai-completions': isOpenAiChatCompletionsResponse,
+    'openai-responses': isOpenAiResponsesResponse,
+    'google-generative-ai': isGeminiGenerateContentResponse,
+};
 async function readJsonBody(response) {
     try {
         return await response.json();
@@ -273,6 +319,9 @@ function isOpenAiChatCompletionsResponse(payload) {
 function isOpenAiResponsesResponse(payload) {
     const data = readRecord(payload);
     return data.object === 'response' && typeof data.id === 'string' && Array.isArray(data.output);
+}
+function isGeminiGenerateContentResponse(payload) {
+    return Array.isArray(readRecord(payload).candidates);
 }
 function readRecord(value) {
     return value && typeof value === 'object' && !Array.isArray(value)

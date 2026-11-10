@@ -51,8 +51,12 @@ export const THREAD_GOAL_STATUS_REASONS = [
     'complete(user_requested)',
     'paused(user_requested)',
     'paused(retracted)',
+    // A user side message the runtime received but could neither steer nor
+    // queue while the Goal was active; the running Turn may still finish.
+    'paused(message_undelivered)',
     'paused(infra_retryable)',
     'paused(accounting_unavailable)',
+    'paused(questionnaire_failed)',
     'paused(verifier_unavailable)',
     'paused(route_unavailable)',
     // Verifier pauses are split by owner layer, not by adapter error: see

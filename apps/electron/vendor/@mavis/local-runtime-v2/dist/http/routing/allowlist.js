@@ -26,6 +26,8 @@ const CANVAS_OWNER_METHODS = new Set([
     'readCanvas',
     'prepareCanvasFiles',
     'applyCanvasOperation',
+    'removeCanvasImageBackground',
+    'enhanceCanvasImage',
 ]);
 const GLOBAL_EVENTS_METHODS = new Set(['subscribeGlobalEvents']);
 const GLOBAL_INSTRUCTIONS_METHODS = new Set([
@@ -53,6 +55,8 @@ const CRON_OWNER_METHODS = new Set([
     'deliverCron',
 ]);
 const PREFERENCE_OWNER_METHODS = new Set([
+    'getComputerUseDefaultPreference',
+    'putComputerUseDefaultPreference',
     'getComposerSendBehavior',
     'putComposerSendBehavior',
     'getComposerEnterBehavior',
@@ -67,7 +71,11 @@ const SESSION_TURN_METHODS = new Set([
     'enqueueMessage',
     'requestCompaction',
     'steerSession',
+    'sendRemoteMessage',
+    'cancelPromptSuggestion',
+    'getPromptSuggestion',
 ]);
+const SESSION_ACTIVITY_METHODS = new Set(['getSessionActivity']);
 /** Desktop Plugin Marketplace and standalone Skill management. */
 const PLUGIN_SERVICE_METHODS = new Set([
     'listMarketplacePlugins',
@@ -105,6 +113,12 @@ const PLUGIN_SERVICE_METHODS = new Set([
     'refreshPlugins',
     'previewGithubPlugin',
     'importGithubPlugin',
+    'updatePlugin',
+    'listPluginMarketplaces',
+    'addPluginMarketplace',
+    'refreshPluginMarketplaces',
+    'setPluginMarketplaceAutoUpdate',
+    'removePluginMarketplace',
     'setSkillEnabled',
 ]);
 const MODEL_PROVIDER_METHODS = new Set([
@@ -126,14 +140,50 @@ const MODEL_PROVIDER_METHODS = new Set([
     'testUserModelCandidate',
     'discoverUserModelsCandidate',
     'saveUserModelProviderCandidate',
+    'testUserModelApiKey',
+    'unrestUserModelApiKey',
     'discoverUserModels',
     'updateMinimaxModelContext',
     'getMinimaxModelSource',
     'setMinimaxModelSource',
 ]);
+const MODEL_ACCESS_METHODS = new Set([
+    'listModelAccess',
+    'previewModelAccessPackage',
+    'importModelAccessPackage',
+    'enableModelAccessPackage',
+    'disableModelAccessPackage',
+    'rollbackModelAccessPackage',
+    'uninstallModelAccessPackage',
+    'approveModelAccessDevRequest',
+    'dismissModelAccessDevRequest',
+    'startModelAccessDevSession',
+    'reloadModelAccessDevSession',
+    'stopModelAccessDevSession',
+    'promoteModelAccessDevSession',
+    'getModelAccessExtensionStatus',
+    'exportModelAccessPackage',
+    'setModelAccessGlobal',
+    'setModelAccessTarget',
+    'syncModelAccessDelivery',
+    'setModelAccessDeliveryOptIn',
+    'beginModelAccessLogin',
+    'getModelAccessLoginStatus',
+    'submitModelAccessLogin',
+    'cancelModelAccessLogin',
+    'discoverModelAccessBorrow',
+    'useModelAccessBorrow',
+    'scanModelAccessApi',
+    'listModelAccessApiCandidates',
+    'importModelAccessApi',
+    'queryModelAccessUsage',
+    'enableModelAccessPublicProvider',
+    'disableModelAccessPublicProvider',
+    'getModelAccessFailover',
+    'setModelAccessFailover',
+]);
 const WORKSPACE_GIT_METHODS = new Set([
     'suggestCommitMessage',
-    'saveWorkspaceFile',
     'getWorkspaceFileDiff',
     'listWorkspaceFileDiffs',
     'getWorkspaceDiffContext',
@@ -161,6 +211,52 @@ const WORKSPACE_GIT_METHODS = new Set([
     'invalidateWorkspaceGitSnapshot',
     'invalidateAllWorkspaceGitSnapshots',
     'listWorkspaceGitWorktrees',
+]);
+/**
+ * Runtime-owned filesystem surface used by Remote Control and Desktop.
+ * `previewWorkspaceFile`, `listFsDirs`, and `getFsGitInfo` are host-scope by
+ * design (attachment previews and the workspace picker predate any workspace
+ * root); the caller is the authenticated same-user client behind SSH.
+ */
+const WORKSPACE_FILE_METHODS = new Set([
+    'getWorkspaceFileMetadata',
+    'listWorkspaceFileTree',
+    'readWorkspaceFile',
+    'watchWorkspaceFiles',
+    'saveWorkspaceFile',
+    'searchWorkspaceFiles',
+    'streamWorkspaceFileSearch',
+    'stopWorkspaceFileSearch',
+    'previewWorkspaceFile',
+    'createWorkspaceGitWorktree',
+    'removeWorkspaceGitWorktree',
+    'listFsDirs',
+    'getFsGitInfo',
+]);
+/** Actions whose side effect targets the caller's desktop rather than the remote workspace. */
+const WORKSPACE_LOCAL_ACTION_METHODS = new Set([
+    'openWorkspaceApp',
+    'listIdeApps',
+    'openWorkspaceFile',
+    'revealWorkspaceFile',
+    'openWorkspaceFileInIde',
+]);
+/** Permission and AskUser request/response routes. */
+const INTERACTION_METHODS = new Set([
+    'beginQuestionnaire',
+    'replyQuestionnaire',
+    'dismissQuestionnaire',
+    'getPendingQuestionnaire',
+    'getQuestionnaire',
+    'getLatestPlanReview',
+    'getPermissionMode',
+    'setPermissionMode',
+    'replyPermission',
+    'replyQuestion',
+    'rejectQuestion',
+    'listPendingPermissions',
+    'dismissPermission',
+    'batchReplyPermissions',
 ]);
 /**
  * Inspector 读取面与设置。挂载条件是宿主真的组装了 Inspector service，因此不会
@@ -207,6 +303,15 @@ const MEMORY_V2_METHODS = new Set([
     'prepareLegacyMemoryMigration',
     'acceptLegacyMemoryMigration',
     'discardLegacyMemoryMigration',
+    'getMemoryV2Onboarding',
+    'completeMemoryV2Onboarding',
+]);
+const GOAL_OWNER_METHODS = new Set([
+    'createGoal',
+    'getGoal',
+    'patchGoal',
+    'deleteGoal',
+    'dismissGoal',
 ]);
 const OWNER_METHOD_GROUPS = {
     agent: AGENT_OWNER_METHODS,
@@ -214,16 +319,23 @@ const OWNER_METHOD_GROUPS = {
     globalEvents: GLOBAL_EVENTS_METHODS,
     cron: CRON_OWNER_METHODS,
     modelProvider: MODEL_PROVIDER_METHODS,
+    modelAccess: MODEL_ACCESS_METHODS,
     session: SESSION_TURN_METHODS,
     plugin: PLUGIN_SERVICE_METHODS,
     workspaceGit: WORKSPACE_GIT_METHODS,
+    workspaceFile: WORKSPACE_FILE_METHODS,
+    workspaceLocalActions: WORKSPACE_LOCAL_ACTION_METHODS,
     workspaceIndexing: WORKSPACE_INDEXING_METHODS,
+    interaction: INTERACTION_METHODS,
     llmContextInspector: LLM_CONTEXT_INSPECTOR_METHODS,
     preference: PREFERENCE_OWNER_METHODS,
+    agentShell: new Set(['getAgentShellStatus', 'putAgentShellPreference']),
     sandbox: SANDBOX_METHODS,
     globalInstructions: GLOBAL_INSTRUCTIONS_METHODS,
     channel: CHANNEL_OWNER_METHODS,
     memoryV2: MEMORY_V2_METHODS,
+    goal: GOAL_OWNER_METHODS,
+    sessionActivity: SESSION_ACTIVITY_METHODS,
 };
 /** Worktree routes are always owned by the V2 front door and never fall through. */
 const WORKTREE_METHODS = new Set([
@@ -239,6 +351,13 @@ const MCP_METHODS = new Set([
     'deleteLocalMcpServer',
     'setLocalMcpServerEnabled',
     'testLocalMcpServer',
+    'setLocalMcpServerOAuthClientSecret',
+    'listLocalMcpAuthStates',
+    'testLocalMcpAuthTarget',
+    'startLocalMcpAuth',
+    'cancelLocalMcpAuth',
+    'completeLocalMcpAuth',
+    'clearLocalMcpAuth',
     'listLocalMcpRuntimeServers',
     'getLocalMcpRuntimeServer',
     'upsertLocalMcpRuntimeServer',
@@ -252,6 +371,15 @@ const MCP_METHODS = new Set([
     'getLocalMcpRuntimeSyncStatus',
     'callLocalMcpRuntimeTool',
 ]);
+/** User/project hooks.json settings have no v1 owner; absent services answer 503. */
+const HOOK_METHODS = new Set([
+    'listLocalHooks',
+    'createLocalHook',
+    'updateLocalHook',
+    'deleteLocalHook',
+    'setLocalHookEnabled',
+    'setLocalHookScopeEnabled',
+]);
 /**
  * 只有生产组装提供完整 Application 依赖图时，Session/Application 路由才会启用。
  * 该能力与 Cron/event owner 分开判断，避免依赖不完整的 host 在此次整体切换中声明这些方法。
@@ -259,6 +387,11 @@ const MCP_METHODS = new Set([
 const SESSION_APPLICATION_METHODS = new Set([
     'pinAgent',
     'pinSession',
+    'listBackgroundTasks',
+    'getBackgroundTask',
+    'readBackgroundTaskOutput',
+    'stopBackgroundTask',
+    'deleteBackgroundTask',
     'getPinnedItemsOrder',
     'putPinnedItemsOrder',
     'getRootSession',
@@ -294,6 +427,8 @@ const SESSION_APPLICATION_METHODS = new Set([
     'querySidebarAgents',
     'getSidebarSession',
     'listProjects',
+    'createProject',
+    'updateProject',
     'listProjectSessions',
     'setProjectPinned',
     'setProjectHidden',
@@ -308,6 +443,9 @@ const SESSION_APPLICATION_METHODS = new Set([
     'overwriteSessionResult',
 ]);
 const SESSION_APPLICATION_MUTATION_METHODS = new Set([
+    'createSideChat',
+    'createSideChatFromQueue',
+    'promoteSideChat',
     'getSessionForkOptions',
     'forkSession',
     'getSessionRewindPreview',
@@ -328,7 +466,12 @@ const RETIRED_CRON_METHODS = new Set([
 ]);
 export function migratedMethodsForHost(hasOwnerServices, hasSessionApplications = false) {
     // 每个 host 都挂载始终可用的探针和 worktree 路由；缺失 facade 时明确返回 503。
-    const migrated = new Set([...ALWAYS_MOUNTED_METHODS, ...WORKTREE_METHODS, ...MCP_METHODS]);
+    const migrated = new Set([
+        ...ALWAYS_MOUNTED_METHODS,
+        ...WORKTREE_METHODS,
+        ...MCP_METHODS,
+        ...HOOK_METHODS,
+    ]);
     if (typeof hasOwnerServices === 'boolean') {
         if (!hasOwnerServices)
             return migrated;

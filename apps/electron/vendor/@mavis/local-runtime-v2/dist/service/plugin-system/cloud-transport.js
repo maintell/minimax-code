@@ -33,6 +33,9 @@ export class PluginSystemCloudTransport {
         this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
         this.downloadTimeoutMs = options.downloadTimeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS;
     }
+    currentLane() {
+        return this.options.laneGetter ? this.options.laneGetter() : this.options.lane;
+    }
     async request(request) {
         const auth = readAuth(resolveAuthContext(request, this.options.authContextGetter), request.auth);
         const now = this.nowMs();
@@ -62,7 +65,7 @@ export class PluginSystemCloudTransport {
                     now,
                     signedPath,
                     previewSecret: this.options.previewSecret,
-                    lane: this.options.lane,
+                    lane: this.currentLane(),
                 }),
                 ...(bodyText ? { body: bodyText } : {}),
                 signal,

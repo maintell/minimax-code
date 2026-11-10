@@ -1,5 +1,11 @@
+import { poolCatalog } from './failover/pool-catalog.js';
+import path from 'node:path';
+import { createModelAccessFailoverPort } from './failover/pool-lease.js';
+import { FailoverPoolState } from './failover/pool-state.js';
+import { FailoverFileStateStore } from './failover/state-store.js';
 import { compareAndSetLocalModelContext, getConfig, removeLocalProviderConfig, updateLocalByokConfig, updateLocalModelSelection, } from '@mavis/config';
 import { LocalModelCache } from './catalog/model-cache.js';
+import { isModelAccessProvider } from './model-access/projection.js';
 import { ProviderPresetCatalog } from './catalog/provider-presets/provider-presets.service.js';
 import { CodexOAuthManager } from './codex-oauth.js';
 import { ModelDiscoveryClient } from './connectivity/discover-models.js';
@@ -22,6 +28,11 @@ export function createLocalModelSystemConfigPort(read = getConfig) {
         removeProvider: removeLocalProviderConfig,
     };
 }
+function failoverState(dataDir) {
+    if (!dataDir || !path.isAbsolute(dataDir))
+        return new FailoverPoolState();
+    return new FailoverPoolState(Date.now, FailoverFileStateStore.forProfile(dataDir));
+}
 /** Composes the single Runtime V2 owner for model resolution and Provider management. */
 export function initializeModelSystem(options) {
     const providerPresets = new ProviderPresetCatalog({
@@ -29,8 +40,53 @@ export function initializeModelSystem(options) {
         previewSecret: process.env.PREVIEW_SECRET,
         lane: process.env.MAVIS_PLUGIN_CLOUD_LANE,
     });
+    const resolverAccess = options.resolverOptions?.modelAccess;
+    // Only committed model-access entries contribute metadata; ordinary BYOK never does.
+    const catalogModel = (providerKey, modelId) => {
+        const provider = options.config.read().custom_provider?.[providerKey];
+        return isModelAccessProvider(provider) ? provider?.models?.[modelId] : undefined;
+    };
+    const bindings = resolverAccess?.bindings;
+    const modelAccess = resolverAccess
+        ? {
+            ...resolverAccess,
+            catalogModel: (key, id) => isModelAccessProvider(options.config.read().custom_provider?.[key])
+                ? poolCatalog({
+                    config: options.config.read,
+                    binding: (memberKey) => bindings?.peek(memberKey),
+                    installationActive: resolverAccess.installationActive,
+                }, key)[id]
+                : undefined,
+            catalog: (key) => isModelAccessProvider(options.config.read().custom_provider?.[key])
+                ? poolCatalog({
+                    config: options.config.read,
+                    binding: (memberKey) => bindings?.peek(memberKey),
+                    installationActive: resolverAccess.installationActive,
+                }, key)
+                : undefined,
+            // Multi-account pools need binding facts; resolver-only ports never fail over.
+            ...(bindings
+                ? {
+                    failover: createModelAccessFailoverPort({
+                        config: options.config.read,
+                        binding: (providerKey) => bindings.peek(providerKey),
+                        catalog: catalogModel,
+                        ...(resolverAccess.installationActive
+                            ? { installationActive: resolverAccess.installationActive }
+                            : {}),
+                        ...(resolverAccess.requests.ready
+                            ? { ready: (key) => resolverAccess.requests.ready(key) }
+                            : {}),
+                    }, 
+                    // Session affinity and revoked sign-ins survive a restart (no credentials).
+                    failoverState(options.config.read().dataDir)),
+                }
+                : {}),
+        }
+        : undefined;
     const resolver = new LocalModelResolver({
         ...options.resolverOptions,
+        ...(modelAccess ? { modelAccess } : {}),
         providerConfigGetter: () => options.config.read().provider,
         byokConfigGetter: () => {
             const config = options.config.read();
@@ -48,6 +104,7 @@ export function initializeModelSystem(options) {
         removeLegacyProvider: options.config.removeProvider,
     });
     const providers = new LocalModelProviderService({
+        rankModelsByRecency: (input) => providerPresets.rankModelsByRecency(input),
         configGetter: options.config.read,
         updateByokConfig: options.config.updateByok,
         cache: new LocalModelCache(() => options.config.read().dataDir),
@@ -55,6 +112,7 @@ export function initializeModelSystem(options) {
         discoverer: new ModelDiscoveryClient(options.fetchImpl),
         compareAndSetModelContext: options.config.compareAndSetModelContext,
         removeProviderCredentials: (providerKey) => oauth.removeCredentials(providerKey),
+        modelAccess,
         selectModel: (modelKey) => options.config.setDefaultModel(modelKey),
         ...(options.implicitCustomProviderThinking ? { implicitCustomProviderThinking: true } : {}),
     });
@@ -63,6 +121,7 @@ export function initializeModelSystem(options) {
         providers,
         oauth,
         listProviderPresets: () => providerPresets.listProviderPresets(),
+        rankModelsByRecency: (input) => providerPresets.rankModelsByRecency(input),
     };
 }
 //# sourceMappingURL=initialize.js.map

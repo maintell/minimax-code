@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { parseArchiveTitleVerdict } from './archived-root-title.js';
+import { TitleGenerationBudget } from '../title/title-generation-budget.js';
 import { RootArchiveTitleModelError, } from './root-archive-title-model.js';
 import { completeTitleModel, TitleModelCompletionError, } from '../title/title-model-completion.js';
 const CONFIG_FIELD_SAFETY_SCENE = 205;
@@ -14,12 +15,43 @@ export class ArchiveTitleModelAdapter {
         this.makeTurnId = options.makeTurnId ?? (() => `turn_archive_title_${randomUUID()}`);
     }
     async summarize(input) {
+        const budget = new TitleGenerationBudget(input.timeoutMs, input.signal ? [input.signal] : [], input.deadlineAt);
+        try {
+            budget.assertActive();
+            const { raw, contentReviewRequired } = await this.complete({
+                ...input,
+                signal: budget.signal,
+                deadlineAt: budget.deadlineAt,
+            });
+            budget.assertActive();
+            const title = raw ? parseArchiveTitleVerdict(raw) : null;
+            if (!title)
+                return null;
+            // Models that do not require content review (BYOK) keep their title unreviewed.
+            if (contentReviewRequired === false)
+                return title;
+            // Review is currently non-cooperative: retain ownership until it actually settles.
+            const reviewed = await this.reviewTitle(title);
+            budget.assertActive();
+            return reviewed;
+        }
+        finally {
+            budget.dispose();
+        }
+    }
+    async complete(input) {
         const turnId = this.makeTurnId();
+        // 记下这次生成标题用的模型要不要审，标题出来后据此决定是否送审。
+        let contentReviewRequired;
         let raw;
         try {
             raw = await completeTitleModel({
                 buildAgentConfig: this.options.buildAgentConfig,
-                resolveModel: this.options.resolveModel,
+                resolveModel: async (resolveInput) => {
+                    const resolved = await this.options.resolveModel(resolveInput);
+                    contentReviewRequired = resolved.contentReviewRequired;
+                    return resolved;
+                },
                 stream: this.options.stream,
                 nowMs: this.nowMs,
             }, { ...input, turnId });
@@ -29,10 +61,7 @@ export class ArchiveTitleModelAdapter {
                 throw error;
             throw new RootArchiveTitleModelError('model', error.message, error);
         }
-        const title = raw ? parseArchiveTitleVerdict(raw) : null;
-        if (!title)
-            return null;
-        return this.reviewTitle(title);
+        return { raw, contentReviewRequired };
     }
     async reviewTitle(title) {
         let verdict;

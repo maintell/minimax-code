@@ -1,10 +1,12 @@
 import { readFileSync, existsSync, renameSync, unlinkSync, statSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
+import { sanitizeBrowserTelemetryPayload } from "./browser-telemetry-sanitizer";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { app, ipcMain } from "electron";
 import { IPC_CHANNELS } from "../../config/constants";
 import { boundFailureDetail } from "./failure-detail";
 import { sanitizeWorkspaceIndexingPayload } from "./workspace-indexing";
+import { AUTH_REFRESH_SUMMARY_EVENT, sanitizeAuthRefreshSummaryPayload } from "./auth-refresh-summary";
 import logger from "../../utils/logger";
 import { setupElectronStartupPerformanceIPC } from "./startup-performance";
 import { readSystemSessionEndEvidence } from "./system-session-end";
@@ -200,9 +202,38 @@ function sanitizeUtilityRuntimePayload(payload) {
     }
     return sanitized;
 }
+const HOT_UPDATE_CHANNELS = new Set(['prod', 'internal', 'inside', 'staging', 'test', 'none']);
+const HOT_UPDATE_RESULTS = new Set(['success', 'error', 'rejected', 'available', 'up_to_date']);
+const HOT_UPDATE_VERSION_PATTERN = /^(bundled|\d+\.\d+\.\d+-renderer\.\d+)$/;
+/** hot_update.* 只保留通道、版本、结果等有限字段；reason 走路径脱敏与长度上限 */
+function sanitizeHotUpdatePayload(payload) {
+    const sanitized = {
+        ...safeCommonMetadata(payload),
+        domain: 'hot_update',
+        channel: boundedValue(payload.channel, HOT_UPDATE_CHANNELS),
+    };
+    if (typeof payload.version === 'string' && HOT_UPDATE_VERSION_PATTERN.test(payload.version)) {
+        sanitized.version = payload.version;
+    }
+    if (payload.result !== undefined) {
+        sanitized.result = boundedValue(payload.result, HOT_UPDATE_RESULTS);
+    }
+    if (typeof payload.reason === 'string') {
+        sanitized.reason = boundFailureDetail(payload.reason);
+    }
+    if (typeof payload.duration_ms === 'number' && Number.isFinite(payload.duration_ms)) {
+        sanitized.duration_ms = payload.duration_ms;
+    }
+    if (typeof payload.promoted === 'boolean')
+        sanitized.promoted = payload.promoted;
+    return sanitized;
+}
 function sanitizeGenericProbePayload(eventName, payload) {
     if (eventName === 'workspace_indexing.state') {
         return { ...safeCommonMetadata(payload), ...sanitizeWorkspaceIndexingPayload(payload) };
+    }
+    if (eventName === AUTH_REFRESH_SUMMARY_EVENT) {
+        return { ...safeCommonMetadata(payload), ...sanitizeAuthRefreshSummaryPayload(payload) };
     }
     if (eventName === 'app.crash') {
         // `source` collides with the RUM SDK's built-in source dimension and is
@@ -240,6 +271,10 @@ function sanitizeGenericProbePayload(eventName, payload) {
                 payload.crashed_app_instance_id.length <= MAX_CRASHED_APP_INSTANCE_ID_LENGTH
                 ? { crashed_app_instance_id: payload.crashed_app_instance_id }
                 : {}),
+            ...(payload.crashed_browser_backend === 'webview' ||
+                payload.crashed_browser_backend === 'web-contents-view'
+                ? { crashed_browser_backend: payload.crashed_browser_backend }
+                : {}),
         };
     }
     if (eventName === 'app.system_session_end') {
@@ -255,6 +290,12 @@ function sanitizeGenericProbePayload(eventName, payload) {
     // sibling event with a different shape starts flowing through the outbox.
     if (eventName.startsWith('utility_runtime.')) {
         return sanitizeUtilityRuntimePayload(payload);
+    }
+    if (eventName.startsWith('hot_update.')) {
+        return sanitizeHotUpdatePayload(payload);
+    }
+    if (eventName.startsWith('browser.')) {
+        return sanitizeBrowserTelemetryPayload(eventName, payload, safeCommonMetadata(payload));
     }
     if (eventName === 'desktop.abnormal_page') {
         return {

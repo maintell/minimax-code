@@ -4,6 +4,7 @@
 // (they are part of the Config surface); the back edge here is type-only, so
 // there is no runtime import cycle.
 import { MINIMAX_MODELS } from './minimax-model-catalog.js';
+import { deliveredDefaultModelId } from './model-availability.js';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -232,8 +233,8 @@ export function migrateLegacyByokProvidersOnDisk(configPath, deps) {
 // BYOK for protected builds lives exclusively in the `minimax_api` /
 // `custom_provider` trees. The result is never written back to disk, and
 // user-owned trees (`minimax_api`, `custom_provider`) are never touched.
-// Selection fallback for a dangling defaultModel is owned by the models/select
-// layer, not by this read path.
+// A missing managed defaultModel reads as the delivered default; replacing a
+// dangling saved defaultModel is owned by the official snapshot sync.
 //
 // `minimax_api` is additionally a reserved provider id: the resolver matches
 // it before falling back to the legacy provider map, so a hand-written
@@ -288,7 +289,21 @@ export function applyRequiredProviderOverrides(input, deps) {
             },
         },
     };
-    return { provider, defaultModel };
+    return {
+        provider,
+        defaultModel: defaultModel ?? deliveredRuntimeDefault(provider, managedRuntime),
+    };
+}
+/**
+ * A managed user who never saved a default follows the delivered default
+ * (`model_order`), so a later delivery change moves them too. Read-only: the
+ * on-disk config is never rewritten here.
+ */
+function deliveredRuntimeDefault(provider, managedRuntime) {
+    if (!managedRuntime)
+        return undefined;
+    const modelId = deliveredDefaultModelId(provider.minimax);
+    return modelId ? `minimax/${modelId}` : undefined;
 }
 function isManagedOriginMinimaxProvider(provider, deps) {
     const options = provider?.options;

@@ -1,7 +1,6 @@
-import { McpNameRegistry, pluginMcpNameKey, McpConnectionPool, } from '@mavis/mcp';
+import { attachProgrammaticErrorRaw } from '@mavis/agent-core/tools';
+import { describeMcpCallError, findMcpAuthRequiredError, McpNameRegistry, pluginMcpNameKey, McpConnectionPool, } from '@mavis/mcp';
 const LIST_TOOLS_CONCURRENCY = 4;
-const MAX_TOOLS_PER_SERVER = 128;
-const MAX_TOOLS_PER_SNAPSHOT = 256;
 /**
  * Desktop Plugin MCP owner. Its pool and lookup are deliberately separate
  * from v1 LocalMcpService, whose connections belong to the user's mcp.json.
@@ -10,21 +9,27 @@ export class PluginMcpRuntime {
     servers = new Map();
     lifecycleKeys = new Map();
     inventories = new Map();
+    /** Resolved per lookup generation; `null` caches "no credential" for that server. */
+    credentials = new Map();
     pool;
+    auth;
     logger;
     metrics;
     listToolsTimeoutMs;
     disconnectTimeoutMs;
     shutdownTimeoutMs;
+    onManagedMiniAppToolCall;
     closed = false;
     names;
     constructor(options = {}) {
         this.names = options.names ?? new McpNameRegistry();
+        this.auth = options.auth;
         this.logger = options.logger ?? NOOP_LOGGER;
         this.metrics = options.metrics;
         this.listToolsTimeoutMs = options.listToolsTimeoutMs ?? 15_000;
         this.disconnectTimeoutMs = options.disconnectTimeoutMs ?? 5_000;
         this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
+        this.onManagedMiniAppToolCall = options.onManagedMiniAppToolCall;
         this.pool =
             options.pool ??
                 new McpConnectionPool({
@@ -56,18 +61,14 @@ export class PluginMcpRuntime {
         const inventories = await mapBounded(entries, LIST_TOOLS_CONCURRENCY, async (entry) => shouldDiscoverInventory(entry, inventoryMode)
             ? this.resolveInventory(entry, options.reuseExistingInventory === true)
             : this.resolveCachedInventory(entry));
-        await this.enforceInventoryLimits(entries, inventories, inventoryMode);
         for (const [index, entry] of entries.entries()) {
             const inventory = inventories[index];
-            if (!inventory || inventory.failed) {
-                failedServerCount += 1;
-                diagnostics.push(freeze({
-                    code: shouldDiscoverInventory(entry, inventoryMode)
-                        ? 'MCP_SERVER_LIST_FAILED'
-                        : 'MCP_SERVER_WARMING',
-                    pluginName: entry.pluginName,
-                    capabilityName: entry.server.name,
-                }));
+            if (!inventory || inventory.state !== 'ready') {
+                const diagnostic = unavailableServerDiagnostic(entry, inventory, inventoryMode);
+                // Waiting on the user is not a failure: retrying cannot succeed before authorization.
+                if (diagnostic.code !== 'MCP_SERVER_AUTH_REQUIRED')
+                    failedServerCount += 1;
+                diagnostics.push(diagnostic);
                 continue;
             }
             for (const { tool, nativeName } of this.assignToolNames(entry, inventory.tools, diagnostics)) {
@@ -116,7 +117,7 @@ export class PluginMcpRuntime {
     exportInventory() {
         if (this.closed)
             return [];
-        return freeze([...this.inventories.entries()].flatMap(([serverName, inventory]) => inventory.failed
+        return freeze([...this.inventories.entries()].flatMap(([serverName, inventory]) => inventory.state !== 'ready'
             ? []
             : [
                 freeze({
@@ -134,7 +135,7 @@ export class PluginMcpRuntime {
             this.inventories.set(item.serverName, freeze({
                 lifecycleKey: item.lifecycleKey,
                 tools: freeze([...item.tools]),
-                failed: false,
+                state: 'ready',
             }));
         }
     }
@@ -145,10 +146,50 @@ export class PluginMcpRuntime {
         this.servers.clear();
         this.lifecycleKeys.clear();
         this.inventories.clear();
+        this.credentials.clear();
         await ignoreFailure(withTimeout(this.pool.shutdown(), this.shutdownTimeoutMs, 'Plugin MCP runtime shutdown timed out'));
     }
     async disconnectServers(serverNames) {
         await Promise.allSettled([...new Set(serverNames)].map((serverName) => this.disconnectBounded(serverName)));
+    }
+    forgetInventories(serverNames) {
+        for (const serverName of serverNames)
+            this.inventories.delete(serverName);
+    }
+    async probe(serverName) {
+        const entry = this.servers.get(serverName);
+        if (this.closed || !entry)
+            return new Error('Plugin MCP server is not loaded');
+        try {
+            await withTimeout(this.pool.listTools(serverName, this.connectionOverrides(entry)), this.listToolsTimeoutMs, `Plugin MCP tools/list timed out for ${entry.server.name}`);
+            return 'connected';
+        }
+        catch (error) {
+            await this.disconnectBounded(serverName);
+            const authError = findMcpAuthRequiredError(error);
+            if (authError)
+                return authError;
+            return error instanceof Error ? error : new Error(String(error));
+        }
+    }
+    async adoptManagedServers(entries) {
+        if (this.closed)
+            return;
+        const changed = [];
+        for (const entry of entries) {
+            if (entry.managedIdentity?.kind !== 'miniapp')
+                continue;
+            const name = poolName(entry);
+            if (this.servers.get(name)?.managedIdentity?.kind !== 'miniapp')
+                continue;
+            const key = lifecycleKey(entry);
+            if (this.lifecycleKeys.get(name) === key)
+                continue;
+            this.servers.set(name, entry);
+            this.lifecycleKeys.set(name, key);
+            changed.push(name);
+        }
+        await this.disconnectServers(changed);
     }
     async disconnectBounded(serverName) {
         await ignoreFailure(withTimeout(this.pool.disconnect(serverName), this.disconnectTimeoutMs, `Plugin MCP disconnect timed out for ${serverName}`));
@@ -163,36 +204,51 @@ export class PluginMcpRuntime {
     retainExactInventories(entries) {
         const nextKeys = new Map(entries.map((entry) => [poolName(entry), lifecycleKey(entry)]));
         for (const [serverName, inventory] of this.inventories) {
-            if (nextKeys.get(serverName) !== inventory.lifecycleKey || inventory.failed) {
+            if (nextKeys.get(serverName) !== inventory.lifecycleKey || inventory.state !== 'ready') {
                 this.inventories.delete(serverName);
             }
         }
     }
-    resolveCachedInventory(entry) {
+    /** Never connects; a stored needs-authorization state is a local file read. */
+    async resolveCachedInventory(entry) {
         const key = lifecycleKey(entry);
         const existing = this.inventories.get(poolName(entry));
-        if (existing?.lifecycleKey === key && !existing.failed)
+        if (existing?.lifecycleKey === key && existing.state === 'ready')
             return existing;
-        return freeze({ lifecycleKey: key, tools: freeze([]), failed: true });
+        if (await skipsBackground(this.credentialFor(entry)))
+            return this.authRequired(entry);
+        return freeze({ lifecycleKey: key, tools: freeze([]), state: 'failed' });
     }
     async resolveInventory(entry, reuseExisting) {
         const key = lifecycleKey(entry);
         const existing = this.inventories.get(poolName(entry));
-        if (reuseExisting && existing?.lifecycleKey === key)
+        if (reuseExisting && existing?.lifecycleKey === key && existing.state !== 'auth_required') {
             return existing;
+        }
+        const credential = this.credentialFor(entry);
+        if (await skipsBackground(credential))
+            return this.authRequired(entry);
         try {
-            const tools = await withTimeout(this.pool.listTools(poolName(entry)), this.listToolsTimeoutMs, `Plugin MCP tools/list timed out for ${entry.server.name}`);
-            if (tools.length > MAX_TOOLS_PER_SERVER) {
-                throw new Error(`Plugin MCP server ${entry.server.name} returned more than ${MAX_TOOLS_PER_SERVER} tools`);
-            }
+            const tools = await withTimeout(this.pool.listTools(poolName(entry), this.connectionOverrides(entry)), this.listToolsTimeoutMs, `Plugin MCP tools/list timed out for ${entry.server.name}`);
             this.metrics?.incr('plugin_mcp_list_total', { status: 'ok' });
-            const inventory = freeze({ lifecycleKey: key, tools: freeze([...tools]), failed: false });
+            if (credential)
+                await ignoreFailure(credential.markObserved('connected'));
+            const inventory = freeze({
+                lifecycleKey: key,
+                tools: freeze([...tools]),
+                state: 'ready',
+            });
             this.inventories.set(poolName(entry), inventory);
             return inventory;
         }
         catch (error) {
             await this.disconnectBounded(poolName(entry));
-            this.metrics?.incr('plugin_mcp_list_total', { status: 'error' });
+            const authRequired = await this.observeAuthFailure(entry, error);
+            this.metrics?.incr('plugin_mcp_list_total', {
+                status: authRequired ? 'auth_required' : 'error',
+            });
+            if (authRequired)
+                return this.authRequired(entry);
             this.logger.warn('Plugin MCP tools/list failed', {
                 pluginName: entry.pluginName,
                 source: entry.source,
@@ -202,67 +258,52 @@ export class PluginMcpRuntime {
             const inventory = freeze({
                 lifecycleKey: key,
                 tools: freeze([]),
-                failed: true,
+                state: 'failed',
             });
             this.inventories.set(poolName(entry), inventory);
             return inventory;
         }
     }
-    async rejectInventory(entry, key, reason) {
-        await this.disconnectBounded(poolName(entry));
-        this.metrics?.incr('plugin_mcp_list_total', { status: 'limit' });
-        this.logger.warn('Plugin MCP tools/list inventory rejected', {
-            pluginName: entry.pluginName,
-            source: entry.source,
-            serverName: entry.server.name,
-            reason,
-        });
+    authRequired(entry) {
         const inventory = freeze({
-            lifecycleKey: key,
+            lifecycleKey: lifecycleKey(entry),
             tools: freeze([]),
-            failed: true,
+            state: 'auth_required',
         });
         this.inventories.set(poolName(entry), inventory);
         return inventory;
     }
-    async enforceInventoryLimits(entries, inventories, inventoryMode) {
-        let acceptedToolCount = 0;
-        for (const [index, entry] of entries.entries()) {
-            const inventory = inventories[index];
-            if (!inventory || inventory.failed)
-                continue;
-            const exceedsServer = inventory.tools.length > MAX_TOOLS_PER_SERVER;
-            const exceedsSnapshot = acceptedToolCount + inventory.tools.length > MAX_TOOLS_PER_SNAPSHOT;
-            if (exceedsServer || exceedsSnapshot) {
-                const reason = exceedsServer
-                    ? `Plugin MCP server returned more than ${MAX_TOOLS_PER_SERVER} tools`
-                    : `Plugin MCP snapshot exceeds ${MAX_TOOLS_PER_SNAPSHOT} tools`;
-                inventories[index] = shouldDiscoverInventory(entry, inventoryMode)
-                    ? await this.rejectInventory(entry, inventory.lifecycleKey, reason)
-                    : this.rejectCachedInventory(entry, inventory.lifecycleKey, reason);
-                continue;
-            }
-            acceptedToolCount += inventory.tools.length;
-        }
+    credentialFor(entry) {
+        const name = poolName(entry);
+        const cached = this.credentials.get(name);
+        if (cached !== undefined)
+            return cached ?? undefined;
+        const credential = this.auth?.resolve(entry);
+        this.credentials.set(name, credential ?? null);
+        return credential;
     }
-    rejectCachedInventory(entry, key, reason) {
-        this.metrics?.incr('plugin_mcp_list_total', { status: 'limit' });
-        this.logger.warn('Plugin MCP cached inventory rejected', {
-            pluginName: entry.pluginName,
-            source: entry.source,
-            serverName: entry.server.name,
-            reason,
-        });
-        this.inventories.delete(poolName(entry));
-        return freeze({ lifecycleKey: key, tools: freeze([]), failed: true });
+    connectionOverrides(entry) {
+        const credential = this.credentialFor(entry);
+        return credential ? { authorizer: credential.authorizer } : undefined;
     }
     replaceLookup(entries) {
         this.servers.clear();
         this.lifecycleKeys.clear();
+        this.credentials.clear();
         for (const entry of entries) {
             this.servers.set(poolName(entry), entry);
             this.lifecycleKeys.set(poolName(entry), lifecycleKey(entry));
         }
+    }
+    /** True when `error` means the user must authorize a server that has credentials. */
+    async observeAuthFailure(entry, error) {
+        const credential = this.credentialFor(entry);
+        const authError = credential ? findMcpAuthRequiredError(error) : undefined;
+        if (!credential || !authError)
+            return false;
+        await ignoreFailure(credential.markObserved(authError));
+        credential.authRequired(authError);
+        return true;
     }
     runtimeTool(entry, tool, nativeName) {
         const def = freeze({
@@ -274,8 +315,39 @@ export class PluginMcpRuntime {
         return freeze({
             def,
             impl: freeze({
-                execute: async (_context, input, signal) => {
-                    const result = await this.pool.callTool(poolName(entry), tool.name, toRecord(input), undefined, signal ? { signal } : undefined);
+                execute: async (context, input, signal) => {
+                    if (entry.managedIdentity?.kind === 'miniapp') {
+                        try {
+                            this.onManagedMiniAppToolCall?.({
+                                pluginName: entry.pluginName,
+                                sessionId: context.sessionId,
+                                turnId: context.turnId,
+                            });
+                        }
+                        catch {
+                            // The observer is advisory; the tool call proceeds regardless.
+                        }
+                    }
+                    let result;
+                    try {
+                        result = await this.pool.callTool(poolName(entry), tool.name, toRecord(input), this.connectionOverrides(entry), signal ? { signal } : undefined);
+                    }
+                    catch (error) {
+                        // The thrown error still fails the call exactly as before; PTC
+                        // scripts additionally get the JSON-RPC or connection error as
+                        // `error.raw`. Only the error class and code are logged.
+                        const raw = describeMcpCallError(error);
+                        const attached = raw !== undefined && attachProgrammaticErrorRaw(error, raw);
+                        this.logger.warn('Plugin MCP tool call failed', {
+                            pluginName: entry.pluginName,
+                            serverName: entry.server.name,
+                            toolName: tool.name,
+                            errorCode: raw?.code ?? null,
+                            rawAttached: attached,
+                        });
+                        await this.observeAuthFailure(entry, error);
+                        throw error;
+                    }
                     const text = mcpContentToText(result);
                     const content = toToolResultContent(result, text);
                     return {
@@ -290,12 +362,25 @@ export class PluginMcpRuntime {
                             plugin: entry.pluginName,
                         },
                         output: { mcp: result },
+                        // PTC-only: structuredContent becomes `data` on success and on isError.
+                        ...(isPlainRecord(result.structuredContent)
+                            ? { programmatic: { data: result.structuredContent } }
+                            : {}),
                     };
                 },
             }),
             source: 'configured',
         });
     }
+}
+function unavailableServerDiagnostic(entry, inventory, inventoryMode) {
+    let code = 'MCP_SERVER_AUTH_REQUIRED';
+    if (inventory?.state !== 'auth_required') {
+        code = shouldDiscoverInventory(entry, inventoryMode)
+            ? 'MCP_SERVER_LIST_FAILED'
+            : 'MCP_SERVER_WARMING';
+    }
+    return freeze({ code, pluginName: entry.pluginName, capabilityName: entry.server.name });
 }
 function shouldDiscoverInventory(entry, inventoryMode) {
     return (inventoryMode === 'discover' ||
@@ -314,6 +399,18 @@ async function withTimeout(promise, timeoutMs, message) {
     finally {
         if (timer)
             clearTimeout(timer);
+    }
+}
+/**
+ * An unreadable credential store must not fail the whole reconcile: the server
+ * is then attempted normally and fails on its own listing path.
+ */
+async function skipsBackground(credential) {
+    try {
+        return (await credential?.shouldSkipBackground()) === true;
+    }
+    catch {
+        return false;
     }
 }
 async function ignoreFailure(promise) {
@@ -339,9 +436,11 @@ async function mapBounded(values, concurrency, mapper) {
     await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
     return results;
 }
+/** `server` carries the `oauth` descriptor; the PluginId separates same-name credentials. */
 function lifecycleKey(entry) {
     return JSON.stringify({
         pluginName: entry.pluginName,
+        pluginId: entry.pluginId,
         source: entry.source,
         server: entry.server.resolvedServer,
         ...(entry.managedIdentity ? { managedIdentity: entry.managedIdentity } : {}),
@@ -359,6 +458,9 @@ function toRecord(value) {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value
         : {};
+}
+function isPlainRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 function toToolResultContent(result, fallbackText) {
     const content = result.content.map((item) => {

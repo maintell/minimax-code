@@ -1,7 +1,6 @@
-import { CuaPointer } from "./cua-pointer";
 import { CuaDesktopOverlay } from "./cua-overlay";
+import { parseCuaOverlayTarget } from "./cua-overlay-target";
 import { CuaWindowHandoff } from "./cua-window-handoff";
-import { getComputerUsePermissionStatus } from "../../screenshot/permission";
 import { clearCuaPreviewTargets, releaseCuaPreviewTarget, publishCuaPreviewTarget } from "./cua-preview";
 /**
  * Main-process facade for the isolated CUA utility process.
@@ -24,7 +23,6 @@ let cuaControlPort = null;
 let cuaChild = null;
 let cuaGeneration = 0;
 let cuaActiveRequestCount = 0;
-const pointer = new CuaPointer();
 const windowHandoff = new CuaWindowHandoff(async () => {
     const { getMainWindow } = await import('../../../windows/mainWindow');
     return getMainWindow();
@@ -95,27 +93,71 @@ export async function ensureComputerUseUtilityStarted(host) {
         return false;
     }
 }
-export function stopComputerUseUtility() {
-    clearCuaUtilityState();
+/** Upper bound for a quit/stop to let the bridge release its desktop lock. */
+const CUA_SHUTDOWN_WAIT_MS = 5000;
+/**
+ * Asks the bridge to drain and waits a bounded time for it to exit, so a normal quit
+ * releases the desktop lock before the host process ends. A slower drain keeps running;
+ * a later Computer Use owner reclaims the lock once this host has exited.
+ */
+export async function stopComputerUseUtility() {
+    const child = clearCuaUtilityState();
+    if (!child)
+        return;
+    const exited = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(false), CUA_SHUTDOWN_WAIT_MS);
+        child.once('exit', () => {
+            clearTimeout(timer);
+            resolve(true);
+        });
+    });
+    if (!exited)
+        logger.warn(`[CuaUtility] shutdown still draining after ${CUA_SHUTDOWN_WAIT_MS}ms; continuing host stop`);
+}
+/** Keeps startup reclaim off the first-window critical path. */
+const CUA_STARTUP_RECLAIM_DELAY_MS = 5000;
+let cuaStartupReclaimScheduled = false;
+/**
+ * Reclaims profile daemons left by hosts that exited without stopping them, so a user who
+ * never opens Computer Use again still gets them cleaned up. Runs once, in the background.
+ */
+export function scheduleComputerUseDaemonReclaim() {
+    if (cuaStartupReclaimScheduled)
+        return;
+    cuaStartupReclaimScheduled = true;
+    const dataDir = process.env.MINIMAX_DATA_DIR;
+    if (!dataDir || !path.isAbsolute(dataDir))
+        return;
+    setTimeout(() => {
+        void import('@mavis/computer-use').then(({ reclaimProfileDaemons }) => reclaimProfileDaemons(dataDir))
+            .then((summary) => {
+            if (summary.stopped || summary.removed || summary.failed)
+                logger.info('[CuaUtility] startup daemon reclaim', { ...summary });
+        })
+            .catch((error) => logger.warn('[CuaUtility] startup daemon reclaim failed', {
+            errorCode: error.code ?? 'unknown',
+        }));
+    }, CUA_STARTUP_RECLAIM_DELAY_MS).unref();
 }
 function clearCuaUtilityState() {
     windowHandoff.clear();
     clearCuaPreviewTargets();
     desktopOverlay.clear();
-    pointer.clear();
     updateCuaActivity(0);
     cuaRuntimePort?.close();
     cuaRuntimePort = null;
-    cuaControlPort?.close();
-    cuaControlPort = null;
     const child = cuaChild;
     cuaChild = null;
     try {
-        child?.kill();
+        // The bridge retains its owned daemon and desktop lock until native work drains.
+        cuaControlPort?.postMessage({ type: 'cua-shutdown' });
     }
     catch {
-        // Best effort; the exit listener will finish cleanup when possible.
+        logger.warn('[CuaUtility] shutdown delivery failed; native completion is unconfirmed');
     }
+    cuaControlPort?.close();
+    cuaControlPort = null;
+    return child;
 }
 async function ensureCuaUtilityStarted() {
     // `cuaRuntimePort` is transferred to local-runtime once that process is
@@ -136,11 +178,7 @@ async function ensureCuaUtilityStarted() {
         const generation = ++cuaGeneration;
         const child = electron.utilityProcess.fork(path.join(__dirname, 'cua-entry.js'), [], {
             serviceName: 'mavis-cua',
-            // CUA calls AppKit/LaunchServices from native workers. Chromium's default
-            // utility pump does not service the macOS main run loop; Finder's folder
-            // handoff queues work there and otherwise times out. Keep this isolated
-            // child, but let its main thread pump native UI work sources.
-            ...(process.platform === 'darwin' ? { execArgv: ['--message-loop-type-ui'] } : {}),
+            // This child is a protocol/presentation bridge; the branded App owns native UI work.
             env: {
                 ...process.env,
                 MAVIS_CUA_GENERATION: String(generation),
@@ -182,36 +220,21 @@ async function ensureCuaUtilityStarted() {
         };
         channel.port2.on('message', ({ data }) => {
             const message = data;
-            if (!['cua-displays-request', 'cua-permissions-request'].includes(message?.type ?? '') ||
+            if (!['cua-displays-request', 'cua-permission-required'].includes(message?.type ?? '') ||
                 message?.generation !== generation ||
                 cuaChild !== child)
                 return;
-            const requestId = message.requestId;
-            if (typeof requestId !== 'string')
-                return;
-            if (message.type === 'cua-permissions-request') {
-                let ready = false;
-                try {
-                    ready = Object.values(getComputerUsePermissionStatus()).every((status) => status === 'granted' || status === 'not-required');
-                }
-                catch {
-                    // A failed native query cannot authorize a queued driver operation.
-                }
-                channel.port2.postMessage({
-                    type: 'cua-permissions-response',
-                    generation,
-                    requestId,
-                    ready,
-                });
-                if (!ready) {
-                    clearCuaPreviewTargets();
-                    for (const window of electron.BrowserWindow.getAllWindows()) {
-                        if (!window.isDestroyed())
-                            window.webContents.send('cu:permission:required');
-                    }
+            if (message.type === 'cua-permission-required') {
+                clearCuaPreviewTargets();
+                for (const window of electron.BrowserWindow.getAllWindows()) {
+                    if (!window.isDestroyed())
+                        window.webContents.send('cu:permission:required');
                 }
                 return;
             }
+            const requestId = message.requestId;
+            if (typeof requestId !== 'string')
+                return;
             let response;
             try {
                 response = { result: readCuaDisplays(electron.screen) };
@@ -237,7 +260,6 @@ async function ensureCuaUtilityStarted() {
                 return;
             windowHandoff.clear();
             desktopOverlay.clear();
-            pointer.clear();
             updateCuaActivity(0);
             cuaRuntimePort?.close();
             cuaRuntimePort = null;
@@ -267,32 +289,26 @@ async function ensureCuaUtilityStarted() {
                 const controlMessage = message;
                 if (!controlMessage || controlMessage.generation !== generation || cuaChild !== child)
                     return;
-                if (controlMessage.type === 'cua-operation' &&
-                    typeof controlMessage.sessionId === 'string') {
-                    desktopOverlay.show({
+                if ((controlMessage.type === 'cua-operation' ||
+                    controlMessage.type === 'cua-operation-finished') &&
+                    typeof controlMessage.sessionId === 'string' &&
+                    typeof controlMessage.requestId === 'string') {
+                    const turn = {
                         sessionId: controlMessage.sessionId,
                         turnId: controlMessage.turnId,
-                    });
-                    void windowHandoff.begin({
-                        sessionId: controlMessage.sessionId,
-                        turnId: controlMessage.turnId,
-                    });
-                    return;
-                }
-                if (controlMessage.type === 'cua-pointer' && controlMessage.pointer) {
-                    try {
-                        pointer.show(controlMessage.pointer);
+                    };
+                    if (controlMessage.type === 'cua-operation-finished') {
+                        desktopOverlay.finish(turn, controlMessage.requestId);
                     }
-                    catch (error) {
-                        pointer.clear();
-                        logger.warn('pointer_display_failed', { error: String(error) });
+                    else {
+                        desktopOverlay.show(turn, controlMessage.requestId, parseCuaOverlayTarget(controlMessage.overlayTarget));
+                        void windowHandoff.begin(turn);
                     }
                     return;
                 }
                 if (controlMessage.type === 'cua-released') {
                     releaseCuaPreviewTarget(controlMessage.sessionId, controlMessage.turnId);
                     windowHandoff.release(controlMessage.sessionId, controlMessage.turnId);
-                    pointer.clear(controlMessage.sessionId, controlMessage.turnId);
                     desktopOverlay.clear(controlMessage.sessionId, controlMessage.turnId);
                     return;
                 }
@@ -328,6 +344,7 @@ async function ensureCuaUtilityStarted() {
     return cuaStartPromise;
 }
 function updateCuaActivity(activeRequestCount) {
+    desktopOverlay.noteDriverActivity(activeRequestCount > 0);
     if (cuaActiveRequestCount === activeRequestCount)
         return;
     cuaActiveRequestCount = activeRequestCount;

@@ -57,7 +57,6 @@ export class MemoryExecutionLedger {
                 .set({
                 status: result.status,
                 reason: result.reason ?? null,
-                previewId: result.previewId ?? input.previewId ?? null,
                 finishedAtMs: this.nowMs(),
             })
                 .where(eq(tasks.taskId, taskId))

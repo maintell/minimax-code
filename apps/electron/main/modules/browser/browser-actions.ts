@@ -88,6 +88,26 @@ function urlsEquivalent(left, right) {
         return false;
     }
 }
+function needsHashPreparation(currentUrl, requestedUrl) {
+    if (urlsEquivalent(currentUrl, requestedUrl))
+        return false;
+    try {
+        const current = new URL(currentUrl);
+        const requested = new URL(requestedUrl);
+        if (!requested.href.includes('#'))
+            return false;
+        current.hash = '';
+        requested.hash = '';
+        return current.href === requested.href;
+    }
+    catch {
+        return false;
+    }
+}
+function isSameDocumentNavigation(args) {
+    const details = eventRecord(args[1]);
+    return 'isSameDocument' in details ? details.isSameDocument === true : args[2] === true;
+}
 function scrollSnapshot(value) {
     if (value === null || typeof value !== 'object')
         return null;
@@ -229,12 +249,14 @@ export class BrowserActions {
      * delayed about:blank finish from controller initialization cannot be
      * reported as a successful user-facing load.
      */
-    loadPresentationUrl(wc, requestedUrl, timeout = PAGE_LOAD_TIMEOUT) {
+    loadPresentationUrl(wc, requestedUrl, options = {}, timeout = PAGE_LOAD_TIMEOUT) {
         return new Promise((resolve, reject) => {
             let settled = false;
             let targetStarted = false;
             let targetCommitted = false;
             let committedUrl = '';
+            let documentLoadIssued = false;
+            const lifetime = new AbortController();
             const cleanup = () => {
                 clearTimeout(timeoutId);
                 wc.removeListener('did-start-navigation', onStartNavigation);
@@ -243,6 +265,8 @@ export class BrowserActions {
                 wc.removeListener('did-finish-load', onFinishLoad);
                 wc.removeListener('did-fail-load', onFailLoad);
                 wc.removeListener('destroyed', onDestroyed);
+                options.signal?.removeEventListener('abort', onAbort);
+                lifetime.abort();
             };
             const settle = (error) => {
                 if (settled)
@@ -257,6 +281,8 @@ export class BrowserActions {
             const onStartNavigation = (...args) => {
                 if (!isMainFrameNavigation(args))
                     return;
+                if (options.forceNewDocument && (!documentLoadIssued || isSameDocumentNavigation(args)))
+                    return;
                 const navigationUrl = navigationEventUrl(args);
                 if (urlsEquivalent(navigationUrl, requestedUrl))
                     targetStarted = true;
@@ -268,14 +294,19 @@ export class BrowserActions {
                 // did-navigate event records the URL that actually committed.
             };
             const onNavigate = (...args) => {
+                if (options.forceNewDocument && (!documentLoadIssued || !targetStarted))
+                    return;
                 const navigationUrl = navigationEventUrl(args);
                 if (!targetStarted) {
                     if (!urlsEquivalent(navigationUrl, requestedUrl))
                         return;
                     targetStarted = true;
                 }
-                targetCommitted = true;
                 committedUrl = navigationUrl;
+                if (targetCommitted)
+                    return;
+                targetCommitted = true;
+                options.onDocumentCommitted?.();
             };
             const onFinishLoad = () => {
                 if (!targetStarted || !targetCommitted)
@@ -288,11 +319,13 @@ export class BrowserActions {
                 settle();
             };
             const onFailLoad = (...args) => {
+                if (options.forceNewDocument && !documentLoadIssued)
+                    return;
                 const errorCode = typeof args[1] === 'number' ? args[1] : 0;
                 const errorDescription = typeof args[2] === 'string' ? args[2] : 'Navigation failed';
                 const validatedUrl = typeof args[3] === 'string' ? args[3] : '';
                 const isMainFrame = args[4] !== false;
-                if (!isMainFrame || errorCode === -3)
+                if (!isMainFrame || (errorCode === -3 && !options.forceNewDocument))
                     return;
                 if (!targetStarted && !urlsEquivalent(validatedUrl, requestedUrl))
                     return;
@@ -302,6 +335,17 @@ export class BrowserActions {
             const onDestroyed = () => {
                 settle(new Error('Browser was destroyed while loading the page'));
             };
+            const onAbort = () => {
+                if (targetCommitted)
+                    return;
+                try {
+                    wc.stop();
+                }
+                catch {
+                    // The page may already have gone away.
+                }
+                settle(new Error('ABORTED: Browser action was cancelled'));
+            };
             const timeoutId = setTimeout(() => settle(new Error('PAGE_LOAD_TIMEOUT')), timeout);
             timeoutId.unref?.();
             wc.on('did-start-navigation', onStartNavigation);
@@ -310,17 +354,42 @@ export class BrowserActions {
             wc.on('did-finish-load', onFinishLoad);
             wc.on('did-fail-load', onFailLoad);
             wc.on('destroyed', onDestroyed);
-            try {
+            options.signal?.addEventListener('abort', onAbort, { once: true });
+            if (options.signal?.aborted) {
+                onAbort();
+                return;
+            }
+            const start = async () => {
+                if (options.forceNewDocument && needsHashPreparation(wc.getURL(), requestedUrl)) {
+                    // Adopt the requested fragment before replacing the document, while the old launch
+                    // identity still applies. loadURL alone may only perform an in-page navigation.
+                    await wc.loadURL(requestedUrl);
+                    if (!urlsEquivalent(wc.getURL(), requestedUrl))
+                        throw new Error('Browser navigation changed before document reload');
+                }
+                if (settled)
+                    return;
+                const beforeUrl = wc.getURL();
+                if (options.beforeDocumentLoad)
+                    await options.beforeDocumentLoad(lifetime.signal);
+                if (settled)
+                    return;
+                options.signal?.throwIfAborted();
+                if (options.forceNewDocument && !urlsEquivalent(wc.getURL(), beforeUrl))
+                    throw new Error('Browser navigation changed before document reload');
+                documentLoadIssued = true;
+                if (options.forceNewDocument && urlsEquivalent(wc.getURL(), requestedUrl)) {
+                    wc.reload();
+                    return;
+                }
                 void wc.loadURL(requestedUrl).catch((error) => {
                     const message = String(error);
-                    if (targetStarted && message.includes('ERR_ABORTED'))
+                    if (!options.forceNewDocument && targetStarted && message.includes('ERR_ABORTED'))
                         return;
                     settle(error);
                 });
-            }
-            catch (error) {
-                settle(error);
-            }
+            };
+            void start().catch(settle);
         });
     }
     /**
@@ -616,14 +685,14 @@ export class BrowserActions {
      * the Agent ElementMap. Agent navigation keeps using navigate(), while the
      * first inspect rebuilds a fresh map after any presentation navigation.
      */
-    async loadForPresentation(params) {
+    async loadForPresentation(params, options = {}) {
         const startTime = Date.now();
         const wc = this.wc;
         if (!wc) {
             return { success: false, error: 'Browser not created or destroyed', url: '', title: '' };
         }
         try {
-            await this.loadPresentationUrl(wc, params.url);
+            await this.loadPresentationUrl(wc, params.url, options);
             return {
                 success: true,
                 url: wc.getURL() || params.url,

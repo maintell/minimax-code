@@ -3,6 +3,7 @@ import { parseAgentReferences } from '@mavis/shared/agent-mention';
 import { readPromptWithBuiltinFallback } from '../../../agent/index.js';
 import { SessionTitleConflictError } from '../repo/contract.js';
 import { SessionServiceError } from '../errors.js';
+import { TitleGenerationBudget } from './title-generation-budget.js';
 const TITLE_SYSTEM_PROMPT = `You are a conversation title generator. Generate a clear, concise, easy-to-scan title from the user's message to represent the task in the conversation list.
 
 Follow these rules:
@@ -53,12 +54,12 @@ const TITLE_INPUT_TRUNCATION_MARKER = '\n[…]\n';
 const TITLE_MAX_LEN = SESSION_TITLE_MAX_UNICODE_LENGTH;
 const TITLE_ATTEMPTS = 2;
 const TITLE_PROVIDER_RETRY_DELAYS_MS = [500, 2_000];
-const INJECTED_TAG_RE = /<(agent-message|agent-context|system-reminder|peer-memory-path|engine-message|inbound-context|html-selection-context)\b[^>]*>[\s\S]*?<\/\1>/g;
-/** Owns first-accepted-message title eligibility, freshness fencing and safe writeback. */
+const INJECTED_TAG_RE = /<(agent-message|agent-context|system-reminder|peer-memory-path|engine-message|inbound-context|html-selection-context|user-provided-context|mavis-chat-context|deployed-website-context)\b[^>]*>[\s\S]*?<\/\1>/g;
+/** Owns automatic-title eligibility, freshness fencing and safe writeback. */
 export class SessionTitleService {
     options;
     pending = new Map();
-    retryWakers = new Set();
+    shutdown = new AbortController();
     closed = false;
     closePromise;
     constructor(options) {
@@ -67,15 +68,15 @@ export class SessionTitleService {
     async generateAfterAcceptedUserMessage(input) {
         if (!input.receipt.acceptedNow || !input.receipt.firstAcceptedForSession)
             return;
-        await this.generateTitle(input.sessionId, input.userMessage);
+        await this.generateTitle(input.sessionId, input.userMessage, input.expectedTitle, input.signal);
     }
-    generate(sessionId, userMessage) {
-        const operation = this.startGeneration(sessionId, userMessage);
+    generate(sessionId, userMessage, expectedTitle) {
+        const operation = this.startGeneration(sessionId, userMessage, expectedTitle);
         if (operation)
             this.pending.set(sessionId, operation);
     }
-    async generateTitle(sessionId, userMessage) {
-        const operation = this.startGeneration(sessionId, userMessage);
+    async generateTitle(sessionId, userMessage, expectedTitle, signal) {
+        const operation = this.startGeneration(sessionId, userMessage, expectedTitle, signal);
         if (!operation)
             return;
         this.pending.set(sessionId, operation);
@@ -85,52 +86,80 @@ export class SessionTitleService {
         if (this.closePromise)
             return this.closePromise;
         this.closed = true;
-        for (const wake of [...this.retryWakers])
-            wake();
+        this.shutdown.abort(new DOMException('Title service closed', 'AbortError'));
         this.closePromise = settlePendingGenerations([...this.pending.values()]);
         return this.closePromise;
     }
-    startGeneration(sessionId, userMessage) {
+    startGeneration(sessionId, userMessage, expectedTitle, signal) {
         const cleanInput = stripSessionTitleInjectedTags(userMessage);
-        if (this.closed || !cleanInput || this.pending.has(sessionId))
+        if (this.closed || signal?.aborted || !cleanInput || this.pending.has(sessionId))
             return;
-        return this.runGeneration(sessionId, cleanInput);
+        const budget = new TitleGenerationBudget(TITLE_TIMEOUT_MS, [
+            this.shutdown.signal,
+            ...(signal ? [signal] : []),
+        ]);
+        return this.runGeneration(sessionId, cleanInput, budget, {
+            expectedTitle,
+            callerSignal: signal,
+        });
     }
-    async runGeneration(sessionId, cleanInput) {
+    async runGeneration(sessionId, cleanInput, budget, input) {
+        const { expectedTitle, callerSignal } = input;
         try {
-            const session = await this.readEligibleSession(sessionId);
-            if (!session)
+            await Promise.resolve();
+            if (budget.remainingMs === 0)
                 return;
-            const candidate = await this.generateCandidate(sessionId, session, cleanInput);
+            const session = await this.readEligibleSession(sessionId, expectedTitle);
+            if (!session || budget.remainingMs === 0)
+                return;
+            let candidate = await this.generateCandidate(sessionId, session, cleanInput, budget);
+            if (!this.canCommitTitle(budget, callerSignal))
+                return;
             if (!candidate.title) {
                 this.observe(candidate.outcome);
                 return;
             }
             const fresh = await this.readEligibleSession(sessionId, session.title);
+            if (!this.canCommitTitle(budget, callerSignal))
+                return;
             if (!fresh) {
                 this.observe('skipped_race');
                 return;
             }
-            try {
-                await this.options.commitTitle(sessionId, candidate.title, session.title ?? null);
+            if (this.shutdown.signal.aborted) {
+                candidate = { title: fallbackSessionTitle(cleanInput), outcome: 'provider_error' };
             }
-            catch (error) {
-                if (error instanceof SessionTitleConflictError) {
-                    this.observe('skipped_race');
-                    return;
-                }
-                if (error instanceof SessionServiceError && error.reason === 'content-policy-rejected') {
-                    this.observe('blocked');
-                    return;
-                }
-                this.report('write', sessionId, error);
-                return;
-            }
-            this.observe(candidate.outcome);
+            await this.commitCandidate(sessionId, candidate.title, session.title ?? null, candidate.outcome);
         }
         finally {
+            budget.dispose();
             this.pending.delete(sessionId);
         }
+    }
+    async commitCandidate(sessionId, title, expectedTitle, outcome) {
+        if (!title)
+            return;
+        try {
+            await this.options.commitTitle(sessionId, title, expectedTitle);
+            this.observe(outcome);
+        }
+        catch (error) {
+            const reason = error instanceof SessionServiceError ? error.reason : undefined;
+            if (error instanceof SessionTitleConflictError || reason === 'session-not-found') {
+                this.observe('skipped_race');
+            }
+            else if (reason === 'content-policy-rejected') {
+                this.observe('blocked');
+            }
+            else {
+                this.report('write', sessionId, error);
+            }
+        }
+    }
+    canCommitTitle(budget, callerSignal) {
+        if (callerSignal?.aborted || Date.now() >= budget.deadlineAt)
+            return false;
+        return budget.remainingMs > 0 || this.shutdown.signal.aborted;
     }
     async readEligibleSession(sessionId, originalTitle) {
         let session;
@@ -141,15 +170,17 @@ export class SessionTitleService {
             this.report('read', sessionId, error);
             return undefined;
         }
-        if (!session || session.sessionType !== 'branch' || session.sessionKind === 'task') {
+        if (!session ||
+            session.sessionType !== 'branch' ||
+            session.sessionKind === 'task' ||
+            session.titleSource !== 'default') {
             return undefined;
         }
-        if (originalTitle !== undefined && session.title !== originalTitle)
-            return undefined;
-        const title = session.title?.trim() ?? '';
-        return !title || title.endsWith('...') ? session : undefined;
+        if (originalTitle !== undefined)
+            return session.title === originalTitle ? session : undefined;
+        return session;
     }
-    async generateCandidate(sessionId, session, userMessage) {
+    async generateCandidate(sessionId, session, userMessage, budget) {
         const systemPrompt = await readPromptWithBuiltinFallback({
             source: this.options.promptSnapshots,
             key: SESSION_TITLE_SYSTEM_PROMPT_KEY,
@@ -159,15 +190,19 @@ export class SessionTitleService {
         let invalidAttempts = 0;
         let providerRetries = 0;
         let outcome = 'invalid_output';
-        for (;;) {
+        while (budget.remainingMs > 0) {
             try {
                 const title = normalizeSessionTitleCandidate(await this.options.model.summarize({
                     session,
                     systemPrompt,
                     userPrompt: titleUserPrompt(userMessage),
                     maxTokens: TITLE_MAX_TOKENS,
-                    timeoutMs: TITLE_TIMEOUT_MS,
+                    timeoutMs: budget.remainingMs,
+                    deadlineAt: budget.deadlineAt,
+                    signal: budget.signal,
                 }));
+                if (budget.remainingMs === 0)
+                    break;
                 outcome = 'invalid_output';
                 if (title)
                     return { title, outcome: 'success' };
@@ -180,29 +215,11 @@ export class SessionTitleService {
                 this.report('model', sessionId, error);
                 const delayMs = retryDelays[providerRetries];
                 providerRetries += 1;
-                if (delayMs === undefined || !(await this.delayBeforeProviderRetry(delayMs)))
+                if (delayMs === undefined || !(await budget.waitForRetry(delayMs)))
                     break;
             }
         }
         return { title: fallbackSessionTitle(userMessage), outcome };
-    }
-    /** Resolves false when the service starts closing, so shutdown never waits out a backoff. */
-    async delayBeforeProviderRetry(delayMs) {
-        if (this.closed)
-            return false;
-        if (delayMs <= 0)
-            return true;
-        await new Promise((resolve) => {
-            const wake = () => {
-                clearTimeout(timer);
-                this.retryWakers.delete(wake);
-                resolve();
-            };
-            const timer = setTimeout(wake, delayMs);
-            timer.unref?.();
-            this.retryWakers.add(wake);
-        });
-        return !this.closed;
     }
     observe(outcome) {
         try {
@@ -230,11 +247,26 @@ async function settlePendingGenerations(operations) {
 export function normalizeSessionTitleCandidate(input) {
     return normalizeConversationSessionTitle(input) ?? null;
 }
-function fallbackSessionTitle(userMessage) {
+export function fallbackSessionTitle(userMessage) {
     return Array.from(userMessage.replace(/\s+/gu, ' ').trim()).slice(0, TITLE_MAX_LEN).join('');
 }
 export function stripSessionTitleInjectedTags(input) {
-    const withoutInjectedTags = input.replace(INJECTED_TAG_RE, '');
+    // Project the visible Session name before model prompting or fallback truncation.
+    const withoutSessionReferences = input.replace(/<session-reference>([\s\S]*?)<\/session-reference>/gu, (_match, payload) => {
+        try {
+            const reference = JSON.parse(payload);
+            return reference &&
+                typeof reference === 'object' &&
+                'title' in reference &&
+                typeof reference.title === 'string'
+                ? reference.title.trim()
+                : '';
+        }
+        catch {
+            return '';
+        }
+    });
+    const withoutInjectedTags = withoutSessionReferences.replace(INJECTED_TAG_RE, '');
     return parseAgentReferences(withoutInjectedTags)
         .segments.map((segment) => segment.type === 'agent-reference' ? `@${segment.reference.displayName}` : segment.content)
         .join('')

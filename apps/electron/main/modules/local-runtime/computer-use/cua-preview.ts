@@ -108,11 +108,22 @@ export async function inspectCuaPreview(sessionId, capture) {
         sourceId: undefined,
         icon: await appIcon(target.appPath),
         available: false,
+        unavailableReason: undefined,
     };
     if (targets.get(sessionId) !== target)
         return null;
-    if (!capture || getScreenPermissionStatus() !== 'granted')
+    if (!capture)
         return metadata;
+    // Preview runs in this Desktop process; the Computer Use component grant does not cover it.
+    const permission = getScreenPermissionStatus();
+    if (permission !== 'granted') {
+        logger.warn('desktop_screen_permission_missing', {
+            sessionId,
+            revision: target.revision,
+            permission,
+        });
+        return { ...metadata, unavailableReason: 'desktop-screen-permission' };
+    }
     try {
         const sources = await desktopCapturer.getSources({
             types: [target.kind === 'desktop' ? 'screen' : 'window'],

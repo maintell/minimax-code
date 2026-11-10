@@ -6,7 +6,7 @@ Desktop、Web、Native 共用仓库内 PDF.js 4.2.67 阅读资源。`PdfView` �
 PPT 的跨源 `mavis-preview` bridge 保持独立。
 
 阅读器只显示一条应用工具栏：页码、缩放与适合页面/宽度、区域截图、搜索、旋转和下载。
-`packages/ui/src/components/file-preview/pdf/PdfReaderToolbar.tsx` 通过 PDF.js application /
+`packages/ui/src/components/file-preview/documents/pdf/PdfReaderToolbar.tsx` 通过 PDF.js application /
 event bus 操作导航和全文查找；搜索显示当前/总匹配数，支持 Enter、Shift+Enter、Esc
 和阅读器范围内的 Ctrl/Cmd+F，高级匹配选项按需展开。旧 findbar 与底部页码缩放条仅在
 本组件拥有的 iframe 内隐藏，没有改写三端静态资源或其他类型的预览 UI。窄面板收起

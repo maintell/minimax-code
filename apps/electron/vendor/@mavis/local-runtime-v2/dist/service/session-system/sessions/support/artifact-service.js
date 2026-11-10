@@ -6,6 +6,25 @@ export class SessionArtifactService {
     async ensureReportsDirectory(sessionId) {
         return this.owners.reports.ensureDirectory(sessionId);
     }
+    /**
+     * Where this Session's reports live, without side effects: no history
+     * binding, no directory creation, no manifest write. `undefined` when the
+     * Session does not exist. The directory itself may not exist yet.
+     */
+    async inspectReportsDirectory(sessionId) {
+        return this.owners.reports.inspectDirectory(sessionId);
+    }
+    /**
+     * Where this Session's compaction snapshots live, without side effects (see
+     * `inspectReportsDirectory`). `undefined` when the Session does not exist.
+     */
+    async inspectSnapshotsDirectory(sessionId) {
+        return this.owners.snapshots.inspectDirectory(sessionId);
+    }
+    /** Where each compaction keeps the full history it replaced. */
+    async resolveSnapshotsDirectory(sessionId) {
+        return this.owners.snapshots.resolveDirectory(sessionId);
+    }
     async deleteSession(sessionId, options = {}) {
         const operations = [
             () => this.owners.queue.deleteSession(sessionId),

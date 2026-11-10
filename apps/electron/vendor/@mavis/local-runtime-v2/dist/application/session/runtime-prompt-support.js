@@ -56,10 +56,13 @@ export async function createRuntimePromptSessionSupport(input) {
                             : undefined;
                     },
                     client: options.computerUseClient,
+                    readSessionTitle: async (sessionId) => (await productionSessionComposition.sessionSystem.sessions.repository.get(sessionId))
+                        ?.title,
                     logger: options.logger,
                 }),
             },
             safety,
+            modelAccess: input.modelAccess,
             logger: serviceLogger,
             nowMs,
             publishGlobalEvent: writeGlobalEvent,
@@ -68,6 +71,7 @@ export async function createRuntimePromptSessionSupport(input) {
             inspector,
             internalTurnPromptReads,
             miniappAvailable: resolveRuntimeMiniAppOptions(options) !== undefined,
+            pptPreviewAvailable: options.pptPreviewRenderHost !== undefined,
             browserUse,
             promptSnapshots,
             globalInstructions,
