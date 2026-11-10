@@ -18,6 +18,7 @@
     }
   },
   "dependencies": {
+    "@mavis/shared": "file:../shared",
     "js-yaml": "^4",
     "proper-lockfile": "^4",
     "yaml": "^2.9.0"

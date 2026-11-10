@@ -485,6 +485,7 @@
     }
   },
   "dependencies": {
+    "@mavis/thrift-gen-client": "file:../thrift-gen-client",
     "mdast-util-from-markdown": "^2.0.3",
     "minimatch": "10.2.6",
     "pino": "^9",

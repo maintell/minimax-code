@@ -1,6 +1,6 @@
 {
   "name": "@mmx-agent/electron",
-  "version": "3.1.13",
+  "version": "3.1.14",
   "description": "MiniMax Agent Desktop Application",
   "author": "MiniMax",
   "private": true,

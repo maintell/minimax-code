@@ -10,6 +10,7 @@
     }
   },
   "dependencies": {
-    "@mavis/agent-core": "file:../agent-core"
+    "@mavis/agent-core": "file:../agent-core",
+    "@mavis/shared": "file:../shared"
   }
 }

@@ -59,6 +59,11 @@
     }
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
+    "@mavis/protocol": "file:../protocol",
+    "@mavis/shared": "file:../shared",
     "@sinclair/typebox": "^0.34.0",
     "mediabunny": "1.64.0",
     "typebox": "1.1.38",
