@@ -31,26 +31,26 @@ export const publishedClientExceptions = {
   "apps/electron/main/modules/remote-control-bridge/ipc.ts": ["@mavis/thrift-gen"],
   "apps/electron/main/modules/ssh-runtime/cli-install-target.ts": ["npmmirror.xaminim.com"],
   "apps/electron/main/modules/ssh-runtime/shared-global-events.ts": ["@mavis/thrift-gen"],
-  "apps/electron/out/_next/static/chunks/16323.c6af0dd77c4b4f29.js":
+  "apps/electron/out/_next/static/chunks/16323.2b84c62e63af75c3.js":
     ["matrix-overseas-test.xaminim.com", "matrix-test.xaminim.com"],
   "apps/electron/out/_next/static/chunks/17454.5efa1a444d1b72b5.js": ["/Users/minimax/"],
   "apps/electron/out/_next/static/chunks/21518.b7da22cfa3178630.js":
     ["account-pre.xaminim.com", "account-test.xaminim.com"],
   "apps/electron/out/_next/static/chunks/51656.3d1ab25d80a4e9bd.js":
     ["lark-auth-vela-bench.xaminim.com", "platform-api.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/53243.e43d31f26e0dec6e.js":
+  "apps/electron/out/_next/static/chunks/53243.b639dbc7dd250d8d.js":
     ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "mmx-pre.xaminim.com", "mmx-test.xaminim.com", "open-platform-for-online-test.xaminim.com", "openplatform-test.xaminim.com", "platform-pre.xaminim.com", "platform-test.xaminim.com", "platform-us-pre.xaminim.com", "platform-us-test.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/64741-a803c53e2a34b936.js":
+  "apps/electron/out/_next/static/chunks/64741-477cfebee92a5611.js":
     ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "mmx-pre.xaminim.com", "mmx-test.xaminim.com", "open-platform-for-online-test.xaminim.com", "openplatform-test.xaminim.com", "platform-pre.xaminim.com", "platform-test.xaminim.com", "platform-us-pre.xaminim.com", "platform-us-test.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/6907-3f2a05e71bfb4bc8.js":
+  "apps/electron/out/_next/static/chunks/6907-897cd804a7d0ddf9.js":
     ["matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "platform-pay-test.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/70323.ac6517e92179a16f.js": ["/Users/minimax/"],
-  "apps/electron/out/_next/static/chunks/aad4249a.51c068675f46421b.js": ["/Users/minimax/"],
-  "apps/electron/out/_next/static/chunks/app/(pages)/login/page-30adf3e4cd911d09.js":
+  "apps/electron/out/_next/static/chunks/70323.31a229fea0819394.js": ["/Users/minimax/"],
+  "apps/electron/out/_next/static/chunks/aad4249a.f146f73aa8db05d0.js": ["/Users/minimax/"],
+  "apps/electron/out/_next/static/chunks/app/(pages)/login/page-aa82178986db1bfb.js":
     ["account-pre.xaminim.com", "account-test.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/app/error-cc50f03fa702746a.js":
+  "apps/electron/out/_next/static/chunks/app/error-e1794c84164025d3.js":
     ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com", "mmx-pre.xaminim.com", "mmx-test.xaminim.com", "open-platform-for-online-test.xaminim.com", "openplatform-test.xaminim.com", "platform-pre.xaminim.com", "platform-test.xaminim.com", "platform-us-pre.xaminim.com", "platform-us-test.xaminim.com"],
-  "apps/electron/out/_next/static/chunks/pptx-media-decoder.6797f81c64877811.js":
+  "apps/electron/out/_next/static/chunks/pptx-media-decoder.71353c53ca79c243.js":
     ["/Users/minimax/"],
   "apps/electron/package.json": ["@mavis/thrift-gen"],
   "apps/electron/pnpm-lock.yaml": ["@mavis/thrift-gen"],
@@ -58,11 +58,17 @@ export const publishedClientExceptions = {
   "apps/electron/resources/install-mcode-test.sh": ["npmmirror.xaminim.com"],
   "apps/electron/resources/mcode-tools/cli.mjs":
     ["account-overseas-pre.xaminim.com", "account-overseas-test.xaminim.com", "account-pre.xaminim.com", "account-test.xaminim.com", "matrix-overseas-pre.xaminim.com", "matrix-overseas-test.xaminim.com", "matrix-pre.xaminim.com", "matrix-test.xaminim.com"],
-  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.Importer.Wasm.iafahvxj5x.wasm":
+  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.Importer.Wasm.73xzi6k66x.wasm":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.Importer.unuidrry0i.wasm":
+  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.Importer.Wasm.o1xlbocroo.wasm":
     ["/Users/minimax/"],
-  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.SafeOpc.ylxo34zdoy.wasm":
+  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.Importer.gxtuzq08i4.wasm":
+    ["/Users/minimax/"],
+  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.Importer.tedze088wg.wasm":
+    ["/Users/minimax/"],
+  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.SafeOpc.d0uyzqg6c1.wasm":
+    ["/Users/minimax/"],
+  "apps/electron/resources/pptx-core/r/_framework/Mavis.Pptx.SafeOpc.zqtyoqiohq.wasm":
     ["/Users/minimax/"],
   "apps/electron/resources/pptx-core/r/_framework/dotnet.native.afikkofx3k.wasm":
     ["/Users/minimax/"],

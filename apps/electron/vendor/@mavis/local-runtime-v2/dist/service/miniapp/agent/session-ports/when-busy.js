@@ -17,6 +17,17 @@ const QUEUE_FALLBACK_REASONS = new Set([
 /** How long a queued text that was settled without being seen in a turn may still show up. */
 const LANDING_AFTER_SETTLE_TIMEOUT_MS = 15_000;
 /**
+ * A `run` without `whenBusy`: the text opens its own turn, like a Desktop composer send on an
+ * idle session, or comes back `busy` without having reached any turn. A busy session is running a
+ * turn (whoever started it: this Mini App, the side panel, a background task delivery) or has
+ * work waiting ahead.
+ */
+export async function startIfIdle(options, input) {
+    const message = newMessageIdentity(input.sessionId);
+    const first = await startMessage(options, input, message);
+    return first.kind === 'busy' ? keepEmptiedPausedQueue(options, input, message, first) : first;
+}
+/**
  * `whenBusy` follows the Desktop composer: an idle session starts a turn; a busy one queues the
  * text or steers it into the running turn. The call then follows the turn its own text opened,
  * or ends `steered` once a running turn took the text in.
@@ -68,8 +79,8 @@ function newMessageIdentity(sessionId) {
     };
 }
 /**
- * An idle session behind a paused queue starts the turn only when nothing the user stopped is
- * still queued, resuming the queue (Desktop's automatic "keep"); otherwise the text waits.
+ * The text runs as its own turn when the session is idle; a busy session queues it or (with
+ * `steer`) hands it to the running turn.
  */
 async function placeMessage(options, input, message) {
     const first = input.whenBusy === 'steer'
@@ -77,13 +88,20 @@ async function placeMessage(options, input, message) {
         : await startMessage(options, input, message);
     if (first.kind !== 'busy')
         return first;
-    if (first.reason === 'priority-blocked' &&
-        (await isPausedWithoutQueuedItems(options, input.sessionId))) {
-        const kept = await startMessage(options, input, message, { resumePausedQueue: true });
-        if (kept.kind !== 'busy')
-            return kept;
+    const kept = await keepEmptiedPausedQueue(options, input, message, first);
+    return kept.kind === 'turn' ? kept : enqueueMessage(options, input, message);
+}
+/**
+ * An idle session behind a paused queue starts the turn only when nothing the user stopped is
+ * still queued, resuming the queue (Desktop's automatic "keep"); otherwise it stays busy.
+ */
+async function keepEmptiedPausedQueue(options, input, message, busy) {
+    if (busy.reason !== 'priority-blocked' ||
+        !(await isPausedWithoutQueuedItems(options, input.sessionId))) {
+        return busy;
     }
-    return enqueueMessage(options, input, message);
+    const kept = await startMessage(options, input, message, { resumePausedQueue: true });
+    return kept.kind === 'turn' ? kept : busy;
 }
 function messageProvenance(sessionId, message) {
     return {

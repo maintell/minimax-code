@@ -173,8 +173,13 @@ function __mavisResumeStream(input) {
         text = text + tail;
         finalMessage = final;
     }
+    let generator;
     const stream = {
-        async *[Symbol.asyncIterator]() {
+        [Symbol.asyncIterator]() {
+            // One consumer only: the engine attaches settlement bookkeeping and
+            // may ask for the iterator more than once, and two concurrent
+            // generators over the same replay stream would split the events.
+            return (generator ??= (async function* () {
             started = true;
             const iterator = source[Symbol.asyncIterator]();
             let failure;
@@ -259,21 +264,13 @@ function __mavisResumeStream(input) {
             yield { type: 'text_end', contentIndex: 0, content: text, partial: merged };
             yield { type: 'done', reason: 'stop', message: merged };
             resolveSettled(merged);
+            })());
         },
         result() {
-            if (!started) {
-                started = true;
-                void (async () => {
-                    try {
-                        for await (const ignored of stream) {
-                            void ignored;
-                        }
-                    }
-                    catch (error) {
-                        rejectSettled(error);
-                    }
-                })();
-            }
+            // The engine asks for the result as soon as it attaches settlement
+            // bookkeeping, before the caller iterates. Consuming the stream here
+            // would swallow every event (the turn renders nothing and the timer
+            // runs forever), so this only reports the outcome the consumer sees.
             return settledPromise;
         },
     };

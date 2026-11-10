@@ -186,9 +186,33 @@ function failureTypeForReasonCode(reasonCode) {
     }
     return 'startup_error';
 }
+let networkServiceGoneListenerInstalled = false;
+/**
+ * Forwards Network Service exits to the utility runtime. After Chromium
+ * restarts the Network Service, the utility's Electron `net` factory can stay
+ * bound to the dead context, so the runtime switches to Node fetch.
+ */
+function installNetworkServiceGoneListener() {
+    if (networkServiceGoneListenerInstalled)
+        return;
+    networkServiceGoneListenerInstalled = true;
+    void import('electron').then(({ app }) => {
+        app.on('child-process-gone', (_event, details) => {
+            if (details.type !== 'Utility' || details.serviceName !== 'network.mojom.NetworkService') {
+                return;
+            }
+            logger.warn(`[UtilityRuntime] network service gone (reason=${details.reason}); notifying runtime`);
+            manager?.notifyNetworkServiceGone();
+        });
+    })
+        .catch(() => {
+        logger.warn('[UtilityRuntime] network service listener install failed');
+    });
+}
 function getManager() {
     if (manager)
         return manager;
+    installNetworkServiceGoneListener();
     const launchPlan = resolveLocalRuntimeLaunchPlan(process.env.NEXT_PUBLIC_BUILD_ENV, process.env.MAVIS_LOCAL_RUNTIME_ISOLATION);
     const lifecycleObserver = new UtilityRuntimeObserver({
         emit: enqueueElectronObservabilityEvent,

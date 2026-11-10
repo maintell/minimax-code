@@ -760,6 +760,18 @@ export class LocalRuntimeUtilityProcessManager {
             (this.options.logger ?? noopLogger).warn('[UtilityRuntime] Prompt suggestion policy post failed');
         }
     }
+    /** Tells the live utility that Chromium's Network Service process exited. */
+    notifyNetworkServiceGone() {
+        const state = this.state;
+        if (state.phase !== 'starting' && state.phase !== 'ready')
+            return;
+        try {
+            state.child.postMessage({ type: 'runtime-network-service-gone' });
+        }
+        catch {
+            (this.options.logger ?? noopLogger).warn('[UtilityRuntime] Network service gone post failed');
+        }
+    }
     setToolResultCompactionConfig(config) {
         const state = this.state;
         if (state.phase !== 'starting' && state.phase !== 'ready')

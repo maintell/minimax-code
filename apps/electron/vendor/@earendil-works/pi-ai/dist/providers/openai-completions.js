@@ -155,17 +155,11 @@ export const streamOpenAICompletions = (model, context, options) => {
                 }
                 return thinkingBlock;
             };
-            // A fragment with neither index nor id continues the call last opened: Gemini's
-            // OpenAI-compatible API sends calls without an index.
-            let lastToolCallBlock;
             const ensureToolCallBlock = (toolCall) => {
                 const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
                 let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
                 if (!block && toolCall.id) {
                     block = toolCallBlocksById.get(toolCall.id);
-                }
-                if (!block && streamIndex === undefined && !toolCall.id && lastToolCallBlock) {
-                    block = lastToolCallBlock;
                 }
                 if (!block) {
                     block = {
@@ -196,7 +190,6 @@ export const streamOpenAICompletions = (model, context, options) => {
                 if (toolCall.id) {
                     toolCallBlocksById.set(toolCall.id, block);
                 }
-                lastToolCallBlock = block;
                 return block;
             };
             const observedStream = withProviderEventObserver(openaiStream, options?.onProviderStreamEvent, model);

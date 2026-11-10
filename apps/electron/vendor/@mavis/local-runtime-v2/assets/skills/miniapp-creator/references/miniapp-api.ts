@@ -475,8 +475,9 @@ export interface MiniAppAgentError extends Error {
    */
   readonly retryable: boolean;
   /**
-   * Set on every `BUSY`: the session already has a run in flight, the wait queue is full, the
-   * per-minute start cap was hit, or `observe` found 4 observers already running.
+   * Set on every `BUSY`: the session is running a turn, compacting, or has messages queued ahead
+   * (the text reached no turn), the wait queue is full, the per-minute start cap was hit, or
+   * `observe` found 4 observers already running.
    */
   readonly reason?: 'session_busy' | 'queue_full' | 'rate_limited' | 'observer_limit';
 }

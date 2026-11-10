@@ -338,8 +338,8 @@ export interface MiniAppAgentRunOptions {
  * `cancel` or the page closes; there is no timeout. Up to `agentConcurrency` runs (default 4) per
  * Mini App run at once, one per session; further `run` / `answer` calls wait in order (up to four
  * times that many, see `run.queued`), and `cancel` on a waiting call rejects it with `cancelled`.
- * `busy` means the session already has a run in progress (never with `whenBusy`) or the wait
- * queue is full.
+ * `busy` means the session is running a turn, compacting, or has messages queued ahead (never with
+ * `whenBusy`; the text reached no turn) or the wait queue is full.
  * Failures reject with an `Error` whose `message` is `invalid_request`, `not_permitted`, `busy`,
  * `session_not_found`, `runtime_unavailable`, `cancelled`, `result_unknown`, or
  * `request_not_found`. `runtime_unavailable` means nothing was started; `result_unknown` means

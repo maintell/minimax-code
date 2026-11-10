@@ -1,11 +1,10 @@
-import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { getRuntimePresetKey, resolveModelAvailability } from '@mavis/config';
 import { LocalModelProviderError, resolveRequestedSessionModel, } from '../../../model-system/index.js';
 import { MINIAPP_AGENT_NAME, MINIAPP_AGENT_PURPOSE_PREFIX, MiniAppAgentError, } from '../contracts.js';
 import { modelSelectionFromRecord, sessionModelFields } from '../model-selection.js';
-import { ABORT_SETTLE_TIMEOUT_MS, ABORTED, beforeDispatch, confirmCancelled, deliverChecked, errorFields, finish, followOwnedTurn, nextTurnFrame, outcomeUnknown, pendingQuestionOf, preDeliveryCheck, prepend, readNumber, readString, rejectedTurn, settleAbortedTurn, TIMED_OUT, timeoutPromise, withTurnStream, } from './turn-follow.js';
-import { runWhenBusy } from './when-busy.js';
+import { ABORT_SETTLE_TIMEOUT_MS, ABORTED, beforeDispatch, confirmCancelled, errorFields, finish, followOwnedTurn, nextTurnFrame, outcomeUnknown, pendingQuestionOf, prepend, readNumber, readString, settleAbortedTurn, TIMED_OUT, timeoutPromise, withTurnStream, } from './turn-follow.js';
+import { runWhenBusy, startIfIdle } from './when-busy.js';
 import { findObservableSession, lastAssistantText, listObservableSessions, observeAllSessions, observeOneSession, } from './session-observe.js';
 /** Upper bound on delegated-session hops walked to find a Mini App root. */
 const MAX_MINIAPP_ROOT_HOPS = 16;
@@ -211,7 +210,7 @@ const CONTINUATION_START_TIMEOUT_MS = 15_000;
 async function runMiniAppAgentTurn(options, input) {
     const model = await modelBeforeDispatch(options, input.sessionId);
     const follow = { ...input, model };
-    // Subscribe before steering; the iterator buffers frames until the turnId is known.
+    // Subscribe before delivering; the iterator buffers frames until the turnId is known.
     return withTurnStream(options, input, async (source, aborted) => {
         const startedAtMs = options.nowMs();
         if (input.whenBusy !== undefined) {
@@ -340,28 +339,18 @@ function projectPermissionAsk(payload) {
         ...(payload.toolInput === undefined ? {} : { toolInput: payload.toolInput }),
     };
 }
+/**
+ * Starts the text as the call's own turn. A busy session rejects with `BUSY` before the text
+ * reaches any turn, so the caller may send it again.
+ */
 async function activateTurn(options, input) {
-    const { sessionId, beforeDelivery } = input;
-    const requestId = randomUUID();
-    const steered = await deliverChecked(() => options.turns.steer({
-        sessionId,
-        input: { text: input.text },
-        producerId: `miniapp:${sessionId}`,
-        idempotencyKey: requestId,
-        provenance: {
-            source: 'miniapp',
-            routingFingerprint: `miniapp:${sessionId}:${requestId}`,
-        },
-        // Checked at the delivery itself: the steer awaits before it delivers.
-        ...preDeliveryCheck(beforeDelivery),
-    }));
-    if (!steered.delivered)
-        throw rejectedTurn();
-    // A steered delivery merged the text into a turn this run does not own.
-    if (steered.mode !== 'activated') {
+    const started = await startIfIdle(options, input);
+    if (started.kind === 'busy') {
+        // A call cancelled or switched off meanwhile reports that refusal rather than a busy session.
+        input.beforeDelivery?.();
         throw new MiniAppAgentError('BUSY', 'Mini App Agent session is busy', true, 'session_busy');
     }
-    return steered.turnId;
+    return started.turnId;
 }
 /**
  * Cancelled before the continuation turn was seen: wait (bounded) for it to appear, abort it

@@ -9,16 +9,17 @@ a locally installed client.
 
 | | |
 | --- | --- |
-| Installed client | `MiniMax Code` 3.1.12, taken from the updater's pending installer (`%LOCALAPPDATA%\@mmx-agentelectron-updater\pending\MiniMax Code Setup 3.1.12.exe` → `app-64.7z`) |
-| Application | `@mmx-agent/electron` 3.1.12, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
+| Installed client | `MiniMax Code` 3.1.13, restored from the installed client (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
+| Application | `@mmx-agent/electron` 3.1.13, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
 | Identity | appId `com.minimax.agent.cn`, runtime app name `MiniMax`, user data `%APPDATA%\MiniMax` |
-| Package | `resources/app.asar` (372 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+| Package | `resources/app.asar` (355 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
 
 Version history of this recovery:
 
 | App | Date | Notes |
 | --- | --- | --- |
-| 3.1.12 | 2026-11-09 | Current. Mini-app hosting moves into the main process (`main/modules/browser/miniapp-host*.ts`, `main/ipc/miniAppHost.ipc.ts`), PowerPoint editing gains a full local pipeline (`main/modules/document-preview/pptx-edit/**`, `pptPreviewQuery`/`pptxEditing` IPC, `pptx-core` fonts and new wasm hashes) and browser-profile import ships a separate elevated broker (`resources/abe-broker/win32-x64`, `main/modules/browser-profile-import/**`). `resources/model-access-host/host-entry.mjs` and an updater test-branch switch are new. Vendor versions are unchanged (48 packages) but 319 runtime files were rebuilt. Main process: 422 files (was 388). |
+| 3.1.13 | 2026-11-10 | Current. Small maintenance release: a service fetch path for the utility process (`main/modules/local-runtime/utility/network-service-fetch.ts` plus its wiring), a refreshed elevated profile-import broker and session-transfer client, a new `pptx-core` wasm hash set (the previous hashes return alongside), and a changed prod-zh environment lane. No dependency drift. Main process: 423 files (was 422). |
+| 3.1.12 | 2026-11-09 | Mini-app hosting moves into the main process (`main/modules/browser/miniapp-host*.ts`, `main/ipc/miniAppHost.ipc.ts`), PowerPoint editing gains a full local pipeline (`main/modules/document-preview/pptx-edit/**`, `pptPreviewQuery`/`pptxEditing` IPC, `pptx-core` fonts and new wasm hashes) and browser-profile import ships a separate elevated broker (`resources/abe-broker/win32-x64`, `main/modules/browser-profile-import/**`). `resources/model-access-host/host-entry.mjs` and an updater test-branch switch are new. Vendor versions are unchanged (48 packages) but 319 runtime files were rebuilt. Main process: 422 files (was 388). |
 | 3.1.10 | 2026-11-03 | The v1 local runtime is gone: the shipped tree no longer carries `@mavis/local-runtime` (57 packages remain vendored), and `@mavis/local-runtime-v2` grows by ~700 files. Embedded browser rework in the main process — `native-browser-view`, `webview-browser-view`, guest registry/input, backend policy store, telemetry runtime plus a sanitizer, full-page capture and downloads (`main/modules/browser/**`, `main/ipc/browser*.ipc.ts`). New `main/modules/file-open-with/**` (Windows "打开方式" enhancement, with a generated text-type list), `main/modules/deeplink/workspace-open.ts`, `main/utils/default-project-dir.ts`, auth refresh diagnostics/environment, `data-dir-relocation-guard` and `cua-overlay-target`. `resources/file-associations.nsh` stops writing `OpenWithProgids` (it lists `SupportedTypes` instead), `pptx-core` moved to new content hashes, the session-transfer client was rebuilt, and the QuickJS wasm runtime (`quickjs-emscripten`, `quickjs-emscripten-core`, `@jitl/*`) joins the unpacked set. The new PTC worker resolves its own module URL against `app.asar.unpacked` (`.../runner/ptc/worker-path.js`), so `@mavis/local-runtime-v2`'s PTC modules and its `package.json` must be unpacked as well — leaving them in the archive fails at runtime with `Cannot find module ... quickjs-worker.js`. `@opentelemetry/*` is no longer a direct dependency (transitive only). Main process: 388 files (was 357). |
 | 3.1.6 | 2026-10-27 | Renderer assets moved out of `public/`: the shipped `public/` keeps only the six files the main process and the plugin pages load, and `out/assets/**` carries the images. New packaged Computer Use component (`resources/computer-use/0.34.1/win32-x64/**`) and the vendored `@mavis/computer-use` package it is driven by; mini-app speech/tool IPC, browser device-preview and permission-panel modules are new. `pptx-core` moved to a new content hash. Main process: 357 files (was 346). |
 | 3.1.4 | 2026-10-20 | New `@minimax/mcode-app-server-protocol` dependency, an SSH runtime (`main/modules/ssh-runtime/**`), mini-app agent IPC and detached windows; the Word/Excel editor IPC modules are gone. Renderer grew ~14 MB. |
@@ -28,7 +29,7 @@ Version history of this recovery:
 
 | Part | Method | Fidelity |
 | --- | --- | --- |
-| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **410 of 422 files byte-identically**; six of the remaining twelve differ only in the *order* of adjacent export-assignment statements (one of them additionally inlines an arrow function into its export assignment, 10 lines total, semantically inert), and the other six carry this distribution's offline-mode patch (see "Local behavioural patches"). See "Verification" below. |
+| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **411 of 423 files byte-identically**; six of the remaining twelve differ only in the *order* of adjacent export-assignment statements (one of them additionally inlines an arrow function into its export assignment, 10 lines total, semantically inert), and the other six carry this distribution's offline-mode patch (see "Local behavioural patches"). See "Verification" below. |
 | Renderer (`out/**`) | Committed as the prebuilt static Next.js export. | Byte-identical to the shipped `out/`. The upstream UI sources are not part of this distribution and the build carries no source maps, so a source recovery is not possible. |
 | `public/**` | Committed as-is from the shipped app root. | Byte-identical. 3.1.6 moved the renderer images into `out/assets/**`, so only six files remain: the prompt-config key carriers the main process reads (`public/assets/img/breakDown.png`, `computer_use.png`, see `main/config/prompt-config-key.ts`) and four plugin/permission images the renderer loads. The directory stays a runtime dependency, not only renderer input. |
 | Model menu (`model-menu/**`) | Committed as the prebuilt Vite build output. | Byte-identical. |
@@ -42,7 +43,7 @@ Version history of this recovery:
 
 1. **Emit equivalence.** `tools/restore/verify-main.mjs` compiles `main/**` with
    the app `tsconfig.json` and diffs every emitted file against the shipped
-   `dist/main`. Result: 410/422 identical, 12 files differing:
+   `dist/main`. Result: 411/423 identical, 12 files differing:
    - six with export-order-only differences (`config/env.js`,
      `ipc/documentPreview.ipc.js`, `modules/desktop-appearance.js`,
      `modules/document-preview/artifact-protocol.js`,
@@ -160,7 +161,11 @@ the empty-reply retry (`guard.emptyRetry` / `emptyFailure`), which supersedes th
 old "drop the `done` shortcut" patch; reasoning never commits because
 `commitsOutput` ignores thinking deltas and blocks; and the resume wrapper is
 applied to the `commit()` stream (the single point every committed attempt
-returns through). The trace file and the classifier patches are unchanged.
+returns through). That wrapper must expose exactly one consumer and a `result()`
+that only reports the outcome: the engine asks for the result as soon as it
+attaches settlement bookkeeping, so a `result()` that drains the stream hides
+every delta from the caller (the turn shows nothing and its timer never stops).
+The trace file and the classifier patches are unchanged.
 
 ## Dependency closure
 

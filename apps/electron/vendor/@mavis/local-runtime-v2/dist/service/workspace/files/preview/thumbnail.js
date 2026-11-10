@@ -4,6 +4,7 @@ import { PNG } from 'pngjs';
 import { buildCompressedModelImageFromFile, decodeDataUrl, } from '../../../../infra/util/model-image-preprocess.js';
 const DEFAULT_THUMBNAIL_MAX_EDGE = 512;
 const THUMBNAIL_MAX_OUTPUT_BYTES = 1024 * 1024;
+const HIGH_RES_THUMBNAIL_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const THUMBNAIL_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const THUMBNAIL_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const THUMBNAIL_EDGE_TIERS = [256, 512, 1024];
@@ -104,7 +105,7 @@ function resizePng(source, width, height) {
     }
     return output;
 }
-function encodePngWithinLimit(source, maxEdge) {
+function encodePngWithinLimit(source, maxEdge, maxOutputBytes) {
     const initialSize = boundedPngSize(source.width, source.height, maxEdge);
     let current = resizePng(source, initialSize.width, initialSize.height);
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -114,12 +115,12 @@ function encodePngWithinLimit(source, maxEdge) {
             inputHasAlpha: true,
             deflateLevel: 9,
         });
-        if (encoded.byteLength <= THUMBNAIL_MAX_OUTPUT_BYTES)
+        if (encoded.byteLength <= maxOutputBytes)
             return encoded;
         const longEdge = Math.max(current.width, current.height);
         if (longEdge <= 64)
             return null;
-        const ratio = Math.max(0.5, Math.sqrt(THUMBNAIL_MAX_OUTPUT_BYTES / encoded.byteLength) * 0.95);
+        const ratio = Math.max(0.5, Math.sqrt(maxOutputBytes / encoded.byteLength) * 0.95);
         const nextWidth = Math.max(1, Math.round(current.width * ratio));
         const nextHeight = Math.max(1, Math.round(current.height * ratio));
         if (nextWidth === current.width && nextHeight === current.height)
@@ -194,10 +195,12 @@ export async function buildWorkspaceFileThumbnail(absolutePath, maxEdge, preserv
     }
 }
 async function encodeThumbnail(absolutePath, maxEdge, preservePngAlpha) {
+    // Detailed high-density previews need a larger byte budget to retain their pixels.
+    const maxOutputBytes = maxEdge >= 1024 ? HIGH_RES_THUMBNAIL_MAX_OUTPUT_BYTES : THUMBNAIL_MAX_OUTPUT_BYTES;
     if (preservePngAlpha) {
         const sourceBytes = await readFile(absolutePath);
         if (isPngBuffer(sourceBytes)) {
-            const bytes = encodePngWithinLimit(PNG.sync.read(sourceBytes), maxEdge);
+            const bytes = encodePngWithinLimit(PNG.sync.read(sourceBytes), maxEdge, maxOutputBytes);
             if (!bytes) {
                 return {
                     ok: false,
@@ -210,7 +213,7 @@ async function encodeThumbnail(absolutePath, maxEdge, preservePngAlpha) {
         }
     }
     const compressed = await buildCompressedModelImageFromFile(absolutePath, undefined, {
-        maxBytes: THUMBNAIL_MAX_OUTPUT_BYTES,
+        maxBytes: maxOutputBytes,
         maxEdgePx: maxEdge,
     });
     const decoded = compressed ? decodeDataUrl(compressed.filePart.url) : null;

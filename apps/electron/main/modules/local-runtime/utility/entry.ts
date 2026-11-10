@@ -38,6 +38,7 @@ import { UtilityMiniAppSurfaceClient } from "./miniapp-surface-broker";
 import { UtilityMiniAppToolBroker } from "./miniapp-tool-broker";
 import { createUtilityProxyFetch } from "./proxy-fetch";
 import { resolveElectronNetFetch } from "../electron-net-fetch";
+import { createNetworkServiceAwareFetch, isRuntimeNetworkServiceGoneMessage } from "./network-service-fetch";
 import { UtilityRuntimeMemoryMonitor } from "./runtime-memory-monitor";
 import { createReconnectingComputerUseClient, UtilityComputerUseBrokerClient } from "./computer-use-broker";
 /**
@@ -116,15 +117,34 @@ async function prepareRuntime(init, brokers, transferredPorts) {
         throw error;
     }
 }
+let networkServiceGone = false;
+let networkServiceAwareFetch = null;
 function createUtilityFetchAdapter() {
     const electronFetch = resolveElectronNetFetch(reportElectronNetFetchDiagnostic);
     if (electronFetch) {
-        return {
-            fetch: electronFetch,
-            close: async () => { },
-        };
+        networkServiceAwareFetch = createNetworkServiceAwareFetch(electronFetch, () => createUtilityProxyFetch(process.env, warn));
+        if (networkServiceGone && networkServiceAwareFetch.fallbackToNodeFetch()) {
+            warn('network service gone before prepare; runtime fetch switched to Node fetch');
+        }
+        return networkServiceAwareFetch;
     }
     return createUtilityProxyFetch(process.env, warn);
+}
+/**
+ * The Network Service restarted under this utility; Electron `net` here may be
+ * bound to the dead NetworkContext, so later runtime requests use Node fetch.
+ */
+function handleNetworkServiceGone(message) {
+    if (!isRuntimeNetworkServiceGoneMessage(message))
+        return false;
+    networkServiceGone = true;
+    if (!networkServiceAwareFetch) {
+        warn('network service gone before prepare; runtime fetch will use Node fetch');
+    }
+    else if (networkServiceAwareFetch.fallbackToNodeFetch()) {
+        warn('network service gone; runtime fetch switched to Node fetch');
+    }
+    return true;
 }
 async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferredPorts) {
     // The dominant cold-start cost: two dynamic ESM graphs plus the native
@@ -565,7 +585,8 @@ if (parentPort) {
             miniApp.handleMessage(message) ||
             miniAppSurface.handleMessage(message) ||
             miniAppTool.handleMessage(message) ||
-            memoryMonitor.handleMessage(message),
+            memoryMonitor.handleMessage(message) ||
+            handleNetworkServiceGone(message),
         exit: (code) => process.exit(code),
         sampleHealth: () => {
             const memory = process.memoryUsage();

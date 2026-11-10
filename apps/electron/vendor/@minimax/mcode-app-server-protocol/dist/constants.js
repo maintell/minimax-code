@@ -75,12 +75,5 @@ export const APP_SERVER_FEATURE_PROJECT_ICON_UPDATE = 'project.icon.update';
  * New features extend this list without changing the protocol version.
  */
 export const APP_SERVER_FEATURES = [APP_SERVER_FEATURE_PROJECT_ICON_UPDATE];
-/**
- * Remote Computer Use on the SSH host. Declared only when the app-server
- * process owns a Computer Use client (macOS / Windows), so it is not part of
- * the static `APP_SERVER_FEATURES`. Desktop reads the same value as
- * `RUNTIME_FEATURE_COMPUTER_USE`.
- */
-export const APP_SERVER_FEATURE_COMPUTER_USE = 'computer.use';
 export const APP_SERVER_DAEMON_STATE_VERSION = 1;
 //# sourceMappingURL=constants.js.map
