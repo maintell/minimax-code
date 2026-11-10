@@ -832,7 +832,13 @@ async function handleProxyFetch(sender, options, setupOptions = {}, debugEmitter
         // shape is covered. getCurrentUser (/v1/api/user/info) MUST succeed
         // with a complete userInfo, otherwise useInitFetch sets
         // authInitFailed and shows the "account unavailable" card.
-        if (await isOffline() && isOfflineStubPath(urlObj.pathname)) {
+        // The startup connectivity probe can still report "online" for a few
+        // seconds after the network is gone; the init call then fails with a
+        // network error while the probe is stale, useInitFetch sets
+        // authInitFailed and the client shows the account-unavailable card.
+        // The request has already failed, so answer control-plane endpoints
+        // from the offline stub without waiting for the probe to catch up.
+        if (isOfflineStubPath(urlObj.pathname)) {
             logger.info(`[IPC Proxy] offline stub for ${urlObj.pathname} (${errorMsg})`);
             return neutralProxyResult(urlObj.pathname);
         }

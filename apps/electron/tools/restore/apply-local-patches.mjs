@@ -16,17 +16,30 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// The retry enhancements (unbounded retries, the reasoning-commit rule, the
+// resume wrapper and the bounded settlement wait) are DISABLED: on the offline
+// verification machine a turn that reached the commit boundary never finished
+// with them in place, while the same build with the shipped retry engine (and
+// the offline-mode patches only) completed normally. Keep the code — the anchors
+// are still asserted when the flag is on — but do not apply it until each piece
+// has been re-validated on its own.
+const RETRY_ENHANCEMENTS = process.env.MAVIS_RETRY_ENHANCEMENTS === "1";
+
 const vendorRoot =
   process.argv[2] ?? path.join(fileURLToPath(new URL("../..", import.meta.url)), "vendor");
 
 function patchFile(relativePath, patches) {
+  if (!RETRY_ENHANCEMENTS) return;
   const file = path.join(vendorRoot, relativePath);
   if (!fs.existsSync(file)) throw new Error(`missing vendored file: ${file}`);
   const original = fs.readFileSync(file, "utf8");
   let text = original;
-  for (const { find, replace, label } of patches) {
-    // Idempotent: a snapshot that already carries the patch is left alone.
-    if (text.includes(replace)) continue;
+  for (const { find, replace, label, applied } of patches) {
+    // Idempotent: a snapshot that already carries the patch is left alone. The
+    // `applied` marker is a short substring of the replacement, used where the
+    // replacement itself contains the anchor (an insertion keeps its own anchor
+    // in place, so a second run would insert a duplicate declaration).
+    if (text.includes(replace) || (applied && text.includes(applied))) continue;
     if (!text.includes(find)) {
       throw new Error(
         `${relativePath}: anchor not found for "${label}". The shipped code changed; ` +
@@ -169,6 +182,10 @@ function hasCommittedContent(message) {
   },
   {
     label: "resume after a post-commit transport failure",
+    // This patch prepends code above its own anchor, so re-running it on an
+    // already-patched tree would declare `__mavisRetryTrace` twice and stop the
+    // local runtime from booting. The marker makes the second run a no-op.
+    applied: "function __mavisRetryTrace(event) {",
     find: `/** Add framework-owned transport retry to a provider StreamFn. Hosts opt in explicitly. */
 export function withLLMRetry(inner, input) {`,
     replace: `function __mavisRetryTrace(event) {
@@ -196,6 +213,27 @@ export function withLLMRetry(inner, input) {`,
  * once it completes, and a tool call aborts the resume because a second tool
  * block cannot be merged into the committed message.
  */
+let __mavisFlags;
+function __mavisFlag(name) {
+    try {
+        if (!__mavisFlags) {
+            const proc = globalThis.process;
+            const fs = proc?.getBuiltinModule?.('node:fs');
+            const home = proc?.env?.USERPROFILE || proc?.env?.HOME;
+            __mavisFlags = { fs, dir: home ? home + '/.minimax/' : undefined };
+        }
+        if (!__mavisFlags.fs || !__mavisFlags.dir) return false;
+        return __mavisFlags.fs.existsSync(__mavisFlags.dir + name);
+    }
+    catch {
+        return false;
+    }
+}
+/** Diagnostic switch: a disable-resume file under ~/.minimax bypasses this wrapper. */
+function __mavisMaybeResume(input) {
+    if (__mavisFlag('disable-resume')) return input.source;
+    return __mavisResumeStream(input);
+}
 function __mavisResumeStream(input) {
     const { inner, model, context, options, source } = input;
     const signal = options?.signal;
@@ -203,6 +241,7 @@ function __mavisResumeStream(input) {
     const directive = '（上一段输出因链路中断被截断：请从断点继续，不要重复已经输出的内容，也不要重新解释。）';
     let text = '';
     let sawToolcall = false;
+    let doneMessage;
     let finalMessage;
     let started = false;
     let resolveSettled;
@@ -304,18 +343,43 @@ function __mavisResumeStream(input) {
                     text = text || String(event.content || '');
                 else if (typeof event.type === 'string' && event.type.indexOf('toolcall') === 0)
                     sawToolcall = true;
+                else if (event.type === 'done' && event.message)
+                    doneMessage = event.message;
+                if (__mavisFlag('trace-chunks'))
+                    __mavisRetryTrace({ event: 'chunk', type: String(event && event.type), chars: event && typeof event.delta === 'string' ? event.delta.length : -1 });
                 yield event;
+                if (event.type === 'done') {
+                    // The provider's done event is the end of the reply, but the
+                    // connection may stay open (observed offline through the
+                    // local gateway): waiting for the iterator to close left the
+                    // caller's result() pending forever after the text had
+                    // rendered. Settle and stop here.
+                    resolveSettled(doneMessage ?? {
+                        role: 'assistant',
+                        timestamp: Date.now(),
+                        stopReason: 'stop',
+                        content: [{ type: 'text', text }],
+                    });
+                    return;
+                }
             }
             if (failure === undefined) {
-                let settled;
-                try {
-                    settled = await source.result();
-                }
-                catch (thrown) {
-                    failure = thrown;
+                // Do NOT await source.result() here: the engine gates the result
+                // behind the request-settlement ledger, and offline that ledger
+                // never settles, which left the wrapper (and the turn) open
+                // forever after the text had already streamed. The done event
+                // already carries the provider's final message.
+                let settled = doneMessage;
+                if (!settled) {
+                    settled = {
+                        role: 'assistant',
+                        timestamp: Date.now(),
+                        stopReason: 'stop',
+                        content: [{ type: 'text', text }],
+                    };
                 }
                 if (failure === undefined) {
-                    if (settled && settled.stopReason === 'error') {
+                    if (settled.stopReason === 'error') {
                         failure = new Error(String(settled.errorMessage || 'stream ended in error'));
                     }
                     else {
@@ -393,7 +457,7 @@ export function withLLMRetry(inner, input) {`,
         budget?.stop();
         return {
             kind: 'committed',
-            stream: __mavisResumeStream({
+            stream: __mavisMaybeResume({
                 inner,
                 model,
                 context,
@@ -429,6 +493,45 @@ export function withLLMRetry(inner, input) {`,
                 });
                 if (preflight.kind === 'committed') {
                     budget?.stop();`,
+  },
+  {
+    // The host settlement is a ledger write that cannot complete offline, and
+    // the caller awaits result() before it emits message_end: an unbounded await
+    // kept every offline turn open after the text had streamed. Bound the wait
+    // and let the write finish in the background.
+    label: "settlement wait bounded",
+    find: `function gateResult(source, settle, signal, project) {
+    let gated;
+    const result = () => {
+        gated ??= Promise.resolve()
+            .then(() => source.result())
+            .then(async (final) => {
+            await settle(final, undefined, signal?.aborted === true);
+            return project ? project(final) : final;
+        }, async (error) => {
+            await settle(undefined, error, signal?.aborted === true);
+            throw error;
+        });`,
+    replace: `function gateResult(source, settle, signal, project) {
+    let gated;
+    // Local patch: the host settlement is a ledger write that cannot complete
+    // offline; the caller awaits result() before it emits message_end, so an
+    // unbounded await left every offline turn open after the text had streamed.
+    // Bound the wait and let the write finish in the background.
+    const settleWithin = (promise) => Promise.race([
+        promise,
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+    const result = () => {
+        gated ??= Promise.resolve()
+            .then(() => source.result())
+            .then(async (final) => {
+            await settleWithin(settle(final, undefined, signal?.aborted === true));
+            return project ? project(final) : final;
+        }, async (error) => {
+            await settleWithin(settle(undefined, error, signal?.aborted === true));
+            throw error;
+        });`,
   },
 ]);
 
@@ -477,6 +580,7 @@ patchFile("@mavis/shared/dist/llm-error-classifier.js", [
 // carry `∞`, and a converged tree carries the number; all three input forms are
 // accepted so re-running the patch is idempotent.
 function patchRendererRetryBudget(outputRoot) {
+  if (!RETRY_ENHANCEMENTS) return;
   const chunksDir = path.join(outputRoot, "_next", "static", "chunks");
   if (!fs.existsSync(chunksDir)) throw new Error(`missing renderer chunks: ${chunksDir}`);
   let replaced = 0;

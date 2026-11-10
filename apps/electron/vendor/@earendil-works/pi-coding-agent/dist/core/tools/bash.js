@@ -10,6 +10,7 @@ import { theme } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess, waitForChildProcessExit } from "../../utils/child-process.js";
 import { armParentDeathGuard, getShellConfig, getShellEnv, killProcessTree, terminateProcessTreeGracefully, trackDetachedChildPid, untrackDetachedChildPid, } from "../../utils/shell.js";
 import { OutputAccumulator } from "./output-accumulator.js";
+import { applyShellEncodingDefaults, decodeShellOutput, prepareWindowsAnsiCodePageEncoding } from "./shell-encoding.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "./truncate.js";
@@ -163,6 +164,11 @@ export function createLocalBashOperations(options) {
                 throw new Error("aborted");
             }
             const shellEnv = { ...(env ?? getShellEnv()) };
+            applyShellEncodingDefaults(shellEnv);
+            // Resolve the code page before output arrives so decoding never queries the registry synchronously.
+            await prepareWindowsAnsiCodePageEncoding();
+            if (signal?.aborted)
+                throw new Error("aborted");
             // Windows console encoding can also be inherited by PowerShell 7. Use the
             // UTF-8 transport for both Windows PowerShell families in FullLanguage.
             // ConstrainedLanguage blocks the .NET APIs used by that wrapper, so carry
@@ -484,7 +490,7 @@ class BashProcessStreamCapture {
     }
     snapshot() {
         return {
-            content: this.truncated ? "" : Buffer.concat(this.chunks).toString("utf-8"),
+            content: this.truncated ? "" : decodeShellOutput(Buffer.concat(this.chunks)),
             truncated: this.truncated,
         };
     }

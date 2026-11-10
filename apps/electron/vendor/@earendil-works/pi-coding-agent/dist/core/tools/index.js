@@ -6,6 +6,7 @@ export { createFindTool, createFindToolDefinition, } from "./find.js";
 export { createGrepTool, createGrepToolDefinition, } from "./grep.js";
 export { createLsTool, createLsToolDefinition, } from "./ls.js";
 export { createReadTool, createReadToolDefinition, } from "./read.js";
+export { applyShellEncodingDefaults, createShellOutputDecoder, decodeShellOutput, getWindowsAnsiCodePageEncoding, prepareWindowsAnsiCodePageEncoding, } from "./shell-encoding.js";
 export { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, truncateLine, truncateTail, } from "./truncate.js";
 export { createWriteTool, createWriteToolDefinition, } from "./write.js";
 import { createBashTool, createBashToolDefinition } from "./bash.js";

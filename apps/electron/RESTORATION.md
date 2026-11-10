@@ -167,6 +167,17 @@ attaches settlement bookkeeping, so a `result()` that drains the stream hides
 every delta from the caller (the turn shows nothing and its timer never stops).
 The trace file and the classifier patches are unchanged.
 
+**These retry enhancements are currently disabled.** On the offline verification
+host (a Windows box with no default gateway and an internal model gateway) a turn
+that reached the commit boundary never finished with them applied — the assistant
+text rendered, the provider sent `done`, and the turn then stayed open with no
+error. The same build with the shipped retry engine and only the offline-mode
+patches completes normally, so
+`tools/restore/apply-local-patches.mjs` now applies nothing unless
+`MAVIS_RETRY_ENHANCEMENTS=1` is set. Re-enable one piece at a time (policy,
+classifier, reasoning rule, resume, settlement bound) with an offline run in
+between; the anchors are still asserted so a shipped refactor fails loudly.
+
 ## Dependency closure
 
 Third-party dependencies are installed from npm at the exact versions the
