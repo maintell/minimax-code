@@ -51,6 +51,71 @@ export async function isOffline() {
  * never written to the store, so it never masquerades as a persisted account.
  */
 export const OFFLINE_USER_ID = "offline-local";
+/**
+ * The store keeps the account identity the user last signed in with. While
+ * offline the client cannot refresh it, but it must NOT replace it either: the
+ * renderer captures that identity at startup and rejects a `getCurrentUser`
+ * answer whose `realUserID` differs ("Account identity changed during
+ * startup" → `authInitFailed` → the account-unavailable card). A profile that
+ * has ever been signed in therefore has to keep its own identity; only a
+ * profile with no stored account falls back to the synthetic sentinel.
+ */
+let identityResolver: (() => Record<string, unknown> | undefined) | null = null;
+export function configureOfflineIdentity(resolver: () => Record<string, unknown> | undefined) {
+    identityResolver = resolver;
+}
+const IDENTITY_FIELDS = [
+    "userID",
+    "realUserID",
+    "userName",
+    "subUserName",
+    "name",
+    "userMail",
+    "email",
+    "userPhone",
+    "accountAvatarUrl",
+    "accountDefaultAvatarUrl",
+    "accountAvatarStatus",
+    "webAvatar",
+    "subUserAvatar",
+    "subUserSocialMediaUrl",
+    "deviceID",
+] as const;
+function storedIdentity() {
+    let source: Record<string, unknown> | undefined;
+    try {
+        source = identityResolver?.();
+    }
+    catch {
+        return {};
+    }
+    if (!source)
+        return {};
+    const realUserID = typeof source.realUserID === "string" ? source.realUserID : "";
+    const userID = typeof source.userID === "string" ? source.userID : "";
+    if (!realUserID && !userID)
+        return {};
+    // A stored sentinel means this profile never held a real account.
+    if (realUserID === OFFLINE_USER_ID || userID === OFFLINE_USER_ID)
+        return {};
+    const identity: Record<string, string> = {};
+    for (const field of IDENTITY_FIELDS) {
+        const value = source[field];
+        if (typeof value === "string" && value.length > 0)
+            identity[field] = value;
+    }
+    if (!identity.realUserID)
+        identity.realUserID = identity.userID;
+    if (!identity.userID)
+        identity.userID = identity.realUserID;
+    if (!identity.userName)
+        identity.userName = identity.name ?? "Offline";
+    if (!identity.subUserName)
+        identity.subUserName = identity.userName;
+    if (!identity.name)
+        identity.name = identity.userName;
+    return identity;
+}
 export function buildOfflineUser() {
     return {
         userID: OFFLINE_USER_ID,
@@ -66,6 +131,7 @@ export function buildOfflineUser() {
         subUserSocialMediaUrl: "",
         userPhone: "",
         email: "",
+        ...storedIdentity(),
         offline: true,
     };
 }

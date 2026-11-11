@@ -192,6 +192,25 @@ patches completes normally, so
 classifier, reasoning rule, resume, settlement bound) with an offline run in
 between; the anchors are still asserted so a shipped refactor fails loudly.
 
+## Offline mode
+
+`modules/connectivity/offline-mode.ts` (added by this distribution) decides
+"offline" once per process with a short `net.fetch` probe to the OAuth host and
+then lets the main process (a) answer `STORAGE_GET_USER` with a complete user,
+(b) answer failing account/config/bootstrap proxy calls with a neutral `200`, and
+(c) keep the login window, the onboarding flow and the identity projection from
+blocking the main surface.
+
+The offline answers must **not** invent a new identity. The renderer captures the
+account identity at startup and rejects a `getCurrentUser` answer whose
+`realUserID` differs (`Account identity changed during startup`), which sets
+`authInitFailed` and shows the account-unavailable card. `buildOfflineUser`
+therefore reuses the identity the store already holds — wired through
+`configureOfflineIdentity(getUserInfo)` in `ipc/storage.ipc.ts` — and only falls
+back to the `offline-local` sentinel when the profile never held an account.
+Verified against a profile that had been signed in before going offline: the main
+surface renders, while the same profile hit the account card before the fix.
+
 ## Dependency closure
 
 Third-party dependencies are installed from npm at the exact versions the

@@ -14,7 +14,7 @@ import { scheduleMcodeToolsAuthorization, clearMcodeToolsAuthorization } from ".
 import { resolveAccountOnboardingInstallCohort, resolveDesktopOnboardingMode } from "../windows/accountOnboardingEligibility";
 import { DEFAULT_DESKTOP_TYPOGRAPHY, getDesktopTypographySnapshot, desktopTypographyEquals } from "../modules/desktop-typography";
 import { DEFAULT_DESKTOP_APPEARANCE_STATE, getDesktopAppearanceState, desktopAppearanceStatesEqual, mergeDesktopAppearancePatch, emitDesktopAppearanceCommitted } from "../modules/desktop-appearance";
-import { OFFLINE_USER_ID, buildOfflineUser, isOffline } from "../modules/connectivity/offline-mode";
+import { OFFLINE_USER_ID, buildOfflineUser, configureOfflineIdentity, isOffline } from "../modules/connectivity/offline-mode";
 /**
  * 根据国内/海外版本和环境区分存储配置名称
  * 这样不同版本和环境可以共存而不互相影响
@@ -203,6 +203,10 @@ export function clearTokens() {
 export function getUserInfo() {
     return store.get(sharedAuthStorageEnabled ? 'sharedUser' : 'user') || {};
 }
+// The offline answers for getCurrentUser / STORAGE_GET_USER are built in
+// `connectivity/offline-mode`; they must reuse the identity already persisted
+// here, or the renderer's startup identity check rejects them.
+configureOfflineIdentity(() => getUserInfo());
 let sharedAuthStorageEnabled = false;
 function isCredentialFieldName(key) {
     const normalized = key.toLowerCase().replace(/[^a-z0-9]/gu, '');
