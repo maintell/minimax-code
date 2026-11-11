@@ -22,6 +22,7 @@ import { compareVersions, releaseCli } from '../scripts/release-cli.mjs';
 import { compareRuns, exitCodeForStatus, renderReport, spread, validateRun, validateRequest, validateToolOutput, median, selectScenarios } from '../scripts/perf/report.mjs';
 import { copyMcodeToolsArtifact, downloadMcodeToolsArtifact, MCODE_TOOLS_ARTIFACT } from '../scripts/lib/mcode-tools-artifact.mjs';
 import { checkWindowsSourceLocation, runWindowsSourceLocationCheck } from '../scripts/check-windows-source-location.mjs';
+import { releaseNotesFromChangelog } from '../scripts/desktop-release-notes.mjs';
 
 test('Windows source preflight accepts local NTFS without parsing fsutil display text', () => {
   for (const fsutilOutput of ['E: - Fixed Drive\r\n', 'E: - Festplatte\r\n', new Error('Error 5: Access is denied')]) {
@@ -557,6 +558,57 @@ test('CLI release publishes only tag pushes after full verification and archive 
     }
   }
 });
+test('desktop release notes come from the versioned changelog section', () => {
+  const changelog = [
+    '# Changelog',
+    '',
+    '## 3.1.14 · 2026-11-11',
+    '',
+    '### Added',
+    '',
+    '- first',
+    '',
+    '## 3.1.13',
+    '',
+    '- older',
+  ].join('\n');
+  assert.equal(releaseNotesFromChangelog(changelog, '3.1.14'), '### Added\n\n- first');
+  assert.equal(releaseNotesFromChangelog(changelog, '3.1.13'), '- older');
+  // A version must never match a longer one, and every section must carry text.
+  assert.throws(() => releaseNotesFromChangelog(changelog, '3.1.140'), /no "## 3.1.140" section/);
+  assert.throws(() => releaseNotesFromChangelog('## 3.1.14\n\n## 3.1.13\n\n- x\n', '3.1.14'), /empty/);
+  // The packaged version must be documented before it can be released.
+  const version = JSON.parse(readFileSync(new URL('../apps/electron/package.json', import.meta.url), 'utf8')).version;
+  const notes = releaseNotesFromChangelog(readFileSync(new URL('../apps/electron/CHANGELOG.md', import.meta.url), 'utf8'), version);
+  assert.ok(notes.length > 0);
+});
+
+test('desktop release publishes changelog notes from the update-channel repository', () => {
+  const workflow = parseYaml(readFileSync(new URL('../.github/workflows/desktop-release.yml', import.meta.url), 'utf8'));
+  assert.deepEqual(workflow.on.push, { tags: ['desktop-v*'] });
+  const meta = workflow.jobs.package.steps.find(step => step.id === 'meta');
+  assert.match(meta.run, /release-channel\.json/);
+  assert.match(meta.run, /test "\$channel_repository" = "\$GITHUB_REPOSITORY"/);
+  const notes = workflow.jobs.package.steps.find(step => step.run?.includes('desktop-release-notes.mjs'));
+  assert.match(notes.run, /"\$VERSION"/);
+  assert.ok(workflow.jobs.package.steps.some(step => step.uses?.startsWith('actions/upload-artifact@')
+    && step.with.name === 'desktop-release-notes-${{ steps.meta.outputs.version }}'));
+  assert.ok(workflow.jobs.publish.steps.some(step => step.uses?.startsWith('actions/download-artifact@')
+    && step.with.name === 'desktop-release-notes-${{ needs.package.outputs.version }}'));
+  const publish = workflow.jobs.publish.steps.find(step => step.name === 'Publish the installer');
+  assert.match(publish.run, /gh release create "\$RELEASE_TAG"/);
+  assert.match(publish.run, /--notes-file "\$notes"/);
+  // Re-publishing a tag must refresh the body, not only the assets.
+  assert.match(publish.run, /gh release edit "\$RELEASE_TAG" --notes-file "\$notes"/);
+  // The electron-builder fallback feed must belong to the repository the client
+  // resolves, so a bypass of the resolver can never reach another product.
+  const channel = JSON.parse(readFileSync(new URL('../apps/electron/main/modules/updater/release-channel.json', import.meta.url), 'utf8'));
+  assert.equal(channel.tagPrefix, 'desktop-v');
+  const builder = parseYaml(readFileSync(new URL('../apps/electron/electron-builder.yml', import.meta.url), 'utf8'));
+  assert.equal(builder.publish.provider, 'generic');
+  assert.ok(builder.publish.url.includes(`/${channel.repository}/releases/latest/download`));
+});
+
 import { runInNewContext } from 'node:vm';
 
 function fixture(t) {

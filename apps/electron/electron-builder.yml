@@ -79,6 +79,12 @@ nsis:
   # function is inert either way, so warnings stay warnings here.
   warningsAsErrors: false
 
+# electron-updater's fallback channel file. A running client resolves the newest
+# `desktop-v*` release of the repository named in
+# `main/modules/updater/release-channel.json` and calls setFeedURL before every
+# check, so this value only matters if a check bypasses the resolver. Keep it on
+# this repository's releases and never on the upstream CDN: a bypass must fail,
+# not offer an official MiniMax build.
 publish:
   provider: generic
-  url: https://filecdn.minimax.chat/public/minimax-agent/release
+  url: https://github.com/maintell/minimax-code/releases/latest/download

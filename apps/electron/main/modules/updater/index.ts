@@ -11,14 +11,14 @@
  */
 import { isDev } from "../../config/env";
 import { getCategoryLogger } from "../../utils/logger";
-import { configureAutoUpdater } from "./config";
+import { configureAutoUpdater, ensurePublicReleaseFeed } from "./config";
 import { setupAutoUpdaterEvents } from "./events";
 const logger = getCategoryLogger('update');
 // 导出状态管理函数
 export { setIsUserTriggeredCheck as setUserTriggeredCheck, getUpdateStatus, setUpdateStatus, isChecking, isDownloading, isDownloaded, isUpToDate, hasUpdateReady, resetTempFlags, resetUpdateCache, getCachedUpdateInfo, getCachedProgress, isAutoUpdateEnabled, setAutoUpdateEnabled, getDownloadedFilePath, isNativeUpdateReady } from "./state";
 
 // 导出配置
-export { getUpdateServerUrl } from "./config";
+export { getUpdateServerUrl, ensurePublicReleaseFeed } from "./config";
 
 /**
  * 初始化更新模块
@@ -31,5 +31,10 @@ export function initUpdater() {
     }
     configureAutoUpdater();
     setupAutoUpdaterEvents();
+    // 预热版本发现，让第一次检查不必等待 release feed 请求。失败时保持静默，
+    // 由下一次检查重试并把错误返回渲染层。
+    void ensurePublicReleaseFeed().catch((error) => {
+        logger.warn(`[Updater] 预解析发布源失败: ${error instanceof Error ? error.message : String(error)}`);
+    });
     logger.info('[Updater] 更新模块初始化完成');
 }

@@ -11,7 +11,7 @@ import { IPC_CHANNELS } from "../config/constants";
 import { isVersionLower } from "../utils";
 import { getCategoryLogger } from "../utils/logger";
 import { windowManager } from "../windows/manager";
-import { isNativeUpdateReady, hasUpdateReady, isAutoUpdateEnabled, getDownloadedFilePath, resetUpdateCache, setUpdateStatus, getUpdateStatus, getCachedUpdateInfo, setUserTriggeredCheck, getCachedProgress, setAutoUpdateEnabled, initUpdater } from "../modules/updater";
+import { isNativeUpdateReady, hasUpdateReady, isAutoUpdateEnabled, getDownloadedFilePath, resetUpdateCache, setUpdateStatus, getUpdateStatus, getCachedUpdateInfo, setUserTriggeredCheck, getCachedProgress, setAutoUpdateEnabled, initUpdater, ensurePublicReleaseFeed } from "../modules/updater";
 import { isPendingUpdateCheck, checkPendingUpdate } from "../modules/updater/pending-check";
 import { triggerNativeUpdaterFetch, isNativeUpdaterFetchInFlight } from "../modules/updater/native-fetch";
 import { isTestBranchUpdateBuild, readTestBuild, isNewerTestBuild } from "../modules/updater/test-branch";
@@ -129,6 +129,22 @@ function setupUpdaterIPCHandlers(options) {
     ipcMain.handle(IPC_CHANNELS.UPDATER_CHECK, async (_event, options) => {
         if (isDev) {
             return { success: true, status: 'not-available' };
+        }
+        // 公开包先定位本仓库最新的 release，再交给 electron-updater。检查入口
+        // 必须先等 feed 解析完成，不能让检查落到安装包内 app-update.yml 的
+        // 回退地址（那是上游 CDN，会提示安装官方构建）。
+        try {
+            await ensurePublicReleaseFeed();
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            logger.error(`[Updater] 解析发布源失败: ${message}`);
+            setUpdateStatus('error');
+            return {
+                success: false,
+                status: 'error',
+                error: message,
+            };
         }
         // 切换测试分支期间由切换流程独占更新器。
         if (isSwitchingTestBranch()) {

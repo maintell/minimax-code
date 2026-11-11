@@ -65,6 +65,12 @@ matching `package.json`), which packages the client on `windows-latest` and
 publishes the installer, its blockmap and `latest.yml` to the release. Do not
 hand-publish a workstation build.
 
+The release body comes from [`CHANGELOG.md`](./CHANGELOG.md): the workflow
+publishes the section for the released version, so a version without a section
+cannot be released. Update checks read the newest `desktop-v*` release of the
+repository named in `main/modules/updater/release-channel.json`; the client
+resolves it before every check and never falls back to the upstream CDN.
+
 ## Dependency policy
 
 - First-party and native dependencies are vendored from the shipped client

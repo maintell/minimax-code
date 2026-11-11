@@ -72,6 +72,23 @@ This workflow does not publish to the npm registry or change the official instal
 
 The current source target is MiniMax Code 0.6.3. Workspace and local-build manifests remain `private: true` to prevent accidental npm publication, except `@minimax-ai/code-sdk`. That package is public. Publish it only as the tarball checked by `packages/code-sdk` `release:check` (see `packages/code-sdk/RELEASING.md`). Its `prepublishOnly` script rejects `npm publish` run in the package directory. A source release, npm package, and installer are separate artifacts with separate verification.
 
+## Desktop installer releases
+
+The desktop client (`apps/electron`) is packaged by the `Desktop release`
+workflow, which runs only for a `desktop-v<version>` tag matching
+`apps/electron/package.json` (or a manual dispatch that targets that tag).
+Pushing the tag packages the client on `windows-latest` and publishes the
+installer, its blockmap and `latest.yml` to a GitHub release. Do not hand-publish
+a workstation build.
+
+Before tagging, add the release's section to
+[`apps/electron/CHANGELOG.md`](../apps/electron/CHANGELOG.md); the workflow
+publishes it as the release body and fails when the section is missing. The
+release also fails when the repository does not match
+`apps/electron/main/modules/updater/release-channel.json`, because the packaged
+client resolves its update feed from that repository's `desktop-v*` releases and
+never falls back to the upstream CDN.
+
 ## Prepare a release
 
 1. Select a reviewed commit on `main`. For shared-source updates, first complete the three-way process in [Source synchronization](source-sync.md).

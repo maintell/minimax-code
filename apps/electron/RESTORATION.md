@@ -29,7 +29,7 @@ Version history of this recovery:
 
 | Part | Method | Fidelity |
 | --- | --- | --- |
-| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **411 of 423 files byte-identically**; six of the remaining twelve differ only in the *order* of adjacent export-assignment statements (one of them additionally inlines an arrow function into its export assignment, 10 lines total, semantically inert), and the other six carry this distribution's offline-mode patch (see "Local behavioural patches"). See "Verification" below. |
+| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **407 of 423 files byte-identically**; six of the remaining sixteen differ only in the *order* of adjacent export-assignment statements (one of them additionally inlines an arrow function into its export assignment, 10 lines total, semantically inert), and the other ten carry this distribution's offline-mode and update-channel patches (see "Known deviations"). See "Verification" below. |
 | Renderer (`out/**`) | Committed as the prebuilt static Next.js export. | Byte-identical to the shipped `out/`. The upstream UI sources are not part of this distribution and the build carries no source maps, so a source recovery is not possible. |
 | `public/**` | Committed as-is from the shipped app root. | Byte-identical. 3.1.6 moved the renderer images into `out/assets/**`, so only six files remain: the prompt-config key carriers the main process reads (`public/assets/img/breakDown.png`, `computer_use.png`, see `main/config/prompt-config-key.ts`) and four plugin/permission images the renderer loads. The directory stays a runtime dependency, not only renderer input. |
 | Model menu (`model-menu/**`) | Committed as the prebuilt Vite build output. | Byte-identical. |
@@ -43,7 +43,7 @@ Version history of this recovery:
 
 1. **Emit equivalence.** `tools/restore/verify-main.mjs` compiles `main/**` with
    the app `tsconfig.json` and diffs every emitted file against the shipped
-   `dist/main`. Result: 411/423 identical, 12 files differing:
+   `dist/main`. Result: 407/423 identical, 16 files differing:
    - six with export-order-only differences (`config/env.js`,
      `ipc/documentPreview.ipc.js`, `modules/desktop-appearance.js`,
      `modules/document-preview/artifact-protocol.js`,
@@ -53,11 +53,14 @@ Version history of this recovery:
      re-export statements, the hoisting order of exported function assignments,
      and whether an exported arrow function is inlined into its
      `exports.x = …` assignment); they do not change any runtime behaviour.
-   - six carrying this distribution's offline-mode patch (`ipc/auth.ipc.ts`,
-     `ipc/proxy.ipc.ts`, `ipc/storage.ipc.ts`,
+   - ten carrying this distribution's patches: the offline-mode patch
+     (`ipc/auth.ipc.ts`, `ipc/proxy.ipc.ts`, `ipc/storage.ipc.ts`,
      `lifecycle/application-modules.ts`, `windows/archonChatWindow.ts`,
-     `windows/initial-auth.ts`), plus the added
-     `modules/connectivity/offline-mode.ts`.
+     `windows/initial-auth.ts`) and the update-channel patch
+     (`ipc/updater.ipc.ts`, `modules/updater/config.ts`,
+     `modules/updater/index.ts`, `modules/updater/pending-check.ts`), plus the
+     added `modules/connectivity/offline-mode.ts` and
+     `modules/updater/release-feed.ts`.
 
    1 prebuilt bundle is copied verbatim.
 2. **Packaged-run verification.** `pnpm package` produces
@@ -87,8 +90,9 @@ Version history of this recovery:
 
 ## Known deviations
 
-1. **Export-order-only diffs** — six of the twelve files listed above; 10 lines
-   total. The other six carry the offline-mode patch by design.
+1. **Export-order-only diffs** — six of the sixteen files listed above; 10 lines
+   total. The other ten carry this distribution's offline-mode and
+   update-channel patches by design.
 2. **Erased type annotations.** The shipped build erased all TypeScript types.
    The recovered sources compile to the same JavaScript but do not satisfy a
    full type check (`pnpm typecheck:strict` reports ≈5.3k diagnostics, dominated
@@ -120,6 +124,16 @@ Version history of this recovery:
 8. **`resources/resources/**` ships build resources at runtime.** The shipped
    installation contains the NSIS/DMG assets inside `resources/resources/`; the
    reconstruction preserves that layout.
+9. **Update checks follow this repository's releases.** The shipped client reads
+   the upstream CDN feed (`…/minimax-agent-prod/release`). This distribution
+   publishes its installers as GitHub releases (`desktop-v*`), so
+   `main/modules/updater/release-feed.ts` resolves the newest such release from
+   the repository's release feed and points `electron-updater` at that release's
+   `latest.yml` before every check; `main/ipc/updater.ipc.ts` waits for the
+   resolution and reports a failure instead of falling back to the CDN. The
+   repository and tag prefix live in `main/modules/updater/release-channel.json`,
+   and the `Desktop release` workflow refuses to publish from any other
+   repository. Release notes are published from `apps/electron/CHANGELOG.md`.
 
 ## Vendor manifest rewrites
 

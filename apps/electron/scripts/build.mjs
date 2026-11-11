@@ -3,6 +3,8 @@
 // 1. main/**/*.ts  -> dist/main/**/*.js   (tsc, CommonJS, ES2022 — the same
 //    emit shape the shipped build uses)
 // 2. main/**/*.js  -> dist/main/**/*.js   (the prebuilt esbuild preload bundle)
+//    main/**/*.json -> dist/main/**/*.json (runtime JSON imports, e.g. the
+//    updater's release channel)
 // 3. model-menu/   -> dist/model-menu/    (prebuilt popup renderer)
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -71,7 +73,9 @@ export function build() {
   copyTree(
     path.join(appDir, "main"),
     path.join(appDir, "dist", "main"),
-    (file) => file.endsWith(".js"),
+    // tsc emits `require()` for JSON imports instead of inlining them, so
+    // `modules/updater/release-channel.json` has to ship next to its module.
+    (file) => file.endsWith(".js") || file.endsWith(".json"),
   );
   copyTree(path.join(appDir, "model-menu"), path.join(appDir, "dist", "model-menu"));
   // The emit is per-file: `main/foo.ts` becomes `dist/main/foo.js`, while the

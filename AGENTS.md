@@ -41,6 +41,7 @@ Never merge internal Git history or cherry-pick internal commits into this repos
 | Verification pipeline | `scripts/verify.mjs` | GitHub CI, `pnpm verify` |
 | Documentation-only classification | `scripts/ci-changes.mjs` | source verification, release audit |
 | Source archive validation/extraction | `scripts/lib/source-archive.mjs` | source export, candidate validation |
+| Desktop update channel and release notes | `apps/electron/main/modules/updater/release-channel.json`, `apps/electron/CHANGELOG.md` | desktop update check, `scripts/desktop-release-notes.mjs`, `desktop-release.yml` |
 
 ## Common changes
 
