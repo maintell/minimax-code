@@ -459,6 +459,12 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     });
     ipcMain.handle(IPC_CHANNELS.RC_BINDING_LOST, async () => {
         log.info('[rc.ipc] rc:binding-lost invoked (renderer reports state=none)');
+        // PRC mode owns the binding: a cloud `state=none` says nothing about the
+        // operator gateway, so it must not disconnect us.
+        if (prcMode) {
+            log.info('[rc.ipc] rc:binding-lost ignored source=prc');
+            return { success: true, source: 'prc', ignored: true };
+        }
         try {
             rc.onRendererBindingLost();
             return { success: true };
@@ -470,6 +476,12 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     });
     ipcMain.handle(IPC_CHANNELS.RC_MARK_UNBOUND, async () => {
         log.info('[rc.ipc] rc:mark-unbound invoked (renderer issued the unbind HTTP call itself; main only clears local state)');
+        // The renderer can only unbind the cloud binding; clearing local state
+        // here would drop the operator's PRC binding with it.
+        if (prcMode) {
+            log.info('[rc.ipc] rc:mark-unbound ignored source=prc');
+            return { success: true, source: 'prc', ignored: true };
+        }
         try {
             rc.onRendererUnbound();
             return { success: true };
