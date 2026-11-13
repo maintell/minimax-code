@@ -68,6 +68,8 @@ export function createHttpApi(deps: {
   router: CommandRouter;
   config: Config;
   passwordHash: string;
+  // Owned by the composition root, which holds the live producer registry.
+  closeProducer?: (bindingId: number) => void;
   nowMs?: () => number;
 }) {
   const now = deps.nowMs ?? Date.now;
@@ -78,10 +80,22 @@ export function createHttpApi(deps: {
   // Producer routes bypass the cookie/CSRF gate by design: a desktop install has
   // no browser session, so it proves the operator password instead. The password
   // is checked before any binding is read or written, a wrong one can never
-  // probe which device ids exist.
+  // probe which device ids exist. Verification is scrypt and synchronous, so a
+  // failure budget runs first: without it one client could stall the only event
+  // loop. A missing header performs no scrypt work and so spends no budget.
   async function handleProducer(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+    const key = loginKey(req, deps.config.trustProxy);
+    if (deps.auth.producerAuthBlocked(key, now())) {
+      send(res, 429, { error: { code: 'RATE_LIMITED' } });
+      return true;
+    }
     const password = req.headers['x-prc-password'];
-    if (typeof password !== 'string' || !verifyPassword(password, deps.passwordHash)) {
+    if (typeof password !== 'string') {
+      send(res, 401, { error: { code: 'not_authenticated' } });
+      return true;
+    }
+    if (!verifyPassword(password, deps.passwordHash)) {
+      deps.auth.recordProducerAuthFailure(key, now());
       send(res, 401, { error: { code: 'not_authenticated' } });
       return true;
     }
@@ -123,6 +137,10 @@ export function createHttpApi(deps: {
         return true;
       }
       deps.store.deleteBinding(bindingId);
+      // Deleting the row is not revocation: a socket that is already open keeps
+      // serving its consumer until it is told to stop. The disconnect_reason is
+      // what makes the bridge clear its local binding.
+      deps.closeProducer?.(bindingId);
       send(res, 200, { ok: true });
       return true;
     }

@@ -59,3 +59,18 @@ test('login attempts are limited per key inside the window', () => {
   assert.equal(auth.allowLogin('5.6.7.8', now + 6), true);
   assert.equal(auth.allowLogin('1.2.3.4', now + 61_000), true);
 });
+
+test('producer auth failures have their own budget, separate from login', () => {
+  const auth = createAuth('server-secret');
+  const now = 10_000;
+  for (let i = 0; i < 10; i += 1) {
+    assert.equal(auth.producerAuthBlocked('1.2.3.4', now + i), false, `check ${i + 1}`);
+    auth.recordProducerAuthFailure('1.2.3.4', now + i);
+  }
+  assert.equal(auth.producerAuthBlocked('1.2.3.4', now + 10), true);
+  assert.equal(auth.producerAuthBlocked('5.6.7.8', now + 10), false);
+  // The window slides: the first failure ages out and the key is served again.
+  assert.equal(auth.producerAuthBlocked('1.2.3.4', now + 61_000), false);
+  // Neither budget spends the other.
+  assert.equal(auth.allowLogin('1.2.3.4', now + 10), true);
+});

@@ -7,6 +7,10 @@ const KEY_BYTES = 64;
 const COOKIE_TTL_MS = 7 * 24 * 3600 * 1000;
 const LOGIN_WINDOW_MS = 60_000;
 const LOGIN_LIMIT = 5;
+// Producer credentials are re-read on every reconnect (1/2/4/8/16/30 s), so this
+// budget counts failures only and never throttles a producer that authenticates.
+const PRODUCER_AUTH_WINDOW_MS = 60_000;
+const PRODUCER_AUTH_LIMIT = 10;
 const MIN_SALT_BYTES = 8;
 const MIN_KEY_BYTES = 32;
 const MAX_SCRYPT_N = 1_048_576;
@@ -73,6 +77,9 @@ function sign(secret: string, value: string): string {
 
 export function createAuth(secret: string) {
   const attempts = new Map<string, number[]>();
+  // A separate map: a brute-force budget for the producer password must never
+  // spend the browser login budget, or vice versa.
+  const producerFailures = new Map<string, number[]>();
   const makeToken = (payload: string) => `${Buffer.from(payload, 'utf8').toString('base64url')}.${sign(secret, payload)}`;
 
   return {
@@ -107,6 +114,25 @@ export function createAuth(secret: string) {
       fresh.push(nowMs);
       attempts.set(key, fresh);
       return true;
+    },
+    // Read-only: a key with no failure inside the window is reported unblocked
+    // and its stale entry is dropped, so a producer that only ever succeeds
+    // never grows this map.
+    producerAuthBlocked(key: string, nowMs = Date.now()): boolean {
+      const failures = producerFailures.get(key);
+      if (!failures) return false;
+      const fresh = failures.filter((ts) => nowMs - ts < PRODUCER_AUTH_WINDOW_MS);
+      if (fresh.length === 0) {
+        producerFailures.delete(key);
+      } else {
+        producerFailures.set(key, fresh);
+      }
+      return fresh.length >= PRODUCER_AUTH_LIMIT;
+    },
+    recordProducerAuthFailure(key: string, nowMs = Date.now()): void {
+      const fresh = (producerFailures.get(key) ?? []).filter((ts) => nowMs - ts < PRODUCER_AUTH_WINDOW_MS);
+      fresh.push(nowMs);
+      producerFailures.set(key, fresh);
     },
   };
 }

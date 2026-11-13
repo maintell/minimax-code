@@ -52,7 +52,14 @@ const hub = new ConsumerHub();
 // One live producer per binding; the router reads it, the socket layer writes it.
 const producers = new Map<number, ProducerSocket>();
 const router = new CommandRouter({ getProducer: (bindingId) => producers.get(bindingId), logger });
-const api = createHttpApi({ auth, store, router, config, passwordHash });
+const api = createHttpApi({
+  auth,
+  store,
+  router,
+  config,
+  passwordHash,
+  closeProducer: (bindingId) => producers.get(bindingId)?.close('server_initiated_unbind'),
+});
 const server = await createServer({
   config,
   api,

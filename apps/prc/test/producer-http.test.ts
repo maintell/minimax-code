@@ -1,31 +1,56 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAuth, hashPassword } from '../src/auth.ts';
 import { createHttpApi } from '../src/http.ts';
+import { ProducerSocket } from '../src/producer.ts';
+import type { Logger } from '../src/producer.ts';
 import { createServer } from '../src/server.ts';
 import { openStore } from '../src/store.ts';
 
 const BINDINGS = '/minimax-cloud/api/v1/remote-control/desktop/bindings';
 const UNBIND = '/minimax-cloud/api/v1/remote-control/unbind';
 
-async function boot() {
+const silent: Logger = { info() {}, warn() {}, error() {} };
+
+class FakeWs extends EventEmitter {
+  readonly sent: string[] = [];
+  readonly closed: Array<{ code?: number; reason?: string }> = [];
+  send(text: string): void {
+    this.sent.push(text);
+  }
+  close(code?: number, reason?: string): void {
+    this.closed.push({ code, reason });
+  }
+}
+
+async function boot(options: { trustProxy?: boolean } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'prc-producer-http-'));
   const store = openStore(path.join(dir, 'prc.sqlite'));
-  const config = { port: 0, dataDir: dir, publicUrl: 'https://prc.example.com', trustProxy: false };
+  const config = {
+    port: 0,
+    dataDir: dir,
+    publicUrl: 'https://prc.example.com',
+    trustProxy: options.trustProxy ?? false,
+  };
+  // The same registry the composition root holds, wired the same way.
+  const producers = new Map<number, ProducerSocket>();
   const api = createHttpApi({
     auth: createAuth('secret'),
     store,
     router: { request: async () => ({ kind: 'ack', payload: {} }) } as never,
     config,
     passwordHash: hashPassword('pw'),
+    closeProducer: (bindingId) => producers.get(bindingId)?.close('server_initiated_unbind'),
   });
   const server = await createServer({ config, api });
   return {
     server,
     store,
+    producers,
     close: async () => {
       await server.close();
       store.close();
@@ -95,6 +120,83 @@ test('an authenticated unbind deletes the binding; an anonymous one does not', a
     assert.equal(ok.status, 200);
     assert.deepEqual(await ok.json(), { ok: true });
     assert.equal(env.store.getBinding(binding.id), undefined);
+  } finally {
+    await env.close();
+  }
+});
+
+test('an authenticated unbind revokes the live producer socket', async () => {
+  const env = await boot();
+  try {
+    const binding = env.store.getOrCreateBinding('dev-1', '3.1.14');
+    const ws = new FakeWs();
+    const producer = new ProducerSocket({
+      socket: ws as never,
+      bindingId: binding.id,
+      store: env.store,
+      logger: silent,
+      onFrame: () => {},
+      onClose: () => {},
+    });
+    env.producers.set(binding.id, producer);
+    producer.start();
+
+    const response = await fetch(`${env.server.url}${UNBIND}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-prc-password': 'pw' },
+      body: JSON.stringify({ binding_id: binding.id }),
+    });
+    assert.equal(response.status, 200);
+
+    const frames = ws.sent.map((text) => JSON.parse(text) as Record<string, unknown>);
+    const reason = frames.find((frame) => frame.type === 'ctrl.disconnect_reason');
+    assert.equal((reason?.payload as Record<string, unknown> | undefined)?.code, 'server_initiated_unbind');
+    assert.deepEqual(ws.closed, [{ code: 1000, reason: 'server_initiated_unbind' }]);
+    assert.equal(env.store.getBinding(binding.id), undefined);
+  } finally {
+    await env.close();
+  }
+});
+
+test('wrong producer passwords are rate limited per address before any scrypt work', async () => {
+  const env = await boot({ trustProxy: true });
+  try {
+    const url = `${env.server.url}${BINDINGS}`;
+    const attempt = (key: string, password: string) => fetch(url, {
+      headers: { 'x-prc-password': password, 'x-device-id': 'dev-1', 'x-forwarded-for': key },
+    });
+
+    for (let i = 0; i < 10; i += 1) {
+      assert.equal((await attempt('1.2.3.4', 'nope')).status, 401, `failure ${i + 1}`);
+    }
+    const blocked = await attempt('1.2.3.4', 'nope');
+    assert.equal(blocked.status, 429);
+    assert.deepEqual(await blocked.json(), { error: { code: 'RATE_LIMITED' } });
+    // The guard runs before the comparison, so a blocked key cannot keep
+    // spending scrypt even when it finally guesses right.
+    assert.equal((await attempt('1.2.3.4', 'pw')).status, 429);
+    // A different address keeps its own budget.
+    assert.equal((await attempt('5.6.7.8', 'nope')).status, 401);
+    assert.equal(env.store.findBindingByDevice('dev-1'), undefined);
+  } finally {
+    await env.close();
+  }
+});
+
+test('a correct producer password never consumes the failure budget', async () => {
+  const env = await boot({ trustProxy: true });
+  try {
+    const url = `${env.server.url}${BINDINGS}`;
+    const attempt = (password: string) => fetch(url, {
+      headers: { 'x-prc-password': password, 'x-device-id': 'dev-1', 'x-forwarded-for': '9.9.9.9' },
+    });
+
+    for (let i = 0; i < 12; i += 1) {
+      assert.equal((await attempt('pw')).status, 200, `success ${i + 1}`);
+    }
+    // Twelve successful reconnects left the budget untouched: the first wrong
+    // password is still judged on its merits rather than answered 429.
+    assert.equal((await attempt('nope')).status, 401);
   } finally {
     await env.close();
   }
