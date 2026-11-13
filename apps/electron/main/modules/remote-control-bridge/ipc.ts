@@ -344,9 +344,12 @@ function broadcastRefreshBinding(logger) {
 export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = loadRemoteControlBridgeModule) {
     const log = logger ?? createRcAuditLogger();
     const rc = proxy ?? buildDefaultProxy(log, await loadBridge());
-    // Only a default-built proxy has PRC state; an injected one must not inherit
-    // a previous build's configuration.
+    // Only a default-built proxy can be in PRC mode; an injected one must not
+    // inherit a previous build's configuration.
     const startPrc = proxy ? null : prcConnect;
+    // PRC mode owns the binding: the operator password signs it, so the renderer
+    // and the cloud account have no say over this proxy's lifecycle.
+    const prcMode = startPrc !== null;
     activeProxy = rc;
     activeLogger = log;
     // The Runtime's mavis tool reads controlled devices' sessions as this desktop.
@@ -396,6 +399,14 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     // needs to consult /binding directly.
     ipcMain.handle(IPC_CHANNELS.RC_BINDING_READY, async (_event, payload) => {
         log.info(`[rc.ipc] rc:binding-ready invoked binding_id=${payload?.binding_id} producer_generation=${payload?.producer_generation ?? 'absent'} request_epoch=${payload?.request_epoch ?? 'absent'}`);
+        // PRC credentials come from the gateway, not from the renderer. A renderer
+        // that still checks the cloud binding would otherwise look like a same-
+        // identity refresh (both sides report `prc:operator`) and silently replace
+        // our ticket, so acknowledge and drop the payload before any validation.
+        if (prcMode) {
+            log.info(`[rc.ipc] rc:binding-ready ignored source=prc binding_id=${String(payload?.binding_id)}`);
+            return { success: true, source: 'prc', ignored: true };
+        }
         // 只有三个必填字段能否决整条凭据；producer_generation / request_epoch 这类
         // 可选字段即便畸形也不整条拒绝 —— 见下方「按未提供处理 + 留痕」。
         // 否则一个装饰性字段写错就能让桌面端永远连不上（§4.5.1 / §4.5.2）。
@@ -541,6 +552,13 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     }
     // Account switch / logout: a binding belongs to the user who paired it.
     const unsubscribeUserChange = onUserInfoChanged(() => {
+        // PRC mode binds to the device/operator, not to the cloud session: the
+        // bound user is `prc:operator`, so every login/logout would read as an
+        // owner switch and tear down a connection the operator still wants.
+        if (prcMode) {
+            log.info('[rc.ipc] user identity changed; PRC mode ignores account changes action=none');
+            return;
+        }
         const state = rc.getBoundUserState();
         if (state.binding_id === undefined) {
             log.debug('[rc.ipc] user identity changed but no local binding; nothing to do action=none');
