@@ -6,6 +6,7 @@ export interface Config {
   dataDir: string;
   publicUrl: string;
   password?: string;
+  trustProxy: boolean;
 }
 
 const appDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -23,5 +24,7 @@ export function loadConfig(
   }
   const dataDir = path.resolve(env.PRC_DATA_DIR ?? path.join(appDir, 'data'));
   const publicUrl = (env.PRC_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/u, '');
-  return { port, dataDir, publicUrl, ...(password ? { password } : {}) };
+  // Only an explicit opt-in may trust a client-supplied forwarding header.
+  const trustProxy = env.PRC_TRUST_PROXY === '1' || env.PRC_TRUST_PROXY === 'true';
+  return { port, dataDir, publicUrl, trustProxy, ...(password ? { password } : {}) };
 }

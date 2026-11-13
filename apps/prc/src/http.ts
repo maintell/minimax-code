@@ -30,6 +30,26 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+function firstHop(header: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(header) ? header.join(',') : header;
+  if (!raw) return undefined;
+  for (const hop of raw.split(',')) {
+    const trimmed = hop.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+// The limiter must key on a value the client cannot choose. Only a proxy that
+// the operator opted into may supply it through x-forwarded-for.
+function loginKey(req: IncomingMessage, trustProxy: boolean): string {
+  if (trustProxy) {
+    const forwarded = firstHop(req.headers['x-forwarded-for']);
+    if (forwarded) return forwarded;
+  }
+  return req.socket.remoteAddress ?? 'unknown';
+}
+
 export function createHttpApi(deps: {
   auth: Auth;
   store: Store;
@@ -39,6 +59,9 @@ export function createHttpApi(deps: {
   nowMs?: () => number;
 }) {
   const now = deps.nowMs ?? Date.now;
+  // The design spec asks for Secure except on a declared plaintext origin, and
+  // the origin is already described by the public URL.
+  const secureSuffix = deps.config.publicUrl.startsWith('https:') ? '; Secure' : '';
 
   return {
     async handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
@@ -46,7 +69,7 @@ export function createHttpApi(deps: {
       if (!url.pathname.startsWith('/api/')) return false;
 
       if (req.method === 'POST' && url.pathname === '/api/login') {
-        const key = req.socket.remoteAddress ?? 'unknown';
+        const key = loginKey(req, deps.config.trustProxy);
         if (!deps.auth.allowLogin(key, now())) return send(res, 429, { error: { code: 'RATE_LIMITED' } }), true;
         const body = await readJson(req);
         if (typeof body.password !== 'string' || !verifyPassword(body.password, deps.passwordHash)) {
@@ -54,8 +77,8 @@ export function createHttpApi(deps: {
         }
         const csrf = deps.auth.issueCsrf();
         res.setHeader('set-cookie', [
-          `${SESSION_COOKIE}=${encodeURIComponent(deps.auth.issueCookie(now()))}; HttpOnly; SameSite=Lax; Path=/`,
-          `${CSRF_COOKIE}=${csrf}; SameSite=Lax; Path=/`,
+          `${SESSION_COOKIE}=${encodeURIComponent(deps.auth.issueCookie(now()))}; HttpOnly; SameSite=Lax; Path=/${secureSuffix}`,
+          `${CSRF_COOKIE}=${csrf}; SameSite=Lax; Path=/${secureSuffix}`,
         ]);
         return send(res, 200, { ok: true, csrf }), true;
       }
@@ -102,6 +125,16 @@ export function createHttpApi(deps: {
         if (result.kind === 'err') return send(res, 502, result), true;
         const messages = JSON.parse(String(result.payload.messages_json ?? '[]')) as unknown;
         return send(res, 200, { messages, hasMore: result.payload.has_more === true, oldestMsgId: result.payload.oldest_msg_id ?? '' }), true;
+      }
+
+      if (req.method === 'POST' && historyMatch) {
+        if (bindingId === undefined) return send(res, 409, { error: { code: 'NO_BINDING' } }), true;
+        const body = await readJson(req);
+        const result = await deps.router.request(bindingId, 'cmd.session.send', {
+          ...body,
+          session_id: decodeURIComponent(historyMatch[1] ?? ''),
+        });
+        return send(res, result.kind === 'ack' ? 200 : 502, result), true;
       }
 
       return send(res, 404, { error: { code: 'not_found' } }), true;

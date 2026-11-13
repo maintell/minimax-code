@@ -9,6 +9,7 @@ const config: Config = {
   port: 0,
   dataDir: path.join(process.cwd(), 'data'),
   publicUrl: 'http://127.0.0.1:0',
+  trustProxy: false,
 };
 
 function rawRequest(port: number, payload: string): Promise<string> {

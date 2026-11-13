@@ -18,3 +18,10 @@ test('bootstrap password comes from the flag or the environment', () => {
   assert.equal(loadConfig({ PRC_PASSWORD: 'from-env' }, []).password, 'from-env');
   assert.equal(loadConfig({}, ['--password', 'from-flag']).password, 'from-flag');
 });
+
+test('trust proxy is an explicit opt-in from the environment', () => {
+  assert.equal(loadConfig({}, []).trustProxy, false);
+  assert.equal(loadConfig({ PRC_TRUST_PROXY: '1' }, []).trustProxy, true);
+  assert.equal(loadConfig({ PRC_TRUST_PROXY: 'true' }, []).trustProxy, true);
+  assert.equal(loadConfig({ PRC_TRUST_PROXY: 'yes' }, []).trustProxy, false);
+});
