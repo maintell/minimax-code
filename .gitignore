@@ -2,6 +2,7 @@ node_modules/
 dist/
 .turbo/
 .cache/
+.superpowers/
 .pnpm-store/
 *.tsbuildinfo
 .env
