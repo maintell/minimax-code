@@ -7,6 +7,45 @@ const KEY_BYTES = 64;
 const COOKIE_TTL_MS = 7 * 24 * 3600 * 1000;
 const LOGIN_WINDOW_MS = 60_000;
 const LOGIN_LIMIT = 5;
+const MIN_SALT_BYTES = 8;
+const MIN_KEY_BYTES = 32;
+const MAX_SCRYPT_N = 1_048_576;
+const MAX_SCRYPT_R = 32;
+const MAX_SCRYPT_P = 16;
+
+interface StoredHash {
+  N: number;
+  r: number;
+  p: number;
+  salt: Buffer;
+  key: Buffer;
+}
+
+function parseCost(value: string, min: number, max: number): number | undefined {
+  if (!/^\d+$/u.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : undefined;
+}
+
+function decodeField(value: string, minBytes: number): Buffer | undefined {
+  const bytes = Buffer.from(value, 'base64');
+  return bytes.length >= minBytes ? bytes : undefined;
+}
+
+function parseStored(stored: string): StoredHash | undefined {
+  const parts = stored.split('$');
+  if (parts.length !== 6 || parts[0] !== 'scrypt') return undefined;
+  const [, n, r, p, salt, key] = parts;
+  const N = parseCost(n, 2, MAX_SCRYPT_N);
+  const costR = parseCost(r, 1, MAX_SCRYPT_R);
+  const costP = parseCost(p, 1, MAX_SCRYPT_P);
+  if (N === undefined || costR === undefined || costP === undefined) return undefined;
+  if ((N & (N - 1)) !== 0) return undefined;
+  const saltBytes = decodeField(salt, MIN_SALT_BYTES);
+  const keyBytes = decodeField(key, MIN_KEY_BYTES);
+  if (!saltBytes || !keyBytes) return undefined;
+  return { N, r: costR, p: costP, salt: saltBytes, key: keyBytes };
+}
 
 export function hashPassword(password: string): string {
   const salt = randomBytes(16);
@@ -15,14 +54,17 @@ export function hashPassword(password: string): string {
 }
 
 export function verifyPassword(password: string, stored: string): boolean {
-  const parts = stored.split('$');
-  if (parts.length !== 6 || parts[0] !== 'scrypt') return false;
-  const [, n, r, p, salt, hash] = parts;
-  const expected = Buffer.from(hash ?? '', 'base64');
-  const actual = scryptSync(password, Buffer.from(salt ?? '', 'base64'), expected.length, {
-    N: Number(n), r: Number(r), p: Number(p),
-  });
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
+  const parsed = parseStored(stored);
+  if (!parsed) return false;
+  let actual: Buffer;
+  try {
+    actual = scryptSync(password, parsed.salt, parsed.key.length, {
+      N: parsed.N, r: parsed.r, p: parsed.p,
+    });
+  } catch {
+    return false;
+  }
+  return timingSafeEqual(parsed.key, actual);
 }
 
 function sign(secret: string, value: string): string {

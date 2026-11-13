@@ -9,6 +9,20 @@ test('a password round-trips through scrypt and rejects a wrong one', () => {
   assert.equal(verifyPassword('wrong horse', stored), false);
 });
 
+test('malformed stored hashes fail closed instead of throwing', () => {
+  const cases = [
+    ['scrypt$16384$8$1$c2FsdHNhbHQ=$', 'empty hash field'],
+    ['scrypt$16384$8$1$c2FsdHNhbHQ=$!!!!', 'undecodable hash field'],
+    ['scrypt$16384$8$1$$AAAA', 'empty salt'],
+    ['scrypt$abc$8$1$AAAA$AAAA', 'non-numeric cost'],
+    ['scrypt$16383$8$1$AAAA$AAAA', 'non-power-of-two cost'],
+  ];
+  for (const [stored, why] of cases) {
+    assert.equal(verifyPassword('anything', stored), false, why);
+    assert.equal(verifyPassword('', stored), false, `${why} (empty password)`);
+  }
+});
+
 test('cookies are signed, expire, and reject tampering', () => {
   const auth = createAuth('server-secret');
   const cookie = auth.issueCookie(1_000);
