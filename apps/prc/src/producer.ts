@@ -89,6 +89,7 @@ export class ProducerSocket {
     if (frame.type === 'ctrl.auth.complete') {
       this.authed = true;
       this.opts.logger.info(`producer authed binding=${this.bindingId} connection=${this.connectionId}`);
+      this.replayMissed(frame);
     }
     if (frame.type === 'ctrl.ping') {
       this.sendFrame(makeFrame('ctrl.pong', {}, { traceId: frame.trace_id }));
@@ -98,5 +99,29 @@ export class ProducerSocket {
       this.opts.logger.info(`producer disconnect_reason ${String(frame.payload.code ?? 'unknown')}`);
     }
     this.opts.onFrame(frame);
+  }
+
+  // The producer keeps the newest `event_id` it received and offers it back on
+  // reconnect. Only frames this gateway emitted are in the log, so a replay can
+  // never echo producer traffic; the stored frames go out with their original
+  // ids, before any new frame reaches the socket, and are not appended a second
+  // time. A cursor that predates the retained window — or any positive cursor
+  // while nothing is retained — cannot be served, so the producer is told to
+  // refetch state instead of trusting a partial history.
+  private replayMissed(frame: Frame): void {
+    const lastEventId = Number(frame.payload.last_event_id ?? 0);
+    const retainedFrom = this.opts.store.oldestEventId(this.bindingId);
+    if (lastEventId > 0 && (retainedFrom === 0 || lastEventId < retainedFrom - 1)) {
+      this.opts.logger.info(`replay overflow binding=${this.bindingId} from=${lastEventId}`);
+      this.sendFrame(makeFrame('ctrl.replay.overflow', {}));
+      return;
+    }
+    const missed = this.opts.store.replayAfter(this.bindingId, lastEventId) as Frame[];
+    if (missed.length > 0) {
+      this.opts.logger.info(`replay binding=${this.bindingId} from=${lastEventId} frames=${missed.length}`);
+    }
+    // Replayed frames bypass `onFrame`: they were settled and fanned out when
+    // they were first emitted, and re-running either would duplicate the effect.
+    for (const replayed of missed) this.sendFrame(replayed);
   }
 }
