@@ -30,21 +30,23 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-function firstHop(header: string | string[] | undefined): string | undefined {
+function nearestHop(header: string | string[] | undefined): string | undefined {
   const raw = Array.isArray(header) ? header.join(',') : header;
   if (!raw) return undefined;
+  let last: string | undefined;
   for (const hop of raw.split(',')) {
     const trimmed = hop.trim();
-    if (trimmed) return trimmed;
+    if (trimmed) last = trimmed;
   }
-  return undefined;
+  return last;
 }
 
-// The limiter must key on a value the client cannot choose. Only a proxy that
-// the operator opted into may supply it through x-forwarded-for.
+// The limiter must key on a value the client cannot choose. A proxy usually
+// appends to x-forwarded-for, so only the rightmost hop (the address the
+// closest trusted proxy saw) is trustworthy; the leftmost hop is client input.
 function loginKey(req: IncomingMessage, trustProxy: boolean): string {
   if (trustProxy) {
-    const forwarded = firstHop(req.headers['x-forwarded-for']);
+    const forwarded = nearestHop(req.headers['x-forwarded-for']);
     if (forwarded) return forwarded;
   }
   return req.socket.remoteAddress ?? 'unknown';

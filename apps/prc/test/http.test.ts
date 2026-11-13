@@ -168,7 +168,7 @@ test('five wrong logins are answered and the sixth is rate limited', async () =>
   await server.close();
 });
 
-test('the login limiter only trusts x-forwarded-for when the operator opted in', async () => {
+test('the login limiter keys on the hop the trusted proxy appended', async () => {
   const untrusted = await boot();
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const response = await fetch(`${untrusted.server.url}/api/login`, {
@@ -187,16 +187,29 @@ test('the login limiter only trusts x-forwarded-for when the operator opted in',
   await untrusted.server.close();
 
   const proxied = await boot({ trustProxy: true });
-  const login = (forwardedFor: string) => fetch(`${proxied.server.url}/api/login`, {
+  const login = (forwardedFor?: string) => fetch(`${proxied.server.url}/api/login`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-forwarded-for': forwardedFor },
+    headers: {
+      'content-type': 'application/json',
+      ...(forwardedFor === undefined ? {} : { 'x-forwarded-for': forwardedFor }),
+    },
     body: JSON.stringify({ password: 'nope' }),
   });
+
+  // A rotated leftmost hop must not mint a fresh bucket: the rightmost hop,
+  // appended by the proxy, is the client address.
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    assert.equal((await login('10.0.0.1, 127.0.0.1')).status, 401);
+    assert.equal((await login(`10.0.0.${attempt}, 10.0.0.9`)).status, 401);
   }
-  assert.equal((await login('10.0.0.1, 127.0.0.1')).status, 429);
-  assert.equal((await login(' , 10.0.0.2 ')).status, 401);
+  assert.equal((await login('10.0.0.99, 10.0.0.9')).status, 429);
+
+  // The same leftmost hop with different proxy-appended addresses stays allowed.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    assert.equal((await login(`10.0.0.9, 10.0.0.${attempt}`)).status, 401);
+  }
+
+  // Without the header the socket address is the key.
+  assert.equal((await login()).status, 401);
   await proxied.server.close();
 });
 
