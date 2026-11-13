@@ -121,12 +121,17 @@ export function openStore(file: string) {
            SELECT COALESCE(MAX(event_id), 0) - 2000 FROM event_log WHERE binding_id = ?)`,
       ).run(bindingId, bindingId);
     },
-    // Where the retained window starts; 0 means nothing is retained, which is
-    // also the one case where a positive replay cursor cannot be checked.
+    // The retained window is [oldest, newest]; both are 0 when nothing is
+    // retained.
     oldestEventId(bindingId: number): number {
       const row = db.prepare('SELECT MIN(event_id) AS oldest FROM event_log WHERE binding_id = ?')
         .get(bindingId) as { oldest: number | null } | undefined;
       return Number(row?.oldest ?? 0);
+    },
+    newestEventId(bindingId: number): number {
+      const row = db.prepare('SELECT MAX(event_id) AS newest FROM event_log WHERE binding_id = ?')
+        .get(bindingId) as { newest: number | null } | undefined;
+      return Number(row?.newest ?? 0);
     },
     replayAfter(bindingId: number, eventId: number): unknown[] {
       const rows = db.prepare('SELECT frame_json FROM event_log WHERE binding_id = ? AND event_id > ? ORDER BY event_id ASC')

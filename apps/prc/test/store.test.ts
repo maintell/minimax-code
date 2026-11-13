@@ -67,12 +67,14 @@ test('event ids are monotonic per binding and replay is ordered', () => {
   assert.deepEqual(replayed, ['evt.b']);
 });
 
-test('the oldest retained event id is 0 for an empty log and the first id otherwise', () => {
+test('the retained window is 0/0 when empty and the first and last id otherwise', () => {
   const store = freshStore();
   const binding = store.getOrCreateBinding('dev-1', '3.1.14');
   assert.equal(store.oldestEventId(binding.id), 0);
+  assert.equal(store.newestEventId(binding.id), 0);
   store.appendEvent(binding.id, store.nextEventId(binding.id), { type: 'evt.first' });
   assert.equal(store.oldestEventId(binding.id), 1);
+  assert.equal(store.newestEventId(binding.id), 1);
 });
 
 test('the event log keeps only the newest 2000 frames per binding', () => {
@@ -88,6 +90,7 @@ test('the event log keeps only the newest 2000 frames per binding', () => {
   assert.equal(replayed[0].event_id, 6);
   assert.equal(replayed.at(-1)?.event_id, 2_005);
   assert.equal(store.oldestEventId(binding.id), 6);
+  assert.equal(store.newestEventId(binding.id), 2_005);
   assert.deepEqual(store.replayAfter(binding.id, 2_004).map((frame) => (frame as { event_id: number }).event_id), [2_005]);
 });
 

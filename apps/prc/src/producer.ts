@@ -24,6 +24,12 @@ export interface ProducerOptions {
   onClose(): void;
 }
 
+// Only a JSON number that is a non-negative safe integer is a replay cursor; a
+// string, NaN, a negative or a fraction counts as absent, which replays all.
+function replayCursor(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 export class ProducerSocket {
   readonly bindingId: number;
   private authed = false;
@@ -105,20 +111,22 @@ export class ProducerSocket {
   // reconnect. Only frames this gateway emitted are in the log, so a replay can
   // never echo producer traffic; the stored frames go out with their original
   // ids, before any new frame reaches the socket, and are not appended a second
-  // time. A cursor that predates the retained window — or any positive cursor
-  // while nothing is retained — cannot be served, so the producer is told to
+  // time. A cursor outside the retained window cannot be served — older than the
+  // window means frames were trimmed, newer than the newest id means the log was
+  // rolled back under a producer that kept counting — so the producer is told to
   // refetch state instead of trusting a partial history.
   private replayMissed(frame: Frame): void {
-    const lastEventId = Number(frame.payload.last_event_id ?? 0);
-    const retainedFrom = this.opts.store.oldestEventId(this.bindingId);
-    if (lastEventId > 0 && (retainedFrom === 0 || lastEventId < retainedFrom - 1)) {
-      this.opts.logger.info(`replay overflow binding=${this.bindingId} from=${lastEventId}`);
+    const cursor = replayCursor(frame.payload.last_event_id);
+    const oldest = this.opts.store.oldestEventId(this.bindingId);
+    const newest = this.opts.store.newestEventId(this.bindingId);
+    if (cursor > 0 && (cursor < oldest - 1 || cursor > newest)) {
+      this.opts.logger.info(`replay overflow binding=${this.bindingId} from=${cursor}`);
       this.sendFrame(makeFrame('ctrl.replay.overflow', {}));
       return;
     }
-    const missed = this.opts.store.replayAfter(this.bindingId, lastEventId) as Frame[];
+    const missed = this.opts.store.replayAfter(this.bindingId, cursor) as Frame[];
     if (missed.length > 0) {
-      this.opts.logger.info(`replay binding=${this.bindingId} from=${lastEventId} frames=${missed.length}`);
+      this.opts.logger.info(`replay binding=${this.bindingId} from=${cursor} frames=${missed.length}`);
     }
     // Replayed frames bypass `onFrame`: they were settled and fanned out when
     // they were first emitted, and re-running either would duplicate the effect.

@@ -80,6 +80,27 @@ test('an auth without last_event_id replays every retained frame', () => {
   assert.deepEqual(wireFrames(ws, baseline).map((frame) => frame.event_id), [1, 2]);
 });
 
+test('a cursor ahead of the newest id overflows instead of replaying nothing', () => {
+  const { ws, producer } = setup('prc-replay-ahead-');
+  producer.send('evt.a', {});
+  producer.send('evt.b', {});
+  producer.start();
+  const baseline = ws.sent.length;
+  authComplete(ws, { last_event_id: 99_999 });
+  const frames = wireFrames(ws, baseline);
+  assert.deepEqual(frames.map((frame) => frame.type), ['ctrl.replay.overflow']);
+});
+
+test('a non-numeric cursor is treated as absent and replays everything', () => {
+  const { ws, producer } = setup('prc-replay-junk-');
+  producer.send('evt.a', {});
+  producer.start();
+  const baseline = ws.sent.length;
+  authComplete(ws, { last_event_id: 'abc' });
+  const frames = wireFrames(ws, baseline);
+  assert.deepEqual(frames.map((frame) => frame.type), ['evt.a']);
+});
+
 test('a replayed frame is the stored frame verbatim and is not logged again', () => {
   const { store, binding, ws, producer } = setup('prc-replay-log-');
   producer.send('evt.a', { n: 1 });
