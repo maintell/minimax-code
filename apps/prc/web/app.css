@@ -1,2 +1,106 @@
-body { font: 14px/1.5 ui-sans-serif, system-ui; margin: 0; background: #0f1115; color: #e6e6e6; }
-main { max-width: 900px; margin: 0 auto; padding: 24px; }
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+[hidden] { display: none !important; }
+
+h1, h2 { font-weight: 600; }
+.muted, .notice { color: #8b93a7; }
+.notice { font-size: 13px; padding: 4px 2px; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+button, input, textarea { font: inherit; color: inherit; }
+button {
+  background: #2b6cb0; border: 0; border-radius: 8px; padding: 8px 12px;
+  cursor: pointer; white-space: nowrap;
+}
+button:hover { background: #2f7ac4; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+input, textarea {
+  background: #141821; border: 1px solid #2a3040; border-radius: 8px;
+  padding: 8px 10px; width: 100%;
+}
+input:focus, textarea:focus, button:focus-visible {
+  outline: 2px solid #4c8de0; outline-offset: 1px;
+}
+
+#login {
+  max-width: 360px; margin: 18vh auto; padding: 20px;
+  background: #151922; border: 1px solid #232936; border-radius: 12px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+#login h1 { margin: 0 0 4px; font-size: 20px; }
+#login label { color: #8b93a7; font-size: 13px; }
+.login-row { display: flex; gap: 8px; }
+.login-row input { flex: 1; }
+.error { color: #ff8a8a; min-height: 1.5em; margin: 0; font-size: 13px; }
+
+#console {
+  display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 16px;
+  max-width: 1200px; margin: 0 auto; padding: 24px; height: 100dvh;
+}
+aside {
+  background: #151922; border: 1px solid #232936; border-radius: 12px;
+  padding: 12px; min-height: 0; overflow-y: auto;
+}
+aside h2 {
+  margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.08em; color: #8b93a7;
+}
+#sessions { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 2px; }
+#sessions button {
+  width: 100%; text-align: left; background: transparent; padding: 7px 9px;
+  border-radius: 6px; overflow: hidden; text-overflow: ellipsis;
+}
+#sessions button:hover { background: #1b1f27; }
+#sessions button.active { background: #243149; color: #fff; }
+#sessions .muted { padding: 7px 9px; font-size: 13px; }
+
+section { display: flex; flex-direction: column; min-height: 0; gap: 12px; }
+section > header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+#status {
+  font-size: 12px; color: #8b93a7; text-transform: uppercase;
+  letter-spacing: 0.06em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#transcript {
+  flex: 1; min-height: 320px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px; padding-right: 4px;
+}
+.bubble {
+  background: #1b1f27; padding: 8px 10px; border-radius: 8px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.bubble.me { background: #243149; align-self: flex-end; max-width: 85%; }
+.bubble.stream { border-left: 3px solid #4c8de0; }
+
+#composer { display: flex; gap: 8px; align-items: flex-end; }
+#composer textarea { flex: 1; min-height: 64px; resize: vertical; }
+
+#permissions {
+  position: fixed; right: 16px; bottom: 16px; width: min(380px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px); overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.permission {
+  background: #22262f; border: 1px solid #333a4a; padding: 12px;
+  border-radius: 10px; box-shadow: 0 8px 24px rgb(0 0 0 / 50%);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.permission pre {
+  max-height: 120px; overflow: auto; margin: 0; padding: 8px;
+  background: #141821; border-radius: 6px; white-space: pre-wrap;
+}
+.permission-reason { margin: 0; color: #b8c0d4; }
+.permission-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.permission-actions button[data-decision="deny"] { background: #7a2b2b; }
+.permission-actions button[data-decision="deny"]:hover { background: #913434; }
+.permission-error { margin: 0; color: #ff8a8a; font-size: 13px; }
+
+@media (max-width: 760px) {
+  #console { grid-template-columns: 1fr; height: auto; min-height: 100dvh; padding: 16px; }
+  aside { max-height: 32vh; }
+  #transcript { max-height: 50vh; }
+  #permissions { position: static; width: auto; max-height: none; margin: 0 16px 16px; }
+}

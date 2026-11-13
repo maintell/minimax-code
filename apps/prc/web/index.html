@@ -1,4 +1,40 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>PRC</title>
-<link rel="stylesheet" href="/app.css"></head>
-<body><main id="root">PRC is running.</main><script type="module" src="/app.js"></script></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRC</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<form id="login">
+  <h1>PRC console</h1>
+  <label for="password">Operator password</label>
+  <div class="login-row">
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
+    <button>Sign in</button>
+  </div>
+  <p id="login-error" class="error" role="alert"></p>
+</form>
+<main id="console" hidden>
+  <aside>
+    <h2>Sessions</h2>
+    <ul id="sessions"></ul>
+  </aside>
+  <section>
+    <header>
+      <span id="status" aria-live="polite">offline</span>
+      <button id="stop" type="button">Stop</button>
+    </header>
+    <div id="transcript" aria-live="polite"></div>
+    <form id="composer">
+      <label class="sr-only" for="input">Message</label>
+      <textarea id="input" rows="3" placeholder="Message the agent…"></textarea>
+      <button>Send</button>
+    </form>
+  </section>
+</main>
+<div id="permissions"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
