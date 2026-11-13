@@ -13,7 +13,14 @@ const contentTypes: Record<string, string> = {
 
 export async function createServer(deps: { config: Config }) {
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? '/', 'http://prc.local');
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://prc.local');
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'invalid_request_target' } }));
+      return;
+    }
     if (url.pathname === '/healthz') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
