@@ -8,6 +8,15 @@ import type { Store } from './store.ts';
 
 export const SESSION_COOKIE = 'prc_session';
 const CSRF_COOKIE = 'prc_csrf';
+const RC_API_BASE = '/minimax-cloud/api/v1/remote-control';
+
+// The producer speaks the shipped bridge's HTTP contract: the operator password
+// travels in a header because a desktop install has no browser session, and the
+// socket endpoint is derived from the URL the operator published.
+function producerEndpoint(publicUrl: string): string {
+  const url = new URL(publicUrl);
+  return `${url.protocol === 'https:' ? 'wss:' : 'ws:'}//${url.host}/rc`;
+}
 
 export function readCookie(req: IncomingMessage, name: string): string | undefined {
   const header = req.headers.cookie;
@@ -66,9 +75,66 @@ export function createHttpApi(deps: {
   // the origin is already described by the public URL.
   const secureSuffix = deps.config.publicUrl.startsWith('https:') ? '; Secure' : '';
 
+  // Producer routes bypass the cookie/CSRF gate by design: a desktop install has
+  // no browser session, so it proves the operator password instead. The password
+  // is checked before any binding is read or written, a wrong one can never
+  // probe which device ids exist.
+  async function handleProducer(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+    const password = req.headers['x-prc-password'];
+    if (typeof password !== 'string' || !verifyPassword(password, deps.passwordHash)) {
+      send(res, 401, { error: { code: 'not_authenticated' } });
+      return true;
+    }
+
+    if (req.method === 'GET' && url.pathname === `${RC_API_BASE}/desktop/bindings`) {
+      const deviceHeader = req.headers['x-device-id'];
+      const deviceId = typeof deviceHeader === 'string' ? deviceHeader.trim() : '';
+      if (!deviceId) {
+        send(res, 400, { error: { code: 'missing_device_id' } });
+        return true;
+      }
+      // The binding read carries no protocol version of its own; the desktop
+      // client names its build in X-Client-Version, which is recorded as-is.
+      const versionHeader = req.headers['x-client-version'];
+      const producerVersion = typeof versionHeader === 'string' && versionHeader.trim()
+        ? versionHeader.trim()
+        : 'unknown';
+      const binding = deps.store.getOrCreateBinding(deviceId, producerVersion);
+      // Every read mints a fresh one-shot ticket; mintTicket drops the previous
+      // unconsumed one, so an old bundle can never be replayed.
+      const { ticket } = deps.store.mintTicket(binding.id);
+      send(res, 200, {
+        state: 'bound',
+        binding_id: binding.id,
+        ticket,
+        endpoint: producerEndpoint(deps.config.publicUrl),
+        bound_at_ms: binding.boundAtMs,
+        producer_generation: binding.producerGeneration,
+        producer_version: binding.producerVersion,
+      });
+      return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === `${RC_API_BASE}/unbind`) {
+      const body = await readJson(req);
+      const bindingId = body.binding_id;
+      if (typeof bindingId !== 'number' || !Number.isSafeInteger(bindingId) || bindingId <= 0) {
+        send(res, 400, { error: { code: 'invalid_binding_id' } });
+        return true;
+      }
+      deps.store.deleteBinding(bindingId);
+      send(res, 200, { ok: true });
+      return true;
+    }
+
+    send(res, 404, { error: { code: 'not_found' } });
+    return true;
+  }
+
   return {
     async handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
       const url = new URL(req.url ?? '/', 'http://prc.local');
+      if (url.pathname.startsWith(`${RC_API_BASE}/`)) return handleProducer(req, res, url);
       if (!url.pathname.startsWith('/api/')) return false;
 
       if (req.method === 'POST' && url.pathname === '/api/login') {
