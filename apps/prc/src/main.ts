@@ -4,8 +4,9 @@ import path from 'node:path';
 import { createAuth, hashPassword } from './auth.ts';
 import { CommandRouter } from './commands.ts';
 import { loadConfig } from './config.ts';
+import { ConsumerHub } from './consumer.ts';
 import { createHttpApi } from './http.ts';
-import type { Logger } from './producer.ts';
+import type { Logger, ProducerSocket } from './producer.ts';
 import { createServer } from './server.ts';
 import { openStore } from './store.ts';
 
@@ -46,7 +47,15 @@ const secret = readFileSync(secretFile, 'utf8').trim();
 if (!secret) throw new Error(`${secretFile} is empty`);
 
 const store = openStore(path.join(config.dataDir, 'prc.sqlite'));
-const router = new CommandRouter({ getProducer: () => undefined, logger });
-const api = createHttpApi({ auth: createAuth(secret), store, router, config, passwordHash });
-const server = await createServer({ config, api });
+const auth = createAuth(secret);
+const hub = new ConsumerHub();
+// One live producer per binding; the router reads it, the socket layer writes it.
+const producers = new Map<number, ProducerSocket>();
+const router = new CommandRouter({ getProducer: (bindingId) => producers.get(bindingId), logger });
+const api = createHttpApi({ auth, store, router, config, passwordHash });
+const server = await createServer({
+  config,
+  api,
+  realtime: { auth, store, router, hub, producers, logger },
+});
 console.log(`PRC listening on ${server.url} (public ${config.publicUrl})`);

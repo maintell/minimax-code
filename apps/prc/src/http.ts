@@ -5,10 +5,10 @@ import type { CommandRouter } from './commands.ts';
 import type { Config } from './config.ts';
 import type { Store } from './store.ts';
 
-const SESSION_COOKIE = 'prc_session';
+export const SESSION_COOKIE = 'prc_session';
 const CSRF_COOKIE = 'prc_csrf';
 
-function readCookie(req: IncomingMessage, name: string): string | undefined {
+export function readCookie(req: IncomingMessage, name: string): string | undefined {
   const header = req.headers.cookie;
   if (!header) return undefined;
   for (const part of header.split(';')) {
