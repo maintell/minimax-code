@@ -191,6 +191,48 @@ test('a producer frame reaches the browser socket of its binding only', async ()
   }
 });
 
+test('producer acknowledgements never reach a browser socket but permission asks do', async () => {
+  const env = await boot();
+  const producer = await connectProducer(env);
+  const browser = await openClient(`${env.wsBase}/ws?binding_id=${env.binding.id}`, env.cookie);
+  try {
+    producer.send({
+      v: 1,
+      id: 'ack-9',
+      ts: Date.now(),
+      type: 'ack.session.send',
+      payload: { message_id: 'm1' },
+    });
+    producer.send({
+      v: 1,
+      id: 'ask-1',
+      ts: Date.now(),
+      type: 'evt.permission.ask',
+      payload: {
+        session_id: 's1', request_id: 'p1', tool_name: 'Bash',
+        tool_input: '{"cmd":"ls"}', rule_contents: 'ls', reason: 'needs shell',
+      },
+      event_id: 11,
+    });
+    const ask = await browser.next((message) => message.type === 'evt.permission.ask', 'permission ask');
+    assert.deepEqual(ask, {
+      kind: 'evt',
+      type: 'evt.permission.ask',
+      payload: {
+        requestId: 'p1', sessionId: 's1', toolName: 'Bash',
+        toolInput: '{"cmd":"ls"}', ruleContents: 'ls', reason: 'needs shell',
+      },
+      eventId: 11,
+    });
+    // The ack was sent before the ask, so its absence is settled, not a race.
+    assert.equal(browser.messages.some((message) => message.type === 'ack.session.send'), false);
+  } finally {
+    browser.close();
+    producer.close();
+    await env.server.close();
+  }
+});
+
 test('a browser command is routed to the producer and answered on the same socket', async () => {
   const env = await boot();
   const producer = await connectProducer(env);
@@ -216,12 +258,21 @@ test('a browser command is routed to the producer and answered on the same socke
     const reply = await browser.next((message) => message.kind === 'ack', 'command reply');
     assert.deepEqual(reply, { kind: 'ack', payload: { sessions: [] }, requestId: 'r1' });
 
-    // The same producer frame is fanned out after it settles the request.
-    const fanout = await browser.next(
-      (message) => message.kind === 'evt' && message.type === 'ack.session.list',
-      'ack fanout',
+    // The ack settles the request on the requesting socket. It belongs to
+    // command correlation, not to the event stream, so the tabs must not see it.
+    producer.send({
+      v: 1,
+      id: 'evt-2',
+      ts: Date.now(),
+      type: 'evt.session.message_chunk',
+      payload: { session_id: 's1', chunk: { text: 'next' } },
+      event_id: 10,
+    });
+    await browser.next(
+      (message) => message.type === 'evt.session.message_chunk',
+      'event after the ack',
     );
-    assert.deepEqual(fanout.payload, { sessions: [] });
+    assert.equal(browser.messages.some((message) => message.type === 'ack.session.list'), false);
   } finally {
     browser.close();
     producer.close();

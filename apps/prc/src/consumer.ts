@@ -1,4 +1,5 @@
 import type { CommandRouter } from './commands.ts';
+import type { Frame } from './frames.ts';
 import type { WsLike } from './producer.ts';
 
 // The producer's decision codes: 1 allows the tool call, 2 denies it.
@@ -35,6 +36,25 @@ export const SUPPORTED_COMMANDS: ReadonlySet<string> = Object.freeze(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// The browser decision is a name the console renders; the producer only
+// understands its numeric codes. One lookup keeps the two ends in step.
+export function permissionDecisionCode(decision: string): number | undefined {
+  return PERMISSION_DECISIONS.get(decision);
+}
+
+// An ask is reshaped once, here, instead of in every tab. `tool_input` is
+// carried to the console for display and must never be written to a log.
+export function toPermissionCard(payload: Record<string, unknown>) {
+  return {
+    requestId: String(payload.request_id ?? ''),
+    sessionId: String(payload.session_id ?? ''),
+    toolName: String(payload.tool_name ?? ''),
+    toolInput: typeof payload.tool_input === 'string' ? payload.tool_input : '',
+    ruleContents: typeof payload.rule_contents === 'string' ? payload.rule_contents : '',
+    reason: typeof payload.reason === 'string' ? payload.reason : '',
+  };
 }
 
 export class ConsumerHub {
@@ -76,6 +96,19 @@ function reply(socket: WsLike, message: unknown): void {
   } catch {
     // The tab closed while its command was in flight; the result is lost.
   }
+}
+
+// Only `evt.` frames are browser events. An `ack.*` or `err.*` frame answers a
+// command on the socket that asked, and a `ctrl.*` frame steers the producer
+// connection, so broadcasting either would show a tab a frame it cannot place.
+export function eventFanout(hub: ConsumerHub, bindingId: number, frame: Frame): void {
+  if (!frame.type.startsWith('evt.')) return;
+  hub.broadcast(bindingId, {
+    kind: 'evt',
+    type: frame.type,
+    payload: frame.type === 'evt.permission.ask' ? toPermissionCard(frame.payload) : frame.payload,
+    eventId: frame.event_id,
+  });
 }
 
 export async function handleConsumerFrame(

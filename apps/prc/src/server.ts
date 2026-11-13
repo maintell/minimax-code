@@ -8,7 +8,7 @@ import { WebSocketServer } from 'ws';
 import type { Auth } from './auth.ts';
 import type { CommandRouter } from './commands.ts';
 import type { Config } from './config.ts';
-import { ConsumerHub, handleConsumerFrame } from './consumer.ts';
+import { ConsumerHub, eventFanout, handleConsumerFrame } from './consumer.ts';
 import { DEFAULT_MAX_MESSAGE_BYTES, makeFrame } from './frames.ts';
 import { SESSION_COOKIE, readCookie } from './http.ts';
 import { ProducerSocket } from './producer.ts';
@@ -157,15 +157,9 @@ export async function createServer(deps: {
           logger: realtime.logger,
           onFrame: (frame) => {
             // A reply settles the browser request it belongs to before the same
-            // frame is fanned out to the tabs.
+            // frame is offered to the tabs; only `evt.` frames are browser events.
             realtime.router.settle(frame);
-            // Browser envelope: the producer frame type is carried verbatim.
-            realtime.hub.broadcast(binding.id, {
-              kind: 'evt',
-              type: frame.type,
-              payload: frame.payload,
-              eventId: frame.event_id,
-            });
+            eventFanout(realtime.hub, binding.id, frame);
           },
           onClose: () => {
             // A superseded socket closes after its replacement is registered;
