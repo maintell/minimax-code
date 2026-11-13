@@ -357,6 +357,13 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     ipcMain.handle(IPC_CHANNELS.RC_CONNECT, async () => {
         log.info('[rc.ipc] rc:connect invoked');
         try {
+            // PRC mode: only the gateway can mint a ticket, so `rc.connect()` alone
+            // could never recover from a stop. Re-ticket through the same path the
+            // refresh hook and startup use, then report the state it produced.
+            if (prcMode) {
+                await startPrc();
+                return rc.getStatus();
+            }
             return await rc.connect();
         }
         catch (err) {
@@ -366,8 +373,13 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     });
     ipcMain.handle(IPC_CHANNELS.RC_DISCONNECT, async (_event, opts) => {
         log.info(`[rc.ipc] rc:disconnect invoked unbind=${opts?.unbind === true}`);
+        // PRC mode: a PRC binding id must never reach the cloud pairing client, so
+        // the renderer's unbind flag degrades to a plain disconnect.
+        if (prcMode && opts?.unbind === true) {
+            log.info('[rc.ipc] rc:disconnect unbind skipped source=prc');
+        }
         try {
-            await rc.disconnect(opts?.unbind ? { unbind: true } : {});
+            await rc.disconnect(opts?.unbind && !prcMode ? { unbind: true } : {});
             return { success: true };
         }
         catch (err) {
@@ -495,6 +507,13 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     // 持久化在 main（renderer 刷新会丢），HTTP 仍由 renderer 发（matrix gateway
     // 签名材料只在 renderer 的 axios 管线里，是硬约束）。
     ipcMain.handle(IPC_CHANNELS.RC_BEGIN_UNBIND, async () => {
+        // Unbinding a PRC device belongs to the operator gateway (`POST
+        // …/remote-control/unbind`, password-authenticated), not to the renderer:
+        // fail loudly instead of writing a pending record nobody can resolve.
+        if (prcMode) {
+            log.warn('[rc.ipc] rc:begin-unbind rejected reason=prc_mode');
+            return { success: false, error: 'prc_mode' };
+        }
         try {
             const pending = rc.beginProducerUnbind();
             log.info(`[rc.ipc] rc:begin-unbind → request_id=${pending.request_id} attempts=${pending.attempts}`);
@@ -522,6 +541,12 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
         }
     });
     ipcMain.handle(IPC_CHANNELS.RC_RESOLVE_UNBIND, async (_event, payload) => {
+        // Same rule as rc:begin-unbind: no renderer outcome may clear the PRC
+        // binding, so neither `resolveProducerUnbind()` nor the proxy is touched.
+        if (prcMode) {
+            log.warn('[rc.ipc] rc:resolve-unbind rejected reason=prc_mode');
+            return { success: false, error: 'prc_mode' };
+        }
         const outcome = payload?.outcome;
         if (outcome !== 'confirmed' && outcome !== 'rejected') {
             // 只接受两种**确定**结果。超时/网络错误必须保持待确认，不能从这里溜进来。
