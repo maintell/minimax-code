@@ -79,6 +79,69 @@ test('settle only consumes frames whose in_reply_to matches a pending command', 
   assert.equal(router.settle({ v: 1, id: 'f4', ts: 1, type: 'ack.session.send', payload: {}, in_reply_to: cmdId }), false);
 });
 
+test('a permission event carrying a command id does not complete the command', async () => {
+  const { producer } = fakeProducer();
+  const router = new CommandRouter({ getProducer: () => producer, logger: { info() {}, warn() {}, error() {} } });
+  const pending = router.request(1, 'cmd.permission.respond', { request_ids: ['p1'], decision: 1 });
+  const cmdId = router.pendingCommandId(1);
+  assert.ok(cmdId);
+
+  // The ask echoes the command id but is not its answer; it goes on to the
+  // fanout and the command stays pending.
+  assert.equal(router.settle({
+    v: 1, id: 'e1', ts: 1, type: 'evt.permission.ask', payload: { request_id: 'p1' }, in_reply_to: cmdId,
+  }), false);
+  assert.equal(router.settle({
+    v: 1, id: 'e2', ts: 1, type: 'evt.permission.resolved', payload: { request_id: 'p1' }, in_reply_to: cmdId,
+  }), false);
+
+  // Still in the map: only the real ack can complete it.
+  assert.equal(router.settle({
+    v: 1, id: 'a1', ts: 1, type: 'ack.permission.respond', payload: { processed: 1, skipped: 0 }, in_reply_to: cmdId,
+  }), true);
+  assert.deepEqual(await pending, { kind: 'ack', payload: { processed: 1, skipped: 0 } });
+});
+
+test('an error reply still resolves a command an event left pending', async () => {
+  const { producer } = fakeProducer();
+  const router = new CommandRouter({ getProducer: () => producer, logger: { info() {}, warn() {}, error() {} } });
+  const pending = router.request(1, 'cmd.session.send', { session_id: 's1' });
+  const cmdId = router.pendingCommandId(1);
+  assert.ok(cmdId);
+
+  assert.equal(router.settle({
+    v: 1, id: 'e1', ts: 1, type: 'evt.session.message_chunk', payload: {}, in_reply_to: cmdId,
+  }), false);
+  assert.equal(router.settle({
+    v: 1,
+    id: 'e2',
+    ts: 1,
+    type: 'err.session.send',
+    payload: { code: 'SESSION_BUSY', message: 'busy', retryable: true },
+    in_reply_to: cmdId,
+  }), true);
+  const result = await pending;
+  assert.equal(result.kind, 'err');
+  if (result.kind === 'err') {
+    assert.equal(result.code, 'SESSION_BUSY');
+    assert.equal(result.retryable, true);
+  }
+});
+
+test('a control frame carrying a command id is not treated as a reply', async () => {
+  const { producer } = fakeProducer();
+  const router = new CommandRouter({ getProducer: () => producer, logger: { info() {}, warn() {}, error() {} } });
+  const pending = router.request(1, 'cmd.session.list', {});
+  const cmdId = router.pendingCommandId(1);
+  assert.ok(cmdId);
+
+  assert.equal(router.settle({ v: 1, id: 'c1', ts: 1, type: 'ctrl.pong', payload: {}, in_reply_to: cmdId }), false);
+  assert.equal(router.settle({
+    v: 1, id: 'a1', ts: 1, type: 'ack.session.list', payload: { sessions: [] }, in_reply_to: cmdId,
+  }), true);
+  assert.deepEqual(await pending, { kind: 'ack', payload: { sessions: [] } });
+});
+
 test('cancelAll leaves commands for other bindings pending', async () => {
   const { producer } = fakeProducer();
   const router = new CommandRouter({ getProducer: () => producer, logger: { info() {}, warn() {}, error() {} } });

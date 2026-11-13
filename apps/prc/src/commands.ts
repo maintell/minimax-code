@@ -62,6 +62,12 @@ export class CommandRouter {
   }
 
   settle(frame: Frame): boolean {
+    // A command is answered only by an ack or an err. Any other type that
+    // happens to echo a command id — an event, a control frame — must fall
+    // through to the fanout with the command still pending, or the real reply
+    // would be lost to a fabricated error.
+    const isReply = frame.type.startsWith('ack.') || frame.type.startsWith('err.');
+    if (!isReply) return false;
     const replyTo = frame.in_reply_to;
     if (!replyTo) return false;
     const pending = this.pending.get(replyTo);
