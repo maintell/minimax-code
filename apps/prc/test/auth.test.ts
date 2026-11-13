@@ -23,6 +23,18 @@ test('malformed stored hashes fail closed instead of throwing', () => {
   }
 });
 
+test('cost validation rejects malformed N when the salt and key are well formed', () => {
+  const salt = Buffer.alloc(16).toString('base64');
+  const hash = Buffer.alloc(64).toString('base64');
+  const cases = [
+    [`scrypt$abc$8$1$${salt}$${hash}`, 'non-numeric cost'],
+    [`scrypt$16383$8$1$${salt}$${hash}`, 'non-power-of-two cost'],
+  ];
+  for (const [stored, why] of cases) {
+    assert.equal(verifyPassword('anything', stored), false, why);
+  }
+});
+
 test('cookies are signed, expire, and reject tampering', () => {
   const auth = createAuth('server-secret');
   const cookie = auth.issueCookie(1_000);
