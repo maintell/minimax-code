@@ -200,7 +200,6 @@ without the CSRF token except for `POST /api/login`.
 | `GET /api/sessions?agent=&keyword=&limit=&cursor=` | Session tree or search |
 | `GET /api/sessions/:id/messages?before=&limit=` | History page |
 | `POST /api/sessions/:id/messages` | Send a message (streams over the socket) |
-| `POST /api/sessions/:id/abort` | Stop the running turn |
 | `POST /api/sessions` | Create a session |
 | `GET /api/sessions/:id` | Session detail |
 | `PATCH /api/sessions/:id` | Title or composer mode |
@@ -211,13 +210,17 @@ without the CSRF token except for `POST /api/login`.
 | `GET|PUT /api/preferences/pinned` | Pinned order |
 | `POST /api/attachments` | Upload (section 10) |
 
+M1 serves `POST /api/login`, `GET /api/state`, `GET /api/sessions`, the history
+and message routes, and `POST /api/permissions/:requestId`; the rest of the table
+is the M2 and M3 target. In particular M1 has no abort route: stopping a turn is
+the `cmd.session.stop` socket command in section 8.
+
 Browser socket messages:
 
 ```jsonc
 // server → browser
-{"kind":"evt","type":"session.message_chunk","payload":{...},"eventId":42}
-{"kind":"evt","type":"permission.ask","payload":{...}}
-{"kind":"state","binding":{"online":true}}
+{"kind":"evt","type":"evt.session.message_chunk","payload":{...},"eventId":42}
+{"kind":"evt","type":"evt.permission.ask","payload":{...}}
 {"kind":"ack","requestId":"r-1","payload":{...}}
 {"kind":"err","requestId":"r-1","code":"SESSION_BUSY","message":"..."}
 
@@ -225,6 +228,11 @@ Browser socket messages:
 {"kind":"cmd","requestId":"r-1","type":"session.send","payload":{...}}
 {"kind":"permission","requestId":"r-2","decision":"allowOnce","requestIds":["p-1"]}
 ```
+
+`type` carries the producer frame type verbatim, including its `evt.` prefix: a
+stream chunk is `{"kind":"evt","type":"evt.session.message_chunk"}`. Only
+`evt.*` frames are fanned out; `ack.*` and `err.*` answer the socket that asked,
+and `ctrl.*` steers the producer connection, so a tab never receives either.
 
 `requestId` is PRC-scoped and exists only to correlate a browser request with its
 reply; it is unrelated to the protocol's `cmd.id`.
@@ -301,6 +309,11 @@ Goal objective resources; ordinary `attachments` always go through the
 downloader, even on the generic route form.
 
 ### 10.2 Inbound: browser to producer
+
+This leg is **not implemented in M1**. The shipped gateway has no
+`POST /api/attachments` route, no signed URL endpoint and no injected fetcher, so
+the console sends a turn without `attachments` and a producer never downloads
+from PRC. Steps 1-2 and the producer-side seam below describe the M3 work.
 
 1. The console uploads with `POST /api/attachments` (multipart). PRC enforces
    20 MB per file and 50 MB per batch, sniffs the type, sanitises the filename,
