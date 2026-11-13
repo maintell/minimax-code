@@ -57,6 +57,21 @@ export function toPermissionCard(payload: Record<string, unknown>) {
   };
 }
 
+// The producer reports the turn terminal with the protocol's numeric enum
+// (1 ok, 2 error, 3 aborted) while the console contract names the same states.
+// An unrecognised value is passed through unchanged rather than inventing a
+// terminal the producer never sent.
+const TURN_END_STATUS_NAMES = new Map<number, string>([
+  [1, 'finished'],
+  [2, 'error'],
+  [3, 'aborted'],
+]);
+
+export function toTurnEndPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const name = typeof payload.status === 'number' ? TURN_END_STATUS_NAMES.get(payload.status) : undefined;
+  return name === undefined ? payload : { ...payload, status: name };
+}
+
 export class ConsumerHub {
   private readonly byBinding = new Map<number, Set<WsLike>>();
 
@@ -106,7 +121,11 @@ export function eventFanout(hub: ConsumerHub, bindingId: number, frame: Frame): 
   hub.broadcast(bindingId, {
     kind: 'evt',
     type: frame.type,
-    payload: frame.type === 'evt.permission.ask' ? toPermissionCard(frame.payload) : frame.payload,
+    payload: frame.type === 'evt.permission.ask'
+      ? toPermissionCard(frame.payload)
+      : frame.type === 'evt.session.turn_end'
+        ? toTurnEndPayload(frame.payload)
+        : frame.payload,
     eventId: frame.event_id,
   });
 }
