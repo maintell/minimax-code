@@ -20,5 +20,5 @@ test('the console scopes its socket to the binding and matches prefixed events',
   assert.match(script, /evt\.session\.turn_end/u);
   assert.match(script, /evt\.permission\.ask/u);
   assert.match(script, /evt\.permission\.resolved/u);
-  assert.match(script, /payload\.request_id/u);
+  assert.match(script, /payload\??\.request_id/u);
 });

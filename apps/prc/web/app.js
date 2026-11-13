@@ -1,4 +1,7 @@
+import { backoffDelay, sameId } from './ids.js';
+
 const $ = (id) => document.getElementById(id);
+const QUICK_CLOSE_MS = 5_000;
 
 let csrf = sessionStorage.getItem('prc.csrf') ?? readCsrfCookie();
 let bindingId = null;
@@ -7,6 +10,10 @@ let currentSession = null;
 let socket;
 let socketBindingId = null;
 let reconnectTimer;
+let reconnectAttempt = 0;
+let quickCloses = 0;
+let openedAt = 0;
+let stableTimer;
 let streamingBubble = null;
 const pendingCommands = new Map();
 const permissionCards = new Map();
@@ -49,6 +56,7 @@ function showConsole() {
 
 function showLogin(message = '') {
   closeSocket();
+  resetReconnect();
   bindingId = null;
   deviceId = '';
   currentSession = null;
@@ -98,6 +106,7 @@ async function refresh() {
       return;
     }
     $('status').textContent = 'unavailable';
+    scheduleReconnect();
     return;
   }
 
@@ -108,6 +117,7 @@ async function refresh() {
 
   if (bindingId === null) {
     closeSocket();
+    resetReconnect();
     $('status').textContent = 'no producer';
     renderSessions([]);
     $('transcript').replaceChildren(
@@ -152,7 +162,7 @@ function renderSessions(sessions) {
 
 function markActiveSession() {
   for (const button of $('sessions').querySelectorAll('button[data-session-id]')) {
-    const active = button.dataset.sessionId === String(currentSession);
+    const active = currentSession !== null && sameId(button.dataset.sessionId, currentSession);
     button.classList.toggle('active', active);
     if (active) button.setAttribute('aria-current', 'true');
     else button.removeAttribute('aria-current');
@@ -167,6 +177,8 @@ async function openSession(id) {
   transcript.replaceChildren();
   try {
     const page = await api(`/api/sessions/${encodeURIComponent(id)}/messages?limit=50`);
+    // A slow history response must not overwrite the session opened after it.
+    if (!sameId(id, currentSession)) return;
     const messages = page.messages ?? [];
     for (const message of messages) {
       const text = messageText(message);
@@ -174,6 +186,7 @@ async function openSession(id) {
     }
     if (!messages.length) transcript.append(appendNotice('No messages yet.'));
   } catch (error) {
+    if (!sameId(id, currentSession)) return;
     transcript.append(appendNotice(`Could not load messages: ${error.message}`));
   }
   connectSocket();
@@ -269,16 +282,32 @@ function connectSocket() {
 
   ws.onopen = () => {
     if (socket !== ws) return;
+    openedAt = Date.now();
+    // A successful open clears the state-failure count. A connection that
+    // closes immediately is tracked separately so flapping still backs off.
+    reconnectAttempt = 0;
+    if (stableTimer !== undefined) clearTimeout(stableTimer);
+    stableTimer = setTimeout(() => {
+      stableTimer = undefined;
+      if (socket === ws) quickCloses = 0;
+    }, QUICK_CLOSE_MS);
     $('status').textContent = 'connected';
   };
   ws.onmessage = (event) => handleMessage(event.data);
   ws.onclose = () => {
     if (socket !== ws) return;
+    const quick = openedAt !== 0 && Date.now() - openedAt < QUICK_CLOSE_MS;
+    if (stableTimer !== undefined) {
+      clearTimeout(stableTimer);
+      stableTimer = undefined;
+    }
+    openedAt = 0;
     socket = null;
     socketBindingId = null;
     pendingCommands.clear();
+    quickCloses = quick ? quickCloses + 1 : 0;
     $('status').textContent = 'offline';
-    scheduleReconnect();
+    scheduleReconnect(quickCloses);
   };
   ws.onerror = () => {
     // A close follows and owns the reconnect.
@@ -290,6 +319,11 @@ function closeSocket() {
     clearTimeout(reconnectTimer);
     reconnectTimer = undefined;
   }
+  if (stableTimer !== undefined) {
+    clearTimeout(stableTimer);
+    stableTimer = undefined;
+  }
+  openedAt = 0;
   pendingCommands.clear();
   if (!socket) return;
   const ws = socket;
@@ -306,17 +340,28 @@ function closeSocket() {
   }
 }
 
-function scheduleReconnect() {
+function resetReconnect() {
+  reconnectAttempt = 0;
+  quickCloses = 0;
+}
+
+function scheduleReconnect(extraAttempts = 0) {
   if (reconnectTimer !== undefined || !csrf) return;
+  const delay = backoffDelay(reconnectAttempt + extraAttempts);
+  reconnectAttempt += 1;
   $('status').textContent = 'reconnecting…';
   reconnectTimer = setTimeout(() => {
     reconnectTimer = undefined;
     // Re-read discovery before retrying: the binding may be gone or replaced.
     void refresh().catch((error) => {
-      if (error?.status === 401) showLogin('Session expired. Sign in again.');
-      else $('status').textContent = 'offline';
+      if (error?.status === 401) {
+        showLogin('Session expired. Sign in again.');
+        return;
+      }
+      $('status').textContent = 'offline';
+      scheduleReconnect();
     });
-  }, 1_500);
+  }, delay);
 }
 
 function handleMessage(raw) {
@@ -332,7 +377,7 @@ function handleMessage(raw) {
   }
 
   if (message.type === 'evt.session.message_chunk') {
-    if (message.payload?.session_id !== currentSession) return;
+    if (!sameId(message.payload?.session_id, currentSession)) return;
     const text = chunkText(message.payload?.chunk);
     if (!text) return;
     if (streamingBubble === null) streamingBubble = appendText('', 'stream');
@@ -342,7 +387,7 @@ function handleMessage(raw) {
 
   if (message.type === 'evt.session.turn_end') {
     const endedSession = message.payload?.session_id;
-    if (typeof endedSession === 'string' && endedSession !== currentSession) return;
+    if (endedSession !== undefined && endedSession !== null && !sameId(endedSession, currentSession)) return;
     streamingBubble = null;
     $('status').textContent = 'idle';
     return;
@@ -371,7 +416,9 @@ function chunkText(chunk) {
 
 function renderPermission(card) {
   if (!card || typeof card.requestId !== 'string' || !card.requestId) return;
-  if (permissionCards.has(card.requestId)) return;
+  for (const requestId of permissionCards.keys()) {
+    if (sameId(requestId, card.requestId)) return;
+  }
 
   const box = document.createElement('div');
   box.id = `p-${card.requestId}`;
@@ -444,12 +491,14 @@ async function decidePermission(card, decision, box, actions) {
 // An ask arrives normalised as a card; its resolution arrives raw from the
 // producer, so the two are joined on the producer's request id.
 function removePermission(payload) {
-  const requestId = typeof payload?.request_id === 'string' ? payload.request_id : '';
-  if (!requestId) return;
-  const box = permissionCards.get(requestId);
-  if (!box) return;
-  permissionCards.delete(requestId);
-  box.remove();
+  const requestId = payload?.request_id;
+  if (requestId === undefined || requestId === null) return;
+  for (const [cardRequestId, box] of permissionCards) {
+    if (!sameId(cardRequestId, requestId)) continue;
+    permissionCards.delete(cardRequestId);
+    box.remove();
+    return;
+  }
 }
 
 async function start() {
