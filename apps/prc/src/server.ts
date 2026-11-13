@@ -1,4 +1,5 @@
 import http from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +12,10 @@ const contentTypes: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
 };
 
-export async function createServer(deps: { config: Config }) {
+export async function createServer(deps: {
+  config: Config;
+  api?: { handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> };
+}) {
   const server = http.createServer(async (req, res) => {
     let url: URL;
     try {
@@ -25,6 +29,22 @@ export async function createServer(deps: { config: Config }) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
       return;
+    }
+    if (deps.api) {
+      try {
+        if (await deps.api.handle(req, res)) return;
+      } catch {
+        // A handler failure must not leave the socket open or reject unhandled.
+        if (!res.writableEnded) {
+          if (res.headersSent) {
+            res.end();
+          } else {
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: { code: 'internal_error' } }));
+          }
+        }
+        return;
+      }
     }
     const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
     if (file.includes('..')) {
