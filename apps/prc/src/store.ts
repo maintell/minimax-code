@@ -85,11 +85,7 @@ export function openStore(file: string) {
     mintTicket(bindingId: number, nowMs = Date.now()) {
       const ticket = randomBytes(32).toString('base64url');
       const hash = createHash('sha256').update(ticket).digest('hex');
-      const previous = db.prepare('SELECT COALESCE(MAX(expires_at_ms), 0) AS value FROM ticket WHERE binding_id = ?')
-        .get(bindingId) as { value: number };
-      // Strictly monotonic per binding: a later ticket never expires before an earlier
-      // one, even when both are minted inside the same millisecond.
-      const expiresAtMs = Math.max(nowMs + TICKET_TTL_MS, Number(previous.value) + 1);
+      const expiresAtMs = nowMs + TICKET_TTL_MS;
       db.prepare('DELETE FROM ticket WHERE binding_id = ? AND consumed_at_ms IS NULL').run(bindingId);
       db.prepare('INSERT INTO ticket (hash, binding_id, issued_at_ms, expires_at_ms) VALUES (?, ?, ?, ?)')
         .run(hash, bindingId, nowMs, expiresAtMs);
