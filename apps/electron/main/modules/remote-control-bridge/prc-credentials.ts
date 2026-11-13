@@ -53,6 +53,10 @@ export async function fetchPrcBinding(deps: {
   try {
     response = await deps.fetchImpl(buildBindingUrl(deps.config.baseUrl), {
       method: 'GET',
+      // The password travels in a custom header, and custom headers survive a
+      // redirect, so a 307/308 could replay it to another origin. A redirect is
+      // a misconfiguration; surface it as a transport failure and never follow.
+      redirect: 'error',
       headers: {
         'X-PRC-Password': deps.config.password,
         'X-Device-Id': deps.deviceId,
@@ -66,16 +70,29 @@ export async function fetchPrcBinding(deps: {
   }
   if (response.status === 401) return { ok: false, error: 'not_authenticated' };
   if (!response.ok) return { ok: false, error: `http_${response.status}` };
-  let body: Record<string, unknown>;
+  // A JSON body is untrusted whatever its shape: `null`, an array, or a scalar
+  // all parse "successfully" and would throw on the field reads below.
+  let body: unknown;
   try {
-    body = (await response.json()) as Record<string, unknown>;
+    body = await response.json();
   } catch {
     return { ok: false, error: 'not_bound' };
   }
-  const bindingId = typeof body.binding_id === 'number' ? body.binding_id : undefined;
-  const ticket = text(body.ticket);
-  const endpoint = text(body.endpoint);
-  if (body.state !== 'bound' || bindingId === undefined || !ticket || !endpoint) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'not_bound' };
+  }
+  const record = body as Record<string, unknown>;
+  const bindingId = record.binding_id;
+  const ticket = text(record.ticket);
+  const endpoint = text(record.endpoint);
+  if (
+    record.state !== 'bound' ||
+    typeof bindingId !== 'number' ||
+    !Number.isSafeInteger(bindingId) ||
+    bindingId <= 0 ||
+    !ticket ||
+    !endpoint
+  ) {
     return { ok: false, error: 'not_bound' };
   }
   return { ok: true, credentials: { binding_id: bindingId, ticket, endpoint } };
