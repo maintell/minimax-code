@@ -15,7 +15,7 @@
 ## Contribute
 
 - [Contributing](../CONTRIBUTING.md) · [Maintainers and review](maintainers.md) · [Security reporting](../SECURITY.md)
-- [Architecture](architecture.md) · [Verification records](verification.md)
+- [Architecture](architecture.md) · [Remote control protocol](remote-control-protocol.md) · [Verification records](verification.md)
 
 ## Maintain and release
 
