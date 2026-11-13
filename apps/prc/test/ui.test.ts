@@ -17,6 +17,7 @@ test('the console scopes its socket to the binding and matches prefixed events',
   const script = await readFile(clientUrl, 'utf8');
   assert.match(script, /\/ws\?binding_id=/u);
   assert.match(script, /evt\.session\.message_chunk/u);
+  assert.match(script, /evt\.session\.message'/u);
   assert.match(script, /evt\.session\.turn_end/u);
   assert.match(script, /evt\.permission\.ask/u);
   assert.match(script, /evt\.permission\.resolved/u);

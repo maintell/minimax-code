@@ -3,7 +3,7 @@ import { verifyPassword } from './auth.ts';
 import type { Auth } from './auth.ts';
 import type { CommandRouter } from './commands.ts';
 import type { Config } from './config.ts';
-import { permissionDecisionCode } from './consumer.ts';
+import { permissionResponsePayload } from './consumer.ts';
 import type { Store } from './store.ts';
 
 export const SESSION_COOKIE = 'prc_session';
@@ -238,13 +238,12 @@ export function createHttpApi(deps: {
       if (req.method === 'POST' && permissionMatch) {
         if (bindingId === undefined) return send(res, 409, { error: { code: 'NO_BINDING' } }), true;
         const body = await readJson(req);
-        const decision = typeof body.decision === 'string' ? permissionDecisionCode(body.decision) : undefined;
+        const payload = typeof body.decision === 'string'
+          ? permissionResponsePayload(body.decision, [decodeURIComponent(permissionMatch[1] ?? '')])
+          : undefined;
         // An unrecognised decision must never be forwarded as an allow.
-        if (decision === undefined) return send(res, 400, { error: { code: 'INVALID_DECISION' } }), true;
-        const result = await deps.router.request(bindingId, 'cmd.permission.respond', {
-          request_ids: [decodeURIComponent(permissionMatch[1] ?? '')],
-          decision,
-        });
+        if (payload === undefined) return send(res, 400, { error: { code: 'INVALID_DECISION' } }), true;
+        const result = await deps.router.request(bindingId, 'cmd.permission.respond', payload);
         if (result.kind === 'err') return send(res, 502, result), true;
         return send(res, 200, {
           ok: true,

@@ -163,15 +163,18 @@ retrying.
 
 ### 6.4 Replay
 
-`event_log` keeps the last 2000 frames per binding (24 hours). On
-`ctrl.auth.complete` with `last_event_id`:
+`event_log` keeps the last 2000 `evt.*` frames per binding (24 hours); commands
+carry an `event_id` on the wire but are never logged, because replaying one would
+re-execute work the producer has already done. Replay happens only when
+`ctrl.auth.complete` carries an explicit positive `last_event_id`:
 
-- Inside the window: send every frame with a greater `event_id`, in order, before
+- Inside the window: send every event with a greater `event_id`, in order, before
   any new traffic.
 - Outside the window: send `ctrl.replay.overflow {}`; the producer refetches
   state instead of trusting a partial history.
+- No cursor: replay nothing.
 
-Replay only applies to frames PRC emitted. Producer-to-gateway frames are never
+Replay only applies to events PRC emitted. Producer-to-gateway frames are never
 replayed.
 
 ### 6.5 Disconnect reasons
@@ -406,19 +409,21 @@ Configuration, additive and optional:
 
 ```jsonc
 {
-  "remote_control": {
-    "prc": {
-      "url": "https://prc.example.com",
-      "password": "…",
-      "allow_insecure_origin": false
-    }
+  "remote_control_prc": {
+    "url": "https://prc.example.com",
+    "password": "…",
+    "allowInsecureOrigin": false
   }
 }
 ```
 
+`MC_RC_PRC_URL` and `MC_RC_PRC_PASSWORD` override `url` and `password` when both
+are set; `allowInsecureOrigin` is only ever read from the file, and a plaintext
+`http:` origin stays disabled without it.
+
 Behaviour:
 
-1. When `remote_control.prc` is absent, the client behaves exactly as today.
+1. When `remote_control_prc` is absent, the client behaves exactly as today.
 2. When present, the main process becomes the credential source: it calls
    `GET {url}/minimax-cloud/api/v1/remote-control/desktop/bindings` with
    `X-Device-Id`, `X-Producer-Type: desktop` and `X-PRC-Password`, applies the

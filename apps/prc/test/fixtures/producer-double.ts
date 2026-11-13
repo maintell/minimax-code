@@ -14,8 +14,10 @@ const CLIENT_VERSION = '0.0.0-e2e';
 
 // Standard SSE framing: the bridge joins consecutive `data:` lines into one
 // event and only flushes on a blank line, so each frame is separated by one.
+// The chunk is the runtime's own RespData envelope: type 6 carries the text in
+// `agent_message_chunk.msg_content`, which is what the console parses.
 const SSE_BODY = [
-  'data: {"type":2,"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}',
+  'data: {"type":6,"agent_message_chunk":{"msg_id":"m1","msg_content":"hi"}}',
   '',
   'data: {"type":10}',
   '',

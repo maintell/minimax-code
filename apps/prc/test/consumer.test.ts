@@ -75,7 +75,7 @@ test('malformed browser messages are dropped without a reply or a throw', async 
   assert.equal(calls.length, 0);
 });
 
-test('a permission decision becomes the numeric producer response', async () => {
+test('a permission decision becomes the numeric producer response with its remember code', async () => {
   const socket = new FakeSocket();
   const calls: Array<{ bindingId: number; type: string; payload: Record<string, unknown> }> = [];
   const router = {
@@ -84,13 +84,30 @@ test('a permission decision becomes the numeric producer response', async () => 
       return { kind: 'ack' as const, payload: { processed: 2, skipped: 0 } };
     },
   };
-  await handleConsumerFrame(
-    new ConsumerHub(), router as never, socket as never, 7,
-    JSON.stringify({ kind: 'permission', requestId: 'r2', decision: 'deny', requestIds: ['p1', 2] }),
-  );
-  assert.deepEqual(calls, [
-    { bindingId: 7, type: 'cmd.permission.respond', payload: { request_ids: ['p1', '2'], decision: 2 } },
-  ]);
+  const decide = async (decision: string) => {
+    await handleConsumerFrame(
+      new ConsumerHub(), router as never, socket as never, 7,
+      JSON.stringify({ kind: 'permission', requestId: 'r2', decision, requestIds: ['p1', 2] }),
+    );
+    return calls.at(-1);
+  };
+  // The socket path must send the same `remember` code as the HTTP route: the
+  // producer reads an allow without it as a one-off approval.
+  assert.deepEqual(await decide('allowOnce'), {
+    bindingId: 7,
+    type: 'cmd.permission.respond',
+    payload: { request_ids: ['p1', '2'], decision: 1, remember: 3 },
+  });
+  assert.deepEqual(await decide('allowAlways'), {
+    bindingId: 7,
+    type: 'cmd.permission.respond',
+    payload: { request_ids: ['p1', '2'], decision: 1, remember: 1 },
+  });
+  assert.deepEqual(await decide('deny'), {
+    bindingId: 7,
+    type: 'cmd.permission.respond',
+    payload: { request_ids: ['p1', '2'], decision: 2 },
+  });
   assert.deepEqual(JSON.parse(socket.sent.at(-1) ?? '{}'), {
     kind: 'ack',
     payload: { processed: 2, skipped: 0 },

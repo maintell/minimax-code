@@ -133,17 +133,17 @@ test('the logged frame and the wire frame are identical JSON', () => {
   assert.deepEqual(logged, JSON.parse(JSON.stringify(frame)));
 });
 
-test('an explicit id is used in the log and on the wire so in_reply_to can match', () => {
+test('a command keeps its explicit id on the wire and stays out of the log', () => {
   const { store, binding, ws, producer } = setup();
   producer.start();
   producer.send('cmd.session.send', { session_id: 's1' }, { id: 'cmd-1', inReplyTo: 'req-0' });
   const wire = JSON.parse(ws.sent.at(-1) ?? '{}');
-  const [logged] = store.replayAfter(binding.id, 0) as Array<Record<string, unknown>>;
+  // The reply names the command id, so the id has to reach the wire; the
+  // command itself is not replayable, so it never enters the log.
   assert.equal(wire.id, 'cmd-1');
-  assert.equal(logged?.id, 'cmd-1');
   assert.equal(wire.in_reply_to, 'req-0');
-  assert.equal(logged?.in_reply_to, 'req-0');
-  assert.equal(wire.event_id, logged?.event_id);
+  assert.equal(typeof wire.event_id, 'number');
+  assert.deepEqual(store.replayAfter(binding.id, 0), []);
 });
 
 test('control frames never enter the replay stream', () => {

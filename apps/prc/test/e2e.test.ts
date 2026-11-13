@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { startProducerDouble } from './fixtures/producer-double.ts';
 import { startPrc } from './fixtures/prc-harness.ts';
+import { chunkText } from '../web/text.js';
 
 test('a bridged producer completes a turn through PRC', async () => {
   const prc = await startPrc({ password: 'e2e' });
@@ -20,6 +21,9 @@ test('a bridged producer completes a turn through PRC', async () => {
 
     const chunk = await socket.next((message) => message.type === 'evt.session.message_chunk');
     assert.equal(chunk.payload.session_id, 's1');
+    // The double emits the runtime's real chunk, so the console's own parser is
+    // what has to turn it into text.
+    assert.equal(chunkText(chunk.payload.chunk), 'hi');
     const end = await socket.next((message) => message.type === 'evt.session.turn_end');
     assert.equal(end.payload.status, 'finished');
   } finally {

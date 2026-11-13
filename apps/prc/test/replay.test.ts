@@ -70,14 +70,42 @@ test('an evicted cursor produces replay.overflow', () => {
   assert.ok(types.includes('ctrl.replay.overflow'));
 });
 
-test('an auth without last_event_id replays every retained frame', () => {
-  const { ws, producer } = setup('prc-replay-all-');
+test('a cursor-less auth replays nothing even when events are retained', () => {
+  const { ws, producer } = setup('prc-replay-none-');
   producer.send('evt.a', {});
   producer.send('evt.b', {});
   producer.start();
   const baseline = ws.sent.length;
   authComplete(ws, {});
-  assert.deepEqual(wireFrames(ws, baseline).map((frame) => frame.event_id), [1, 2]);
+  assert.deepEqual(wireFrames(ws, baseline), []);
+});
+
+test('a command is not logged, so a cursor-less reconnect cannot re-deliver it', () => {
+  const { store, binding, ws, producer } = setup('prc-replay-cmd-');
+  producer.send('cmd.session.send', { session_id: 's1', content: 'hi' });
+  // The command still carries its id on the wire; it is only kept out of the log.
+  const [command] = wireFrames(ws);
+  assert.equal(command?.type, 'cmd.session.send');
+  assert.equal(command?.event_id, 1);
+  assert.deepEqual(store.replayAfter(binding.id, 0), []);
+
+  producer.start();
+  const baseline = ws.sent.length;
+  authComplete(ws, {});
+  assert.deepEqual(wireFrames(ws, baseline), []);
+});
+
+test('an explicit cursor replays newer events across a command gap', () => {
+  const { ws, producer } = setup('prc-replay-gap-');
+  producer.send('evt.a', {});
+  producer.send('cmd.session.list', {});
+  producer.send('evt.b', {});
+  producer.start();
+  const baseline = ws.sent.length;
+  authComplete(ws, { last_event_id: 1 });
+  const replayed = wireFrames(ws, baseline);
+  assert.deepEqual(replayed.map((frame) => frame.type), ['evt.b']);
+  assert.deepEqual(replayed.map((frame) => frame.event_id), [3]);
 });
 
 test('a cursor ahead of the newest id overflows instead of replaying nothing', () => {
@@ -91,14 +119,14 @@ test('a cursor ahead of the newest id overflows instead of replaying nothing', (
   assert.deepEqual(frames.map((frame) => frame.type), ['ctrl.replay.overflow']);
 });
 
-test('a non-numeric cursor is treated as absent and replays everything', () => {
+test('a non-numeric cursor is treated as absent and replays nothing', () => {
   const { ws, producer } = setup('prc-replay-junk-');
   producer.send('evt.a', {});
   producer.start();
   const baseline = ws.sent.length;
   authComplete(ws, { last_event_id: 'abc' });
   const frames = wireFrames(ws, baseline);
-  assert.deepEqual(frames.map((frame) => frame.type), ['evt.a']);
+  assert.deepEqual(frames, []);
 });
 
 test('a replayed frame is the stored frame verbatim and is not logged again', () => {
@@ -106,16 +134,16 @@ test('a replayed frame is the stored frame verbatim and is not logged again', ()
   producer.send('evt.a', { n: 1 });
   producer.send('evt.b', { n: 2 });
   producer.start();
-  const logged = store.replayAfter(binding.id, 0);
+  const retained = store.replayAfter(binding.id, 0);
   const baseline = ws.sent.length;
-  authComplete(ws, { last_event_id: 0 });
+  authComplete(ws, { last_event_id: 1 });
 
   const replayed = wireFrames(ws, baseline);
-  assert.deepEqual(replayed as unknown[], logged);
-  assert.deepEqual(replayed.map((frame) => frame.event_id), [1, 2]);
+  assert.deepEqual(replayed as unknown[], [retained[1]]);
+  assert.deepEqual(replayed.map((frame) => frame.event_id), [2]);
   // Nothing was appended by the replay: the log is unchanged and the next
   // frame keeps the id after the highest logged one.
-  assert.deepEqual(store.replayAfter(binding.id, 0), logged);
+  assert.deepEqual(store.replayAfter(binding.id, 0), retained);
   assert.equal(producer.send('evt.c', {}).event_id, 3);
 });
 

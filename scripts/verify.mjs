@@ -65,6 +65,8 @@ const steps = [
   { name: "test:status-contract", script: "test:status-contract" },
   { name: "test:smoke", script: "test:smoke" },
   { name: "test:byok", script: "test:byok" },
+  // `apps/prc` is outside the workspace and runs under `node --test`, not Vitest.
+  { name: "test:prc", script: "test:prc", windows: true },
   // The permission facade uses POSIX process and filesystem semantics.
   {
     name: "test:policy",

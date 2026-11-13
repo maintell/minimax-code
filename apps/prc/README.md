@@ -271,10 +271,12 @@ gateway instead (see below).
 | --- | --- |
 | `operator.json` | The scrypt password hash, written on first run with mode `0600`. While it exists, `PRC_PASSWORD` is ignored. |
 | `session-secret` | HMAC key for browser session cookies. Deleting it signs every browser out; producers are unaffected. |
-| `prc.sqlite` | Bindings, one-shot tickets, and a rolling replay log trimmed to roughly the newest 2,000 frames per binding. |
+| `prc.sqlite` | Bindings, one-shot tickets, and a rolling log of application events trimmed to roughly the newest 2,000 per binding. Commands are never logged. |
 | `prc.sqlite-wal`, `prc.sqlite-shm` | SQLite write-ahead sidecars, present while the process runs. |
 
 `data/` is covered by `apps/prc/.gitignore`; it never enters version control.
+The `0600` mode on `operator.json` and `session-secret` is a POSIX guarantee; on
+Windows the files inherit the data directory's ACLs instead.
 Nothing else on disk holds state: the console keeps only its CSRF token in
 `sessionStorage`.
 

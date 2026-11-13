@@ -9,6 +9,14 @@ const PERMISSION_DECISIONS = new Map<string, number>([
   ['deny', 2],
 ]);
 
+// The decision code alone cannot express "always": the producer reads the
+// persistence of an allow from `remember` (1 always, 3 once) and treats a
+// missing field as a one-off approval. Both allow variants therefore send it.
+const PERMISSION_REMEMBER = new Map<string, number>([
+  ['allowAlways', 1],
+  ['allowOnce', 3],
+]);
+
 // Design section 8 is the complete command surface a browser may request. The
 // list is explicit so that forwarding a new producer command is a reviewed change
 // rather than a passthrough of whatever a tab names.
@@ -39,9 +47,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // The browser decision is a name the console renders; the producer only
-// understands its numeric codes. One lookup keeps the two ends in step.
-export function permissionDecisionCode(decision: string): number | undefined {
-  return PERMISSION_DECISIONS.get(decision);
+// understands its numeric codes. One lookup keeps the two ends in step, and an
+// unknown name yields undefined so it can never default to an allow.
+export function permissionResponsePayload(
+  decision: string,
+  requestIds: string[],
+): { request_ids: string[]; decision: number; remember?: number } | undefined {
+  const code = PERMISSION_DECISIONS.get(decision);
+  if (code === undefined) return undefined;
+  const remember = PERMISSION_REMEMBER.get(decision);
+  return { request_ids: requestIds, decision: code, ...(remember !== undefined ? { remember } : {}) };
 }
 
 // An ask is reshaped once, here, instead of in every tab. `tool_input` is
@@ -171,14 +186,11 @@ export async function handleConsumerFrame(
 
   if (message.kind === 'permission') {
     if (typeof message.decision !== 'string') return;
-    const decision = PERMISSION_DECISIONS.get(message.decision);
-    // An unrecognised decision must not default to "allow".
-    if (decision === undefined) return;
     const requestIds = Array.isArray(message.requestIds) ? message.requestIds.map(String) : [];
-    const result = await router.request(bindingId, 'cmd.permission.respond', {
-      request_ids: requestIds,
-      decision,
-    });
+    const payload = permissionResponsePayload(message.decision, requestIds);
+    // An unrecognised decision must not default to "allow".
+    if (!payload) return;
+    const result = await router.request(bindingId, 'cmd.permission.respond', payload);
     reply(socket, { ...result, requestId });
     void hub;
   }

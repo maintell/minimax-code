@@ -131,7 +131,7 @@ async function signIn(server: { url: string }) {
   return { cookies, csrf: body.csrf };
 }
 
-test('allow decisions send the producer code 1 and deny sends 2', async () => {
+test('allow decisions carry their remember code and deny sends 2', async () => {
   const { server, store, calls } = await boot(
     async () => ({ kind: 'ack', payload: { processed: 2, skipped: 1 } }),
   );
@@ -145,14 +145,21 @@ test('allow decisions send the producer code 1 and deny sends 2', async () => {
     body: JSON.stringify({ decision }),
   });
 
-  for (const [decision, code] of [['allowOnce', 1], ['allowAlways', 1], ['deny', 2]] as const) {
+  // Without `remember` the producer reads an allow as a one-off approval, so
+  // "Allow always" would silently degrade to "Allow once".
+  const cases = [
+    ['allowOnce', { request_ids: ['p1'], decision: 1, remember: 3 }],
+    ['allowAlways', { request_ids: ['p1'], decision: 1, remember: 1 }],
+    ['deny', { request_ids: ['p1'], decision: 2 }],
+  ] as const;
+  for (const [decision, payload] of cases) {
     const response = await reply(decision);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true, processed: 2, skipped: 1 });
     assert.deepEqual(calls.at(-1), {
       bindingId: binding.id,
       type: 'cmd.permission.respond',
-      payload: { request_ids: ['p1'], decision: code },
+      payload,
     });
   }
   assert.equal(calls.length, 3);

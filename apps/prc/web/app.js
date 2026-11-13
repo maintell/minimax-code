@@ -1,4 +1,5 @@
 import { backoffDelay, sameId } from './ids.js';
+import { chunkText, messageText } from './text.js';
 
 const $ = (id) => document.getElementById(id);
 const QUICK_CLOSE_MS = 5_000;
@@ -192,18 +193,6 @@ async function openSession(id) {
   connectSocket();
 }
 
-function messageText(message) {
-  if (typeof message === 'string') return message;
-  if (typeof message?.content === 'string') return message.content;
-  const content = message?.content;
-  if (Array.isArray(content)) {
-    return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('');
-  }
-  if (typeof content?.text === 'string') return content.text;
-  if (typeof message?.text === 'string') return message.text;
-  return '';
-}
-
 function appendText(text, extraClass = '') {
   const div = document.createElement('div');
   div.className = extraClass ? `bubble ${extraClass}` : 'bubble';
@@ -385,6 +374,17 @@ function handleMessage(raw) {
     return;
   }
 
+  if (message.type === 'evt.session.message') {
+    if (!sameId(message.payload?.session_id, currentSession)) return;
+    const msg = message.payload?.msg;
+    // The composer already printed the operator's own message, so the user
+    // echo of the same turn must not produce a second bubble.
+    if (msg?.role === 'user') return;
+    const text = messageText(msg);
+    if (text) appendText(text);
+    return;
+  }
+
   if (message.type === 'evt.session.turn_end') {
     const endedSession = message.payload?.session_id;
     if (endedSession !== undefined && endedSession !== null && !sameId(endedSession, currentSession)) return;
@@ -401,17 +401,6 @@ function handleMessage(raw) {
   if (message.type === 'evt.permission.resolved') {
     removePermission(message.payload);
   }
-}
-
-// The chunk field is the producer's raw stream object and its exact text shape
-// is not settled yet. Append only text we recognise; never dump JSON.
-function chunkText(chunk) {
-  if (typeof chunk?.text === 'string') return chunk.text;
-  const content = chunk?.message?.content;
-  if (Array.isArray(content)) {
-    return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('');
-  }
-  return '';
 }
 
 function renderPermission(card) {

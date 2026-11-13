@@ -25,7 +25,8 @@ export interface ProducerOptions {
 }
 
 // Only a JSON number that is a non-negative safe integer is a replay cursor; a
-// string, NaN, a negative or a fraction counts as absent, which replays all.
+// string, NaN, a negative or a fraction counts as absent, and an absent cursor
+// asks for no replay at all.
 function replayCursor(value: unknown): number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
@@ -64,7 +65,11 @@ export class ProducerSocket {
     const eventId = this.opts.store.nextEventId(this.bindingId);
     const frame = makeFrame(type, payload, { eventId, ...(opts.inReplyTo ? { inReplyTo: opts.inReplyTo } : {}) });
     if (opts.id) frame.id = opts.id;
-    this.opts.store.appendEvent(this.bindingId, eventId, frame);
+    // Every frame carries an event id, but only application events are
+    // replayable. A command was addressed to one live socket and acts once;
+    // keeping it in the log would let a reconnect re-deliver — and therefore
+    // re-execute — work the producer has already done.
+    if (type.startsWith('evt.')) this.opts.store.appendEvent(this.bindingId, eventId, frame);
     this.sendFrame(frame);
     return frame;
   }
@@ -108,18 +113,25 @@ export class ProducerSocket {
   }
 
   // The producer keeps the newest `event_id` it received and offers it back on
-  // reconnect. Only frames this gateway emitted are in the log, so a replay can
-  // never echo producer traffic; the stored frames go out with their original
-  // ids, before any new frame reaches the socket, and are not appended a second
-  // time. A cursor outside the retained window cannot be served — older than the
-  // window means frames were trimmed, newer than the newest id means the log was
-  // rolled back under a producer that kept counting — so the producer is told to
-  // refetch state instead of trusting a partial history.
+  // reconnect; replaying from it is the only way it resumes the stream. With no
+  // cursor there is no position to resume from — the producer may be starting
+  // fresh, and re-sending retained events would duplicate turns it already ran —
+  // so nothing is replayed. Only `evt.` frames are in the log, so a replay can
+  // never echo a command back to the producer. The stored frames go out with
+  // their original ids, before any new frame reaches the socket, and are not
+  // appended a second time. A cursor outside the retained window cannot be
+  // served — older than the window means frames were trimmed, newer than the
+  // newest id means the log was rolled back under a producer that kept counting
+  // — so the producer is told to refetch state instead of trusting a partial
+  // history. Ids spent on commands leave gaps in the log, so a cursor that lands
+  // in one can only be answered with an extra refetch, never with a silently
+  // partial replay.
   private replayMissed(frame: Frame): void {
     const cursor = replayCursor(frame.payload.last_event_id);
+    if (cursor <= 0) return;
     const oldest = this.opts.store.oldestEventId(this.bindingId);
     const newest = this.opts.store.newestEventId(this.bindingId);
-    if (cursor > 0 && (cursor < oldest - 1 || cursor > newest)) {
+    if (cursor < oldest - 1 || cursor > newest) {
       this.opts.logger.info(`replay overflow binding=${this.bindingId} from=${cursor}`);
       this.sendFrame(makeFrame('ctrl.replay.overflow', {}));
       return;
