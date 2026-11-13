@@ -98,12 +98,22 @@ export function createHttpApi(deps: {
         }
       }
 
-      const binding = deps.store.findBindingByDevice(String(req.headers['x-device-id'] ?? '')) ?? undefined;
+      const deviceHeader = req.headers['x-device-id'];
+      const deviceId = typeof deviceHeader === 'string' ? deviceHeader : '';
+      // A header the caller sent still decides even when it matches nothing.
+      const hasDeviceHeader = deviceHeader !== undefined;
+      const binding = deps.store.findBindingByDevice(deviceId) ?? undefined;
       const bindingId = binding?.id;
 
       if (req.method === 'GET' && url.pathname === '/api/state') {
+        // Discovery for a console that cannot send a device header on every
+        // request: with no header and exactly one binding, that binding is the
+        // answer; with several, only the header identifies which one.
+        const stateBinding = binding ?? (hasDeviceHeader ? undefined : deps.store.soleBinding());
         return send(res, 200, {
-          binding: binding ? { id: binding.id, deviceId: binding.deviceId, generation: binding.producerGeneration } : null,
+          binding: stateBinding
+            ? { id: stateBinding.id, deviceId: stateBinding.deviceId, generation: stateBinding.producerGeneration }
+            : null,
         }), true;
       }
 

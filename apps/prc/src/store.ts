@@ -61,6 +61,12 @@ export function openStore(file: string) {
       const row = db.prepare('SELECT * FROM binding WHERE device_id = ?').get(deviceId);
       return row ? toBinding(row as Record<string, unknown>) : undefined;
     },
+    // A console that never sent a device header can still find the one binding
+    // this installation serves; with several, only the header identifies which.
+    soleBinding(): Binding | undefined {
+      const rows = db.prepare('SELECT * FROM binding LIMIT 2').all() as Array<Record<string, unknown>>;
+      return rows.length === 1 ? toBinding(rows[0] as Record<string, unknown>) : undefined;
+    },
     getOrCreateBinding(deviceId: string, producerVersion: string): Binding {
       const existing = this.findBindingByDevice(deviceId);
       if (existing) {

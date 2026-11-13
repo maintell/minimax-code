@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { ConsumerHub, handleConsumerFrame } from '../src/consumer.ts';
+import { ConsumerHub, SUPPORTED_COMMANDS, handleConsumerFrame } from '../src/consumer.ts';
 
 class FakeSocket extends EventEmitter {
   sent: string[] = [];
@@ -126,4 +126,72 @@ test('a socket that closes mid-command does not reject the handler', async () =>
     new ConsumerHub(), router as never, socket as never, 1,
     JSON.stringify({ kind: 'cmd', requestId: 'r4', type: 'session.list', payload: {} }),
   ));
+});
+
+test('the browser command surface is the seventeen design commands', () => {
+  assert.equal(SUPPORTED_COMMANDS.size, 17);
+  assert.deepEqual([...SUPPORTED_COMMANDS].sort(), [
+    'cmd.model.list',
+    'cmd.permission.respond',
+    'cmd.pinned.list',
+    'cmd.pinned.reorder',
+    'cmd.projects.list',
+    'cmd.session.delete',
+    'cmd.session.get',
+    'cmd.session.history',
+    'cmd.session.list',
+    'cmd.session.new',
+    'cmd.session.pin',
+    'cmd.session.resume',
+    'cmd.session.send',
+    'cmd.session.stop',
+    'cmd.session.update',
+    'cmd.skill.list',
+    'cmd.workspace.list',
+  ]);
+  assert.equal(SUPPORTED_COMMANDS.has('cmd.session.exec'), false);
+});
+
+test('an unreviewed command name is refused without reaching the router', async () => {
+  const socket = new FakeSocket();
+  const calls: string[] = [];
+  const router = {
+    request: async (_bindingId: number, type: string) => {
+      calls.push(type);
+      return { kind: 'ack' as const, payload: {} };
+    },
+  };
+  await handleConsumerFrame(
+    new ConsumerHub(), router as never, socket as never, 1,
+    JSON.stringify({ kind: 'cmd', requestId: 'r5', type: 'session.exec', payload: {} }),
+  );
+  assert.deepEqual(calls, []);
+  assert.deepEqual(JSON.parse(socket.sent.at(-1) ?? '{}'), {
+    kind: 'err',
+    requestId: 'r5',
+    code: 'UNSUPPORTED_COMMAND',
+    message: 'cmd.session.exec is not a supported command',
+    retryable: false,
+  });
+});
+
+test('a reviewed command name still reaches the router', async () => {
+  const socket = new FakeSocket();
+  const calls: Array<{ bindingId: number; type: string; payload: Record<string, unknown> }> = [];
+  const router = {
+    request: async (bindingId: number, type: string, payload: Record<string, unknown>) => {
+      calls.push({ bindingId, type, payload });
+      return { kind: 'ack' as const, payload: { id: 's2' } };
+    },
+  };
+  await handleConsumerFrame(
+    new ConsumerHub(), router as never, socket as never, 3,
+    JSON.stringify({ kind: 'cmd', requestId: 'r6', type: 'session.new', payload: { title: 'demo' } }),
+  );
+  assert.deepEqual(calls, [{ bindingId: 3, type: 'cmd.session.new', payload: { title: 'demo' } }]);
+  assert.deepEqual(JSON.parse(socket.sent.at(-1) ?? '{}'), {
+    kind: 'ack',
+    payload: { id: 's2' },
+    requestId: 'r6',
+  });
 });

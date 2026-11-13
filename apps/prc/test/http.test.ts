@@ -86,6 +86,33 @@ test('state needs the cookie and sessions ride the device header', async () => {
   await server.close();
 });
 
+test('state discovers the sole binding without a device header', async () => {
+  const { server, store } = await boot();
+  const { cookies } = await signIn(server);
+  const only = store.getOrCreateBinding('dev-only', '3.1.14');
+
+  const sole = await fetch(`${server.url}/api/state`, { headers: { cookie: cookies } });
+  assert.equal(sole.status, 200);
+  assert.equal((await sole.json()).binding.id, only.id);
+
+  const second = store.getOrCreateBinding('dev-two', '3.1.14');
+  const ambiguous = await fetch(`${server.url}/api/state`, { headers: { cookie: cookies } });
+  assert.deepEqual(await ambiguous.json(), { binding: null });
+
+  const headed = await fetch(`${server.url}/api/state`, {
+    headers: { cookie: cookies, 'x-device-id': 'dev-two' },
+  });
+  assert.equal((await headed.json()).binding.id, second.id);
+
+  // A header still decides even when it matches nothing; the sole binding is
+  // never substituted for a device the caller named.
+  const unknown = await fetch(`${server.url}/api/state`, {
+    headers: { cookie: cookies, 'x-device-id': 'dev-unknown' },
+  });
+  assert.deepEqual(await unknown.json(), { binding: null });
+  await server.close();
+});
+
 test('a mutating request answers 401 before csrf is considered', async () => {
   const { server } = await boot();
   const response = await fetch(`${server.url}/api/sessions/s1/messages`, {

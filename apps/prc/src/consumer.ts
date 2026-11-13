@@ -8,6 +8,31 @@ const PERMISSION_DECISIONS = new Map<string, number>([
   ['deny', 2],
 ]);
 
+// Design section 8 is the complete command surface a browser may request. The
+// list is explicit so that forwarding a new producer command is a reviewed change
+// rather than a passthrough of whatever a tab names.
+export const SUPPORTED_COMMANDS: ReadonlySet<string> = Object.freeze(
+  new Set([
+    'cmd.session.list',
+    'cmd.session.history',
+    'cmd.session.send',
+    'cmd.session.new',
+    'cmd.session.resume',
+    'cmd.session.stop',
+    'cmd.session.pin',
+    'cmd.session.get',
+    'cmd.session.update',
+    'cmd.session.delete',
+    'cmd.permission.respond',
+    'cmd.workspace.list',
+    'cmd.projects.list',
+    'cmd.pinned.list',
+    'cmd.pinned.reorder',
+    'cmd.model.list',
+    'cmd.skill.list',
+  ]),
+);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -77,6 +102,16 @@ export async function handleConsumerFrame(
     const payload = message.payload === undefined ? {} : message.payload;
     if (!isRecord(payload)) return;
     const type = message.type.startsWith('cmd.') ? message.type : `cmd.${message.type}`;
+    if (!SUPPORTED_COMMANDS.has(type)) {
+      reply(socket, {
+        kind: 'err',
+        requestId,
+        code: 'UNSUPPORTED_COMMAND',
+        message: `${type} is not a supported command`,
+        retryable: false,
+      });
+      return;
+    }
     const result = await router.request(bindingId, type, payload);
     reply(socket, { ...result, kind: result.kind, requestId });
     return;

@@ -159,6 +159,7 @@ export async function createServer(deps: {
             // A reply settles the browser request it belongs to before the same
             // frame is fanned out to the tabs.
             realtime.router.settle(frame);
+            // Browser envelope: the producer frame type is carried verbatim.
             realtime.hub.broadcast(binding.id, {
               kind: 'evt',
               type: frame.type,
