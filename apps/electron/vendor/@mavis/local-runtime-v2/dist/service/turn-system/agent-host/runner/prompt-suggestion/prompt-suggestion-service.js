@@ -1,3 +1,5 @@
+import { isTurnClosedByTerminatingTools } from '@mavis/agent-core/tools';
+import { readNextStepCard } from '@mavis/shared/next-step';
 import { composeStreamFn, } from '@mavis/agent-core/pi-turn-runner';
 import { buildRecentConversationPrompt, latestUserText } from './recent-context.js';
 import { evaluatePromptSuggestionPolicy, PROMPT_SUGGESTION_VERSION, promptSuggestionInstruction, } from './prompt-suggestion-policy.js';
@@ -24,13 +26,28 @@ function turnKey(sessionId, turnId) {
 export function createPromptSuggestionCapture(resolved, payloadFactory, contentReviewRequired) {
     let prepared;
     let finalAssistant;
+    let nextStepCard = false;
+    /** Tool results of the final assistant message only; a newer message resets them. */
+    let finalToolResults = [];
     return {
         preparedHook(input) {
             prepared = input;
             finalAssistant = undefined;
+            finalToolResults = [];
         },
         assistantHook(input) {
             finalAssistant = input.message;
+            finalToolResults = [];
+            return undefined;
+        },
+        toolHook(input) {
+            finalToolResults.push({
+                toolCallId: input.toolCall.id,
+                details: resultDetails(input.result),
+            });
+            if (input.toolCall.name === 'wrap_up' && !input.isError) {
+                nextStepCard = Boolean(readNextStepCard(input.result)?.ask);
+            }
             return undefined;
         },
         read() {
@@ -40,11 +57,18 @@ export function createPromptSuggestionCapture(resolved, payloadFactory, contentR
                     prepared,
                     finalAssistant,
                     payloadFactory,
+                    nextStepCard,
+                    closedByTerminatingTool: isTurnClosedByTerminatingTools(finalAssistant, finalToolResults),
                     ...(contentReviewRequired !== undefined ? { contentReviewRequired } : {}),
                 }
                 : undefined;
         },
     };
+}
+function resultDetails(result) {
+    return typeof result === 'object' && result !== null
+        ? result.details
+        : undefined;
 }
 export function createPromptSuggestionService(options) {
     const now = options.nowMs ?? (() => Date.now());
@@ -226,7 +250,9 @@ export function createPromptSuggestionService(options) {
         },
         schedule(sessionId, turnId, capture, replyMessageId) {
             syncPolicy();
-            if (closed || !options.enabled() || capture.finalAssistant.stopReason !== 'stop')
+            if (closed || !options.enabled())
+                return;
+            if (skipUnsupportedCapture(capture, { sessionId, turnId }, log, status))
                 return;
             // Dedupe runs before any cancel: a repeated schedule for the same Turn
             // must not cancel the request it is duplicating.
@@ -301,6 +327,14 @@ export function createPromptSuggestionService(options) {
             }));
         },
     };
+}
+function skipUnsupportedCapture(capture, { sessionId, turnId }, log, status) {
+    // A Turn a tool closed on purpose (wrap_up recap only) finished like a stop.
+    if (!capture.nextStepCard)
+        return capture.finalAssistant.stopReason !== 'stop' && capture.closedByTerminatingTool !== true;
+    log({ sessionId, turnId, status: 'skipped', reason: 'next_step_card' });
+    status(sessionId, turnId, 'unavailable');
+    return true;
 }
 async function runScheduledSuggestion({ options, sessionId, turnId, capture, attempt, controller, stillCurrent, storeResult, log, status, now, finish, }) {
     const started = Date.now();

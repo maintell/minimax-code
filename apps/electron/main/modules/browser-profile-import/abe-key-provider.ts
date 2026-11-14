@@ -130,7 +130,7 @@ export async function readWindowsChromeAppBoundKey(localStatePath, dependencies,
     catch (error) {
         if (signal?.aborted)
             throw error;
-        throw new AbeKeyError('user_layer_failed');
+        throw new AbeKeyError('user_layer_failed', { cause: error });
     }
     finally {
         inner.fill(0);

@@ -10,7 +10,7 @@ import { PI_TURN_RUNNER_LOGGER } from '../../../infra/observability/pi-turn-logg
 import { createWebsiteDeployTurnProjection, prepareDeployedSources } from '../../website/index.js';
 import { createHostedAttachmentCapabilities } from './hosted-agent-attachments.js';
 import { toLocalSessionRecord } from './hosted-agent-session.js';
-import { applyHostedCapabilityRestrictions, } from './hosted-agent-capability-restrictions.js';
+import { createCliRefusalTools, resolveHostedToolCapabilities, shouldExposeCliRefusals, } from './hosted-agent-capability-restrictions.js';
 import { createHostedAgentPermissionCapabilities } from './hosted-agent-permission-capabilities.js';
 import { HostedReviewCapability, resolveBuiltinReviewPromptDir } from '../../review/index.js';
 import { createHostedSkillCapabilities } from './hosted-agent-skill-capabilities.js';
@@ -64,6 +64,7 @@ export function createHostedAgentCapabilities(host, restrictions = {}) {
                     }),
                     environmentInSystemPrompt: true,
                     ...(input.sessionIdInContext ? { sessionIdInContext: true } : {}),
+                    ...(input.reminderAllowlist ? { reminderAllowlist: input.reminderAllowlist } : {}),
                     memoryContextCharsUsed: memoryContextCharsUsed(input.contextUsagePromptRanges),
                 };
                 const reminderMessage = host.localDataCollector.toMessage(input.promptText, input.turnId, input.model);
@@ -162,8 +163,23 @@ function createHostedWebsiteDeployCapabilities(host) {
         createTurnProjection: createWebsiteDeployTurnProjection,
     };
 }
-function resolveHostedToolSources(host, restrictions, input) {
-    const builtinCapabilities = applyHostedCapabilityRestrictions(input.builtinCapabilities ?? resolveAgentCapabilities(), restrictions);
+async function resolveHostedToolSources(host, restrictions, input) {
+    const sources = await resolveHostedOwnerToolSources(host, restrictions, input);
+    if (input.toolsDisabled || !shouldExposeCliRefusals(restrictions, input.coordination)) {
+        return sources;
+    }
+    const refusals = createCliRefusalTools();
+    const refusalNames = new Set(refusals.map((tool) => tool.def.name));
+    return {
+        ...sources,
+        nativeTools: [
+            ...sources.nativeTools.filter((tool) => !refusalNames.has(tool.def.name)),
+            ...refusals,
+        ],
+    };
+}
+function resolveHostedOwnerToolSources(host, restrictions, input) {
+    const builtinCapabilities = resolveHostedToolCapabilities(input.builtinCapabilities ?? resolveAgentCapabilities(), restrictions, input.coordination);
     return host.buildOwnerTurnToolSources({
         session: toLocalSessionRecord(input.session),
         turnId: input.turnId,
@@ -182,6 +198,9 @@ function resolveHostedToolSources(host, restrictions, input) {
         ...(restrictions.resumeCodexAvailable === true ? { resumeCodexAvailable: true } : {}),
         ...(input.miniappAvailable === true ? { miniappAvailable: true } : {}),
         ...(input.pptPreviewAvailable === true ? { pptPreviewAvailable: true } : {}),
+        ...(input.pluginRecommendationAvailable === true
+            ? { pluginRecommendationAvailable: true }
+            : {}),
         ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
     });
 }

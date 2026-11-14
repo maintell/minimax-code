@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { join, resolve, relative } from 'node:path';
-import { readFile, rm, stat } from 'node:fs/promises';
+import { basename, isAbsolute, join, resolve, relative } from 'node:path';
+import { readdir, readFile, rm, rmdir, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import { decodePptPreviewRequest, PptPreviewError, PPT_PREVIEW_LIMITS, } from '@mavis/shared/ppt-preview';
 import { PreviewRepository } from '../preview.repository.js';
 import { capturePptx, readPptxSource, writePptxSnapshot } from './snapshot-capture.js';
@@ -22,6 +23,29 @@ function fingerprint(input) {
 function sourceIdentity(stats) {
     return [stats.size, stats.mtimeMs, stats.ctimeMs, stats.ino, stats.dev].join(':');
 }
+async function fileContentHash(path) {
+    const hash = createHash('sha256');
+    for await (const chunk of createReadStream(path))
+        hash.update(chunk);
+    return `sha256:${hash.digest('hex')}`;
+}
+const PENDING_STATES = ['accepted', 'importing', 'preparing'];
+/** Ready snapshots each generation keeps: the newest one previews open and its fallback. */
+const KEPT_READY = 2;
+/** Per-session folders are `sha256(JSON(sessionId))`; anything else (for example `connections`) is not ours. */
+const SNAPSHOT_FOLDER = /^[0-9a-f]{64}$/u;
+/** Covers filesystem timestamp granularity when comparing mtimes with the wall clock. */
+const ORPHAN_MTIME_MARGIN_MS = 5_000;
+const SNAPSHOT_FILE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.pptx(?:\.tmp)?$/u;
+/** Disk reclamation never fails the owning operation; the startup sweep retries leftovers. */
+async function bestEffort(run) {
+    try {
+        await run();
+    }
+    catch {
+        /* Unreferenced bytes are reclaimed by the next startup sweep. */
+    }
+}
 function generation(owner = 'explicit') {
     return {
         generationId: randomUUID(),
@@ -38,7 +62,11 @@ export class PptPreviewService {
     tails = new Map();
     jobs = new Map();
     closed = false;
+    /** Files written before this instance existed can only be referenced through persisted state. */
+    startedAtMs = Date.now();
+    orphanSweep;
     preparationTail = Promise.resolve();
+    integrityCheck = Promise.resolve();
     observeAfter = new Map();
     /** Last examined file identity per session source; unchanged files are not re-read or copied. */
     observedSources = new Map();
@@ -82,17 +110,33 @@ export class PptPreviewService {
     async ready() {
         if (!this.options.renderHost)
             return;
-        for (const a of this.repo.all()) {
-            for (const s of a.generation.snapshots)
-                if (a.generation.state !== 'cancelled' &&
-                    ['accepted', 'importing', 'preparing'].includes(s.renderState))
-                    this.prepare(a.sessionId, a.artifactId, s);
-            for (const s of [...a.generations.flatMap((g) => g.snapshots), ...a.generation.snapshots])
-                if (s.renderState === 'ready')
-                    this.prepare(a.sessionId, a.artifactId, s);
-            if (a.generation.state === 'validating')
-                await this.serial(a.sessionId, () => this.finishIfReady(a));
+        for (const a of this.repo.all())
+            await this.serial(a.sessionId, () => this.compactArtifact(a.sessionId, a.artifactId));
+        for (const a of this.repo.all())
+            await this.resume(a);
+        // Same-size content changes need a full hash; run it in the background so startup is not blocked.
+        this.integrityCheck = this.verifyLatestReadySnapshots();
+        // Disk reclamation must not delay startup; close() drains it.
+        this.orphanSweep ??= bestEffort(() => this.sweepOrphans());
+    }
+    /** Resumes interrupted preparation and checks stored ready copies by metadata only. */
+    async resume(a) {
+        for (const s of a.generation.snapshots)
+            if (a.generation.state !== 'cancelled' &&
+                ['accepted', 'importing', 'preparing'].includes(s.renderState))
+                this.prepare(a.sessionId, a.artifactId, s);
+        // Ready snapshots are not re-rendered on startup; Desktop verifies their bytes when opened.
+        // A missing or resized stored copy becomes error so readers fall back to an earlier version.
+        for (const s of [...a.generations.flatMap((g) => g.snapshots), ...a.generation.snapshots]) {
+            if (s.renderState !== 'ready')
+                continue;
+            const problem = await this.storedSnapshotProblem(s);
+            if (problem)
+                await this.serial(a.sessionId, () => this.markFailed(a.sessionId, a.artifactId, s.snapshotId, new PptPreviewError('SNAPSHOT_UNAVAILABLE', `PPT_SNAPSHOT_UNAVAILABLE:${problem}`)));
         }
+        // Re-read: the startup check above may have just marked the final snapshot as error.
+        if (a.generation.state === 'validating')
+            await this.serial(a.sessionId, () => this.finishIfReady(this.artifact(a.sessionId, a.artifactId)));
     }
     async close() {
         this.closed = true;
@@ -100,17 +144,36 @@ export class PptPreviewService {
         for (const j of this.jobs.values())
             j.controller.abort();
         await Promise.allSettled([...this.jobs.values()].map((j) => j.done));
+        await this.integrityCheck;
         await Promise.allSettled([...this.tails.values()]);
+        await this.orphanSweep;
+    }
+    /**
+     * Session deletion owns its private snapshot folder. Best effort: a failure
+     * leaves files that the next startup sweep reclaims once the record is gone.
+     */
+    async deleteSession(sessionId) {
+        await this.serial(sessionId, async () => {
+            for (const job of this.jobs.values())
+                if (job.sessionId === sessionId)
+                    job.controller.abort();
+            this.observeAfter.delete(sessionId);
+            for (const key of this.observedSources.keys())
+                if (key.startsWith(`${sessionId}\0`))
+                    this.observedSources.delete(key);
+            await bestEffort(() => rm(this.snapshotFolder(sessionId), { recursive: true, force: true, maxRetries: 2 }));
+        });
     }
     async cancelSession(sessionId) {
         if (this.closed || !this.options.renderHost)
             return;
-        await this.serial(sessionId, () => {
+        await this.serial(sessionId, async () => {
             for (const artifact of this.repo.list(sessionId)) {
                 if (!['generating', 'validating'].includes(artifact.generation.state))
                     continue;
                 this.cancel(artifact);
                 this.repo.commit(artifact, 'task-cancelled');
+                await this.removeSupersededFiles(artifact);
             }
         });
     }
@@ -282,7 +345,7 @@ export class PptPreviewService {
             });
             if (request.action === 'publish')
                 captured = undefined;
-            this.schedule(artifact, request.action);
+            await this.schedule(artifact, request.action);
             if (request.action === 'complete')
                 await this.finishIfReady(artifact);
             return result;
@@ -318,7 +381,9 @@ export class PptPreviewService {
             generationState: artifact.generation.state,
         };
     }
-    schedule(artifact, action) {
+    async schedule(artifact, action) {
+        if (action === 'cancel')
+            await this.removeSupersededFiles(artifact);
         const latest = artifact.generation.snapshots.at(-1);
         if (action === 'publish' && latest)
             this.prepare(artifact.sessionId, artifact.artifactId, latest);
@@ -471,7 +536,7 @@ export class PptPreviewService {
             }
         })();
         this.preparationTail = this.observeJob(done);
-        this.jobs.set(snapshot.snapshotId, { controller, done });
+        this.jobs.set(snapshot.snapshotId, { sessionId, controller, done });
     }
     async observeJob(done) {
         try {
@@ -508,14 +573,75 @@ export class PptPreviewService {
                 if (!prepared)
                     return;
                 prepared.renderState = 'ready';
+                const owner = [artifact.generation, ...artifact.generations].find((g) => g.snapshots.includes(prepared));
+                const retired = owner ? this.retireOlderReady(owner) : [];
                 this.repo.commit(artifact, 'ready');
                 await this.finishIfReady(artifact);
+                await this.removeSnapshotFiles(retired);
             });
         }
         catch (error) {
             if (controller.signal.aborted || this.closed)
                 return;
             await this.serial(sessionId, () => this.markFailed(sessionId, artifactId, snapshot.snapshotId, error));
+        }
+    }
+    /** Startup check by metadata only; transient IO errors leave the snapshot to the open-time check. */
+    async storedSnapshotProblem(snapshot) {
+        try {
+            const stats = await stat(snapshot.sourcePath);
+            return stats.isFile() && stats.size === snapshot.sizeBytes ? undefined : 'size_mismatch';
+        }
+        catch (error) {
+            return error.code === 'ENOENT' ? 'missing' : undefined;
+        }
+    }
+    /**
+     * Hashes the snapshot readers pick (the latest ready one) and walks back past corrupted copies
+     * until one matches, so readers fall back to an intact version. IO errors other than ENOENT stop
+     * the walk and leave that snapshot to the open-time check.
+     */
+    async verifyLatestReadySnapshots() {
+        for (const a of this.repo.all()) {
+            if (this.closed)
+                return;
+            try {
+                await this.walkBackCorruptedSnapshots(a);
+            }
+            catch {
+                /* Background check; an unreadable artifact is left to the open-time check. */
+            }
+        }
+    }
+    async walkBackCorruptedSnapshots(a) {
+        const candidates = [...a.generations.flatMap((g) => g.snapshots), ...a.generation.snapshots]
+            .filter((s) => s.renderState === 'ready')
+            .reverse();
+        for (const s of candidates) {
+            if (this.closed)
+                return;
+            const problem = await this.storedSnapshotHashProblem(s);
+            if (!problem)
+                return;
+            await this.serial(a.sessionId, () => this.markCorrupted(a, s, problem));
+        }
+    }
+    /** Re-reads the artifact so a snapshot changed since hashing is not overwritten. */
+    markCorrupted(a, s, problem) {
+        const current = this.repo.list(a.sessionId).find((i) => i.artifactId === a.artifactId);
+        const stored = current && this.findSnapshot(current, s.snapshotId);
+        if (this.closed || stored?.renderState !== 'ready' || stored.contentHash !== s.contentHash)
+            return;
+        this.markFailed(a.sessionId, a.artifactId, s.snapshotId, new PptPreviewError('SNAPSHOT_UNAVAILABLE', `PPT_SNAPSHOT_UNAVAILABLE:${problem}`));
+    }
+    async storedSnapshotHashProblem(snapshot) {
+        try {
+            return (await fileContentHash(snapshot.sourcePath)) === snapshot.contentHash
+                ? undefined
+                : 'hash_mismatch';
+        }
+        catch (error) {
+            return error.code === 'ENOENT' ? 'missing' : undefined;
         }
     }
     markPreparing(sessionId, artifactId, snapshotId) {
@@ -557,6 +683,128 @@ export class PptPreviewService {
         }
         a.generation.state = 'completed';
         this.repo.commit(a, 'completed');
+    }
+    /**
+     * Each generation keeps its newest KEPT_READY ready snapshots plus the final one, which
+     * completion re-verifies. Previews open the newest; the one before it is the fallback when the
+     * newest turns out missing or corrupted after a restart, and it also stays readable for a UI
+     * that is still opening it while the newest becomes ready. Older ones are retired.
+     */
+    retireOlderReady(owner) {
+        const retired = owner.snapshots
+            .filter((item) => item.renderState === 'ready')
+            .sort((a, b) => b.acceptedRevision - a.acceptedRevision)
+            .slice(KEPT_READY)
+            .filter((item) => item.snapshotId !== owner.finalSnapshotId);
+        for (const item of retired)
+            item.renderState = 'superseded';
+        return retired;
+    }
+    /**
+     * Startup reconciliation for state persisted before cleanup existed or
+     * interrupted mid-way: pending snapshots of a closed generation never
+     * prepare again. Older ready snapshots are not retired here: startup only
+     * checks stored copies, so they stay as the fallback when the newest one
+     * turns out missing or corrupted.
+     */
+    async compactArtifact(sessionId, artifactId) {
+        const artifact = this.repo.list(sessionId).find((item) => item.artifactId === artifactId);
+        if (!artifact)
+            return;
+        const retired = [];
+        for (const owner of [...artifact.generations, artifact.generation]) {
+            const active = owner === artifact.generation && owner.state !== 'cancelled';
+            if (!active)
+                retired.push(...this.retirePending(owner));
+        }
+        if (retired.length === 0)
+            return;
+        this.repo.commit(artifact, 'snapshots-retired');
+        await this.removeSnapshotFiles(retired);
+    }
+    /** A closed generation never prepares its queued snapshots again. */
+    retirePending(owner) {
+        const retired = owner.snapshots.filter((item) => PENDING_STATES.includes(item.renderState));
+        for (const item of retired)
+            item.renderState = 'superseded';
+        return retired;
+    }
+    /** Cancellation supersedes only queued snapshots, which never reached the UI; ready ones stay. */
+    removeSupersededFiles(artifact) {
+        return this.removeSnapshotFiles(artifact.generation.snapshots.filter((item) => item.renderState === 'superseded'));
+    }
+    /** Best effort; anything left behind is unreferenced and the startup sweep reclaims it. */
+    async removeSnapshotFiles(snapshots) {
+        const root = resolve(this.options.dataDir, 'v2', 'ppt-preview');
+        for (const item of snapshots) {
+            const path = relative(root, resolve(item.sourcePath));
+            if (!path || path.startsWith('..') || isAbsolute(path))
+                continue;
+            await bestEffort(() => rm(item.sourcePath, { force: true }));
+        }
+    }
+    /**
+     * Reclaims snapshot files no persisted snapshot references: folders of
+     * deleted sessions (named by a one-way hash) and leftovers of interrupted
+     * captures or cleanups. Files written after this instance started may still
+     * be awaiting their commit, so only older files are eligible.
+     */
+    async sweepOrphans() {
+        const root = join(this.options.dataDir, 'v2', 'ppt-preview');
+        let folders;
+        try {
+            folders = await readdir(root);
+        }
+        catch {
+            return;
+        }
+        const referenced = new Set();
+        const owned = new Set();
+        for (const a of this.repo.all()) {
+            owned.add(fingerprint(a.sessionId));
+            for (const item of [...a.generations, a.generation].flatMap((g) => g.snapshots))
+                if (item.renderState !== 'superseded')
+                    referenced.add(basename(item.sourcePath));
+        }
+        for (const folder of folders) {
+            if (this.closed)
+                return;
+            if (!SNAPSHOT_FOLDER.test(folder))
+                continue;
+            const dir = join(root, folder);
+            const kept = await this.sweepFolder(dir, referenced);
+            // Non-recursive: a concurrent capture that just created a file keeps the folder.
+            if (kept === 0 && !owned.has(folder))
+                await bestEffort(() => rmdir(dir));
+        }
+    }
+    /** Returns how many entries remain in the folder. */
+    async sweepFolder(dir, referenced) {
+        let entries;
+        try {
+            entries = await readdir(dir, { withFileTypes: true });
+        }
+        catch {
+            return 1;
+        }
+        let kept = 0;
+        for (const entry of entries) {
+            const eligible = entry.isFile() && SNAPSHOT_FILE.test(entry.name) && !referenced.has(entry.name);
+            if (!eligible || !(await this.removeIfStale(join(dir, entry.name))))
+                kept += 1;
+        }
+        return kept;
+    }
+    async removeIfStale(file) {
+        try {
+            if ((await stat(file)).mtimeMs >= this.startedAtMs - ORPHAN_MTIME_MARGIN_MS)
+                return false;
+            await rm(file, { force: true });
+            return true;
+        }
+        catch {
+            return false;
+        }
     }
 }
 //# sourceMappingURL=publication.service.js.map

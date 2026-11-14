@@ -63,7 +63,6 @@ export async function createSessionHandoffComposition(input) {
         resultDelivery?.recoverPending(),
     ]);
     return initializeSessionHandoffService({
-        ...(input.metrics ? { metrics: input.metrics } : {}),
         workspace,
         cloud,
         state,

@@ -5,7 +5,7 @@
  * on its own and the manager stays within size limits.
  */
 
-import { COMMENT_COMPOSER_BRIDGE_THEME_VARIABLES, COMMENT_COMPOSER_SPEC, resolveCommentInputAutoGrow } from "@mavis/shared/comment-composer";
+import { COMMENT_COMPOSER_BRIDGE_THEME_VARIABLES, COMMENT_COMPOSER_SPEC, resolveCommentInputAutoGrow, fitCommentInputHeight } from "@mavis/shared/comment-composer";
 import { COMMENT_MARKER_BRIDGE_THEME_VARIABLES, COMMENT_MARKER_SPEC } from "@mavis/shared/comment-marker";
 export let EMBEDDED_COMMENT_SOURCE = 'mavis-embedded-browser-comment';
 export let EMBEDDED_COMMENT_WORLD_ID = 1004;
@@ -71,7 +71,7 @@ const EMBEDDED_COMMENT_COMPOSER_ICONS = {
         ],
     },
 };
-export let EMBEDDED_COMMENT_BRIDGE_VERSION = '2026-10-19-props-iframe-region-glass-v28';
+export let EMBEDDED_COMMENT_BRIDGE_VERSION = '2026-11-05-shift-enter-newline-v29';
 export function buildEmbeddedCommentBridgeScript(options) {
     const allowSyntheticEventsForTests = options?.allowSyntheticEventsForTests === true;
     const isolateUiInShadowRoot = options?.isolateUiInShadowRoot !== false;
@@ -88,6 +88,7 @@ export function buildEmbeddedCommentBridgeScript(options) {
   // function, so both boxes grow, clamp and wrap on the same numbers. It is
   // pure and closes over nothing, which is what makes this safe.
   const resolveCommentInputAutoGrow = ${resolveCommentInputAutoGrow.toString()};
+  const fitCommentInputHeight = ${fitCommentInputHeight.toString()};
   const markerCssVariables = ${JSON.stringify(COMMENT_MARKER_BRIDGE_THEME_VARIABLES)};
   const markerSpec = ${JSON.stringify(COMMENT_MARKER_SPEC)};
   if (window.__mavisEmbeddedBrowserCommentBridgeInstalled) {
@@ -2473,28 +2474,14 @@ export function buildEmbeddedCommentBridgeScript(options) {
           ? parsedMaxHeight
           : lineHeight * composerSpec.input.maxLines;
 
-      // Collapse before measuring so deleting text shrinks the box too, and
-      // hide the scrollbar so a visible one can't narrow the measured line and
-      // inflate scrollHeight.
-      const previousHeight = input.style.height;
-      const previousOverflowY = input.style.overflowY;
-      input.style.overflowY = 'hidden';
-      input.style.height = '0px';
-      const contentHeight = input.scrollHeight;
-      if (contentHeight <= 0) {
-        // No layout yet, or the box is display:none. Put back everything the
-        // probe touched — leaving overflow-y hidden would strand the edit box,
-        // which is scrollable from the start, without its scrollbar.
-        input.style.height = previousHeight;
-        input.style.overflowY = previousOverflowY;
-        return false;
-      }
-      const next = resolveCommentInputAutoGrow({ contentHeight, minHeight, maxHeight });
-      input.style.height = next.height + 'px';
-      input.style.overflowY = next.overflowY;
+      const next = fitCommentInputHeight(
+        input,
+        { minHeight, maxHeight },
+        resolveCommentInputAutoGrow,
+      );
       // Only a new comment has a layout to switch — the edit box is stacked
       // from the start.
-      if (isEditingExistingComment || draftHasWrapped || !next.wrapped) return false;
+      if (!next || isEditingExistingComment || draftHasWrapped || !next.wrapped) return false;
       draftHasWrapped = true;
       return true;
     };
@@ -2650,10 +2637,9 @@ export function buildEmbeddedCommentBridgeScript(options) {
       });
       event.stopPropagation();
       if (event.isComposing || composing || event.keyCode === 229) return;
-      const shouldSubmitOnEnter =
-        composerMode === 'create'
-          ? composerSpec.behavior.createEnterSubmitsWithShift
-          : !(event.shiftKey && composerSpec.behavior.editShiftEnterCreatesNewline);
+      const shouldSubmitOnEnter = !(
+        event.shiftKey && composerSpec.behavior.shiftEnterCreatesNewline
+      );
       if (event.key === 'Enter' && shouldSubmitOnEnter) {
         event.preventDefault();
         commit(event);

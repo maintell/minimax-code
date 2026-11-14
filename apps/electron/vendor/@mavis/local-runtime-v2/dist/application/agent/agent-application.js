@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { isDefaultAgentAvatarMarker } from '@mavis/shared/agent-avatar';
+import { isDefaultAgentAvatarMarker, isBunnyAgentAvatarMarker } from '@mavis/shared/agent-avatar';
 import { BoundedInternalTurnPromptReadRegistry, isPromptSnapshotInvalidError, } from '@mavis/agent-runtime';
 import { AgentServiceError, AgentImportService, } from '../../service/agent/index.js';
 import { SAFETY_SCENE, } from '../../service/content-safety/index.js';
@@ -364,7 +364,7 @@ function initialDefinitionReviewFields(input, definition) {
     ];
 }
 function reviewableAvatar(value) {
-    return isDefaultAgentAvatarMarker(value)
+    return isDefaultAgentAvatarMarker(value) || isBunnyAgentAvatarMarker(value)
         ? []
         : [{ value, scene: SAFETY_SCENE.AgentConfigAvatar }];
 }

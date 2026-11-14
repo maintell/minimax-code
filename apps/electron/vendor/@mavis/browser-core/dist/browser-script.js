@@ -9,6 +9,13 @@ export const BROWSER_SCRIPT_MAX_TIMEOUT_MS = 120_000;
 /** Release, recovery and result assembly run after the script deadline. */
 export const BROWSER_SCRIPT_CLEANUP_BUDGET_MS = 5_000;
 export const BROWSER_SCRIPT_MAX_CODE_BYTES = 200 * 1024;
+export function browserScriptTimeoutMs(input) {
+    const requested = asNumber(input.timeout, BROWSER_SCRIPT_DEFAULT_TIMEOUT_MS);
+    return Math.max(1_000, Math.min(BROWSER_SCRIPT_MAX_TIMEOUT_MS, Math.floor(requested)));
+}
+export function browserScriptActionDeadlineMs(input) {
+    return browserScriptTimeoutMs(input) + BROWSER_SCRIPT_CLEANUP_BUDGET_MS;
+}
 const SHIFT_MODIFIER = 8;
 const MAX_SCRIPT_CALLS = 20_000;
 const MAX_SCREENSHOTS = 4;
@@ -321,6 +328,8 @@ export class BrowserScriptRun {
         }
     }
     async mouseMove(x, y, steps) {
+        // Present the destination once; interpolation must not wait for an animation per step.
+        await this.session.beforePointerAction?.({ action: 'run_script', point: { x, y } }, this.operationSignal);
         // Without a known start the first move jumps straight to the target.
         const from = this.pointer ?? { x, y };
         const count = this.pointer ? Math.max(1, Math.min(100, Math.floor(steps))) : 1;

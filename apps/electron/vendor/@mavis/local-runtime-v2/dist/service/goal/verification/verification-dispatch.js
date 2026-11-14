@@ -107,7 +107,6 @@ export class ThreadGoalVerificationDispatcher {
             transcriptWindow,
             evidence: assembleVerificationEvidence({
                 mode: threadGoalVerifierEvidenceMode(this.deps.configGetter),
-                objective: context.goal.objective,
                 objectiveDigest,
                 claim: completionClaimText(context),
                 transcriptWindow,

@@ -1,5 +1,10 @@
 import { buildLocalTurnToolSources } from './local-native-tools.js';
 import { buildLocalTaskAdapter, buildLocalTaskAppendAdapter, shouldEnableLocalTaskTool, } from '../../team/index.js';
+/**
+ * Runtime owners whose users reach managed web tools (native web_search, the
+ * web_fetch server reader). Diagnostic and unknown owners read pages locally.
+ */
+const MANAGED_WEB_TOOL_OWNERS = new Set(['electron', 'tui', 'cli']);
 export async function buildLocalTurnToolSourcesForHost(input) {
     const runtimeConfig = input.host.configGetter();
     const memoryAgentScopeEnabled = input.excludeAgentResources || input.session.sessionKind === 'task'
@@ -24,7 +29,7 @@ export async function buildLocalTurnToolSourcesForHost(input) {
         routingContextGetter: input.host.routingContextGetter,
         fetchImpl: input.host.fetchImpl,
         matrixLogger: input.host.matrixLogger,
-        nativeWebSearchEnabled: ['electron', 'tui', 'cli'].includes(input.host.getRuntimeOwnerKind()),
+        ...managedWebToolSources(input.host),
         mcpService: input.host.mcpService,
         questionnaireContext: input.host.supportsInteraction('questionnaireReply')
             ? input.host.questionnaireServiceDeps()
@@ -54,6 +59,19 @@ export async function buildLocalTurnToolSourcesForHost(input) {
     return sources;
 }
 /**
+ * Diagnostic and unknown owners keep native web_search off and read pages with
+ * the plain local client (the tool assembly default when no adapter is given).
+ */
+function managedWebToolSources(host) {
+    if (!MANAGED_WEB_TOOL_OWNERS.has(host.getRuntimeOwnerKind())) {
+        return { nativeWebSearchEnabled: false };
+    }
+    return {
+        nativeWebSearchEnabled: true,
+        ...(host.webFetchRouter ? { webFetchAdapter: host.webFetchRouter } : {}),
+    };
+}
+/**
  * Passes the host getter itself, not its result: the host swaps in a new auth
  * object on every token refresh, so website_deploy must read it per request
  * instead of the Turn-start snapshot in `authContext`.
@@ -80,6 +98,9 @@ function optionalToolCapabilities(input) {
     return {
         ...(input.miniappAvailable === true ? { miniappAvailable: true } : {}),
         ...(input.pptPreviewAvailable === true ? { pptPreviewAvailable: true } : {}),
+        ...(input.pluginRecommendationAvailable === true
+            ? { pluginRecommendationAvailable: true }
+            : {}),
         ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
         computerUseActive: input.computerUseActive === true,
         ...(input.builtinCapabilities ? { builtinCapabilities: input.builtinCapabilities } : {}),

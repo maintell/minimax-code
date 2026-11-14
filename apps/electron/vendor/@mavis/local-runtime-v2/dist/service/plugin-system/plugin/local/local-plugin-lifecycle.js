@@ -287,7 +287,9 @@ export function installedLocalPlugin(plugin) {
         ...(plugin.version ? { version: plugin.version } : {}),
         contentDigest: plugin.contentDigest,
         enabled: plugin.enabled,
-        ...(plugin.unavailableReason ? { unavailableReason: plugin.unavailableReason } : {}),
+        ...(plugin.unavailableReason === 'SOURCE_MISSING'
+            ? { unavailableReason: plugin.unavailableReason }
+            : {}),
     };
 }
 function installedFromInput(entry, enabled) {

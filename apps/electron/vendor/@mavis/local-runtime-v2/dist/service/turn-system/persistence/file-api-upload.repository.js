@@ -1,5 +1,21 @@
 import { and, eq } from 'drizzle-orm';
 import { fileApiUploads } from '../../../infra/db/schema/file-api.js';
+/**
+ * The Files API wiring of a product's model requests: the per-Session upload cache in the runtime
+ * database, plus the product's fetch and logger. The Turn executor and the advisor both use it,
+ * so their requests upload media the same way and share uploads.
+ */
+export function createFileApiRuntime(options) {
+    return {
+        uploadStores: createFileApiUploadStoreSource({
+            db: options.db,
+            ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+        }),
+        ...(options.product?.fetchImpl ? { fetchImpl: options.product.fetchImpl } : {}),
+        ...(options.product?.logger ? { logger: options.product.logger } : {}),
+    };
+}
+/** @internal Exported only for focused tests; production wiring uses {@link createFileApiRuntime}. */
 export function createFileApiUploadStoreSource(options) {
     const nowMs = options.nowMs ?? Date.now;
     return {

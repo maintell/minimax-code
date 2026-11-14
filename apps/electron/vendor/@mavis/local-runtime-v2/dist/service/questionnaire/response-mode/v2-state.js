@@ -10,10 +10,12 @@ export function questionnaireState(record) {
         ...(record.responseMode ? { responseMode: record.responseMode } : {}),
         ...(record.answeredAt !== undefined ? { answeredAt: record.answeredAt } : {}),
         ...(record.injectedAt !== undefined ? { injectedAt: record.injectedAt } : {}),
+        ...(record.dismissedAt !== undefined ? { dismissedAt: record.dismissedAt } : {}),
     };
 }
 /**
- * `questionnaire.state` for a v2 row whose `status` or `injectedAt` changed.
+ * `questionnaire.state` for a v2 row whose `status`, `injectedAt` or
+ * `dismissedAt` (skipped) changed.
  * Publishing is best-effort after the durable write: a failure is logged and
  * never rolls the change back (clients reconcile through getPending).
  */

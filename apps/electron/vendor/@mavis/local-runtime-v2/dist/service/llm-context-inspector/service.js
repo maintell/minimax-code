@@ -143,6 +143,9 @@ export class LlmContextInspectorService {
                     }
                     : undefined);
                 calls.push({ ...call, prefixComparison });
+                // A rejected request produced no response and warmed no cache.
+                if (call.outcome === 'error')
+                    continue;
                 baseline = call;
                 baselineRequestJson = currentRequestJson;
             }

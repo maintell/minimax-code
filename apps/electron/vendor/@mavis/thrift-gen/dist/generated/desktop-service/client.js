@@ -413,6 +413,57 @@ export function createDesktopServiceClient(options) {
         setMinimaxModelSource(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setMinimaxModelSource, req, callOptions);
         },
+        ensureBunny(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ensureBunny, req, callOptions);
+        },
+        resetBunny(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.resetBunny, req, callOptions);
+        },
+        reportBunnyViewState(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.reportBunnyViewState, req, callOptions);
+        },
+        listAgentAssignments(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listAgentAssignments, req, callOptions);
+        },
+        setAssignmentCompletion(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setAssignmentCompletion, req, callOptions);
+        },
+        setBunnyPermissionMode(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setBunnyPermissionMode, req, callOptions);
+        },
+        setBunnyTaskModel(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.setBunnyTaskModel, req, callOptions);
+        },
+        listBunnyBackups(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listBunnyBackups, req, callOptions);
+        },
+        restoreBunnyBackup(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.restoreBunnyBackup, req, callOptions);
+        },
+        listWorkingStateEntries(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listWorkingStateEntries, req, callOptions);
+        },
+        addWorkingStateEntry(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.addWorkingStateEntry, req, callOptions);
+        },
+        updateWorkingStateEntry(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.updateWorkingStateEntry, req, callOptions);
+        },
+        closeWorkingStateEntry(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.closeWorkingStateEntry, req, callOptions);
+        },
+        confirmWorkingStateEntry(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.confirmWorkingStateEntry, req, callOptions);
+        },
+        listBunnyTraceEvents(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listBunnyTraceEvents, req, callOptions);
+        },
+        listBunnyTaskTelemetry(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listBunnyTaskTelemetry, req, callOptions);
+        },
+        ackBunnyTaskTelemetry(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ackBunnyTaskTelemetry, req, callOptions);
+        },
         listAgents(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listAgents, req, callOptions);
         },
@@ -722,6 +773,12 @@ export function createDesktopServiceClient(options) {
         replaceRootSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.replaceRootSession, req, callOptions);
         },
+        getArtifactSpaceContext(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getArtifactSpaceContext, req, callOptions);
+        },
+        writeArtifactSpaceContext(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.writeArtifactSpaceContext, req, callOptions);
+        },
         listSessions(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listSessions, req, callOptions);
         },
@@ -794,6 +851,9 @@ export function createDesktopServiceClient(options) {
         getSessionSourceDetail(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSessionSourceDetail, req, callOptions);
         },
+        getSessionToolCallResult(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSessionToolCallResult, req, callOptions);
+        },
         getSessionForkOptions(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSessionForkOptions, req, callOptions);
         },
@@ -865,6 +925,24 @@ export function createDesktopServiceClient(options) {
         },
         reapplyTurnDiff(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.reapplyTurnDiff, req, callOptions);
+        },
+        listArtifacts(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listArtifacts, req, callOptions);
+        },
+        getArtifactSpace(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getArtifactSpace, req, callOptions);
+        },
+        linkArtifactSpaceSession(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.linkArtifactSpaceSession, req, callOptions);
+        },
+        saveArtifactSpace(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.saveArtifactSpace, req, callOptions);
+        },
+        deleteArtifactSpace(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deleteArtifactSpace, req, callOptions);
+        },
+        importArtifact(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.importArtifact, req, callOptions);
         },
         listSessionFiles(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listSessionFiles, req, callOptions);
@@ -1027,6 +1105,18 @@ export function createDesktopServiceClient(options) {
         },
         saveWorkspaceFile(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.saveWorkspaceFile, req, callOptions);
+        },
+        beginWorkspaceFileUpload(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.beginWorkspaceFileUpload, req, callOptions);
+        },
+        appendWorkspaceFileUpload(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.appendWorkspaceFileUpload, req, callOptions);
+        },
+        commitWorkspaceFileUpload(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.commitWorkspaceFileUpload, req, callOptions);
+        },
+        abortWorkspaceFileUpload(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.abortWorkspaceFileUpload, req, callOptions);
         },
         searchWorkspaceFiles(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.searchWorkspaceFiles, req, callOptions);
@@ -1234,6 +1324,9 @@ export function createDesktopServiceClient(options) {
         },
         getSidebarSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSidebarSession, req, callOptions);
+        },
+        ensureMiniAppHostSession(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ensureMiniAppHostSession, req, callOptions);
         },
         suggestMiniAppCreationIdeas(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.suggestMiniAppCreationIdeas, req, callOptions);

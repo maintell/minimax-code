@@ -1,4 +1,5 @@
 import { isRecord, readCompactionLifecycleMetadata } from './context-compaction.js';
+import { readSegmentCheckpointPlan } from './segment-checkpoint-plan.js';
 export function readCompactionCommitMetadata(value) {
     const lifecycle = readCompactionLifecycleMetadata(value);
     if (!lifecycle || !isRecord(value))
@@ -9,7 +10,44 @@ export function readCompactionCommitMetadata(value) {
     const tail = readOptionalCurrentUserTail(value, lifecycle);
     if (tail === null)
         return undefined;
+    if (lifecycle.method === 'llm_segment_checkpoint') {
+        return readSegmentCommitMetadata(value, lifecycle, summary, tail);
+    }
     return readCheckpointCommitMetadata(lifecycle, summary, tail);
+}
+/**
+ * A segment plan names every kept record. When runner placement moved the
+ * current user behind hidden markers, the markers become new host records and
+ * the current user keeps its source index at the tail of the plan.
+ */
+function readSegmentCommitMetadata(value, lifecycle, summary, tail) {
+    const sourceCount = tail === undefined
+        ? lifecycle.messagesAfter
+        : lifecycle.messagesAfter - 1 - tail.placedMarkerCount;
+    if (sourceCount < 1)
+        return undefined;
+    const base = readSegmentCheckpointPlan(value, sourceCount);
+    if (!base)
+        return undefined;
+    if (tail !== undefined && base.sourceIndexes.includes(tail.currentUserSourceIndex)) {
+        return undefined;
+    }
+    const segment = tail === undefined
+        ? base
+        : Object.freeze({
+            ...base,
+            sourceIndexes: Object.freeze([
+                ...base.sourceIndexes,
+                ...Array.from({ length: tail.placedMarkerCount }, () => null),
+                tail.currentUserSourceIndex,
+            ]),
+        });
+    return Object.freeze({
+        compactionId: lifecycle.compactionId,
+        method: 'llm_segment_checkpoint',
+        summary,
+        segment,
+    });
 }
 function readCheckpointCommitMetadata(lifecycle, summary, tail) {
     // Native summary, optional owned mode, then the exact markers + external user tail.

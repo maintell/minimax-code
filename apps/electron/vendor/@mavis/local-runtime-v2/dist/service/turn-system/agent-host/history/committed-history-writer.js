@@ -1,7 +1,8 @@
 import { observeCompactionBestEffort, readCompactionAttemptId, readCompactionLifecycleMetadata, } from '../compaction/context-compaction.js';
+import { endToolSearchWindow, forgetToolSearchAnnouncements } from '../tools/tool-search.js';
 import { AgentHostDependencyUnavailableError } from '../empty-dependencies.js';
 import { SemanticReplayRegistry } from '../events/semantic-replay-registry.js';
-import { resetPtcPrefixBaseline } from '../runner/policy/ptc-prefix-fingerprint.js';
+import { resetPtcPrefixBaseline } from '../runner/observability/ptc-prefix-fingerprint.js';
 import { captureSemanticSnapshot, estimateSemanticValueSize } from './semantic-identity.js';
 const DEFAULT_COMMITTED_HISTORY_REPLAYS = 2_048;
 const DEFAULT_COMMITTED_HISTORY_REPLAY_BYTES = 64 * 1_024 * 1_024;
@@ -13,6 +14,27 @@ class AgentCommittedHistoryIdentityError extends Error {
         super(`Committed history ${reason}: "${operationId}".`);
         this.reason = reason;
         this.operationId = operationId;
+    }
+}
+/**
+ * The history refused a segment plan before writing anything, because the
+ * segment or its covered prefix changed since the plan was made.
+ */
+export class SegmentPlanRefusedError extends Error {
+    name = 'SegmentPlanRefusedError';
+    constructor(cause) {
+        super(cause instanceof Error ? cause.message : String(cause), { cause });
+    }
+}
+/**
+ * A hidden segment rebuild whose write failed and left the history as it was:
+ * the rebuild was not made. The failure is the rebuild's own, not the
+ * Session's history, so the Turn's later records and events still commit.
+ */
+export class UnmadeSegmentRebuildError extends Error {
+    name = 'UnmadeSegmentRebuildError';
+    constructor(cause) {
+        super(cause instanceof Error ? cause.message : String(cause), { cause });
     }
 }
 /**
@@ -83,6 +105,7 @@ export class AgentHostCommittedHistoryWriter {
                     ...(options.onDurableCommitted
                         ? { onDurableCommitted: options.onDurableCommitted }
                         : {}),
+                    ...(options.baseIdentity ? { baseIdentity: options.baseIdentity } : {}),
                 }),
                 conflict: () => new AgentCommittedHistoryIdentityError('conflict', operationId),
                 handleConflict: (error) => this.failCommit({
@@ -147,7 +170,29 @@ export class AgentHostCommittedHistoryWriter {
             return delivered;
         }
         catch (error) {
-            return this.failCommit({ context, change, error, metadata, compaction });
+            const unmade = (await this.leftUnchanged(plan, error)) ? { unmade: true } : {};
+            return this.failCommit({ context, change, error, metadata, compaction, ...unmade });
+        }
+    }
+    /**
+     * A hidden segment rebuild that wrote nothing: the history refused its plan
+     * (another change came first), or failed with the history still at its base.
+     */
+    async leftUnchanged(plan, error) {
+        if (plan.metadata?.hidden !== true)
+            return false;
+        if (error instanceof SegmentPlanRefusedError)
+            return true;
+        const base = plan.baseIdentity;
+        if (!base)
+            return false;
+        try {
+            const settled = await this.readSettled(plan.context.sessionId);
+            const identity = settled.identityVector ?? [];
+            return identity.length === base.length && identity.every((id, index) => id === base[index]);
+        }
+        catch {
+            return false;
         }
     }
     async commitTurnMutationSnapshot(plan) {
@@ -196,7 +241,7 @@ export class AgentHostCommittedHistoryWriter {
         }
         return this.dependencies.history.replace(change);
     }
-    commitCanonicalTurnMutation(mutation) {
+    async commitCanonicalTurnMutation(mutation) {
         if (mutation.kind === 'settle-turn-tail') {
             if (!this.dependencies.history.settleTurnTail) {
                 throw new AgentHostDependencyUnavailableError('history-settle-turn-tail');
@@ -206,7 +251,10 @@ export class AgentHostCommittedHistoryWriter {
         if (!this.dependencies.history.retractTurn) {
             throw new AgentHostDependencyUnavailableError('history-retract-turn');
         }
-        return this.dependencies.history.retractTurn(mutation);
+        const commit = await this.dependencies.history.retractTurn(mutation);
+        // The retracted user message may have carried a Tool Search notice: state it all again.
+        forgetToolSearchAnnouncements(mutation.sessionId);
+        return commit;
     }
     observeUsage(context, change) {
         const usage = this.dependencies.usage;
@@ -242,6 +290,8 @@ export class AgentHostCommittedHistoryWriter {
             return;
         // The replacement history is durable: the next Turn may assemble a new prefix.
         resetPtcPrefixBaseline(context.sessionId);
+        // Same point for the Tool Search prefix window, so the next Turn plans afresh.
+        endToolSearchWindow(context.sessionId);
         await compaction.lifecycle.completeCommittedHistory({
             context,
             attemptId: metadata.attemptId,
@@ -263,13 +313,15 @@ export class AgentHostCommittedHistoryWriter {
         });
     }
     async failCommit(plan) {
-        const { context, change, error, metadata, compaction } = plan;
+        const { context, change, error, metadata, compaction, unmade } = plan;
         const failures = [...flattenFailure(error)];
-        await appendCapturedFailure(failures, () => this.dependencies.historyFailure?.fail({
-            sessionId: context.sessionId,
-            turnId: context.turnId,
-            ...(change.metadata === undefined ? {} : { metadata: change.metadata }),
-        }));
+        if (!unmade) {
+            await appendCapturedFailure(failures, () => this.dependencies.historyFailure?.fail({
+                sessionId: context.sessionId,
+                turnId: context.turnId,
+                ...(change.metadata === undefined ? {} : { metadata: change.metadata }),
+            }));
+        }
         if (metadata && compaction) {
             await appendCapturedFailure(failures, () => compaction.lifecycle.failCommittedHistory({
                 context,
@@ -284,6 +336,9 @@ export class AgentHostCommittedHistoryWriter {
                 compactionId: metadata.compactionId,
                 ...(metadata.tokenUsage === undefined ? {} : { tokenUsage: metadata.tokenUsage }),
             });
+        }
+        if (unmade && failures.length === flattenFailure(error).length) {
+            throw new UnmadeSegmentRebuildError(error);
         }
         throwFailures(failures, 'Committed history mutation failed.');
     }

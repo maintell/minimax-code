@@ -1,4 +1,7 @@
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
+import { isUserAuthoredSource, isUserAuthoredTurnSource, } from '../agent-host/canonical-user-input.js';
+import { resolveInputWakeReason } from '../agent-host/preparation/turn-wake-reasons.js';
+export { isUserAuthoredSource, isUserAuthoredTurnSource };
 /** Resolves exact user-query authorship before execution and display diverge. */
 export function resolveGenuineUserQueryText(input) {
     if (input.provenance.source === 'background-task')
@@ -10,11 +13,26 @@ export function resolveGenuineUserQueryText(input) {
         return '';
     return isUserAuthoredSource(input.provenance.source) ? input.input.text : '';
 }
-export function isUserAuthoredSource(source) {
-    return (source === 'api' ||
-        source === 'code_review' ||
-        source === 'channel' ||
-        source.startsWith('channel:'));
+/**
+ * Who authored a delivered message, by its producer (source plus origin):
+ * `typed` is what the person wrote, `questionnaire_answer` an AskUser answer
+ * (also after a closed Turn requeued it with the `api` source), and `system`
+ * everything else, including note hand-offs (`api` with a note origin),
+ * assignment reports and hand-offs. Spec 12.4 keeps typed messages and
+ * answers as the user's own words and nothing else.
+ */
+export function resolveMessageAuthorship(input) {
+    const reason = resolveInputWakeReason({
+        provenance: {
+            source: input.source,
+            ...(input.origin !== undefined ? { sourceContext: { origin: input.origin } } : {}),
+        },
+    });
+    if (reason === 'user_answer')
+        return 'questionnaire_answer';
+    if (reason !== undefined && reason !== 'user')
+        return 'system';
+    return isUserAuthoredSource(input.source) ? 'typed' : 'system';
 }
 /** Identifies queued user work that must preempt an autonomous Goal continuation. */
 export function hasPriorityUserQueueItem(items) {

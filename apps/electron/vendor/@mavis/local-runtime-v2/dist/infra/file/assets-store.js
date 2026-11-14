@@ -60,6 +60,37 @@ export class LocalAssetManifestDiagnosticSource {
         ];
     }
 }
+/**
+ * O(1) check whether `filePath` resolves to a valid registered file inside
+ * `<dataDir>/v2/assets`, returning its sidecar metadata without walking the
+ * asset store. Ordinary workspace paths return `undefined`.
+ */
+export function inspectRegisteredV2Asset(input) {
+    const expanded = expandHomePath(input.filePath.trim());
+    if (!expanded || !isV2AssetPath(input.dataDir, expanded))
+        return undefined;
+    try {
+        const assetPath = realpathSync(expanded);
+        const sidecarPath = `${assetPath}.asset.json`;
+        const sidecarInfo = lstatSync(sidecarPath);
+        if (sidecarInfo.isSymbolicLink() || !sidecarInfo.isFile())
+            return undefined;
+        const [record] = readAssetSidecar(sidecarPath);
+        if (!record || !isRegisteredV2AssetPath(input.dataDir, assetPath, record.assetId)) {
+            return undefined;
+        }
+        return {
+            assetId: record.assetId,
+            filePath: assetPath,
+            fileName: record.fileName,
+            mimeType: record.mimeType,
+            kind: record.kind,
+        };
+    }
+    catch {
+        return undefined;
+    }
+}
 /** Resolve one immutable v2 asset only when its sidecar owns the exact Session. */
 export async function resolveSessionLocalAsset(input) {
     const assetId = input.assetId.trim();

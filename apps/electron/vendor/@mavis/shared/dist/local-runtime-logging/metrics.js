@@ -1,6 +1,14 @@
 import { MetricsClient, createDesktopReporter, } from '../metrics-proxy.js';
 const SERVICE_NAME = 'local_runtime';
 const SERVER_APPLIED_PREFIX = 'local_runtime_';
+/**
+ * Delivery of the Desktop clients (the local runtime and the Electron main
+ * process): failed sends back off and carry their counts over, and drops are
+ * counted in metrics_client_dropped_points_total. See MetricsDelivery.
+ */
+export const DESKTOP_METRICS_DELIVERY = Object.freeze({
+    mode: 'carry_over',
+});
 class NoopMetricsReporter {
     async reportBatch() {
         return { accepted: 0 };
@@ -30,6 +38,7 @@ export function createLocalRuntimeMetricsClient(options) {
         ...(options.histogramBucketsByName
             ? { histogramBucketsByName: options.histogramBucketsByName }
             : {}),
+        ...(options.delivery ? { delivery: options.delivery } : {}),
         ...(options.onError ? { onError: options.onError } : {}),
         ...(options.now ? { now: options.now } : {}),
     });
@@ -72,4 +81,5 @@ export async function timeRouteDuration(metrics, name, run) {
         throw err;
     }
 }
+export { LONG_TAIL_HISTOGRAM_BOUNDS, createBusyTimeAccumulator, incrementMetric, observeMetric, registeredHistogramBucketsByName, } from './metric-registry.js';
 //# sourceMappingURL=metrics.js.map

@@ -1,6 +1,8 @@
 import { logger } from '@mavis/shared/local-runtime-logging';
 import { checkConsolidationWindow } from './consolidation-window.js';
 import { GLOBAL_SCOPE_KEY } from '../contracts.js';
+import { dropRequestLineEdit } from './artifact-edit.js';
+import { editSummaryAndBaseline } from './memory-files.js';
 import { computeOutputDigest, renderRulesMirror, renderSessionMirror } from './session-doc.js';
 export class MemoryReconciler {
     deps;
@@ -248,8 +250,10 @@ export class MemoryReconciler {
         const notes = await this.deps.repository.listAdHocNotes(scopeKey);
         const noteNames = new Set(notes.map((note) => `${note.sessionId}.md`));
         for (const filename of await this.deps.fileStore.listAdHocNoteFiles(scopeKey)) {
-            if (!noteNames.has(filename))
-                await this.deps.fileStore.deleteAdHocNoteMirror(scopeKey, filename);
+            if (noteNames.has(filename))
+                continue;
+            await this.deps.fileStore.deleteAdHocNoteMirror(scopeKey, filename);
+            await this.dropOrphanRequestLines(scopeKey, filename.replace(/\.md$/u, ''));
         }
         for (const note of notes) {
             const mirror = renderSessionMirror(note, note.content ?? '');
@@ -262,6 +266,24 @@ export class MemoryReconciler {
         }
         for (const state of states) {
             await this.rematerializeOne(scopeKey, state);
+        }
+    }
+    /**
+     * 孤儿 note 镜像（DB 已无该 note，治理删镜像前中断）连带撤掉摘要里的请求行，与
+     * GovernanceService 删除 note 镜像时一致(§5.18)。失败只留痕，留下的行由整理按规则 12 删除。
+     */
+    async dropOrphanRequestLines(scopeKey, noteSessionId) {
+        try {
+            const outcome = await editSummaryAndBaseline(this.deps, scopeKey, (markdown) => dropRequestLineEdit(markdown, noteSessionId));
+            if (outcome.status !== 'ok')
+                logger.warn({
+                    noteSessionId,
+                    outcome: outcome.status,
+                    reason: 'reason' in outcome ? outcome.reason : undefined,
+                }, '[memory-v2] orphan note request line cleanup incomplete');
+        }
+        catch (error) {
+            logger.warn({ noteSessionId, error: String(error) }, '[memory-v2] orphan note request line cleanup failed');
         }
     }
     async rematerializeOne(scopeKey, state) {
@@ -576,6 +598,15 @@ export class MemoryReconciler {
                     this.deferConsolidation(scopeKey, result.reason);
                 else
                     this.consolidationFailures.delete(scopeKey);
+                if (result.status === 'skipped') {
+                    // 窗口不足是环境事实而非本轮失败：不进失败退避，只发诊断事件与 warn，下一次唤醒再试。
+                    this.event('consolidation.skipped', {
+                        scopeKey,
+                        reason: result.reason,
+                        contextWindow: result.contextWindow,
+                    });
+                    logger.warn({ scopeKey, reason: result.reason, contextWindow: result.contextWindow }, '[memory-v2] consolidation skipped: model context window too small');
+                }
             }
             catch (error) {
                 this.deferConsolidation(scopeKey, error);

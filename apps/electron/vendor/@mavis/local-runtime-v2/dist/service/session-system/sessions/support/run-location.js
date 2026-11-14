@@ -1,10 +1,13 @@
-import { execFile as execFileCallback } from 'node:child_process';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { excludeManagedWorktrees } from '../../../../infra/git/worktree-exclude.js';
+import { createWorktreeCreationProgressTracker, } from './worktree-creation-progress.js';
 const execFile = promisify(execFileCallback);
+const UPSTREAM_FETCH_TIMEOUT_MS = 60_000;
 export class LocalRunLocationError extends Error {
     code;
     constructor(message, code) {
@@ -28,7 +31,7 @@ export function readLocalRunLocationInput(value) {
         ...optionalField(value, 'newWorktreeBase'),
     };
 }
-export async function applyLocalRunLocation(input, workspaceDir, nowMs, refreshBeforeCreate = true) {
+export async function applyLocalRunLocation(input, workspaceDir, nowMs, options = {}) {
     const createdAt = nowMs();
     if (input.mode === 'current') {
         await checkoutOptionalBranch(input.branch, workspaceDir);
@@ -40,28 +43,43 @@ export async function applyLocalRunLocation(input, workspaceDir, nowMs, refreshB
         };
     }
     if (input.mode === 'new-worktree') {
-        return createNewWorktree(input, workspaceDir, createdAt, refreshBeforeCreate);
+        return createNewWorktree(input, workspaceDir, createdAt, options);
     }
     return resolveExistingWorktree(input, workspaceDir, createdAt);
 }
-async function createNewWorktree(input, workspaceDir, createdAt, refreshBeforeCreate) {
+async function createNewWorktree(input, workspaceDir, createdAt, options) {
     const branch = input.newWorktreeBranch ?? input.branch ?? generateDefaultWorktreeBranch(createdAt);
-    await assertSafeBranchName(branch, workspaceDir);
-    const baseSha = await resolveWorktreeBase(input.newWorktreeBase ?? 'HEAD', workspaceDir, refreshBeforeCreate);
-    const worktreeParentDir = await resolveSafeWorktreeParent(workspaceDir);
-    const targetDir = join(worktreeParentDir, branch.replaceAll('/', '-'));
-    await createPinnedBranch(branch, input.newWorktreeBase ?? 'HEAD', baseSha, workspaceDir);
-    const result = await git(['worktree', 'add', targetDir, branch], workspaceDir);
-    if (result.code !== 0) {
-        throw new LocalRunLocationError(`git worktree add failed: ${result.stderr || result.stdout}`, 'RUN_LOCATION_WORKTREE_ADD_FAILED');
+    const progress = createWorktreeCreationProgressTracker({
+        workspace: workspaceDir,
+        branch,
+        sink: options.onWorktreeProgress,
+    });
+    try {
+        await assertSafeBranchName(branch, workspaceDir);
+        const baseSha = await resolveWorktreeBase(input.newWorktreeBase ?? 'HEAD', workspaceDir, options.refreshBeforeCreate ?? true, progress);
+        const worktreeParentDir = await resolveSafeWorktreeParent(workspaceDir);
+        const targetDir = join(worktreeParentDir, branch.replaceAll('/', '-'));
+        progress.beginCheckout();
+        await createPinnedBranch(branch, input.newWorktreeBase ?? 'HEAD', baseSha, workspaceDir);
+        const result = await gitStreaming(['worktree', 'add', targetDir, branch], workspaceDir, {
+            onOutput: (text) => progress.checkoutOutput(text),
+        });
+        if (result.code !== 0) {
+            throw new LocalRunLocationError(`git worktree add failed: ${summarizeGitOutput(result.stderr) || summarizeGitOutput(result.stdout)}`, 'RUN_LOCATION_WORKTREE_ADD_FAILED');
+        }
+        progress.complete(targetDir);
+        return {
+            mode: 'new-worktree',
+            resolvedDir: targetDir,
+            resolvedBranch: branch,
+            parentRepoDir: workspaceDir,
+            createdAt,
+        };
     }
-    return {
-        mode: 'new-worktree',
-        resolvedDir: targetDir,
-        resolvedBranch: branch,
-        parentRepoDir: workspaceDir,
-        createdAt,
-    };
+    catch (error) {
+        progress.fail(error instanceof Error ? error.message : String(error));
+        throw error;
+    }
 }
 async function createPinnedBranch(branch, baseRef, baseSha, cwd) {
     // Let Git apply autoSetupMerge/autoSetupRebase to the selected reference before
@@ -111,6 +129,7 @@ async function resolveSafeWorktreeParent(workspaceDir) {
     const workspaceReal = await realpath(workspaceDir);
     const parent = join(workspaceDir, '.worktrees');
     await mkdir(parent, { recursive: true });
+    await excludeManagedWorktrees(workspaceDir);
     const parentReal = await realpath(parent);
     const pathFromParent = relative(resolve(workspaceReal), resolve(parentReal));
     if (pathFromParent.startsWith('..') || isAbsolute(pathFromParent)) {
@@ -124,9 +143,9 @@ function assertSafeBaseRef(baseRef) {
     }
 }
 /** Resolve the selected ref once; the worktree setting owns network refresh policy. */
-async function resolveWorktreeBase(baseRef, cwd, refresh) {
+async function resolveWorktreeBase(baseRef, cwd, refresh, progress) {
     assertSafeBaseRef(baseRef);
-    const ref = refresh ? await resolvePreferredRef(baseRef, cwd) : baseRef;
+    const ref = refresh ? await resolvePreferredRef(baseRef, cwd, progress) : baseRef;
     const result = await git(['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], cwd);
     const sha = result.stdout.trim();
     if (result.code !== 0 || !/^[0-9a-f]{40,64}$/.test(sha)) {
@@ -134,7 +153,7 @@ async function resolveWorktreeBase(baseRef, cwd, refresh) {
     }
     return sha;
 }
-async function resolvePreferredRef(baseRef, cwd) {
+async function resolvePreferredRef(baseRef, cwd, progress) {
     const result = await git(['remote'], cwd);
     if (result.code !== 0) {
         throw new LocalRunLocationError(result.stderr, 'RUN_LOCATION_INVALID_BASE');
@@ -151,18 +170,18 @@ async function resolvePreferredRef(baseRef, cwd) {
             ? await git(['symbolic-ref', '--quiet', '--short', 'HEAD'], cwd)
             : { stdout: localName };
         const branch = branchResult.stdout.trim();
-        return branch ? resolveBranchUpstream(branch, cwd) : baseRef;
+        return branch ? resolveBranchUpstream(branch, cwd, progress) : baseRef;
     }
     const shortRef = baseRef.replace(/^refs\/remotes\//, '');
     const remote = remotes.find((name) => shortRef.startsWith(`${name}/`));
     if (remote)
-        return fetchBaseRef(remote, shortRef.slice(remote.length + 1), cwd);
+        return fetchBaseRef(remote, shortRef.slice(remote.length + 1), cwd, progress);
     if (baseRef.startsWith('refs/remotes/')) {
         throw new LocalRunLocationError(`Remote no longer exists for ${baseRef}`, 'RUN_LOCATION_FETCH_FAILED');
     }
     return baseRef;
 }
-async function resolveBranchUpstream(branch, cwd) {
+async function resolveBranchUpstream(branch, cwd, progress) {
     const [remoteConfig, mergeConfig] = await Promise.all([
         git(['config', '--get', `branch.${branch}.remote`], cwd),
         git(['config', '--get', `branch.${branch}.merge`], cwd),
@@ -172,7 +191,7 @@ async function resolveBranchUpstream(branch, cwd) {
     if (remote === '.' && mergeRef)
         return mergeRef;
     if (remote && mergeRef.startsWith('refs/heads/')) {
-        return fetchBaseRef(remote, mergeRef.slice('refs/heads/'.length), cwd);
+        return fetchBaseRef(remote, mergeRef.slice('refs/heads/'.length), cwd, progress);
     }
     return `refs/heads/${branch}`;
 }
@@ -187,24 +206,28 @@ async function resolveRemoteBranch(remote, branch, cwd) {
     }
     return target.slice(prefix.length);
 }
-async function fetchBaseRef(remote, branch, cwd, timeoutMs = 60_000) {
+async function fetchBaseRef(remote, branch, cwd, progress) {
     const resolvedBranch = await resolveRemoteBranch(remote, branch, cwd);
     const ref = `refs/remotes/${remote}/${resolvedBranch}`;
     const validRef = await git(['check-ref-format', ref], cwd);
     if (!remote || remote.startsWith('-') || !resolvedBranch || validRef.code !== 0) {
         throw new LocalRunLocationError(`Invalid remote base "${remote}/${resolvedBranch}"`, 'RUN_LOCATION_INVALID_BASE');
     }
-    const result = await git([
+    progress.beginFetch(`${remote}/${resolvedBranch}`);
+    // `--progress` keeps Git's transfer meter on the pipe so the UI can show it.
+    const result = await gitStreaming([
         'fetch',
+        '--progress',
         '--no-tags',
         '--no-recurse-submodules',
         '--',
         remote,
         `+refs/heads/${resolvedBranch}:${ref}`,
-    ], cwd, timeoutMs);
+    ], cwd, { timeoutMs: UPSTREAM_FETCH_TIMEOUT_MS, onOutput: (text) => progress.fetchOutput(text) });
     if (result.code !== 0) {
-        throw new LocalRunLocationError(`Failed to fetch latest ${remote}/${resolvedBranch}. Retry or turn off upstream refresh in Worktree settings: ${result.stderr || result.stdout}`, 'RUN_LOCATION_FETCH_FAILED');
+        throw new LocalRunLocationError(`Failed to fetch latest ${remote}/${resolvedBranch}. Retry or turn off upstream refresh in Worktree settings: ${summarizeGitOutput(result.stderr) || summarizeGitOutput(result.stdout)}`, 'RUN_LOCATION_FETCH_FAILED');
     }
+    progress.endFetch();
     return ref;
 }
 async function assertSafeBranchName(branch, cwd) {
@@ -216,13 +239,12 @@ async function assertSafeBranchName(branch, cwd) {
         throw new LocalRunLocationError(`Invalid git branch name "${branch}": ${result.stderr || result.stdout}`, 'RUN_LOCATION_INVALID_BRANCH');
     }
 }
-async function git(args, cwd, timeoutMs) {
+async function git(args, cwd) {
     try {
         const result = await execFile('git', args, {
             cwd,
             encoding: 'utf-8',
             env: { ...gitEnv(), GIT_TERMINAL_PROMPT: '0' },
-            ...(timeoutMs ? { timeout: timeoutMs } : {}),
         });
         return { code: 0, stdout: String(result.stdout ?? ''), stderr: String(result.stderr ?? '') };
     }
@@ -234,6 +256,84 @@ async function git(args, cwd, timeoutMs) {
             stderr: bufferToString(failure.stderr) || failure.message,
         };
     }
+}
+/** Bounded capture for the error text; live output goes to `onOutput` as it arrives. */
+const MAX_CAPTURED_GIT_OUTPUT = 256 * 1024;
+/**
+ * Runs a long Git command with its output streamed to `onOutput`, so callers can
+ * surface Git's progress meter while the command is still running.
+ */
+function gitStreaming(args, cwd, options = {}) {
+    return new Promise((resolveResult) => {
+        let stdout = '';
+        let stderr = '';
+        let settled = false;
+        let timedOut = false;
+        const stdoutDecoder = new TextDecoder();
+        const stderrDecoder = new TextDecoder();
+        const child = spawn('git', [...args], {
+            cwd,
+            env: { ...gitEnv(), GIT_TERMINAL_PROMPT: '0' },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+        });
+        const timer = options.timeoutMs === undefined
+            ? undefined
+            : setTimeout(() => {
+                timedOut = true;
+                child.kill();
+            }, options.timeoutMs);
+        timer?.unref?.();
+        const forward = (text) => {
+            if (!text)
+                return;
+            try {
+                options.onOutput?.(text);
+            }
+            catch {
+                // Progress observers never change the command outcome.
+            }
+        };
+        child.stdout.on('data', (chunk) => {
+            const text = stdoutDecoder.decode(chunk, { stream: true });
+            stdout = keepTail(stdout + text);
+            forward(text);
+        });
+        child.stderr.on('data', (chunk) => {
+            const text = stderrDecoder.decode(chunk, { stream: true });
+            stderr = keepTail(stderr + text);
+            forward(text);
+        });
+        const settle = (code, failure) => {
+            if (settled)
+                return;
+            settled = true;
+            if (timer)
+                clearTimeout(timer);
+            stdout = keepTail(stdout + stdoutDecoder.decode());
+            stderr = keepTail(stderr + stderrDecoder.decode());
+            if (timedOut)
+                stderr = `${stderr}\ngit ${args[0]} timed out after ${options.timeoutMs}ms`;
+            else if (failure && !stderr.trim())
+                stderr = failure;
+            resolveResult({ code, stdout, stderr });
+        };
+        child.once('error', (error) => settle(1, error.message));
+        child.once('close', (code, signal) => settle(code ?? 1, signal ? `git ${args[0]} terminated by ${signal}` : undefined));
+    });
+}
+function keepTail(text) {
+    return text.length > MAX_CAPTURED_GIT_OUTPUT ? text.slice(-MAX_CAPTURED_GIT_OUTPUT) : text;
+}
+/** Meter titles are translated; the `: NN% (done/total)` shape is not. */
+const GIT_PROGRESS_LINE = /^(?:remote:\s*)?[^:]+:\s+\d{1,3}% \(\d+\/\d+\)/u;
+/** Error text without the transfer/checkout meter lines `--progress` adds. */
+function summarizeGitOutput(output) {
+    return output
+        .split(/\r\n|\r|\n/u)
+        .map((line) => line.trimEnd())
+        .filter((line) => line && !GIT_PROGRESS_LINE.test(line))
+        .join('\n');
 }
 function gitEnv() {
     return Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));

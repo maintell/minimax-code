@@ -197,14 +197,21 @@ export function convertTools(tools, isOAuthToken, supportsEagerToolInputStreamin
             name: isOAuthToken ? toReferenceToolName(tool.name) : tool.name,
             description: tool.description,
             ...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
+            // Same shape as pi-ai's Messages request body, so the count matches what is sent.
             input_schema: {
                 type: 'object',
                 properties: schema.properties ?? {},
                 required: schema.required ?? [],
+                // Must match pi-ai's convertTools guard: the request omits non-object maps, so the count must too.
+                ...(isDefinitionMap(schema.$defs) ? { $defs: schema.$defs } : {}),
+                ...(isDefinitionMap(schema.definitions) ? { definitions: schema.definitions } : {}),
             },
             ...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
         };
     });
+}
+function isDefinitionMap(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 function transformAssistantMessage(message, model, normalizeToolCallIdFn, toolCallIdMap) {
     const isSameModel = message.provider === model.provider && message.api === model.api && message.model === model.id;
@@ -263,6 +270,8 @@ function transformMessages(messages, model, normalizeToolCallIdFn) {
     const result = [];
     let pendingToolCalls = [];
     let existingToolResultIds = new Set();
+    // Same as pi-ai transformMessages: a skipped assistant's tool results are skipped too.
+    const skippedToolCallIds = new Set();
     const insertSyntheticToolResults = () => {
         if (pendingToolCalls.length === 0)
             return;
@@ -285,9 +294,16 @@ function transformMessages(messages, model, normalizeToolCallIdFn) {
         if (msg.role === 'assistant') {
             insertSyntheticToolResults();
             const assistantMsg = msg;
-            if (assistantMsg.stopReason === 'error' || assistantMsg.stopReason === 'aborted')
-                continue;
             const toolCalls = assistantMsg.content.filter((block) => block.type === 'toolCall');
+            if (isSkippedReply(assistantMsg)) {
+                toolCalls.forEach((toolCall) => {
+                    skippedToolCallIds.add(toolCall.id);
+                });
+                continue;
+            }
+            toolCalls.forEach((toolCall) => {
+                skippedToolCallIds.delete(toolCall.id);
+            });
             if (toolCalls.length > 0) {
                 pendingToolCalls = toolCalls;
                 existingToolResultIds = new Set();
@@ -295,6 +311,8 @@ function transformMessages(messages, model, normalizeToolCallIdFn) {
             result.push(msg);
         }
         else if (msg.role === 'toolResult') {
+            if (skippedToolCallIds.has(msg.toolCallId))
+                continue;
             existingToolResultIds.add(msg.toolCallId);
             result.push(msg);
         }
@@ -308,6 +326,10 @@ function transformMessages(messages, model, normalizeToolCallIdFn) {
     }
     insertSyntheticToolResults();
     return result;
+}
+/** Replies that requests leave out: they ended in an error or were aborted mid-stream. */
+function isSkippedReply(message) {
+    return message.stopReason === 'error' || message.stopReason === 'aborted';
 }
 function downgradeUnsupportedImages(messages, model) {
     if (model.input.includes('image'))

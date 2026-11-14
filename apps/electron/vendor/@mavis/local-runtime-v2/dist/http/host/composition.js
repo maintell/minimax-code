@@ -1,4 +1,4 @@
-import { currentBetaResolutionContext, resolveBetaFeature } from '@mavis/config';
+import { resolveEffectivePtc } from '@mavis/config';
 import { closeAgentDb } from '../../infra/legacy-db/agent-db.js';
 import { createLocalWorkspaceGitFacade, listFileTree, searchFiles, scanWorkspace, ManagedWorktreeService, } from '../../service/workspace/index.js';
 import { resolveTaskTarget } from '../../service/agent/index.js';
@@ -9,8 +9,9 @@ import { withAgentNameConflictMigrationScope } from '../../infra/legacy-db/agent
 import { discardLocalAssetRegistrations, registerLocalAsset, registerMessageAttachments, resolveSessionLocalAsset, } from '../../infra/file/assets-store.js';
 import { loadUserImages } from '../../infra/conversation/user-media.js';
 import { SqliteQuestionnaireRequestStore } from '../../infra/legacy-db/questionnaire-request-store.js';
-import { backgroundTaskNotificationReceiptId, } from '@mavis/agent-tools/desktop';
+import {} from '@mavis/agent-tools/desktop';
 import { listAllV1BackgroundTasks } from './goal-background-tasks.js';
+import { createBackgroundTaskNotificationProjection, } from './background-task-notifications.js';
 import { createV1WorkspaceLocalActionsPort, createV1WorkspaceIndexingWorker, } from './workspace-local-actions.js';
 import {} from './initialize.js';
 import { updateLocalConfigFile } from '../../infra/config/update.js';
@@ -89,59 +90,6 @@ export function withAgentStorageScope(dataDir, operation) {
 function buildChannelWireCompatibility(api) {
     return api.runtimeConversation ? { channelWire: () => api.buildChannelWireInput() } : {};
 }
-const TERMINAL_BACKGROUND_TASK_STATUSES = new Set(['succeeded', 'failed', 'canceled', 'lost']);
-/**
- * Derives each terminal Task's notification state from durable facts only: the Task row and
- * the Turn ingress receipt its delivery bound to the admitting Turn. User-stop suppression is
- * the one process-local input, and it can only end a notification, never start one.
- */
-function createBackgroundTaskNotificationProjection(api) {
-    let receipts;
-    return {
-        bind: (next) => {
-            receipts = next;
-        },
-        annotate: async (ownerSessionId, tasks) => {
-            const terminal = tasks.filter((task) => TERMINAL_BACKGROUND_TASK_STATUSES.has(task.status));
-            if (!receipts || terminal.length === 0)
-                return tasks;
-            const receiptIds = terminal.map(({ taskId }) => backgroundTaskNotificationReceiptId(taskId));
-            let bindings;
-            try {
-                bindings = await receipts.findClientRequestBindings({
-                    sessionId: ownerSessionId,
-                    clientRequestIds: receiptIds,
-                });
-            }
-            catch (error) {
-                try {
-                    api.matrixLogger?.warn({ sessionId: ownerSessionId, turnId: 'background-task-notification' }, `Background Task notification receipts could not be read: ${String(error)}`);
-                }
-                catch {
-                    // Diagnostics are best-effort.
-                }
-                return tasks; // Unreadable ledger: state stays unknown (absent), read as settled.
-            }
-            const byReceiptId = new Map(bindings.map((binding) => [binding.clientRequestId, binding]));
-            return tasks.map((task) => {
-                if (!TERMINAL_BACKGROUND_TASK_STATUSES.has(task.status))
-                    return task;
-                const binding = byReceiptId.get(backgroundTaskNotificationReceiptId(task.taskId));
-                return { ...task, notification: backgroundTaskNotificationState(api, task, binding) };
-            });
-        },
-    };
-}
-function backgroundTaskNotificationState(api, task, binding) {
-    // Steered into a running Turn or admitted as a new one: the owner has it, however long it runs.
-    if (binding)
-        return { state: 'settled', turnId: binding.turnId };
-    // A result already read by a completed Turn, or a stop the user asked for, never wakes it.
-    if (task.deliveredAt !== undefined || api.backgroundTasks.isDeliverySuppressed(task.taskId)) {
-        return { state: 'settled' };
-    }
-    return { state: 'pending' };
-}
 /** Binds legacy Goal/session capabilities to the injected V2 background owner. */
 function buildBackgroundTaskCompatibility(api, notifications) {
     return {
@@ -196,6 +144,9 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
                 .map((session) => session.runLocation?.resolvedDir ?? session.workspaceDir);
             return {
                 ...processLocal,
+                bindAssignmentTools: (tools) => {
+                    api.assignmentTools = tools;
+                },
                 bindQuestionnaireGoalProbe: (probe) => {
                     host.apiHost.isQuestionnaireGoalActive = probe;
                 },
@@ -419,7 +370,7 @@ function toQuestionnaireRecord(record) {
  * (`createSessionToolCallModePolicy`): unset follows the build default.
  */
 function readEffectivePtc(host) {
-    return resolveBetaFeature('ptc', host.apiHost.configGetter().beta?.ptc, currentBetaResolutionContext());
+    return resolveEffectivePtc(host.apiHost.configGetter()).mode === 'ptc';
 }
 function createPeripheralApplication(host, notifications) {
     const questionnaires = new LocalQuestionnaireService(host.apiHost.questionnaireServiceDeps());

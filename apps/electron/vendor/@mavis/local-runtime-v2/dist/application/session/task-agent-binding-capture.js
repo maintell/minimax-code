@@ -1,11 +1,12 @@
-import { isMemoryV2Enabled, getRuntimePresetKey, resolveModelAvailability } from '@mavis/config';
+import { currentBetaResolutionContext, isMemoryV2Enabled, getRuntimePresetKey, resolveBetaFeature, resolveModelAvailability, } from '@mavis/config';
 import { hasConversationTaskModelSelection, } from '@mavis/conversation-contract';
 import { COMPUTER_USE_TOOL_NAMES } from '../../service/computer-use/index.js';
 import { bindPluginAgentMcpSelectors, pluginAgentSource, renderPluginAgentProfile, } from './plugin-agent-capture.js';
 import { FROZEN_MCP_SERVERS_NONE, FROZEN_SELECTOR_VERSION, FROZEN_TOOLS_ALL_SCOPE_MARKER, } from '../../service/agent/index.js';
 import { AgentModelSelectionError, canonicalSelectionModelKey, LocalModelProviderError, resolveEffectiveAgentModelSelection, modelConfigForRef, modelRefForModel, savedSessionModel, parseSourceQualifiedModelKey, } from '../../service/model-system/index.js';
 import { toLegacyTaskSessionBinding } from '../../service/session-system/index.js';
-import { filterLocalTurnCapabilityInventory, isAgentSelectorMcpToolName, resolveToolsAllowlistScope, resolveAgentPromptSurface, } from '../../service/turn-system/index.js';
+import { filterLocalTurnCapabilityInventory, isAgentSelectorMcpToolName, isLocalTurnBuiltinToolAllowed, resolveToolsAllowlistScope, resolveAgentPromptSurface, } from '../../service/turn-system/index.js';
+import { SAVE_PTC_SCRIPT_NAME } from '@mavis/agent-tools';
 /** Captures an immutable V2 Agent definition before the Session row is inserted. */
 export function createTaskAgentBindingCaptureCoordinator(options) {
     return {
@@ -56,6 +57,13 @@ async function captureDefinition(options, input, historical) {
         ...(options.diagnostics ? { diagnostics: options.diagnostics } : {}),
     });
     logTaskModelDiagnostics(options.diagnostics, selection.diagnostics);
+    // Checked before the Session row exists: a child that cannot sign in is never created.
+    if (!historical) {
+        await options.modelLoginCheck?.({
+            providerId: selection.providerId,
+            modelId: selection.modelId,
+        });
+    }
     const effectiveModel = `${selection.providerId}/${selection.modelId}`;
     const variant = resolvedModelVariant({ selection, session, parent: input.parent });
     const thinking = resolvedThinkingSelection({ selection, session, parent: input.parent });
@@ -82,7 +90,7 @@ async function freezeCapturedCapabilities(options, session, profile, pluginAgent
     return freezeSelectorCapabilities(bindPluginAgentMcpSelectors(profile, pluginAgent, bindings, inventoryToolNames), ready, 
     // Decided from the list the author wrote: rebinding may replace a Plugin's
     // `mcp__*` selectors with nothing, which must not turn it into a native list.
-    resolveToolsAllowlistScope(profile.configSelection?.tools));
+    resolveToolsAllowlistScope(profile.configSelection?.tools), ptcScriptsEnabled(options.config()));
 }
 async function renderCaptureProfile(input) {
     const { options, config, session } = input;
@@ -316,7 +324,7 @@ async function captureLegacyTaskBinding(options, input) {
                 definitionVersion: 1,
                 systemPrompt: profile.agentSystemPrompt ?? '',
                 ...(profile.promptSnapshot ? { promptSnapshot: profile.promptSnapshot } : {}),
-                capabilities: freezeSelectorCapabilities(profile, inventory),
+                capabilities: freezeSelectorCapabilities(profile, inventory, undefined, ptcScriptsEnabled(options.config())),
             },
         },
     };
@@ -584,7 +592,7 @@ function baseThinkingSelection(input) {
 function taskTargetModelSelection(profile) {
     return profile.configSelection?.model ? profile.configSelection : undefined;
 }
-function freezeSelectorCapabilities(profile, ready, authorToolsAllowlistScope) {
+function freezeSelectorCapabilities(profile, ready, authorToolsAllowlistScope, scriptsEnabled) {
     const facts = toTurnProfileFacts(profile);
     const toolsAllowlistScope = authorToolsAllowlistScope ?? resolveToolsAllowlistScope(profile.configSelection?.tools);
     const filtered = filterLocalTurnCapabilityInventory({
@@ -597,7 +605,10 @@ function freezeSelectorCapabilities(profile, ready, authorToolsAllowlistScope) {
     const deferredComputerTools = facts.trustedBuiltin && facts.canonicalRole === 'mavis' && facts.surface === 'interactive'
         ? COMPUTER_USE_TOOL_NAMES.filter((name) => filtered.selector.allowsTool(name))
         : [];
-    const tools = frozenToolNames(filtered, deferredComputerTools, toolsAllowlistScope, profile.configSelection?.tools);
+    const tools = frozenToolNames(filtered, [
+        ...deferredComputerTools,
+        ...deferredPtcScriptTools(facts, toolsAllowlistScope, scriptsEnabled),
+    ], toolsAllowlistScope, profile.configSelection?.tools);
     // Agent `skills` preloads Skills and no longer limits them. Older releases
     // still read `skills` / `extensionSkills` as an upper bound, so both keep
     // every Skill ready at capture; this release never reads them back.
@@ -648,6 +659,39 @@ function frozenMcpServerSelector(selection) {
  * same-named configured server, so only `FROZEN_TOOLS_ALL_SCOPE_MARKER` is
  * added, which matches no tool and keeps the list read as `all`.
  */
+/**
+ * `save_run_code_script` is created by PTC on top of the filtered inventory
+ * (`buildPtcCatalog`), so the ready inventory never contains it. Without this
+ * the frozen snapshot would drop it and a Task child could never save a
+ * script, even when its `tools` allowlist permits it. The same Agent rules the
+ * Turn uses decide it (`isLocalTurnBuiltinToolAllowed` runs the inventory
+ * filter, which already applies the authority, allowlist, `disallowedTools`
+ * and canonical role ceiling); Turn gates still re-check model suppression.
+ *
+ * `beta.ptcScripts` decides the rest: off means the host wired no script
+ * support at all, so no Turn of this child can offer the tool and the snapshot
+ * must not claim it either.
+ */
+function deferredPtcScriptTools(facts, toolsAllowlistScope, scriptsEnabled) {
+    if (!scriptsEnabled)
+        return [];
+    return isLocalTurnBuiltinToolAllowed(SAVE_PTC_SCRIPT_NAME, { ...facts, toolsAllowlistScope })
+        ? [SAVE_PTC_SCRIPT_NAME]
+        : [];
+}
+/**
+ * `beta.ptcScripts`, resolved exactly the way the Turn System resolves it when
+ * it decides whether to wire script support, but read here at capture time —
+ * when the child Session is created — while the host resolved it once at
+ * startup. A config change without a restart therefore leaves the two
+ * disagreeing: on→off means Tasks created afterwards cannot save scripts while
+ * the parent still can; off→on means the frozen list names a tool the host
+ * never built, which is harmless because no Turn of that child offers it. This
+ * is intentional for now; only a restart makes the host follow.
+ */
+function ptcScriptsEnabled(config) {
+    return resolveBetaFeature('ptcScripts', config.beta?.ptcScripts, currentBetaResolutionContext());
+}
 function frozenToolNames(filtered, deferredComputerTools, scope, selected) {
     const all = scope === 'all';
     const admitted = uniqueNames([
@@ -668,10 +712,12 @@ function isBuiltinRuntimeSkill(skill) {
     return skill.sourceType === 1;
 }
 function toTurnProfileFacts(profile) {
+    const trustedBuiltin = profile.creationSource === 'builtin' && profile.provenance.source !== 'custom';
     return {
         capabilityCeiling: profile.capabilityCeiling,
         ...(profile.creationSource === 'builtin' ? { canonicalRole: profile.canonicalViewName } : {}),
-        trustedBuiltin: profile.creationSource === 'builtin' && profile.provenance.source !== 'custom',
+        trustedBuiltin,
+        ...(trustedBuiltin && profile.coordination ? { coordination: profile.coordination } : {}),
         surface: profile.surface,
         ...(profile.configSelection ? { configSelection: profile.configSelection } : {}),
     };

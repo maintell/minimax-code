@@ -1,10 +1,11 @@
+import { MiniAppLaunchpadController } from './mini-app-launchpad.controller.js';
+import { BunnyController, } from './bunny.controller.js';
 import { AgentShellController } from './agent-shell.controller.js';
 import { BackgroundTaskController } from './background-task.controller.js';
 import { SkillEvolveController, } from './skill-evolve.controller.js';
 import { SandboxControllerBase } from '../generated/sandbox-controller-base.gen.js';
 import { ShareControllerBase } from '../generated/share-controller-base.gen.js';
 import { AgentShellControllerBase } from '../generated/agent-shell-controller-base.gen.js';
-import { MiniAppLaunchpadControllerBase } from '../generated/mini-app-launchpad-controller-base.gen.js';
 import { WebsiteControllerBase } from '../generated/website-controller-base.gen.js';
 import { LlmContextInspectorController } from './llm-context-inspector.controller.js';
 import { agentController, createAgentController } from './agent.controller.js';
@@ -49,9 +50,16 @@ const shareController = new ShareControllerBase();
 export function createControllers(services) {
     return {
         demo: demoController,
+        miniAppLaunchpad: new MiniAppLaunchpadController(services.miniAppLaunchpad),
+        bunny: new BunnyController({
+            bunny: services.bunny,
+            assignments: services.assignments,
+            workingState: services.workingState,
+            trace: services.bunnyTrace,
+            store: services.bunnyStoreState,
+            taskTelemetry: services.bunnyTaskTelemetry,
+        }),
         modelAccess: new ModelAccessController(services.modelAccessApplication),
-        // Contract only: v2 does not mount these routes, so v1 answers 501 until Mini App Pad lands.
-        miniAppLaunchpad: new MiniAppLaunchpadControllerBase(),
         agentShell: services.agentShell
             ? new AgentShellController(services.agentShell)
             : new AgentShellControllerBase(),
@@ -96,7 +104,13 @@ function createModelProviderAdapter(services) {
         : modelProviderController;
 }
 function createAgentAdapter(services) {
-    return services.agent ? createAgentController(services.agent) : agentController;
+    return services.agent
+        ? createAgentController(services.agent, {
+            ...(services.resolveDefaultWorkspaceDir
+                ? { resolveDefaultWorkspaceDir: services.resolveDefaultWorkspaceDir }
+                : {}),
+        })
+        : agentController;
 }
 function createPreferenceAdapter(services) {
     return new PreferenceController({

@@ -1,4 +1,5 @@
 import { dirname, join } from 'node:path';
+import { BUNNY_AGENT_NAME } from '@mavis/shared/agent-avatar';
 import { toAgentRequestRef } from '@mavis/agent-tools/desktop/subagent-roles';
 import { isPtcTurnEnabled } from '@mavis/config';
 import { BuiltinAgentCatalog, canonicalBuiltinName, resolveCanonicalCapabilities, } from '../builtin/catalog.js';
@@ -85,7 +86,23 @@ export async function resolveAgentProfileRenderContext(input, dependencies) {
         surface,
         memoryReadAgentNames,
         canonicalBuiltin,
+        // `definition` exists only for a canonical built-in owner.
+        ...builtinCoordination(definition, input.bunnyHelperAgents === true),
     };
+}
+/** The read-only sub-agents Bunny's main conversation gets when `bunny.helperAgents` is on. */
+const BUNNY_HELPER_AGENTS = Object.freeze(['explore', 'verifier']);
+/**
+ * Coordination is a bundled built-in declaration; every other owner renders without it.
+ * Bunny's bundled declaration has no helpers; the local `bunny.helperAgents` switch adds them.
+ */
+function builtinCoordination(definition, bunnyHelperAgents = false) {
+    if (!definition?.coordination)
+        return {};
+    if (bunnyHelperAgents && definition.name === BUNNY_AGENT_NAME) {
+        return { coordination: { ...definition.coordination, helperAgents: BUNNY_HELPER_AGENTS } };
+    }
+    return { coordination: definition.coordination };
 }
 export function createAgentPromptSelection(options) {
     const { promptMode, promptVersion } = options;
@@ -210,6 +227,7 @@ function toFrozenAgentExecutionProfile(input) {
             .join('\n\n'),
         surfacePrompt,
         capabilityCeiling: toCapabilityCeiling(capabilities),
+        ...builtinCoordination(builtin, request.bunnyHelperAgents === true),
         configSelection,
         provenance: frozenProfileProvenance(request, builtin, canonicalViewName),
     };
@@ -286,7 +304,8 @@ async function renderBuiltinProfile(dependencies, context) {
             throw await builtinConfigBrokenError(dependencies, name, rereadError);
         }
     }
-    const rendered = await dependencies.catalog.render(renderInput, managed.systemPrompt);
+    // Bunny's rules are application-owned, never the seeded data-directory copy.
+    const rendered = await dependencies.catalog.render(renderInput, context.canonicalViewName === BUNNY_AGENT_NAME ? undefined : managed.systemPrompt);
     return {
         ...toBuiltinProfile(context, rendered, resolveLocale, toCapabilityCeiling),
         agentSystemPrompt: rendered.agentSystemPrompt,
@@ -306,6 +325,16 @@ function isMissingBuiltinConfig(error) {
  * drop the user's edits); a file that could not be regenerated is not rendered
  * from memory either. The message itself is a copyable instruction that the
  * user can hand to another Agent to fix the file.
+ *
+ * A coordinator on the segment profile is the exception (emergency rebuild
+ * spec 8): when this error fails the preparation of its Turn, the Turn system
+ * calls `LocalAgentService.repairCorruptedCoordinatorConfig`, which archives
+ * the corrupted file byte-for-byte as startup does, rewrites it from the
+ * bundled template keeping its valid model group, and lets the Turn prepare
+ * again. When the
+ * emergency rebuild is switched off or that repair cannot run, the user sees
+ * this instruction as for any other Builtin. The hot path itself still never
+ * rewrites a file.
  */
 async function builtinConfigBrokenError(dependencies, name, error, state = isMissingBuiltinConfig(error) ? 'missing' : 'corrupted') {
     const chinese = resolveLocale().toLowerCase().startsWith('zh');
@@ -421,7 +450,12 @@ async function renderCustomProfile(dependencies, context) {
 async function withPtcRender(catalog, request, renderInput) {
     if (!isPtcTurnEnabled({ requested: request.ptcRequested === true }))
         return renderInput;
-    const ptc = { section: await catalog.renderPtcSection(renderInput) };
+    const ptc = {
+        section: await catalog.renderPtcSection({
+            ...renderInput,
+            ptcStoreRequested: request.ptcStoreRequested === true,
+        }),
+    };
     return { ...renderInput, ptc };
 }
 function withPromptReadContext(input, request) {

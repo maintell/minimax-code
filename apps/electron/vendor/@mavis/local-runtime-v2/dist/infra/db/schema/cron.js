@@ -48,6 +48,8 @@ export const cronRuns = sqliteTable('local_runtime_v2_cron_runs', {
     deliveryInputJson: text('delivery_input_json'),
     retryAtMs: integer('retry_at_ms'),
     retryAttempt: integer('retry_attempt').notNull().default(0),
+    // Planned firing time; older rows and manual runs have no scheduled time.
+    scheduledForMs: integer('scheduled_for_ms'),
 }, (table) => [
     uniqueIndex('idx_v2_cron_runs_scheduler_trigger')
         .on(table.schedulerTriggerId)

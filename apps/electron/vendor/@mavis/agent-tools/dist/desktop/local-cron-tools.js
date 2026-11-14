@@ -1,4 +1,5 @@
 import { defineRuntimeTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
+import { isCoordinatorAgent, schedulesTargetMainConversation, } from '@mavis/shared/agent-coordination';
 import { Value } from '@sinclair/typebox/value';
 import { cronCommand, cronToolDefinitions, cronToolFailure, LocalSelfReminderToolDef, } from '../cron/tool-defs.js';
 import { DESKTOP_MANAGEMENT_MAX_TOKENS, currentLocalCronModel, dispatchLocalMavis, isCronCallableInRunCode, limitLocalManagementOutput, } from './local-mavis.js';
@@ -13,6 +14,15 @@ export function buildLocalCronTools(deps) {
                 // Never use truthiness here: the string "false" must pause, not resume.
                 if (args.enabled === 'true' || args.enabled === 'false') {
                     args.enabled = args.enabled === 'true';
+                }
+                // A coordinator whose schedules target its main conversation (Bunny) always wakes
+                // its own current main conversation, never another Agent or a fresh session; the
+                // runtime resolves the main conversation at fire time.
+                if (def.name === 'cron_create' &&
+                    ctx.agentName &&
+                    schedulesTargetMainConversation(ctx.coordination)) {
+                    args.agent_name = ctx.agentName;
+                    args.session = { mode: 'sessionId' };
                 }
                 if (def.name === 'cron_create' && typeof args.model === 'string') {
                     const resolution = await deps.cronAdapter.resolveModel?.({ model: args.model, sessionId: ctx.sessionId }, signal);
@@ -38,6 +48,7 @@ export function buildLocalCronTools(deps) {
                     cronAdapter: deps.cronAdapter,
                     sessionAdapter: deps.sessionAdapter,
                     currentAgentName: ctx.agentName,
+                    ...(isCoordinatorAgent(ctx.coordination) ? { currentCoordinator: true } : {}),
                     currentSessionId: ctx.sessionId,
                     currentModel: currentLocalCronModel(ctx),
                 }, command, args, signal);

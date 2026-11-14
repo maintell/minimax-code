@@ -100,7 +100,9 @@ export function startLocalRuntimeUtilityServer(options) {
     let pendingContextWindowUsageEnabled = null;
     let pendingRunawayGuardConfig = null;
     let pendingPromptSuggestionPolicy = null;
+    let pendingBunnyPolicy = null;
     let pendingToolResultCompactionConfig = null;
+    let pendingBunnyContextConfig = null;
     let pendingCollectionPolicy = null;
     let pendingComputerUseChannel = null;
     let pendingAuthRequestIds = [];
@@ -336,9 +338,17 @@ export function startLocalRuntimeUtilityServer(options) {
                 surface.setPromptSuggestionPolicy(pendingPromptSuggestionPolicy);
                 pendingPromptSuggestionPolicy = null;
             }
+            if (pendingBunnyPolicy !== null) {
+                surface.setBunnyPolicy(pendingBunnyPolicy);
+                pendingBunnyPolicy = null;
+            }
             if (pendingToolResultCompactionConfig !== null) {
                 surface.setToolResultCompactionConfig(pendingToolResultCompactionConfig);
                 pendingToolResultCompactionConfig = null;
+            }
+            if (pendingBunnyContextConfig !== null) {
+                surface.setBunnyContextConfig(pendingBunnyContextConfig);
+                pendingBunnyContextConfig = null;
             }
             if (pendingCollectionPolicy !== null) {
                 surface.setCollectionPolicy(pendingCollectionPolicy);
@@ -516,12 +526,29 @@ export function startLocalRuntimeUtilityServer(options) {
                     pendingPromptSuggestionPolicy = message.policy;
                 }
                 return;
+            case 'runtime-bunny-policy':
+                // Same startup window as the prompt-suggestion policy above.
+                if (surface && (phase === 'starting' || phase === 'ready')) {
+                    surface.setBunnyPolicy(message.policy);
+                }
+                else if (phase === 'idle' || phase === 'starting') {
+                    pendingBunnyPolicy = message.policy;
+                }
+                return;
             case 'runtime-tool-result-compaction-config':
                 if (phase === 'ready' && surface) {
                     surface.setToolResultCompactionConfig(message.config);
                 }
                 else if (phase === 'idle' || phase === 'starting') {
                     pendingToolResultCompactionConfig = message.config;
+                }
+                return;
+            case 'runtime-bunny-context-config':
+                if (phase === 'ready' && surface) {
+                    surface.setBunnyContextConfig(message.config);
+                }
+                else if (phase === 'idle' || phase === 'starting') {
+                    pendingBunnyContextConfig = message.config;
                 }
                 return;
             case 'runtime-collection-policy':
@@ -595,7 +622,7 @@ export function startLocalRuntimeUtilityServer(options) {
                 return;
             }
             case 'runtime-session-report-request': {
-                const { requestId, sessionId } = message;
+                const { requestId, sessionId, scope } = message;
                 void (async () => {
                     let response;
                     if (phase !== 'ready' || !surface) {
@@ -607,7 +634,9 @@ export function startLocalRuntimeUtilityServer(options) {
                     }
                     else {
                         try {
-                            const report = await surface.collectSessionReport(sessionId);
+                            const report = scope
+                                ? await surface.collectSessionReport(sessionId, scope)
+                                : await surface.collectSessionReport(sessionId);
                             response = { type: 'runtime-session-report-result', requestId, report };
                         }
                         catch (error) {

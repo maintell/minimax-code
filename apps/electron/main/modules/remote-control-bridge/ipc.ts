@@ -28,7 +28,6 @@ import { handleLocalRuntimeRequest, isLocalRuntimeReady } from "../local-runtime
 import { setRemoteAccessEnabled } from "../power";
 import { createRcAuditLogger } from "./audit-log";
 import { getHostDeviceName } from "./device-name";
-import { fetchPrcBinding, parsePrcConfig } from "./prc-credentials";
 import { registerRemoteSessionRcDeviceIdProvider } from "../local-runtime/utility/remote-session-broker";
 import { createRemoteControlGlobalEventSource } from "./global-events";
 let remoteControlBridgeModulePromise = null;
@@ -119,111 +118,8 @@ export function parseByteSizeConfigValue(value) {
     const bytes = amount * multiplier;
     return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : undefined;
 }
-/**
- * PRC mode: an operator configured a self-hosted gateway URL + password, so the
- * main process signs its own binding instead of waiting for the renderer. The
- * operator is the only principal on that gateway, hence the fixed user id.
- */
-const PRC_OPERATOR_USER_ID = 'prc:operator';
-/**
- * Cap every PRC HTTP call well below the 60 s ticket TTL: a gateway that accepts
- * the connection but never answers must not wedge the single-flight guard. The
- * credential module reports the abort as a `network:*` failure.
- */
-const PRC_FETCH_TIMEOUT_MS = 10_000;
-/** Re-entry guard for every PRC connect attempt; cleared in `finally` so a
- *  failed attempt can retry on the next refresh instead of dead-locking. */
-let prcConnecting = false;
-/** One-shot startup thunk installed by buildDefaultProxy, run once by setup. */
-let prcConnect: (() => Promise<void>) | null = null;
-/**
- * Resolve the operator config: the persisted `remote_control_prc` block, with
- * `MC_RC_PRC_URL` / `MC_RC_PRC_PASSWORD` winning when both are present. Plain
- * `http:` carries the password in the clear, so it is only accepted when the
- * operator set `allowInsecureOrigin` explicitly; otherwise PRC mode stays off
- * and the bridge keeps its existing renderer-driven path.
- */
-function resolvePrcConfig(logger) {
-    // `getDesktopConfig()` is typed from its defaults, which do not list optional
-    // extras like this one; read it as an untyped record and let the parser decide.
-    const desktopConfig: Record<string, unknown> = getDesktopConfig();
-    const fromFile = parsePrcConfig(desktopConfig.remote_control_prc);
-    const envUrl = process.env.MC_RC_PRC_URL?.trim();
-    const envPassword = process.env.MC_RC_PRC_PASSWORD?.trim();
-    // The opt-in flag is a safety decision, not credential material: env
-    // overrides replace the secret pair only and still honour the file's flag.
-    const fromEnv = envUrl && envPassword
-        ? parsePrcConfig({ url: envUrl, password: envPassword, allowInsecureOrigin: fromFile?.allowInsecureOrigin })
-        : undefined;
-    const config = fromEnv ?? fromFile;
-    if (!config)
-        return undefined;
-    if (config.baseUrl.startsWith('http:') && !config.allowInsecureOrigin) {
-        logger.warn('[rc.ipc] PRC disabled reason=insecure_origin scheme=http set remote_control_prc.allowInsecureOrigin=true to permit plaintext');
-        return undefined;
-    }
-    return config;
-}
-/**
- * PRC-only fetch: bounded by `PRC_FETCH_TIMEOUT_MS`, combined with any caller
- * signal via `AbortSignal.any` so neither side is silently dropped.
- */
-function createPrcFetchImpl() {
-    return (input, init) => {
-        const timeout = AbortSignal.timeout(PRC_FETCH_TIMEOUT_MS);
-        const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-        return net.fetch(input instanceof URL ? input.toString() : input, { ...init, signal });
-    };
-}
-/**
- * Fetch our own binding, cache it on the proxy and connect. Logs phase and
- * binding id only — never the password, the ticket or the URL query.
- */
-async function connectToPrc(deps) {
-    if (prcConnecting) {
-        deps.logger.info('[rc.ipc] prc connect skipped reason=already_in_progress');
-        return;
-    }
-    prcConnecting = true;
-    try {
-        deps.logger.info('[rc.ipc] prc connect start');
-        const result = await fetchPrcBinding({
-            config: deps.config,
-            deviceId: deps.proxy.getDeviceId(),
-            clientVersion: app.getVersion(),
-            fetchImpl: createPrcFetchImpl(),
-        });
-        if (!result.ok) {
-            // `error` is a controlled token (`network:*`, `http_<status>`,
-            // `not_authenticated`, `not_bound`) built by the credential module.
-            deps.logger.warn(`[rc.ipc] prc connect failed reason=${result.error}`);
-            return;
-        }
-        const bindingId = result.credentials.binding_id;
-        if (!deps.proxy.applyRendererCredentials(result.credentials)) {
-            deps.logger.warn(`[rc.ipc] prc credentials rejected reason=stale_request_epoch binding_id=${bindingId}`);
-            return;
-        }
-        const connected = await deps.proxy.connect();
-        deps.logger.info(`[rc.ipc] prc connect settled phase=${connected.phase} binding_id=${bindingId}`);
-    }
-    catch (err) {
-        // A thrown message may echo the request URL; keep only the error class.
-        deps.logger.warn(`[rc.ipc] prc connect threw error=${err instanceof Error ? err.name : 'unknown'}`);
-    }
-    finally {
-        prcConnecting = false;
-    }
-}
 function buildDefaultProxy(logger, bridge) {
     const identity = new bridge.DeviceIdentityStore(path.join(app.getPath('userData'), 'remote-control', 'state.json'), logger);
-    // A rebuild (hot reload) must not replay the previous configuration's
-    // startup connect; setup installs a fresh thunk below when PRC is on.
-    prcConnect = null;
-    const prcConfig = resolvePrcConfig(logger);
-    // Assigned right after construction: requestRendererRefresh only fires from
-    // async proxy events, never during the constructor.
-    let connectViaPrc = async () => {};
     const baseUrl = process.env.RC_BIZ_BASE_URL ?? DOMAIN_URL;
     const envHeaders = parseExtraBizHeaders(process.env.RC_BIZ_HEADERS);
     logger.info(`[rc.ipc] init baseUrl=${baseUrl} envHeaders=${Object.keys(envHeaders).join('|') || 'none'}`);
@@ -235,6 +131,8 @@ function buildDefaultProxy(logger, bridge) {
     };
     const getWebSocketHeaders = () => getRemoteControlWebSocketHeaders(getDesktopConfig().swimLaneName);
     const getRemoteControlFileContentMaxBytes = () => parseByteSizeConfigValue(getDesktopConfig().remote_control_file_content_max_bytes);
+    // Only selects the RC history truncation notice wording (zh default).
+    const getAppLocale = () => getDesktopConfig().language;
     const localRuntimeInvoke = (request) => handleLocalRuntimeRequest(request, { transportConsumer: 'remote-control' });
     const pairingClient = new bridge.PairingClient({
         baseUrl,
@@ -254,26 +152,17 @@ function buildDefaultProxy(logger, bridge) {
         fetchImpl: ((input, init) => net.fetch(input instanceof URL ? input.toString() : input, init)),
         logger,
     });
-    const rc = new bridge.RemoteControlProxy({
+    return new bridge.RemoteControlProxy({
         identity,
         pairingClient,
         logger,
         clientVersion: app.getVersion(),
         isRuntimeHealthy: () => isLocalRuntimeReady(),
-        // PRC is single-principal: the operator password is the only identity
-        // there is, and the renderer never signs a binding in this mode.
-        getCurrentUserId: () => (prcConfig ? PRC_OPERATOR_USER_ID : resolveCurrentUserId(getUserInfo())),
+        getCurrentUserId: () => resolveCurrentUserId(getUserInfo()),
         getWebSocketHeaders,
         // Reverse loop: main can't sign GET /desktop/bindings, so ask the renderer to
-        // re-sign and push credentials back (self-heal design §4.2). In PRC mode the
-        // main process holds the password and signs the binding itself.
-        requestRendererRefresh: () => {
-            if (prcConfig) {
-                void connectViaPrc();
-                return;
-            }
-            broadcastRefreshBinding(logger);
-        },
+        // re-sign and push credentials back (self-heal design §4.2).
+        requestRendererRefresh: () => broadcastRefreshBinding(logger),
         onSessionComposerModeChange: broadcastSessionComposerMode,
         // Wave-2 commands ride the in-process localRuntime entrypoint. Global
         // Events use the same entrypoint behind a generated-client host adapter,
@@ -281,6 +170,7 @@ function buildDefaultProxy(logger, bridge) {
         localRuntimeInvoke,
         globalEventSource: createRemoteControlGlobalEventSource(localRuntimeInvoke, loadGlobalEventTransport),
         getRemoteControlFileContentMaxBytes,
+        getAppLocale,
         // Wave-3 §4-3: send attachments land under userData before the daemon
         // sees them (filePath shape); net.fetch mirrors the pairing client.
         attachmentFetcher: bridge.createAttachmentFetcher({
@@ -289,11 +179,6 @@ function buildDefaultProxy(logger, bridge) {
             logger,
         }),
     });
-    if (prcConfig) {
-        connectViaPrc = () => connectToPrc({ logger, config: prcConfig, proxy: rc });
-        prcConnect = connectViaPrc;
-    }
-    return rc;
 }
 let activeProxy = null;
 let activeLogger = null;
@@ -344,12 +229,6 @@ function broadcastRefreshBinding(logger) {
 export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = loadRemoteControlBridgeModule) {
     const log = logger ?? createRcAuditLogger();
     const rc = proxy ?? buildDefaultProxy(log, await loadBridge());
-    // Only a default-built proxy can be in PRC mode; an injected one must not
-    // inherit a previous build's configuration.
-    const startPrc = proxy ? null : prcConnect;
-    // PRC mode owns the binding: the operator password signs it, so the renderer
-    // and the cloud account have no say over this proxy's lifecycle.
-    const prcMode = startPrc !== null;
     activeProxy = rc;
     activeLogger = log;
     // The Runtime's mavis tool reads controlled devices' sessions as this desktop.
@@ -357,13 +236,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     ipcMain.handle(IPC_CHANNELS.RC_CONNECT, async () => {
         log.info('[rc.ipc] rc:connect invoked');
         try {
-            // PRC mode: only the gateway can mint a ticket, so `rc.connect()` alone
-            // could never recover from a stop. Re-ticket through the same path the
-            // refresh hook and startup use, then report the state it produced.
-            if (prcMode) {
-                await startPrc();
-                return rc.getStatus();
-            }
             return await rc.connect();
         }
         catch (err) {
@@ -373,13 +245,8 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     });
     ipcMain.handle(IPC_CHANNELS.RC_DISCONNECT, async (_event, opts) => {
         log.info(`[rc.ipc] rc:disconnect invoked unbind=${opts?.unbind === true}`);
-        // PRC mode: a PRC binding id must never reach the cloud pairing client, so
-        // the renderer's unbind flag degrades to a plain disconnect.
-        if (prcMode && opts?.unbind === true) {
-            log.info('[rc.ipc] rc:disconnect unbind skipped source=prc');
-        }
         try {
-            await rc.disconnect(opts?.unbind && !prcMode ? { unbind: true } : {});
+            await rc.disconnect(opts?.unbind ? { unbind: true } : {});
             return { success: true };
         }
         catch (err) {
@@ -411,14 +278,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     // needs to consult /binding directly.
     ipcMain.handle(IPC_CHANNELS.RC_BINDING_READY, async (_event, payload) => {
         log.info(`[rc.ipc] rc:binding-ready invoked binding_id=${payload?.binding_id} producer_generation=${payload?.producer_generation ?? 'absent'} request_epoch=${payload?.request_epoch ?? 'absent'}`);
-        // PRC credentials come from the gateway, not from the renderer. A renderer
-        // that still checks the cloud binding would otherwise look like a same-
-        // identity refresh (both sides report `prc:operator`) and silently replace
-        // our ticket, so acknowledge and drop the payload before any validation.
-        if (prcMode) {
-            log.info(`[rc.ipc] rc:binding-ready ignored source=prc binding_id=${String(payload?.binding_id)}`);
-            return { success: true, source: 'prc', ignored: true };
-        }
         // 只有三个必填字段能否决整条凭据；producer_generation / request_epoch 这类
         // 可选字段即便畸形也不整条拒绝 —— 见下方「按未提供处理 + 留痕」。
         // 否则一个装饰性字段写错就能让桌面端永远连不上（§4.5.1 / §4.5.2）。
@@ -471,12 +330,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     });
     ipcMain.handle(IPC_CHANNELS.RC_BINDING_LOST, async () => {
         log.info('[rc.ipc] rc:binding-lost invoked (renderer reports state=none)');
-        // PRC mode owns the binding: a cloud `state=none` says nothing about the
-        // operator gateway, so it must not disconnect us.
-        if (prcMode) {
-            log.info('[rc.ipc] rc:binding-lost ignored source=prc');
-            return { success: true, source: 'prc', ignored: true };
-        }
         try {
             rc.onRendererBindingLost();
             return { success: true };
@@ -488,12 +341,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     });
     ipcMain.handle(IPC_CHANNELS.RC_MARK_UNBOUND, async () => {
         log.info('[rc.ipc] rc:mark-unbound invoked (renderer issued the unbind HTTP call itself; main only clears local state)');
-        // The renderer can only unbind the cloud binding; clearing local state
-        // here would drop the operator's PRC binding with it.
-        if (prcMode) {
-            log.info('[rc.ipc] rc:mark-unbound ignored source=prc');
-            return { success: true, source: 'prc', ignored: true };
-        }
         try {
             rc.onRendererUnbound();
             return { success: true };
@@ -507,13 +354,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     // 持久化在 main（renderer 刷新会丢），HTTP 仍由 renderer 发（matrix gateway
     // 签名材料只在 renderer 的 axios 管线里，是硬约束）。
     ipcMain.handle(IPC_CHANNELS.RC_BEGIN_UNBIND, async () => {
-        // Unbinding a PRC device belongs to the operator gateway (`POST
-        // …/remote-control/unbind`, password-authenticated), not to the renderer:
-        // fail loudly instead of writing a pending record nobody can resolve.
-        if (prcMode) {
-            log.warn('[rc.ipc] rc:begin-unbind rejected reason=prc_mode');
-            return { success: false, error: 'prc_mode' };
-        }
         try {
             const pending = rc.beginProducerUnbind();
             log.info(`[rc.ipc] rc:begin-unbind → request_id=${pending.request_id} attempts=${pending.attempts}`);
@@ -541,12 +381,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
         }
     });
     ipcMain.handle(IPC_CHANNELS.RC_RESOLVE_UNBIND, async (_event, payload) => {
-        // Same rule as rc:begin-unbind: no renderer outcome may clear the PRC
-        // binding, so neither `resolveProducerUnbind()` nor the proxy is touched.
-        if (prcMode) {
-            log.warn('[rc.ipc] rc:resolve-unbind rejected reason=prc_mode');
-            return { success: false, error: 'prc_mode' };
-        }
         const outcome = payload?.outcome;
         if (outcome !== 'confirmed' && outcome !== 'rejected') {
             // 只接受两种**确定**结果。超时/网络错误必须保持待确认，不能从这里溜进来。
@@ -589,13 +423,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
     }
     // Account switch / logout: a binding belongs to the user who paired it.
     const unsubscribeUserChange = onUserInfoChanged(() => {
-        // PRC mode binds to the device/operator, not to the cloud session: the
-        // bound user is `prc:operator`, so every login/logout would read as an
-        // owner switch and tear down a connection the operator still wants.
-        if (prcMode) {
-            log.info('[rc.ipc] user identity changed; PRC mode ignores account changes action=none');
-            return;
-        }
         const state = rc.getBoundUserState();
         if (state.binding_id === undefined) {
             log.debug('[rc.ipc] user identity changed but no local binding; nothing to do action=none');
@@ -633,11 +460,6 @@ export async function setupRemoteControlBridgeIPC(proxy, logger, loadBridge = lo
         }
     });
     teardownHooks.push(unsubscribeUserChange);
-    // PRC mode: nobody pushes rc:binding-ready, so the first connect happens
-    // here — after the teardown hooks exist, so a failed attempt stays retryable
-    // through requestRendererRefresh.
-    if (startPrc)
-        void startPrc();
 }
 /** Lifecycle-owned quit hook: quiet WS teardown while retaining the binding. */
 export function disconnectRemoteControlBridgeBeforeQuit() {
@@ -671,8 +493,6 @@ export function teardownRemoteControlBridgeIPC() {
     teardownHooks = [];
     activeProxy = null;
     activeLogger = null;
-    // Drop the startup thunk with the proxy it closes over (hot reload / tests).
-    prcConnect = null;
     setRemoteAccessEnabled(false);
     if (!rc)
         return;

@@ -54,15 +54,19 @@ export class PluginSystem {
     disposalController = new AbortController();
     snapshot = EMPTY_PLUGIN_SNAPSHOT;
     desiredSnapshot = this.snapshot;
+    snapshotListeners = new Set();
     mcpRuntime;
     capabilityGenerations;
     metrics;
     packageStorage;
     localDirectoryWatcher;
     local;
+    forbiddenPluginNames;
     constructor(options) {
         this.options = options;
+        this.forbiddenPluginNames = new Set((options.forbiddenPluginNames ?? []).map((name) => name.trim().normalize('NFKC').toLocaleLowerCase('en-US')));
         this.builder = new PluginSnapshotBuilder(options.mcpNames, {
+            forbiddenPluginNames: this.forbiddenPluginNames,
             ...(options.miniAppHostVersion ? { hostVersion: options.miniAppHostVersion } : {}),
         });
         this.metrics = new PluginSystemMetrics(options.metrics);
@@ -157,6 +161,11 @@ export class PluginSystem {
     }
     get currentSnapshot() {
         return this.snapshot;
+    }
+    /** Notified after every published snapshot replacement; returns the unsubscribe. */
+    subscribeSnapshotChanges(listener) {
+        this.snapshotListeners.add(listener);
+        return () => this.snapshotListeners.delete(listener);
     }
     /** Install surface for packages that do not come from the official Registry. */
     get localInstaller() {
@@ -830,8 +839,11 @@ export class PluginSystem {
         for (const pluginName of deactivatedPluginNames(previous, next)) {
             this.options.onPluginDeactivated?.(pluginName);
         }
-        if (!this.disposed)
-            this.options.onCapabilitiesChanged?.(next.turnCapabilities);
+        if (this.disposed)
+            return;
+        this.options.onCapabilitiesChanged?.(next.turnCapabilities);
+        for (const listener of [...this.snapshotListeners])
+            listener();
     }
     adoptPublishedSnapshot(snapshot, buildContextSource = snapshot) {
         const reservations = this.snapshotReservations.get(snapshot);

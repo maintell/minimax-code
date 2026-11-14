@@ -1,3 +1,4 @@
+export { MEMORY_SUMMARY_FILE } from './contracts/storage-contracts.js';
 /**
  * Memory V2 共享契约。
  *

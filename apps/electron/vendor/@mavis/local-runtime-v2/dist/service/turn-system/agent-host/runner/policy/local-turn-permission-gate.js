@@ -27,7 +27,8 @@ export class LocalTurnPermissionGate {
         if (sideSession?.block)
             return { ...sideSession.block, blockedBy: 'permission' };
         const sideApprovalRequired = sideSession?.approvalRequired === true;
-        if (shouldSkipPermissionCheck(this.options, callInput)) {
+        const assignmentCommand = isAssignmentCommand(request, callInput.sessionId);
+        if (!assignmentCommand && shouldSkipPermissionCheck(this.options, callInput)) {
             // Desktop's built-in tool policy owns these tools elsewhere; the
             // side-Session confirmation is the only gate-level requirement here.
             if (!sideApprovalRequired)
@@ -408,6 +409,26 @@ function preToolHookAllowsWithoutApproval(input, decision) {
 /** An ordinary root session or a SideChat (`parentSessionId: null`) can never be a Mini App ask. */
 function isOrdinaryRootSession(lineage) {
     return lineage !== undefined && !lineage.miniApp && !lineage.parentSessionId;
+}
+/**
+ * Assignment semantics need project approval even from a built-in tool: a
+ * project `session create` and a reporting-back `session send`. An ordinary
+ * send between sessions keeps the built-in exemption.
+ */
+function isAssignmentCommand(request, callerSessionId) {
+    if (request.toolName !== 'mavis')
+        return false;
+    const args = request.toolInput.args;
+    if (typeof args !== 'object' || args === null)
+        return false;
+    if (request.toolInput.command === 'session create')
+        return Reflect.get(args, 'project') !== undefined;
+    if (request.toolInput.command !== 'session send')
+        return false;
+    if (Reflect.get(args, 'report_back') !== true)
+        return false;
+    const target = Reflect.get(args, 'session_id');
+    return target !== 'me' && target !== callerSessionId;
 }
 function shouldSkipPermissionCheck(options, input) {
     return (options.enforceBuiltinTools !== true &&

@@ -397,8 +397,9 @@ export function getDesktopConfig() {
         config.scheduleNotification = true;
         changed = true;
     }
+    // 保持唤醒默认关闭；已写入磁盘的值保持不变。
     if (config.keepAwake === undefined) {
-        config.keepAwake = true;
+        config.keepAwake = false;
         changed = true;
     }
     if (config.webLinkOpenDestination !== 'embedded' && config.webLinkOpenDestination !== 'system') {

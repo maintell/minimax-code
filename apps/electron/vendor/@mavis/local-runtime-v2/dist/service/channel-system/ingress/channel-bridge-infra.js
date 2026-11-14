@@ -14,7 +14,8 @@ import { serializeChannelBinding } from '../binding/channel-binding-codec.js';
 import { validateImBindingTargetSession } from '../binding/im-binding-target-validation.js';
 import { channelImNewCreatedReceiptText, channelRouteBrokenReceiptText, imReceiptForRoute, imReceiptFromRouteError, isMissingEnqueueSessionError, keepImReceiptInternal, logImReceipt, resolveChannelEnqueueRejectionInboundResult, } from '../delivery/channel-im-receipts.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
-import { buildEnqueueChannelContext, channelPrefersZh, compactionReply, compactionStartReply, enqueueOutcomeFields, mapAccessDenial, } from './channel-inbound-helpers.js';
+import { buildEnqueueChannelContext, handleChannelCompactCommand, enqueueOutcomeFields, mapAccessDenial, } from './channel-inbound-helpers.js';
+import { coordinatorNewCommandReply, denyCoordinatorInbound, isCoordinatorAgentName, withCoordinatorOrigin, } from './coordinator-inbound.js';
 export class LocalChannelBridgeInfra {
     options;
     bindingStore;
@@ -47,6 +48,8 @@ export class LocalChannelBridgeInfra {
      * store that `handleInbound` evaluates against.
      */
     accessControlStore;
+    /** Wired to provider registration proof, never the first-DM owner store. */
+    checkCoordinatorCreator;
     issuedPreflightTokens = new WeakSet();
     /**
      * Setter for the deny-reply provider. The wire layer
@@ -72,6 +75,9 @@ export class LocalChannelBridgeInfra {
                     ...(options.revealMigratedSession
                         ? { revealMigratedSession: options.revealMigratedSession }
                         : {}),
+                    ...(options.resolveCoordinatorMainSession
+                        ? { resolveCoordinatorMainSession: options.resolveCoordinatorMainSession }
+                        : {}),
                 })
                 : undefined;
         this.routeResolver = new LocalChannelRouteResolver(this.bindingStore, options, this.imConnectionStore);
@@ -92,6 +98,38 @@ export class LocalChannelBridgeInfra {
     reportResourceAmbiguity(memberCount) {
         reportChannelResourceAmbiguity(this.options, memberCount);
     }
+    async isCoordinatorContext(ctx) {
+        const route = await this.imConnectionStore?.peekRoute(ctx);
+        if (route)
+            return isCoordinatorAgentName(route.agentName);
+        const bindings = await this.bindingStore.list();
+        if (bindings.some((binding) => binding.platform === ctx.platform &&
+            binding.clientName === ctx.clientName &&
+            isCoordinatorAgentName(binding.agentName)))
+            return true;
+        return isCoordinatorAgentName((await this.routeResolver.preview(ctx)).agentId);
+    }
+    /** Also used before questionnaire/permission interception, not just text enqueue. */
+    async denyCoordinatorAccess(ctx, lane = ctx.lane ?? 'interactive') {
+        if (!(await this.isCoordinatorContext(ctx)))
+            return undefined;
+        const checkCreator = this.checkCoordinatorCreator;
+        return denyCoordinatorInbound({
+            ctx,
+            lane,
+            checkCreator: checkCreator ? (context) => checkCreator(context, 'inbound') : undefined,
+        });
+    }
+    /** Revalidate old persisted reply targets; no verified creator DM means no outbound. */
+    async canDeliverToChannel(ctx, sessionId) {
+        const coordinatorRoute = await this.isCoordinatorContext(ctx);
+        const session = sessionId ? await this.options.getSessionById(sessionId) : undefined;
+        if (!coordinatorRoute && !isCoordinatorAgentName(session?.agentName))
+            return true;
+        if (!coordinatorRoute)
+            return false;
+        return (await this.checkCoordinatorCreator?.(ctx, 'delivery')) === true;
+    }
     /**
      * Run the same inbound access pipeline as `handleInbound`, without routing,
      * queueing, attachment normalization, or any Agent work. The returned token
@@ -100,6 +138,10 @@ export class LocalChannelBridgeInfra {
     async preflightInbound(input) {
         const command = parseLocalChannelSlashCommand(input.text);
         const lane = input.ctx.lane ?? (command ? 'control' : 'interactive');
+        const coordinator = await this.isCoordinatorContext(input.ctx);
+        const creatorDenied = await this.denyCoordinatorAccess(input.ctx, lane);
+        if (creatorDenied)
+            return { allowed: false, inbound: creatorDenied };
         const didRunAccessControl = Boolean(this.options.accessControlStore);
         if (didRunAccessControl) {
             const dedup = await checkChannelAccess(input.ctx, input.eventId, this.eventDedupCache, {
@@ -110,11 +152,11 @@ export class LocalChannelBridgeInfra {
                 return { allowed: false, inbound: mapAccessDenial(dedup, lane) };
         }
         if (this.options.accessControlStore) {
-            const denied = await this.evaluateAccessControlGate(this.options.accessControlStore, input.ctx, lane);
+            const denied = await this.evaluateAccessControlGate(this.options.accessControlStore, input.ctx, lane, coordinator);
             if (denied)
                 return denied;
         }
-        const access = await checkChannelAccess(input.ctx, input.eventId, this.eventDedupCache, this.legacyAccessOptions());
+        const access = await checkChannelAccess(input.ctx, input.eventId, this.eventDedupCache, this.legacyAccessOptions(coordinator));
         if (access !== 'allow')
             return { allowed: false, inbound: mapAccessDenial(access, lane) };
         const token = {
@@ -133,7 +175,7 @@ export class LocalChannelBridgeInfra {
      * Legacy owner-gate options. With an AC store present the dedup/group/owner
      * legs already ran (AC path), so only the residual bookkeeping runs here.
      */
-    legacyAccessOptions() {
+    legacyAccessOptions(coordinator = false) {
         return {
             ...(this.options.ownerStore ? { ownerStore: this.options.ownerStore } : {}),
             ...(this.options.requiresOwnerGate
@@ -142,6 +184,7 @@ export class LocalChannelBridgeInfra {
             ...(this.options.accessControlStore
                 ? { skipDedupCheck: true, skipGroupHardBlock: true, skipOwnerGate: true }
                 : {}),
+            ...(coordinator ? { skipOwnerGate: true } : {}),
         };
     }
     /**
@@ -150,14 +193,19 @@ export class LocalChannelBridgeInfra {
      * the policy, and on deny sends + logs the best-effort deny notice.
      * Returns undefined when the policy allows the inbound.
      */
-    async evaluateAccessControlGate(acStore, ctx, lane) {
+    async evaluateAccessControlGate(acStore, ctx, lane, coordinator) {
         const acPolicy = await acStore.get(ctx.platform, ctx.clientName);
-        if (acPolicy.allowedUsers !== 'ALL' && this.options.ownerStore && isP2pChat(ctx.chatType)) {
+        if (!coordinator &&
+            acPolicy.allowedUsers !== 'ALL' &&
+            this.options.ownerStore &&
+            isP2pChat(ctx.chatType)) {
             await this.options.ownerStore.checkAndBootstrap(ctx.clientName, ctx.senderId, undefined);
         }
         const decision = await acStore.evaluate({
             ctx,
             resolveOwnerSenderId: async (clientName) => {
+                if (coordinator)
+                    return ctx.senderId; // Already verified above, not the legacy owner.
                 if (!this.options.ownerStore)
                     return undefined;
                 const owner = await this.options.ownerStore.getOwner(clientName);
@@ -205,6 +253,9 @@ export class LocalChannelBridgeInfra {
         // SECURITY: card_action / approval endpoints must call `checkChannelAccess`
         // when wired (D5). The dedup cache is shared via `eventDedupCache` so the
         // future approval path deduplicates clicks too.
+        const coordinatorDenied = await this.denyCoordinatorAccess(input.ctx, lane);
+        if (coordinatorDenied)
+            return { ...coordinatorDenied, ...(command ? { command: command.name } : {}) };
         const gate = await this.consumePreflightOrGate(input, lane);
         if (gate)
             return gate;
@@ -227,8 +278,37 @@ export class LocalChannelBridgeInfra {
                     lane,
                 };
             }
+            if (isCoordinatorAgentName(route.agentName)) {
+                return this.enqueueCoordinatorInbound(input, { ...route, sessionId }, lane);
+            }
             return this.enqueueRoutedInbound(input, { ...route, sessionId }, lane);
         });
+    }
+    /**
+     * Bunny's main conversation admits only the owner's direct messages, and
+     * each admitted message carries its IM origin so Bunny can tell it apart
+     * from desktop input. Delivery back to IM still follows the Turn's
+     * channelContext, exactly like an ordinary IM route.
+     */
+    async enqueueCoordinatorInbound(input, route, lane) {
+        const checkCreator = this.checkCoordinatorCreator;
+        const denied = await denyCoordinatorInbound({
+            ctx: input.ctx,
+            lane,
+            checkCreator: checkCreator ? (ctx) => checkCreator(ctx, 'inbound') : undefined,
+        });
+        if (denied)
+            return denied;
+        return this.enqueueRoutedInbound({ ...input, text: withCoordinatorOrigin(input.ctx, input.text) }, route, lane);
+    }
+    /**
+     * Slash commands act on the routed Session directly, so a coordinator
+     * route applies the same owner + p2p gate before any command runs (a
+     * group member must not be able to `/stop` Bunny's main conversation).
+     * Route lookup failures are left to the command handler's own receipts.
+     */
+    async denyCoordinatorSlashCommand(ctx, lane) {
+        return this.denyCoordinatorAccess(ctx, lane);
     }
     /**
      * Product decision 2026-09-04 (desktop and cloud agree): when the bound
@@ -471,6 +551,9 @@ export class LocalChannelBridgeInfra {
             platform: ctx.platform,
             argsLength: command.args.length,
         }, 'Channel slash command dispatching');
+        const coordinatorDenied = await this.denyCoordinatorSlashCommand(ctx, lane);
+        if (coordinatorDenied)
+            return { ...coordinatorDenied, command: command.name };
         // Single-source dispatch: every entry in `LOCAL_CHANNEL_SLASH_COMMANDS`
         // must have exactly one handler here. The `Record<...>` key type is the
         // command-name union derived from that constant, so TypeScript refuses to
@@ -481,7 +564,14 @@ export class LocalChannelBridgeInfra {
             new: (c, cmd, l, e) => this.handleNewCommand(c, cmd, l, e),
             clear: (c, cmd, l, e) => this.handleNewCommand(c, cmd, l, e),
             stop: (c, cmd, l) => this.handleStopCommand(c, cmd, l),
-            compact: (c, cmd, l, e) => this.handleCompactCommand(c, cmd, l, e),
+            compact: (c, cmd, l, e) => handleChannelCompactCommand({
+                ctx: c,
+                command: cmd,
+                lane: l,
+                extras: e,
+                routeResolver: this.routeResolver,
+                requestCompaction: this.options.requestCompaction,
+            }),
         };
         return registry[command.name](ctx, command, lane, extras);
     }
@@ -592,6 +682,9 @@ export class LocalChannelBridgeInfra {
         const { ctx, command, lane, extras, baseFields, startedAt } = cmd;
         const requestId = extras.requestId?.trim() || buildLocalChannelInboundRequestId(ctx);
         try {
+            const coordinator = await this.coordinatorNewCommand(ctx, command, lane);
+            if (coordinator)
+                return coordinator;
             const route = await this.routeResolver.advance(ctx, requestId);
             if (route.blocked || !route.sessionId) {
                 logger.warn({ ...baseFields, outcome: 'no_route', durationMs: Date.now() - startedAt }, 'Channel /new skipped because no Rootless route is active');
@@ -620,6 +713,36 @@ export class LocalChannelBridgeInfra {
             }, 'Channel /new failed to advance the concrete Session binding');
             throw error;
         }
+    }
+    /**
+     * Bunny has exactly one main conversation: `/new` / `/clear` keep the
+     * Binding on it and answer with a short explanation instead of advancing.
+     */
+    async coordinatorNewCommand(ctx, command, lane) {
+        // Read-only probe first: an ordinary Agent's empty cursor must not get a
+        // Session from this check before `advance` creates the real one.
+        const preview = await this.imConnectionStore?.peekRoute(ctx);
+        if (!isCoordinatorAgentName(preview?.agentName))
+            return undefined;
+        const route = await this.routeResolver.resolveExisting(ctx);
+        if (!route?.sessionId || !isCoordinatorAgentName(route.agentName))
+            return undefined;
+        logger.info({
+            scope: 'channel.slash',
+            op: 'new',
+            command: command.name,
+            lane,
+            platform: ctx.platform,
+            outcome: 'coordinator_single_main',
+        }, 'Channel /new kept the coordinator main conversation');
+        return {
+            handled: true,
+            command: command.name,
+            reply: coordinatorNewCommandReply(ctx.platform),
+            route,
+            sessionId: route.sessionId,
+            lane,
+        };
     }
     /**
      * Legacy Root creation for standalone-V1 `/new`. Prefers the host-wired
@@ -758,111 +881,6 @@ export class LocalChannelBridgeInfra {
             route,
             sessionId: route.sessionId,
             ...enqueueOutcomeFields(queued),
-            lane,
-        };
-    }
-    async handleCompactCommand(ctx, command, lane, extras) {
-        // ── `/compact` handler ──
-        // Out-of-band compaction request for the active session. We do NOT
-        // touch the routing table here — `/compact` runs on whichever session
-        // the route resolver currently points at (typically a branch task
-        // session for short-lived work, or the agent root for the main chat).
-        //
-        // Stages:
-        //   1. resolve route (skip cleanly if blocked / unrouteable),
-        //   2. defensive check: refuse to crash if host omitted
-        //      `requestCompaction` (some test scaffolding + the legacy
-        //      HTTP-only boot path),
-        //   3. invoke the compaction core. The core itself may return
-        //      `SESSION_BUSY` / `UNSUPPORTED` / `SUCCESS` etc. — we mirror
-        //      the code through the localized reply copy.
-        //
-        // Note: `args` here are the user's `/compact <custom instructions>`
-        // payload. Like the dispatcher we log `argsLength` not the contents.
-        const baseFields = {
-            scope: 'channel.slash',
-            op: 'compact',
-            command: 'compact',
-            lane,
-            platform: ctx.platform,
-            clientName: ctx.clientName,
-            chatId: ctx.chatId,
-            senderId: ctx.senderId,
-            argsLength: command.args.length,
-        };
-        const startedAt = Date.now();
-        const route = await this.routeResolver.resolve(ctx);
-        if (route.blocked || !route.sessionId) {
-            logger.warn({
-                ...baseFields,
-                ...(route.agentName ? { agentName: route.agentName } : {}),
-                outcome: 'no_route',
-                durationMs: Date.now() - startedAt,
-            }, 'Channel /compact skipped — route resolver returned blocked or no sessionId');
-            return { handled: true, command: 'compact', reply: 'No active route.', route, lane };
-        }
-        const zh = channelPrefersZh(ctx.platform);
-        // Defensive: host did not wire the compaction core. Never crash the inbound
-        // path — surface the "unsupported" copy so the sender gets feedback.
-        if (!this.options.requestCompaction) {
-            logger.warn({
-                ...baseFields,
-                agentName: route.agentName,
-                sessionId: route.sessionId,
-                outcome: 'unsupported',
-                durationMs: Date.now() - startedAt,
-            }, 'Channel /compact ignored — host did not wire requestCompaction');
-            return {
-                handled: true,
-                command: 'compact',
-                reply: compactionReply('COMPACTION_UNSUPPORTED', zh),
-                route,
-                sessionId: route.sessionId,
-                lane,
-            };
-        }
-        const customInstructions = command.args.trim() || undefined;
-        const outcome = await this.options.requestCompaction({
-            sessionId: route.sessionId,
-            agentName: route.agentName,
-            ...(customInstructions ? { customInstructions } : {}),
-            reason: 'im_request',
-            // The two-stage "started" line only fires once the core has passed its
-            // busy/lock guards and is genuinely about to compact. A busy session
-            // returns SESSION_BUSY before this runs, so no "started" line is sent.
-            onStarted: extras.onProgress
-                ? async () => {
-                    await extras.onProgress?.(compactionStartReply(zh));
-                }
-                : undefined,
-        });
-        const isSuccess = outcome.code === 'SUCCESS';
-        if (isSuccess) {
-            logger.info({
-                ...baseFields,
-                agentName: route.agentName,
-                sessionId: route.sessionId,
-                outcome: 'ok',
-                compactionCode: outcome.code,
-                durationMs: Date.now() - startedAt,
-            }, 'Channel /compact completed');
-        }
-        else {
-            logger.warn({
-                ...baseFields,
-                agentName: route.agentName,
-                sessionId: route.sessionId,
-                outcome: 'failed',
-                compactionCode: outcome.code,
-                durationMs: Date.now() - startedAt,
-            }, 'Channel /compact did not succeed — surfacing localized reply to sender');
-        }
-        return {
-            handled: true,
-            command: 'compact',
-            reply: compactionReply(outcome.code, zh),
-            route,
-            sessionId: route.sessionId,
             lane,
         };
     }

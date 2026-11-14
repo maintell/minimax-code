@@ -1,4 +1,5 @@
 import { parseAskUserConfig, resolveAskUserPolicyContext, resolveEffectiveAskUserPolicy, } from '@mavis/config';
+import { overridesGenericReminders, readTrustedAgentProfileCoordination, } from '@mavis/shared/agent-coordination';
 import { decideAskUserReminders } from '@mavis/system-reminder';
 /**
  * Decides the `<ask-user-policy>` declaration and `<ask-user-guidance>` block
@@ -7,6 +8,10 @@ import { decideAskUserReminders } from '@mavis/system-reminder';
  * suppress needed re-injection and duplicate existing blocks.
  */
 export async function resolveAskUserReminder(execution, source, logger) {
+    // A coordinator that declares its own reminder set owns user-question policy too.
+    const coordination = readTrustedAgentProfileCoordination(execution.preparation.agentConfig.agent_profile);
+    if (overridesGenericReminders(coordination))
+        return undefined;
     const fields = { session_id: execution.lease.sessionId, turn_id: execution.lease.turnId };
     const hasAskUserTool = execution.assembly?.tools.some((tool) => tool.def.name === 'ask_user');
     if (!source || !hasAskUserTool || execution.request.executionMode === 'continuation') {

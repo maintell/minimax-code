@@ -6,11 +6,13 @@ import { installedLocalPlugin } from '../local/local-plugin-lifecycle.js';
 import { declaredMiniAppPermissions } from '../package/miniapp/permissions.js';
 import { PluginRegistryClient } from './registry-client.js';
 import { effectiveInstallationPolicy } from './repository.js';
-import { builtInMarketplaces, catalogEntryDetail, catalogEntrySummary, installedIdentityFields, installedSummaryFields, marketplaceInfo, nameHolder, nameOwnerField, } from './wire/marketplace-views.js';
+import { builtInMarketplaces, catalogEntryDetail, catalogEntrySummary, installedIdentityFields, localMarketplaceSummary, marketplaceInfo, nameHolder, nameOwnerField, } from './wire/marketplace-views.js';
 import { categoryId, categoryName, declaredTransport, optionalPluginIcon, pluginPackageSummary, } from './wire/package-views.js';
 import { PluginDesktopFacadeError, readUserMarketplaceName, resolveCatalogTarget, resolvePluginTarget, userMarketplaceOf, } from './wire/plugin-selector.js';
 export { PluginDesktopFacadeError } from './wire/plugin-selector.js';
 const DEFAULT_LIMIT = 50;
+/** MCP discovery retries start at 10 s; one retry fits before the card reports loading. */
+const PLUGIN_CAPABILITY_READINESS_WAIT_MS = 20_000;
 const MAX_LIMIT = 200;
 const NO_MARKETPLACE_STATES = new Map();
 /**
@@ -74,7 +76,7 @@ export class PluginDesktopFacade {
                 ...response,
                 plugin: {
                     ...response.plugin,
-                    summary: overlayOfficialSummary(response.plugin.summary, installations, this.options.system.currentSnapshot),
+                    summary: overlayOfficialSummary(response.plugin.summary, installations, this.options.system.currentSnapshot, this.options.system.forbiddenPluginNames),
                 },
             };
         }
@@ -113,7 +115,7 @@ export class PluginDesktopFacade {
                 reuseCached: true,
             }),
         ]);
-        const official = officialInstalledItems(officialStates, filter, localSnapshot);
+        const official = officialInstalledItems(officialStates, filter, localSnapshot, this.options.system.forbiddenPluginNames);
         const local = localInstalledItems(localSnapshot, filter, await this.describeInstalled(localSnapshot));
         return installedSnapshotPage([...official, ...local], filter, limit, cursor?.stage === 'snapshot' ? cursor.offset : 0);
     }
@@ -133,6 +135,34 @@ export class PluginDesktopFacade {
             ];
         });
         return { plugins };
+    }
+    async getPluginCapabilityReadiness(pluginName, options = {}) {
+        const system = this.options.system;
+        const read = () => evaluatePluginCapabilityReadiness(system.currentSnapshot, pluginName);
+        const initial = read();
+        if (initial.status !== 'loading')
+            return initial;
+        options.signal?.throwIfAborted();
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (result) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                unsubscribe();
+                options.signal?.removeEventListener('abort', onAbort);
+                result();
+            };
+            const onAbort = () => finish(() => reject(options.signal?.reason));
+            const unsubscribe = system.subscribeSnapshotChanges(() => {
+                const next = read();
+                if (next.status !== 'loading')
+                    finish(() => resolve(next));
+            });
+            const timer = setTimeout(() => finish(() => resolve(read())), options.timeoutMs ?? PLUGIN_CAPABILITY_READINESS_WAIT_MS);
+            options.signal?.addEventListener('abort', onAbort, { once: true });
+        });
     }
     async listEnabledPluginSkillSummaries() {
         const enabledPlugins = new Map(this.options.system.currentSnapshot.enabledPlugins.map((plugin) => [
@@ -496,7 +526,7 @@ export class PluginDesktopFacade {
         const snapshot = this.options.system.currentSnapshot;
         return {
             ...response,
-            plugins: response.plugins.map((plugin) => overlayOfficialSummary(plugin, installations, snapshot)),
+            plugins: response.plugins.map((plugin) => overlayOfficialSummary(plugin, installations, snapshot, this.options.system.forbiddenPluginNames)),
         };
     }
     async projectStandaloneSkillAdded(response) {
@@ -604,16 +634,16 @@ function installedSnapshotPage(items, filter, limit, offset) {
             : {}),
     };
 }
-function officialInstalledItems(states, filter, snapshot) {
-    return states.flatMap((state) => officialInstalledItem(state, filter, snapshot));
+function officialInstalledItems(states, filter, snapshot, forbiddenPluginNames) {
+    return states.flatMap((state) => officialInstalledItem(state, filter, snapshot, forbiddenPluginNames));
 }
-function officialInstalledItem({ installation, plugin }, filter, snapshot) {
+function officialInstalledItem({ installation, plugin }, filter, snapshot, forbiddenPluginNames) {
     if (!pluginMatchesKeyword([installation.name, plugin?.displayName, plugin?.description], filter)) {
         return [];
     }
-    return [toOfficialInstalledSummary(installation, plugin, snapshot)];
+    return [toOfficialInstalledSummary(installation, plugin, snapshot, forbiddenPluginNames)];
 }
-function toOfficialInstalledSummary(installation, plugin, snapshot) {
+function toOfficialInstalledSummary(installation, plugin, snapshot, forbiddenPluginNames) {
     return {
         name: installation.name,
         ...officialInstalledMetadata(installation, plugin),
@@ -622,7 +652,7 @@ function toOfficialInstalledSummary(installation, plugin, snapshot) {
         enabled: installation.enabled,
         installationPolicy: effectiveInstallationPolicy(installation),
         category: plugin ? categoryId(plugin.category) : MarketplaceCategory.OTHER,
-        ...officialIdentityFields(installation.name, snapshot),
+        ...officialIdentityFields(installation.name, snapshot, forbiddenPluginNames),
     };
 }
 function officialInstalledMetadata(installation, plugin) {
@@ -644,7 +674,7 @@ function officialInstalledCapabilities(plugin) {
         agentCount: plugin?.agents?.length ?? 0,
     };
 }
-function overlayOfficialSummary(summary, installations, snapshot) {
+function overlayOfficialSummary(summary, installations, snapshot, forbiddenPluginNames) {
     const installation = installations.find((item) => normalizedName(item.name) === normalizedName(summary.name));
     return {
         ...summary,
@@ -653,13 +683,16 @@ function overlayOfficialSummary(summary, installations, snapshot) {
         installationPolicy: installation
             ? effectiveInstallationPolicy(installation)
             : (summary.installationPolicy ?? PluginInstallationPolicy.USER_MANAGED),
-        ...officialIdentityFields(summary.name, snapshot),
+        ...officialIdentityFields(summary.name, snapshot, forbiddenPluginNames),
     };
 }
 /** An official Plugin always wins its name when enabled; otherwise it names the holder. */
-function officialIdentityFields(name, snapshot) {
+function officialIdentityFields(name, snapshot, forbiddenPluginNames) {
     return {
         marketplace: OFFICIAL_PLUGIN_MARKETPLACE,
+        ...(forbiddenPluginNames.has(normalizedName(name))
+            ? { unavailableReason: 'FORBIDDEN_BY_CONFIG' }
+            : {}),
         ...nameOwnerField({ name, marketplace: OFFICIAL_PLUGIN_MARKETPLACE }, nameHolder(snapshot, name)),
     };
 }
@@ -688,29 +721,6 @@ function localInstalledItems(snapshot, filter, states) {
             },
         ];
     });
-}
-/** Every installed PluginId is listed, including copies whose name another Plugin holds. */
-function localMarketplaceSummary(plugin, state) {
-    return {
-        name: plugin.id.name,
-        ...(plugin.version ? { version: plugin.version } : {}),
-        ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
-        ...(plugin.description ? { description: plugin.description } : {}),
-        ...(plugin.author ? { author: plugin.author } : {}),
-        ...optionalPluginIcon(plugin),
-        capabilities: {
-            appCount: plugin.plugin.apps.length,
-            mcpServerCount: plugin.plugin.mcpServers.length,
-            skillCount: plugin.plugin.skills.length,
-            hookCount: plugin.plugin.hooks?.length ?? 0,
-            agentCount: plugin.plugin.agents?.length ?? 0,
-        },
-        installExists: true,
-        enabled: plugin.enabled,
-        installationPolicy: PluginInstallationPolicy.USER_MANAGED,
-        category: categoryId(plugin.plugin.category),
-        ...installedSummaryFields(plugin, state),
-    };
 }
 function stateOf(states, id) {
     const state = states.get(pluginIdKey(id));
@@ -795,5 +805,25 @@ function pluginMatchesKeyword(texts, keyword) {
 }
 function normalizedName(value) {
     return value.trim().normalize('NFKC').toLocaleLowerCase('en-US');
+}
+/**
+ * Usable means: enabled in the published snapshot and none of its MCP servers
+ * still warming or failed to list. Tool bindings are not required (an MCP
+ * server may legitimately list zero tools). App tools come from host
+ * connectors and pure Skill Plugins only need enabling.
+ */
+function evaluatePluginCapabilityReadiness(snapshot, pluginName) {
+    const key = normalizedName(pluginName);
+    const owns = (name) => name !== undefined && normalizedName(name) === key;
+    if (!snapshot.enabledPlugins.some((plugin) => owns(plugin.name)))
+        return { status: 'loading' };
+    const diagnostics = snapshot.diagnostics.filter((diagnostic) => owns(diagnostic.pluginName));
+    const failedServers = diagnostics.flatMap((diagnostic) => diagnostic.code === 'MCP_SERVER_LIST_FAILED' ? [diagnostic.capabilityName ?? pluginName] : []);
+    if (failedServers.length > 0)
+        return { status: 'failed', failedServers };
+    if (diagnostics.some((diagnostic) => diagnostic.code === 'MCP_SERVER_WARMING')) {
+        return { status: 'loading' };
+    }
+    return { status: 'ready' };
 }
 //# sourceMappingURL=desktop-facade.js.map

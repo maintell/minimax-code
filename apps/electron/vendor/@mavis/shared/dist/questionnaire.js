@@ -1,5 +1,26 @@
 /** Shared expiry window for pending Questionnaire requests and Plan lifecycle fences. */
 export const QUESTIONNAIRE_TTL_MS = 24 * 60 * 60 * 1000;
+/** Card reply contract: one answer `{ stepId: STEP_ID, selectedOptionIds: [READY_OPTION_ID] }`. */
+export const PLUGIN_PREPARATION_STEP_ID = 'plugin-preparation';
+export const PLUGIN_PREPARATION_READY_OPTION_ID = 'ready';
+/**
+ * Official plugin readiness shared by Runtime discovery/verification and the
+ * preparation UI. An app needs connection unless its status is `connected`;
+ * without `requiredApps`, apps missing from the detail also need connection.
+ */
+export function getPluginPreparationReadiness(detail, requiredApps) {
+    if (!detail.summary.installExists)
+        return 'needs-install';
+    if (!detail.summary.enabled)
+        return 'needs-enable';
+    if (!requiredApps && detail.apps.length < detail.summary.capabilities.appCount) {
+        return 'needs-app-connection';
+    }
+    const apps = requiredApps
+        ? requiredApps.map((provider) => detail.apps.find((app) => app.provider === provider))
+        : detail.apps;
+    return apps.some((app) => app?.status !== 'connected') ? 'needs-app-connection' : 'ready';
+}
 /**
  * Steering producer id for an AskUser v2 answer steered into a running Turn.
  * It is machine delivery (never counts as new user input), but the answer is

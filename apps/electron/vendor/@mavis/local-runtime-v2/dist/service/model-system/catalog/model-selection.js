@@ -35,6 +35,21 @@ export function resolveLegacyMinimaxModel(config, selection) {
     ].find((candidate) => candidate !== undefined && listed.includes(candidate));
     return { providerId: 'minimax', modelId: modelId ?? selection.modelId };
 }
+/**
+ * A saved Agent-level model (for example Bunny's task model) that its official
+ * route no longer lists falls back to the same provider's delivered default,
+ * never to the Runtime default of another provider. `undefined` means the
+ * saved model is used as stored.
+ */
+export function resolveSavedAgentModelReplacement(config, selection) {
+    const outcome = resolveModelReplacement({
+        config,
+        providerId: selection.providerId,
+        modelId: selection.modelId,
+        preset: getRuntimePresetKey(),
+    });
+    return outcome.kind === 'replaced' ? outcome.model : undefined;
+}
 export const SELECTED_THINKING_EFFORT_CAPABILITY = 'selected_thinking_effort';
 export function readSelectedThinkingEffort(capabilities) {
     return readOptionalString(capabilities?.[SELECTED_THINKING_EFFORT_CAPABILITY]);

@@ -758,7 +758,9 @@ export class LocalPermissionFacade {
         for (const root of [dataDir, path.join(homedir(), '.minimax')]) {
             if (!root)
                 continue;
-            candidates.push(path.resolve(root, 'skills'), path.resolve(root, '.builtin-skills'));
+            candidates.push(path.resolve(root, 'skills'), path.resolve(root, '.builtin-skills'), 
+            // Saved run_code scripts, matching the read grant in fs-permission.
+            path.resolve(root, 'ptc'));
             if (agentName)
                 candidates.push(path.resolve(root, 'agents', agentName, 'skills'));
         }

@@ -1,7 +1,7 @@
 import { DEFAULT_COLLECTION_POLICY, parseCollectionPolicy } from "@mavis/shared/collection-policy";
 import { createCollectionPolicyMatcher } from "@mavis/shared/collection-policy/matcher";
 import { resolveSessionClioCaptureEnabled } from "@mavis/shared/session-clio";
-import { parseRunawayGuardOverride, parsePromptSuggestionRemotePolicy } from "@mavis/config";
+import { parseRunawayGuardOverride, parsePromptSuggestionRemotePolicy, parseBunnyRemotePolicy } from "@mavis/config";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
@@ -13,6 +13,7 @@ import { app, BrowserWindow } from "electron";
 import { resetConfig, getConfig, writeLocalRuntimeAuthContext, readLocalRuntimeAuthContext } from "@mavis/config";
 import * as ws_1 from "ws";
 import logger from "../../utils/logger";
+import { prepareDesktopMcodeToolsHostBinDir } from "../mcode-tools/host-bin-dir";
 import { DOMAIN_URL, IPC_CHANNELS } from "../../config/constants";
 import { resolveDesktopPromptConfigKey } from "../../config/prompt-config-key";
 import { buildEmbeddedBrowserToolAdapter } from "../browser/browser-tool-adapter";
@@ -26,7 +27,7 @@ import { resolveLocalRuntimeLaunchPlan } from "./test-data-isolation";
 import { pcm16LeToWav, consumeAmadeusAsrSse } from "./amadeus-asr";
 import { resolveAmadeusProxyBaseURL, issueAmadeusProxySessionToken, postAmadeusProxyWav } from "./asr-proxy-http";
 import { routeProjectRuntimeMediaRequest } from "../protocol/project-runtime-media";
-import { setUtilityRuntimeRoutingContext, ensureUtilityRuntimeStarted, getUtilityRuntimeStartupToken, stopUtilityRuntime, isUtilityRuntimeReady, getUtilityRuntimeTerminalFailure, getUtilityRuntimeFailReason, fetchViaUtilityRuntime, setUtilityRuntimeAuthContext, setUtilityRuntimeContextWindowUsageEnabled, setUtilityRuntimeRunawayGuardConfig, setUtilityRuntimePromptSuggestionPolicy, setUtilityRuntimeToolResultCompactionConfig, setUtilityRuntimeCollectionPolicy, registerUtilityRuntimeMainHooks } from "./utility";
+import { setUtilityRuntimeRoutingContext, ensureUtilityRuntimeStarted, getUtilityRuntimeStartupToken, stopUtilityRuntime, isUtilityRuntimeReady, getUtilityRuntimeTerminalFailure, getUtilityRuntimeFailReason, fetchViaUtilityRuntime, setUtilityRuntimeAuthContext, setUtilityRuntimeContextWindowUsageEnabled, setUtilityRuntimeRunawayGuardConfig, setUtilityRuntimePromptSuggestionPolicy, setUtilityRuntimeBunnyPolicy, setUtilityRuntimeToolResultCompactionConfig, setUtilityRuntimeBunnyContextConfig, setUtilityRuntimeCollectionPolicy, registerUtilityRuntimeMainHooks } from "./utility";
 export { ensureComputerUseUtilityStarted } from "./utility";
 
 export { releaseComputerUseLease } from "./utility";
@@ -53,7 +54,13 @@ let swimLaneListenerRegistered = false;
 let contextWindowUsageEnabled = true;
 let runawayGuardConfig = {};
 let promptSuggestionPolicy = {};
+/**
+ * Apollo Bunny rollout (default, UID allowlist, buckets); empty until a fetch
+ * succeeds, which leaves the build default (on outside prod, off in prod).
+ */
+let bunnyPolicy = {};
 let toolResultCompactionConfig = {};
+let bunnyContextConfig = {};
 /**
  * Effective collection policy. Seeded from the built-in policy, restored from
  * the persisted last-valid document on cold start, and only replaced by an
@@ -962,10 +969,20 @@ export function setLocalRuntimePromptSuggestionPolicy(value) {
     promptSuggestionPolicy = parsePromptSuggestionRemotePolicy(value);
     setUtilityRuntimePromptSuggestionPolicy(promptSuggestionPolicy);
 }
+/** Stores the validated Apollo Bunny rollout for live updates and Utility restarts. */
+export function setLocalRuntimeBunnyPolicy(value) {
+    bunnyPolicy = parseBunnyRemotePolicy(value, (message) => logger.warn(`[LocalRuntime] Bunny policy: ${message}`));
+    setUtilityRuntimeBunnyPolicy(bunnyPolicy);
+}
 /** Applies a validated, non-persistent Apollo threshold snapshot to the live Desktop runtime. */
 export function setLocalRuntimeToolResultCompactionConfig(value) {
     toolResultCompactionConfig = normalizeToolResultCompactionConfig(value);
     setUtilityRuntimeToolResultCompactionConfig(toolResultCompactionConfig);
+}
+/** Applies the non-persistent Apollo Bunny context switches to the live Desktop runtime. */
+export function setLocalRuntimeBunnyContextConfig(value) {
+    bunnyContextConfig = normalizeBunnyContextConfig(value);
+    setUtilityRuntimeBunnyContextConfig(bunnyContextConfig);
 }
 /**
  * Applies an Apollo collection-policy payload to the live Desktop runtime and
@@ -1048,6 +1065,23 @@ function normalizeToolResultCompactionConfig(value) {
         ...(maxInlineBytes !== undefined ? { maxInlineBytes } : {}),
         ...(mcpDetailsMaxInlineBytes !== undefined ? { mcpDetailsMaxInlineBytes } : {}),
         ...(checkpointSharedPrefix !== undefined ? { checkpointSharedPrefix } : {}),
+    };
+}
+/**
+ * Each switch is read on its own: only a real boolean survives, anything else leaves that
+ * switch at the runtime default (on), and keys this build does not know are dropped.
+ */
+function normalizeBunnyContextConfig(value) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value))
+        return {};
+    const record = value;
+    return {
+        ...(typeof record.background_compaction === 'boolean'
+            ? { backgroundCompaction: record.background_compaction }
+            : {}),
+        ...(typeof record.emergency_rebuild === 'boolean'
+            ? { emergencyRebuild: record.emergency_rebuild }
+            : {}),
     };
 }
 function kibToPositiveSafeBytes(value) {
@@ -1219,9 +1253,15 @@ registerUtilityRuntimeMainHooks({
     getContextWindowUsageEnabled: () => contextWindowUsageEnabled,
     getRunawayGuardConfig: () => runawayGuardConfig,
     getPromptSuggestionPolicy: () => promptSuggestionPolicy,
+    getBunnyPolicy: () => bunnyPolicy,
     getToolResultCompactionConfig: () => toolResultCompactionConfig,
+    getBunnyContextConfig: () => bunnyContextConfig,
     getCollectionPolicy: () => collectionPolicy,
     getStartupExecutionPolicy: () => startupExecutionPolicy,
+    // Same dataDir resolution as the mcode-tools integration, so the Runtime finds the launcher
+    // directory this App installs instead of the shared copy another package may have rewritten.
+    // The directory is handed over with fail-closed placeholders until the integration is ready.
+    getMcodeToolsHostBinDir: () => prepareDesktopMcodeToolsHostBinDir(resolveLocalRuntimeDataDir()),
     getAppVersion: () => app.getVersion(),
     // Resolved lazily (and only on the rare failure that renders prose to the
     // user): `utils/tool` reaches the desktop config through ipc/storage.ipc,

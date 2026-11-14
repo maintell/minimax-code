@@ -1,14 +1,15 @@
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { canonicalActiveHistoryRevision, canonicalHistoryRevision, inspectCanonicalHistorySequence, } from '../../../sessions/representation/canonical-history-contract.js';
+import { canonicalActiveHistoryRevision, copyCanonicalHistorySnapshotFile, inspectCanonicalHistorySequence, rewriteCanonicalHistorySnapshotFile, verifyCanonicalHistorySnapshotFile, } from '../../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../../sessions/representation/canonical-history.js';
 import { ensureCanonicalHistoryMaterialized, } from '../canonical-history-materializer.js';
-import { scanCanonicalHistoryArtifacts } from './canonical-history-scanner.js';
+import { assertPlannedLineage, scanCanonicalHistoryArtifacts, } from './canonical-history-scanner.js';
 import { createSessionHistoryLocationResolver, } from '../session-history-location.js';
 import { ensureResolvedSessionHistoryPaths, resolveSessionHistoryPaths, utcSessionHistoryRelativeDir, } from '../session-history-paths.js';
 import { decodeHistoryMutationStagingManifest, historyMutationStagingPaths, toHistoryMutationStagingManifest, } from './session-history-staging.js';
 import { createSessionHistoryIoLane, createSessionHistoryCompactionBarrier, } from './session-history-coordination.js';
-import { planRetractTurn, planSettleTurnTail, toTurnHistoryMutationCommit, validateRetractTurnInput, } from './session-turn-history-mutation.js';
+import { planRetractTurn, planSettleTurnTail, retractTurnArtifactIndex, toTurnHistoryMutationCommit, validateRetractTurnInput, } from './session-turn-history-mutation.js';
+export { canonicalHistoryRecordEntry, } from './canonical-history-scanner.js';
 const SNAPSHOT_NAME = /^g(\d{12})--[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$/u;
 /** SessionSystem owns validated publication of the physical canonical-history bundle. */
 export function createSessionHistoryMutationAdapter(options) {
@@ -22,11 +23,12 @@ export function createSessionHistoryMutationAdapter(options) {
     return {
         compactionBarrier,
         read: (sessionId) => ioLane.run(sessionId, () => read(sessionId)),
+        readSnapshotRecords: (sessionId, snapshot) => ioLane.run(sessionId, async () => (await snapshotReader(context, sessionId)).read(snapshot)),
         readFrozen: (sessionId, capture, signal) => compactionBarrier.run(sessionId, () => ioLane.run(sessionId, async () => {
             signal?.throwIfAborted();
             const frozen = await read(sessionId, false);
             signal?.throwIfAborted();
-            return capture(frozen);
+            return capture(frozen, await snapshotReader(context, sessionId));
         }), signal),
         stageUnpersisted: (input) => ioLane.run(input.target.sessionId, () => stageUnpersisted(context, input)),
         settleTurnTail: (input) => ioLane.run(input.sessionId, () => settleTurnTail(input)),
@@ -90,7 +92,11 @@ export function createSessionHistoryMutationAdapter(options) {
         if (resumed)
             return resumed;
         const history = await read(input.sessionId);
-        const plan = planRetractTurn(history, input);
+        const targetIndex = retractTurnArtifactIndex(history, input.turnId);
+        const targetSnapshot = history.snapshots[targetIndex];
+        const plan = planRetractTurn(history, input, targetSnapshot
+            ? await (await snapshotReader(context, input.sessionId)).read(targetSnapshot)
+            : undefined);
         if (plan.status === 'already-retracted') {
             return toTurnHistoryMutationCommit({
                 status: plan.status,
@@ -129,37 +135,42 @@ export function createSessionHistoryMutationAdapter(options) {
             deletedMessageIds: plan.deletedMessageIds,
         });
     }
+    /**
+     * A Rewind receipt holds only the new active history and a manifest naming the snapshots it
+     * keeps; snapshots never change after publication, so they stay where they are. A Fork stages
+     * nothing: publication copies the source snapshot files into the target.
+     */
     async function stage(input) {
         validatePlan(input.generation, input.active, input.snapshots);
+        assertPlannedLineage(input.generation, input.active, input.snapshots);
         const target = await requireSession(options, input.sessionId);
         const targetPaths = await locations.ensure(target);
-        const staging = await createStaging(targetPaths, input.operationId);
-        try {
-            await writeBundle(staging, input.active, input.snapshots);
-            const stagedScan = await scan(staging, input.sessionId);
-            if (stagedScan.orphans.length > 0 ||
-                stagedScan.catalog.activeGeneration !== input.generation) {
-                throw new Error('Staged canonical history generation is not reachable');
-            }
-            if (input.kind === 'rewind') {
+        const sourcePaths = input.kind === 'fork'
+            ? await locations.ensure(await requireSession(options, input.sourceSessionId))
+            : undefined;
+        if (input.kind === 'rewind') {
+            const staging = await createStaging(targetPaths, input.operationId);
+            try {
+                await writeStagedActive(files, staging.messages, input.active);
                 await writeFile(staging.manifest, JSON.stringify(toHistoryMutationStagingManifest(input)), {
                     encoding: 'utf8',
                     mode: 0o600,
                 });
             }
-        }
-        catch (error) {
-            await cleanup(staging);
-            throw error;
+            catch (error) {
+                await cleanup(staging);
+                throw error;
+            }
         }
         let published = false;
         return {
-            staging,
             publish: (publishOptions) => ioLane.run(input.sessionId, async () => {
                 if (published)
                     return;
                 if (input.kind === 'fork') {
-                    await publishFork(context, targetPaths, input);
+                    if (!sourcePaths)
+                        throw new Error('Fork source history location is missing');
+                    await publishFork(context, sourcePaths, targetPaths, input);
                     await observeForkCommittedBestEffort(options, input);
                 }
                 else {
@@ -168,8 +179,6 @@ export function createSessionHistoryMutationAdapter(options) {
                 }
                 published = true;
                 options.activity?.notify(input.sessionId);
-                if (input.kind === 'fork')
-                    await cleanup(staging);
             }),
         };
     }
@@ -202,18 +211,18 @@ async function readHistory({ files, locations, options }, sessionId, cleanupOrph
             };
         }
     }
-    const scanned = await scan(paths, sessionId);
+    const scanned = await scan(paths, sessionId, { collectEntries: true });
     if (cleanupOrphans)
         await cleanupOrphansBestEffort(paths, scanned.orphans);
-    const snapshots = await Promise.all(scanned.catalog.artifacts
+    const snapshots = scanned.catalog.artifacts
         .filter((artifact) => artifact.kind === 'snapshot')
         .sort((left, right) => left.generation - right.generation)
-        .map(async (artifact) => ({
+        .map((artifact) => ({
         generation: artifact.generation,
         fileName: artifact.fileName,
         revision: artifact.revision,
-        records: await files.readStrict(join(paths.snapshots, artifact.fileName)),
-    })));
+        entries: scanned.snapshotEntries?.get(artifact.fileName) ?? [],
+    }));
     return {
         activeGeneration: scanned.catalog.activeGeneration,
         active,
@@ -222,11 +231,16 @@ async function readHistory({ files, locations, options }, sessionId, cleanupOrph
         activeSettled: inspectCanonicalHistorySequence(active).status === 'settled',
     };
 }
-async function stageUnpersisted({ ioLane, options }, input) {
+async function stageUnpersisted(context, input) {
+    const { ioLane, options } = context;
     validatePlan(input.generation, input.active, input.snapshots);
     if (await options.sessions.get(input.target.sessionId)) {
         throw new Error('Unpersisted history target Session already exists');
     }
+    // Only archived generations are copied from the source; an empty lineage needs no source.
+    const sourcePaths = input.snapshots.length > 0
+        ? await context.locations.ensure(await requireSession(options, input.source.sessionId))
+        : undefined;
     const historyRelativeDir = input.target.historyRelativeDir ??
         utcSessionHistoryRelativeDir(input.target.sessionId, input.target.createdAtMs);
     const target = {
@@ -238,10 +252,20 @@ async function stageUnpersisted({ ioLane, options }, input) {
     await mkdir(dirname(paths.sessionDir), { recursive: true, mode: 0o700 });
     // Exclusive creation establishes ownership; never overwrite or clean up an existing directory.
     await mkdir(paths.sessionDir, { mode: 0o700 });
+    let targetRevision;
     try {
         ensureResolvedSessionHistoryPaths(paths, target);
-        await writeBundle(paths, input.active, input.snapshots);
+        const revisions = sourcePaths
+            ? await publishUnpersistedSnapshots(sourcePaths, paths, input)
+            : new Map();
+        const active = remapFirstRecordParent(input.active, revisions);
+        assertPlannedLineage(input.generation, active, input.snapshots.map((snapshot) => ({
+            ...snapshot,
+            revision: revisions.get(snapshot.revision) ?? snapshot.revision,
+        })));
+        await writeFile(paths.messages, jsonl(active), { encoding: 'utf8', mode: 0o600 });
         await validatePublished(paths, target.sessionId, input.generation, true);
+        targetRevision = canonicalActiveHistoryRevision(active);
     }
     catch (error) {
         await cleanup(paths);
@@ -249,6 +273,7 @@ async function stageUnpersisted({ ioLane, options }, input) {
     }
     return {
         historyRelativeDir,
+        targetRevision,
         rollback: () => ioLane.run(target.sessionId, async () => {
             if (await options.sessions.get(target.sessionId))
                 return;
@@ -301,19 +326,14 @@ async function resumeStagedRewind(context, input, resumeOptions = {}) {
         return undefined;
     const manifest = decodeHistoryMutationStagingManifest(raw, input);
     const active = await context.files.readActiveStrict(staging.messages);
-    const snapshots = await Promise.all(manifest.snapshots.map(async (snapshot) => ({
-        ...snapshot,
-        records: await context.files.readStrict(join(staging.snapshots, snapshot.fileName)),
-    })));
+    // Receipts from earlier versions also hold snapshot copies; publication verifies the
+    // Session's own snapshot files instead, so the copies are never read.
+    const snapshots = manifest.snapshots;
     validatePlan(manifest.generation, active, snapshots);
     if (canonicalActiveHistoryRevision(active) !== manifest.targetRevision) {
         throw new Error('Staged canonical history target revision changed');
     }
-    const stagedScan = await scan(staging, input.sessionId);
-    if (stagedScan.orphans.length > 0 ||
-        stagedScan.catalog.activeGeneration !== manifest.generation) {
-        throw new Error('Staged canonical history generation is not reachable');
-    }
+    assertPlannedLineage(manifest.generation, active, snapshots);
     const stageInput = {
         kind: 'rewind',
         sessionId: input.sessionId,
@@ -377,7 +397,7 @@ function decodeTurnRetractionReceipt(data, input) {
     }
     return deletedMessageIds.flatMap((messageId) => typeof messageId === 'string' ? [messageId] : []);
 }
-async function publishFork(context, paths, input) {
+async function publishFork(context, sourcePaths, paths, input) {
     const existing = await context.files.readTargetStrict(paths.messages);
     const expectedRevision = canonicalActiveHistoryRevision(input.active);
     const initializedEmptyTarget = existing?.length === 0;
@@ -387,13 +407,9 @@ async function publishFork(context, paths, input) {
         throw new Error('Fork target canonical history already contains a different revision');
     }
     await mkdir(paths.snapshots, { recursive: true, mode: 0o700 });
-    await Promise.all(input.snapshots.map(async (snapshot) => {
-        const path = join(paths.snapshots, snapshot.fileName);
-        const publication = await context.files.publishSnapshot(path, snapshot.records);
-        if (publication === 'already-exists') {
-            await assertSnapshotRevision(path, snapshot.revision);
-        }
-    }));
+    for (const snapshot of input.snapshots) {
+        await copyCanonicalHistorySnapshotFile(join(sourcePaths.snapshots, snapshot.fileName), join(paths.snapshots, snapshot.fileName), snapshot.revision);
+    }
     if (initializedEmptyTarget && input.active.length > 0) {
         await context.files.replaceActive(paths.messages, input.active);
     }
@@ -420,12 +436,26 @@ async function publishRewind(context, paths, input, publishOptions) {
         currentRevision !== nextRevision) {
         throw new Error('Canonical history revision changed before Rewind publication');
     }
-    await Promise.all(input.snapshots.map((snapshot) => assertSnapshotRevision(join(paths.snapshots, snapshot.fileName), snapshot.revision)));
+    await assertStagedRewindReachable(paths, input);
     if (currentRevision !== nextRevision) {
         await context.files.replaceActive(paths.messages, input.active);
     }
     await removeSnapshotsExcept(paths, new Set(input.snapshots.map((snapshot) => snapshot.fileName)));
     await validatePublished(paths, input.sessionId, input.generation, false);
+}
+/**
+ * Scans the staged active history against the Session's own snapshots before anything is
+ * replaced or removed. The scan streams one record at a time, so the retained lineage never
+ * sits in memory, and it must reach exactly the snapshots the plan keeps.
+ */
+async function assertStagedRewindReachable(paths, input) {
+    const { catalog } = await scan({ ...paths, messages: historyMutationStagingPaths(paths, input.operationId).messages }, input.sessionId);
+    const reached = catalog.artifacts.filter((artifact) => artifact.kind === 'snapshot');
+    if (catalog.activeGeneration !== input.generation ||
+        reached.length !== input.snapshots.length ||
+        input.snapshots.some((snapshot) => !reached.some((artifact) => artifact.fileName === snapshot.fileName && artifact.revision === snapshot.revision))) {
+        throw new Error('Staged canonical history generation is not reachable');
+    }
 }
 async function validatePublished(paths, sessionId, generation, cleanupUnexpected) {
     let published = await scan(paths, sessionId);
@@ -461,7 +491,7 @@ async function readOptionalFile(path) {
 }
 function containsMessage(snapshot, messageId) {
     return (snapshot.active.some((envelope) => envelope.message_id === messageId) ||
-        snapshot.snapshots.some((entry) => entry.records.some((envelope) => envelope.message_id === messageId)));
+        snapshot.snapshots.some((entry) => entry.entries.some((record) => record.messageId === messageId)));
 }
 async function observeRewindCommittedBestEffort(options, input) {
     try {
@@ -488,6 +518,7 @@ async function observeForkCommittedBestEffort(options, input) {
         // Report projection must never replace a committed canonical Fork.
     }
 }
+/** Snapshot revisions are verified against the files when they are published or copied. */
 function validatePlan(generation, active, snapshots) {
     if (!Number.isSafeInteger(generation) || generation < 0) {
         throw new Error('Invalid history generation');
@@ -495,30 +526,104 @@ function validatePlan(generation, active, snapshots) {
     if (new Set(snapshots.map((snapshot) => snapshot.generation)).size !== snapshots.length) {
         throw new Error('Duplicate snapshot generation');
     }
-    snapshots.forEach((snapshot) => {
-        const match = SNAPSHOT_NAME.exec(snapshot.fileName);
-        if (!match || Number(match[1]) !== snapshot.generation) {
-            throw new Error(`Invalid canonical snapshot identity: ${snapshot.fileName}`);
-        }
-        if (canonicalHistoryRevision(snapshot.records) !== snapshot.revision) {
-            throw new Error(`Canonical snapshot revision mismatch: ${snapshot.fileName}`);
-        }
-    });
+    snapshots.forEach(assertSnapshotIdentity);
     void canonicalActiveHistoryRevision(active);
 }
-async function writeBundle(paths, active, snapshots) {
-    await mkdir(paths.snapshots, { recursive: true, mode: 0o700 });
-    await writeFile(paths.messages, jsonl(active), { encoding: 'utf8', mode: 0o600 });
-    await Promise.all(snapshots.map((snapshot) => writeFile(join(paths.snapshots, snapshot.fileName), jsonl(snapshot.records), {
-        encoding: 'utf8',
-        mode: 0o600,
-    })));
-}
-async function assertSnapshotRevision(path, expectedRevision) {
-    const records = await createCanonicalHistoryFileAdapter().readStrict(path);
-    if (canonicalHistoryRevision(records) !== expectedRevision) {
-        throw new Error(`Canonical snapshot revision changed: ${path}`);
+/** A snapshot's file name must carry its generation before the name is joined to a path. */
+function assertSnapshotIdentity(snapshot) {
+    const match = SNAPSHOT_NAME.exec(snapshot.fileName);
+    if (!match || Number(match[1]) !== snapshot.generation) {
+        throw new Error(`Invalid canonical snapshot identity: ${snapshot.fileName}`);
     }
+}
+/** Writes the staged active history and reads it back strictly before it becomes a receipt. */
+async function writeStagedActive(files, path, active) {
+    await writeFile(path, jsonl(active), { encoding: 'utf8', mode: 0o600 });
+    const staged = await files.readActiveStrict(path);
+    if (canonicalActiveHistoryRevision(staged) !== canonicalActiveHistoryRevision(active)) {
+        throw new Error('Staged canonical history does not match its plan');
+    }
+}
+/**
+ * Copies each snapshot into a new Session in generation order, or rewrites its records when the
+ * caller rewrites messages. Returns the old-to-new revision of every rewritten snapshot.
+ */
+async function publishUnpersistedSnapshots(sourcePaths, paths, input) {
+    const revisions = new Map();
+    const rewriteMessage = input.source.rewriteMessage;
+    await mkdir(paths.snapshots, { recursive: true, mode: 0o700 });
+    const ordered = [...input.snapshots].sort((left, right) => left.generation - right.generation);
+    for (const snapshot of ordered) {
+        const sourcePath = join(sourcePaths.snapshots, snapshot.fileName);
+        const targetPath = join(paths.snapshots, snapshot.fileName);
+        if (!rewriteMessage) {
+            await copyCanonicalHistorySnapshotFile(sourcePath, targetPath, snapshot.revision);
+            continue;
+        }
+        const revision = await rewriteCanonicalHistorySnapshotFile({ path: sourcePath, revision: snapshot.revision }, targetPath, (record, index) => {
+            const rewritten = { ...record, message: rewriteMessage(record.message) };
+            return index === 0 ? remapParentRevision(rewritten, revisions) : rewritten;
+        });
+        revisions.set(snapshot.revision, revision);
+    }
+    return revisions;
+}
+function remapFirstRecordParent(records, revisions) {
+    const [first, ...rest] = records;
+    return first && revisions.size > 0 ? [remapParentRevision(first, revisions), ...rest] : records;
+}
+/** Points a generation marker at the rewritten revision of its parent snapshot. */
+function remapParentRevision(record, revisions) {
+    let copied = record;
+    const artifact = record.history_artifact;
+    if (artifact) {
+        const parent = artifact.parentSnapshot;
+        copied = {
+            ...copied,
+            history_artifact: {
+                ...artifact,
+                parentSnapshot: { ...parent, revision: revisions.get(parent.revision) ?? parent.revision },
+            },
+        };
+    }
+    const marker = record.message.archonCompaction;
+    if (isRecord(marker) && isRecord(marker.parentSnapshot)) {
+        const parent = marker.parentSnapshot;
+        if (typeof parent.revision === 'string') {
+            copied = {
+                ...copied,
+                message: {
+                    ...copied.message,
+                    archonCompaction: {
+                        ...marker,
+                        parentSnapshot: {
+                            ...parent,
+                            revision: revisions.get(parent.revision) ?? parent.revision,
+                        },
+                    },
+                },
+            };
+        }
+    }
+    return copied;
+}
+async function snapshotReader(context, sessionId) {
+    const session = await requireSession(context.options, sessionId);
+    const paths = await context.locations.ensure(session);
+    const forEach = async (snapshot, visit) => {
+        assertSnapshotIdentity(snapshot);
+        await verifyCanonicalHistorySnapshotFile(join(paths.snapshots, snapshot.fileName), snapshot.revision, visit);
+    };
+    return {
+        forEach,
+        read: async (snapshot) => {
+            const records = [];
+            await forEach(snapshot, (record) => {
+                records.push(record);
+            });
+            return records;
+        },
+    };
 }
 async function removeSnapshotsExcept(paths, retained) {
     const names = await readDirectoryIfPresent(paths.snapshots);
@@ -540,12 +645,12 @@ async function removeOrphans(paths, names) {
 async function cleanupOrphansBestEffort(paths, names) {
     await Promise.allSettled(names.map((name) => rm(join(paths.snapshots, name), { recursive: true, force: true })));
 }
-function scan(paths, sessionId) {
+function scan(paths, sessionId, options) {
     return scanCanonicalHistoryArtifacts({
         activePath: paths.messages,
         snapshotsPath: paths.snapshots,
         sessionId,
-    });
+    }, undefined, options);
 }
 async function cleanup(paths) {
     await rm(paths.sessionDir, { recursive: true, force: true });

@@ -14,7 +14,7 @@ import { fitsReminderInFinalRequest } from './reminder-admission.js';
  * comes from the registered tool object, never from a tool description.
  */
 export function createTodoCadenceReminderHook(usageAnchor, hasPtcChildTodoWrite = () => false) {
-    return (input) => {
+    return async (input) => {
         const todoWriteCallable = input.tools?.some((tool) => tool.name.toLowerCase() === 'todowrite') === true ||
             hasPtcChildTodoWrite(input.sessionId);
         if (!todoWriteCallable)

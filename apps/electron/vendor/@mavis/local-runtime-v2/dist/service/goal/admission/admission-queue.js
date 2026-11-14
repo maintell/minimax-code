@@ -1,6 +1,16 @@
 import { isContinuationStatus } from '@mavis/goal';
+import { isChannelQueueSource, } from '../../../infra/conversation/queue-source.js';
 import { firstGoalBlocker } from './blockers.js';
 import { isThreadGoalContinuationQueueItem, isThreadGoalKickoffQueueItem, readThreadGoalContinuationOrigin, readThreadGoalKickoffOrigin, } from '../continuation/kickoff.js';
+/**
+ * `ThreadGoalQueueItemIdentity.source` is a plain string because the Goal owner
+ * sees queue items from several producers, while `isChannelQueueSource` is typed
+ * to the narrower IM wire union. The predicate only tests the `channel:` prefix,
+ * so narrowing here is safe; an absent source is never a channel item.
+ */
+function isChannelQueuedItem(item) {
+    return item.source !== undefined && isChannelQueueSource(item.source);
+}
 /** Classify one queued item against the current Goal and ordered dependency gates. */
 export async function classifyThreadGoalQueueItem(item, hasPendingPlan, deps) {
     if (isThreadGoalKickoffQueueItem(item)) {
@@ -9,6 +19,17 @@ export async function classifyThreadGoalQueueItem(item, hasPendingPlan, deps) {
     if (isThreadGoalContinuationQueueItem(item)) {
         return classifyContinuationQueueItem(item, hasPendingPlan, deps);
     }
+    // An IM-channel message is the user's new instruction, not an answer: an IM
+    // user has no composer a question card replaces, and an IM ask_user always
+    // runs the legacy protocol, so an unresolved questionnaire must not park it.
+    // Same rule as the runtime queue selection in
+    // `application/session/runtime-queue-selection.ts`, which reaches this gate
+    // through `goals.classifyQueuedItem`. The questionnaire itself stays pending
+    // and stays answerable from the card, the buttons, the numbered reply or
+    // Desktop. Goal's own kickoff and continuation items are classified above and
+    // keep their blocker-based verdict.
+    if (isChannelQueuedItem(item))
+        return 'ready';
     if (await deps.gates.hasPendingQuestionnaire(item.sessionId)) {
         deps.emitQueueItemDeferred(item.sessionId, 'questionnaire_unresolved');
         return 'defer';

@@ -1,14 +1,22 @@
 import { createHash } from 'node:crypto';
 import { isSelfReminderId } from '@mavis/shared/cron-purpose';
+import { CRON_DEFINITION_DELETED, CRON_DEFINITION_DELETED_ERROR, CRON_DEFINITION_PAUSED, CRON_DEFINITION_PAUSED_ERROR, CRON_DELIVERY_RETRY_EXHAUSTED, CRON_DELIVERY_RETRY_EXHAUSTED_ERROR, CRON_RUN_EXPIRED, CRON_RUN_EXPIRED_ERROR, } from '../errors.js';
 const SESSION_CREATE_FAILED = 'SESSION_CREATE_FAILED';
 const SESSION_DELIVERY_FAILED = 'SESSION_DELIVERY_FAILED';
-const CRON_DEFINITION_DELETED = 'CRON_DEFINITION_DELETED';
 const PROCESS_RESTARTED = 'PROCESS_RESTARTED';
 const SESSION_CREATE_ERROR = 'Cron session creation failed';
 const SESSION_DELIVERY_ERROR = 'Cron session delivery failed';
-const CRON_DEFINITION_DELETED_ERROR = 'Cron definition was deleted before execution';
 const PROCESS_RESTARTED_ERROR = 'Cron run abandoned by a previous process';
 const MAX_BOUNDARY_ERROR_LENGTH = 256;
+/**
+ * A scheduled Run older than this is settled instead of delivered: the moment it was
+ * planned for is long gone, so waking a session with it is noise rather than a reminder.
+ * Mirrors the busy-queue TTL that already discards cron messages which waited too long
+ * (packages/agent-modules/cron/src/busy-queue.ts).
+ */
+const SCHEDULED_RUN_MAX_AGE_MS = 30 * 60 * 1_000;
+/** Backoff saturates at 30s per attempt; this bounds the whole retry chain (~2.5 min). */
+const MAX_DELIVERY_RETRY_ATTEMPTS = 8;
 const MIN_REQUEST_TEXT_FRAGMENT_LENGTH = 24;
 const TARGET_SESSION_FAILURE_MESSAGES = {
     CRON_SESSION_TARGET_NOT_FOUND: 'Cron target session was not found',
@@ -42,6 +50,9 @@ export class CronExecutor {
     constructor(deps) {
         this.deps = deps;
     }
+    targetsMainConversation(agentName) {
+        return this.deps.mainConversationAgents?.(agentName) === true;
+    }
     /**
      * 兼容调用方的脱离请求链路手动触发入口。同步检查 requestId 所有权，冲突会
      * 向调用方抛错；接纳后的后台执行结果记录在持久化 CronRun 终态中。
@@ -73,6 +84,8 @@ export class CronExecutor {
      * 留下一条必然失败的记录只会堆积在历史里。查询失败按未归档处理，交给执行时的会话校验。
      */
     async isTargetArchived(definition) {
+        if (this.targetsMainConversation(definition.agentName) && !isSelfReminderId(definition.cronId))
+            return false;
         const target = definition.sessionTarget;
         if (target.mode !== 'sessionId' || !target.sessionId)
             return false;
@@ -95,7 +108,7 @@ export class CronExecutor {
                 const definition = this.deps.definitions.getBySchedulerId(envelope.schedulerId);
                 if (!definition)
                     return undefined;
-                return this.deps.runs.insertPendingScheduled(definition.cronId, envelope.triggerId, this.deps.nowMs());
+                return this.deps.runs.insertPendingScheduled(definition.cronId, envelope.triggerId, this.deps.nowMs(), envelope.scheduledForMs);
             }, { behavior: 'immediate' });
             if (!run)
                 return { accepted: false, errorCode: 'CRON_NOT_FOUND' };
@@ -358,6 +371,11 @@ export class CronExecutor {
     async executePending(pending, settleReady, triggerMetric) {
         if (pending.status !== 'pending')
             return settlePrepared(settleReady, pending);
+        if ((pending.retryAttempt ?? 0) >= MAX_DELIVERY_RETRY_ATTEMPTS) {
+            // The retry budget is spent: settle instead of deferring again, so the failure is
+            // visible in the run history rather than retried every 30s forever.
+            return settlePrepared(settleReady, this.finishFailed(pending, CRON_DELIVERY_RETRY_EXHAUSTED, CRON_DELIVERY_RETRY_EXHAUSTED_ERROR, ''));
+        }
         if (pending.retryAtMs !== undefined && pending.retryAtMs > this.deps.nowMs()) {
             this.scheduleRetry(pending);
             return settlePrepared(settleReady, pending);
@@ -378,7 +396,20 @@ export class CronExecutor {
         let agentName = 'unknown';
         let outcome;
         try {
-            const executionInput = claimed.deliveryInput ?? currentExecutionInput(this.deps.definitions.get(claimed.cronId));
+            // A missed moment is not replayed: a scheduled Run whose planned time is long gone
+            // is settled here, before a session is created or a turn is admitted. Manual Runs
+            // are user-initiated and keep their existing behaviour.
+            if (isExpiredScheduledRun(claimed, this.deps.nowMs())) {
+                outcome = settlePrepared(settleReady, this.finishFailed(claimed, CRON_RUN_EXPIRED, CRON_RUN_EXPIRED_ERROR, ''));
+                return outcome;
+            }
+            // A retry reuses its frozen snapshot rather than the current definition, but a
+            // definition deleted or cancelled since then withdraws the delivery: settle the
+            // Run here, before the session would admit a turn only to have it rejected.
+            const definition = this.deps.definitions.get(claimed.cronId);
+            const executionInput = definition
+                ? (claimed.deliveryInput ?? currentExecutionInput(definition))
+                : undefined;
             if (!executionInput) {
                 outcome = settlePrepared(settleReady, this.finishFailed(claimed, CRON_DEFINITION_DELETED, CRON_DEFINITION_DELETED_ERROR, ''));
                 return outcome;
@@ -387,14 +418,19 @@ export class CronExecutor {
             let sessionId;
             try {
                 sessionId =
-                    claimed.sessionId ?? (await this.createExecutionSession(claimed, executionInput));
+                    this.targetsMainConversation(executionInput.agentName) &&
+                        !isSelfReminderId(claimed.cronId)
+                        ? await this.createExecutionSession(claimed, executionInput)
+                        : (claimed.sessionId ?? (await this.createExecutionSession(claimed, executionInput)));
             }
             catch (error) {
                 const failure = targetSessionFailure(error);
                 outcome = settlePrepared(settleReady, this.finishFailed(claimed, failure.code, failure.message, ''));
                 return outcome;
             }
-            if (!this.deps.runs.attachSession(claimed.runId, sessionId, executionInput)) {
+            if (!this.deps.runs.attachSession(claimed.runId, sessionId, executionInput, {
+                replaceSession: this.targetsMainConversation(executionInput.agentName),
+            })) {
                 outcome = settlePrepared(settleReady, this.resolveConflict(claimed, 'session-attach-conflict', 'pending'));
                 return outcome;
             }
@@ -419,6 +455,9 @@ export class CronExecutor {
         return this.requireRun(run.runId);
     }
     deferDelivery(run) {
+        if ((run.retryAttempt ?? 0) >= MAX_DELIVERY_RETRY_ATTEMPTS) {
+            return this.finishFailed(run, CRON_DELIVERY_RETRY_EXHAUSTED, CRON_DELIVERY_RETRY_EXHAUSTED_ERROR, '');
+        }
         const delay = Math.min(30_000, 1_000 * 2 ** Math.min(run.retryAttempt ?? 0, 5));
         if (!this.deps.runs.deferDelivery(run.runId, this.deps.nowMs() + delay)) {
             return this.resolveConflict(run, 'terminal-conflict', 'pending');
@@ -440,8 +479,9 @@ export class CronExecutor {
         });
         const sessionId = requireSessionId(created.sessionId);
         const pendingFixedTarget = executionInput.sessionTarget.mode === 'sessionId' && !executionInput.sessionTarget.sessionId;
-        if (!pendingFixedTarget)
+        if (this.targetsMainConversation(executionInput.agentName) || !pendingFixedTarget) {
             return sessionId;
+        }
         return this.bindPendingFixedSession(claimed.cronId, sessionId);
     }
     async bindPendingFixedSession(cronId, createdSessionId) {
@@ -475,6 +515,7 @@ export class CronExecutor {
     scheduleRetry(run) {
         if (this.closed || this.retryTimers.has(run.runId))
             return;
+        // Re-enqueue even at the retry limit so executePending can settle the run.
         const delay = Math.max(1, (run.retryAtMs ?? this.deps.nowMs()) - this.deps.nowMs());
         const timer = setTimeout(() => {
             this.retryTimers.delete(run.runId);
@@ -494,7 +535,27 @@ export class CronExecutor {
             this.deps.lifecycle.retireFinishedSelfReminders(this.deps.nowMs(), target.sessionId);
         });
     }
+    /**
+     * Whether this run lands in a conversation that already exists instead of one the run creates.
+     *
+     * Mirrors the reuse branch in `session-creation.adapter.ts`: a bound fixed target resolves an
+     * existing Session, while an unbound one still creates its first conversation and binds it
+     * afterwards. A main-conversation schedule resolves the Agent's Root conversation, which also
+     * already exists. Self reminders stay on the fixed-target path so their own conversation wins.
+     */
+    deliversIntoExistingConversation(executionInput, cronId) {
+        if (this.targetsMainConversation(executionInput.agentName) && !isSelfReminderId(cronId)) {
+            return true;
+        }
+        const target = executionInput.sessionTarget;
+        return target.mode === 'sessionId' && (target.sessionId?.trim() ?? '') !== '';
+    }
     async deliver(executionInput, pending, sessionId) {
+        // A conversation the user already owns keeps its own model: the definition neither overrides
+        // this run nor leaves a different one behind. Only a conversation the run creates takes it.
+        const model = this.deliversIntoExistingConversation(executionInput, pending.cronId)
+            ? undefined
+            : executionInput.model;
         try {
             return await this.deps.delivery.deliver({
                 cronId: pending.cronId,
@@ -503,10 +564,29 @@ export class CronExecutor {
                 agentName: executionInput.agentName,
                 cronName: executionInput.cronName,
                 text: executionInput.prompt,
-                ...(executionInput.model === undefined ? {} : { model: executionInput.model }),
+                ...(model === undefined ? {} : { model }),
                 beforeDelivery: async () => {
-                    if (!this.deps.definitions.get(pending.cronId)) {
+                    const current = this.deps.definitions.get(pending.cronId);
+                    // A soft-deleted definition withdraws every Run, manual included.
+                    if (!current) {
                         throw new CronExecutionError(CRON_DEFINITION_DELETED, CRON_DEFINITION_DELETED_ERROR);
+                    }
+                    // A manual Run is the user pressing "run now": pausing the schedule must not
+                    // take that away. Only the missing-definition check above applies to it.
+                    if (pending.triggerSource !== 'scheduled')
+                        return;
+                    const job = this.deps.scheduler.get(current.schedulerId);
+                    if (!job) {
+                        throw new CronExecutionError(CRON_DEFINITION_DELETED, CRON_DEFINITION_DELETED_ERROR);
+                    }
+                    // Pausing must also stop a first delivery already in flight: the definition is
+                    // still there, but its schedule was cancelled after this Run was admitted.
+                    // Only an explicit cancel fences the delivery. 'completed' and 'expired' are how
+                    // a schedule ends its own life: Scheduler.trigger marks a once job, or a recurring
+                    // job that reached maxRuns, 'completed' BEFORE it invokes the handler, so the Run
+                    // that firing produced must still be delivered.
+                    if (job.state === 'cancelled') {
+                        throw new CronExecutionError(CRON_DEFINITION_PAUSED, CRON_DEFINITION_PAUSED_ERROR);
                     }
                 },
             });
@@ -641,6 +721,17 @@ function requireSessionId(value) {
         throw new TypeError('Cron session creation returned an invalid sessionId');
     }
     return sessionId;
+}
+function isExpiredScheduledRun(run, nowMs) {
+    if (run.triggerSource !== 'scheduled')
+        return false;
+    // Compare against the moment the firing was planned for. createdAtMs is when the Run row
+    // was written, which for a machine that slept is already hours after the planned moment,
+    // so measuring age from it can never detect a missed window. Rows written before
+    // scheduled_for_ms existed carry NULL: fall back to createdAtMs so an upgrade never
+    // mass-expires history that is already in flight.
+    const plannedAtMs = run.scheduledForMs ?? run.createdAtMs;
+    return nowMs - plannedAtMs >= SCHEDULED_RUN_MAX_AGE_MS;
 }
 function executionMetricResult(run) {
     if (run?.status === 'delivered')

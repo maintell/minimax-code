@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
+import { resolveAbeBrokerBinary } from "./abe-broker-connector";
 const MAX_SECRET_OUTPUT_BYTES = 1024 * 1024;
 const MAX_LOCAL_STATE_BYTES = 16 * 1024 * 1024;
 const MAC_KEYCHAIN_TIMEOUT_MS = 120000;
@@ -118,12 +119,34 @@ function powershellExecutable(environment = process.env) {
         ? path.join(environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
         : 'powershell.exe';
 }
-export function windowsDpapiUnprotect(encrypted, signal) {
+export class WindowsDpapiError extends Error {
+    constructor(message, options) {
+        super(message);
+        this.name = 'WindowsDpapiError';
+        if (options?.exitCode !== undefined)
+            this.exitCode = options.exitCode;
+        if (options?.win32Code !== undefined)
+            this.win32Code = options.win32Code;
+    }
+}
+
+export function windowsDpapiUnprotect(encrypted, signal, options = {}) {
     return new Promise((resolve, reject) => {
-        const encodedScript = Buffer.from(WINDOWS_DPAPI_SCRIPT, 'utf16le').toString('base64');
-        const child = spawn(powershellExecutable(), ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodedScript], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], signal });
+        const resolveBroker = options.resolveBrokerBinary ?? resolveAbeBrokerBinary;
+        const brokerBinary = resolveBroker(options.binaryPath);
+        const executable = brokerBinary ?? powershellExecutable();
+        const args = brokerBinary
+            ? ['--dpapi-unprotect']
+            : ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_DPAPI_SCRIPT];
+        const child = spawn(executable, args, {
+            windowsHide: true,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            signal,
+        });
         const stdout = [];
+        const stderr = [];
         let outputBytes = 0;
+        let stderrBytes = 0;
         let settled = false;
         const finish = (error, value) => {
             if (settled)
@@ -137,23 +160,34 @@ export function windowsDpapiUnprotect(encrypted, signal) {
         };
         const timeout = setTimeout(() => {
             child.kill();
-            finish(new Error('DPAPI helper timed out'));
+            finish(new WindowsDpapiError('DPAPI helper timed out'));
         }, WINDOWS_DPAPI_TIMEOUT_MS);
         child.stdout.on('data', (chunk) => {
             outputBytes += chunk.length;
             if (outputBytes > MAX_SECRET_OUTPUT_BYTES) {
                 child.kill();
-                finish(new Error('DPAPI output exceeded the size limit'));
+                finish(new WindowsDpapiError('DPAPI output exceeded the size limit'));
                 return;
             }
             stdout.push(chunk);
         });
-        child.stderr.resume();
+        child.stderr.on('data', (chunk) => {
+            if (stderrBytes >= 4096)
+                return;
+            const slice = chunk.subarray(0, 4096 - stderrBytes);
+            stderr.push(slice);
+            stderrBytes += slice.length;
+        });
         child.stdin.on('error', (error) => finish(error));
         child.once('error', (error) => finish(error));
         child.once('close', (code) => {
             if (code !== 0) {
-                finish(new Error(`DPAPI helper failed with exit code ${code}`));
+                const detail = Buffer.concat(stderr).toString('utf8');
+                const win32Match = /win32=(\d+)/.exec(detail);
+                finish(new WindowsDpapiError(`DPAPI helper failed with exit code ${code}`, {
+                    ...(typeof code === 'number' ? { exitCode: code } : {}),
+                    ...(win32Match ? { win32Code: Number(win32Match[1]) } : {}),
+                }));
                 return;
             }
             try {

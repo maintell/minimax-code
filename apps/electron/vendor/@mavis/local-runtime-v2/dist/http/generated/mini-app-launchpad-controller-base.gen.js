@@ -1,5 +1,10 @@
 import { NotImplementedError } from '../errors.js';
 export class MiniAppLaunchpadControllerBase {
+    async ensureMiniAppHostSession(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('ensureMiniAppHostSession');
+    }
     async suggestMiniAppCreationIdeas(ctx, req) {
         void ctx;
         void req;

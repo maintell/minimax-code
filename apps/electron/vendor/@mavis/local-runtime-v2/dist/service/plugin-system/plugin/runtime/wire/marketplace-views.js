@@ -1,6 +1,6 @@
 import { formatPluginId, isBuiltInPluginMarketplace, LOCAL_PLUGIN_MARKETPLACE, OFFICIAL_PLUGIN_MARKETPLACE, pluginIdKey, } from '@mavis/shared';
-import { PluginMarketplaceSourceKind, } from '@mavis/thrift-gen/generated/desktop-service/types';
-import { categoryId, pluginPackageDetail, pluginPackageSummary } from './package-views.js';
+import { PluginMarketplaceSourceKind, PluginInstallationPolicy, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { categoryId, optionalPluginIcon, pluginPackageDetail, pluginPackageSummary, } from './package-views.js';
 /** official and local come first: not removable, not user-upgradable, no catalog count. */
 export function builtInMarketplaces() {
     return [
@@ -119,8 +119,31 @@ export function catalogEntryDetail(entry, overlay) {
         : { apps: [], mcpServers: [], skills: [], exampleQueries: [] };
     return { ...detail, summary, dependencies: [...entry.dependencies] };
 }
+/** Every installed PluginId is listed, including copies whose name another Plugin holds. */
+export function localMarketplaceSummary(plugin, state) {
+    return {
+        name: plugin.id.name,
+        ...(plugin.version ? { version: plugin.version } : {}),
+        ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
+        ...(plugin.description ? { description: plugin.description } : {}),
+        ...(plugin.author ? { author: plugin.author } : {}),
+        ...optionalPluginIcon(plugin),
+        capabilities: {
+            appCount: plugin.plugin.apps.length,
+            mcpServerCount: plugin.plugin.mcpServers.length,
+            skillCount: plugin.plugin.skills.length,
+            hookCount: plugin.plugin.hooks?.length ?? 0,
+            agentCount: plugin.plugin.agents?.length ?? 0,
+        },
+        installExists: true,
+        enabled: plugin.enabled,
+        installationPolicy: PluginInstallationPolicy.USER_MANAGED,
+        category: categoryId(plugin.plugin.category),
+        ...installedSummaryFields(plugin, state),
+    };
+}
 /** Summary fields of an installed LOCAL Plugin; `has_local_changes` is installed-list only. */
-export function installedSummaryFields(installed, state) {
+function installedSummaryFields(installed, state) {
     const fields = installedIdentityFields(installed, state);
     return {
         marketplace: fields.marketplace,

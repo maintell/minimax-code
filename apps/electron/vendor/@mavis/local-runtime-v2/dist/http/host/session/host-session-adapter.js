@@ -19,15 +19,16 @@ function hostRemoteSessions(host) {
     }
     return reader;
 }
-/** Session 工具共用 Host 的等待图，消息和生命周期均进入同一 Conversation owner。 */
+/** Session 工具的消息和生命周期均进入同一 Conversation owner。 */
 export function buildHostMavisSessionAdapter(host, conversation, serializers) {
     return buildMavisSessionAdapter({
         remoteSessions: hostRemoteSessions(host),
         ...(host.metricsClient ? { metrics: host.metricsClient } : {}),
         conversation,
-        sessionSendWaitGraph: host.sessionSendWaitGraph,
+        assignmentTools: host.assignmentTools,
+        coordinationOf: (agentName) => host.coordinatorRoster?.coordinationOf(agentName),
         subSessionRoundAttribution: () => host.subSessionRoundAttribution,
-        ...(host.composerSendBehavior ? { getComposerSendBehavior: host.composerSendBehavior } : {}),
+        turnOwnedByOtherRuntime: async (sessionId) => (await host.isTurnOwnedByOtherRuntime?.(sessionId)) === true,
         listAllSessions: (agentName, options) => host.listAllSessions(agentName, options),
         getSessionById: (sessionId) => host.getSessionById(sessionId),
         ...serializers,

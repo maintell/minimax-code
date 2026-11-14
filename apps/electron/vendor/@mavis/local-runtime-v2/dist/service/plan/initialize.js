@@ -1,4 +1,5 @@
 import { planModeExtension } from '@mavis/agent-extension';
+import { OwnedActionDeferredError, } from '../questionnaire/index.js';
 import { QUESTIONNAIRE_TTL_MS } from '@mavis/shared/questionnaire';
 import { createPlanAdmissionPolicy, createPlanLifecycleAdmissionFence, hasAnyPendingQuestionnaire, } from './questionnaire/admission.js';
 import { createPlanApplication } from './application.js';
@@ -45,7 +46,11 @@ export function initializePlanService(options) {
             });
         },
         dispatchQueue: options.dispatchQueue,
-        reportFailure: options.reportFailure,
+        // A ready plugin card waiting for the active Turn still retries, without alerting.
+        reportFailure: (error) => {
+            if (!(error instanceof OwnedActionDeferredError))
+                options.reportFailure(error);
+        },
     });
     const questionnaireActionHandler = createPlanQuestionnaireActionHandler({
         application,

@@ -1,10 +1,10 @@
+import { trustedPreviewHost, validPreviewTarget, validPreviewBounds } from "./preview-host-guard";
 import { getDesktopConfig } from "./storage.ipc";
-import { BrowserWindow, ipcMain, nativeImage, clipboard } from "electron";
+import { ipcMain, BrowserWindow, nativeImage, clipboard } from "electron";
 import { withTimeout, BROWSER_TIMEOUTS, browserOperationFailure } from "@mavis/browser-core";
 import { LOCAL_DESKTOP_RUNTIME_ID } from "@mavis/shared/desktop-runtime";
 import { getActiveShortcutOverrides } from "@mavis/shared/keyboard-shortcuts";
-import { isDev } from "../config";
-import { DEV_SERVER_URL, IPC_CHANNELS } from "../config/constants";
+import { IPC_CHANNELS } from "../config/constants";
 import { isBrowserPreviewScope, isBrowserPreviewLayout, isBrowserDevicePreviewRequest } from "@mavis/shared/browser-device-preview";
 import { getEmbeddedBrowserManager, openEmbeddedBrowserExternally } from "../modules/browser/embedded-browser-manager";
 import { normalizeCommentKeys, normalizeCommentRevisions, validateCommentKey } from "../modules/browser/embedded-browser-manager-helpers";
@@ -80,37 +80,6 @@ function normalizeBrowserTarget(value) {
 function normalizeDestroyParams(value) {
     return normalizeBrowserTarget(value);
 }
-function trustedPreviewHost(event) {
-    if (event.sender.isDestroyed() ||
-        !event.senderFrame ||
-        event.senderFrame !== event.sender.mainFrame)
-        return false;
-    const owner = BrowserWindow.fromWebContents(event.sender);
-    if (!owner || owner.isDestroyed() || owner.webContents.id !== event.sender.id)
-        return false;
-    try {
-        const url = new URL(event.sender.getURL());
-        if (url.pathname !== '/archon' && url.pathname !== '/archon/')
-            return false;
-        return isDev
-            ? url.origin === new URL(DEV_SERVER_URL).origin
-            : url.protocol === 'app:' && url.hostname === '.';
-    }
-    catch {
-        return false;
-    }
-}
-function validPreviewTarget(value) {
-    if (!value || typeof value !== 'object')
-        return false;
-    const raw = value;
-    return (typeof raw.sessionId === 'string' &&
-        raw.sessionId.length > 0 &&
-        raw.sessionId.length <= 256 &&
-        typeof raw.tabId === 'number' &&
-        Number.isSafeInteger(raw.tabId) &&
-        raw.tabId > 0);
-}
 function validPreviewLayoutRequest(event, bounds, params) {
     const raw = params;
     if (raw?.previewLayout === undefined)
@@ -119,13 +88,7 @@ function validPreviewLayoutRequest(event, bounds, params) {
         validPreviewTarget(params) &&
         isBrowserPreviewScope(raw.previewScope) &&
         (raw.previewLayout === null || isBrowserPreviewLayout(raw.previewLayout)) &&
-        Boolean(bounds) &&
-        ['x', 'y', 'width', 'height'].every((key) => {
-            const value = bounds[key];
-            return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 30000;
-        }) &&
-        bounds.width > 0 &&
-        bounds.height > 0);
+        validPreviewBounds(bounds));
 }
 function normalizeDevicePreviewMode(value) {
     return value === 'responsive' ||

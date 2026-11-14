@@ -1,6 +1,8 @@
 import { createBashTool, createEditTool, createReadTool, createWriteTool, } from '@earendil-works/pi-coding-agent/tools';
 import { createBashEnvSpawnHook, resolveBashEnvPolicy } from '../bash-subprocess-env.js';
 import { isTurnTerminatingToolResultDetails } from '../tools/turn-termination.js';
+import { toolResultIsError } from '../tools/result-error.js';
+import { steerInterruptibleSignal } from '../tools/steer-interruption.js';
 export function newTools(cwd, bound, ctx, options = {}) {
     const seen = new Set();
     const out = [];
@@ -39,12 +41,15 @@ export function setToolHooks(agent, turn) {
     const sourceByToolName = new Map(turn.tools
         .map((tool) => [tool.name, readRuntimeToolSource(tool)])
         .filter((entry) => entry[1] !== undefined));
-    for (const tool of turn.input.toolConfig.ptcTools ?? []) {
+    for (const tool of [
+        ...(turn.input.toolConfig.ptcTools ?? []),
+        ...(turn.input.toolConfig.deferredTools ?? []),
+    ]) {
         if (tool.source === undefined)
             continue;
         const existing = sourceByToolName.get(tool.def.name);
         if (existing !== undefined && existing !== tool.source) {
-            throw new Error(`PiTurnRunner: conflicting source for PTC tool '${tool.def.name}'`);
+            throw new Error(`PiTurnRunner: conflicting source for hidden tool '${tool.def.name}'`);
         }
         if (existing !== undefined)
             continue;
@@ -115,15 +120,21 @@ export function newRuntimeTool(b, ctx, readAssistantMessageId, observer) {
                 toolCallId,
                 ...(assistantMessageId ? { assistantMessageId } : {}),
             };
+            const steering = b.def.interruptOnSteer ? callCtx.userSteering : undefined;
+            const settled = steering ? new AbortController() : undefined;
+            const toolSignal = steering && settled ? steerInterruptibleSignal(signal, steering, settled.signal) : signal;
             let result;
             try {
-                result = await b.impl.execute(callCtx, input, signal, onUpdate);
+                result = await b.impl.execute(callCtx, input, toolSignal, onUpdate);
             }
             catch (error) {
                 // Pi keeps only the message of a thrown error; PTC may still need the
                 // raw protocol error attached to it. The error propagates unchanged.
                 observer?.onError(error);
                 throw error;
+            }
+            finally {
+                settled?.abort();
             }
             observer?.onResult(result);
             // `programmatic` is intentionally dropped here: model calls never carry it.
@@ -142,8 +153,7 @@ export function newRuntimeTool(b, ctx, readAssistantMessageId, observer) {
  * executor can tell the tool's own error state from one a hook changed.
  */
 export function runtimeToolResultIsError(result) {
-    const details = toolResultDetails(result.details, result.isError);
-    return details.is_error === true || details.ok === false;
+    return toolResultIsError(result);
 }
 function readRuntimeToolSource(tool) {
     const source = tool.source;
@@ -196,7 +206,8 @@ function toolResultErrorPatch(context) {
     if (context.isError || !isRecord(context.result?.details)) {
         return undefined;
     }
-    return context.result.details.is_error === true || context.result.details.ok === false
+    // Pi reported no error: the details decide, by the rule every host shares.
+    return toolResultIsError({ details: context.result.details })
         ? { isError: true, isErrorOrigin: 'tool' }
         : undefined;
 }

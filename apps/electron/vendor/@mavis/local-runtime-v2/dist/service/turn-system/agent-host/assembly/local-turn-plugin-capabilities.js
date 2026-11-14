@@ -268,6 +268,8 @@ function mergeTools(input) {
         options: input.options,
         alwaysExpose: true,
         ...(input.ptc ? { ptc: true } : {}),
+        ...(input.window ? { window: input.window } : {}),
+        ...(input.onToolSearch ? { onToolSearch: input.onToolSearch } : {}),
     });
 }
 function replaceMcpInvoke(tools, hostReferences) {

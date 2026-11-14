@@ -1,3 +1,4 @@
+import { AGENT_PROFILE_COORDINATION_KEY, readAgentCoordinationConfig, } from '@mavis/shared/agent-coordination';
 export function createLocalTurnToolCatalogInput(context, desktopCapabilities) {
     const modelCapabilities = readModelCapabilities(context.model);
     const builtinCapabilities = readBuiltinCapabilities(context.agentConfig);
@@ -13,12 +14,22 @@ export function createLocalTurnToolCatalogInput(context, desktopCapabilities) {
         llmModel: readResolvedModel(context.model),
         effectivePluginSkills: readEffectivePluginSkills(context.agentConfig),
         ...(context.userInput ? { userText: context.userInput.text } : {}),
-        // The Session mode alone: the prompt prefix must not change with what started the Turn.
-        ...(context.agentConfig.ptc_enabled === true ? { ptcEnabled: true } : {}),
+        ...readTurnBindings(context.agentConfig),
         ...(modelCapabilities ? { modelCapabilities } : {}),
         ...(agentProfile ? { agentProfile } : {}),
         ...(desktopCapabilities ? { desktopCapabilities } : {}),
         ...(context.history.length === 0 ? { sessionFirstTurn: true } : {}),
+    };
+}
+/** Frozen per-Turn facts of the built AgentConfig that decide what this catalog offers. */
+function readTurnBindings(agentConfig) {
+    return {
+        // The Session mode alone: the prompt prefix must not change with what started the Turn.
+        ...(agentConfig.ptc_enabled === true ? { ptcEnabled: true } : {}),
+        ...(readAdvisorBinding(agentConfig.advisor) ? { advisorBound: true } : {}),
+        // A lightweight root sends no tools, so no Tool Search notice has anything to explain.
+        ...(agentConfig.lightweightRoot === true ? { commitWindow: false } : {}),
+        ...(agentConfig.isDefaultWorkspace === true ? { isDefaultWorkspace: true } : {}),
     };
 }
 function readEffectivePluginSkills(agentConfig) {
@@ -39,19 +50,21 @@ function readBuiltinCapabilities(agentConfig) {
         ? value
         : undefined;
 }
-function readAgentProfile(config) {
+/** The Agent profile facts the tool catalog gates on, read from a built AgentConfig. */
+export function readAgentProfile(config) {
     const ceiling = readRecord(config.capability_ceiling);
     const features = readRecord(ceiling.features);
     if (!hasValidCapabilityCeiling(ceiling, features))
         return undefined;
     const profile = readRecord(config.agent_profile);
-    const { trustedBuiltin, canonicalViewName } = readTrustedBuiltinAgentProfileIdentity(profile);
+    const { trustedBuiltin, canonicalViewName, coordination } = readTrustedBuiltinAgentProfileIdentity(profile);
     const configSelection = readConfigSelection(profile);
     return {
         capabilityCeiling: toCapabilityCeiling(ceiling, features),
         ...agentProfileResourceFacts(profile),
         ...agentProfileIdentityFacts(profile, canonicalViewName, trustedBuiltin),
         trustedBuiltin,
+        ...(coordination ? { coordination } : {}),
         ...agentProfileMemoryFacts(profile),
         ...(configSelection ? { configSelection } : {}),
     };
@@ -120,14 +133,23 @@ function hasValidCapabilityCeiling(ceiling, features) {
 export function readTrustedBuiltinAgentProfileIdentity(value) {
     const profile = readRecord(value);
     const canonicalViewName = readString(profile, 'canonical_view_name');
+    const trustedBuiltin = typeof profile.trusted_builtin === 'boolean'
+        ? profile.trusted_builtin
+        : profile.creation_source === 'builtin' &&
+            (profile.provenance_source === 'builtin' ||
+                profile.provenance_source === 'legacy-read-through');
+    const coordination = trustedBuiltin
+        ? readAgentCoordinationConfig(profile[AGENT_PROFILE_COORDINATION_KEY])
+        : undefined;
     return {
-        trustedBuiltin: typeof profile.trusted_builtin === 'boolean'
-            ? profile.trusted_builtin
-            : profile.creation_source === 'builtin' &&
-                (profile.provenance_source === 'builtin' ||
-                    profile.provenance_source === 'legacy-read-through'),
+        trustedBuiltin,
         ...(canonicalViewName ? { canonicalViewName } : {}),
+        ...(coordination ? { coordination } : {}),
     };
+}
+/** Coordinator capabilities frozen into this Turn's trusted Agent profile. */
+export function readTrustedAgentCoordination(agentConfig) {
+    return readTrustedBuiltinAgentProfileIdentity(agentConfig.agent_profile).coordination;
 }
 function toCapabilityCeiling(ceiling, features) {
     return {
@@ -143,9 +165,37 @@ function toCapabilityCeiling(ceiling, features) {
     };
 }
 function readRecord(value) {
-    return value && typeof value === 'object' && !Array.isArray(value)
-        ? value
-        : {};
+    return isRecord(value) ? value : {};
+}
+function isRecord(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+/**
+ * The secret-free advisor binding preparation put on the AgentConfig (see assembly-context.ts).
+ * The one reader for it: the catalog offers the advisor tool, and the advisor extension adds its
+ * guidance and captures the conversation, exactly when this returns a binding.
+ */
+export function readAdvisorBinding(value) {
+    if (!isRecord(value))
+        return undefined;
+    const { providerId, modelId, effort, contextWindow, maxOutputTokens } = value;
+    if (!isNonEmptyString(providerId) || !isNonEmptyString(modelId))
+        return undefined;
+    if (!isPositiveNumber(contextWindow) || !isPositiveNumber(maxOutputTokens))
+        return undefined;
+    return {
+        providerId,
+        modelId,
+        ...(isNonEmptyString(effort) ? { effort } : {}),
+        contextWindow,
+        maxOutputTokens,
+    };
+}
+function isNonEmptyString(value) {
+    return typeof value === 'string' && value.length > 0;
+}
+function isPositiveNumber(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 function readResolvedModel(model) {
     const provider = readString(model, 'provider');

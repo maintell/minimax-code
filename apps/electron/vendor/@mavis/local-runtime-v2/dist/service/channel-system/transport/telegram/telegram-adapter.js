@@ -22,7 +22,7 @@ import { buildPermissionKeyboard, decodePermissionCallback } from './telegram-ke
 import { LocalTelegramPollWire } from './telegram-poll-wire.js';
 import { IDLE_CHANNEL_TRANSPORT, } from '../../ingress/channel-transport-status.js';
 import { TelegramQuestionnaireRuntime } from './questionnaire/telegram-questionnaire-runtime.js';
-import { TelegramSender } from './telegram-sender.js';
+import { TelegramSender } from './outbound/telegram-sender.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 /**
  * Decompose `clientName` into the underlying agent name. Strips the
@@ -321,7 +321,7 @@ export class TelegramPlatformAdapter {
                 });
             }
             else if (text) {
-                await sender.sendText(outbound.ctx.chatId, outbound.text, undefined, outbound.ctx.threadId);
+                await sender.sendRichText(outbound.ctx.chatId, outbound.text, outbound.ctx.threadId);
             }
             for (const ref of outbound.media ?? []) {
                 await this.sendOneMediaSafely(sender, outbound.ctx.chatId, ref, outbound.ctx.threadId);

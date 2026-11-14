@@ -6,19 +6,25 @@ import { projects as p } from '../../../../infra/db/schema/projects.js';
 import { decodeSessionRow } from '../../sessions/repo/codec.js';
 import { SidebarQueryError, } from './contracts.js';
 import { encodeObject, normalizeSidebarQuery, pageLimit, readCursor, } from './context.js';
-import { canonicalOwner, eligible, isDone, sidebarPredicate, sidebarProjectPredicate, tupleAfter, TRUSTED_IM_MARKER, } from './predicate.js';
+import { canonicalOwner, eligible, ordinarySidebarSession, isDone, sidebarPredicate, sidebarProjectPredicate, tupleAfter, TRUSTED_IM_MARKER, } from './predicate.js';
 export class SidebarQueryService {
     db;
     nowMs;
     agentInternalWorkspaceDir;
-    constructor(db, nowMs = Date.now, agentInternalWorkspaceDir) {
+    bunnyCreatedSessionIds;
+    constructor(db, nowMs = Date.now, agentInternalWorkspaceDir, bunnyCreatedSessionIds) {
         this.db = db;
         this.nowMs = nowMs;
         this.agentInternalWorkspaceDir = agentInternalWorkspaceDir;
+        this.bunnyCreatedSessionIds = bunnyCreatedSessionIds;
     }
     normalizeQuery(input, rootAgentNames) {
         const internalRootIds = listInternalDefaultRootIds(this.db, this.agentInternalWorkspaceDir);
-        return normalizeSidebarQuery(input, this.nowMs(), internalRootIds, rootAgentNames);
+        return normalizeSidebarQuery(input, this.nowMs(), {
+            internalRootIds,
+            rootAgentNames,
+            bunnyCreatedIds: this.bunnyCreatedSessionIds?.(),
+        });
     }
     projects(input) {
         const q = this.normalizeQuery(input);
@@ -36,7 +42,7 @@ export class SidebarQueryService {
             const hasEligibleSession = (includeArchived) => sqlExists(tx
                 .select({ id: s.sessionId })
                 .from(s)
-                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds, includeArchived)))
+                .where(and(eq(s.projectId, p.projectId), eligible(false, q.internalRootIds, includeArchived, q), ordinarySidebarSession))
                 .limit(1));
             // A workspace project stays listed after all of its conversations are
             // archived; only an explicit removal (hidden) takes it out of the sidebar.
@@ -112,10 +118,7 @@ export class SidebarQueryService {
                     previews.set(row.project.projectId, list);
                 }
             }
-            const groups = [
-                ...page,
-                ...(selectedProject ? [selectedProject] : []),
-            ].map((row) => {
+            const groups = [...page, ...(selectedProject ? [selectedProject] : [])].map((row) => {
                 const entries = previews.get(row.project.projectId) ?? [];
                 const shown = entries.slice(0, sessionLimit);
                 return {
@@ -127,7 +130,8 @@ export class SidebarQueryService {
                     },
                     entries: shown,
                     ...(activeRow?.project.projectId === row.project.projectId &&
-                        (selectedProject || !shown.some((value) => value.session.sessionId === activeRow.record.sessionId))
+                        (selectedProject ||
+                            !shown.some((value) => value.session.sessionId === activeRow.record.sessionId))
                         ? { activeEntry: entry(activeRow, q) }
                         : {}),
                     matchedCount: Number(row.matchedCount),
@@ -184,14 +188,14 @@ export class SidebarQueryService {
     agents(input, rootAgentNames = []) {
         // Candidate owners come from eligible historical conversations, independently
         // of the current filters and the configured Agent roster.
-        const q = this.normalizeQuery({ ...input, filter: undefined, scope: undefined }, rootAgentNames);
+        const q = this.normalizeQuery({ ...input, filter: { showBunnyCreatedSessions: true }, scope: undefined }, rootAgentNames);
         const last = readCursor(input.cursor, q, 'agents');
         const limit = pageLimit(input.limit, 50);
         const rows = this.db
             .select({ name: canonicalOwner })
             .from(s)
             .innerJoin(p, eq(p.projectId, s.projectId))
-            .where(and(eligible(false, q.internalRootIds), 
+            .where(and(eligible(false, q.internalRootIds, false, q), 
         // Unconfigured legacy CLI roots alone are not evidence of a usable Agent.
         // Preserve real branch tasks, configured roots and explicit Desktop/IM roots.
         sql `(${s.sessionType} <> 'root'
@@ -213,12 +217,16 @@ export class SidebarQueryService {
     get(sessionId, bindingIds, cronTargetIds = []) {
         if (!sessionId?.trim())
             throw new SidebarQueryError('SIDEBAR_INVALID_FILTER', 'Session required');
-        const q = this.normalizeQuery({ bindingIds, cronTargetIds });
+        const q = this.normalizeQuery({
+            bindingIds,
+            cronTargetIds,
+            filter: { showBunnyCreatedSessions: true },
+        });
         const row = this.db
             .select({ record: s, project: p, done: isDone })
             .from(s)
             .innerJoin(p, eq(p.projectId, s.projectId))
-            .where(and(eq(s.sessionId, sessionId), eligible(false, q.internalRootIds)))
+            .where(and(eq(s.sessionId, sessionId), eligible(false, q.internalRootIds, false, q)))
             .get();
         if (!row) {
             const exists = this.db

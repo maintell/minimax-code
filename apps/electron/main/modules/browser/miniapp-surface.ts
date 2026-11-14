@@ -201,7 +201,7 @@ export async function openManagedMiniAppSurface(input, dependencies = {
         : (bound?.signal ?? input.signal);
     return runManagedMiniAppLaunch(input.pluginId, async (signal) => {
         const attemptOpen = async () => {
-            const result = await dependencies.requestLaunch('open', input.pluginId, signal);
+            const result = await dependencies.requestLaunch(input.initiator === 'agent' ? 'openForAgent' : 'open', input.pluginId, signal);
             signal.throwIfAborted();
             assertGenerationCurrent(input.isGenerationCurrent);
             if (!('launch' in result)) {

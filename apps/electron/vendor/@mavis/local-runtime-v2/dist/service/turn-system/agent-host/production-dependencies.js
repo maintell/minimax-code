@@ -2,7 +2,7 @@ import { assertAgentHostCapabilityAvailable } from './empty-dependencies.js';
 import { RequiredAgentEventDelivery, } from './events/required-agent-event-delivery.js';
 import { DurableCanonicalHistoryStore, } from './history/durable-canonical-history-store.js';
 import { LocalRuntimeTurnExecutor, } from './execution/executor.js';
-import { buildLocalRequestPayloadTransform } from './assembly/local-turn-payload-transform.js';
+import { buildLocalRequestPayloadTransform } from './assembly/payload/local-turn-payload-transform.js';
 /**
  * Explicit composition seam for concrete AgentHost adapters.
  *
@@ -46,6 +46,7 @@ function createDependencyRecord(options, history, events, executor) {
         ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
         ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
         promptSuggestion: options.promptSuggestion,
+        turnTiming: options.turnTiming,
         history,
         events,
         ...(options.logger ? { logger: options.logger } : {}),

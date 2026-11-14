@@ -1,6 +1,6 @@
 import { SessionRootSwapError } from '../repo/contract.js';
 import { isSameSessionAgentName } from '../agent-name.js';
-import { buildArchivedRootTitle } from './archived-root-title.js';
+import { buildArchivedRootTitle, resolveArchiveTitleLocale } from './archived-root-title.js';
 export class RootInvariantError extends Error {
     reason;
     constructor(reason, message) {
@@ -46,14 +46,16 @@ export class RootSessionInvariantService {
             archivedRootTitle: buildArchivedRootTitle({
                 oldTitle: previousRoots[0]?.title,
                 fallbackName,
-                locale: this.options.locale?.(),
+                locale: this.options.locale?.() ?? resolveArchiveTitleLocale(),
             }),
         };
     }
     async commitReplacement(plan, options = {}) {
+        const hidden = await this.options.agentSurfaces?.hidesRootSessions(plan.agentName);
         try {
             const swapped = await this.options.sessions.swapRoot({
                 agentName: plan.agentName,
+                ...(hidden ? { visibility: 'hidden' } : {}),
                 nextRootSessionId: plan.nextRoot.sessionId,
                 archivedRootTitle: plan.archivedRootTitle,
                 ...(options.linkPreviousRootsToNext ? { linkPreviousRootsToNext: true } : {}),

@@ -1,3 +1,4 @@
+import { release as osRelease } from 'node:os';
 import { parse as parsePath } from 'node:path';
 export async function callCuaToolWithDeliveryMode(runtime, name, payload, signal) {
     return runtime.callTool(name, payload, signal);
@@ -164,6 +165,21 @@ export function validateClickAction(payload, platform = process.platform) {
         throw new Error('computer_click_action_requires_single_element_click');
     }
 }
+/**
+ * On macOS 14 and earlier, CUA's background pixel route activates the target
+ * through SkyLight without raising it, and that private call crashes the
+ * native component (trycua/cua#2688). Refuse it before any input is sent;
+ * element_token clicks and explicit foreground delivery use other routes.
+ */
+export function assertBackgroundPointerSupported(name, payload, platform = process.platform, darwinRelease = osRelease()) {
+    if (platform !== 'darwin' || payload.delivery_mode !== 'background')
+        return;
+    if (Number.parseInt(darwinRelease, 10) >= 24)
+        return;
+    if (name === 'click' && payload.x === undefined && payload.y === undefined)
+        return;
+    throw new Error('computer_background_pointer_unsupported: no input was sent. Background coordinate clicks and drags are unavailable on this macOS version. For a click, use the full element_token of the target from the latest computer_app_state with background delivery. Otherwise, unless the user requires background-only, tell the user which app will take focus and retry the same window_ref and coordinates with delivery_mode:"foreground". Do not retry background x/y.');
+}
 export async function mapRequestToCuaTool(runtime, request, signal) {
     // The SDK keeps an implicit transport session when callers omit `session`.
     // Give every session-aware action a stable name so a long-running chat does
@@ -305,15 +321,17 @@ export async function mapRequestToCuaTool(runtime, request, signal) {
                     payload: pick(mapped, ['pid', 'window_id', 'element_token', 'session', 'delivery_mode']),
                 };
             }
-            return {
-                name: 'click',
-                payload: await withWindowTarget(runtime, clickPayload.click_count !== undefined
-                    ? { ...clickPayload, count: clickPayload.click_count }
-                    : clickPayload, signal),
-            };
+            const mappedClick = await withWindowTarget(runtime, clickPayload.click_count !== undefined
+                ? { ...clickPayload, count: clickPayload.click_count }
+                : clickPayload, signal);
+            assertBackgroundPointerSupported('click', mappedClick);
+            return { name: 'click', payload: mappedClick };
         }
-        case 'drag':
-            return { name: 'drag', payload: await withWindowTarget(runtime, payload, signal) };
+        case 'drag': {
+            const mappedDrag = await withWindowTarget(runtime, payload, signal);
+            assertBackgroundPointerSupported('drag', mappedDrag);
+            return { name: 'drag', payload: mappedDrag };
+        }
         case 'type':
             return { name: 'type_text', payload: await withWindowTarget(runtime, payload, signal) };
         case 'set_value': {

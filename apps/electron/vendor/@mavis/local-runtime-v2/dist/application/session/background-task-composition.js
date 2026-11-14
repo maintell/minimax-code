@@ -1,10 +1,11 @@
 import { initializeBackgroundTaskService, buildLocalBashAdapter, stopBackgroundLocalBashTask, createChildBashLifecycle, admitBackgroundTask, abortAdmittedBackgroundTask, beginBackgroundTaskShutdown, drainBackgroundTasks, openUserStopWindow, isTaskDeliverySuppressed, attributeTaskRowRound, } from '../../service/background-task/index.js';
-import { closeLocalBackgroundTaskDelivery, scheduleLocalBackgroundTaskDelivery, } from './background-task-delivery.js';
+import { bindClosedTaskBackgroundRoute, closeLocalBackgroundTaskDelivery, scheduleLocalBackgroundTaskDelivery, } from './background-task-delivery.js';
 import { createUserStopCascade } from './background-task-user-stop-cascade.js';
 export function prepareBackgroundTasks(input) {
     let host;
     let abortChild;
     let publish;
+    let closedTaskRoute;
     const requireHost = () => {
         if (!host)
             throw new Error('Background task runtime is not bound');
@@ -60,10 +61,18 @@ export function prepareBackgroundTasks(input) {
         bindPublisher(writer) {
             publish = writer;
         },
+        /** Late results of closed tasks go to the task owner instead of a new round (Bunny 6.1). */
+        bindClosedTaskRoute(route) {
+            closedTaskRoute = route;
+            if (host)
+                bindClosedTaskBackgroundRoute(host, route);
+        },
         createRuntime(boundHost) {
             if (host)
                 throw new Error('Background task runtime already bound');
             host = boundHost;
+            if (closedTaskRoute)
+                bindClosedTaskBackgroundRoute(boundHost, closedTaskRoute);
             return {
                 service: owner.service,
                 buildBashAdapter: (session, executor) => buildLocalBashAdapter(boundHost, session, executor),

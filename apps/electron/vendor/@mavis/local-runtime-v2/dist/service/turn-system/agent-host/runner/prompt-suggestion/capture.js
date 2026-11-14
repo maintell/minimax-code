@@ -1,17 +1,39 @@
-import { buildPromptSuggestionPayloadTransform } from '../../assembly/local-turn-payload-transform.js';
+import { isCoordinatorAgent } from '@mavis/shared/agent-coordination';
+import { buildPromptSuggestionPayloadTransform } from '../../assembly/payload/local-turn-payload-transform.js';
 import { createPromptSuggestionCapture, } from './prompt-suggestion-service.js';
+/**
+ * Whether this Turn belongs to a trusted built-in Agent that declares the
+ * coordinator role in its bundled `x-mavis.coordination`.
+ *
+ * Coordination is a capability of the built-in catalog, never a property of an
+ * Agent's name: a Custom or Plugin Agent that reaches the same record reads as
+ * ordinary, exactly as every other consumer of the block requires.
+ */
+function isCoordinatorTurn(input) {
+    const profile = input.preparation.agentConfig.agent_profile;
+    if (typeof profile !== 'object' || profile === null || Array.isArray(profile))
+        return false;
+    const { trusted_builtin: trustedBuiltin, coordination } = profile;
+    if (trustedBuiltin !== true)
+        return false;
+    return isCoordinatorAgent(coordination);
+}
 /**
  * Installs the capture Hooks only when the port is present and enabled, so a
  * disabled feature adds no Hook and keeps the main request untouched.
  */
 export function createTurnPromptSuggestionCapture(input, prepared, options) {
     const port = options.promptSuggestion;
+    // A coordinator dispatches work to Tasks and reports back, so a next-message
+    // suggestion in its composer proposes a step for the wrong actor. It collects
+    // no context and issues no request; every other Agent is untouched.
     if (!port ||
         !port.enabled() ||
         prepared.caller !== 'chat' ||
         input.session.parentSessionId ||
         (input.session.interactionMode ?? 'default') !== 'default' ||
-        isAutomaticOrPlannedTurn(input))
+        isAutomaticOrPlannedTurn(input) ||
+        isCoordinatorTurn(input))
         return undefined;
     return {
         capture: createPromptSuggestionCapture(prepared.llm, (signal) => buildPromptSuggestionPayloadTransform({
@@ -51,6 +73,7 @@ export function withPromptSuggestionHooks(hooks, capture) {
         ...hooks,
         onLlmCallPreparedHook: [...(hooks.onLlmCallPreparedHook ?? []), capture.preparedHook],
         afterLlmCallHook: [...(hooks.afterLlmCallHook ?? []), capture.assistantHook],
+        afterToolCallHook: [...(hooks.afterToolCallHook ?? []), capture.toolHook],
     };
 }
 function isAutomaticOrPlannedTurn(input) {
@@ -81,7 +104,9 @@ export class PromptSuggestionCommitRelay {
     }
     /** Only a completed, non-waiting Turn with a capture can offer a suggestion. */
     remember(outcome, scope) {
-        if (!scope?.capture || outcome.status !== 'completed' || outcome.waitingForUser)
+        if (!scope?.capture ||
+            outcome.status !== 'completed' ||
+            (outcome.waitingForUser && !scope.capture.nextStepCard))
             return;
         this.scopes.set(outcome, scope);
     }

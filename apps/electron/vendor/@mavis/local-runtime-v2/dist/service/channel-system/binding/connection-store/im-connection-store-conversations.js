@@ -6,6 +6,7 @@ import { mutateDurableYaml, readYamlDocument } from '../storage/durable-yaml.js'
 import { invalidImStorage, nextBindingUpdatedAt, readBindingData, requireBindingSessionState, writeBindingData, } from './im-connection-store-data.js';
 import { LocalImConnectionError, } from '../im-connection-types.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
+import { isBunnyAgentName } from '@mavis/shared/agent-avatar';
 /** Advances one physical Binding; shared legacy cursors are never advanced together. */
 export async function advanceImBinding(operations, advance) {
     const { connection, bindingId, requestId, telemetry } = advance;
@@ -130,6 +131,10 @@ async function createBindingSession(input) {
     const { operations, connection, binding, telemetry } = input;
     const stage = 'new_session_create';
     const state = assertBindingForConnection(binding, connection);
+    // Bunny has exactly one main conversation: never create a channel Session.
+    const coordinator = await resolveCoordinatorBindingSession(operations, connection);
+    if (coordinator)
+        return coordinator;
     const workspace = operations.options.resolveProjectWorkspace(state.resolvedProjectKey);
     logAdvanceLifecycle({
         telemetry,
@@ -170,6 +175,72 @@ async function createBindingSession(input) {
         });
         throw error;
     }
+}
+/**
+ * A coordinator Agent (Bunny) owns exactly one main conversation. Its IM
+ * Bindings follow that Root instead of owning per-Binding channel Sessions.
+ * Returns undefined for every other Agent, or when the host did not wire the
+ * lookup (standalone/test compositions keep the per-Binding behavior).
+ */
+async function resolveCoordinatorBindingSession(operations, connection) {
+    const resolve = operations.options.resolveCoordinatorMainSession;
+    if (!resolve || !isCoordinatorConnection(connection))
+        return undefined;
+    const main = await resolve(connection.agentName);
+    if (!main?.sessionId) {
+        throw new LocalImConnectionError(409, 'CHANNEL_IM_COORDINATOR_MAIN_UNAVAILABLE', 'The coordinator main conversation is unavailable.');
+    }
+    return { sessionId: main.sessionId };
+}
+/** Whether this Connection targets a single-main-conversation coordinator Agent. */
+function isCoordinatorConnection(connection) {
+    return isBunnyAgentName(connection.agentName);
+}
+/**
+ * Re-points an existing coordinator Binding cursor at the coordinator's main
+ * conversation (e.g. a Binding created before Bunny routing existed). CAS on
+ * the observed cursor so a concurrent move is never overwritten blindly.
+ */
+export async function repinCoordinatorBinding(operations, connection, bindingId) {
+    if (!operations.options.resolveCoordinatorMainSession || !isCoordinatorConnection(connection)) {
+        return undefined;
+    }
+    return operations.bindingSessionLane.run(bindingId, async () => {
+        const existing = await readBindingForConnection(operations, connection, bindingId);
+        const main = await resolveCoordinatorBindingSession(operations, connection);
+        if (!main)
+            return undefined;
+        const observed = requireBindingSessionState(existing).currentSessionId;
+        if (observed === main.sessionId)
+            return existing;
+        const repinned = await mutateDurableYaml(operations.bindingsPath, (document) => {
+            const data = readBindingData(document, operations.options.nowMs());
+            const current = data.physicalBindings.get(bindingId);
+            if (!current)
+                throw bindingNotFound(bindingId);
+            const currentState = assertBindingForConnection(current, connection);
+            if (currentState.currentSessionId === main.sessionId) {
+                return { changed: false, value: current };
+            }
+            const next = {
+                ...current,
+                currentSessionId: main.sessionId,
+                updatedAt: nextBindingUpdatedAt(current, operations.options.nowMs()),
+            };
+            data.physicalBindings.set(next.bindingId, next);
+            writeBindingData(document, data);
+            return { changed: true, value: next };
+        });
+        logger.info({
+            connectionId: connection.connectionId,
+            bindingId,
+            sessionId: main.sessionId,
+            ...(observed ? { previousSessionId: observed } : {}),
+            code: 'CHANNEL_IM_COORDINATOR_REPINNED',
+            outcome: 'updated',
+        }, 'IM Binding re-pinned to the coordinator main conversation');
+        return repinned;
+    });
 }
 function bindingNotFound(bindingId) {
     return new LocalImConnectionError(409, 'IM_BINDING_NOT_FOUND', `IM Binding not found: ${bindingId}`);

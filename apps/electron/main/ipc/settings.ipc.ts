@@ -358,9 +358,9 @@ export function setupDesktopSettingsIPC(options = {}) {
     ipcMain.handle(IPC_CHANNELS.DESKTOP_GET_RUN_ON_STARTUP, () => {
         return getLoginItemSettings();
     });
-    // 保持唤醒（用户偏好）— mode 状态机会结合 RC、供电和 CU 状态选择 blocker type:
-    //   keepAwake=true & RC=on & AC=on & CU=off → 'prevent-app-suspension'（屏幕可休眠）
-    //   keepAwake=false / RC=off / AC=off & CU=off → 'off'
+    // 保持唤醒（用户偏好）— mode 状态机会结合 RC、本地任务、供电和 CU 状态选择 blocker type:
+    //   keepAwake=true & (RC=on 或有本地任务) & AC=on & CU=off → 'prevent-app-suspension'（屏幕可休眠）
+    //   keepAwake=false / (RC=off 且无本地任务) / AC=off & CU=off → 'off'
     //   CU=on → 'prevent-display-sleep'（CU 优先级高于用户偏好、RC 和供电状态）
     ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_KEEP_AWAKE, (_, enabled) => {
         try {
@@ -371,11 +371,6 @@ export function setupDesktopSettingsIPC(options = {}) {
         catch (error) {
             return { success: false, error: String(error) };
         }
-    });
-    // 返回用户对 keepAwake 的偏好（不是当前持有的 assertion type）；
-    // RC binding 和供电状态只决定偏好当前是否生效，不覆盖已保存的用户选择。
-    ipcMain.handle(IPC_CHANNELS.DESKTOP_GET_KEEP_AWAKE, () => {
-        return !!getDesktopConfig().keepAwake;
     });
     // Windows-only opt-in that lists MCode for text-like types like VS Code does.
     ipcMain.handle(IPC_CHANNELS.DESKTOP_SET_FILE_OPEN_WITH_ENHANCED, async (_, enabled) => {
@@ -502,12 +497,17 @@ export function setupDesktopSettingsIPC(options = {}) {
         localRuntimeDataDirRelocationInProgress = true;
         try {
             const config = getDesktopConfig();
+            const acknowledged = typeof relocateOptions === 'object' && relocateOptions !== null
+                ? relocateOptions
+                : {};
+            const hotPlugRiskAcknowledged = acknowledged.hotPlugRiskAcknowledged === true;
+            if (hotPlugRiskAcknowledged) {
+                logger.info('[Desktop Settings] Relocating local runtime data dir with hot-plug disk risk acknowledged');
+            }
             const result = await relocateLocalRuntimeDataDir({
                 targetParentDir: parentDir,
-                cloudSyncRiskAcknowledged: typeof relocateOptions === 'object' &&
-                    relocateOptions !== null &&
-                    relocateOptions
-                        .cloudSyncRiskAcknowledged === true,
+                cloudSyncRiskAcknowledged: acknowledged.cloudSyncRiskAcknowledged === true,
+                hotPlugRiskAcknowledged,
                 appInstallDir: process.platform === 'win32' ? path.dirname(app.getPath('exe')) : undefined,
                 previousParentDirs: Array.isArray(config.localRuntimePreviousDataParentDirs)
                     ? config.localRuntimePreviousDataParentDirs.filter((dir) => typeof dir === 'string')

@@ -1,15 +1,16 @@
 import { DEFAULT_LOCAL_PI_API, lookupLocalModelLimits, lookupLocalCatalogModel, positive, } from '../../../infra/config/model-catalog.js';
 import {} from '@earendil-works/pi-ai';
 import { knownMaxImagesPerRequestForBaseUrl, normalizeMaxImagesPerRequest, } from '@mavis/agent-core/pi-turn-runner';
-import { isFirstPartyMinimaxMessagesRoute, resolveProviderAuthMode, resolveProviderCredential, } from '@mavis/config';
+import { isFirstPartyMinimaxMessagesRoute, resolveModelCallRoute, resolveProviderAuthMode, resolveProviderCredential, } from '@mavis/config';
 import { ThinkingLevel } from '@mavis/protocol';
 import { withOpenCodeGoHeaders, withOpenRouterAttributionHeaders } from '@mavis/shared';
+import { ModelLoginRequiredError, } from '../contracts.js';
 import { normalizeProviderBaseUrl } from '../connectivity/provider-request.js';
 import { isModelAccessApi, isModelProviderApi, MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID, } from '../identity.js';
 import { parseProviderId } from './model-key.js';
-import { isMiniMaxM3ModelId, isMiniMaxM3ThinkingMode, isThinkingEffortDisabled, readSelectedThinkingEffort, resolveByokThinkingProtocol, supportsJsonObjectOutput, } from './model-ref.js';
+import { isMiniMaxM3ModelId, isMiniMaxM3ThinkingMode, isThinkingEffortDisabled, modelLimitsFromConfig, readSelectedThinkingEffort, resolveByokThinkingProtocol, supportsJsonObjectOutput, } from './model-ref.js';
 import { planCustomProviderResolution, planMinimaxApiResolution, readStringRecord, } from './model-resolver-byok.js';
-import { buildLocalProviderHeaders, createManagedAuthRetryFetch, readAgentHeaderId, stripUrlCredentials, } from './model-resolver-helpers.js';
+import { buildLocalProviderHeaders, createManagedAuthRetryFetch, modelCallRouteView, readAgentHeaderId, stripUrlCredentials, turnPhaseHeaderFor, } from './model-resolver-helpers.js';
 import { hasOpenPlatformThinkingVariants } from './openplatform-thinking.js';
 import { withByokErrorAttribution } from './byok-error-attribution.js';
 import { withLocalDynamicMaxTokens } from './dynamic-max-tokens.js';
@@ -47,9 +48,21 @@ export class LocalModelResolver {
         const providerKey = parseProviderId(identity.provider)?.providerKey ?? identity.provider;
         if (this.options.modelAccess?.requests.owns(providerKey) ||
             this.options.modelAccess?.failover?.plan(providerKey)?.grouped) {
-            return this.resolveAccessModel(input, identity, providerKey);
+            // An extension serves this provider: its legacy config is never read and
+            // the extension's own transport reaches the upstream, so the route comes
+            // from the provider id alone and no phase header is named.
+            return {
+                ...this.resolveAccessModel(input, identity, providerKey),
+                route: resolveModelCallRoute({}, identity.provider),
+            };
         }
         const providerConfig = this.options.providerConfigGetter?.() ?? this.options.providerConfig;
+        const resolved = await this.resolveConfiguredModel(input, providerConfig);
+        // A metric label only, so dashboards tell managed Token Plan calls from the user's keys.
+        const route = resolveModelCallRoute(modelCallRouteView(providerConfig, this.options.byokConfigGetter?.()), identity.provider);
+        return { ...resolved, route, ...turnPhaseHeaderFor(route) };
+    }
+    async resolveConfiguredModel(input, providerConfig) {
         const selected = selectModel(input.agentConfig, providerConfig, this.options);
         if (selected.byokPlan)
             return this.finishByok(input, selected);
@@ -143,7 +156,7 @@ export class LocalModelResolver {
         const authContext = currentAuthContext ? { ...currentAuthContext } : undefined;
         const routingContext = this.options.routingContextGetter?.();
         const credentials = resolveLocalProviderCredentials(provider, modelRef, providerConfig, authContext);
-        const limits = lookupLocalModelLimits(provider, modelId);
+        const limits = managedModelLimits(provider, modelId, providerConfig);
         const openAiCodex = provider === OPENAI_CODEX_PROVIDER_ID;
         const apiKey = await resolveProviderApiKey(provider, credentials.apiKey, this.options);
         const baseUrl = credentials.baseUrl ?? (openAiCodex ? limits.baseUrl : undefined);
@@ -267,6 +280,22 @@ function selectExternalByokPlan(identity, parsed, providerConfig, options) {
         modelId: identity.modelId,
     });
 }
+/**
+ * Default limits of a managed model: the configured `limit` first, the built-in
+ * catalog as fallback. Ordinary turns already carry the selected window on the
+ * ModelRef; callers that pass only a model identity (Memory V2) get the window
+ * the user configured instead of the catalog fallback, the same source the
+ * BYOK path reads.
+ */
+function managedModelLimits(provider, modelId, providerConfig) {
+    const catalog = lookupLocalModelLimits(provider, modelId);
+    const configured = modelLimitsFromConfig(providerConfig?.[provider]?.models?.[modelId]);
+    return {
+        ...catalog,
+        contextWindow: positive(configured.context_window) || catalog.contextWindow,
+        maxTokens: positive(configured.max_tokens) || catalog.maxTokens,
+    };
+}
 function selectMinimaxByok(identity, providerConfig, options) {
     const byok = options.byokConfigGetter?.();
     if (identity.provider !== MANAGED_MINIMAX_PROVIDER_ID ||
@@ -287,15 +316,18 @@ function selectMinimaxByok(identity, providerConfig, options) {
 async function resolveProviderApiKey(provider, configuredApiKey, options) {
     if (provider !== OPENAI_CODEX_PROVIDER_ID)
         return configuredApiKey;
-    return (await options.providerAuthGetter?.(provider))?.trim();
+    const apiKey = (await options.providerAuthGetter?.(provider))?.trim();
+    if (!apiKey)
+        throw new ModelLoginRequiredError(provider);
+    return apiKey;
 }
 async function resolveByokResolutionPlan(plan, options) {
     const { authProvider, apiKey: configuredApiKey, ...resolved } = plan;
     const apiKey = (authProvider ? await options.providerAuthGetter?.(authProvider) : configuredApiKey)?.trim();
     if (!apiKey) {
-        throw new Error(authProvider
-            ? `LocalModelResolver: ${authProvider} login required; no OAuth credentials found.`
-            : `LocalModelResolver: api_key not configured for provider "${plan.provider}".`);
+        if (authProvider)
+            throw new ModelLoginRequiredError(authProvider);
+        throw new Error(`LocalModelResolver: api_key not configured for provider "${plan.provider}".`);
     }
     return { ...resolved, apiKey };
 }

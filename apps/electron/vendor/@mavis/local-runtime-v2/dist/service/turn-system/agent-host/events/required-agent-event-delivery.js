@@ -126,9 +126,11 @@ export class RequiredAgentEventDelivery {
     }
     async projectRuntime(context, event, signal) {
         const runtimeSequence = this.validateSequence(context, event);
+        // The Session owner reads why an aborted Turn stopped from its signal.
         const authoritative = await this.options.projectors.session.projectRuntimeEvent({
             context,
             event,
+            ...(signal ? { signal } : {}),
         });
         if (!authoritative) {
             throw new AgentEventAcknowledgementError(terminalOutcome(event) ?? 'non-terminal', 'missing');

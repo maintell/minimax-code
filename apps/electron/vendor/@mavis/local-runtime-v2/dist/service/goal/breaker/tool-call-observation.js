@@ -8,6 +8,7 @@ const READ_ONLY_TOOLS = new Set([
     'read',
     'glob',
     'grep',
+    'search_plugins',
     'list',
     'get_goal',
     'task_query',

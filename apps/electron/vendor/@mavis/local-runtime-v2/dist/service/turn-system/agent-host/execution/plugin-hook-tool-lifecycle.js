@@ -4,6 +4,7 @@ import { composePluginHookToolResultContent, emitLocalPluginHookWarnings, localP
 import { authorizeDelegatedToolReference, resolveDelegatedToolTarget, revokeDelegatedToolReferenceAuthorization, } from '../assembly/local-turn-plugin-capabilities.js';
 import { buildCompatiblePostToolResponse, buildCodexPostToolResponse } from '../tools/index.js';
 import { successfulTaskOutputReadTaskId, successfulTerminalTaskOutputReadTaskId, } from './task-output-read.js';
+import { observePtcScriptSave, recordSuccessfulPtcScriptSave, } from './ptc/saved-script-record.js';
 import { evaluatePtcChildToolPolicy } from '../runner/policy/local-turn-tool-ptc-policy.js';
 import { readAuthorizedTurnTools, readPtcChildTools } from './ptc/catalog.js';
 export function createControlledToolHooks(options) {
@@ -162,6 +163,21 @@ function createAfterToolHook(options, state, authorizedTools) {
                 signal: signal ?? input.lease.signal,
             });
             recordSuccessfulTaskOutputRead(readTaskOutputTaskIds, finalized.context, finalized.decision, options.terminalTaskOutputReadIds);
+            // What the save tool itself produced, read before the Plugin PostToolUse
+            // Hook rewrote it. A hook that answers with feedback sets `isError: true`
+            // (buildPluginPostToolDecision), which used to hide a save that really
+            // happened and count it as a refusal. `applied.context` is that hook's own
+            // input, so Mavis's own after-tool Hooks are still honoured and only the
+            // plugin's verdict is left out. The model still sees the hook's error and
+            // its `<plugin-hook-feedback>`.
+            const savedScriptCall = {
+                toolName: applied.context.toolCall.name,
+                isError: applied.context.isError,
+                args: applied.context.args,
+                details: applied.context.result.details,
+            };
+            recordSuccessfulPtcScriptSave(options.savedPtcScripts, savedScriptCall);
+            observePtcScriptSave(options.ptcObserver, savedScriptCall);
             deliveryClosed = true;
             return appendToolResultTail(input, authoritativeToolCallId, finalized, pendingToolResultTailClaims);
         }

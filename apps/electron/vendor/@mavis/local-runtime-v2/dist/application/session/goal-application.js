@@ -26,6 +26,10 @@ export function createRuntimeGoalApplications(goals, isReadOnlyLegacySession) {
         processLocal: createProcessLocalGoalApplication(goals, isReadOnlyLegacySession),
     };
 }
+/** Goal applications for a Runtime host that answers which Sessions are read-only legacy. */
+export function goalApplicationsForHost(goals, goalHost) {
+    return createRuntimeGoalApplications(goals, (sessionId) => goalHost.isReadOnlyLegacySession(sessionId));
+}
 function goalContractPolicyFromConfig() {
     const objectiveMaxChars = getConfig().goal.objectiveMaxChars;
     return objectiveMaxChars === undefined ? {} : { objectiveMaxChars };

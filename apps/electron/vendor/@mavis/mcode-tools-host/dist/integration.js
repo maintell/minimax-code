@@ -13,6 +13,7 @@ export async function startMcodeToolsHostIntegration(options, dependencies = DEF
     });
     const broker = await dependencies.startBroker({
         dataDir: options.dataDir,
+        ...(options.isolateBrokerInstance ? { isolateInstance: true } : {}),
         session: options.session,
         ...(options.logger ? { logger: options.logger } : {}),
     });
@@ -25,6 +26,7 @@ export async function startMcodeToolsHostIntegration(options, dependencies = DEF
             platform: options.platform,
             region: options.region,
             ...(options.bedrockLane ? { bedrockLane: options.bedrockLane } : {}),
+            ...(options.hostBinDir ? { hostBinDir: options.hostBinDir } : {}),
             brokerEndpoint: broker.endpoint,
             brokerCapabilityFile: broker.capabilityFile,
         });
@@ -33,7 +35,7 @@ export async function startMcodeToolsHostIntegration(options, dependencies = DEF
     catch (error) {
         let cleanupError;
         try {
-            dependencies.removeLaunchers(options.dataDir, options.region);
+            dependencies.removeLaunchers(launcherOwnership(options));
         }
         catch (cause) {
             cleanupError = cause;
@@ -52,6 +54,15 @@ export async function startMcodeToolsHostIntegration(options, dependencies = DEF
         throw error;
     }
 }
+function launcherOwnership(options) {
+    return {
+        dataDir: options.dataDir,
+        executable: options.executable,
+        region: options.region,
+        platform: options.platform,
+        ...(options.hostBinDir ? { hostBinDir: options.hostBinDir } : {}),
+    };
+}
 function activeIntegration(options, dependencies, broker, launcherPath, resource) {
     let disposed = false;
     return {
@@ -65,7 +76,7 @@ function activeIntegration(options, dependencies, broker, launcherPath, resource
             disposed = true;
             let launcherError;
             try {
-                dependencies.removeLaunchers(options.dataDir, options.region);
+                dependencies.removeLaunchers(launcherOwnership(options));
             }
             catch (error) {
                 launcherError = error;

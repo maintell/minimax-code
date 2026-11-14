@@ -2,21 +2,26 @@ import { normalizeWindowsShellBase } from '../../agent-shell/index.js';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseAgentCoordinationConfig, } from '@mavis/shared/agent-coordination';
 import { isAgentBuiltinToolEnabled, parseAgentCapabilityConfig, } from '@mavis/config';
 import { PromptSnapshotInvalidError, } from '@mavis/agent-runtime';
-import { BUILTIN_ROSTER_FILE, FEATURE_FILES, PRIMARY_AGENT_NAME, PTC_SECTION_FILE, canonicalBuiltinName, defaultLocale, legacyNamesFor, surfacePromptFiles, toSurfaceRenderInput, } from './definitions.js';
+import { BUILTIN_ROSTER_FILE, FEATURE_FILES, PRIMARY_AGENT_NAME, PTC_SECTION_FILE, builtinSurfaceFlagPreset, canonicalBuiltinName, defaultLocale, legacyNamesFor, surfacePromptFiles, toSurfaceRenderInput, } from './definitions.js';
 import { createBuiltinPromptContext, parseFrontmatter, renderBuiltinTemplate, stripFrontmatter, } from './prompt-renderer.js';
 import { captureLocalPromptAssets } from './prompt-assets.js';
+import { parseAgentSurfaceSwitches } from '../storage/agent-surface-switches.js';
+import { BUILTIN_AGENT_RENDERERS } from './renderers.js';
 export { canonicalBuiltinName, legacyNamesFor, resolveCanonicalCapabilities, } from './definitions.js';
 export class BuiltinAgentCatalog {
     assetsDirOverride;
     promptFileReader;
     freezeLocalPrompts;
+    renderers;
     localPromptAssets;
     constructor(options = {}) {
         this.assetsDirOverride = options.assetsDir?.trim() || undefined;
         this.promptFileReader = options.promptFileReader;
         this.freezeLocalPrompts = options.freezeLocalPrompts === true;
+        this.renderers = options.renderers ?? BUILTIN_AGENT_RENDERERS;
     }
     async frozenPromptSource() {
         if (!this.freezeLocalPrompts)
@@ -54,7 +59,7 @@ export class BuiltinAgentCatalog {
         const agentDir = join(await this.assetsDir(), canonical);
         const persona = await this.readLocalizedPersona(agentDir, 'en');
         const frontmatter = parseFrontmatter(persona ?? '').frontmatter;
-        const { capabilityOverride, preloadSkills } = await this.readAgentSelectors(agentDir);
+        const { capabilityOverride, coordination, preloadSkills, surfaceFlags } = await this.readAgentConfig(agentDir, canonical);
         const identity = {
             ...(typeof frontmatter.display_name === 'string'
                 ? { displayName: frontmatter.display_name }
@@ -70,14 +75,17 @@ export class BuiltinAgentCatalog {
             legacyNames: legacyNamesFor(canonical),
             identity,
             ...(capabilityOverride ? { capabilityOverride } : {}),
+            ...(coordination ? { coordination } : {}),
             ...(preloadSkills ? { preloadSkills } : {}),
+            surfaceFlags,
         };
     }
     async render(input, agentSystemTemplate) {
         const canonical = canonicalBuiltinName(input.agentName);
         const definition = await this.readDefinition(canonical);
         const parts = await this.renderAgentParts(canonical, input, agentSystemTemplate);
-        const surface = canonical === PRIMARY_AGENT_NAME && usesV2Prompts(input) && input.surface !== 'task-child'
+        const surface = this.renderers.get(canonical)?.standalone === true ||
+            (canonical === PRIMARY_AGENT_NAME && usesV2Prompts(input) && input.surface !== 'task-child')
             ? { core: '' }
             : await this.readSurfaceParts(canonical, input);
         const sharedBase = await this.renderSharedBaseParts(input, definition.role, {
@@ -94,6 +102,9 @@ export class BuiltinAgentCatalog {
         };
     }
     async renderAgentParts(canonical, input, agentSystemTemplate) {
+        const renderer = this.renderers.get(canonical);
+        if (renderer)
+            return renderer.renderParts({ agentDir: join(await this.assetsDir(), canonical), input });
         const [personaTemplate, coreTemplate, featurePrompts] = await Promise.all([
             agentSystemTemplate === undefined
                 ? this.readPromptAsset(canonical, input, 'persona')
@@ -152,6 +163,12 @@ export class BuiltinAgentCatalog {
      */
     async readCanonicalTemplate(input) {
         const canonical = canonicalBuiltinName(input.agentName);
+        const renderer = this.renderers.get(canonical);
+        if (renderer)
+            return renderer.readCanonicalTemplate({
+                agentDir: join(await this.assetsDir(), canonical),
+                input,
+            });
         if (canonical === PRIMARY_AGENT_NAME && usesV2Prompts(input)) {
             const templates = await Promise.all(['coding', 'work', 'tui'].map(async (mode) => {
                 const path = posix.join('_v2', mode, 'SYSTEM.md.hbs');
@@ -184,16 +201,11 @@ export class BuiltinAgentCatalog {
         return parts.core;
     }
     async renderSharedBaseParts(input, agentRole, options = {}) {
+        // A non-primary built-in's role is its own name, so its renderer is found by role too.
+        if (this.renderers.get(agentRole)?.standalone === true)
+            return { core: '' };
         const root = usesV2Prompts(input) ? '_v2' : '_default';
-        const files = [
-            ...(options.includeAllLayer === false ? [] : ['prompt-base-all']),
-            ...(!usesV2Prompts(input) &&
-                process.platform === 'win32' &&
-                isAgentBuiltinToolEnabled(input.capabilities, 'bash')
-                ? ['prompt-base-windows']
-                : []),
-            ...(agentRole === 'orchestrator' ? [] : ['prompt-base-worker']),
-        ];
+        const files = sharedBaseFiles(input, agentRole, options.includeAllLayer !== false);
         const core = [];
         for (const file of files) {
             const templates = await this.readLayerTemplates(input, root, `${file}.md.hbs`);
@@ -318,21 +330,27 @@ export class BuiltinAgentCatalog {
      * `skills` is the Agent's preload list, as for every Agent: it is not a
      * Builtin Skill override, so it does not limit Skills and may name any Skill.
      */
-    async readAgentSelectors(agentDir) {
+    async readAgentConfig(agentDir, canonical) {
         const raw = await this.readOptionalFile(join(agentDir, 'agent.md'));
-        if (raw === undefined)
-            return {};
-        const path = `${agentDir}/agent.md`;
+        if (raw === undefined) {
+            return { surfaceFlags: resolveBuiltinSurfaceFlags(canonical, {}, `${agentDir}/agent.md`) };
+        }
+        const source = `${agentDir}/agent.md`;
         const frontmatter = parseFrontmatter(raw).frontmatter;
         const capabilityFields = Object.fromEntries(['persona', 'tools', 'builtinTools', 'features']
             .filter((key) => Object.hasOwn(frontmatter, key))
             .map((key) => [key, frontmatter[key]]));
-        const preloadSkills = parseBuiltinPreloadSkills(frontmatter.skills, path);
+        const capabilityOverride = Object.keys(capabilityFields).length > 0
+            ? parseAgentCapabilityConfig(capabilityFields, source)
+            : undefined;
+        const mavis = readMavisExtension(frontmatter, source);
+        const coordination = parseAgentCoordinationConfig(mavis.coordination, source);
+        const preloadSkills = parseBuiltinPreloadSkills(frontmatter.skills, source);
         return {
-            ...(Object.keys(capabilityFields).length > 0
-                ? { capabilityOverride: parseAgentCapabilityConfig(capabilityFields, path) }
-                : {}),
+            ...(capabilityOverride ? { capabilityOverride } : {}),
+            ...(coordination ? { coordination } : {}),
             ...(preloadSkills ? { preloadSkills } : {}),
+            surfaceFlags: resolveBuiltinSurfaceFlags(canonical, mavis, source),
         };
     }
     async renderFeaturePrompts(canonical, input) {
@@ -468,6 +486,17 @@ export class BuiltinAgentCatalog {
 function resolvePromptMode(input) {
     return input.promptMode ?? (input.promptProfile === 'tui' ? 'tui' : input.appMode);
 }
+function sharedBaseFiles(input, agentRole, includeAllLayer) {
+    return [
+        ...(includeAllLayer ? ['prompt-base-all'] : []),
+        ...(!usesV2Prompts(input) &&
+            process.platform === 'win32' &&
+            isAgentBuiltinToolEnabled(input.capabilities, 'bash')
+            ? ['prompt-base-windows']
+            : []),
+        ...(agentRole === 'orchestrator' ? [] : ['prompt-base-worker']),
+    ];
+}
 function usesV2Prompts(input) {
     return (input.promptProfile === 'desktop' ||
         input.promptProfile === 'tui' ||
@@ -478,6 +507,31 @@ function v2PromptReadContext(input) {
 }
 function isPromptReadScope(value) {
     return Boolean(value && 'source' in value && 'snapshot' in value);
+}
+function readMavisExtension(frontmatter, source) {
+    const value = frontmatter['x-mavis'];
+    if (value === undefined)
+        return {};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`Invalid x-mavis in ${source}: must be a mapping`);
+    }
+    return value;
+}
+/**
+ * Bundled `x-mavis` switches, falling back to the built-in code preset and then
+ * to the contract default (true). Startup writes the result into the canonical
+ * file; the runtime reads that file, so a user edit still wins until restart.
+ */
+function resolveBuiltinSurfaceFlags(canonical, mavis, source) {
+    const preset = builtinSurfaceFlagPreset(canonical);
+    // The field list and the optional-boolean rule live in one place; this only
+    // supplies the bundled-source error wording.
+    const declared = parseAgentSurfaceSwitches(mavis, (field) => new Error(`Invalid configuration at ${source}: ${field} must be a boolean`));
+    return {
+        showInImBinding: declared.showInImBinding ?? preset?.showInImBinding ?? true,
+        showInAgentList: declared.showInAgentList ?? preset?.showInAgentList ?? true,
+        dispatchable: declared.dispatchable ?? preset?.dispatchable ?? true,
+    };
 }
 function parseBuiltinPreloadSkills(value, path) {
     if (value === undefined)

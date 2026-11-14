@@ -1,13 +1,24 @@
+import { COMMENT_COMPOSER_SPEC, resolveCommentInputAutoGrow, fitCommentInputHeight } from "@mavis/shared/comment-composer";
 const PPT_SELECTION_BRIDGE_ICONS = {
     close: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
     confirm: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>',
 };
+/** Comments come from a multi-line box, so their line breaks are content, not noise. */
+export function normalizeSelectionInstruction(value, maxLength) {
+    return String(value ?? '')
+        .trim()
+        .slice(0, maxLength);
+}
 export function buildPPTSelectionBridgeScript(options) {
     const config = JSON.stringify({
         enabled: options.enabled,
         token: options.token,
         placeholder: options.placeholder || 'Describe the change...',
         icons: PPT_SELECTION_BRIDGE_ICONS,
+        commentInput: {
+            lineHeight: COMMENT_COMPOSER_SPEC.input.lineHeight,
+            maxLines: COMMENT_COMPOSER_SPEC.input.maxLines,
+        },
     });
     return `(() => {
   const config = ${config};
@@ -27,6 +38,13 @@ export function buildPPTSelectionBridgeScript(options) {
     let hoverBox = null;
     let hoverTarget = null;
     let composer = null;
+    // How far the composer has grown past its single line, for placement.
+    let composerGrowth = 0;
+    const commentInput = config.commentInput;
+    // Serialised rather than reimplemented, so this box grows and clamps on the
+    // same numbers as the other comment boxes. Both close over nothing.
+    const resolveCommentInputAutoGrow = ${resolveCommentInputAutoGrow.toString()};
+    const fitCommentInputHeight = ${fitCommentInputHeight.toString()};
     let activeRect = null;
     let activePayload = null;
     let activeMarker = null;
@@ -225,6 +243,7 @@ export function buildPPTSelectionBridgeScript(options) {
     const removeComposer = () => {
       if (composer) composer.remove();
       composer = null;
+      composerGrowth = 0;
       activeRect = null;
       activePayload = null;
       activeMarker = null;
@@ -484,6 +503,7 @@ export function buildPPTSelectionBridgeScript(options) {
       panel.style.position = 'fixed';
       panel.style.zIndex = '2147483647';
       panel.style.height = '42px';
+      panel.style.minHeight = '42px';
       panel.style.display = 'flex';
       panel.style.alignItems = 'center';
       panel.style.gap = '10px';
@@ -495,13 +515,27 @@ export function buildPPTSelectionBridgeScript(options) {
       panel.style.backdropFilter = 'blur(12px)';
       panel.style.font = '14px/20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
 
-      const input = document.createElement('input');
+      const input = document.createElement('textarea');
+      input.rows = 1;
       input.setAttribute(bridgeUiAttr, 'true');
       input.placeholder = placeholderText;
       input.value = marker && marker.instruction ? marker.instruction : '';
       input.style.flex = '1 1 auto';
       input.style.minWidth = '0';
-      input.style.height = '26px';
+      input.style.display = 'block';
+      input.style.boxSizing = 'border-box';
+      input.style.height = commentInput.lineHeight + 'px';
+      // The box sits in the previewed page, whose textarea rules reach it too. A
+      // min-height would also inflate the measurement the box grows from.
+      input.style.minHeight = '0';
+      input.style.maxHeight = 'none';
+      input.style.boxShadow = 'none';
+      input.style.margin = '0';
+      input.style.padding = '0';
+      input.style.resize = 'none';
+      input.style.overflowX = 'hidden';
+      input.style.overflowY = 'hidden';
+      input.style.overflowWrap = 'anywhere';
       input.style.border = '0';
       input.style.outline = '0';
       input.style.font = '400 14px/20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
@@ -564,11 +598,19 @@ export function buildPPTSelectionBridgeScript(options) {
         event.stopPropagation();
         submit();
       });
-      input.addEventListener('input', syncAction);
+      input.addEventListener('input', () => {
+        syncAction();
+        syncComposerInputHeight();
+        positionComposer();
+      });
       input.addEventListener('keydown', (event) => {
+        // While an IME is composing, Enter and Escape belong to its candidate window.
+        if (event.isComposing || event.keyCode === 229) return;
         if (event.key === 'Enter') {
-          event.preventDefault();
           event.stopPropagation();
+          // Shift+Enter falls through to the textarea's native newline.
+          if (event.shiftKey) return;
+          event.preventDefault();
           submit();
         } else if (event.key === 'Escape') {
           event.preventDefault();
@@ -586,6 +628,25 @@ export function buildPPTSelectionBridgeScript(options) {
       input.focus();
     };
 
+    const syncComposerInputHeight = () => {
+      const input = composer && composer.querySelector('textarea');
+      if (!input) return;
+      const computedLineHeight = Number.parseFloat(window.getComputedStyle(input).lineHeight);
+      const lineHeight = computedLineHeight > 0 ? computedLineHeight : commentInput.lineHeight;
+      const next = fitCommentInputHeight(
+        input,
+        { minHeight: lineHeight, maxHeight: lineHeight * commentInput.maxLines },
+        resolveCommentInputAutoGrow,
+      );
+      if (!next) return;
+      composerGrowth = next.height - lineHeight;
+      // The one-line box keeps its fixed height. Past that it hugs the text: a fixed
+      // height would let the page's box-sizing decide how much slack opens up above
+      // the text. The actions stay on the bottom edge.
+      composer.style.height = composerGrowth > 0 ? 'auto' : '42px';
+      composer.style.alignItems = composerGrowth > 0 ? 'flex-end' : 'center';
+    };
+
     const positionComposer = () => {
       if (!composer) return;
       const rect = activeMarker
@@ -595,8 +656,12 @@ export function buildPPTSelectionBridgeScript(options) {
       if (activeMarker) activeMarker.rect = rect;
       else activeRect = rect;
       const width = Math.min(360, Math.max(260, Math.min(window.innerWidth - 32, rect.right - rect.left)));
-      composer.style.width = width + 'px';
-      const composerHeight = 42;
+      // Width drives wrapping, so measure against the width the box is about to take.
+      if (composer.style.width !== width + 'px') {
+        composer.style.width = width + 'px';
+        syncComposerInputHeight();
+      }
+      const composerHeight = 42 + composerGrowth;
       const bottomInset = 24;
       const gap = 12;
       const left = clamp(rect.left + (rect.right - rect.left) / 2 - width / 2, 16, Math.max(16, window.innerWidth - width - 16));
@@ -626,6 +691,7 @@ export function buildPPTSelectionBridgeScript(options) {
       startPoint = null;
       window.removeEventListener('pointermove', onPointerMove, true);
       window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
     };
 
     const onPointerMove = (event) => {
@@ -642,8 +708,10 @@ export function buildPPTSelectionBridgeScript(options) {
       event.stopPropagation();
       window.removeEventListener('pointermove', onPointerMove, true);
       window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
       let rect = rectFromPoints(startPoint, { x: event.clientX, y: event.clientY });
-      if (area(rect) < 64) {
+      const isBoxDrawn = area(rect) >= 64;
+      if (!isBoxDrawn) {
         const targetRect = rectForElement(hoverTarget || targetElementForPointer(event.target));
         rect = targetRect || {
           left: clamp(event.clientX - 12, 0, window.innerWidth - 1),
@@ -660,6 +728,16 @@ export function buildPPTSelectionBridgeScript(options) {
         return;
       }
       showComposer(rect, payload);
+      if (isBoxDrawn) post('selection-box-drawn', { source: 'native' });
+    };
+
+    const onPointerCancel = () => {
+      if (!startPoint) return;
+      startPoint = null;
+      window.removeEventListener('pointermove', onPointerMove, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
+      if (selectionBox) selectionBox.style.display = 'none';
     };
 
     const onPointerDown = (event) => {
@@ -674,6 +752,7 @@ export function buildPPTSelectionBridgeScript(options) {
       updateSelectionBox({ left: event.clientX, top: event.clientY, right: event.clientX + 1, bottom: event.clientY + 1 });
       window.addEventListener('pointermove', onPointerMove, true);
       window.addEventListener('pointerup', onPointerUp, true);
+      window.addEventListener('pointercancel', onPointerCancel, true);
     };
 
     const onPointerOver = (event) => {
@@ -717,6 +796,7 @@ export function buildPPTSelectionBridgeScript(options) {
       document.removeEventListener('scroll', onScroll, true);
       window.removeEventListener('pointermove', onPointerMove, true);
       window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
       startPoint = null;
     };
 

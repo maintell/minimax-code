@@ -28,6 +28,7 @@ const IPC_CHANNELS = {
     SYSTEM_SHOW_IMAGE_CONTEXT_MENU: 'system:show-image-context-menu',
     SYSTEM_GET_HOME_PATH: 'system:get-home-path',
     SYSTEM_GET_APP_INSTALL_DIR: 'system:get-app-install-dir',
+    SYSTEM_GET_HARDWARE_INFO: 'system:get-hardware-info',
     SYSTEM_GET_APP_VERSION_SYNC: 'system:get-app-version-sync',
     // 窗口控制
     WINDOW_MINIMIZE: 'window:minimize',
@@ -134,7 +135,6 @@ const IPC_CHANNELS = {
     DESKTOP_SET_RUN_ON_STARTUP: 'desktop:set-run-on-startup',
     DESKTOP_GET_RUN_ON_STARTUP: 'desktop:get-run-on-startup',
     DESKTOP_SET_KEEP_AWAKE: 'desktop:set-keep-awake',
-    DESKTOP_GET_KEEP_AWAKE: 'desktop:get-keep-awake',
     DESKTOP_SET_FILE_OPEN_WITH_ENHANCED: 'desktop:set-file-open-with-enhanced',
     DESKTOP_GET_FILE_OPEN_WITH_ENHANCED: 'desktop:get-file-open-with-enhanced',
     DESKTOP_START_COMPUTER_USE_RUNTIME: 'desktop:start-computer-use-runtime',
@@ -202,6 +202,11 @@ const IPC_CHANNELS = {
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
+    MINIAPP_WIDGET: 'miniapp:widget',
+    MINIAPP_PREVIEW: 'miniapp:preview',
+    MINIAPP_PREVIEW_CACHE: 'miniapp:preview-cache',
+    MINIAPP_PREVIEW_CAPTURED: 'miniapp:preview-captured',
+    MINIAPP_PRESENTATION_CHANGED: 'miniapp:presentation-changed',
     MINIAPP_REFRESH: 'miniapp:refresh',
     MINIAPP_STOP: 'miniapp:stop',
     MINIAPP_CLOSE: 'miniapp:close',
@@ -280,6 +285,7 @@ const IPC_CHANNELS = {
     OBSERVABILITY_ACK_OUTBOX: 'observability:ack-outbox',
     OBSERVABILITY_OUTBOX_EVENT: 'observability:outbox-event',
     OBSERVABILITY_STARTUP_MILESTONE: 'observability:startup-milestone',
+    OBSERVABILITY_REPORT_METRICS: 'observability:report-metrics',
     // Document preview source/backend bridge (mirrors config/constants.ts)
     DOCUMENT_PREVIEW_OPEN_SOURCE: 'document-preview:open-source',
     DOCUMENT_PREVIEW_SAVE_PPTX_NOTES: 'document-preview:save-pptx-notes',
@@ -316,6 +322,7 @@ const IPC_CHANNELS = {
     PPT_PREVIEW_GET_DEBUG_STATE: 'ppt-preview:get-debug-state',
     PPT_PREVIEW_SELECTION_BRIDGE_EVENT: 'ppt-preview:selection-bridge-event',
     PPT_PREVIEW_SELECTION_EVENT: 'ppt-preview:selection-event',
+    PPT_PREVIEW_SELECTION_INTENT_EVENT: 'ppt-preview:selection-intent-event',
     PPT_PREVIEW_DESTROY: 'ppt-preview:destroy',
     // Runtime lifecycle.
     RUNTIME_READY: 'runtime:ready',
@@ -323,7 +330,9 @@ const IPC_CHANNELS = {
     RUNTIME_CHECK_READY: 'runtime:check-ready',
     RUNTIME_SET_RUNAWAY_GUARD_CONFIG: 'runtime:set-runaway-guard-config',
     RUNTIME_SET_PROMPT_SUGGESTION_POLICY: 'runtime:set-prompt-suggestion-policy',
+    RUNTIME_SET_BUNNY_POLICY: 'runtime:set-bunny-policy',
     RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG: 'runtime:set-tool-result-compaction-config',
+    RUNTIME_SET_BUNNY_CONTEXT_CONFIG: 'runtime:set-bunny-context-config',
     RUNTIME_SET_COLLECTION_POLICY_CONFIG: 'runtime:set-collection-policy-config',
     // Always-on Electron utility-process runtime transport.
     RUNTIME_TRANSPORT_REQUEST_PORT: 'runtime:transport-request-port',
@@ -574,6 +583,7 @@ catch {
 const platformInfo = {
     platform: process.platform,
     arch: process.arch,
+    getHardwareInfo: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_HARDWARE_INFO),
     isElectron: true,
     buildEnv: process.env.NEXT_PUBLIC_BUILD_ENV,
     isDev: isDev,
@@ -610,6 +620,9 @@ const electronObservability = {
             surface,
             timestampEpochMs: performance.timeOrigin + performance.now(),
         });
+    },
+    reportMetrics: (points) => {
+        ipcRenderer.send(IPC_CHANNELS.OBSERVABILITY_REPORT_METRICS, points);
     },
 };
 // ============================================
@@ -887,7 +900,6 @@ const electronAPI = {
     getRunOnStartup: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_RUN_ON_STARTUP),
     // 保持唤醒
     setKeepAwake: (enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_KEEP_AWAKE, enabled),
-    getKeepAwake: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_KEEP_AWAKE),
     // Windows 文本类型“打开方式”增强登记
     setFileOpenWithEnhanced: (enabled) => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_SET_FILE_OPEN_WITH_ENHANCED, enabled),
     getFileOpenWithEnhanced: () => ipcRenderer.invoke(IPC_CHANNELS.DESKTOP_GET_FILE_OPEN_WITH_ENHANCED),
@@ -911,7 +923,9 @@ const electronAPI = {
     checkRuntimeReady: () => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_CHECK_READY),
     setRunawayGuardConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_RUNAWAY_GUARD_CONFIG, config),
     setPromptSuggestionPolicy: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_PROMPT_SUGGESTION_POLICY, config),
+    setBunnyPolicy: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_BUNNY_POLICY, config),
     setToolResultCompactionConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG, config),
+    setBunnyContextConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_BUNNY_CONTEXT_CONFIG, config),
     // `config` is the raw Apollo value (object, JSON string, or `undefined` when
     // the key is absent). Main owns validation and the last-valid fallback.
     setCollectionPolicyConfig: (config) => ipcRenderer.invoke(IPC_CHANNELS.RUNTIME_SET_COLLECTION_POLICY_CONFIG, config),
@@ -2026,9 +2040,22 @@ const onMiniAppSlept = (listener) => {
     };
 };
 const miniAppAPI = {
+    pagePreviews: (request) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PREVIEW_CACHE, request),
+    presentWidget: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_WIDGET, params),
     host: miniAppHost,
     agentSessions: miniAppAgentSessions,
     composer: miniAppComposer,
+    capturePreview: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PREVIEW, params),
+    onPresentationChanged: (callback) => {
+        const listener = (_event, event) => callback(event);
+        ipcRenderer.on(IPC_CHANNELS.MINIAPP_PRESENTATION_CHANGED, listener);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_PRESENTATION_CHANGED, listener);
+    },
+    onPreviewCaptured: (callback) => {
+        const listener = (_event, snapshot) => callback(snapshot);
+        ipcRenderer.on(IPC_CHANNELS.MINIAPP_PREVIEW_CAPTURED, listener);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.MINIAPP_PREVIEW_CAPTURED, listener);
+    },
     toolPermission: miniAppToolPermission,
     list: () => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_LIST),
     open: openMiniApp,
@@ -2337,6 +2364,20 @@ const pptPreviewViewAPI = {
         ipcRenderer.on(IPC_CHANNELS.PPT_PREVIEW_SELECTION_EVENT, listener);
         return () => {
             ipcRenderer.removeListener(IPC_CHANNELS.PPT_PREVIEW_SELECTION_EVENT, listener);
+        };
+    },
+    onSelectionIntent: (callback) => {
+        const listener = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const event = payload;
+            if (event.type !== 'selection-box-drawn' || event.source !== 'native')
+                return;
+            callback({ type: 'selection-box-drawn', source: 'native' });
+        };
+        ipcRenderer.on(IPC_CHANNELS.PPT_PREVIEW_SELECTION_INTENT_EVENT, listener);
+        return () => {
+            ipcRenderer.removeListener(IPC_CHANNELS.PPT_PREVIEW_SELECTION_INTENT_EVENT, listener);
         };
     },
     destroy: (options) => ipcRenderer.invoke(IPC_CHANNELS.PPT_PREVIEW_DESTROY, options),

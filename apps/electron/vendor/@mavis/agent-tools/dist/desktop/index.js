@@ -1,4 +1,5 @@
 import { buildLocalCronTools } from './local-cron-tools.js';
+import { buildLocalAssignmentTools } from './local-assignment-tools.js';
 import { buildLocalSessionCreateTool } from './local-session-create-tool.js';
 import { toRuntimeTool } from '@mavis/agent-core/tools';
 import { LocalAskUserTool } from './local-ask-user.js';
@@ -36,7 +37,10 @@ export * from './local-grep.js';
 export * from './local-rg-runner.js';
 export * from './local-skill.js';
 export * from './local-mavis.js';
+export * from './local-assignment-tools.js';
+export { PLAIN_TEXT_ENDING_FOLLOW_UP, emptyEndingFollowUp, plainTextEndingFollowUpAfterDelivery, } from './local-mavis-coordinator-text.js';
 export * from './local-mavis-commands.js';
+export * from './local-mavis-coordinator.js';
 export * from './local-mavis-ptc.js';
 export * from './local-mavis-cron-adapter.js';
 export * from './local-memory.js';
@@ -44,6 +48,11 @@ export * from './local-code-review.js';
 export * from './local-task-control.js';
 export * from './local-task.js';
 export * from './local-task-append.js';
+export * from './saved-ptc-scripts.js';
+export * from './ptc-script-roots.js';
+export * from './ptc-script-save.js';
+export * from './ptc-script-catalog.js';
+export * from './ptc-script-text.js';
 export * from './task-verification.js';
 export * from './local-todowrite.js';
 export * from './local-webfetch.js';
@@ -83,6 +92,8 @@ export function buildLocalToolRegistry(deps) {
     if (deps.mavisAgentAdapter) {
         tools.push(toRuntimeTool(new LocalMavisTool(deps.mavisAgentAdapter, deps.mavisCronAdapter, deps.mavisSessionAdapter, deps.mavisMcpAdapter)));
     }
+    if (deps.mavisSessionAdapter)
+        tools.push(...buildLocalAssignmentTools({ sessionAdapter: deps.mavisSessionAdapter }));
     if (deps.mavisAgentAdapter && deps.mavisSessionAdapter) {
         tools.push(buildLocalSessionCreateTool({
             agentAdapter: deps.mavisAgentAdapter,

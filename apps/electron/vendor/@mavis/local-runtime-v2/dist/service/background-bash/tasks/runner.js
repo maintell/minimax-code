@@ -8,7 +8,7 @@ import { resolveV2SessionArtifactPathsSync } from '../../../infra/legacy-db/v2-s
 import { isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, logTaskAdmissionRejectedAfterPrecheck, precheckTaskConcurrency, readTaskOccupancy, runInjectedConversationTaskTurn, } from '../shared-task/injected-conversation-task-turn.js';
 import { requireTaskConversation } from '../shared-task/local-task-host.js';
 import { normalizeLocalTaskInput, taskModelSelectionFor } from '../shared-task/local-task-input.js';
-import { resolveLocalTaskAgentTarget, taskSessionOwner, } from '../shared-task/local-task-subagents.js';
+import { resolveLocalTaskAgentTarget, TaskDispatchNotAllowedError, taskSessionOwner, } from '../shared-task/local-task-subagents.js';
 import { admitBackgroundTask } from './lifecycle.js';
 export async function startBackgroundLocalTask(input) {
     if (input.signal?.aborted)
@@ -31,7 +31,17 @@ async function startAdmittedBackgroundLocalTask(input, admission, shutdownSignal
 async function prepareAdmittedTask(input, admission, shutdownSignal) {
     const taskInput = normalizeLocalTaskInput(input.taskInput);
     requireTaskConversation(input.host);
-    const target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name, input.toolCtx.pluginAgents);
+    let target;
+    try {
+        target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name, input.toolCtx.pluginAgents);
+    }
+    catch (error) {
+        // Rejected before the task id exists, so no task row and no child Session.
+        if (error instanceof TaskDispatchNotAllowedError) {
+            return { result: { status: 'failed', errorMessage: error.message } };
+        }
+        throw error;
+    }
     throwIfShuttingDown(shutdownSignal);
     if (!target) {
         return { result: { status: 'failed', errorMessage: `Unknown agent: ${taskInput.agent_name}` } };

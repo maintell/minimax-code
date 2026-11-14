@@ -41,23 +41,25 @@ export function formatQuestionnaireText(renderable) {
     return lines.join('\n');
 }
 /**
- * Parse a free-text reply against ALL steps of the pending questionnaire,
+ * Parse an inbound reply against ALL steps of the pending questionnaire,
  * using a continuous global option numbering (matches `formatQuestionnaireText`).
  *
- * Mapping rules ported from `feat/im-genui-full-mr`'s
- * `parseWechatQuestionnaireReply`:
- *   - Extract all integers from the text → map each back to (stepId, optionId)
- *     via the global numbering → group into per-step selectedOptionIds (a
- *     single-choice step keeps only the first selected option).
+ * Returns `null` — "this is not a questionnaire answer" — unless the trimmed
+ * text consists solely of digits and separators AND at least one of those
+ * numbers names an option. Everything else (free text, digits glued to words,
+ * numbers that are all out of range) is an ordinary message for the agent.
+ *
+ * Mapping rules:
+ *   - Extract all integers → map each back to (stepId, optionId) via the
+ *     global numbering → group into per-step selectedOptionIds (a
+ *     single-choice step keeps only the first selected option). Out-of-range
+ *     numbers are ignored.
  *   - Separators are intentionally tolerant: ASCII `,`, Chinese full-width
  *     `，`, Chinese pause `、`, and any whitespace are all accepted (a user
  *     typing `1，3` or `1、3` or `1 3` all map identically to `1, 3`).
- *   - Remaining non-numeric free text → selectedOther=true / otherText. With
- *     one step it lands on that step; with multiple steps it lands on the
- *     first step that has no numeric answer (best-effort).
- *   - A step with no selection and no free text answer is omitted from the
- *     payload (the desktop questionnaire UI treats missing answers as
- *     "skipped" / "not required").
+ *   - Every step gets an answer; a step with no in-range number is emitted as
+ *     an explicit `skipped: true` answer (omitting it would make the server
+ *     reject the whole reply, because every step is `required`).
  */
 export function parseNumberedReply(input) {
     const steps = input.request.steps ?? [];
@@ -74,46 +76,31 @@ export function parseNumberedReply(input) {
     }
     const maxIndex = numbering.length;
     const trimmed = input.text.trim();
+    // A numbered answer is digits + separators and nothing else. Free text, or
+    // digits glued to words ("2 换一批", "2024年"), is a normal message.
+    if (!/^[\d\s,，、]+$/u.test(trimmed))
+        return null;
     // Collect selected numbers (only those within range).
     const numberMatches = trimmed.match(/\d+/g) ?? [];
     const selectedIndexes = numberMatches
         .map((n) => Number.parseInt(n, 10))
         .filter((n) => n >= 1 && n <= maxIndex);
-    // Free text = the message with all numbers + separators stripped.
-    const freeText = trimmed
-        .replace(/\d+/g, ' ')
-        .replace(/[，,、\s]+/gu, ' ')
-        .trim();
-    const perStep = collectPerStepSelections(numbering, selectedIndexes);
-    const freeTextStepId = resolveFreeTextStep(steps, perStep, freeText);
-    const answers = buildNumberedAnswers({ steps, perStep, freeTextStepId, freeText });
-    // If the reply produced nothing usable, fall back to "first step / other"
-    // so the agent still sees an answer instead of dropping the user's reply.
-    if (answers.length === 0) {
-        return {
-            schemaVersion: 2,
-            requestId: input.request.id,
-            submittedAt: Date.now(),
-            answers: [
-                {
-                    stepId: steps[0].id,
-                    selectedOptionIds: [],
-                    selectedOther: true,
-                    otherText: trimmed,
-                },
-            ],
-        };
-    }
+    // Digits only, but none of them names an option ("99") — not an answer.
+    if (selectedIndexes.length === 0)
+        return null;
     return {
         schemaVersion: 2,
         requestId: input.request.id,
         submittedAt: Date.now(),
-        answers,
+        answers: buildNumberedAnswers({
+            steps,
+            perStep: collectPerStepSelections(numbering, selectedIndexes),
+        }),
     };
 }
 /**
  * Build a `ChannelQuestionnairePending['request']` shell from a renderable.
- * Slice 2 stores this so a free-form reply can be mapped back to a
+ * The adapter stores this so a numbered reply can be mapped back to a
  * questionnaire even when the original `AskQuestionnaireRequest` is not on
  * hand (the questionnaire bridge keeps its own authoritative copy).
  */
@@ -157,15 +144,12 @@ function collectPerStepSelections(numbering, selectedIndexes) {
     }
     return perStep;
 }
-/** Free text lands on the single step, else the first unanswered, else step 1. */
-function resolveFreeTextStep(steps, perStep, freeText) {
-    if (!freeText)
-        return undefined;
-    if (steps.length === 1)
-        return steps[0].id;
-    const firstUnanswered = steps.find((s) => (perStep.get(s.id) ?? []).length === 0);
-    return (firstUnanswered ?? steps[0]).id;
-}
+/**
+ * One answer per step, in request order. A step the user did not number is
+ * emitted as an explicit `skipped: true` answer: omitting it would make the
+ * server reject the whole reply, because `normalizeAskUserInput` pins every
+ * step to `required: true`.
+ */
 function buildNumberedAnswers(input) {
     const answers = [];
     for (const step of input.steps) {
@@ -173,17 +157,9 @@ function buildNumberedAnswers(input) {
         if (step.selectionMode === 'single' && selected.length > 1) {
             selected = [selected[0]];
         }
-        const isFreeTextStep = input.freeTextStepId === step.id;
-        if (selected.length === 0 && !isFreeTextStep)
-            continue;
-        const answer = {
-            stepId: step.id,
-            selectedOptionIds: selected,
-            selectedOther: isFreeTextStep,
-        };
-        if (isFreeTextStep)
-            answer.otherText = input.freeText;
-        answers.push(answer);
+        answers.push(selected.length === 0
+            ? { stepId: step.id, selectedOptionIds: [], selectedOther: false, skipped: true }
+            : { stepId: step.id, selectedOptionIds: selected, selectedOther: false });
     }
     return answers;
 }

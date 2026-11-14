@@ -135,7 +135,7 @@ export function createSideChatDataCapability(options) {
                     status: 'idle',
                     isDefaultWorkspace: source.isDefaultWorkspace,
                     runLocation: source.runLocation,
-                    ...inheritedSettings(source),
+                    ...inheritedSettings(source, input.advisor),
                     ...initialModelSnapshot(source, model),
                     sessionOrigin: 'local-runtime',
                     sessionDataVersion: CURRENT_SESSION_DATA_VERSION,
@@ -184,14 +184,15 @@ export function createSideChatDataCapability(options) {
 }
 /**
  * A Side copies the main conversation's history, so it keeps the settings that history was built
- * under. An absent tool call mode stays absent, which reads as native; an absent memory policy
- * reads as the default.
+ * under, and Main's advisor unless the side chat brings its own. An absent tool call mode stays
+ * absent, which reads as native; an absent memory policy reads as the default.
  */
-function inheritedSettings(source) {
+function inheritedSettings(source, advisor) {
     return {
         appMode: source.appMode,
         toolCallMode: source.toolCallMode,
         memoryPolicy: source.memoryPolicy,
+        advisor: advisor ?? source.advisor,
     };
 }
 function initialModelSnapshot(source, model) {

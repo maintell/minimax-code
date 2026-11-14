@@ -1,4 +1,5 @@
 import { TRUSTED_LEGACY_IM_ROOT_PURPOSE_MARKER } from '@mavis/conversation-contract';
+import { isBunnyAgentName } from '@mavis/shared/agent-avatar';
 import { isAgentNotFoundError, } from '../../agent/index.js';
 import { applyPermissionReplyFromChannel } from '../../permission/index.js';
 import { LocalQuestionnaireError, LocalQuestionnaireService, } from '../../questionnaire/index.js';
@@ -62,7 +63,7 @@ export function buildHostChannelWireInput(host, options) {
         dataDir: () => host.configGetter().dataDir,
         nowMs: host.nowMs,
         agentName: host.agentName,
-        ...(buildChannelAgentResolution(host)),
+        ...buildChannelAgentResolution(host),
         makeId,
         fetchImpl: host.fetchImpl,
         ...(host.runtimeConversation ? { conversation: host.runtimeConversation } : {}),
@@ -94,6 +95,7 @@ export function buildHostChannelWireInput(host, options) {
             }
             : {}),
         ...buildRootlessChannelCapabilities(host),
+        ...buildCoordinatorMainSessionCapability(host),
         createRootSession: async (agentName) => {
             const conversation = requireConversation();
             const previousRoot = (await conversation.query.listSessions({ agentName, sessionType: 'root', limit: 1 }))[0];
@@ -137,6 +139,7 @@ export function buildHostChannelWireInput(host, options) {
             : {}),
         ...(options.deferChannelStartup === true ? { deferChannelStartup: true } : {}),
         ...(options.metricsReporter ? { metricsReporter: options.metricsReporter } : {}),
+        getQuestionnaireSessionId: async (requestId) => (await host.questionnaireServiceDeps().store.get(requestId))?.sessionId,
         submitQuestionnaireReply: async ({ agentName, requestId, reply, }) => {
             try {
                 await new LocalQuestionnaireService(host.questionnaireServiceDeps()).reply({
@@ -305,6 +308,25 @@ async function readLegacyCredentialAgent(port, agentName) {
             return undefined;
         throw error;
     }
+}
+/**
+ * Bunny keeps exactly one main conversation. Without `workspaceDir`,
+ * `createRootSession` is the ensure path: it returns the existing Root (or
+ * creates the first one) and never replaces it — unlike the `createRootSession`
+ * closure above, which swaps in a fresh Root for the legacy `/new`.
+ */
+function buildCoordinatorMainSessionCapability(host) {
+    const conversation = host.runtimeConversation;
+    if (!conversation)
+        return {};
+    return {
+        resolveCoordinatorMainSession: async (agentName) => {
+            if (!isBunnyAgentName(agentName))
+                return undefined;
+            const root = await conversation.lifecycle.createRootSession({ agentName });
+            return { sessionId: root.sessionId };
+        },
+    };
 }
 function buildRootlessChannelCapabilities(host) {
     return host.runtimeConversation

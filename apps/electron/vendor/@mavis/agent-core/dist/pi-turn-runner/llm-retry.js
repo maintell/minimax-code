@@ -1,8 +1,10 @@
-import { isContextOverflow, } from '@earendil-works/pi-ai';
-import { isLLMDeterministicRequestRejection, normalizeLLMError, toLLMMetricErrorKind, toLLMProtocolClassification, toLLMRetryDecision, } from '@mavis/shared/llm-error-classifier';
+import { createAssistantMessageEventStream, isContextOverflow, } from '@earendil-works/pi-ai';
+import { isLLMDeterministicRequestRejection, isLLMDeterministicStreamRefusal, isLLMRecoverableStreamInterruption, normalizeLLMError, toLLMMetricErrorKind, toLLMProtocolClassification, toLLMRetryDecision, } from '@mavis/shared/llm-error-classifier';
+import { LLM_PARTIAL_STREAM_RESET } from '../protocol/stream-reset.js';
 import { runWithLLMCallLifecycle, } from './llm-call-lifecycle.js';
 import { LLMReplyLoopGuard, llmReplyLoopMessage, } from './llm-reply-loop-guard.js';
 import { withLLMStreamFailure } from './llm-stream-failure.js';
+import { abortError, abortableSleep, asError, callSettledEvent, captureProviderError, classifyCallOutcome, commitsOutput, createRetryBudget, createSystemWakeLatch, defaultCallId, isDeviceOffline, isEmptyReply, isFailureMessage, parseRetryAfterMs, readProviderUsage, releaseIterator, replayStream, retryDelayMs, retryPolicyForReason, retryTimeout, signalAborted, sleepUntilResume, throwingReplayStream, refusalWaitFields, } from './llm-retry-support.js';
 function isByokProvider(provider) {
     return provider === 'minimax_api' || provider.startsWith('custom_provider:');
 }
@@ -12,11 +14,43 @@ export const LLM_RETRY_CALL_IDENTITY = Symbol('mavis.llmRetryCallIdentity');
 export const LLM_RETRY_BEFORE_REQUEST = Symbol('mavis.llmRetryBeforeRequest');
 /** Symbol-keyed observer for every physical provider request in a logical call. */
 export const LLM_RETRY_REQUEST_SETTLED_OBSERVER = Symbol('mavis.llmRetryRequestSettledObserver');
+/** A wait that overran its delay by more than this spanned a system sleep. */
+export const SYSTEM_SLEEP_GAP_MS = 30_000;
+/**
+ * Whether a wait of `delayMs` that started at `sleptFromMs` spanned a system
+ * sleep. Timers stand still while the system sleeps and the wall clock does
+ * not, and an overdue timer fires on wake before any resume hint arrives, so
+ * the overrun itself marks the wake: time asleep is not time waited.
+ */
+export function overranSystemSleep(sleptFromMs, nowMs, delayMs) {
+    return nowMs - sleptFromMs > delayMs + SYSTEM_SLEEP_GAP_MS;
+}
 export const DEFAULT_LLM_RETRY_POLICY = {
     maxRetries: 5,
     baseDelayMs: 1_000,
     maxDelayMs: 30_000,
     maxRetryElapsedMs: 120_000,
+    /**
+     * Five times the ordinary base, for rate-limit retries only.
+     *
+     * Why: a rate-limit window is minute-scale. Providers meter RPM/TPM over a
+     * rolling minute, and a 429 that carries no `Retry-After` promises nothing
+     * shorter. With the ordinary 1 s base the whole budget is spent in ~16 s
+     * (0.5/1/2/4/8 s at zero jitter), so all five retries land inside the very
+     * window that just refused the request, keep adding load to it, and the
+     * call gives up while still throttled.
+     *
+     * A 5 s base spreads the same five retries over ~47 s at zero jitter and
+     * ~95 s at full jitter — still inside the unchanged 120 s budget, so no
+     * retry is lost — and makes the first wait (2.5–5 s) clearly longer than a
+     * network blip.
+     *
+     * Scope: rate limits only. Timeouts and transport errors keep the 1 s base,
+     * where a fast retry is usually right. `Retry-After` still wins over both
+     * (`retryDelayMs`), and `maxRetries` / `maxRetryElapsedMs` / `maxDelayMs`
+     * are unchanged.
+     */
+    rateLimitBaseDelayMs: 5_000,
 };
 export const DEFAULT_LLM_REPLY_GUARD_POLICY = {
     emptyRetries: 2,
@@ -145,27 +179,37 @@ admissionDeadlineAt) {
             state,
             signal: options?.signal,
         };
+        // Retries charged to `policy`; offline waits never count against it.
+        let retriesUsed = 0;
         let retryStartedAtMs;
+        // Offline waits are not charged. They are bounded by `maxOfflineWaitMs` from
+        // the first offline verdict; only a system wake opens a fresh offline window,
+        // so a probe that flips between verdicts still ends the call.
+        let offlineSinceMs;
+        let offlinePolls = 0;
         // With a host lease: retries and recovery share the retry budget from the first failure.
         let retryDeadlineAt;
         const deadlineAt = () => retryDeadlineAt ?? hardDeadlineAt;
+        // A host lease bounds the whole call itself, so offline waits and wake resets stay off.
+        const offlineRecovery = lease === undefined ? input.networkRecovery : undefined;
         let requestAttempt = 1;
         // Asks spent on empty and looping replies; each is also a retry of the policy's budget.
         let emptyRetries = 0;
         let loopRetries = 0;
+        const wake = createSystemWakeLatch(offlineRecovery);
         const event = (status, error) => ({
             sessionId: input.sessionId,
             turnId: input.turnId,
             callId,
             scope: input.scope,
             status,
-            retryAttempt: requestAttempt - 1,
+            retryAttempt: retriesUsed,
             maxRetries: policy.maxRetries,
             requestAttempt,
             ...(error ? { error } : {}),
         });
         try {
-            while (requestAttempt <= policy.maxRetries + 1) {
+            while (retriesUsed <= policy.maxRetries) {
                 if (options?.signal?.aborted)
                     throw abortError(options.signal);
                 const attemptDeadlineAt = deadlineAt();
@@ -175,16 +219,20 @@ admissionDeadlineAt) {
                 // re-arms the caller's own timeout once the request is sent.
                 budget?.arm(retryDeadlineAt ?? admissionDeadlineAt);
                 state.terminalErrorKind = undefined;
+                state.providerError = undefined;
                 const beforeRequest = options?.[LLM_RETRY_BEFORE_REQUEST];
                 beforeRequest?.(requestAttempt);
                 await lifecycle?.beforeAttempt({ callId, requestAttempt });
+                // Admission/accounting can yield while the user stops the turn.
+                if (options?.signal?.aborted)
+                    throw abortError(options.signal);
                 state.requestAttempts = requestAttempt;
-                const preflight = await preflightAttempt(inner, model, context, options, nowMs, callIdentity, isByokProvider(model.provider), requestAttempt, request.observeAttempt(requestSettledObserver(options)), budget, {
+                const preflight = await preflightAttempt(inner, model, context, captureProviderError(options, state), nowMs, callIdentity, isByokProvider(model.provider), requestAttempt, request.observeAttempt(requestSettledObserver(options)), budget, {
                     policy: replyGuard,
-                    emptyRetry: emptyRetries < replyGuard.emptyRetries && requestAttempt <= policy.maxRetries,
-                    loopRetry: loopRetries < replyGuard.loopRetries && requestAttempt <= policy.maxRetries,
+                    emptyRetry: emptyRetries < replyGuard.emptyRetries && retriesUsed < policy.maxRetries,
+                    loopRetry: loopRetries < replyGuard.loopRetries && retriesUsed < policy.maxRetries,
                     ...(attemptDeadlineAt !== undefined ? { deadlineAt: attemptDeadlineAt } : {}),
-                });
+                }, { recoverStreamInterruptions: input.recoverPartialStream === true });
                 if (options?.signal?.aborted) {
                     if (preflight.kind !== 'committed') {
                         if (requestAttempt > 1)
@@ -195,9 +243,37 @@ admissionDeadlineAt) {
                 }
                 if (preflight.kind === 'committed') {
                     budget?.stop();
+                    input.networkRecovery?.markReachable(model.baseUrl);
                     if (requestAttempt > 1)
                         await notify(input.observer, event('recovered'));
-                    return request.settleWith(observeCallSettlement(preflight.stream, settlement), options?.signal);
+                    const committed = input.recoverPartialStream === true
+                        ? recoveringStream(preflight.stream, preflight.facts, {
+                            inner,
+                            input,
+                            policy,
+                            replyGuard,
+                            model,
+                            context,
+                            options,
+                            callId,
+                            callIdentity,
+                            state,
+                            lifecycle,
+                            request,
+                            // A host lease bounds the whole call by its deadline, so it keeps
+                            // the bounded budget only, as before the commit.
+                            networkRecovery: offlineRecovery,
+                            ...(attemptDeadlineAt !== undefined ? { deadlineAt: attemptDeadlineAt } : {}),
+                            requestAttempt,
+                            retriesUsed,
+                            // A wake since the window opened hands the resend a fresh window.
+                            ...(retryStartedAtMs !== undefined && !wake.take() ? { retryStartedAtMs } : {}),
+                            nowMs,
+                            random,
+                            sleep,
+                        })
+                        : preflight.stream;
+                    return request.settleWith(observeCallSettlement(committed, settlement), options?.signal);
                 }
                 const failure = preflight.failure;
                 const owned = failure.streamFailure;
@@ -228,12 +304,73 @@ admissionDeadlineAt) {
                     state.terminalErrorKind = decision.errorKind;
                 }
                 const failureAtMs = nowMs();
+                // An offline device is waited out instead of spending the retry budget.
+                // A host lease bounds the whole call by its deadline, so it keeps the
+                // bounded budget only.
+                const recovery = offlineRecovery;
+                if (recovery &&
+                    preflight.kind === 'failure' &&
+                    decision.kind === 'retry' &&
+                    !owned &&
+                    !isAbortFailure(failure) &&
+                    (await isDeviceOffline(recovery, model.baseUrl, preflight.failure.retryReason, options?.signal))) {
+                    offlineSinceMs ??= failureAtMs;
+                    if (failureAtMs - offlineSinceMs > recovery.maxOfflineWaitMs) {
+                        await notify(input.observer, event('exhausted', failure.error));
+                        return request.settleWith(await request.guardThrow(options?.signal, () => observeTerminalFailure(failure, settlement)), options?.signal);
+                    }
+                    // Time spent offline does not count against the charged window.
+                    retryStartedAtMs = undefined;
+                    offlinePolls += 1;
+                    await discardAttempt(failure);
+                    if (options?.signal?.aborted)
+                        throw abortError(options.signal);
+                    const offlineDelayMs = retryDelayMs(undefined, offlinePolls, policy, random);
+                    await notify(input.observer, {
+                        ...event('waiting', failure.error),
+                        retryAttempt: 0,
+                        requestAttempt: requestAttempt + 1,
+                        delayMs: offlineDelayMs,
+                        nextRetryAtMs: nowMs() + offlineDelayMs,
+                        waitingFor: 'network',
+                    });
+                    let resumed;
+                    try {
+                        const sleptFromMs = nowMs();
+                        resumed =
+                            (await sleepUntilResume(sleep, offlineDelayMs, options?.signal, recovery)) ||
+                                overranSystemSleep(sleptFromMs, nowMs(), offlineDelayMs);
+                    }
+                    catch (error) {
+                        await notify(input.observer, {
+                            ...event('cancelled', failure.error),
+                            retryAttempt: 0,
+                            requestAttempt: requestAttempt + 1,
+                        });
+                        throw error;
+                    }
+                    if (resumed) {
+                        // A wake gives the network a fresh window; time asleep is not waiting.
+                        offlineSinceMs = undefined;
+                        offlinePolls = 0;
+                    }
+                    requestAttempt += 1;
+                    continue;
+                }
+                offlinePolls = 0;
+                // A wake since the window opened restarts it: time asleep is not time retrying.
+                if (wake.take())
+                    retryStartedAtMs = undefined;
                 retryStartedAtMs ??= failureAtMs;
+                wake.arm();
                 if (budget && retryDeadlineAt === undefined) {
                     retryDeadlineAt = Math.min(hardDeadlineAt ?? Infinity, Date.now() + policy.maxRetryElapsedMs);
                     budget.arm(retryDeadlineAt);
                 }
-                const delayMs = retryDelayMs(decision.retryAfterMs ?? failure.retryAfterMs, requestAttempt, policy, random);
+                const delayMs = Math.max(retryDelayMs(decision.retryAfterMs ?? failure.retryAfterMs, retriesUsed + 1, 
+                // A rate-limited retry starts from the longer rate-limit base;
+                // every other reason keeps the ordinary backoff.
+                retryPolicyForReason(policy, decision.retryReason ?? failure.error.reason), random), failure.cooldownMs ?? 0);
                 const expired = retryDeadlineAt !== undefined
                     ? Date.now() + delayMs >= retryDeadlineAt
                     : failureAtMs + delayMs - retryStartedAtMs > policy.maxRetryElapsedMs;
@@ -241,7 +378,7 @@ admissionDeadlineAt) {
                 if (isAbortFailure(failure) ||
                     decision.kind === 'terminal' ||
                     cannotRecover ||
-                    requestAttempt > policy.maxRetries ||
+                    retriesUsed >= policy.maxRetries ||
                     expired) {
                     // An empty reply handed over as it came ends the call with that reply, not a failure.
                     const handedOver = owned?.kind === 'llm_empty_response';
@@ -268,6 +405,7 @@ admissionDeadlineAt) {
                 if (retryDeadlineAt !== undefined && Date.now() + delayMs >= retryDeadlineAt)
                     throw retryTimeout();
                 state.retryTriggered = true;
+                retriesUsed += 1;
                 if (owned?.kind === 'llm_empty_response')
                     emptyRetries += 1;
                 if (owned?.kind === 'llm_reply_loop')
@@ -276,18 +414,21 @@ admissionDeadlineAt) {
                 state.retryReason ??= decision.retryReason;
                 await notify(input.observer, {
                     ...event('waiting', failure.error),
-                    retryAttempt: requestAttempt,
+                    retryAttempt: retriesUsed,
                     requestAttempt: requestAttempt + 1,
                     delayMs,
                     nextRetryAtMs: nowMs() + delayMs,
                 });
                 try {
+                    const sleptFromMs = nowMs();
                     await sleep(delayMs, options?.signal);
+                    if (overranSystemSleep(sleptFromMs, nowMs(), delayMs))
+                        wake.mark();
                 }
                 catch (error) {
                     await notify(input.observer, {
                         ...event('cancelled', failure.error),
-                        retryAttempt: requestAttempt,
+                        retryAttempt: retriesUsed,
                         requestAttempt: requestAttempt + 1,
                     });
                     throw error;
@@ -300,6 +441,9 @@ admissionDeadlineAt) {
             notifyCallSettled(settlement, error);
             await request.settleThrown(error, options?.signal);
             throw error;
+        }
+        finally {
+            wake.dispose();
         }
     });
 }
@@ -497,12 +641,15 @@ const NO_REPLY_GUARD = {
     emptyRetry: false,
     loopRetry: false,
 };
-async function preflightAttempt(inner, model, context, options, nowMs, callIdentity, retryAllErrors, requestAttempt, onRequestSettled, budget, guard = NO_REPLY_GUARD) {
-    let response;
+async function preflightAttempt(inner, model, context, options, nowMs, callIdentity, retryAllErrors, requestAttempt, onRequestSettled, budget, guard = NO_REPLY_GUARD, failurePolicy = {}) {
+    // Filled by the provider callbacks for as long as the attempt runs, so a
+    // committed attempt still reports what it says after the commit boundary.
+    const facts = {};
     const callerOnResponse = options?.onResponse;
     // A reply cut for looping must also stop the provider request (it would otherwise run to its
     // output limit): this attempt's own signal, linked to the caller's.
     const stopController = guard.policy.loopGuard ? new AbortController() : undefined;
+    const callerOnProviderError = options?.onProviderError;
     const attemptOptions = {
         ...(options ?? {}),
         ...(stopController
@@ -513,8 +660,19 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
             }
             : {}),
         maxRetries: 0,
+        onProviderError: (error, responseModel) => {
+            // Providers flatten exceptions to text in their error events. Keep the
+            // typed cause for this attempt only; never put it into public events.
+            facts.providerError = error;
+            try {
+                callerOnProviderError?.(error, responseModel);
+            }
+            catch {
+                // Observability must not replace the original transport failure.
+            }
+        },
         onResponse: async (value, responseModel) => {
-            response = value;
+            facts.response = value;
             await callerOnResponse?.(value, responseModel);
         },
     };
@@ -530,7 +688,14 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
     }
     catch (thrown) {
         notifyRequestSettled(onRequestSettled, requestAttempt, undefined, thrown, options?.signal);
-        return failureResult({ thrown, response, buffered: [], nowMs, retryAllErrors });
+        return failureResult({
+            thrown,
+            response: facts.response,
+            buffered: [],
+            nowMs,
+            retryAllErrors,
+            ...failurePolicy,
+        });
     }
     let iterator;
     try {
@@ -538,7 +703,15 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
     }
     catch (thrown) {
         notifyRequestSettled(onRequestSettled, requestAttempt, undefined, thrown, options?.signal);
-        return failureResult({ thrown, response, stream, buffered: [], nowMs, retryAllErrors });
+        return failureResult({
+            thrown,
+            response: facts.response,
+            stream,
+            buffered: [],
+            nowMs,
+            retryAllErrors,
+            ...failurePolicy,
+        });
     }
     const buffered = [];
     const loop = guard.policy.loopGuard ? new LLMReplyLoopGuard() : undefined;
@@ -572,6 +745,7 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
                     }
                     : {}),
             }), requestAttempt, onRequestSettled, options?.signal),
+            facts,
         };
     };
     const emptyFailure = (final) => ownedFailure({
@@ -580,7 +754,7 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
         retry: true,
         // When nobody asks again, the empty reply goes on exactly as the provider sent it.
         handover: () => replayStream(stream, iterator, buffered),
-        response,
+        response: facts.response,
         stream,
         iterator,
         buffered,
@@ -596,7 +770,16 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
         }
         catch (thrown) {
             notifyRequestSettled(onRequestSettled, requestAttempt, undefined, thrown, options?.signal);
-            return failureResult({ thrown, response, stream, iterator, buffered, nowMs, retryAllErrors });
+            return failureResult({
+                thrown,
+                response: facts.response,
+                stream,
+                iterator,
+                buffered,
+                nowMs,
+                retryAllErrors,
+                ...failurePolicy,
+            });
         }
         if (next.done) {
             try {
@@ -605,28 +788,31 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
                 if (isFailureMessage(final)) {
                     return failureResult({
                         final,
-                        response,
+                        providerError: facts.providerError,
+                        response: facts.response,
                         stream,
                         iterator,
                         buffered,
                         nowMs,
                         retryAllErrors,
+                        ...failurePolicy,
                     });
                 }
                 if (guard.emptyRetry && isEmptyReply(final))
                     return emptyFailure(final);
-                return { kind: 'committed', stream: replayStream(stream, iterator, buffered) };
+                return { kind: 'committed', stream: replayStream(stream, iterator, buffered), facts };
             }
             catch (thrown) {
                 notifyRequestSettled(onRequestSettled, requestAttempt, undefined, thrown, options?.signal);
                 return failureResult({
                     thrown,
-                    response,
+                    response: facts.response,
                     stream,
                     iterator,
                     buffered,
                     nowMs,
                     retryAllErrors,
+                    ...failurePolicy,
                 });
             }
         }
@@ -639,12 +825,14 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
             notifyRequestSettled(onRequestSettled, requestAttempt, event.error, undefined, options?.signal);
             return failureResult({
                 final: event.error,
-                response,
+                providerError: facts.providerError,
+                response: facts.response,
                 stream,
                 iterator,
                 buffered,
                 nowMs,
                 retryAllErrors,
+                ...failurePolicy,
             });
         }
         const trip = loop?.feed(event);
@@ -660,7 +848,7 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
                 final,
                 retry,
                 handover: () => cutStream(buffered, final),
-                response,
+                response: facts.response,
                 stream,
                 iterator,
                 buffered,
@@ -687,44 +875,7 @@ async function preflightAttempt(inner, model, context, options, nowMs, callIdent
         }
     }
 }
-/** APIs whose every whole reply counts its tokens. */
-const REPLIES_COUNTED = new Set([
-    'anthropic-messages',
-    'openai-responses',
-    'openai-codex-responses',
-]);
 const EMPTY_REPLY_MESSAGE = 'LLM provider returned an empty response: the reply ended without text or a tool call';
-/**
- * A reply that ended `stop` with no text and no tool call: reasoning alone
- * says nothing the agent can act on. A Messages API empty
- * `end_turn` that counted its prompt is the model's answer, and stays one. Chat Completions, which most subscription transports
- * (Gemini's among them) are translated to, fails on any empty stop.
- */
-function isEmptyReply(final) {
-    // A custom stream may end with a malformed message: never read that as an empty reply.
-    if (!final || typeof final !== 'object' || !Array.isArray(final.content))
-        return false;
-    if (final.stopReason !== 'stop')
-        return false;
-    const content = final.content;
-    if (content.some((block) => block.type === 'toolCall' || (block.type === 'text' && block.text.trim().length > 0)))
-        return false;
-    // Messages and Responses count every whole reply; one that counted its tokens and said
-    // nothing is the model's answer (a turn ending after a tool result), not a lost reply.
-    if (REPLIES_COUNTED.has(String(final.api)) && countedUsage(final))
-        return false;
-    return true;
-}
-function countedUsage(final) {
-    const usage = final.usage;
-    if (!usage)
-        return false;
-    return (finiteTokens(usage.input) +
-        finiteTokens(usage.output) +
-        finiteTokens(usage.cacheRead) +
-        finiteTokens(usage.cacheWrite) >
-        0);
-}
 /** A failure decided by this layer on a reply the provider sent (empty or looping). */
 function ownedFailure(input) {
     const normalized = normalizeLLMError({
@@ -832,12 +983,6 @@ function detachedPartial(partial, model) {
         timestamp: Date.now(),
     };
 }
-/** Ask the inner stream to stop without waiting on one that may never settle. */
-function releaseIterator(iterator) {
-    void Promise.resolve()
-        .then(() => iterator.return?.())
-        .catch(() => undefined);
-}
 /** What came of a reply before its loop was found, then its error. */
 function cutStream(buffered, final) {
     return {
@@ -847,6 +992,435 @@ function cutStream(buffered, final) {
             yield { type: 'error', reason: 'error', error: final };
         },
         result: async () => final,
+    };
+}
+/**
+ * Forward one committed attempt in real time, pushing every frame to `push` as
+ * it arrives. A visible delta is already in the consumer's hands, so nothing is
+ * buffered: only the terminal frames are held back, and the caller releases
+ * them once the attempt that produced them can no longer be resent.
+ *
+ * `suppressStart` drops the `start` frame of a resent attempt. pi's agent loop
+ * pushes a partial into the transcript on every `start` it sees, so a second one
+ * would leave the abandoned attempt in the message history.
+ */
+async function forwardCommittedAttempt(stream, suppressStart, push) {
+    let partial;
+    try {
+        for await (const event of stream) {
+            if (event.type === 'start') {
+                partial = event.partial;
+                if (suppressStart)
+                    continue;
+            }
+            else if ('partial' in event) {
+                partial = event.partial;
+            }
+            if (event.type === 'error') {
+                return { kind: 'error', event, message: event.error, ...(partial ? { partial } : {}) };
+            }
+            if (event.type === 'done') {
+                return { kind: 'done', event, message: event.message };
+            }
+            push(event);
+        }
+    }
+    catch (error) {
+        return { kind: 'thrown', error, ...(partial ? { partial } : {}) };
+    }
+    // No terminal frame: the attempt's own result decides, exactly as before.
+    return { kind: 'ended' };
+}
+/**
+ * Classify a post-commit failure. Only a recognised transient stream
+ * interruption may be resent: the request already produced output, so anything
+ * deterministic, cancelled or unknown fails closed.
+ */
+function streamInterruptionFailure(drained, facts, nowMs) {
+    if (drained.kind !== 'error' && drained.kind !== 'thrown')
+        return undefined;
+    const final = drained.kind === 'error' ? drained.message : undefined;
+    const responseStatus = facts.response?.status;
+    const failureStatus = responseStatus !== undefined && (responseStatus < 200 || responseStatus >= 300)
+        ? responseStatus
+        : undefined;
+    const normalized = normalizeLLMError({
+        ...(drained.kind === 'thrown'
+            ? { raw: drained.error }
+            : facts.providerError !== undefined
+                ? { raw: { message: final?.errorMessage, cause: facts.providerError } }
+                : {}),
+        ...(final?.stopReason ? { finishReason: final.stopReason } : {}),
+        ...(final?.errorMessage ? { errorMessage: final.errorMessage } : {}),
+        ...(failureStatus !== undefined ? { statusCode: failureStatus } : {}),
+        explicitAbort: final?.stopReason === 'aborted',
+    });
+    if (!isLLMRecoverableStreamInterruption(normalized))
+        return undefined;
+    return {
+        // Fixed public wording and a numeric code only: no parameter, prompt or
+        // credential from the failed attempt reaches the observer.
+        error: publicRetryError(normalized, toLLMMetricErrorKind(normalized.facts)),
+        retryAfterMs: parseRetryAfterMs(facts.response?.headers, nowMs),
+    };
+}
+/**
+ * Report the abandoned attempt so the bridge can close what the consumer already
+ * rendered and start the resent attempt as a new message.
+ *
+ * The frame carries an empty partial for pi's agent loop, which keeps the
+ * abandoned attempt out of the model context, and the abandoned message itself
+ * on the marker beside it, so the bridge still has the content to close.
+ */
+function partialStreamResetEvent(partial, model) {
+    const cleared = clearedPartial(partial, model);
+    const event = {
+        type: 'text_start',
+        contentIndex: 0,
+        partial: cleared,
+    };
+    Object.defineProperty(event, LLM_PARTIAL_STREAM_RESET, {
+        value: { abandoned: partial ?? cleared },
+        // StreamFn composition spreads options and events, so an enumerable symbol
+        // survives the wrappers while staying invisible to JSON and provider
+        // payloads. Same convention as LLM_RETRY_CALL_IDENTITY.
+        enumerable: true,
+    });
+    return event;
+}
+/** The same assistant message with nothing generated yet. */
+function clearedPartial(partial, model) {
+    if (!partial) {
+        return {
+            role: 'assistant',
+            content: [],
+            api: String(model.api),
+            provider: String(model.provider),
+            model: String(model.id),
+            usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 0,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: 'stop',
+            timestamp: 0,
+        };
+    }
+    const cleared = { ...partial, content: [], stopReason: 'stop' };
+    delete cleared.errorMessage;
+    return cleared;
+}
+/** How the resent message ends when no further attempt is made after a reset. */
+function endedAfterReset(partial, model, stopReason, errorMessage) {
+    return { ...clearedPartial(partial, model), stopReason, errorMessage };
+}
+/** Release a failed attempt's transport before waiting for the next one. */
+async function releaseAttempt(failure) {
+    if (failure)
+        await discardAttempt(failure);
+    return undefined;
+}
+/**
+ * Replay a pre-commit failure's own frames to the consumer. Call settlement is
+ * left to the wrapper around the whole recovery stream, so this must not
+ * observe it a second time.
+ */
+async function replayFailure(stream, suppressStart, push) {
+    for await (const event of stream) {
+        if (suppressStart && event.type === 'start')
+            continue;
+        push(event);
+    }
+}
+/**
+ * Own a committed attempt so a stream that breaks after the consumer already saw
+ * output can be resent inside the same logical call.
+ *
+ * The resend continues the pre-commit loop's budget, backoff, elapsed window,
+ * offline wait, cancellation, observer events, request lifecycle and
+ * settlement — there is no second budget. Events are forwarded as they
+ * arrive; a stream-reset frame tells the consumer to close the abandoned
+ * attempt before the resend, and the resent attempt's `start` frame is
+ * suppressed so pi keeps a single assistant slot in the message history.
+ *
+ * The loop runs on its own instead of being pulled by the consumer: a
+ * result-only consumer (checkpoint compaction, the title scope) never iterates,
+ * and a pull-driven loop would leave `result()` pending forever.
+ */
+function recoveringStream(first, firstFacts, recovery) {
+    const { input, policy, state, callId, model, nowMs, random, sleep, deadlineAt } = recovery;
+    const networkRecovery = recovery.networkRecovery;
+    const options = recovery.options;
+    const signal = options?.signal;
+    const queue = createAssistantMessageEventStream();
+    const push = (event) => queue.push(event);
+    // The logical result is decided by the recovery itself, not by the attempt
+    // that happened to commit first: the wrapper around this stream reads
+    // `result()` as soon as it is built, so it must be a promise this loop
+    // settles when the delivered attempt ends.
+    let resolveFinal;
+    let rejectFinal;
+    const finalResult = new Promise((resolve, reject) => {
+        resolveFinal = resolve;
+        rejectFinal = reject;
+    });
+    // An iterate-only consumer never attaches a handler to the logical result;
+    // the rejection still reaches it through the iteration.
+    void finalResult.catch(() => undefined);
+    let pendingError;
+    let requestAttempt = recovery.requestAttempt;
+    let retriesUsed = recovery.retriesUsed;
+    let retryStartedAtMs = recovery.retryStartedAtMs;
+    const wake = createSystemWakeLatch(networkRecovery);
+    if (retryStartedAtMs !== undefined)
+        wake.arm();
+    let offlineSinceMs;
+    let offlinePolls = 0;
+    const event = (status, error) => ({
+        sessionId: input.sessionId,
+        turnId: input.turnId,
+        callId,
+        scope: input.scope,
+        status,
+        retryAttempt: retriesUsed,
+        maxRetries: policy.maxRetries,
+        requestAttempt,
+        ...(error ? { error } : {}),
+    });
+    const beforeRequest = options?.[LLM_RETRY_BEFORE_REQUEST];
+    const run = async () => {
+        let stream = first;
+        let facts = firstFacts;
+        let suppressStart = false;
+        for (;;) {
+            const drained = await forwardCommittedAttempt(stream, suppressStart, push);
+            if (drained.kind === 'done') {
+                // The attempt's own result is the authority on what the provider
+                // produced: a provider that fails while finalising must never be
+                // reported as a success, or the agent loop would run the tools of a
+                // message that does not exist.
+                let physical;
+                try {
+                    physical = await stream.result();
+                }
+                catch (error) {
+                    rejectFinal(error);
+                    throw error;
+                }
+                resolveFinal(physical);
+                push(drained.event);
+                return;
+            }
+            if (drained.kind === 'ended') {
+                void stream.result().then(resolveFinal, rejectFinal);
+                return;
+            }
+            // The attempt's known usage must be on the ledger before the next
+            // physical request. Best effort: a broken attempt may never settle.
+            if (drained.kind === 'error')
+                await stream.result().catch(() => undefined);
+            const interruption = streamInterruptionFailure(drained, facts, nowMs());
+            if (!interruption || signalAborted(signal)) {
+                // Fail closed exactly as before: this attempt's own terminal frame.
+                if (drained.kind === 'thrown')
+                    throw drained.error;
+                resolveFinal(drained.message);
+                push(drained.event);
+                return;
+            }
+            const partial = drained.partial;
+            const interruptedMessage = drained.kind === 'error'
+                ? (drained.message.errorMessage ?? PUBLIC_ERROR_MESSAGES.network)
+                : asError(drained.error).message;
+            let reset = false;
+            const ensureReset = () => {
+                if (reset)
+                    return;
+                reset = true;
+                // The consumer must close what it already rendered before the resend.
+                push(partialStreamResetEvent(partial, model));
+            };
+            /** End the call when no further attempt is made, with the failure that ended it. */
+            const giveUp = async (status, error, last) => {
+                await notify(input.observer, event(status, error));
+                if (last) {
+                    const delivered = terminalFailure(last);
+                    void delivered.result().then(resolveFinal, rejectFinal);
+                    await replayFailure(delivered, suppressStart, push);
+                    return;
+                }
+                if (!reset) {
+                    if (drained.kind === 'thrown')
+                        throw drained.error;
+                    resolveFinal(drained.message);
+                    push(drained.event);
+                    return;
+                }
+                const ended = endedAfterReset(partial, model, status === 'cancelled' ? 'aborted' : 'error', status === 'cancelled' ? PUBLIC_ERROR_MESSAGES.abort : interruptedMessage);
+                resolveFinal(ended);
+                push({ type: 'error', reason: status === 'cancelled' ? 'aborted' : 'error', error: ended });
+            };
+            let error = interruption.error;
+            let retryAfterMs = interruption.retryAfterMs;
+            let retryReason = 'network';
+            let last;
+            for (;;) {
+                const failureAtMs = nowMs();
+                if (networkRecovery &&
+                    (await isDeviceOffline(networkRecovery, model.baseUrl, retryReason, signal))) {
+                    // An offline device is waited out instead of spending the budget, as
+                    // before the commit.
+                    offlineSinceMs ??= failureAtMs;
+                    if (failureAtMs - offlineSinceMs > networkRecovery.maxOfflineWaitMs) {
+                        await giveUp('exhausted', error, last);
+                        return;
+                    }
+                    retryStartedAtMs = undefined;
+                    offlinePolls += 1;
+                    last = await releaseAttempt(last);
+                    ensureReset();
+                    const offlineDelayMs = retryDelayMs(undefined, offlinePolls, policy, random);
+                    await notify(input.observer, {
+                        ...event('waiting', error),
+                        retryAttempt: 0,
+                        requestAttempt: requestAttempt + 1,
+                        delayMs: offlineDelayMs,
+                        nextRetryAtMs: nowMs() + offlineDelayMs,
+                        waitingFor: 'network',
+                    });
+                    let resumed;
+                    try {
+                        const sleptFromMs = nowMs();
+                        resumed =
+                            (await sleepUntilResume(sleep, offlineDelayMs, signal, networkRecovery)) ||
+                                overranSystemSleep(sleptFromMs, nowMs(), offlineDelayMs);
+                    }
+                    catch {
+                        await giveUp('cancelled', error, undefined);
+                        return;
+                    }
+                    if (resumed) {
+                        offlineSinceMs = undefined;
+                        offlinePolls = 0;
+                    }
+                }
+                else {
+                    offlinePolls = 0;
+                    if (wake.take())
+                        retryStartedAtMs = undefined;
+                    retryStartedAtMs ??= failureAtMs;
+                    wake.arm();
+                    const delayMs = Math.max(
+                    // `error` is the failure this wait follows: the stream
+                    // interruption on the first pass, the resent attempt's failure
+                    // afterwards. A rate-limited one backs off from the longer base.
+                    retryDelayMs(retryAfterMs, retriesUsed + 1, retryPolicyForReason(policy, error.reason), random), last?.cooldownMs ?? 0);
+                    const expired = deadlineAt !== undefined
+                        ? Date.now() + delayMs >= deadlineAt
+                        : failureAtMs + delayMs - retryStartedAtMs > policy.maxRetryElapsedMs;
+                    if (retriesUsed >= policy.maxRetries || expired) {
+                        await giveUp('exhausted', error, last);
+                        return;
+                    }
+                    state.retryTriggered = true;
+                    retriesUsed += 1;
+                    state.retryReason ??= retryReason;
+                    last = await releaseAttempt(last);
+                    ensureReset();
+                    await notify(input.observer, {
+                        ...event('waiting', error),
+                        requestAttempt: requestAttempt + 1,
+                        delayMs,
+                        nextRetryAtMs: nowMs() + delayMs,
+                    });
+                    try {
+                        const sleptFromMs = nowMs();
+                        await sleep(delayMs, signal);
+                        if (overranSystemSleep(sleptFromMs, nowMs(), delayMs))
+                            wake.mark();
+                    }
+                    catch {
+                        await giveUp('cancelled', error, undefined);
+                        return;
+                    }
+                }
+                // From here on every attempt resends a message the consumer already saw
+                // a `start` for, including a retry that ends before producing output.
+                suppressStart = true;
+                if (signalAborted(signal)) {
+                    await giveUp('cancelled', error, undefined);
+                    return;
+                }
+                requestAttempt += 1;
+                beforeRequest?.(requestAttempt);
+                await recovery.lifecycle?.beforeAttempt({ callId, requestAttempt });
+                // Admission can yield while the user stops the turn: nothing is sent then.
+                if (signalAborted(signal)) {
+                    await giveUp('cancelled', error, undefined);
+                    return;
+                }
+                state.requestAttempts = requestAttempt;
+                state.providerError = undefined;
+                const next = await preflightAttempt(recovery.inner, model, recovery.context, captureProviderError(options, state), nowMs, recovery.callIdentity, 
+                // A resend never inherits the BYOK retry-everything path: a
+                // deterministic rejection or an unknown upstream error on the resent
+                // attempt ends the call instead of spending the rest of the budget.
+                false, requestAttempt, recovery.request.observeAttempt(requestSettledObserver(options)), undefined, {
+                    policy: recovery.replyGuard,
+                    emptyRetry: false,
+                    loopRetry: false,
+                    ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+                }, { recoverStreamInterruptions: true, vetoDeterministicRejections: true });
+                if (next.kind === 'committed') {
+                    input.networkRecovery?.markReachable(model.baseUrl);
+                    await notify(input.observer, event('recovered'));
+                    stream = next.stream;
+                    facts = next.facts;
+                    break;
+                }
+                if (next.kind === 'terminal' || isAbortFailure(next.failure) || signalAborted(signal)) {
+                    const cancelled = signalAborted(signal) || isAbortFailure(next.failure);
+                    await giveUp(cancelled ? 'cancelled' : 'exhausted', next.failure.error, next.failure);
+                    return;
+                }
+                // A retryable pre-output failure of a resent attempt: same budget, same
+                // backoff and the same offline wait. No second reset frame. It is kept
+                // until the next wait, so an exhausted call still replays it.
+                last = next.failure;
+                error = next.failure.error;
+                retryAfterMs = next.failure.retryAfterMs;
+                retryReason = next.failure.retryReason;
+            }
+        }
+    };
+    void run()
+        .finally(() => wake.dispose())
+        .then(() => queue.end(), (error) => {
+        pendingError = { error };
+        rejectFinal(error);
+        queue.end();
+    });
+    return {
+        [Symbol.asyncIterator]() {
+            const inner = queue[Symbol.asyncIterator]();
+            const iterator = {
+                async next(...args) {
+                    const next = await inner.next(...args);
+                    if (next.done && pendingError)
+                        throw pendingError.error;
+                    return next;
+                },
+            };
+            if (inner.return)
+                iterator.return = inner.return.bind(inner);
+            if (inner.throw)
+                iterator.throw = inner.throw.bind(inner);
+            return iterator;
+        },
+        result: () => finalResult,
     };
 }
 function requestSettledObserver(options) {
@@ -943,7 +1517,11 @@ function failureResult(input) {
         ? responseStatus
         : undefined;
     const normalized = normalizeLLMError({
-        ...(input.thrown !== undefined ? { raw: input.thrown } : {}),
+        ...(input.thrown !== undefined
+            ? { raw: input.thrown }
+            : input.providerError !== undefined
+                ? { raw: { message: input.final?.errorMessage, cause: input.providerError } }
+                : {}),
         ...(input.final?.stopReason ? { finishReason: input.final.stopReason } : {}),
         ...(input.final?.errorMessage ? { errorMessage: input.final.errorMessage } : {}),
         ...(failureStatus !== undefined ? { statusCode: failureStatus } : {}),
@@ -957,13 +1535,33 @@ function failureResult(input) {
     // the whole backoff window. The deterministic check excludes anything that
     // also looks transient (timeout, network, 408/429/5xx). A context overflow,
     // by tokens or by request bytes, is left to context management as in Pi.
+    // Retrying everything changes only whether to retry: the reason stays the
+    // error's own classification (429 is rate_limited, 529 overloaded, a 5xx
+    // server_error), so metrics and the public error do not read every BYOK
+    // failure as a network one.
+    const classifiedDecision = toLLMRetryDecision(normalized);
+    // Custom gateways may have unclassified failures, but never override a
+    // known cancellation, business limit, authentication or safety rejection.
+    const terminalDecision = !classifiedDecision.retryable &&
+        (classifiedDecision.reason === 'abort' ||
+            classifiedDecision.reason === 'auth' ||
+            classifiedDecision.reason === 'usage_limit' ||
+            classifiedDecision.reason === 'credits_exhausted' ||
+            classifiedDecision.reason === 'content_filter');
     const decision = input.retryAllErrors &&
-        !normalized.facts.explicitAbort &&
-        !normalized.facts.signals.has('refusal') &&
+        !classifiedDecision.retryable &&
+        !terminalDecision &&
         !isLLMDeterministicRequestRejection(normalized) &&
         !(input.final && isContextOverflow(input.final))
-        ? { retryable: true, reason: 'network' }
-        : toLLMRetryDecision(normalized);
+        ? { retryable: true, reason: classifiedDecision.reason }
+        : // Opt-in hosts also resend a recognised transient stream interruption
+            // that happened before any output reached the consumer. Nothing was
+            // rendered, so this needs no reset frame.
+            input.recoverStreamInterruptions && isLLMRecoverableStreamInterruption(normalized)
+                ? { retryable: true, reason: 'network' }
+                : input.vetoDeterministicRejections && isLLMDeterministicStreamRefusal(normalized)
+                    ? { retryable: false, reason: toLLMMetricErrorKind(normalized.facts) }
+                    : classifiedDecision;
     if (!decision.retryable) {
         return {
             kind: 'terminal',
@@ -992,6 +1590,7 @@ function failureResult(input) {
             final: input.final,
             response: input.response,
             retryAfterMs: parseRetryAfterMs(input.response?.headers, input.nowMs()),
+            ...refusalWaitFields(input.final?.errorMessage, normalized.sanitizedMessage, input.thrown),
         },
     };
 }
@@ -1071,31 +1670,7 @@ function notifyCallSettled(context, thrown, final) {
     if (!observer || context.state.settled)
         return;
     context.state.settled = true;
-    let finalOutcome = classifyCallOutcome(final, thrown, context.signal?.aborted === true);
-    if (finalOutcome.outcome !== 'success' &&
-        !context.signal?.aborted &&
-        context.state.terminalErrorKind) {
-        const errorKind = context.state.terminalErrorKind;
-        finalOutcome = { outcome: errorKind === 'abort' ? 'abort' : 'error', errorKind };
-    }
-    const usage = finalOutcome.outcome === 'success' ? callUsage(final) : undefined;
-    const event = {
-        sessionId: context.input.sessionId,
-        turnId: context.input.turnId,
-        callId: context.callId,
-        scope: context.input.scope,
-        provider: String(context.model.provider),
-        model: String(context.model.id),
-        final: finalOutcome,
-        retryTriggered: context.state.retryTriggered,
-        ...(context.state.retryReason ? { retryReason: context.state.retryReason } : {}),
-        requestAttempts: context.state.requestAttempts,
-        ...(finalOutcome.outcome === 'success' && final
-            ? { expectedTools: expectedToolsFrom(final) }
-            : {}),
-        ...(usage ? { usage } : {}),
-    };
-    observeObserver(observer, event);
+    observeObserver(observer, callSettledEvent(context, thrown, final));
 }
 async function observeObserver(observer, event) {
     try {
@@ -1104,238 +1679,6 @@ async function observeObserver(observer, event) {
     catch {
         // Final-call observability must never change provider-call behavior.
     }
-}
-function expectedToolsFrom(final) {
-    return final.content.flatMap((block) => block.type === 'toolCall' ? [{ toolCallId: block.id, toolName: block.name }] : []);
-}
-function classifyCallOutcome(final, thrown, explicitAbort) {
-    if (thrown === undefined && final?.stopReason !== 'error' && final?.stopReason !== 'aborted') {
-        return { outcome: 'success', errorKind: 'none' };
-    }
-    const normalized = normalizeLLMError({
-        ...(thrown !== undefined ? { raw: thrown } : {}),
-        ...(final?.stopReason ? { finishReason: final.stopReason } : {}),
-        ...(final?.errorMessage ? { errorMessage: final.errorMessage } : {}),
-        explicitAbort: explicitAbort || final?.stopReason === 'aborted',
-    });
-    const errorKind = toLLMMetricErrorKind(normalized.facts);
-    return { outcome: errorKind === 'abort' ? 'abort' : 'error', errorKind };
-}
-/**
- * Project the provider usage of a successful call into the four raw buckets.
- *
- * Provider payloads are untrusted input, so a missing or non-finite bucket is
- * normalised to zero rather than propagated as NaN. Absent usage yields
- * `undefined` so observers can distinguish "no usage reported" from "zero
- * tokens used".
- */
-function callUsage(final) {
-    const usage = final?.usage;
-    if (!usage)
-        return undefined;
-    return {
-        input: finiteTokens(usage.input),
-        output: finiteTokens(usage.output),
-        cacheRead: finiteTokens(usage.cacheRead),
-        cacheWrite: finiteTokens(usage.cacheWrite),
-    };
-}
-function readProviderUsage(final) {
-    try {
-        const usage = final?.usage;
-        if (!usage)
-            return { complete: false };
-        const input = readTokenBucket(usage.input);
-        const output = readTokenBucket(usage.output);
-        const cacheRead = readTokenBucket(usage.cacheRead);
-        const cacheWrite = readTokenBucket(usage.cacheWrite);
-        const totalTokens = readTokenBucket(usage.totalTokens);
-        return {
-            reportedUsage: {
-                ...(input.valid ? { input: input.value } : {}),
-                ...(output.valid ? { output: output.value } : {}),
-                ...(cacheRead.valid ? { cacheRead: cacheRead.value } : {}),
-                ...(cacheWrite.valid ? { cacheWrite: cacheWrite.value } : {}),
-                ...(totalTokens.valid ? { totalTokens: totalTokens.value } : {}),
-            },
-            usage: {
-                input: input.value,
-                output: output.value,
-                cacheRead: cacheRead.value,
-                cacheWrite: cacheWrite.value,
-            },
-            // A stream that ended in an error or abort reports only what arrived
-            // before it stopped (e.g. the input counted at message start), so its
-            // usage is partial even when every bucket is a valid number.
-            complete: final?.stopReason !== 'error' &&
-                final?.stopReason !== 'aborted' &&
-                input.valid &&
-                output.valid &&
-                cacheRead.valid &&
-                cacheWrite.valid,
-        };
-    }
-    catch {
-        return { complete: false };
-    }
-}
-function readTokenBucket(value) {
-    return typeof value === 'number' && Number.isFinite(value) && value >= 0
-        ? { value, valid: true }
-        : { value: 0, valid: false };
-}
-function finiteTokens(value) {
-    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
-}
-function replayStream(source, iterator, buffered, extra = {}) {
-    if (!extra.guard && !extra.pending) {
-        return {
-            async *[Symbol.asyncIterator]() {
-                let index = 0;
-                while (index < buffered.length) {
-                    const event = buffered[index];
-                    index += 1;
-                    if (event !== undefined)
-                        yield event;
-                }
-                for (;;) {
-                    const next = await iterator.next();
-                    if (next.done)
-                        return;
-                    yield next.value;
-                }
-            },
-            result: () => source.result(),
-        };
-    }
-    return guardedReplay(source, iterator, buffered, extra);
-}
-/**
- * Replay through one reader that both the iterator and `result()` drive, so a
- * loop cut decides the result even for a consumer (or a settlement observer)
- * that asks for the result before, or instead of, reading the events. Events
- * are queued until read; an early `return()` stops the reader and releases the
- * provider stream.
- */
-function guardedReplay(source, iterator, buffered, extra) {
-    const queue = [...buffered];
-    let finished = false;
-    let cancelled = false;
-    let failure;
-    let cut;
-    let wake;
-    let pumping;
-    const wakeReader = () => {
-        const waiter = wake;
-        wake = undefined;
-        waiter?.();
-    };
-    const pump = () => {
-        pumping ??= (async () => {
-            try {
-                let pending = extra.pending;
-                for (;;) {
-                    if (cancelled)
-                        return;
-                    const next = pending ? await pending : await iterator.next();
-                    pending = undefined;
-                    if (cancelled || next.done)
-                        return;
-                    const final = extra.guard?.(next.value);
-                    if (final) {
-                        cut = final;
-                        extra.stop?.();
-                        queue.push({ type: 'error', reason: 'error', error: final });
-                        return;
-                    }
-                    queue.push(next.value);
-                    wakeReader();
-                }
-            }
-            catch (error) {
-                failure = { error };
-            }
-            finally {
-                finished = true;
-                wakeReader();
-            }
-        })();
-        return pumping;
-    };
-    return {
-        async *[Symbol.asyncIterator]() {
-            void pump();
-            try {
-                for (;;) {
-                    const event = queue.shift();
-                    if (event !== undefined) {
-                        yield event;
-                        continue;
-                    }
-                    if (finished) {
-                        if (failure)
-                            throw failure.error;
-                        return;
-                    }
-                    await new Promise((resolve) => {
-                        wake = resolve;
-                    });
-                }
-            }
-            finally {
-                if (!finished) {
-                    cancelled = true;
-                    releaseIterator(iterator);
-                }
-            }
-        },
-        async result() {
-            await pump();
-            return cut ?? source.result();
-        },
-    };
-}
-function throwingReplayStream(buffered, thrown) {
-    return {
-        async *[Symbol.asyncIterator]() {
-            let index = 0;
-            while (index < buffered.length) {
-                const event = buffered[index];
-                index += 1;
-                if (event !== undefined)
-                    yield event;
-            }
-            throw thrown;
-        },
-        async result() {
-            throw thrown;
-        },
-    };
-}
-function commitsOutput(event, holdReasoning = false) {
-    if (event.type === 'text_delta' || event.type === 'toolcall_delta')
-        return event.delta.length > 0;
-    if (event.type === 'thinking_delta')
-        return !holdReasoning && event.delta.length > 0;
-    if (event.type === 'text_end')
-        return event.content.length > 0;
-    if (event.type === 'thinking_end')
-        return !holdReasoning && event.content.length > 0;
-    if (event.type === 'toolcall_end')
-        return true;
-    return 'partial' in event && hasCommittedContent(event.partial, holdReasoning);
-}
-function hasCommittedContent(message, holdReasoning) {
-    return message.content.some((block) => {
-        if (block.type === 'text')
-            return block.text.length > 0;
-        if (block.type === 'thinking')
-            return !holdReasoning && block.thinking.length > 0;
-        return block.type === 'toolCall';
-    });
-}
-function isFailureMessage(message) {
-    return message.stopReason === 'error' || message.stopReason === 'aborted';
 }
 function resolvePolicy(policy) {
     return { ...DEFAULT_LLM_RETRY_POLICY, ...(policy ?? {}) };
@@ -1354,32 +1697,6 @@ function resolveReplyGuardPolicy(policy) {
         loopRetries: count(merged.loopRetries, d.loopRetries),
     };
 }
-function retryDelayMs(retryAfterMs, retryAttempt, policy, random) {
-    if (retryAfterMs !== undefined)
-        return Math.min(policy.maxDelayMs, Math.max(0, retryAfterMs));
-    const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (retryAttempt - 1));
-    return Math.floor(exponential / 2 + (clampRandom(random()) * exponential) / 2);
-}
-function clampRandom(value) {
-    return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
-}
-function parseRetryAfterMs(headers, nowMs) {
-    if (!headers)
-        return undefined;
-    const entries = Object.entries(headers);
-    const retryAfterMs = entries.find(([name]) => name.toLowerCase() === 'retry-after-ms')?.[1];
-    const parsedMillis = retryAfterMs === undefined ? undefined : Number(retryAfterMs);
-    if (parsedMillis !== undefined && Number.isFinite(parsedMillis))
-        return Math.max(0, parsedMillis);
-    const retryAfter = entries.find(([name]) => name.toLowerCase() === 'retry-after')?.[1];
-    if (!retryAfter)
-        return undefined;
-    const parsedSeconds = Number(retryAfter);
-    if (Number.isFinite(parsedSeconds))
-        return Math.max(0, parsedSeconds * 1_000);
-    const parsedDate = Date.parse(retryAfter);
-    return Number.isNaN(parsedDate) ? undefined : Math.max(0, parsedDate - nowMs);
-}
 function publicRetryError(normalized, reason) {
     const protocol = toLLMProtocolClassification(normalized);
     return {
@@ -1395,66 +1712,5 @@ async function notify(observer, event) {
     catch {
         // Observability must never change provider-call correctness.
     }
-}
-function retryTimeout() {
-    const error = new Error('LLM request timed out');
-    error.name = 'TimeoutError';
-    return error;
-}
-function createRetryBudget(callerSignal, deadlineAt) {
-    const controller = new AbortController();
-    let expired = false;
-    const expire = () => {
-        expired = true;
-        controller.abort(retryTimeout());
-    };
-    let timer;
-    const arm = (at) => {
-        if (timer !== undefined)
-            clearTimeout(timer);
-        timer = undefined;
-        if (expired || at === undefined)
-            return;
-        const delay = Math.max(0, at - Date.now());
-        if (delay === 0)
-            return expire();
-        timer = setTimeout(expire, delay);
-        timer.unref?.();
-    };
-    arm(deadlineAt);
-    return {
-        // Clearing the deadline must never detach subsequent user cancellation.
-        signal: AbortSignal.any([callerSignal, controller.signal]),
-        expired: () => expired,
-        arm,
-        stop: () => arm(undefined),
-    };
-}
-function abortableSleep(delayMs, signal) {
-    if (signal?.aborted)
-        return Promise.reject(abortError(signal));
-    return new Promise((resolve, reject) => {
-        const onAbort = () => {
-            clearTimeout(timer);
-            signal?.removeEventListener('abort', onAbort);
-            if (signal)
-                reject(abortError(signal));
-        };
-        const timer = setTimeout(() => {
-            signal?.removeEventListener('abort', onAbort);
-            resolve();
-        }, delayMs);
-        signal?.addEventListener('abort', onAbort, { once: true });
-    });
-}
-function abortError(signal) {
-    return signal.reason instanceof Error ? signal.reason : new Error('LLM retry cancelled');
-}
-function asError(value) {
-    return value instanceof Error ? value : new Error(String(value ?? 'LLM request failed'));
-}
-function defaultCallId() {
-    return (globalThis.crypto?.randomUUID?.() ??
-        `llm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
 }
 //# sourceMappingURL=llm-retry.js.map

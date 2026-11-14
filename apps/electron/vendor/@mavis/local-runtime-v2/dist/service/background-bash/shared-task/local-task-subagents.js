@@ -1,6 +1,20 @@
 import { resolveTaskTarget, } from '../../agent/index.js';
 import { SUBAGENT_TELEMETRY_EVENT, emitSubagentTelemetry, inferNameResolutionSource, telemetryErrorCode, } from '../../agent/index.js';
 /**
+ * The resolved Task target exists but its canonical `agent.md` sets
+ * `x-mavis.dispatchable: false`. Task-tool only: every other session-creating
+ * flow (assignment_create, Goal, cron, team) never resolves a target here.
+ */
+export class TaskDispatchNotAllowedError extends Error {
+    agentName;
+    code = 'AGENT_NOT_DISPATCHABLE';
+    constructor(agentName) {
+        super(`Agent ${agentName} cannot be dispatched as a task`);
+        this.agentName = agentName;
+        this.name = 'TaskDispatchNotAllowedError';
+    }
+}
+/**
  * Built-in owner that stores Plugin Agent Task Sessions; the frozen definition is authoritative.
  * @internal Exported only for focused tests.
  */
@@ -19,6 +33,7 @@ export async function resolveLocalTaskAgentTarget(host, agentName, pluginAgents)
     let source = inferNameResolutionSource(requested);
     try {
         const resolved = await resolveTaskTarget(host.agentResolver, requested);
+        await assertTaskTargetDispatchable(host, resolved);
         source = inferNameResolutionSource(requested, resolved.resolvedAgentName);
         emitSubagentTelemetry(host, SUBAGENT_TELEMETRY_EVENT.resolve, { source, success: true });
         return resolved;
@@ -38,6 +53,16 @@ export async function resolveLocalTaskAgentTarget(host, agentName, pluginAgents)
             return undefined;
         throw error;
     }
+}
+/**
+ * Rejects a Task target whose current `agent.md` disables dispatch. Read through
+ * the resolver on every call, so a user edit takes effect without a restart.
+ * An absent or `undefined` answer keeps the contract default (dispatchable).
+ */
+async function assertTaskTargetDispatchable(host, target) {
+    const dispatchable = await host.agentResolver.resolveAgentDispatchable?.(target.exactOwnerName);
+    if (dispatchable === false)
+        throw new TaskDispatchNotAllowedError(target.resolvedAgentName);
 }
 /** Session creation fields for a resolved Task target. */
 export function taskSessionOwner(target) {

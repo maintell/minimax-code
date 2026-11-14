@@ -37,10 +37,7 @@ const ALLOWED_ENV_NAMES = new Set([
     'SSL_CERT_DIR',
     'NODE_USE_ENV_PROXY',
 ]);
-/**
- * Starts one extension host without exposing runtime identity or credentials through env.
- * `nodeArgs` is a test seam for the source-only tsx entry; packaged hosts pass no loader.
- */
+/** Starts one extension host without exposing runtime identity or credentials through env. */
 export async function launchModelAccessHost(options) {
     validateLaunchOptions(options);
     const epoch = options.epoch ?? randomUUID();
@@ -79,7 +76,7 @@ export async function launchModelAccessHost(options) {
     }
 }
 function spawnHost(options, epoch) {
-    return spawn(options.execPath ?? process.execPath, [...(options.nodeArgs ?? []), options.entryPath, `--model-access-epoch=${epoch}`], {
+    return spawn(options.execPath ?? process.execPath, [options.entryPath, `--model-access-epoch=${epoch}`], {
         cwd: options.cwd ?? options.dataDir ?? process.cwd(),
         env: buildModelAccessHostEnv(options.environment ?? process.env, options.runAsElectronNode),
         detached: process.platform !== 'win32',

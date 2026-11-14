@@ -4,7 +4,25 @@ import { createSessionClioEligibilityPort, createSessionClioFinalAnswerPort, cre
 import { createSessionClioCapture } from './capture.js';
 import { DrizzleSessionClioStore } from './store.js';
 import { createSessionClioTransport } from './transport.js';
+import { buildLocalTrajectoryId } from './telemetry/payload.js';
 const DEFAULT_TICK_INTERVAL_MS = 60_000;
+/**
+ * Composes Session Clio from the owner's inputs over the runtime's own ports;
+ * undefined when the owner supplied none. Trajectories default to the local id.
+ */
+export function composeOwnerSessionClio(clio, runtime) {
+    if (!clio)
+        return undefined;
+    return composeSessionClio({
+        ...runtime,
+        authContext: clio.authContext,
+        gateway: clio.gateway,
+        trajectoryId: clio.trajectoryId ?? buildLocalTrajectoryId,
+        enabled: clio.enabled,
+        ...(clio.bizId ? { bizId: clio.bizId } : {}),
+        ...(clio.tickIntervalMs !== undefined ? { tickIntervalMs: clio.tickIntervalMs } : {}),
+    });
+}
 /**
  * Composes the desktop Session Clio capture.
  *
@@ -12,6 +30,7 @@ const DEFAULT_TICK_INTERVAL_MS = 60_000;
  * optimisation rather than a correctness requirement: they let a Session that
  * simply stopped being used seal on time instead of waiting for a next Query
  * that may never arrive.
+ * @internal Exported only for focused tests.
  */
 export function composeSessionClio(options) {
     const nowMs = options.overrides?.nowMs ?? options.nowMs;

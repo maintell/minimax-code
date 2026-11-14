@@ -120,11 +120,18 @@ async function settleAgentTurn(options, turn, request, pending) {
         outcome = await pending;
     }
     catch (error) {
+        // Ended by force (context reset spec 3.2): it was already settled as stopped.
+        if (options.controller.isForceReleased?.(turn.sessionId, turn.turnId)) {
+            return { status: 'aborted', reason: 'force-released' };
+        }
         outcome = { status: 'failed', error };
         // Close admission cancellation before the failure projection.
         options.onBeginSettlement?.(turn.sessionId, turn.turnId);
         settlementStarted = true;
         await projectPostHostFailure(options, turn, error);
+    }
+    if (options.controller.isForceReleased?.(turn.sessionId, turn.turnId)) {
+        return { status: 'aborted', reason: 'force-released' };
     }
     const settlementOptions = settlementStarted
         ? { ...options, onBeginSettlement: undefined }
@@ -134,10 +141,20 @@ async function settleAgentTurn(options, turn, request, pending) {
         outcome: outcome.status,
         controllerTurn: turn,
         wakeQueue: outcome.status === 'completed'
-            ? outcome.waitingForUser !== true || request.provenance.source === 'thread-goal'
+            ? outcome.waitingForUser !== true ||
+                request.provenance.source === 'thread-goal' ||
+                (await wakesQueueWhileWaitingForUser(options, turn.sessionId))
             : outcome.status === 'aborted' && wakesQueueOnAbort(turn.signal.reason),
     });
     return settlementError ? { status: 'failed', error: settlementError } : outcome;
+}
+async function wakesQueueWhileWaitingForUser(options, sessionId) {
+    try {
+        return (await options.wakesQueueWhileWaitingForUser?.(sessionId)) === true;
+    }
+    catch {
+        return false;
+    }
 }
 /**
  * A rejected Host run may have died before writing its own terminal Session

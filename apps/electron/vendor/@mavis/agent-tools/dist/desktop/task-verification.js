@@ -1,3 +1,4 @@
+import { formatSavedPtcScripts } from './saved-ptc-scripts.js';
 /** Product-visible scope of file-change capture; this is not a write barrier. */
 export const FILE_CHANGE_OBSERVATION_NOTICE = 'best-effort observation only; not a filesystem sandbox or security boundary; no_observed_change does not prove that no write occurred';
 /**
@@ -58,9 +59,7 @@ function candidatePayload(line) {
     const inline = /^VERDICT\s*:(.*)$/iu.exec(normalized);
     if (inline)
         return inline[1] ?? '';
-    return /^VERDICT(?:\s*(?:\*{1,2}|_{1,2}|`{1,3}|~{2}))*\s*$/iu.test(normalized)
-        ? null
-        : undefined;
+    return /^VERDICT(?:\s*(?:\*{1,2}|_{1,2}|`{1,3}|~{2}))*\s*$/iu.test(normalized) ? null : undefined;
 }
 function stripLeadingDecoration(line) {
     let value = line.trimStart();
@@ -104,7 +103,7 @@ export function formatLocalTaskParentReport(result) {
     const verification = result.verification;
     const changedFiles = verification?.changedFiles ?? [];
     const observationNotes = verification?.observationNotes ?? [];
-    return [
+    const report = [
         `run_status: ${result.status}`,
         `requested_agent_name: ${result.requestedAgentName}`,
         `resolved_agent_name: ${result.resolvedAgentName ?? 'missing'}`,
@@ -117,5 +116,8 @@ export function formatLocalTaskParentReport(result) {
         result.finalText ?? '',
         `error_message: ${result.errorMessage ?? ''}`,
     ].join('\n');
+    // Absent when the child saved nothing, so today's report stays byte-identical.
+    const savedScripts = formatSavedPtcScripts(result.savedPtcScripts);
+    return savedScripts ? `${report}\n${savedScripts}` : report;
 }
 //# sourceMappingURL=task-verification.js.map

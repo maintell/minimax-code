@@ -1,3 +1,4 @@
+import { isLightweightRootSession } from './preparation/session-read.js';
 const AGENT_CONFIG_ALLOWLIST = [
     'system_prompt',
     'tools',
@@ -61,12 +62,17 @@ export function createSecretFreeTurnAssemblyContext(scope) {
         history: scope.history,
     });
     const turnIntent = projectTurnIntent(input.request.provenance);
+    // The session record is the source of truth: a promoted SideChat keeps the
+    // sidechat_mode marker in its history but becomes visible. Same rule as
+    // isConversationMutationEligibleSession.
+    const sideChat = Boolean(scope.session.sideChatOrigin) && scope.session.visibility === 'hidden';
     const outputSchema = input.request.outputContract?.type === 'json_schema'
         ? input.request.outputContract.schema
         : undefined;
     return {
         ...context,
         userInput: { text: canonicalUserInput.text },
+        ...nextStepContext(input, scope.session, sideChat, turnIntent?.kind),
         ...(outputSchema !== undefined || scope.preparation.outputRevisionInstruction !== undefined
             ? {
                 outputContract: {
@@ -93,6 +99,10 @@ export function createSecretFreeModelContextAssemblyContext(scope) {
         agentConfig: {
             ...projectAllowedFields(preparation.agentConfig, AGENT_CONFIG_ALLOWLIST),
             model,
+            // Secret-free advisor binding: the tool catalog offers the advisor tool only with it,
+            // and the advisor tool reads its model group from it.
+            ...(preparation.advisor ? { advisor: { ...preparation.advisor } } : {}),
+            ...(isLightweightRootSession(session) ? { lightweightRoot: true } : {}),
         },
         model,
         history,
@@ -205,5 +215,58 @@ function isRecord(value) {
 }
 function readRecord(value) {
     return isRecord(value) ? value : {};
+}
+/** The turn's input came through an IM channel, directly or in a queued batch. */
+export function arrivedThroughChannel(request) {
+    return Boolean(request.input.channelContext ||
+        request.input.queuedMessages?.some((message) => message.channelContext));
+}
+const FOREGROUND_USER_SOURCES = new Set([
+    'api',
+    'conversation-mutation',
+    'questionnaire',
+    'turn-continuation',
+]);
+/**
+ * Nobody is waiting, but the card stays in the Session until the user reads the result.
+ * A message from another Session counts: a reminder or a peer drove the Turn, not the user.
+ */
+const UNATTENDED_CARD_SOURCES = new Set([
+    'cron',
+    'background-task',
+    'communication',
+]);
+function nextStepContext(input, session, sideChat, turnIntentKind) {
+    const sessionEligible = isNextStepSession(session, sideChat);
+    return {
+        nextStepSessionEligible: sessionEligible,
+        nextStepEligible: sessionEligible && isNextStepTurn(input, turnIntentKind),
+        nextStepUnattended: UNATTENDED_CARD_SOURCES.has(input.request.provenance.source),
+        nextStepReplyOnly: sideChat,
+    };
+}
+/**
+ * Sessions that carry wrap_up. Decided by the Session alone: every Turn of the Session
+ * then sends the same system prompt and tools, which keeps the request prefix cached.
+ * This is the only gate for task children too: the extension registers wrap_up after the local
+ * catalog, so tool lists cannot remove it.
+ */
+function isNextStepSession(session, sideChat) {
+    return ((session.sessionKind === 'conversation' || session.sessionKind === 'cron') &&
+        (session.visibility !== 'hidden' || sideChat) &&
+        !session.miniAppOrigin);
+}
+/**
+ * Turns that may show a card: a send, an edited resend, Continue, an answered question, a cron
+ * run, a background-task notice or a message from another Session. IM input is left out, whatever its source, because those replies carry no clickable answer;
+ * an answer that resumes a Goal's turn belongs to the Goal, which never shows a card.
+ */
+function isNextStepTurn(input, turnIntentKind) {
+    const provenance = input.request.provenance;
+    return ((FOREGROUND_USER_SOURCES.has(provenance.source) ||
+        UNATTENDED_CARD_SOURCES.has(provenance.source)) &&
+        !arrivedThroughChannel(input.request) &&
+        readRecord(provenance.sourceContext?.questionnaireOwner).kind !== 'thread-goal' &&
+        !turnIntentKind?.startsWith('goal-'));
 }
 //# sourceMappingURL=assembly-context.js.map

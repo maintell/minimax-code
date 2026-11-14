@@ -6,7 +6,7 @@ import { pathObjectShas, resolveHead } from '../source/git-checkout.js';
 import { AutoUpdater } from './auto-updater.js';
 import { entryNameKey, findCatalogEntry, readCatalog, } from './catalog.js';
 import { errorCodeOf, MarketplaceErrorCode, marketplaceError, normalizeMarketplaceError, } from './errors.js';
-import { changedFiles, digestFiles, InstallRecords } from './installs.js';
+import { InstallRecords } from './installs.js';
 import { declaredComponentPaths, EntryMaterializer, inspectRelativeEntry, manifestDependencies, manifestVersion, probeManifest, } from './materializer.js';
 import { MarketplaceRegistry, resolveMarketplaceSource, } from './registry.js';
 const DEFAULT_PAGE_SIZE = 50;
@@ -179,7 +179,6 @@ class MarketplaceService {
         return this.exclusive(async () => {
             const startedAt = this.now();
             try {
-                // A manual update always runs and overwrites local edits (it reports them).
                 const result = await this.replaceInstalled(await this.updateTarget(id));
                 this.observe('update', { result: 'ok', trigger: 'manual' }, startedAt);
                 return result;
@@ -334,7 +333,6 @@ class MarketplaceService {
                 id: plugin.id,
                 rootPath: plugin.rootPath,
                 installedDigest: plugin.contentDigest,
-                files: await digestFiles(plugin.rootPath),
                 ...(material.version ? { version: material.version } : {}),
                 ...(material.remoteHead ? { remoteHead: material.remoteHead } : {}),
             };
@@ -347,6 +345,11 @@ class MarketplaceService {
             });
         }
     }
+    /**
+     * The installed copy is a cache of the marketplace entry: an update replaces it
+     * whole, like a reinstall. Edits and runtime files inside it (bytecode caches,
+     * logs) are not preserved; Folder marketplaces load in place for editing.
+     */
     async updateTarget(id) {
         const installed = await this.options.installer.listInstalled();
         const current = installed.find((plugin) => samePluginId(plugin.id, id));
@@ -358,15 +361,12 @@ class MarketplaceService {
         if (record.source.kind === 'directory' || current.ownership === 'linked') {
             throw marketplaceError(MarketplaceErrorCode.UPDATE_UNSUPPORTED, 'Folder marketplaces load in place and are not upgraded');
         }
-        const previous = (await this.installs.read(installed)).get(pluginIdKey(current.id));
-        return { current, previous, edited: hasLocalChanges(current, previous) };
+        return current;
     }
-    async replaceInstalled(target) {
-        const { current, previous, edited } = target;
-        const discardedLocalChanges = previous && edited ? await changedSince(previous, current.rootPath) : [];
+    async replaceInstalled(current) {
         const { market, resolved } = await this.requireEntry(current.id);
         const plugin = await this.installOwned(market, resolved, current.id, true);
-        return { plugin, discardedLocalChanges };
+        return { plugin, discardedLocalChanges: [] };
     }
     async requireEntry(id) {
         const record = await this.registry.find(id.marketplace);
@@ -484,18 +484,11 @@ class MarketplaceService {
     async autoUpdate(id) {
         const startedAt = this.now();
         try {
-            const outcome = await this.exclusive(async () => {
-                const target = await this.updateTarget(id);
-                // The automatic path never overwrites edits, nor a copy it cannot compare.
-                if (target.edited || !target.previous)
-                    return 'skipped';
-                await this.replaceInstalled(target);
-                return 'ok';
-            });
-            this.observe('update', { result: outcome, trigger: 'auto' }, startedAt);
+            await this.exclusive(async () => this.replaceInstalled(await this.updateTarget(id)));
+            this.observe('update', { result: 'ok', trigger: 'auto' }, startedAt);
             this.options.logger.info('plugin marketplace auto update', {
                 marketplace: id.marketplace,
-                result: outcome,
+                result: 'ok',
             });
         }
         catch (error) {
@@ -538,8 +531,10 @@ class MarketplaceService {
         }
     }
     observe(operation, tags, startedAt) {
-        this.options.metrics.incr(`plugin_marketplace_${operation}_total`, tags);
-        this.options.metrics.latency(`plugin_marketplace_${operation}_duration_ms`, this.now() - startedAt, tags);
+        const total = `plugin_marketplace_${operation}_total`;
+        const duration = `plugin_marketplace_${operation}_duration_ms`;
+        this.options.metrics.incr(total, tags);
+        this.options.metrics.latency(duration, this.now() - startedAt, tags);
     }
     assertUsable() {
         if (this.disposed)
@@ -563,18 +558,17 @@ async function describeInstalledPlugin(market, plugin, resolved, install) {
         ...(resolved?.dependencies ?? []),
         ...manifestDependencies(installedManifest),
     ]);
-    const localChanges = owned && hasLocalChanges(plugin, install);
     if (!market?.catalog || !resolved) {
         return {
             updateAvailable: false,
-            hasLocalChanges: localChanges,
+            hasLocalChanges: false,
             unavailableReason: 'NOT_IN_MARKETPLACE',
             dependencies,
         };
     }
     return {
         updateAvailable: isUpdateAvailable(market, plugin, resolved, install),
-        hasLocalChanges: localChanges,
+        hasLocalChanges: false,
         dependencies,
     };
 }
@@ -588,19 +582,6 @@ function isUpdateAvailable(market, plugin, resolved, install) {
         ? (resolved.version ?? install.remoteHead)
         : resolved.version;
     return latest !== undefined && install.version !== undefined && latest !== install.version;
-}
-function hasLocalChanges(plugin, install) {
-    return (install !== undefined &&
-        plugin.contentDigest !== '' &&
-        install.installedDigest !== plugin.contentDigest);
-}
-async function changedSince(install, rootPath) {
-    try {
-        return changedFiles(install.files, await digestFiles(rootPath));
-    }
-    catch {
-        return [];
-    }
 }
 function resolveEntry(market, entry, state, objects) {
     const missingRoot = entry.source.kind === 'relative' && !state ? 'SOURCE_MISSING' : undefined;

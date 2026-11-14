@@ -1,6 +1,10 @@
 import { buildRunningSessionStatusEvent } from '../event-bridge/index.js';
 import { isLLMRequestStoppedMessage } from './llm-retry.js';
+import { llmCallPreemptedNotice } from './llm-preemption.js';
 import { immediateSendBatchId } from './outbound-message-normalizer.js';
+import { failureReason } from './terminal.js';
+/** Bounds a turn-failure hook that keeps asking to recover. */
+const MAX_TURN_FAILURE_RECOVERIES = 4;
 export async function emitRunning(turn) {
     try {
         await flushEvents(turn.writer, [
@@ -12,7 +16,7 @@ export async function emitRunning(turn) {
         ]);
     }
     catch (err) {
-        turn.metrics.tryRecordTerminalFailure({ errorSource: 'event_writer', errorKind: 'delivery' });
+        turn.metrics.tryRecordTerminalFailure({ errorSource: 'event_writer', errorKind: 'delivery' }, err);
         turn.logger.error({
             sessionId: turn.input.sessionId,
             turnId: turn.input.turnId,
@@ -28,10 +32,7 @@ export async function emitTerminal(turn, reason) {
         events = (await turn.bridge.emitTerminal(reason)).events;
     }
     catch (err) {
-        turn.metrics.tryRecordTerminalFailure({
-            errorSource: 'event_bridge',
-            errorKind: 'translation',
-        });
+        turn.metrics.tryRecordTerminalFailure({ errorSource: 'event_bridge', errorKind: 'translation' }, err);
         turn.logger.error({
             sessionId: turn.input.sessionId,
             turnId: turn.input.turnId,
@@ -44,7 +45,7 @@ export async function emitTerminal(turn, reason) {
         await flushEvents(turn.writer, events);
     }
     catch (err) {
-        turn.metrics.tryRecordTerminalFailure({ errorSource: 'event_writer', errorKind: 'delivery' });
+        turn.metrics.tryRecordTerminalFailure({ errorSource: 'event_writer', errorKind: 'delivery' }, err);
         turn.logger.error({
             sessionId: turn.input.sessionId,
             turnId: turn.input.turnId,
@@ -60,12 +61,87 @@ export function subscribeEvents(agent, turn, history, nowMs) {
     let forcedTermination;
     let continuationsClosed = false;
     const existingShouldStopAfterTurn = agent.shouldStopAfterTurn;
-    agent.shouldStopAfterTurn = async (context) => forcedTermination !== undefined || (await existingShouldStopAfterTurn?.(context)) === true;
+    // A recovered response leaves the loop to the runner, which repeats the call:
+    // no queued steering may reach the provider ahead of that repeat.
+    agent.shouldStopAfterTurn = async (context) => forcedTermination !== undefined ||
+        turn.recovery.pending !== undefined ||
+        (await existingShouldStopAfterTurn?.(context)) === true;
+    /**
+     * Asks the turn-failure hooks about a Turn that is about to fail. True when
+     * one of them recovers: the response is dropped and the call repeated. Once
+     * a history change failed to persist, nothing more of the Turn can be
+     * written, so a recovery would end the Turn looking complete with its
+     * records missing: only `restore` is honoured then.
+     */
+    const recoverTurnFailure = async (message, failure, termination, errorMessage) => {
+        const stopped = () => turn.input.signal?.aborted === true;
+        if (turn.hooks.turnFailure.length === 0 || stopped())
+            return false;
+        const requestMessages = turn.recovery.lastRequestPrepared
+            ? turn.recovery.lastRequest
+            : undefined;
+        const recoverable = () => !history.deliveryFailed() &&
+            turn.recovery.turnFailureRecoveries < MAX_TURN_FAILURE_RECOVERIES;
+        for (const hook of turn.hooks.turnFailure) {
+            let decision;
+            try {
+                decision = await hook({
+                    sessionId: turn.input.sessionId,
+                    turnId: turn.input.turnId,
+                    failure,
+                    message,
+                    ...(requestMessages ? { requestMessages } : {}),
+                    signal: turn.input.signal ?? agent.signal,
+                    recoverable: recoverable(),
+                });
+            }
+            catch (error) {
+                turn.logger.error({
+                    session_id: turn.input.sessionId,
+                    turn_id: turn.input.turnId,
+                    error: error instanceof Error ? error.message : String(error),
+                }, '[pi-turn-runner] turnFailure hook threw; leaving the failure as it is');
+                continue;
+            }
+            if (!decision || decision.type === 'continue')
+                continue;
+            if (decision.type === 'restore') {
+                const replaced = turn.recovery.replacedFailure;
+                if (replaced) {
+                    turn.recovery.restoredFailure = replaced;
+                    if (message.stopReason === 'error')
+                        message.errorMessage = replaced.errorMessage;
+                }
+                return false;
+            }
+            // The hook may have awaited a stop.
+            if (stopped() || !recoverable())
+                return false;
+            turn.recovery.turnFailureRecoveries += 1;
+            message.content = message.content.filter((block) => block.type !== 'toolCall');
+            turn.recovery.pending = {
+                reason: decision.reason,
+                errorMessage,
+                requestMessages: requestMessages ?? [],
+                ...(decision.detail !== undefined ? { detail: decision.detail } : {}),
+                ...(decision.replay === true && requestMessages ? { replay: true } : {}),
+            };
+            turn.recovery.replacedFailure = { termination, errorMessage };
+            return true;
+        }
+        return false;
+    };
     const applyAfterLlmControl = async (event) => {
-        if (event.message.role !== 'assistant' || turn.hooks.afterLLM.length === 0)
+        if (event.message.role !== 'assistant' ||
+            (turn.hooks.afterLLM.length === 0 && turn.hooks.turnFailure.length === 0)) {
             return 'emit';
+        }
         if (event.message.stopReason !== 'error')
             turn.recovery.used = false;
+        // A follow-up is sent only once every hook has kept this response: a later
+        // retry or failure discards it, and the follow-up would ask about a reply
+        // the model never sees again.
+        let followUpPrompt;
         for (const hook of turn.hooks.afterLLM) {
             let decision;
             try {
@@ -85,7 +161,14 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                     error: message,
                 }, '[pi-turn-runner] afterLlmCall hook threw; failing response control closed');
                 event.message.content = event.message.content.filter((block) => block.type !== 'toolCall');
-                forcedTermination = { kind: 'failed', message: `after_llm_call_failed: ${message}` };
+                const termination = {
+                    kind: 'failed',
+                    message: `after_llm_call_failed: ${message}`,
+                };
+                if (await recoverTurnFailure(event.message, { kind: 'hook_error', errorMessage: message }, termination, termination.message)) {
+                    return 'discard';
+                }
+                forcedTermination = termination;
                 return isEmptyAssistantResponse(event.message) ? 'discard' : 'emit';
             }
             if (!decision || decision.type === 'continue')
@@ -109,6 +192,13 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                 });
                 return 'discard';
             }
+            if (decision.type === 'followUp') {
+                const final = event.message.stopReason !== 'error' &&
+                    !event.message.content.some((block) => block.type === 'toolCall');
+                if (final)
+                    followUpPrompt ??= decision.prompt;
+                continue;
+            }
             if (decision.type === 'recover') {
                 if (event.message.stopReason !== 'error' ||
                     turn.recovery.used ||
@@ -126,10 +216,27 @@ export function subscribeEvents(agent, turn, history, nowMs) {
             // A failed response is rejected as a whole. Never let its still-pending
             // tool intent execute.
             event.message.content = event.message.content.filter((block) => block.type !== 'toolCall');
-            forcedTermination = { kind: 'failed', message: decision.reason };
+            const termination = { kind: 'failed', message: decision.reason };
+            if (await recoverTurnFailure(event.message, { kind: 'response_rejected', reason: decision.reason }, termination, decision.reason)) {
+                return 'discard';
+            }
+            forcedTermination = termination;
             return isEmptyAssistantResponse(event.message) ? 'discard' : 'emit';
         }
-        return 'emit';
+        if (event.message.stopReason !== 'error') {
+            if (followUpPrompt !== undefined) {
+                agent.followUp({
+                    role: 'user',
+                    content: [{ type: 'text', text: followUpPrompt }],
+                    timestamp: Date.now(),
+                });
+            }
+            return 'emit';
+        }
+        const errorMessage = event.message.errorMessage ?? '';
+        const normalized = turn.metrics.getLLMFailureObservation()?.normalized;
+        const recovered = await recoverTurnFailure(event.message, { kind: 'provider_error', errorMessage, ...(normalized ? { normalized } : {}) }, failureReason(errorMessage, normalized), errorMessage);
+        return recovered ? 'discard' : 'emit';
     };
     /**
      * A request the host refused to send (its request budget closed while a
@@ -161,7 +268,35 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         }
         turn.bridge.discardActiveAssistantMessage();
     };
+    /**
+     * The preempted response never reached history, so nothing of it is flushed.
+     * Its text may already be on screen: the host retracts it by message id.
+     */
+    const discardPreemptedResponse = async (event) => {
+        // An id still being allocated would be written back after the discard.
+        await pendingMessageID?.catch(() => undefined);
+        const messageId = turn.bridge.getActiveAssistantMessageId();
+        const delivered = turn.preemption.discarded?.delivered === true;
+        delete turn.preemption.discardMessage;
+        turn.preemption.resumePending = true;
+        discardAssistantMessage(event);
+        turn.logger.info({ session_id: turn.input.sessionId, turn_id: turn.input.turnId, message_id: messageId }, '[pi-turn-runner] discarded preempted LLM response');
+        // Retraction removes the whole message, including what the user already read.
+        if (!messageId || delivered)
+            return;
+        try {
+            await turn.input.llmPreemption?.onResponseDiscarded?.(messageId);
+        }
+        catch (error) {
+            turn.logger.warn({
+                session_id: turn.input.sessionId,
+                turn_id: turn.input.turnId,
+                error: error instanceof Error ? error.message : String(error),
+            }, '[pi-turn-runner] retracting preempted response failed; continuing the resend');
+        }
+    };
     const cannotContinueAtIdle = () => forcedTermination !== undefined ||
+        turn.recovery.pending !== undefined ||
         turn.input.signal?.aborted === true ||
         agent.state.errorMessage !== undefined;
     const failContinuationPoll = (error) => {
@@ -185,6 +320,10 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         }
         try {
             const hasToolCalls = event.message.content.some((block) => block.type === 'toolCall');
+            const resending = turn.preemption.resumePending === true;
+            delete turn.preemption.resumePending;
+            const discarded = turn.preemption.discarded;
+            delete turn.preemption.discarded;
             let closeRefused = false;
             for (;;) {
                 // The poll reports whether more steps already follow. At an exit
@@ -192,10 +331,38 @@ export function subscribeEvents(agent, turn, history, nowMs) {
                 // them back to the session instead of extending a finished answer.
                 // Once the host closed the Turn's work, every poll is an exit.
                 const workClosed = (await turn.input.isWorkClosed?.()) === true;
-                const boundary = !workClosed && (hasToolCalls || agent.hasQueuedMessages()) ? 'mid-turn' : 'exit';
+                // A preempted step produced nothing, so it finished no answer: the
+                // user steering that caused it must join the resend, not wait for a
+                // next Turn. Closed work or a stopping prompt falls through to a close.
+                const boundary = !workClosed && (resending || hasToolCalls || agent.hasQueuedMessages())
+                    ? 'mid-turn'
+                    : 'exit';
                 const steering = [
                     ...((await turn.input.getSteeringMessages?.(workClosed ? { boundary, workClosed } : { boundary })) ?? []),
                 ];
+                if (resending &&
+                    boundary === 'mid-turn' &&
+                    (await turn.input.shouldStopAfterSteering?.()) !== true) {
+                    try {
+                        // One batch: Pi drains single steering messages one request at a time.
+                        agent.steerBatch([
+                            llmCallPreemptedNotice({ timestamp: nowMs(), ...discarded }),
+                            ...steering,
+                        ]);
+                        return;
+                    }
+                    catch (error) {
+                        // Without the notice the steering still joins the next call, as it always did.
+                        turn.logger.warn({
+                            session_id: turn.input.sessionId,
+                            turn_id: turn.input.turnId,
+                            error: error instanceof Error ? error.message : String(error),
+                        }, '[pi-turn-runner] preempted resend notice failed; queueing steering as usual');
+                        void Promise.resolve()
+                            .then(() => turn.input.llmPreemption?.onResendFallback?.())
+                            .catch(() => undefined);
+                    }
+                }
                 enqueueSteering(agent, steering);
                 if (steering.length > 0 || hasToolCalls || agent.hasQueuedMessages())
                     return;
@@ -334,8 +501,17 @@ export function subscribeEvents(agent, turn, history, nowMs) {
     };
     const onAgentEvent = async (event, observedAtMs) => {
         let discardMessage = false;
+        if (event.type === 'tool_execution_start' &&
+            !event.parentToolCallId &&
+            turn.input.llmPreemption?.deliversOnToolStart?.(event.toolName, event.args) === true) {
+            turn.preemption.deliveredInCall = true;
+        }
         try {
-            if (event.type === 'message_end') {
+            if (event.type === 'message_end' && event.message === turn.preemption.discardMessage) {
+                discardMessage = true;
+                await discardPreemptedResponse(event);
+            }
+            else if (event.type === 'message_end') {
                 discardMessage =
                     isRefusedRequestFailure(event.message) ||
                         (await applyAfterLlmControl(event)) === 'discard';
@@ -358,7 +534,10 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         if ((!discardMessage && event.type === 'message_end') || event.type === 'tool_execution_end') {
             await history.flushTail();
         }
-        if (event.type === 'turn_end' && turn.hooks.onStepEnd.length > 0) {
+        // A preempted step did no work, so step-end hooks have nothing to observe.
+        if (event.type === 'turn_end' &&
+            turn.hooks.onStepEnd.length > 0 &&
+            turn.preemption.resumePending !== true) {
             const blockedToolCalls = turn.blockedToolCalls;
             turn.blockedToolCalls = [];
             // Step-end hooks may enqueue follow-up messages into the same Agent.

@@ -1,4 +1,4 @@
-import { SideChatApplication } from './session/sidechat-application.js';
+import { SideChatApplication, } from './session/sidechat-application.js';
 import { ProjectApplication, } from './project/project-application.js';
 import { QueueApplication } from './queue/queue-application.js';
 import { SessionContentApplication } from './session/content-application.js';
@@ -21,6 +21,7 @@ export const initializeApplications = (options) => {
         dispatch: (sessionId) => options.turn.dispatchQueue(sessionId),
         publish: options.publishGlobalEvent,
         publishQueueFacts: (facts) => options.sessionSystem.queue.facts.handle(facts),
+        ...(options.sideChatAdvisor ? { advisor: options.sideChatAdvisor } : {}),
     });
     const root = new SessionRootApplication({
         invariant: options.sessionSystem.root.invariant,
@@ -72,12 +73,14 @@ export const initializeApplications = (options) => {
             ? { assertSessionDeletionAllowed: options.assertSessionDeletionAllowed }
             : {}),
         ...(options.metrics ? { metrics: options.metrics } : {}),
+        assignments: options.sessionSystem.repositories.assignmentTasks,
     });
     const query = new SessionQueryApplication({
         backgroundTaskWait: options.backgroundTaskWait,
         cloudReader: options.cloudSessionReader,
         service: options.sessionSystem.session.query,
         sideChats: options.sessionSystem.sideChats,
+        assignments: options.sessionSystem.repositories.assignmentTasks,
     });
     const content = new SessionContentApplication({
         cloudReader: options.cloudSessionReader,
@@ -86,6 +89,7 @@ export const initializeApplications = (options) => {
         maintenance: options.sessionSystem.session.maintenance,
         staleCompactionRepair: options.sessionSystem.messages.staleCompactionRepair,
         files: options.sessionSystem.files,
+        artifactCatalog: options.sessionSystem.artifactCatalog,
         mediaIdentity: options.sessionSystem.mediaIdentity,
         inputSummaries: options.sessionSystem.messages.inputSummaries,
         usage: options.sessionSystem.usage,
@@ -124,11 +128,13 @@ export const initializeApplications = (options) => {
         service: options.sessionSystem.project,
         pinService: options.pinService,
         sessionArchive: lifecycle,
+        assignments: options.sessionSystem.repositories.assignmentTasks,
     });
     const conversationMutation = new SessionConversationMutationApplication(options.conversationMutationPort, options.conversationMutationWorkflow);
     const pin = new PinApplication({
         service: options.pinService,
         publishGlobalEvent: options.publishGlobalEvent,
+        assignments: options.sessionSystem.repositories.assignmentTasks,
     });
     return {
         backgroundTask: options.backgroundTask,

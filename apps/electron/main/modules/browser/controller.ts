@@ -61,6 +61,7 @@ export class BrowserController {
         this.shortcutHostOverride = null;
         this.previewWindow = null;
         this.previewLayout = null;
+        this.contentCornerRadius = 0;
         this.parentWindow = null;
         /**
          * File Panel host that owns shortcut routing. Unlike parentWindow it does not
@@ -931,13 +932,22 @@ export class BrowserController {
             height: Math.max(1, Math.round(state.viewport.height * scale)),
         });
     }
+    /** Clips embedded Mini App previews without changing their CSS viewport or zoom. */
+    setContentCornerRadius(radius) {
+        this.contentCornerRadius = radius;
+        this.syncDevicePreviewBorderRadius();
+    }
     syncDevicePreviewBorderRadius() {
         this.syncPreviewPresentation();
         // Electron 42's rounded WebContentsView mask misroutes OOPIF input when
         // emulation scale is below 1. The scrollable preview uses a rectangular
-        // native clip; retain the old mask only for the legacy five-preset surface.
+        // native clip. Unscaled Mini App previews can still use their content mask.
         const legacyDeviceFrame = !this.getDevicePreviewState().enabled && this.devicePreviewController.getPreset();
-        this.webContentsView?.setBorderRadius(legacyDeviceFrame ? BrowserController.DEVICE_PREVIEW_BORDER_RADIUS : 0);
+        this.webContentsView?.setBorderRadius(legacyDeviceFrame
+            ? BrowserController.DEVICE_PREVIEW_BORDER_RADIUS
+            : this.getDevicePreviewState().enabled
+                ? 0
+                : this.contentCornerRadius);
     }
     /**
      * Expose the underlying WebContents for Electron-only host integrations.

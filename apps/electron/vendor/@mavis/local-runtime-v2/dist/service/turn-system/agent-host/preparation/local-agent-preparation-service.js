@@ -1,4 +1,7 @@
+import { readAdvisorSelection, } from '../../../model-system/index.js';
 import { LocalAgentConfigBuilder, } from './config/local-agent-config-builder.js';
+import { ADVISOR_TOOL_NAME, isLocalTurnBuiltinToolAllowed, } from '../assembly/local-turn-tool-catalog.js';
+import { readAgentProfile } from '../assembly/local-turn-tool-catalog-source.js';
 /**
  * Conversation preparation owner shared by normal turns, manual compaction,
  * archive title generation and Context Debug.
@@ -10,6 +13,17 @@ export class LocalAgentPreparationService {
     }
     bindAgentShellResolver(resolve) {
         this.options.configBuilder.bindAgentShellResolver(resolve);
+    }
+    /**
+     * The runtime's one `beta.ptcStore` decision, the same value the Agent Host creates
+     * its store from, so the PTC prompt never names `store` on a Host that has none.
+     */
+    ptcStoreRequested() {
+        return this.options.configBuilder.ptcStoreRequested();
+    }
+    /** Late-bound memory tail rendered at the end of a coordinator's system prompt. */
+    bindCoordinatorMemoryProvider(provider) {
+        this.options.configBuilder.bindCoordinatorMemoryProvider(provider);
     }
     /** Late-bound Session model repair; see `session-model-selection.ts`. */
     bindSessionModelRepair(repair) {
@@ -57,13 +71,15 @@ export class LocalAgentPreparationService {
     async prepareResolved(input) {
         const built = await this.options.configBuilder.buildPrepared(input);
         const builtAgentConfig = built.agentConfig;
+        const agentConfig = Object.freeze({ ...builtAgentConfig });
+        const advisor = this.bindAdvisor(input, agentConfig);
         const llm = await this.resolveModel({
             sessionId: input.session.sessionId,
             turnId: input.turnId,
             agentConfig: builtAgentConfig,
         });
         return {
-            agentConfig: Object.freeze({ ...builtAgentConfig }),
+            agentConfig,
             ...(built.agentShell ? { agentShell: built.agentShell } : {}),
             llm,
             outputRevisionInstruction: built.outputRevisionInstruction,
@@ -74,7 +90,38 @@ export class LocalAgentPreparationService {
             ...(built.additionalWorkspaceRoots
                 ? { additionalWorkspaceRoots: built.additionalWorkspaceRoots }
                 : {}),
+            ...(advisor ? { advisor } : {}),
         };
+    }
+    /**
+     * One binding per Turn, recomputed from the Session's selection and never persisted: the tool
+     * catalog offers the advisor tool exactly when it is present.
+     */
+    bindAdvisor(input, agentConfig) {
+        const stored = input.session.advisor;
+        if (!stored?.enabled)
+            return undefined;
+        if (!isLocalTurnBuiltinToolAllowed(ADVISOR_TOOL_NAME, readAgentProfile(agentConfig))) {
+            return undefined;
+        }
+        const read = readAdvisorSelection(this.options.configBuilder.readRuntimeConfig(), stored);
+        this.reportAdvisorRead(input, read);
+        return read.advisor;
+    }
+    /** The stored selection was not used as written: say so, since the UI cannot see it. */
+    reportAdvisorRead(input, read) {
+        if (read.dropped.length === 0 && !read.failure)
+            return;
+        const fields = {
+            session_id: input.session.sessionId,
+            turn_id: input.turnId,
+            advisor_model: read.selection.model,
+            ...(read.dropped.length > 0 ? { dropped: read.dropped } : {}),
+            ...(read.failure ? { code: read.failure.code, reason: read.failure.message } : {}),
+        };
+        this.options.logger?.warn(fields, read.failure
+            ? '[advisor] the stored advisor model cannot be used; this Turn runs without the advisor'
+            : '[advisor] the stored advisor settings no longer apply; this Turn uses the model defaults');
     }
 }
 function toModelOverride(model) {

@@ -63,16 +63,17 @@ function queryTime(input, hash, nowMs) {
     }
     return Number(previous.nowMs);
 }
-export function normalizeSidebarQuery(input, nowMs, internalRootIds = [], rootAgentNames) {
+export function normalizeSidebarQuery(input, nowMs, { internalRootIds, rootAgentNames, bunnyCreatedIds = [], }) {
     const normalized = {
         ...normalizeInputs(input),
+        showBunnyCreatedSessions: input.filter?.showBunnyCreatedSessions === true,
         internalRootIds: [...internalRootIds].sort(),
         ...(rootAgentNames ? { rootAgentNames: [...new Set(rootAgentNames)].sort() } : {}),
     };
     const hash = createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
     const queryNowMs = queryTime(input, hash, nowMs);
     const context = encodeObject({ v: 1, hash, nowMs: queryNowMs });
-    return { ...normalized, hash, context, nowMs: queryNowMs };
+    return { ...normalized, bunnyCreatedIds, hash, context, nowMs: queryNowMs };
 }
 export function encodeObject(value) {
     return Buffer.from(JSON.stringify(value)).toString('base64url');

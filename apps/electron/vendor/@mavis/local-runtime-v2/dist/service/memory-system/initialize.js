@@ -8,7 +8,7 @@ import { MemoryGovernanceService } from './orchestration/governance-service.js';
 import { MemoryLegacyMigrationService } from './orchestration/legacy-migration-service.js';
 import { MemoryRecallService } from './orchestration/recall-service.js';
 import { MemoryReconciler } from './orchestration/reconciler.js';
-import { MemoryScopeMutationCoordinator, MemorySummaryEditorImpl } from './policies/scope-mutation.js';
+import { MemoryScopeMutationCoordinator, MemorySummaryEditorImpl, } from './policies/scope-mutation.js';
 import { MemoryOnboardingStore } from './onboarding.js';
 import { MemoryAgentContributionAdapter } from './adapters/agent-contribution.js';
 import { MemoryFileStoreImpl } from './adapters/file-store.js';
@@ -45,18 +45,19 @@ export function initializeMemorySystem(options) {
         scopeMutation,
         config,
     };
+    // Turn 观察者依赖 Reconciler，而 Reconciler 依赖治理服务；用持有者回填打破构造环。
+    const rootInputTurns = {};
     // 3. 五个领域服务。它们只依赖 port 与互斥区，不依赖 Reconciler。
     const captureService = traceMemoryPort(diagnostics, 'capture', new MemoryCaptureService({ ...shared, model, nowMs }));
-    const consolidationService = traceMemoryPort(diagnostics, 'consolidation', new MemoryConsolidationService({
-        repository,
-        fileStore,
-        model,
-        scopeMutation,
-        config,
-        nowMs,
-    }));
+    const consolidationService = traceMemoryPort(diagnostics, 'consolidation', new MemoryConsolidationService({ repository, fileStore, model, scopeMutation, config, nowMs }));
     const recall = traceMemoryPort(diagnostics, 'recall', new MemoryRecallService(shared));
-    const governance = traceMemoryPort(diagnostics, 'governance', new MemoryGovernanceService({ ...shared, nowMs }));
+    const governance = traceMemoryPort(diagnostics, 'governance', new MemoryGovernanceService({
+        ...shared,
+        model,
+        isRootInputTurn: (s, t) => rootInputTurns.current?.isRootInputTurn(s, t) ?? false,
+        nowMs,
+        diagnostics,
+    }));
     const onboardingStore = new MemoryOnboardingStore(options.db, repository, nowMs);
     const migrationService = traceMemoryPort(diagnostics, 'migration', new MemoryLegacyMigrationService({
         ...shared,
@@ -137,8 +138,10 @@ export function initializeMemorySystem(options) {
     scopeMutation.bindWakeSink(() => {
         reconciler.kick({ kind: 'maintenance' });
     });
+    const turnAdapter = new MemoryTurnObserverAdapter(reconciler, source, diagnostics);
+    rootInputTurns.current = turnAdapter;
+    const turnObserver = traceMemoryPort(diagnostics, 'turnObserver', turnAdapter);
     const agent = new MemoryAgentContributionAdapter(recall, governance);
-    const turnObserver = traceMemoryPort(diagnostics, 'turnObserver', new MemoryTurnObserverAdapter(reconciler, source, diagnostics));
     return {
         summaryEditor: new MemorySummaryEditorImpl({
             dataDir: options.dataDir,

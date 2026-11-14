@@ -1,19 +1,37 @@
+import { homedir } from 'node:os';
+import path from 'node:path';
 import { withPptPreviewTaskStop } from './ppt-task-stop-cascade.js';
-import { getRuntimeRegion, isLocalSourceProvenanceEnabled, } from '@mavis/config';
+import { bunnyMemoryRoot, createBunnyMediaDescriptionRepository, createBunnyRoundBudgetExtension, } from '../../service/bunny/index.js';
+import { createAssignmentPermissionDecisions } from '../../service/assignment/index.js';
+import { readLocalPermissionMode } from '../../service/permission/index.js';
+import { createRuntimeAssignmentExecutionExtension } from './assignment-snapshot-product.js';
+import { withAssignmentTurnSettlement } from './assignment-turn-settlement.js';
+import { createTurnAgentKindResolver } from './turn-agent-kind.js';
+import { ptcScriptRefusedImport } from './ptc-script-import-check.js';
+import { ptcScriptSkillRoots } from './ptc-script-skill-roots.js';
+import { agentHomeDirectories } from './agent-homes.js';
+import { currentBetaResolutionContext, getRuntimeBuildEnv, getRuntimeRegion, isLocalSourceProvenanceEnabled, resolveBetaFeature, } from '@mavis/config';
+import { resolveBunnyHomeDir } from '@mavis/shared/local-runtime-paths';
 import { createRuntimeAuthSubmissionPreparation } from './runtime-execution-auth.js';
-import { SAFETY_SCENE } from '../../service/content-safety/index.js';
+import { productOutputReviewPolicy, resolveSafetyApiBase, SAFETY_SCENE, } from '../../service/content-safety/index.js';
+import { createPtcScriptHost, readPtcScriptCatalog, renderPtcScriptCatalog, } from '@mavis/agent-tools';
+import { report } from '../../service/turn-system/index.js';
+import { BUNNY_DATABASE_DIR, BUNNY_TRASH_DIR, } from '../../service/session-system/index.js';
 import { isCommandLineRuntimeOwner } from '../agent/profile-source.js';
 import { combineLocalTurnToolPolicyGuards, createGoalBudgetToolPolicyGuard, } from '../agent/goal-budget-tool-policy.js';
 import { createGoalFinalReply } from '../agent/goal-final-reply.js';
 import { createRuntimeSourceReferenceExtension } from '../agent/source-reference-extension.js';
+import { createBuiltinCoordinatorAgents } from '../agent/agent-surface-policy.js';
 import { createPlanEntrySubmissionPreparation, } from '../../service/plan/index.js';
 import { withSessionClioTurnSettlement, } from '../../service/session-clio/index.js';
-import { combineAgentEventObservers, composeTurnSubmissionPreparations, createContentReviewSlowEventObserver, createGoalTurnSubmissionPreparation, createSubmissionMemoryMetricsPreparation, createLocalAgentHost, createSessionLLMRetryEventObserver, createPromptSuggestionService, createSideMessageFallbackLog, createSteerFaultFilePort, hasPriorityUserQueueItem, initializeTurnSystem, requireAgentRuntime, } from '../../service/turn-system/index.js';
+import { combineAgentEventObservers, contextResetSessions, composeTurnSubmissionPreparations, createContentReviewSlowEventObserver, createGoalTurnSubmissionPreparation, createSubmissionMemoryMetricsPreparation, createLocalAgentHost, createLocalNetworkRecovery, createSessionLLMRetryEventObserver, createPromptSuggestionService, createSideMessageFallbackLog, createSteerFaultFilePort, createTurnFaultFilePort, hasPriorityUserQueueItem, initializeTurnSystem, requireAgentRuntime, } from '../../service/turn-system/index.js';
+import { closeRuntimeTurnSystem } from './runtime-services-lifecycle.js';
 import { createRuntimeUndeliveredSideMessages } from './runtime-user-applications.js';
 import { createQuestionnaireAnswerAdmissionPreparation, createQuestionnaireAnswerSteeringMarker, observeQuestionnaireAnswerSteering, } from './questionnaire-answer-admission.js';
-import { createRuntimeQueueSelection, } from './runtime-queue-selection.js';
+import { createRuntimeQueueSelection, createWaitingForUserQueueWake, } from './runtime-queue-selection.js';
 import { createRuntimeTurnAdmissionOptions } from './runtime-services-composition.js';
-import { createApprovedTitleHandler, createConsumedSteeringHandler, createQueueWakeFailureReporter, createTurnSystemMessageDelivery, } from './turn-message-delivery.js';
+import { scopeCoordinatorTurnExtensions, } from './coordinator-turn-scope.js';
+import { createApprovedTitleHandler, createReplyTitleReviewHandler, createConsumedSteeringHandler, createQueueWakeFailureReporter, createTurnSystemMessageDelivery, } from './turn-message-delivery.js';
 /** A Turn detached from its deleted Goal goes on as an ordinary Turn. */
 function createRuntimeGoalFinalReply(goalPort) {
     return createGoalFinalReply({
@@ -70,6 +88,59 @@ function createRuntimePromptSuggestions(input) {
     return { suggestions, promptSuggestion };
 }
 /**
+ * The product with what coordinator-owned Sessions add to it: their `agentKind`
+ * label, Bunny's home readable to Bunny, and assignment-aware permission
+ * decisions over the ordinary policy.
+ */
+function withCoordinatorCapabilities(input) {
+    const { roster } = input.sessionSystem.coordinatorOwnership;
+    return {
+        ...input.product,
+        inputPreparation: {
+            ...input.product.inputPreparation,
+            resolveAgentKind: createTurnAgentKindResolver(input.sessionSystem.coordinatorOwnership),
+        },
+        // Bunny reads its own home (worklines, memory, notes) without asking.
+        agentHomeDirectories: (agentName) => agentHomeDirectories(roster, input.options.dataDir, agentName),
+        permission: {
+            ...input.product.permission,
+            decisions: createAssignmentPermissionDecisions({
+                sessions: input.sessionSystem.repositories.sessions,
+                tasks: input.sessionSystem.repositories.assignmentTasks,
+                ownership: input.sessionSystem.coordinatorOwnership,
+                resolveAssignmentProject: input.resolveAssignmentProject,
+                // The same live view the hosted facade reads, so both see one mode.
+                localPermissionMode: async () => readLocalPermissionMode(input.product.preparation.configBuilder.config().permissionMode),
+            }, input.product.permission.decisions, input.bunnyPermissionMode, {
+                memory: bunnyMemoryRoot(input.options.dataDir),
+                spaces: path.join(resolveBunnyHomeDir(input.options.dataDir), 'spaces'),
+                runtime: [
+                    path.join(resolveBunnyHomeDir(input.options.dataDir), BUNNY_DATABASE_DIR),
+                    path.join(resolveBunnyHomeDir(input.options.dataDir), BUNNY_TRASH_DIR),
+                ],
+            }),
+        },
+    };
+}
+/** Bunny's Turn extensions, mounted only on the Turns of the Sessions they are for. */
+function createCoordinatorTurnExtensions(input) {
+    return scopeCoordinatorTurnExtensions(input.sessionSystem.coordinatorOwnership, {
+        executionReminder: createRuntimeAssignmentExecutionExtension(input),
+        roundBudget: createRuntimeBunnyRoundBudget(input),
+    });
+}
+/** Bunny-only round budget; the refusal is opt-in, count, reminder and summary always run. */
+function createRuntimeBunnyRoundBudget(input) {
+    return createBunnyRoundBudgetExtension({
+        isBlockEnabled: () => input.product.preparation.configBuilder.config().runawayGuard?.bunnyRoundBudgetBlock === true,
+        ...(input.bunnyRoundBudgetSummary ? { onTurnSummary: input.bunnyRoundBudgetSummary } : {}),
+        ...(input.bunnyReviewRound ? { reviewRound: input.bunnyReviewRound } : {}),
+        ...(input.bunnyReferencedSessionRead
+            ? { referencedSessionRead: input.bunnyReferencedSessionRead }
+            : {}),
+    });
+}
+/**
  * Side message fallback log, plus the steer fault rules that only a
  * verification instance's `diagnostics.steerFaultFile` config enables; without
  * that key every steer only reads the config.
@@ -92,12 +163,137 @@ function createRuntimeSideMessageDiagnostics(input) {
         nowMs: input.nowMs,
     };
 }
+/**
+ * Whether this host's own display surface can show a mid-stream retry as two
+ * messages: the half answer ends, the resent attempt follows as a new one.
+ *
+ * Owner alone cannot answer it. `tui` is the owner of the interactive TUI *and*
+ * of headless exec, ACP, app-server and inspection runs, so keying on it would
+ * enable the retry for output surfaces that run adjacent assistant messages
+ * together, or that only print the final text — there the split is unreadable.
+ * Those hosts opt in explicitly through `partialStreamRecoverySurface`, exactly
+ * like `promptSuggestionSurface` does for the suggestion.
+ *
+ * Unlike that option, no owner other than Desktop defaults to `true`: the SSH
+ * `app-server` is not a command-line owner yet has no surface that renders the
+ * split either, so "not a CLI" must not imply "renders the two messages".
+ */
+function shouldRecoverPartialStream(options) {
+    // An explicit host choice always wins, including an explicit `false`.
+    if (options.partialStreamRecoverySurface !== undefined)
+        return options.partialStreamRecoverySurface;
+    // Undeclared, only this machine's Desktop is known to render the split: it
+    // hosts exactly one surface.
+    return options.runtimeOwnerKind === 'electron';
+}
+/**
+ * Network handling shared by every Turn of this runtime: one process-wide
+ * network view, so an endpoint reached by any Session may wait out an outage;
+ * an observer that also logs retry states, so an offline wait can be read
+ * back after the UI has moved on; and the content-review offline wait, shown
+ * in the UI as the same network wait as a model call. Committed-stream
+ * recovery (50113) is enabled only when this host's own surface can show the
+ * abandoned attempt and the resend as two messages.
+ */
+/**
+ * The review requests' `contentReview.testBaseURL`. The conversation config
+ * read model does not type it; `resolveSafetyApiBase` applies the test-build
+ * loopback restriction.
+ */
+function reviewTestBaseURL(input) {
+    const contentReview = Reflect.get(input.product.preparation.configBuilder.config(), 'contentReview');
+    const value = contentReview && typeof contentReview === 'object'
+        ? Reflect.get(contentReview, 'testBaseURL')
+        : undefined;
+    return typeof value === 'string' ? value : undefined;
+}
+function createRuntimeLlmRetry(input) {
+    const publish = createSessionLLMRetryEventObserver(input.writeGlobalEvent);
+    const recoverPartialStream = shouldRecoverPartialStream(input.options);
+    const observer = (event) => {
+        input.options.logger?.info({
+            event: 'llm_retry',
+            session_id: event.sessionId,
+            turn_id: event.turnId,
+            call_id: event.callId,
+            scope: event.scope,
+            status: event.status,
+            retry_attempt: event.retryAttempt,
+            request_attempt: event.requestAttempt,
+            ...(event.delayMs === undefined ? {} : { delay_ms: event.delayMs }),
+            ...(event.waitingFor ? { waiting_for: event.waitingFor } : {}),
+            ...(event.error ? { reason: event.error.reason } : {}),
+        }, '[llm-retry]');
+        return publish(event);
+    };
+    const networkRecovery = createLocalNetworkRecovery({
+        isDeviceOnline: input.options.isDeviceOnline,
+        // The probe follows the model requests' route: the host transport, else the
+        // global fetch the TUI points at its environment proxy.
+        fetchImpl: input.product.fileApi?.fetchImpl ?? ((url, init) => globalThis.fetch(url, init)),
+        // Same address source as the review requests, test-build loopback override included.
+        reviewEndpoint: () => resolveSafetyApiBase(getRuntimeRegion(), getRuntimeBuildEnv(), reviewTestBaseURL(input)),
+        onOfflineCheck: (check) => input.options.logger?.info({ event: 'network_offline_check', ...check }, '[network-recovery]'),
+    });
+    const reviewOfflineWait = ({ sessionId, turnId, signal, }) => networkRecovery.createOfflineWait({
+        ...(signal ? { signal } : {}),
+        observer: reviewWaitObserver(observer, sessionId, turnId),
+    });
+    return {
+        llmRetry: {
+            observer,
+            networkRecovery,
+            ...(recoverPartialStream ? { recoverPartialStream: true } : {}),
+        },
+        reviewOfflineWait,
+    };
+}
+/** A content review waiting for the network, reported as a model-call network wait. */
+function reviewWaitObserver(observer, sessionId, turnId) {
+    const event = (fields) => observer({
+        sessionId,
+        turnId,
+        callId: `content-review:${turnId}`,
+        scope: 'agent',
+        retryAttempt: 0,
+        maxRetries: 0,
+        requestAttempt: 1,
+        ...fields,
+    });
+    return {
+        waiting: (delayMs) => event({
+            status: 'waiting',
+            delayMs,
+            nextRetryAtMs: Date.now() + delayMs,
+            waitingFor: 'network',
+            // Same detail as a model call waiting offline, so the notice keeps its info icon.
+            error: { reason: 'network', message: 'Network unavailable' },
+        }),
+        resolved: (online) => event({ status: online ? 'recovered' : 'cancelled' }),
+    };
+}
+/**
+ * The Turn hold that only a verification instance's `diagnostics.turnFaultFile`
+ * config enables (S14#4). The key is read once, when the Turn System is
+ * composed: without it no Turn holds or reads anything. With it every Turn
+ * reads the rules file, which the verification tooling may write at any time.
+ */
+function createRuntimeTurnFaults(input) {
+    const filePath = () => input.product.preparation.configBuilder.config().diagnostics?.turnFaultFile;
+    if (!filePath())
+        return undefined;
+    return createTurnFaultFilePort({
+        filePath,
+        nowMs: input.nowMs,
+        onError: (error) => input.options.logger?.warn({ error: String(error) }, '[turn-fault] rules file unusable'),
+    });
+}
 export async function initializeRuntimeTurnSystem(input, dependencies) {
-    const { plan, prepareMiniAppTurn, planEntryEnabled, normalExtensions, resumeSessionDeletion, goalVerifierExtension, goalVerifierOutputTokenCap, } = dependencies;
-    const llmRetryObserver = createSessionLLMRetryEventObserver(input.writeGlobalEvent);
+    const { plan } = dependencies;
+    const { llmRetry, reviewOfflineWait } = createRuntimeLlmRetry(input);
     const { suggestions, promptSuggestion } = createRuntimePromptSuggestions(input);
     let agentRuntime;
-    const queueSelection = createTurnQueueSelection(input, plan, planEntryEnabled);
+    const queueSelection = createTurnQueueSelection(input, plan, dependencies.planEntryEnabled);
     input.options.compatibility.backgroundTasks.bindRuntimeOwner({
         ownerId: input.runtimeOwnerIdentity.createOwnerId('background-task'),
         isOwnerAlive: input.runtimeOwnerIdentity.isOwnerAlive,
@@ -105,10 +301,17 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
     const turnSystem = await initializeTurnSystem({
         db: input.options.db,
         onBackgroundTaskWaitChanged: (payload) => input.writeGlobalEvent({ type: 'session.background_task_wait', payload }),
+        steeringObserver: {
+            admitted: (steer) => input.bunnyTurnTiming?.steeringAdmitted?.(steer),
+            discarded: (batch) => input.bunnyTurnTiming?.steeringDiscarded?.(batch),
+        },
+        onActiveTurnCountChanged: input.options.onActiveTurnCountChanged,
         // Explicit user stops cascade into this Session's background work. Owned by
         // the injected V2 background owner; an
         // accepted stop pauses the active Goal through the v2 Goal owner first.
         userStop: createRuntimeUserStop(input),
+        // `/new-bunny` resets Bunny's main conversation instead of compacting it.
+        contextReset: contextResetSessions(input.sessionSystem),
         // A redelivered queue item runs under a fresh Turn id; its Goal token
         // attribution follows it.
         onQueuedTurnIdentity: ({ turnId, previousTurnIds }) => input.goalPort.followQueuedTurn({ turnId, previousTurnIds }),
@@ -127,7 +330,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                 pollRuntimeRecovery: input.options.compatibility.backgroundTasks.pollRecovery,
             }
             : {}),
-        resumeSessionDeletion,
+        resumeSessionDeletion: dependencies.resumeSessionDeletion,
         // Decision v5: teardown fall-to-session uses the delivery service's
         // consumeSteering directly — the wrapped handler above would publish a
         // `session.start` no ended Turn should emit.
@@ -140,67 +343,81 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         // lane or falls back to the queue with injected_at still empty, so a crash
         // at any point leaves it to retry, the queue or startup recovery.
         onSteeringTeardownCommitted: createQuestionnaireAnswerSteeringMarker(questionnaireAnswerObserver(input, 'steering_teardown_committed')),
-        createHost: async ({ turnControl, turnFacts, pluginHookSessionOwnership }) => {
+        createHost: async (capabilities) => {
             const goalFinalReply = createRuntimeGoalFinalReply(input.goalPort);
+            const consumeSteering = createConsumedSteeringHandler(input.messageDelivery, input.sessionSystem, input.writeGlobalEvent, input.product.executor.reportFailure);
             const production = await createLocalAgentHost({
-                product: input.product,
+                product: withTitleReviewCapability(input),
                 db: input.options.db,
                 preparation: input.preparation,
                 sessions: input.sessionSystem,
                 safety: input.safety,
-                turnControl,
-                turnFacts,
-                pluginHookSessionOwnership,
+                ...capabilities,
                 turnCapabilities: input.turnCapabilities,
                 promptSuggestion,
                 // `sessionTitle.enabled: false` disables title generation: wire a
                 // no-op so no title model request is issued. Read from the injected
                 // config source (same as beta/custom_provider above), default on.
-                onInputReviewResolved: (input.product.preparation.configBuilder.config().sessionTitle?.enabled ?? true)
-                    ? createApprovedTitleHandler(input.sessionSystem, input.product.executor.reportFailure)
-                    : () => { },
-                onSteeringConsumed: observeQuestionnaireAnswerSteering(createConsumedSteeringHandler(input.messageDelivery, input.sessionSystem, input.writeGlobalEvent, input.product.executor.reportFailure), questionnaireAnswerObserver(input, 'steering_consumed')),
+                onInputReviewResolved: createRuntimeTitleHandler(input),
+                onSteeringConsumed: observeQuestionnaireAnswerSteering(async (steer) => {
+                    // Before the display write: a consumed user input forbids a silent finish.
+                    input.bunnyTurnSilence?.recordConsumedSteering(steer);
+                    input.bunnyTurnTiming?.steeringConsumed?.(steer);
+                    await consumeSteering(steer);
+                }, questionnaireAnswerObserver(input, 'steering_consumed')),
                 toolPolicyGuard: combineLocalTurnToolPolicyGuards(goalFinalReply.toolPolicyGuard, plan.toolGuard, createGoalBudgetToolPolicyGuard({
                     worksForGoal: (turn) => input.goalPort.goalIdForTurn(turn.sessionId, turn.turnId) !== undefined,
                 })),
-                outputTokenCap: goalVerifierOutputTokenCap,
+                outputTokenCap: dependencies.goalVerifierOutputTokenCap,
                 askUserPolicy: createAskUserPolicySource(input),
-                resolveLlmRetry: () => ({ observer: llmRetryObserver }),
+                resolveLlmRetry: () => llmRetry,
+                reviewOfflineWait,
                 // 送审等了 15 秒以上时发 `content.review.slow`，界面在输入框上方提示检查电脑负荷。
                 onSlowReview: createContentReviewSlowEventObserver(input.writeGlobalEvent),
                 normalExtensions: [
+                    ...createCoordinatorTurnExtensions(input),
                     ...(!isLocalSourceProvenanceEnabled(input.options.runtimeOwnerKind)
                         ? []
                         : [
                             createRuntimeSourceReferenceExtension(input.options.compatibility.attachmentRegistration),
                         ]),
                     plan.extension,
-                    goalVerifierExtension,
+                    dependencies.goalVerifierExtension,
                     goalFinalReply.extension,
-                    ...normalExtensions,
+                    ...dependencies.normalExtensions,
                     ...(input.memory ? [input.memory.agentExtension] : []),
                 ],
                 ...memorySummaryHostOptions(input.memory),
-                eventObserver: combineAgentEventObservers(...(input.channelSystem ? [input.channelSystem.terminalReplies] : []), input.turnLifecycleEvents),
+                ...ptcScriptHostOptions(input, ptcScriptsSwitch(input)),
+                eventObserver: combineAgentEventObservers(...(input.channelSystem ? [input.channelSystem.terminalReplies] : []), 
+                // Before the lifecycle: it records each event before the terminal one is published.
+                input.bunnyTurnSilence, input.turnLifecycleEvents, input.bunnyStateObserver, input.bunnyTurnTiming),
+                turnTiming: input.bunnyTurnTiming,
+                turnFaults: createRuntimeTurnFaults(input),
+                segmentMediaDescriptions: createBunnyMediaDescriptionRepository({
+                    db: input.options.bunnyDb,
+                    // Read when a description is stored, not while the coordinator is composed.
+                    messages: {
+                        get: (sessionId, id) => input.sessionSystem.repositories.messages.get(sessionId, id),
+                    },
+                    nowMs: input.nowMs,
+                }),
                 nowMs: input.nowMs,
                 miniAppApprovals: dependencies.miniAppApprovals,
                 ...(isCommandLineRuntimeOwner(input.options.runtimeOwnerKind)
                     ? { cliProductPolicy: true }
                     : {}),
-                ...(input.options.runtimeOwnerKind === 'tui'
-                    ? { tuiProductPolicy: true, contentReviewEnabled: getRuntimeRegion() === 'cn' }
-                    : {}),
+                ...productOutputReviewPolicy(input.options.runtimeOwnerKind),
                 ...(input.options.getRunawayGuardConfig
                     ? { getRunawayGuardConfig: input.options.getRunawayGuardConfig }
                     : {}),
                 resolveComputerUseCapture: input.options.resolveComputerUseCapture,
                 ...(input.options.getToolResultCompactionConfig
-                    ? {
-                        getToolResultCompactionConfig: input.options.getToolResultCompactionConfig,
-                    }
+                    ? { getToolResultCompactionConfig: input.options.getToolResultCompactionConfig }
                     : {}),
+                getSegmentContextConfig: input.options.getBunnyContextConfig,
             });
-            agentRuntime = production.lifecycle;
+            agentRuntime = bindRuntimePtcStore(input, production);
             return production.host;
         },
         disposeRuntimeSession: async (sessionId) => {
@@ -213,42 +430,30 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
             }
         },
         ...createRuntimeTurnAdmissionOptions(input, plan.admission),
-        submissionPreparation: composeTurnSubmissionPreparations(createRuntimeAuthSubmissionPreparation(input.options.executionAuthMode, input.product.preparation.modelResolver.authContextGetter), 
-        // Counts submissions that passed auth; it never rejects one.
-        createSubmissionMemoryMetricsPreparation(input.options.metrics), createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
-            prepare: input.goalPort.prepareTurnAdmission,
-            hasPendingPlan: (sessionId) => plan.lifecycleFence.blocks({ sessionId }),
-            hasPriorityMailboxWork: async (sessionId) => hasPriorityUserQueueItem(await input.sessionSystem.queue.committed.list(sessionId)),
-        }), input.options.compatibility.sessionHandoff.hosted.submissionPreparation, 
-        // Last: it only records that a v2 questionnaire answer reached the model.
-        createQuestionnaireAnswerAdmissionPreparation({
-            markAnswerAdmitted: markQuestionnaireAnswerDelivered(input),
-            readQueuedOrigins: async (sessionId, itemId) => {
-                const item = await input.sessionSystem.queue.committed.get(sessionId, itemId);
-                return item
-                    ? [
-                        item.message.origin,
-                        ...(item.immediateSendBatch?.members.map((member) => member.message.origin ?? member.provenance.sourceContext?.origin) ?? []),
-                    ]
-                    : [];
-            },
-            ...(input.options.logger ? { logger: input.options.logger } : {}),
-        })),
+        submissionPreparation: createRuntimeSubmissionPreparation(input, plan),
         ...createRuntimeHistoryProjections(input),
         onTurnDiffRewindSkipped: (event) => input.options.logger?.warn({ ...event }, 'Turn diff rewind phase skipped'),
         classifyQueuedItem: queueSelection.classifyQueuedItem,
         shouldYieldFifoPosition: queueSelection.shouldYieldFifoPosition,
+        wakesQueueWhileWaitingForUser: createWaitingForUserQueueWake({
+            queue: input.sessionSystem.queue.committed,
+            sessions: input.sessionSystem.sessions.repository,
+            isCoordinatorAgent: createBuiltinCoordinatorAgents({ agents: input.agentService }),
+        }),
         createMessageDelivery: createTurnSystemMessageDelivery(input.messageDelivery),
-        beforeStart: prepareMentionedMiniApps(input, prepareMiniAppTurn),
+        beforeStart: prepareMentionedMiniApps(input, dependencies.prepareMiniAppTurn),
         onTurnSettling: dependencies.miniAppMemory && releaseMiniAppTurn(dependencies.miniAppMemory),
         ...(input.sessionClio ? { sessionClio: input.sessionClio.capture } : {}),
-        ...(input.sessionClio || input.product.turnSettlement
-            ? {
-                turnSettlement: input.sessionClio
-                    ? withSessionClioTurnSettlement(input.sessionClio.capture, input.product.turnSettlement)
-                    : input.product.turnSettlement,
-            }
-            : {}),
+        turnSettlement: withAssignmentTurnSettlement({
+            owns: async (sessionId) => {
+                const session = await input.sessionSystem.repositories.sessions.get(sessionId);
+                return (session !== undefined &&
+                    input.sessionSystem.coordinatorOwnership.standing(session) !== undefined);
+            },
+            settled: input.assignmentTurnSettled,
+        }, input.sessionClio
+            ? withSessionClioTurnSettlement(input.sessionClio.capture, input.product.turnSettlement)
+            : input.product.turnSettlement),
         onQueueWakeFailure: createQueueWakeFailureReporter(input.product.executor.reportFailure, 'turn_submit_queue_wake_failed'),
         resolveChannelInputModel: input.channelTurnAdmission.resolveChannelInputModel,
         queueSubmissionRejections: input.channelTurnAdmission.queueSubmissionRejections,
@@ -257,7 +462,9 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
     });
     input.options.compatibility.backgroundTasks.bindNotificationReceipts(turnSystem.receipts);
     queueSelection.bindDispatchQueue((sessionId) => turnSystem.turns.dispatchQueue(sessionId));
-    return withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection);
+    return withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection, async () => {
+        await agentRuntime?.close?.();
+    });
 }
 /**
  * Queue selection whose AskUser countdown wake dispatches through the Turn
@@ -265,6 +472,29 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
  * dispatch is bound afterwards; only timers armed by queue classification
  * call it, and classification runs inside the Turn System.
  */
+function createRuntimeSubmissionPreparation(input, plan) {
+    return composeTurnSubmissionPreparations(createRuntimeAuthSubmissionPreparation(input.options.executionAuthMode, input.product.preparation.modelResolver.authContextGetter), 
+    // Counts submissions that passed auth; it never rejects one.
+    createSubmissionMemoryMetricsPreparation(input.options.metrics), createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
+        prepare: input.goalPort.prepareTurnAdmission,
+        hasPendingPlan: (sessionId) => plan.lifecycleFence.blocks({ sessionId }),
+        hasPriorityMailboxWork: async (sessionId) => hasPriorityUserQueueItem(await input.sessionSystem.queue.committed.list(sessionId)),
+    }), input.options.compatibility.sessionHandoff.hosted.submissionPreparation, 
+    // Last: it only records that a v2 questionnaire answer reached the model.
+    createQuestionnaireAnswerAdmissionPreparation({
+        markAnswerAdmitted: markQuestionnaireAnswerDelivered(input),
+        readQueuedOrigins: async (sessionId, itemId) => {
+            const item = await input.sessionSystem.queue.committed.get(sessionId, itemId);
+            return item
+                ? [
+                    item.message.origin,
+                    ...(item.immediateSendBatch?.members.map((member) => member.message.origin ?? member.provenance.sourceContext?.origin) ?? []),
+                ]
+                : [];
+        },
+        ...(input.options.logger ? { logger: input.options.logger } : {}),
+    }));
+}
 function createTurnQueueSelection(input, plan, planEntryEnabled) {
     let dispatchQueue;
     const selection = createRuntimeQueueSelection({
@@ -275,6 +505,7 @@ function createTurnQueueSelection(input, plan, planEntryEnabled) {
         lifecycleFence: plan.lifecycleFence,
         entryEnabled: planEntryEnabled,
         nowMs: input.nowMs,
+        legacyQuestionnaireHoldExempt: createBuiltinCoordinatorAgents({ agents: input.agentService }),
         dispatchQueue: async (sessionId) => {
             if (!dispatchQueue)
                 throw new Error('Turn System queue dispatch is not bound');
@@ -335,7 +566,7 @@ function releaseMiniAppTurn(memory) {
     };
 }
 /** Adds the prompt-suggestion port and stops suggestions and countdown wake timers on close. */
-function withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection) {
+function withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection, closeAgentHostResources) {
     return {
         ...turnSystem,
         turns: {
@@ -348,9 +579,30 @@ function withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection)
         close: async () => {
             suggestions.close();
             queueSelection.close();
-            await turnSystem.close();
+            await closeRuntimeTurnSystem(() => turnSystem.close(), closeAgentHostResources);
         },
     };
+}
+/**
+ * Binds the PTC session store so a committed context reset reaches it, and
+ * returns the Host lifecycle the caller keeps for Session disposal. With
+ * `beta.ptcStore` off there is no store: the binding is told so, and stops
+ * remembering resets for a store that will never exist.
+ */
+function bindRuntimePtcStore(input, production) {
+    input.options.prepared?.ptcStoreBinding?.bind(production.ptcSessionStore);
+    return production.lifecycle;
+}
+/**
+ * `sessionTitle.enabled: false` disables title generation: wire a no-op so no
+ * title model request is issued. Read from the injected config source (same as
+ * beta/custom_provider above), default on.
+ */
+function createRuntimeTitleHandler(input) {
+    const enabled = input.product.preparation.configBuilder.config().sessionTitle?.enabled ?? true;
+    return enabled
+        ? createApprovedTitleHandler(input.sessionSystem, input.product.executor.reportFailure)
+        : () => { };
 }
 function createRuntimeUserStop(input) {
     return withPptPreviewTaskStop(input.options.compatibility.backgroundTasks.createUserStop({
@@ -407,5 +659,106 @@ function createRuntimeHistoryProjections(input) {
 /** Memory owns the summary text; the Turn system places it in history. */
 function memorySummaryHostOptions(memory) {
     return memory ? { memorySummaryContext: memory.summaryContext } : {};
+}
+function withTitleReviewCapability(input) {
+    return {
+        ...withCoordinatorCapabilities(input),
+        executor: {
+            ...input.product.executor,
+            onReplyCommitted: (input.product.preparation.configBuilder.config().sessionTitle?.enabled ?? true)
+                ? createReplyTitleReviewHandler(input.sessionSystem, input.product.executor.reportFailure)
+                : undefined,
+        },
+    };
+}
+/**
+ * `beta.ptcScripts`, read once while the Turn System is composed and
+ * never again. The switch decides whether run_code offers the saved-script
+ * child tool, so a value that changed mid-Session would change the prompt
+ * prefix; turning it on or off therefore needs a restart, which is deliberate.
+ * Task child capture resolves the switch again per child Session, so the two
+ * can disagree until that restart (`ptcScriptsEnabled` in
+ * `task-agent-binding-capture.ts`).
+ */
+function ptcScriptsSwitch(input) {
+    return resolveBetaFeature('ptcScripts', input.product.preparation.configBuilder.config().beta?.ptcScripts, currentBetaResolutionContext());
+}
+/**
+ * The PTC script directories and the catalog reminder that lists what is saved
+ * in them. The directories are the project `.minimax/ptc`, the user
+ * `<dataDir>/ptc` and the skill roots PTC asks for, so a script shipped inside
+ * a skill can be imported. A Session that is not in PTC mode gets no catalog at
+ * all.
+ *
+ * Those skill roots are what `ptcScriptSkillRoots` returns for this call,
+ * which is still not exactly the set the skill registry ends up scanning: PTC
+ * passes no `compatibleAgentNames`, so the compatibility directories of legacy
+ * agent names are missing. It does apply the registry's Agent-resource rule
+ * (`excludeAgentResources` and the frozen owner incarnation), so the
+ * agent-level and Agent-scoped builtin roots the registry would drop are
+ * dropped here too.
+ *
+ * The catalog below lists only the project and user directories
+ * (`ptcScriptCatalogDirectories`); a skill root is never listed, so an
+ * unverified Agent incarnation has nothing to hide from the reminder even
+ * though the loader allowlist is what really decides what `import()` reads.
+ *
+ * `scriptsEnabled` is `beta.ptcScripts`, already resolved by the caller. Off
+ * wires nothing at all, which is the same shape a host without script
+ * support has: `ptcScriptSupport` then returns undefined, so no save tool is
+ * built, the Worker installs no `import()` loader, and the catalog
+ * reminder is withdrawn.
+ */
+function ptcScriptHostOptions(input, scriptsEnabled) {
+    if (!scriptsEnabled)
+        return {};
+    const config = () => input.product.preparation.configBuilder.config();
+    const host = createPtcScriptHost({
+        dataDir: () => config().dataDir,
+        homeDir: () => homedir(),
+        // The Agent resource scope travels with the call: `ptcScriptSupport`
+        // forwards this Turn's `agentProfile`, so the roots the loader allowlist
+        // gets obey the same private-resource rule the `skill` tool obeys.
+        skillRoots: (scope) => ptcScriptSkillRoots(config(), scope),
+        refusedImport: ptcScriptRefusedImport,
+    });
+    return {
+        ptcScripts: host,
+        ptcScriptCatalog: async (sessionId) => {
+            const session = await input.sessionSystem.sessions.repository.get(sessionId);
+            // Not a PTC Session, or already gone: no copy may reach the model. Only
+            // the tool call mode decides this, so a window that already carries a
+            // copy is withdrawn without touching the script directories.
+            if (!session || session.toolCallMode !== 'ptc')
+                return { status: 'disabled' };
+            return {
+                status: 'enabled',
+                // Reading both directories and every listed header happens here, so it
+                // runs only on a Turn that really places a copy.
+                load: async () => {
+                    const catalog = readPtcScriptCatalog(
+                    // The same filtered roots the loader gets, so the reminder never
+                    // offers a script `import()` would refuse.
+                    host.importable({
+                        workspaceDir: session.workspaceDir,
+                        agentName: session.agentName,
+                        ...(session.isDefaultWorkspace ? { isDefaultWorkspace: true } : {}),
+                    }));
+                    const content = renderPtcScriptCatalog(catalog);
+                    return content
+                        ? {
+                            content,
+                            entries: catalog.entries.length,
+                            truncated: catalog.hidden > 0,
+                        }
+                        : undefined;
+                },
+            };
+        },
+        // Counted when a copy really reaches a provider request, not on every Turn
+        // that looked for one: a window that already carries a frozen copy places
+        // nothing, and an empty catalog places nothing either.
+        ptcScriptCatalogInjected: (injected) => report(() => input.product.runner.metricsClient?.histogram('ptc_script_catalog_entries', injected.entries, { truncated: injected.truncated ? 'true' : 'false' })),
+    };
 }
 //# sourceMappingURL=turn-system-composition.js.map

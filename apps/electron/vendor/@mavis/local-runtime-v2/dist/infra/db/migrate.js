@@ -14,17 +14,18 @@
  * scripts (`scripts/session-storage-real-data-rehearsal.mjs`), the schema
  * snapshot generator, and focused tests that need exact-throw semantics.
  */
-export function runMigrations(rawDb, migrations) {
+export function runMigrations(rawDb, migrations, options = {}) {
     validateMigrationEntries(migrations);
+    const historyTable = resolveHistoryTable(options);
     // 确保 meta 表存在
-    ensureMigrationHistoryTable(rawDb);
-    const applied = readAppliedVersionSet(rawDb);
+    ensureMigrationHistoryTable(rawDb, historyTable);
+    const applied = readAppliedVersionSet(rawDb, historyTable);
     for (const migration of migrations) {
         if (applied.has(migration.version))
             continue;
         rawDb.exec('BEGIN IMMEDIATE');
         try {
-            if (isMigrationApplied(rawDb, migration.version)) {
+            if (isMigrationApplied(rawDb, migration.version, historyTable)) {
                 rawDb.exec('COMMIT');
                 applied.add(migration.version);
                 continue;
@@ -36,7 +37,7 @@ export function runMigrations(rawDb, migrations) {
                 migration.up(rawDb);
             }
             rawDb
-                .prepare('INSERT INTO local_runtime_v2_schema_migrations (version, applied_at_ms) VALUES (?, ?)')
+                .prepare(`INSERT INTO ${historyTable} (version, applied_at_ms) VALUES (?, ?)`)
                 .run(migration.version, Date.now());
             rawDb.exec('COMMIT');
             applied.add(migration.version);
@@ -46,6 +47,15 @@ export function runMigrations(rawDb, migrations) {
             throw err;
         }
     }
+}
+/** 大库沿用的迁移历史表；其他 SQLite（如 Bunny 独立库）用自己的表名。 */
+const DEFAULT_MIGRATION_HISTORY_TABLE = 'local_runtime_v2_schema_migrations';
+function resolveHistoryTable(options) {
+    const table = options.historyTable ?? DEFAULT_MIGRATION_HISTORY_TABLE;
+    if (!/^[a-z_][a-z0-9_]*$/u.test(table)) {
+        throw new Error(`Invalid migration history table name: ${table}`);
+    }
+    return table;
 }
 /**
  * Safe-mode migration runner: apply each pending entry, retry a failed entry
@@ -59,8 +69,9 @@ export function runMigrations(rawDb, migrations) {
  */
 export function runMigrationsWithRecovery(rawDb, migrations, options = {}) {
     validateMigrationEntries(migrations);
-    ensureMigrationHistoryTable(rawDb);
-    const applied = readAppliedVersionSet(rawDb);
+    const historyTable = resolveHistoryTable(options);
+    ensureMigrationHistoryTable(rawDb, historyTable);
+    const applied = readAppliedVersionSet(rawDb, historyTable);
     const failures = [];
     for (const migration of migrations) {
         if (applied.has(migration.version))
@@ -68,11 +79,11 @@ export function runMigrationsWithRecovery(rawDb, migrations, options = {}) {
         if (options.skipVersions?.has(migration.version))
             continue;
         try {
-            applyMigrationOnce(rawDb, migration);
+            applyMigrationOnce(rawDb, migration, historyTable);
         }
         catch {
             try {
-                applyMigrationOnce(rawDb, migration);
+                applyMigrationOnce(rawDb, migration, historyTable);
             }
             catch (retryError) {
                 failures.push({ version: migration.version, name: migration.name, error: retryError });
@@ -84,10 +95,10 @@ export function runMigrationsWithRecovery(rawDb, migrations, options = {}) {
     return { failures };
 }
 /** One transactional attempt at a single migration entry. */
-function applyMigrationOnce(rawDb, migration) {
+function applyMigrationOnce(rawDb, migration, historyTable) {
     rawDb.exec('BEGIN IMMEDIATE');
     try {
-        if (isMigrationApplied(rawDb, migration.version)) {
+        if (isMigrationApplied(rawDb, migration.version, historyTable)) {
             rawDb.exec('COMMIT');
             return;
         }
@@ -98,7 +109,7 @@ function applyMigrationOnce(rawDb, migration) {
             migration.up(rawDb);
         }
         rawDb
-            .prepare('INSERT INTO local_runtime_v2_schema_migrations (version, applied_at_ms) VALUES (?, ?)')
+            .prepare(`INSERT INTO ${historyTable} (version, applied_at_ms) VALUES (?, ?)`)
             .run(migration.version, Date.now());
         rawDb.exec('COMMIT');
     }
@@ -113,27 +124,25 @@ function applyMigrationOnce(rawDb, migration) {
         throw err;
     }
 }
-function ensureMigrationHistoryTable(rawDb) {
+function ensureMigrationHistoryTable(rawDb, historyTable) {
     rawDb.exec(`
-    CREATE TABLE IF NOT EXISTS local_runtime_v2_schema_migrations (
+    CREATE TABLE IF NOT EXISTS ${historyTable} (
       version INTEGER PRIMARY KEY,
       applied_at_ms INTEGER NOT NULL
     );
   `);
 }
-function readAppliedVersionSet(rawDb) {
+function readAppliedVersionSet(rawDb, historyTable) {
     const applied = new Set();
-    for (const row of rawDb.prepare('SELECT version FROM local_runtime_v2_schema_migrations').all()) {
+    for (const row of rawDb.prepare(`SELECT version FROM ${historyTable}`).all()) {
         if (!isVersionRow(row))
             throw new Error('Invalid v2 schema migration history row');
         applied.add(row.version);
     }
     return applied;
 }
-function isMigrationApplied(rawDb, version) {
-    const rows = rawDb
-        .prepare('SELECT version FROM local_runtime_v2_schema_migrations WHERE version = ?')
-        .all(version);
+function isMigrationApplied(rawDb, version, historyTable) {
+    const rows = rawDb.prepare(`SELECT version FROM ${historyTable} WHERE version = ?`).all(version);
     if (rows.length === 0)
         return false;
     if (rows.length !== 1 || !isVersionRow(rows[0])) {

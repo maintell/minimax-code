@@ -6,6 +6,8 @@
 export async function invalidateWorkspaceGitSnapshotsAfterResume(invoke) {
     const response = await invoke(new Request('http://127.0.0.1/minimax-desktop/api/v1/file/git/invalidate-all', {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
     }));
     if (!response.ok) {
         throw new Error(`Workspace Git snapshot invalidation failed with ${response.status}`);

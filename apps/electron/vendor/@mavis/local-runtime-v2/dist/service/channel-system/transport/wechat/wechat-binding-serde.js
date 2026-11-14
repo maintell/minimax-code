@@ -100,6 +100,9 @@ export function normalizeWeChatBinding(fallbackClientId, value) {
         agentName,
         botToken,
         ...readOptionalWeChatStrings(value),
+        ...(readRegistrationCreator(value.registrationCreator)
+            ? { registrationCreator: readRegistrationCreator(value.registrationCreator) }
+            : {}),
         ...readPersistedWeChatLiveness(value, mode, pending),
         mode,
         createdAt: readNumber(value.createdAt) ?? Date.now(),
@@ -130,5 +133,15 @@ function readPersistedWeChatLiveness(value, mode, pending) {
     if (mode === 'mock' || pending)
         return { connected: false, enabled: false };
     return { connected: value.connected !== false, enabled: value.enabled !== false };
+}
+function readRegistrationCreator(value) {
+    if (!isRecord(value) || value.source !== 'qr-login')
+        return undefined;
+    const userId = readFirstString(value, ['userId']);
+    const botId = readFirstString(value, ['botId']);
+    const bindingId = readFirstString(value, ['bindingId']);
+    return userId && botId && bindingId
+        ? { source: 'qr-login', userId, botId, bindingId }
+        : undefined;
 }
 //# sourceMappingURL=wechat-binding-serde.js.map

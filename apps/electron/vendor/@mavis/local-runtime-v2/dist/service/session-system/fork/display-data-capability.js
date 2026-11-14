@@ -1,3 +1,4 @@
+import { logger } from '../../../infra/logging/logger.js';
 import { resolveForkDisplayBoundary } from './display-boundary.js';
 import { resolveSideHistoryBoundary } from './side-history-boundary.js';
 /** Session-owned Display boundary and projection operations used by Application Fork. */
@@ -12,7 +13,7 @@ export function createSessionForkDisplayCapability(messages, historyMutation) {
                     return undefined;
                 if (sideHistory) {
                     const history = await historyMutation.read(sessionId);
-                    const messageId = resolveSideHistoryBoundary(history, sideHistory.throughMessageId);
+                    const messageId = await resolveReadableSideHistoryBoundary(historyMutation, sessionId, history, sideHistory.throughMessageId);
                     return {
                         messages: display,
                         assistant: boundary.assistant,
@@ -57,6 +58,19 @@ export function createSessionForkDisplayCapability(messages, historyMutation) {
         deleteSession: (sessionId) => messages.deleteSessionData(sessionId),
     };
 }
+/**
+ * The snapshot list and the snapshot's records are read separately, so a concurrent Rewind can
+ * remove the generation in between. Preflight then reports the boundary as unreachable.
+ */
+async function resolveReadableSideHistoryBoundary(historyMutation, sessionId, history, throughMessageId) {
+    try {
+        return await resolveSideHistoryBoundary(history, throughMessageId, (snapshot) => historyMutation.readSnapshotRecords(sessionId, snapshot));
+    }
+    catch (error) {
+        logger.warn({ sessionId, error: error instanceof Error ? error.message : String(error) }, 'Side history boundary snapshot could not be read');
+        return undefined;
+    }
+}
 function resolveCanonicalBoundary(history, boundary) {
     if (hasCanonicalBoundary(history, boundary.assistantCanonicalMessageId)) {
         return {
@@ -84,7 +98,7 @@ function hasCanonicalBoundary(history, messageId) {
     if (!history || !messageId)
         return false;
     return (history.active.some((envelope) => envelope.message_id === messageId) ||
-        history.snapshots.some((snapshot) => snapshot.records.some((envelope) => envelope.message_id === messageId)));
+        history.snapshots.some((snapshot) => snapshot.entries.some((entry) => entry.messageId === messageId)));
 }
 async function probeDisplayPrefix(messages, input) {
     const [source, target] = await Promise.all([

@@ -185,7 +185,11 @@ export async function createMemoryRealHarness(caseName: string) {
     const governance = traceMemoryPort(
       diagnostics,
       'governance',
-      new MemoryGovernanceService(shared),
+      new MemoryGovernanceService({
+        ...shared,
+        model,
+        isRootInputTurn: () => true,
+      }),
     );
     await writeFile(
       join(dataDir, 'input.json'),

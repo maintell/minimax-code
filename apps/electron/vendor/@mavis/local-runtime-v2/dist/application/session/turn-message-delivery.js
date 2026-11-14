@@ -1,4 +1,5 @@
 import { Role } from '@mavis/agent-core/protocol';
+import { queryCollapseSteeringProjection, } from '../conversation/index.js';
 import { sessionClioQueuedQueryId } from '../../service/session-clio/index.js';
 /**
  * Turn-system message delivery adapters split out of `services.ts` to keep that
@@ -205,5 +206,50 @@ function consumedBackgroundTaskDeliveryIdentity(message) {
 export function reportRootBestEffortFailure(reportFailure, input) {
     const stage = input.stage === 'turn-abort' ? 'abort' : input.stage.replaceAll('-', '_');
     reportFailure?.(input.sessionId, `root_replacement_${stage}_failed:${describeError(input.error)}`);
+}
+/** Read this logical query, including continuation steering, and the runner's exact final reply. */
+export function createReplyTitleReviewHandler(sessions, reportFailure) {
+    return (input) => {
+        detachedTitleResolutions.add((async () => {
+            try {
+                await sessions.titleReviews.review({
+                    sessionId: input.sessionId,
+                    turnId: input.turnId,
+                    loadContent: async () => {
+                        const messages = await sessions.messages.repository.listTurn(input.sessionId, input.turnId);
+                        const reply = messages.find((message) => message.msg_id === input.replyMessageId && message.role === Role.Assistant);
+                        if (typeof reply?.msg_content !== 'string' || !reply.msg_content.trim())
+                            return null;
+                        let inputMessages = messages.slice(0, messages.indexOf(reply));
+                        if (typeof reply.query_key === 'string' && reply.query_key) {
+                            const queryRootKey = queryCollapseSteeringProjection(reply.query_key).root_query_key ??
+                                reply.query_key;
+                            inputMessages = [
+                                ...(await sessions.messages.repository.list(input.sessionId, {
+                                    role: 'user',
+                                    queryRootKey,
+                                    before: input.replyMessageId,
+                                })).messages,
+                            ];
+                        }
+                        return {
+                            userInputs: inputMessages.flatMap((message) => message.role === Role.User && typeof message.msg_content === 'string'
+                                ? [message.msg_content]
+                                : []),
+                            finalReply: reply.msg_content,
+                        };
+                    },
+                });
+            }
+            catch (error) {
+                try {
+                    reportFailure?.(input.sessionId, `session_title_review_source_failed:${describeError(error)}`);
+                }
+                catch {
+                    /* Best-effort diagnostics. */
+                }
+            }
+        })());
+    };
 }
 //# sourceMappingURL=turn-message-delivery.js.map

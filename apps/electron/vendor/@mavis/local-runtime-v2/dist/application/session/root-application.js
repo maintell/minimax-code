@@ -58,8 +58,17 @@ export class RootArchiveTitleEventProjector {
 /** Owns generated Root mapping and the source-ordered replacement workflow. */
 export class SessionRootApplication {
     options;
+    /** Bound late: an owner composed after the applications take part in later Roots. */
+    rootParticipant;
     constructor(options) {
         this.options = options;
+    }
+    /**
+     * Registers the participant every later Root runs, on both timings. Owners composed after this
+     * application exists bind here rather than through the constructor.
+     */
+    bindRootParticipant(participant) {
+        this.rootParticipant = participant;
     }
     async getRootSession(_context, request) {
         const agentName = await this.resolvePublicAgentName(request.name);
@@ -72,8 +81,11 @@ export class SessionRootApplication {
         await this.replaceRootSessionByAgent(agentName, request.sessionId);
         return { ok: true };
     }
-    getRootSessionByAgent(agentName) {
-        return this.invoke(() => this.options.invariant.getRootSessionByAgent(agentName));
+    async getRootSessionByAgent(agentName) {
+        return this.invoke(async () => {
+            const root = await this.options.invariant.getRootSessionByAgent(agentName);
+            return this.runRootParticipant(agentName, root, 'ensured');
+        });
     }
     async replaceRootSessionByAgent(agentName, nextRootSessionId, options = {}) {
         const { nextRoot } = await this.replaceRootSessionWithResult(agentName, nextRootSessionId, options);
@@ -94,6 +106,7 @@ export class SessionRootApplication {
         await Promise.all(plan.previousRoots.map((root) => this.abortOldRoot(agentName, root.sessionId)));
         const committed = await this.options.invariant.commitReplacement(plan, options);
         await Promise.all(committed.previousRoots.map((root) => this.runPostCommitParticipants(agentName, root, plan.fallbackName)));
+        await this.runRootParticipant(agentName, committed.nextRoot, 'adopted');
         await this.observeFact(committed);
         return { ...committed, fallbackName: plan.fallbackName };
     }
@@ -111,6 +124,22 @@ export class SessionRootApplication {
         }
         catch (error) {
             this.reportBestEffortFailure('archive-title', agentName, previousRoot.sessionId, error);
+        }
+    }
+    /**
+     * The one place a Root is materialized on, whichever timing produced it. A read hands back the
+     * record the participant returns; a replacement already committed and keeps its own.
+     */
+    async runRootParticipant(agentName, root, reason) {
+        const participant = this.rootParticipant;
+        if (!participant)
+            return root;
+        try {
+            return (await participant.apply({ agentName, root, reason })) ?? root;
+        }
+        catch (error) {
+            this.reportBestEffortFailure('root-materialized', agentName, root.sessionId, error);
+            return root;
         }
     }
     async observeFact(fact) {

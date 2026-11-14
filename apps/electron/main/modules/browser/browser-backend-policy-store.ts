@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { withPreCommonConfigKeys, applyPreCommonConfigOverrides } from "@mavis/shared/common-config-pre-override";
 // Mirrors BROWSER_BACKEND_APOLLO_KEY; @mavis/shared/browser-backend is ESM-only
 // and Main's CommonJS build may import only its types.
 const BROWSER_BACKEND_APOLLO_KEY = 'agent_desktop_browser_backend';
@@ -48,12 +49,15 @@ export function createFileBrowserBackendPolicyStore(options) {
 /**
  * Reads the public common_config key directly from Main. Rollout membership is
  * evaluated locally, so the request carries no credentials or user identity.
+ * Staging builds apply the shared pre_<key> override like every other reader.
  * Resolves to the raw value, or undefined when the key is authoritatively absent.
  */
 export async function fetchBrowserBackendRemotePolicy(options) {
     const url = new URL('/v1/api/config/web/common_config', options.origin);
     url.search = new URLSearchParams({
-        filter: BROWSER_BACKEND_APOLLO_KEY,
+        filter: options.readsPreKeys
+            ? withPreCommonConfigKeys(BROWSER_BACKEND_APOLLO_KEY)
+            : BROWSER_BACKEND_APOLLO_KEY,
         device_platform: 'web',
         biz_id: '3',
         app_id: '3001',
@@ -78,5 +82,8 @@ export async function fetchBrowserBackendRemotePolicy(options) {
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
         throw new Error('Malformed browser backend policy response.');
     }
-    return data[BROWSER_BACKEND_APOLLO_KEY];
+    const config = options.readsPreKeys
+        ? applyPreCommonConfigOverrides(data)
+        : data;
+    return config[BROWSER_BACKEND_APOLLO_KEY];
 }

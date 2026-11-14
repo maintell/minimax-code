@@ -1,27 +1,37 @@
-import { createContinuationControl, resolveChildBashSteeringContext, prepareInitialImmediateSendBatch, withGenuineQueryProvenance, } from './user-input-control.js';
-import { toPiUserMessage, } from '@mavis/agent-core/pi-turn-runner';
+import { CommittedReplyRelay } from './turn-state-layer/committed-reply.js';
+import { hasSendToUserTool, createBunnyReplyOriginTracker, createPlainTextEndingFollowUp, withPlainTextEndingHook, } from '../runner/output/send-to-user-display-projection.js';
+import { createContinuationControl, resolveChildBashSteeringContext, waitsForChildBash, prepareInitialImmediateSendBatch, preparePlainSteering, userSteeringToolContext, withGenuineQueryProvenance, } from './user-input-control.js';
+import { createTurnSideEventRouter } from '../events/turn-side-event-router.js';
+import { writeTurnFaultLateOutput } from '../events/turn-fault-late-output.js';
+import { isBunnyMainConversationTurn, preemptionRunOption, startUserSteeringPreemption, } from './user-steering-preemption.js';
+import { agentKindField, toPiUserMessage, wakeField, } from '@mavis/agent-core/pi-turn-runner';
 import {} from '@mavis/agent-core/tools';
 import { prepareBashTurnTools } from '../assembly/local-turn-tool-catalog.js';
 import { createPluginAgentRoster } from '../assembly/turn-capability-lifecycle.js';
 import { buildCompletedTerminalStatusEvent, buildRuntimeWarningEvent, } from '@mavis/agent-core/event-bridge';
 import { withPtcCompactionReminder } from './ptc/compaction-reminder.js';
 import { createPtcTurnCompactionReminder, observePtcTurnAdmission, preparePtcExecution, } from './ptc/turn-preparation.js';
+import { createToolSearchContextHook, createToolSearchResponseHook } from '../tools/tool-search.js';
 import { beginLocalPluginHookTurn, createLocalPluginHookEventReporter, emitLocalPluginHookWarnings, localPluginHookCoordinator as pluginHookCoordinator, } from '../assembly/local-turn-plugin-hooks.js';
 import { copyCanonicalHistoryForPiCompatibility } from '../history/canonical-history-validation.js';
-import { assertLocalOutputFormatCapability, buildTurnPayloadTransforms, } from '../assembly/local-turn-payload-transform.js';
-import { AgentHostDependencyUnavailableError, assertAgentHostCapabilityAvailable, } from '../empty-dependencies.js';
+import { coordinatorSteeringOptions, resolveTurnPrefix } from './turn-state-layer/turn-state.js';
+import { assertLocalOutputFormatCapability, buildTurnPayloadTransforms, resolveCoordinatorGenuineUserQueryText, } from '../assembly/payload/local-turn-payload-transform.js';
+import { AgentHostDependencyUnavailableError } from '../empty-dependencies.js';
 import { createLocalTurnEventWriter, } from '../events/runtime-event-writer.js';
-import { AgentEventAssociationError } from '../local-agent-host.js';
 import { inputReviewRunnerOptions } from '../runner/policy/input-review-runner-options.js';
 import { applyProcessLocalToolResultPolicy } from '../runner/policy/process-local-tool-result-policy.js';
 import { joinPrompt, joinUserPrompt, isLightweightRootSession, LIGHTWEIGHT_TOOL_CALL_FALLBACK, readPreparedContextUsagePromptRanges, readPreparedSystemPrompt, renderAgentRuntimeReminders, resolveProviderContextMode, } from './prompt.js';
 import { createAgentHostPluginHookTranscript, } from '../tools/index.js';
-import { withPluginAutomaticCompactionLifecycle } from './plugin-hook-compaction-lifecycle.js';
+import { withPluginAutomaticCompactionLifecycle } from './model-hooks/plugin-hook-compaction-lifecycle.js';
 import { createControlledToolHooks } from './plugin-hook-tool-lifecycle.js';
-import { createExecutionBudgetReminder } from '../runner/execution-budget-reminder.js';
+import { toolSearchContextHooks } from './model-hooks/tool-search-context.js';
+import { createRequestOnlyReminderHook } from './model-hooks/request-only-reminders.js';
+import { prepareTurnReminders } from './model-hooks/execution-reminders.js';
 import { createTurnPromptSuggestionCapture, PromptSuggestionCommitRelay, readPromptSuggestionScope, withPromptSuggestionHooks, } from '../runner/prompt-suggestion/capture.js';
-import { withExecutionObservability } from './execution-observability.js';
-import { ackCommittedToolResultTailClaims, attachCommittedFacts, attachWaitingForUser, continuationRunMode, contentReviewOptions, hostOutputTokenCap, providerHistory, reconcileIntent, requestControlledRunOptions, } from './turn-execution-policy.js';
+import { withExecutionObservability } from './model-hooks/execution-observability.js';
+import { withProviderRequestDiagnostics } from '../runner/observability/provider-request-diagnostics.js';
+import { ackCommittedToolResultTailClaims, attachCommittedFacts, attachWaitingForUser, continuationRunMode, contentReviewOptions, describeUnknownError, hostOutputTokenCap, preparedTurnTiming, providerHistory, reconcileIntent, requestControlledRunOptions, } from './turn-execution-policy.js';
+import { validateOptions, validateResolvedInput, validateRoutedTurnTools, } from './executor-validation.js';
 async function emitComputerUseDefaultWarning(input, reporter) {
     if (input.preparation.agentConfig.computerUseDefaultUnavailable !== true)
         return;
@@ -48,18 +58,9 @@ async function emitComputerUseDefaultWarning(input, reporter) {
  * fail before runtime invocation stays inside `execute()`, so LocalAgentHost
  * can commit exactly one failed terminal before receipt/release.
  */
-/**
- * Wait for the Turn's own background shell only at a natural exit with
- * nothing else to run; never once the Turn's work is closed.
- */
-function waitsForChildBash(context, messageCount, continuation) {
-    return (context?.boundary === 'exit' &&
-        context.workClosed !== true &&
-        messageCount === 0 &&
-        !continuation.shouldStopAfterSteering?.());
-}
 export class LocalRuntimeTurnExecutor {
     options;
+    committedReplies = new CommittedReplyRelay(() => this.options.onReplyCommitted);
     promptSuggestions = new PromptSuggestionCommitRelay(() => this.options.promptSuggestion);
     constructor(options) {
         this.options = options;
@@ -192,6 +193,11 @@ export class LocalRuntimeTurnExecutor {
     }
     async executeTurn(input, eventWriter) {
         const prepared = await this.prepareRunnerInput(input, eventWriter);
+        // Verification-only (S14#4): an abort here ends the Turn cancelled before any history write.
+        const late = await this.options.turnFaults?.holdBeforeHistory(input.lease);
+        // Verification-only (Bunny context reset S03): output a Turn writes after it was ended by force.
+        if (late)
+            await writeTurnFaultLateOutput(input, late.lateText);
         const outputContract = input.request.outputContract;
         assertLocalOutputFormatCapability(input.preparation.llm.model, outputContract, input.preparation.llm.supportsJsonObjectOutput === true);
         await this.beginFileChanges(input);
@@ -208,8 +214,21 @@ export class LocalRuntimeTurnExecutor {
         input.control.setComputerUseAvailable?.(prepared.tools.some((tool) => tool.def.name.startsWith('computer_')));
         const pendingToolResultTailClaims = new Set();
         const readTaskOutputTaskIds = prepared.readTaskOutputTaskIds;
+        const savedPtcScripts = prepared.savedPtcScripts;
         const terminalTaskOutputReadIds = new Set();
-        const continuation = createContinuationControl(input, prepared.prepareSteering, this.options.onSteeringConsumed);
+        const repliesThroughSendToUser = hasSendToUserTool(prepared.tools);
+        const replies = createBunnyReplyOriginTracker(input.request, repliesThroughSendToUser);
+        const plainTextEnding = createPlainTextEndingFollowUp(input, repliesThroughSendToUser, isBunnyMainConversationTurn(input));
+        const continuation = createContinuationControl(input, prepared.prepareSteering, (consumed) => {
+            preemption?.recordConsumedSteering(consumed.message, {
+                hookDenied: consumed.hookDenied === true,
+            });
+            plainTextEnding?.recordConsumedSteering(consumed.message);
+            return this.options.onSteeringConsumed?.(consumed);
+        }, {
+            ...coordinatorSteeringOptions(input, prepared, this.options.turnStateLayer?.()),
+            onAcceptedInput: replies?.accept,
+        });
         const toolSafetyGuard = this.options.createTurnToolSafetyGuard?.();
         const payloadTransforms = buildTurnPayloadTransforms(input, outputContract, this.options);
         // Short-lived internal state. When the feature is off nothing is captured
@@ -220,6 +239,10 @@ export class LocalRuntimeTurnExecutor {
             turnId: input.lease.turnId,
             signal: input.lease.signal,
         });
+        // Preemption side events share Pi's runtime sequence, so they must share
+        // the attempt's safety writer instead of the Turn writer.
+        const sideEventRouter = createTurnSideEventRouter(eventWriter);
+        const preemption = startUserSteeringPreemption(input, this.options.logger, sideEventRouter);
         let runnerResult;
         const evalSessionFields = this.projectEvalSessionFields(input.session, input.lease.sessionId);
         try {
@@ -231,6 +254,7 @@ export class LocalRuntimeTurnExecutor {
                 systemPrompt: prepared.systemPrompt,
                 promptMetadata: input.preparation.agentConfig.prompt_metadata,
                 userMessage: prepared.userMessage,
+                replyOrigin: replies?.current,
                 ...(prepared.beforeUserMessages.length > 0
                     ? { beforeUserMessages: prepared.beforeUserMessages }
                     : {}),
@@ -243,10 +267,16 @@ export class LocalRuntimeTurnExecutor {
                     ...prepared.llm,
                     ...hostOutputTokenCap(this.options.outputTokenCap, input),
                     ...payloadTransforms,
+                    streamFn: withProviderRequestDiagnostics(prepared.llm.streamFn, {
+                        sessionId: input.lease.sessionId,
+                        turnId: input.lease.turnId,
+                        logger: this.options.logger,
+                    }),
                 },
                 eventWriter,
                 eventIdGenerator: input.pluginHookEventReporter?.nextEventId,
                 runtimeSeqGenerator: input.pluginHookEventReporter?.nextRuntimeSeq,
+                sideEventRouter,
                 history: prepared.history,
                 signal: input.lease.signal,
                 tools: prepared.tools,
@@ -258,7 +288,10 @@ export class LocalRuntimeTurnExecutor {
                     toolResolution: prepared.toolResolution,
                     pendingToolResultTailClaims,
                     hostBeforeLlmCallHooks: prepared.beforeLlmCallHooks,
+                    hostAfterLlmCallHooks: withPlainTextEndingHook(prepared.afterLlmCallHooks, plainTextEnding),
                     readTaskOutputTaskIds,
+                    savedPtcScripts,
+                    ptcObserver: prepared.ptcObserver,
                     terminalTaskOutputReadIds,
                     toolsDisabled: this.options.disableTools === true,
                     toolSafetyGuard,
@@ -267,6 +300,8 @@ export class LocalRuntimeTurnExecutor {
                     ptcFactCollector: prepared.ptcFactCollector,
                 }), promptSuggestion?.capture), input.request.provenance.sourceContext?.executionDiagnostics === true),
                 caller: prepared.caller,
+                ...agentKindField(prepared.agentKind),
+                ...wakeField(prepared.wake),
                 ...(prepared.unexpectedToolCallFallback
                     ? { unexpectedToolCallFallback: prepared.unexpectedToolCallFallback }
                     : {}),
@@ -291,6 +326,7 @@ export class LocalRuntimeTurnExecutor {
                 shouldStopAfterSteering: continuation.shouldStopAfterSteering,
                 tryBeginClose: continuation.tryBeginClose,
                 ...(await requestControlledRunOptions(input, this.options)),
+                ...preparedTurnTiming(input.turnTiming, this.options.nowMs),
                 // Desktop and TUI both consume provider-measured output throughput.
                 ...(this.options.cliProductPolicy !== true || this.options.tuiProductPolicy === true
                     ? { includeDetailedUsage: true }
@@ -315,22 +351,26 @@ export class LocalRuntimeTurnExecutor {
                     messageIds: recall.messageIds,
                 }),
                 ...(this.options.captureToolTiming?.(input) ? { captureToolTiming: true } : {}),
+                ...preemptionRunOption(preemption),
             });
         }
         finally {
+            preemption?.close();
             await childBash?.close();
         }
         return {
             outcome: attachWaitingForUser(input.resolveTerminalOutcome(reconcileIntent(runnerResult)), runnerResult?.outcome?.waitingForUser === true),
             prepared,
             readTaskOutputTaskIds,
+            savedPtcScripts,
             runnerResult,
             promptSuggestion: readPromptSuggestionScope(input, prepared, promptSuggestion?.capture, runnerResult?.outcome?.replyMessageId),
         };
     }
-    /** Fires the optional next-message suggestion once the Host durably committed the Turn. */
+    /** Fires optional reply observers once the Host durably committed the Turn. */
     afterSuccessfulCommit(outcome) {
         this.promptSuggestions.committed(outcome);
+        this.committedReplies.committed(outcome);
     }
     async settleTurn(input, settled) {
         try {
@@ -341,8 +381,9 @@ export class LocalRuntimeTurnExecutor {
                     ? { assistantMessageId: settled.runnerResult.outcome.messageId }
                     : {}),
             });
-            const committed = attachCommittedFacts(settled.outcome, observation, settled.readTaskOutputTaskIds);
+            const committed = attachCommittedFacts(settled.outcome, observation, settled.readTaskOutputTaskIds, settled.savedPtcScripts);
             this.promptSuggestions.remember(committed, settled.promptSuggestion);
+            this.committedReplies.remember(committed, input.lease, settled.runnerResult?.outcome?.replyMessageId);
             return committed;
         }
         catch (error) {
@@ -365,6 +406,7 @@ export class LocalRuntimeTurnExecutor {
             eventWriter,
         });
         const readTaskOutputTaskIds = new Set();
+        const savedPtcScripts = new Map();
         const toolResolution = preparedExecution.toolResolution;
         const admittedTools = applyProcessLocalToolResultPolicy(validateRoutedTurnTools(input.assembly.tools), this.options.cliProductPolicy === true);
         const ptc = preparePtcExecution(input.assembly.tools, admittedTools, this.options, input);
@@ -373,6 +415,7 @@ export class LocalRuntimeTurnExecutor {
         const toolContext = {
             ...toolResolution.context,
             ...pluginToolContext(input),
+            ...userSteeringToolContext(input.control),
             // Use admitted tools, including frozen selectors and final routing. A
             // configured/MCP namesake cannot read the native background task store.
             allowBashAutoPromotion: canConsumeNativeTaskOutput,
@@ -390,16 +433,18 @@ export class LocalRuntimeTurnExecutor {
                 ? {}
                 : { contextUsagePromptRanges: standardContextUsagePromptRanges }),
         });
-        const { systemPrompt, tools, contextUsagePromptRanges } = providerContext;
+        const genuineUserQueryText = resolveCoordinatorGenuineUserQueryText(input, preparedExecution.genuineUserQueryText ?? input.request.genuineUserQueryText);
+        // A coordinator's main conversation (spec 8, 9): a frozen prefix and a delta block.
+        const { systemPrompt, tools, contextUsagePromptRanges, deltaBlocks } = await resolveTurnPrefix(input, this.options, providerContext, genuineUserQueryText);
         observePtcTurnAdmission(input, ptc, this.options, { systemPrompt, tools });
         input.onContextUsagePromptRangesResolved?.(contextUsagePromptRanges);
-        const userPromptPrefix = joinUserPrompt(input.assembly.userPromptPrefix, renderAgentRuntimeReminders(input.assembly.reminders), joinPrompt(preparedExecution.reminderBlocks.join('\n\n'), input.pluginHookContext
+        const userPromptPrefix = joinUserPrompt(input.assembly.userPromptPrefix, renderAgentRuntimeReminders(input.assembly.reminders.filter(({ reminder }) => !reminder.requestOnly)), joinPrompt(preparedExecution.reminderBlocks.join('\n\n'), input.pluginHookContext
             ? `<plugin-hook-context>\n${input.pluginHookContext}\n</plugin-hook-context>`
             : ''), '');
         let userMessage = withGenuineQueryProvenance({
             ...preparedExecution.userMessage,
             text: joinUserPrompt(userPromptPrefix, '', '', preparedExecution.promptText ?? input.canonicalUserInput.text),
-        }, preparedExecution.genuineUserQueryText ?? input.request.genuineUserQueryText);
+        }, genuineUserQueryText);
         const history = copyCanonicalHistoryForPiCompatibility(providerHistory(input));
         const batchMessages = prepareInitialImmediateSendBatch(input, {
             messages: preparedExecution.initialBatchMessages,
@@ -418,13 +463,31 @@ export class LocalRuntimeTurnExecutor {
             tools,
             eventWriter,
         });
-        const memorySummary = await prepareMemorySummary(this.options.memorySummaryReminder, initialHookInput, lightweightMode);
-        const backgroundReminder = await this.options.backgroundCadenceReminder?.prepare({
-            hookInput: initialHookInput,
-            loadFacts: preparedExecution.loadBackgroundReminder,
-            hasSuccessfulTaskOutputRead: () => readTaskOutputTaskIds.size > 0,
+        const suppressExecutionReminders = this.options.suppressExecutionReminders?.(input.session, input.preparation.agentConfig) ===
+            true;
+        const reminders = await prepareTurnReminders({
+            options: this.options,
+            background: {
+                hookInput: initialHookInput,
+                loadFacts: preparedExecution.loadBackgroundReminder,
+                hasSuccessfulTaskOutputRead: () => readTaskOutputTaskIds.size > 0,
+            },
+            lightweightMode,
+            suppressed: suppressExecutionReminders,
+            executionDeadlineAtMs: input.request.executionDeadlineAtMs,
         });
-        const beforeLlmCallHooks = await this.resolveBeforeLlmCallHooks(input, withPtcCompactionReminder(createPtcTurnCompactionReminder(input, this.options), afterCompactionReminderHooks(memorySummary.hooks, createExecutionBudgetReminder(input.request.executionDeadlineAtMs, this.options.nowMs, this.options.canAppendExecutionBudgetReminder, this.options.logger), backgroundReminder?.hook)));
+        // Request-only; its initial-phase hook runs after every placing reminder (see
+        // ToolSearchContextHooks); the shared-prefix checkpoint repeats it with the PTC
+        // reminder copy (`projectTurnRequestContext`). Lightweight: no tools, no catalog.
+        const toolSearchContext = toolSearchContextHooks(createToolSearchContextHook({
+            tools: lightweightMode ? [] : input.assembly.tools,
+            sessionId: input.lease.sessionId,
+            logger: this.options.logger,
+            canAppend: this.options.canAppendExecutionBudgetReminder,
+        }));
+        const beforeLlmCallHooks = await this.resolveBeforeLlmCallHooks(input, withPtcCompactionReminder(createPtcTurnCompactionReminder(input, this.options), 
+        // Tool Search's iteration hook only rewrites the request and goes first.
+        [toolSearchContext.iteration, ...reminders.hooks]), suppressExecutionReminders, toolSearchContext.initial);
         validateResolvedInput({
             input,
             llm,
@@ -440,8 +503,9 @@ export class LocalRuntimeTurnExecutor {
             userMessage,
             history,
             beforeUserMessages: [
-                ...memorySummary.beforeUserMessages,
-                ...(backgroundReminder?.beforeUserMessages ?? []),
+                ...reminders.beforeUserMessages,
+                // Right before the Turn's first user or event message (spec 9.1).
+                ...deltaBlocks,
                 ...beforeBatchMessages,
             ],
             tools,
@@ -449,12 +513,12 @@ export class LocalRuntimeTurnExecutor {
             toolResolution,
             toolContext,
             beforeLlmCallHooks,
+            // The window and notice the Turn planned take effect once a request is answered.
+            afterLlmCallHooks: [createToolSearchResponseHook({ sessionId: input.lease.sessionId })],
             caller,
-            ...(lightweightMode
-                ? {
-                    unexpectedToolCallFallback: LIGHTWEIGHT_TOOL_CALL_FALLBACK,
-                }
-                : {}),
+            ...agentKindField(preparedExecution.agentKind),
+            ...wakeField(preparedExecution.wake),
+            ...lightweightToolCallFallback(lightweightMode),
             ...(contextUsagePromptRanges !== undefined
                 ? {
                     contextUsagePromptRanges,
@@ -462,11 +526,14 @@ export class LocalRuntimeTurnExecutor {
                 }
                 : {}),
             readTaskOutputTaskIds,
+            savedPtcScripts,
+            ptcObserver: ptc.context.ptcObserver,
             ptcFactCollector: ptc.ptcFactCollector,
             prepareSteering: preparedExecution.prepareSteering ?? preparePlainSteering,
+            stateLayerApplied: deltaBlocks.length > 0,
         };
     }
-    async resolveBeforeLlmCallHooks(input, afterCompactionHooks = []) {
+    async resolveBeforeLlmCallHooks(input, afterCompactionHooks, suppressExecutionReminders, lastHook) {
         return [
             ...((await this.options.resolveBeforeLlmCallHooks?.(input)) ?? []),
             ...(input.contextCompactionHook
@@ -474,6 +541,13 @@ export class LocalRuntimeTurnExecutor {
                 : []),
             ...afterCompactionHooks,
             ...(this.options.afterCompactionBeforeLlmCallHooks ?? []),
+            ...(suppressExecutionReminders ? [] : (this.options.genericExecutionReminderHooks ?? [])),
+            ...(input.assembly.reminders.some(({ reminder }) => reminder.requestOnly)
+                ? [
+                    createRequestOnlyReminderHook(renderAgentRuntimeReminders(input.assembly.reminders.filter(({ reminder }) => reminder.requestOnly))),
+                ]
+                : []),
+            ...(lastHook ? [lastHook] : []),
         ];
     }
     async beginFileChanges(input) {
@@ -605,34 +679,16 @@ async function cleanupPluginHookTranscriptBestEffort(cleanup) {
 function pluginHookTranscriptCleanup(writer) {
     return writer ? () => writer.cleanup() : undefined;
 }
-/** Lightweight mode drops memory from the provider context entirely. */
-async function prepareMemorySummary(reminder, hookInput, lightweightMode) {
-    if (lightweightMode || !reminder)
-        return { beforeUserMessages: [], hooks: [] };
-    return reminder.prepare({ hookInput });
-}
-/**
- * All reminders append durable hidden markers and `runBeforeLLM` accumulates
- * them, so none can starve another. The order fixes where the markers sit
- * relative to each other, identically in the request and in history: the
- * restored Memory summary comes first because it is context for everything
- * after it, and the budget admission measures the request before the
- * background marker is registered.
- */
-function afterCompactionReminderHooks(memorySummaryHooks, budgetReminder, backgroundReminder) {
-    return [
-        ...memorySummaryHooks,
-        ...(budgetReminder ? [budgetReminder] : []),
-        ...(backgroundReminder ? [backgroundReminder] : []),
-    ];
-}
+const lightweightToolCallFallback = (lightweightMode) => lightweightMode ? { unexpectedToolCallFallback: LIGHTWEIGHT_TOOL_CALL_FALLBACK } : {};
 function mergeHooks(options) {
-    const { input, toolResolution, pendingToolResultTailClaims, hostBeforeLlmCallHooks, readTaskOutputTaskIds, terminalTaskOutputReadIds, toolsDisabled, toolSafetyGuard, toolPolicyGuard, finalizeToolResultForHistory, ptcFactCollector, } = options;
+    const { input, toolResolution, pendingToolResultTailClaims, hostBeforeLlmCallHooks, hostAfterLlmCallHooks, readTaskOutputTaskIds, savedPtcScripts, ptcObserver, terminalTaskOutputReadIds, toolsDisabled, toolSafetyGuard, toolPolicyGuard, finalizeToolResultForHistory, ptcFactCollector, } = options;
     const toolHooks = createControlledToolHooks({
         input,
         permissionGuard: toolResolution.permissionGuard,
         pendingToolResultTailClaims,
         readTaskOutputTaskIds,
+        savedPtcScripts,
+        ptcObserver,
         terminalTaskOutputReadIds,
         toolsDisabled,
         toolSafetyGuard,
@@ -647,6 +703,8 @@ function mergeHooks(options) {
             ...(input.assembly.hooks.beforeLlmCallHook ?? []),
             ...hostBeforeLlmCallHooks,
         ],
+        // Host observers first: a later hook that rejects the response cannot hide that it arrived.
+        afterLlmCallHook: [...hostAfterLlmCallHooks, ...(input.assembly.hooks.afterLlmCallHook ?? [])],
         onHistoryChangedHook: [
             async (change) => {
                 await input.onHistoryChanged(change);
@@ -656,6 +714,19 @@ function mergeHooks(options) {
             ...(input.assembly.hooks.onHistoryChangedHook ?? []),
         ],
         onStepEndHook: input.assembly.hooks.onStepEndHook ?? [],
+        ...(input.mainRequestObserver
+            ? {
+                onLlmCallPreparedHook: [
+                    ...(input.assembly.hooks.onLlmCallPreparedHook ?? []),
+                    input.mainRequestObserver,
+                ],
+            }
+            : {}),
+        ...(input.turnFailureHook
+            ? {
+                turnFailureHook: [...(input.assembly.hooks.turnFailureHook ?? []), input.turnFailureHook],
+            }
+            : {}),
     };
 }
 function toRunnerLlmConfig(prepared) {
@@ -664,69 +735,6 @@ function toRunnerLlmConfig(prepared) {
         ...preparedLlm,
         ...(maxRequestBodyBytes === undefined ? {} : { maxSerializedInputBytes: maxRequestBodyBytes }),
     };
-}
-function validateRoutedTurnTools(tools) {
-    return tools.reduce((catalog, tool) => {
-        if (catalog.some((candidate) => candidate.def.name === tool.def.name)) {
-            throw new Error(`Duplicate tool name '${tool.def.name}' after v2 tool routing.`);
-        }
-        return [...catalog, tool];
-    }, []);
-}
-function validateOptions(options) {
-    assertAgentHostCapabilityAvailable('local-runtime-turn-runner', typeof options.runtime?.runTurn === 'function');
-    assertAgentHostCapabilityAvailable('turn-execution-preparation', typeof options.executionPreparation?.prepare === 'function');
-    assertAgentHostCapabilityAvailable('turn-file-change-lifecycle', [
-        options.fileChanges?.begin,
-        options.fileChanges?.finalize,
-        options.fileChanges?.markFailed,
-    ].every((operation) => typeof operation === 'function'));
-    if (Boolean(options.preparePluginHookSessionOwnership) !==
-        Boolean(options.activatePluginHookSessionOwnership)) {
-        throw new TypeError('Plugin Hook Session ownership preparation and activation must be paired.');
-    }
-}
-function validateResolvedInput(resolved) {
-    validateResolvedPrompt(resolved);
-    validateResolvedTools(resolved);
-    validateResolvedBeforeLlmCallHooks(resolved);
-}
-function validateResolvedBeforeLlmCallHooks(resolved) {
-    if (!Array.isArray(resolved.beforeLlmCallHooks) ||
-        resolved.beforeLlmCallHooks.some((hook) => typeof hook !== 'function')) {
-        throw new TypeError('Resolved host beforeLlmCall hooks are invalid.');
-    }
-}
-function validateResolvedPrompt(resolved) {
-    if (!resolved.llm?.model)
-        throw new TypeError('Resolved LLMModelConfig.model is required.');
-    if (typeof resolved.systemPrompt !== 'string') {
-        throw new TypeError('Resolved system prompt is invalid.');
-    }
-    if (typeof resolved.userMessage?.text !== 'string') {
-        throw new TypeError('Prepared user message is invalid.');
-    }
-    if (resolved.userMessage.attachments !== undefined &&
-        !Array.isArray(resolved.userMessage.attachments)) {
-        throw new TypeError('Prepared user message attachments are invalid.');
-    }
-}
-function validateResolvedTools(resolved) {
-    if (!resolved.tools?.context || typeof resolved.tools.permissionGuard !== 'function') {
-        throw new TypeError('Resolved host tool and permission context is invalid.');
-    }
-    if (resolved.toolContext.sessionId !== resolved.input.lease.sessionId) {
-        throw new AgentEventAssociationError('sessionId', resolved.input.lease.sessionId, resolved.toolContext.sessionId);
-    }
-    if (resolved.toolContext.turnId !== resolved.input.lease.turnId) {
-        throw new AgentEventAssociationError('turnId', resolved.input.lease.turnId, resolved.toolContext.turnId);
-    }
-}
-function preparePlainSteering(input) {
-    return Promise.resolve({
-        userMessage: { text: input.message.text },
-        genuineUserQueryText: input.genuineUserQueryText,
-    });
 }
 function createInitialHookInput(input) {
     const { llm } = input;
@@ -753,13 +761,5 @@ function createInitialHookInput(input) {
         signal: input.signal,
         eventWriter: input.eventWriter,
     };
-}
-function describeUnknownError(error) {
-    try {
-        return error instanceof Error ? error.message : String(error);
-    }
-    catch {
-        return 'unknown error';
-    }
 }
 //# sourceMappingURL=executor.js.map

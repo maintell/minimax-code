@@ -2,8 +2,19 @@ import { waitForRelease } from './wait-for-release.js';
 import { isHandedBackOnClose, isUserSteeringProducer, } from '../../agent-host/contracts.js';
 const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
 const DEFAULT_RENEWAL_INTERVAL_MS = 10_000;
+/** Turns ended by force whose late writes are still dropped; older ones have long stopped. */
+const MAX_FORCE_RELEASED_TURNS = 256;
+function publishActiveTurnCount(options, count) {
+    try {
+        options.onActiveTurnCountChanged?.(count);
+    }
+    catch {
+        // The observer is best-effort and must never change Turn behavior.
+    }
+}
 export function createTurnController(options) {
     const entries = new Map();
+    const forceReleased = new ForceReleasedTurns();
     const publishWait = options.onBackgroundTaskWaitChanged;
     const abortTimeoutMs = positiveInteger(options.abortTimeoutMs, DEFAULT_ABORT_TIMEOUT_MS);
     const renewalIntervalMs = positiveInteger(options.renewalIntervalMs, DEFAULT_RENEWAL_INTERVAL_MS);
@@ -15,6 +26,7 @@ export function createTurnController(options) {
         if (entries.size === 0 && pendingAdmissionCount === 0)
             idleDrain?.resolve();
     };
+    const releaseEntry = (entry) => release({ options, entries, publishWait, resolveIdleDrain }, entry);
     const beginDrain = () => {
         draining = true;
         idleDrain ??= deferred();
@@ -70,6 +82,7 @@ export function createTurnController(options) {
         };
         entry.renewalTimer.unref?.();
         entries.set(input.sessionId, entry);
+        publishActiveTurnCount(options, entries.size);
         clearBackgroundTaskWaitOnAbort(entry, abortController.signal, publishWait);
         const cancellationReason = options.onRegister?.(input.sessionId, input.turnId);
         if (cancellationReason !== undefined)
@@ -111,6 +124,7 @@ export function createTurnController(options) {
             },
             drainSteering: () => drainSteering(entries, lease),
             steeringSignal: () => matchingEntry(entries, lease)?.steeringWake.signal,
+            hasPendingUserSteering: () => holdsUserSteering(matchingEntry(entries, lease)),
             ackSteering: (messages) => ackSteering(entries, lease, messages),
             restoreSteering: (messages) => restoreSteering(entries, lease, messages, discardSteering),
             tryBeginClose: (closeOptions) => tryBeginClose(entries, lease, discardSteering, closeOptions),
@@ -172,29 +186,24 @@ export function createTurnController(options) {
                 ? { status: 'aborted', turnId: entry.turn.turnId }
                 : { status: 'abort-timeout', turnId: entry.turn.turnId };
         },
-        steerActiveTurn: (input) => steer(entries, input, 'ordinary'),
+        steerActiveTurn: (input) => steer(entries, input, 'ordinary', options.onSteeringAdmitted),
         steerToolResultTail: (input) => steer(entries, input, 'tool-result-tail'),
-        hasPendingUserSteering: (sessionId) => {
-            const entry = entries.get(sessionId);
-            if (!entry)
-                return false;
-            return entry.steering.some((message) => isUserSteeringProducer(message.producerId));
-        },
+        hasPendingUserSteering: (sessionId) => holdsUserSteering(entries.get(sessionId)),
         beginClose: (lease) => tryBeginClose(entries, lease, discardSteering),
         complete: (turn) => {
             const entry = matchingEntry(entries, turn);
-            if (!entry)
-                return;
-            setBackgroundTaskWaiting(entry, false, publishWait);
-            clearInterval(entry.renewalTimer);
-            entries.delete(turn.sessionId);
-            clearControl(entry);
-            // Synchronously, right after `entries.delete`: nothing can register the
-            // next Turn in between, so a listener sees the exact release moment.
-            notifyReleased(options, entry);
-            entry.resolveReleased();
-            resolveIdleDrain();
+            if (entry)
+                releaseEntry(entry);
         },
+        forceRelease: (sessionId, turnId) => {
+            const entry = entries.get(sessionId);
+            if (!entry || entry.turn.turnId !== turnId || !awaitsStop(entry))
+                return undefined;
+            forceReleased.add(sessionId, turnId);
+            releaseEntry(entry);
+            return entry.turn;
+        },
+        isForceReleased: (sessionId, turnId) => forceReleased.has(sessionId, turnId),
         activeTurnId: (sessionId) => entries.get(sessionId)?.turn.turnId,
         close: () => {
             if (closePromise)
@@ -210,6 +219,41 @@ export function createTurnController(options) {
             return closePromise;
         },
     };
+}
+/** Ends the Turn's ownership: completed, or ended by force. */
+function release(context, entry) {
+    setBackgroundTaskWaiting(entry, false, context.publishWait);
+    clearInterval(entry.renewalTimer);
+    context.entries.delete(entry.turn.sessionId);
+    clearControl(entry);
+    // Synchronously, right after `entries.delete`: nothing can register the
+    // next Turn in between, so a listener sees the exact release moment.
+    notifyReleased(context.options, entry);
+    entry.resolveReleased();
+    context.resolveIdleDrain();
+    publishActiveTurnCount(context.options, context.entries.size);
+}
+/** A Turn a stop was accepted for: aborted, or asked to stop while closing. */
+function awaitsStop(entry) {
+    return (entry.phase === 'aborted' || (entry.phase === 'closing' && entry.closeAbortRequested === true));
+}
+/** The Turns ended by force, newest kept; their late writes are dropped (context reset spec 3.2). */
+class ForceReleasedTurns {
+    keys = new Set();
+    add(sessionId, turnId) {
+        this.keys.add(forceReleaseKey(sessionId, turnId));
+        if (this.keys.size <= MAX_FORCE_RELEASED_TURNS)
+            return;
+        const oldest = this.keys.values().next().value;
+        if (oldest !== undefined)
+            this.keys.delete(oldest);
+    }
+    has(sessionId, turnId) {
+        return this.keys.has(forceReleaseKey(sessionId, turnId));
+    }
+}
+function forceReleaseKey(sessionId, turnId) {
+    return `${sessionId}\u0000${turnId}`;
 }
 function logRuntimeShutdown(options, active, shutdownAborts) {
     try {
@@ -274,7 +318,7 @@ async function drainActiveTurns(entries, timeoutMs) {
 async function entryDrain(entry) {
     await Promise.all([entry.released, entry.renewalTask ?? Promise.resolve()]);
 }
-function steer(entries, input, lane) {
+function steer(entries, input, lane, onAdmitted) {
     const entry = entries.get(input.sessionId);
     if (!entry)
         return Promise.resolve({ status: 'not-running' });
@@ -303,8 +347,19 @@ function steer(entries, input, lane) {
     const target = lane === 'ordinary' ? entry.steering : entry.toolResultTail;
     target.push(input.message);
     entry.steeringIdentities.add(identity);
+    notifySteeringAdmitted(onAdmitted, input);
     wakeOrdinarySteering(entry, lane);
     return Promise.resolve({ status: 'accepted', turnId: input.turnId });
+}
+function notifySteeringAdmitted(onAdmitted, input) {
+    if (!onAdmitted)
+        return;
+    try {
+        onAdmitted({ sessionId: input.sessionId, turnId: input.turnId, message: input.message });
+    }
+    catch {
+        // Observation never changes whether a steer is accepted.
+    }
 }
 /**
  * A closing Turn takes no steering. After a Stop continuation reopened it, user
@@ -334,6 +389,10 @@ function wakeOrdinarySteering(entry, lane) {
     const wake = entry.steeringWake;
     entry.steeringWake = new AbortController();
     wake.abort();
+}
+/** The wake fires for every ordinary producer; only user producers count as user steering. */
+function holdsUserSteering(entry) {
+    return entry?.steering.some((message) => isUserSteeringProducer(message.producerId)) ?? false;
 }
 function drainSteering(entries, lease) {
     const entry = matchingEntry(entries, lease);

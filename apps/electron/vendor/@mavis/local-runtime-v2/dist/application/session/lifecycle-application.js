@@ -6,7 +6,7 @@ import { AgentServiceError } from '../../service/agent/index.js';
 import { AppError } from '../errors.js';
 import { publishBestEffort } from '../events.js';
 import { countApplicationMetric } from './metrics.js';
-import { toSessionInfoView } from './wire.js';
+import { readSessionAssignments, toSessionInfoView } from './wire.js';
 const ARCHIVE_PLUGIN_HOOK_FOREGROUND_BUDGET_MS = 5_000;
 function publishModelUpdated(publish, session, replacedFrom) {
     const model = toSessionInfoView(session).model;
@@ -143,7 +143,10 @@ export class SessionLifecycleApplication {
             ...whenDefined('title', req.title),
             ...whenDefined('memoryPolicy', req.memoryPolicy),
         }));
-        return { session: toSessionInfoView(updated) };
+        const assignments = await readSessionAssignments(this.options.assignments, [updated]);
+        return {
+            session: toSessionInfoView(updated, undefined, assignments.get(updated.sessionId)),
+        };
     }
     async deleteSession(_context, req) {
         return this.withSessionLifecycle('delete', async () => {
@@ -163,6 +166,13 @@ export class SessionLifecycleApplication {
     }
     async archiveSessionWithinMaintenance(sessionId, lane) {
         await this.setArchived(sessionId, true, lane);
+    }
+    /** Owner workflows may remove internal Sessions from ordinary task discovery. */
+    async hideSessionById(sessionId) {
+        await this.invoke(() => this.options.lifecycle.mutateSession(sessionId, { visibility: 'hidden' }));
+    }
+    async showSessionById(sessionId) {
+        await this.invoke(() => this.options.lifecycle.mutateSession(sessionId, { visibility: 'visible' }));
     }
     async deleteSessionById(sessionId) {
         await this.options.assertSessionDeletionAllowed?.(sessionId);

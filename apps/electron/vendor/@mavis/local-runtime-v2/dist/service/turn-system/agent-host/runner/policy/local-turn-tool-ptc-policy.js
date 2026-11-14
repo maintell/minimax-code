@@ -1,7 +1,14 @@
-import { getMcpInvokeRegistries, isPtcMavisDirectCommand, ptcMavisChildToolName, ptcMavisRunCodeCall, resolveMcpInvokeTarget, } from '@mavis/agent-tools';
+import { createMcpInvokeTool, getMcpInvokeRegistries, isPtcMavisDirectCommand, ptcMavisChildToolName, ptcMavisRunCodeCall, resolveMcpInvokeTarget, } from '@mavis/agent-tools';
 const PTC_DIRECT_ONLY_TOOL_NAMES = new Set([
     'ask_user',
+    // Bunny's user channel: the display projection rewrites its top-level calls,
+    // so it can never be a run_code child.
+    'send_to_user',
+    // Bunny's ledger writes stay top-level calls in history, like its other product writers.
+    'working_state',
     'request_feature_enable',
+    // Creates an inline card anchored to the assistant reply; never from inside run_code.
+    'request_plugin',
     'EnterPlanMode',
     'ExitPlanMode',
     'create_goal',
@@ -16,7 +23,11 @@ const PTC_DIRECT_ONLY_TOOL_NAMES = new Set([
     'task',
     'task_append',
     'code_review',
+    // Forwards the whole conversation to another model; a program has nothing to pass it.
+    'advisor',
     'run_code',
+    // Ends the Turn through ToolResult.terminate, which a run_code child cannot pass on.
+    'wrap_up',
 ]);
 export function isPtcDirectTool(tool) {
     if (tool.def.name === 'mcp_invoke')
@@ -75,7 +86,7 @@ export function evaluatePtcChildToolPolicy(input) {
         return { block: true, reason: 'PTC could not resolve the requested tool in this turn.' };
     }
     if (!input.context.parentToolCallId)
-        return evaluatePtcDirectToolPolicy(resolved);
+        return evaluatePtcDirectToolPolicy(resolved, input.ptcChildTools);
     return evaluatePtcChildTargetPolicy(resolved);
 }
 function evaluatePtcChildTargetPolicy(resolved) {
@@ -91,12 +102,14 @@ function evaluatePtcChildTargetPolicy(resolved) {
     }
     return undefined;
 }
-function evaluatePtcDirectToolPolicy(resolved) {
+function evaluatePtcDirectToolPolicy(resolved, ptcChildTools) {
     if (resolved.name === 'mavis') {
         // The top-level mavis of a PTC Turn lists only agent create, session send
-        // and their help; the refusal names the run_code tool the model needs.
+        // and their help; the refusal names the run_code tool the model needs. A
+        // command this Turn's run_code has no tool for reaches mavis, which answers
+        // it (the coordinator's session interrupt gets the assignment tool to use).
         const child = ptcMavisChildToolName(mavisCommand(resolved.args));
-        return child
+        return child && ptcChildTools.some((tool) => tool.def.name === child)
             ? {
                 block: true,
                 reason: `This mavis command runs inside run_code in a PTC turn: ${ptcMavisRunCodeCall(child)}.`,
@@ -127,7 +140,7 @@ function hasPtcDirectMcpTarget(gateway) {
     return targets.some(isPtcDirectMcpTarget);
 }
 /** An mcp_invoke target that a PTC Turn keeps behind the top-level gateway, never in run_code. */
-export function isPtcDirectMcpTarget(target) {
+function isPtcDirectMcpTarget(target) {
     return target.def.name === 'mavis' || !isPtcChildTool(target);
 }
 function resolveEffectivePtcTarget(input) {
@@ -168,5 +181,100 @@ function recordValue(value) {
 }
 function mavisCommand(value) {
     return recordValue(value).command;
+}
+/**
+ * Tool Search's result decides the long tail; no PTC-specific rule is added.
+ * After buildToolLoadingCatalog the mcp_invoke name registry holds exactly
+ * this Turn's deferred tools: MCP and App tools plus on-demand built-ins (cron_*).
+ * Inside a program a name-routed gateway is a needless hop, so every target
+ * that is an ordinary PTC child becomes a run_code child of its own, with its
+ * own schema, permission source and hooks. mcp_invoke stays only for what it
+ * still routes, unchanged: Plugin Skill `tool_ref` references and targets
+ * that are not PTC children. With neither, the gateway is removed.
+ *
+ * Tool loading now attaches an empty gateway to every Turn. When nothing moves
+ * (no deferral this Turn) that gateway has no reason on a PTC Turn either and
+ * is removed, so run_code gains no `tools.mcp_invoke`. The one exception is
+ * the gateway the Host reserves (`reservedByHost`, Desktop): it was on every
+ * Desktop Turn before tool loading and stays a run_code child as it was.
+ */
+export function splitPtcOnDemandTools(tools, reservedByHost) {
+    const gateway = tools.find((tool) => tool.def.name === 'mcp_invoke');
+    const registries = gateway ? getMcpInvokeRegistries(gateway) : undefined;
+    if (!gateway || !registries)
+        return { tools, callable: [], nameConflicts: 0 };
+    const listedNames = new Set(tools.filter((tool) => tool !== gateway).map((tool) => tool.def.name));
+    const { callable, kept, nameConflicts } = partitionGatewayTargets(registries.registry, listedNames);
+    const routesSomething = kept.size > 0 || registries.referenceRegistry.size > 0;
+    if (callable.length === 0 && (reservedByHost || routesSomething)) {
+        return {
+            tools,
+            callable,
+            nameConflicts,
+            ...(routesSomething ? {} : { hostReservedOnly: true }),
+        };
+    }
+    const narrowed = narrowedGateway(gateway, kept, registries.referenceRegistry);
+    return {
+        tools: tools.flatMap((tool) => {
+            if (tool !== gateway)
+                return [tool];
+            return narrowed ? [narrowed] : [];
+        }),
+        callable,
+        nameConflicts,
+    };
+}
+function partitionGatewayTargets(registry, listedNames) {
+    const callable = [];
+    const kept = new Map();
+    let nameConflicts = 0;
+    for (const [name, target] of registry) {
+        if (isPtcDirectMcpTarget(target)) {
+            kept.set(name, target);
+        }
+        else if (listedNames.has(target.def.name)) {
+            // run_code exposes one function per name; a second one would break the
+            // guest setup, so this target keeps today's mcp_invoke route.
+            kept.set(name, target);
+            nameConflicts += 1;
+        }
+        else {
+            callable.push(target);
+        }
+    }
+    return { callable, kept, nameConflicts };
+}
+/** The gateway for what it still routes, unchanged; undefined when nothing is left. */
+function narrowedGateway(gateway, kept, references) {
+    if (kept.size === 0 && references.size === 0)
+        return undefined;
+    return {
+        ...createMcpInvokeTool(kept, references),
+        ...(gateway.toolCallProvenanceResolver
+            ? { toolCallProvenanceResolver: gateway.toolCallProvenanceResolver }
+            : {}),
+    };
+}
+/** Counts and booleans only: no tool names, arguments or schemas. */
+export function logPtcOnDemandTools(input, split) {
+    const gateway = split.tools.find((tool) => tool.def.name === 'mcp_invoke');
+    const references = gateway ? getMcpInvokeRegistries(gateway)?.referenceRegistry : undefined;
+    try {
+        input.logger?.info?.({
+            session_id: input.sessionId,
+            callable_mcp_tools: split.callable.filter((tool) => tool.source === 'configured').length,
+            callable_builtin_tools: split.callable.filter((tool) => tool.source !== 'configured')
+                .length,
+            mcp_invoke_kept: gateway !== undefined,
+            mcp_invoke_tool_ref: (references?.size ?? 0) > 0,
+            mcp_invoke_direct_target: gateway ? isPtcDirectTool(gateway) : false,
+            ...(split.nameConflicts > 0 ? { name_conflicts: split.nameConflicts } : {}),
+            ...(split.hostReservedOnly ? { mcp_invoke_host_reserved: true } : {}),
+        }, 'ptc on-demand tools resolved');
+    }
+    catch {
+        // Diagnostics must not affect the Turn.
+    }
 }
 //# sourceMappingURL=local-turn-tool-ptc-policy.js.map

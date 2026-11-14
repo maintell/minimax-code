@@ -110,6 +110,7 @@ export let IPC_CHANNELS = {
     SYSTEM_SHOW_IMAGE_CONTEXT_MENU: 'system:show-image-context-menu',
     SYSTEM_GET_HOME_PATH: 'system:get-home-path',
     SYSTEM_GET_APP_INSTALL_DIR: 'system:get-app-install-dir',
+    SYSTEM_GET_HARDWARE_INFO: 'system:get-hardware-info',
     SYSTEM_GET_APP_VERSION_SYNC: 'system:get-app-version-sync',
     // 窗口控制
     WINDOW_MINIMIZE: 'window:minimize',
@@ -194,7 +195,6 @@ export let IPC_CHANNELS = {
     DESKTOP_SET_RUN_ON_STARTUP: 'desktop:set-run-on-startup',
     DESKTOP_GET_RUN_ON_STARTUP: 'desktop:get-run-on-startup',
     DESKTOP_SET_KEEP_AWAKE: 'desktop:set-keep-awake',
-    DESKTOP_GET_KEEP_AWAKE: 'desktop:get-keep-awake',
     DESKTOP_SET_FILE_OPEN_WITH_ENHANCED: 'desktop:set-file-open-with-enhanced',
     DESKTOP_GET_FILE_OPEN_WITH_ENHANCED: 'desktop:get-file-open-with-enhanced',
     DESKTOP_START_COMPUTER_USE_RUNTIME: 'desktop:start-computer-use-runtime',
@@ -267,6 +267,11 @@ export let IPC_CHANNELS = {
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
+    MINIAPP_WIDGET: 'miniapp:widget',
+    MINIAPP_PREVIEW: 'miniapp:preview',
+    MINIAPP_PREVIEW_CACHE: 'miniapp:preview-cache',
+    MINIAPP_PREVIEW_CAPTURED: 'miniapp:preview-captured',
+    MINIAPP_PRESENTATION_CHANGED: 'miniapp:presentation-changed',
     MINIAPP_REFRESH: 'miniapp:refresh',
     MINIAPP_STOP: 'miniapp:stop',
     MINIAPP_CLOSE: 'miniapp:close',
@@ -379,6 +384,7 @@ export let IPC_CHANNELS = {
     OBSERVABILITY_ACK_OUTBOX: 'observability:ack-outbox',
     OBSERVABILITY_OUTBOX_EVENT: 'observability:outbox-event',
     OBSERVABILITY_STARTUP_MILESTONE: 'observability:startup-milestone',
+    OBSERVABILITY_REPORT_METRICS: 'observability:report-metrics',
     // Versioned document preview source and backend bridge
     DOCUMENT_PREVIEW_OPEN_SOURCE: 'document-preview:open-source',
     DOCUMENT_PREVIEW_SAVE_PPTX_NOTES: 'document-preview:save-pptx-notes',
@@ -415,6 +421,7 @@ export let IPC_CHANNELS = {
     PPT_PREVIEW_GET_DEBUG_STATE: 'ppt-preview:get-debug-state',
     PPT_PREVIEW_SELECTION_BRIDGE_EVENT: 'ppt-preview:selection-bridge-event',
     PPT_PREVIEW_SELECTION_EVENT: 'ppt-preview:selection-event',
+    PPT_PREVIEW_SELECTION_INTENT_EVENT: 'ppt-preview:selection-intent-event',
     PPT_PREVIEW_DESTROY: 'ppt-preview:destroy',
     // Runtime lifecycle.
     RUNTIME_READY: 'runtime:ready',
@@ -422,7 +429,9 @@ export let IPC_CHANNELS = {
     RUNTIME_CHECK_READY: 'runtime:check-ready',
     RUNTIME_SET_RUNAWAY_GUARD_CONFIG: 'runtime:set-runaway-guard-config',
     RUNTIME_SET_PROMPT_SUGGESTION_POLICY: 'runtime:set-prompt-suggestion-policy',
+    RUNTIME_SET_BUNNY_POLICY: 'runtime:set-bunny-policy',
     RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG: 'runtime:set-tool-result-compaction-config',
+    RUNTIME_SET_BUNNY_CONTEXT_CONFIG: 'runtime:set-bunny-context-config',
     RUNTIME_SET_COLLECTION_POLICY_CONFIG: 'runtime:set-collection-policy-config',
     // Always-on Electron utility-process runtime transport.
     RUNTIME_TRANSPORT_REQUEST_PORT: 'runtime:transport-request-port',

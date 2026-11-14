@@ -2,14 +2,14 @@
  * Cloud-runtime office file direct-edit guard.
  *
  * Throws `OfficeGuardError` when a tool tries to Read/Write/Edit Office files
- * directly. The error message routes the agent to the matching
- * `{pdf,docx,xlsx,pptx}` skill.
+ * directly. The error message routes the agent to the matching official
+ * Office plugin skill (`pdf:pdf` / `word:docx` / `excel:xlsx` / `ppt:pptx`).
  *
  * Scope (Office 4 件套):
- *   - .pdf                          → pdf
- *   - .doc / .docx / .docm           → docx
- *   - .xlsx / .xlsm / .xlsb / .xls   → xlsx
- *   - .pptx / .pptm / .ppt           → pptx
+ *   - .pdf                          → pdf:pdf
+ *   - .doc / .docx / .docm           → word:docx
+ *   - .xlsx / .xlsm / .xlsb / .xls   → excel:xlsx
+ *   - .pptx / .pptm / .ppt           → ppt:pptx
  *
  * Out of scope (intentionally allowed through):
  *   - .csv / .tsv (plain text, not Office)
@@ -62,18 +62,26 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HookEvent } from '@mavis/protocol';
 /**
- * Single source of truth for the office skill names exposed across:
- *  - office-guard deny-message routing (this file)
- *  - publish-cloud-skill.ts SKILL_NAMES (CLI + tar archive)
- *  - UI `DAEMON_BUILTIN_SKILL_NAMES` allowlists
- *
- * Renaming any one entry requires updating consumers above plus the daemon
- * skill directories, overlay directories, SKILL.md frontmatter `name:`
- * fields, docx-skill-env-gate.ts whitelist, and the archon-server
- * `builtin_skills` table — see
- * `packages/cloud-runtime/skill-overlays/README.md` §"If you must rename".
+ * Model-facing runtime names of the official Office plugin skills
+ * (`<plugin>:<skill>`, see `buildPluginSkillRuntimeName`). The Office
+ * skills used to be hosted builtin skills named `pdf` / `docx` / `xlsx` /
+ * `pptx`; they now ship as the default-installed Word / Excel / PDF / PPT
+ * marketplace plugins, so deny messages must point at the plugin names.
+ * Keep this in sync with the official marketplace entries and the catalog
+ * tier list in `@mavis/context-manager` `skill-catalog.ts`.
  */
-export const OFFICE_SKILL_NAMES = ['pdf', 'docx', 'xlsx', 'pptx'];
+export const OFFICE_SKILL_BY_KIND = {
+    pdf: 'pdf:pdf',
+    docx: 'word:docx',
+    xlsx: 'excel:xlsx',
+    pptx: 'ppt:pptx',
+};
+export const OFFICE_SKILL_NAMES = [
+    OFFICE_SKILL_BY_KIND.pdf,
+    OFFICE_SKILL_BY_KIND.docx,
+    OFFICE_SKILL_BY_KIND.xlsx,
+    OFFICE_SKILL_BY_KIND.pptx,
+];
 /** Aligned with pdf SKILL.md operational rule §2 (>20 pages → locate-first mandatory). */
 export const PDF_PAGE_BLOCK_THRESHOLD = 20;
 /** Cap how many bytes are scanned from the head of the PDF when probing page count. */
@@ -107,16 +115,40 @@ export function resolveOfficeHit(filePath) {
     const local = normalizeFilePath(filePath);
     const ext = path.extname(local).toLowerCase();
     if (PDF_EXTENSIONS.has(ext)) {
-        return { filePath, localFilePath: local, ext, kind: 'pdf', skillName: 'pdf' };
+        return {
+            filePath,
+            localFilePath: local,
+            ext,
+            kind: 'pdf',
+            skillName: OFFICE_SKILL_BY_KIND.pdf,
+        };
     }
     if (DOCX_EXTENSIONS.has(ext)) {
-        return { filePath, localFilePath: local, ext, kind: 'docx', skillName: 'docx' };
+        return {
+            filePath,
+            localFilePath: local,
+            ext,
+            kind: 'docx',
+            skillName: OFFICE_SKILL_BY_KIND.docx,
+        };
     }
     if (XLSX_EXTENSIONS.has(ext)) {
-        return { filePath, localFilePath: local, ext, kind: 'xlsx', skillName: 'xlsx' };
+        return {
+            filePath,
+            localFilePath: local,
+            ext,
+            kind: 'xlsx',
+            skillName: OFFICE_SKILL_BY_KIND.xlsx,
+        };
     }
     if (PPTX_EXTENSIONS.has(ext)) {
-        return { filePath, localFilePath: local, ext, kind: 'pptx', skillName: 'pptx' };
+        return {
+            filePath,
+            localFilePath: local,
+            ext,
+            kind: 'pptx',
+            skillName: OFFICE_SKILL_BY_KIND.pptx,
+        };
     }
     return null;
 }
@@ -182,33 +214,33 @@ export class OfficeGuardError extends Error {
 }
 function buildPdfReadAbortReason(filePath, pages) {
     return (`Direct Read on large PDFs is forbidden. ` +
-        `${filePath} has ~${pages} pages (>${PDF_PAGE_BLOCK_THRESHOLD}); use the 'pdf' skill instead. ` +
+        `${filePath} has ~${pages} pages (>${PDF_PAGE_BLOCK_THRESHOLD}); use the '${OFFICE_SKILL_BY_KIND.pdf}' skill instead. ` +
         `Locate-first is mandatory at this size: build a heading index (pypdf outline → printed TOC → keyword grep), ` +
         `then extract the matching pages. See pdf SKILL.md operational rule §2 / docs/read-guide.md §3.`);
 }
 function buildPdfWriteAbortReason(filePath, tool) {
     return (`Direct ${tool} on PDF files is forbidden. ` +
         `${filePath} is a binary container — it cannot be hand-edited as text. ` +
-        `Use the 'pdf' skill: REFORMAT (markdown→pdf), CREATE (HTML→pdf), FILL (forms), or MUTATE (qpdf/pypdf cookbook). ` +
+        `Use the '${OFFICE_SKILL_BY_KIND.pdf}' skill: REFORMAT (markdown→pdf), CREATE (HTML→pdf), FILL (forms), or MUTATE (qpdf/pypdf cookbook). ` +
         `See pdf SKILL.md route table.`);
 }
 function buildDocxAbortReason(filePath, tool) {
     return (`Direct ${tool} on DOC/DOCX files is forbidden. ` +
         `${filePath} is an OOXML zip archive — Read/Write/Edit silently corrupts content controls, styles, and numbering. ` +
-        `Use the 'docx' skill scripts (read / diff / render / full) instead. ` +
+        `Use the '${OFFICE_SKILL_BY_KIND.docx}' skill scripts (read / diff / render / full) instead. ` +
         `See docx SKILL.md routes.`);
 }
 function buildXlsxAbortReason(filePath, tool) {
     return (`Direct ${tool} on XLSX/XLS files is forbidden. ` +
         `${filePath} is an OOXML zip (or BIFF binary) — Read/Write/Edit silently corrupts formulas, named ranges, ` +
-        `pivot tables, slicers, and number formats. Use the 'xlsx' skill: pandas + openpyxl for read/write, ` +
+        `pivot tables, slicers, and number formats. Use the '${OFFICE_SKILL_BY_KIND.xlsx}' skill: pandas + openpyxl for read/write, ` +
         `scripts/recalc.py for formula evaluation, and SKILL.md §3-§5 for the formula-first convention. ` +
         `See xlsx SKILL.md.`);
 }
 function buildPptxAbortReason(filePath, tool) {
     return (`Direct ${tool} on PPTX/PPT files is forbidden. ` +
         `${filePath} is an OOXML zip — Read/Write/Edit silently corrupts slide masters, layouts, theme colors, ` +
-        `and embedded shapes/charts. Use the 'pptx' skill: extract_pptx.py / audit_pptx.py for inspection, ` +
+        `and embedded shapes/charts. Use the '${OFFICE_SKILL_BY_KIND.pptx}' skill: extract_pptx.py / audit_pptx.py for inspection, ` +
         `PptxGenJS for generation, and SKILL.md template imitation workflow for style preservation. ` +
         `See pptx SKILL.md.`);
 }
@@ -279,19 +311,19 @@ export function assertOfficeGuard(tool, filePath, localFilePath = filePath, opti
             const probe = options.countPdfPages ?? countPdfPagesSync;
             const pages = probe(localFilePath);
             if (pages !== null && pages > PDF_PAGE_BLOCK_THRESHOLD) {
-                throw new OfficeGuardError(filePath, 'pdf', 'pdf', tool, buildPdfReadAbortReason(filePath, pages));
+                throw new OfficeGuardError(filePath, 'pdf', OFFICE_SKILL_BY_KIND.pdf, tool, buildPdfReadAbortReason(filePath, pages));
             }
             return;
         }
-        throw new OfficeGuardError(filePath, 'pdf', 'pdf', tool, buildPdfWriteAbortReason(filePath, tool));
+        throw new OfficeGuardError(filePath, 'pdf', OFFICE_SKILL_BY_KIND.pdf, tool, buildPdfWriteAbortReason(filePath, tool));
     }
     if (hit.kind === 'docx') {
-        throw new OfficeGuardError(filePath, 'docx', 'docx', tool, buildDocxAbortReason(filePath, tool));
+        throw new OfficeGuardError(filePath, 'docx', OFFICE_SKILL_BY_KIND.docx, tool, buildDocxAbortReason(filePath, tool));
     }
     if (hit.kind === 'xlsx') {
-        throw new OfficeGuardError(filePath, 'xlsx', 'xlsx', tool, buildXlsxAbortReason(filePath, tool));
+        throw new OfficeGuardError(filePath, 'xlsx', OFFICE_SKILL_BY_KIND.xlsx, tool, buildXlsxAbortReason(filePath, tool));
     }
     // pptx — exhaustive switch over OfficeKind.
-    throw new OfficeGuardError(filePath, 'pptx', 'pptx', tool, buildPptxAbortReason(filePath, tool));
+    throw new OfficeGuardError(filePath, 'pptx', OFFICE_SKILL_BY_KIND.pptx, tool, buildPptxAbortReason(filePath, tool));
 }
 //# sourceMappingURL=office-guard.js.map

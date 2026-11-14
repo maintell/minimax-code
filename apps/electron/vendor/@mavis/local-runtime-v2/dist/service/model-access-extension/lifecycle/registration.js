@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { desktopVersionSatisfies } from '@minimax/model-access-sdk';
-import { assertPackageNamespace, ModelAccessPackageError } from '../errors.js';
+import { ModelAccessPackageError } from '../errors.js';
 import { keptDigestOf } from '../installation/user-packages.js';
 import { modelAccessSnapshotPath, previewLocalModelAccessPackage, } from '../package-snapshot.adapter.js';
 function assertHostVersion(manifest, hostVersion) {
@@ -35,7 +35,6 @@ export async function validateModelAccessSnapshot(options, item, digest, credent
 export function assertRegistrable(manifest, trustSource, options) {
     if (!manifest.platforms.includes(options.platform))
         throw new ModelAccessPackageError('unsupported_platform');
-    assertPackageNamespace(manifest.name, trustSource);
     assertHostVersion(manifest, options.hostVersion);
 }
 /** New content for an existing installation, trusted and staged for the next activation. */

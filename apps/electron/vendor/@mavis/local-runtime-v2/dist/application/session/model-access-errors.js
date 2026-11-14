@@ -17,7 +17,6 @@ const ERROR_STATUS = {
         'incompatible_sdk',
         'invalid_handlers',
     ]),
-    ...codes(400, ['package_name_reserved']),
     ...codes(404, ['dev_session_missing', 'dev_request_missing']),
     ...codes(409, ['package_name_taken']),
     ...codes(403, [

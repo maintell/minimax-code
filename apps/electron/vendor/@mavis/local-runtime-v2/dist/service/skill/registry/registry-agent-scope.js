@@ -20,4 +20,21 @@ export function createAgentResourceScopeReader(dataDir) {
         }
     };
 }
+/**
+ * The configured roots minus the ones a single Agent owns: its
+ * `agents/<name>/skills` directory and the builtin roots scoped to that Agent.
+ *
+ * One definition of the registry's `excludeAgentResources` filter, so every
+ * reader that resolves its own roots answers the same question the same way.
+ * PTC's script roots are the second reader
+ * (`application/session/ptc-script-skill-roots.ts`); when the two drift,
+ * `run_code` keeps importing an Agent's private scripts that the `skill` tool
+ * already refuses.
+ *
+ * The constraint is the two fields the rule reads, so the element type the
+ * caller passes survives the filter.
+ */
+export function withoutAgentResourceRoots(roots) {
+    return roots.filter((root) => root.kind !== 'agent' && !(root.kind === 'builtin' && root.scope));
+}
 //# sourceMappingURL=registry-agent-scope.js.map

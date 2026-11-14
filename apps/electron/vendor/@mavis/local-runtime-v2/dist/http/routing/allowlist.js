@@ -4,10 +4,38 @@
  * 单位为契约 `tsName`，参见设计 D3。
  */
 const ALWAYS_MOUNTED_METHODS = new Set([
+    'suggestMiniAppCreationIdeas',
+    'startMiniAppCreation',
+    'stopMiniAppCreation',
+    'removeMiniAppCreation',
+    'maintainMiniAppCreation',
+    'listMiniAppLaunchpad',
+    'ensureMiniAppHostSession',
+    'getMiniAppCreation',
     'ping',
     'getEcho',
     'getPathEcho',
     'streamEcho',
+]);
+/** Bunny routes mount only where the host composed the Bunny owner. */
+const BUNNY_METHODS = new Set([
+    'ensureBunny',
+    'resetBunny',
+    'listBunnyBackups',
+    'restoreBunnyBackup',
+    'reportBunnyViewState',
+    'listAgentAssignments',
+    'setAssignmentCompletion',
+    'setBunnyPermissionMode',
+    'setBunnyTaskModel',
+    'listWorkingStateEntries',
+    'addWorkingStateEntry',
+    'updateWorkingStateEntry',
+    'closeWorkingStateEntry',
+    'confirmWorkingStateEntry',
+    'listBunnyTraceEvents',
+    'listBunnyTaskTelemetry',
+    'ackBunnyTaskTelemetry',
 ]);
 const AGENT_OWNER_METHODS = new Set([
     'listAgents',
@@ -124,6 +152,7 @@ const PLUGIN_SERVICE_METHODS = new Set([
 const MODEL_PROVIDER_METHODS = new Set([
     'listModels',
     'selectModel',
+    'selectAdvisorModel',
     'listModelProviders',
     'listUserModelProviders',
     'revealModelProviderApiKey',
@@ -335,6 +364,7 @@ const OWNER_METHOD_GROUPS = {
     channel: CHANNEL_OWNER_METHODS,
     memoryV2: MEMORY_V2_METHODS,
     goal: GOAL_OWNER_METHODS,
+    bunny: BUNNY_METHODS,
     sessionActivity: SESSION_ACTIVITY_METHODS,
 };
 /** Worktree routes are always owned by the V2 front door and never fall through. */
@@ -420,6 +450,14 @@ const SESSION_APPLICATION_METHODS = new Set([
     'revertTurnDiff',
     'reapplyTurnDiff',
     'listSessionFiles',
+    'listArtifacts',
+    'saveArtifactSpace',
+    'getArtifactSpace',
+    'getArtifactSpaceContext',
+    'writeArtifactSpaceContext',
+    'linkArtifactSpaceSession',
+    'deleteArtifactSpace',
+    'importArtifact',
     'listSessionSourceHistory',
     'getSessionSourceDetail',
     'querySidebarProjects',

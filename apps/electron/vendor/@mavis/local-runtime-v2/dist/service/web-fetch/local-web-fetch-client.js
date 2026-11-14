@@ -16,7 +16,7 @@ export class LocalWebFetchClient {
         this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
         this.fetchImpl = options.fetchImpl ?? fetch;
     }
-    async fetch(input, signal) {
+    async fetch(_ctx, input, signal) {
         const url = normalizeHttpUrl(input.url);
         if (!url) {
             return failure('web_fetch only supports absolute http:// or https:// URLs.', {
@@ -50,7 +50,10 @@ async function readFetchResponse(res, method, url, maxBytes) {
     const retryAfter = res.headers.get('retry-after') ?? undefined;
     if (method !== 'HEAD' && !isTextLikeContentType(contentType)) {
         return failure(`web_fetch received non-text content${contentType ? ` (${contentType})` : ''}.`, {
-            res, contentType, retrievalOutcome: 'non_text', retryAfter,
+            res,
+            contentType,
+            retrievalOutcome: 'non_text',
+            retryAfter,
         });
     }
     const body = method === 'HEAD'
@@ -109,8 +112,8 @@ function looksLikeLoginForm(status, attributes, body) {
     const hasIdentityInput = /<input\b[^>]*(?:\btype\s*=\s*["']?email\b|\bautocomplete\s*=\s*["']?(?:email|username)\b|\bname\s*=\s*["']?(?:email|username|user_name|login)\b)/iu.test(body);
     const hasLoginPurpose = /(?:\baction|\bid|\bclass|\bname)\s*=\s*["'][^"']*(?:log[ -]?in|sign[ -]?in|auth|oauth|session)[^"']*["']/iu.test(attributes) ||
         /\b(?:log[ -]?in|sign[ -]?in|continue with)\b/iu.test(visibleText(`${attributes} ${body}`));
-    return (hasPasswordInput && (hasLoginPurpose || status === 401)) ||
-        (hasIdentityInput && hasLoginPurpose);
+    return ((hasPasswordInput && (hasLoginPurpose || status === 401)) ||
+        (hasIdentityInput && hasLoginPurpose));
 }
 function looksLikeAccessChallenge(status, content) {
     const hasProviderChallengeMarker = /(?:\bcf-(?:challenge|chl|turnstile)|\/cdn-cgi\/challenge-platform\/|\bg-recaptcha\b|\bh-captcha\b|\bpx-captcha\b|\barkose(?:labs)?\b|\bdatadome\b|\bperimeterx\b|_Incapsula_Resource)/iu.test(content);

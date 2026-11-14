@@ -146,6 +146,7 @@ let LocalTaskTool = (() => {
                         ...(run.verification ? { verification: run.verification } : {}),
                         error_message: errorMessage,
                         ...(run.errorCode ? { error_code: run.errorCode } : {}),
+                        ...savedPtcScriptDetails(run),
                     },
                     isError: true,
                 };
@@ -166,6 +167,7 @@ let LocalTaskTool = (() => {
                     ...(run.resolvedAgentName ? { resolved_agent_name: run.resolvedAgentName } : {}),
                     ...(run.finalText !== undefined ? { final_text: run.finalText } : {}),
                     ...(run.verification ? { verification: run.verification } : {}),
+                    ...savedPtcScriptDetails(run),
                 },
             };
             return run.subSessionId
@@ -180,6 +182,20 @@ let LocalTaskTool = (() => {
     return LocalTaskTool = _classThis;
 })();
 export { LocalTaskTool };
+/**
+ * The scripts the child saved, for the parent Turn's save metric. A failed or
+ * aborted run carries them too: the files are already on disk.
+ */
+function savedPtcScriptDetails(run) {
+    return run.savedPtcScripts?.length
+        ? {
+            saved_ptc_scripts: run.savedPtcScripts.map((script) => ({
+                path: script.path,
+                scope: script.scope,
+            })),
+        }
+        : {};
+}
 /**
  * The first receipt carries both handles: `task_id` drives task_query /
  * task_output / task_stop, `session_id` drives session send.

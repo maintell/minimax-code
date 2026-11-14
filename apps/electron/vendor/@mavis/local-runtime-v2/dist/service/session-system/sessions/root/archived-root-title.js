@@ -2,6 +2,8 @@ const DEFAULT_ROOT_TITLE = 'Main';
 export const ARCHIVE_TITLE_RECENT_MESSAGE_LIMIT = 30;
 export const ARCHIVE_TITLE_PER_MESSAGE_CHAR_CAP = 500;
 export const ARCHIVE_TITLE_MAX_LEN = 12;
+/** Longest word tail kept past the limit; longer runs are cut at the limit instead. */
+const ARCHIVE_TITLE_WORD_OVERFLOW = 12;
 export const ARCHIVE_TITLE_TIMEOUT_MS = 15_000;
 export const ARCHIVE_TITLE_MAX_TOKENS = 1_024;
 const ARCHIVE_TITLE_SYSTEM_PROMPT_ZH = '你是一个对话主题概括助手。请阅读用户提供的对话片段，给出一个 4-12 个字的主题标题。' +
@@ -47,7 +49,20 @@ export function parseArchiveTitleVerdict(raw) {
         .replace(/[\r\n]+/gu, ' ')
         .replace(/\s+/gu, ' ')
         .trim();
-    return extracted ? Array.from(extracted).slice(0, ARCHIVE_TITLE_MAX_LEN).join('') : null;
+    if (!extracted)
+        return null;
+    const characters = Array.from(extracted);
+    if (characters.length <= ARCHIVE_TITLE_MAX_LEN)
+        return extracted;
+    let end = ARCHIVE_TITLE_MAX_LEN;
+    // Extend through an English word instead of cutting it in half, including long first words.
+    while (end < characters.length &&
+        /[\p{Script=Latin}\p{N}_'-]/u.test(characters[end - 1]) &&
+        /[\p{Script=Latin}\p{N}_'-]/u.test(characters[end]))
+        end++;
+    if (end - ARCHIVE_TITLE_MAX_LEN > ARCHIVE_TITLE_WORD_OVERFLOW)
+        end = ARCHIVE_TITLE_MAX_LEN;
+    return characters.slice(0, end).join('').trim();
 }
 export function isArchiveTitleFallback(input) {
     const title = input.title?.trim() ?? '';

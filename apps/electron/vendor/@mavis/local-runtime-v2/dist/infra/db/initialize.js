@@ -1,4 +1,5 @@
 import { DatabaseClient } from './client.js';
+import { openBunnyStoreLazily } from './bunny-store-open.js';
 import { createDatabaseBackupIfPending, pruneSupersededDatabaseBackups, } from './backup.js';
 import { runMigrations, runMigrationsWithRecovery, } from './migrate.js';
 import { ALL_MIGRATIONS } from './migrations.js';
@@ -17,6 +18,7 @@ import { recoverProjectPreferencesBeforeBackfill, recoverSessionProjectMetadataB
 // Startup reporting over the result belongs to the initializer's surface, so
 // the runtime composition root keeps depending on this module only.
 export { databaseInitializationTimingFields, migrationSafeModeWarning, } from './initialization-report.js';
+export { recordBunnyStoreOpenMetric } from './bunny-store-open.js';
 /**
  * The PRE_SESSION strict lanes (legacy cron copy, session backfill) cover the
  * catalog versions below this bound; later versions run in the main schema
@@ -390,8 +392,17 @@ export async function initializeRuntimeStorage(options) {
             dataDir: options.dataDir,
             onMigration: options.onMigration,
         });
+        // Bunny 的空间、任务、记忆游标和设置在独立库里，第一次用到时才打开（Bunny 打开或已有
+        // Bunny 数据时由装配在启动时打开），两库互不嵌套事务。打不开时只关掉 Bunny
+        // （unavailable 的内存空库），runtime 照常启动。
+        const bunnyStore = openBunnyStoreLazily({
+            dataDir: options.dataDir,
+            ...(options.sqlite3ModulePath ? { sqlite3ModulePath: options.sqlite3ModulePath } : {}),
+            ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+        });
         return {
             database,
+            bunnyStore,
             initialization,
             layoutMigration,
             resolveBashEnvPolicy: (nativeDelete) => resolveAgentBashEnvPolicy(options.dataDir, process.platform, nativeDelete),

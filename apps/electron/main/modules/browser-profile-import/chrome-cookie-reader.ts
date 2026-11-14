@@ -3,7 +3,8 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { decryptMacChromeCookie, decryptWindowsChromeCookie, normalizeChromeCookie } from "./chrome-cookie";
-import { MacSafeStorageAccessError, readMacChromeSafeStoragePassword, readWindowsChromeMasterKey, windowsDpapiUnprotect } from "./platform-crypto";
+import { AbeKeyError } from "./abe-key-provider";
+import { MacSafeStorageAccessError, WindowsDpapiError, readMacChromeSafeStoragePassword, readWindowsChromeMasterKey, windowsDpapiUnprotect } from "./platform-crypto";
 import { BrowserProfileImportFailure } from "./errors";
 const requireForMain = createRequire(__filename);
 const MAX_COOKIE_ROWS = 20000;
@@ -31,9 +32,30 @@ function macSafeStorageErrorCode(error) {
 function secretFailureReason(error) {
     if (error instanceof MacSafeStorageAccessError)
         return error.reason;
+    if (error instanceof AbeKeyError) {
+        switch (error.reason) {
+            case 'app_bound_key_absent':
+                return 'not_found';
+            case 'app_bound_key_malformed':
+            case 'envelope_invalid':
+                return 'invalid_key';
+            default:
+                return 'unavailable';
+        }
+    }
     if (error instanceof Error && error.message.includes('master key'))
         return 'invalid_key';
     return 'unavailable';
+}
+function secretFailureDetails(error) {
+    const abeReason = error instanceof AbeKeyError ? error.reason : undefined;
+    const underlying = error instanceof AbeKeyError && error.cause ? error.cause : error;
+    const dpapi = underlying instanceof WindowsDpapiError ? underlying : undefined;
+    return {
+        ...(abeReason ? { abeReason } : {}),
+        ...(dpapi?.exitCode !== undefined ? { exitCode: dpapi.exitCode } : {}),
+        ...(dpapi?.win32Code !== undefined ? { win32Code: dpapi.win32Code } : {}),
+    };
 }
 function errorField(error, field) {
     if (typeof error !== 'object' || error === null)
@@ -445,29 +467,57 @@ export async function readChromeCookies(profile, signal, options = {}) {
                     });
                 }
             }
-            if (platform === 'win32' &&
+            const hasWindowsMasterKeyRows = platform === 'win32' &&
                 encryptedRows.some((row) => {
                     const prefix = row.encrypted_value.subarray(0, 3).toString('ascii');
                     return prefix === 'v10' || prefix === 'v11';
-                })) {
-                secretAccess = { provider: 'windows_dpapi', startedAt: Date.now() };
+                });
+            const hasWindowsAppBoundRows = platform === 'win32' &&
+                Boolean(options.getWindowsAppBoundKey) &&
+                encryptedRows.some((row) => row.encrypted_value.subarray(0, 3).toString('ascii') === 'v20');
+            if (hasWindowsMasterKeyRows) {
+                const masterKeyAccess = { provider: 'windows_dpapi', startedAt: Date.now() };
                 if (requestId && report) {
                     report({ event: 'secret_access_started', requestId, provider: 'windows_dpapi' });
                 }
-                windowsMasterKey = await (options.getWindowsMasterKey ??
-                    ((localStatePath, abortSignal) => readWindowsChromeMasterKey(localStatePath, options.dpapiUnprotect ?? windowsDpapiUnprotect, abortSignal)))(profile.localStatePath, signal);
-                if (requestId && report) {
-                    report({
-                        event: 'secret_access_completed',
-                        requestId,
-                        provider: 'windows_dpapi',
-                        durationMs: Date.now() - secretAccess.startedAt,
-                    });
+                try {
+                    windowsMasterKey = await (options.getWindowsMasterKey ??
+                        ((localStatePath, abortSignal) => readWindowsChromeMasterKey(localStatePath, options.dpapiUnprotect ?? windowsDpapiUnprotect, abortSignal)))(profile.localStatePath, signal);
+                    if (requestId && report) {
+                        report({
+                            event: 'secret_access_completed',
+                            requestId,
+                            provider: 'windows_dpapi',
+                            durationMs: Date.now() - masterKeyAccess.startedAt,
+                        });
+                    }
+                }
+                catch (error) {
+                    if (requestId && report) {
+                        report({
+                            event: 'secret_access_failed',
+                            requestId,
+                            provider: 'windows_dpapi',
+                            durationMs: Date.now() - masterKeyAccess.startedAt,
+                            reason: signal.aborted ? 'cancelled' : secretFailureReason(error),
+                            ...secretFailureDetails(error),
+                        });
+                    }
+                    if (signal.aborted)
+                        throw error;
+                    // Legacy v10/v11 rows often linger in profiles upgraded to Chrome 127+
+                    // where active cookies use v20. When v20 rows can still be read, a
+                    // failing legacy master key lookup must not abort the import before
+                    // the App-Bound key lookup runs; the undecryptable v10/v11 rows are
+                    // counted as per-row decryption failures below.
+                    if (!hasWindowsAppBoundRows) {
+                        if (error instanceof BrowserProfileImportFailure)
+                            throw error;
+                        throw new BrowserProfileImportFailure('decryption_failed');
+                    }
                 }
             }
-            if (platform === 'win32' &&
-                options.getWindowsAppBoundKey &&
-                encryptedRows.some((row) => row.encrypted_value.subarray(0, 3).toString('ascii') === 'v20')) {
+            if (hasWindowsAppBoundRows && options.getWindowsAppBoundKey) {
                 // v20 需要 SYSTEM 上下文，属于用户可见的授权动作，沿用 authorizing 生命周期。
                 options.onAuthorizationRequired?.();
                 secretAccess = { provider: 'windows_dpapi', startedAt: Date.now() };
@@ -497,6 +547,7 @@ export async function readChromeCookies(profile, signal, options = {}) {
                     provider: secretAccess.provider,
                     durationMs: Date.now() - secretAccess.startedAt,
                     reason: signal.aborted ? 'cancelled' : secretFailureReason(error),
+                    ...secretFailureDetails(error),
                 });
             }
             if (signal.aborted)

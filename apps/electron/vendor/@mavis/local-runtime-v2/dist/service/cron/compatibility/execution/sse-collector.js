@@ -1,4 +1,5 @@
 import { MsgType, RespDataType, Role, ToolCallStatus, } from '@mavis/agent-core/protocol/agent-message';
+import { isAbandonedStreamClosingMessage } from '@mavis/agent-core/protocol';
 import { parseMediaTags } from '@mavis/shared';
 import { parseRespData } from '../../../../infra/transport/http-helpers.js';
 import { extractToolDetail, formatToolResultFallback, formatToolSummary, sanitizeChannelReplyText, } from '../message-format.js';
@@ -12,6 +13,7 @@ export function collectChannelResponseFromSse(raw, filter, options) {
     const chunkMsgIds = new Set();
     const thinkingMsgIds = new Set();
     let error;
+    const frames = [];
     for (const data of decodeSseData(raw)) {
         if (data === '[DONE]')
             continue;
@@ -22,6 +24,12 @@ export function collectChannelResponseFromSse(raw, filter, options) {
         }
         const resp = parseRespData(data);
         if (!resp || resp.type === RespDataType.Heartbeat)
+            continue;
+        frames.push({ resp });
+    }
+    const abandoned = abandonedMessageIds(frames.map((frame) => frame.resp));
+    for (const { resp } of frames) {
+        if (abandoned.has(respMessageId(resp) ?? ''))
             continue;
         response.appendFrame(resp, collectTextFromResp(resp, chunkMsgIds), collectAuxFromResp(resp, thinkingMsgIds));
     }
@@ -54,6 +62,8 @@ class ChannelResponseAccumulator {
     appendMessage(message) {
         if (message.role === 'user' || message.role === 'system' || message.kind === 'compaction')
             return;
+        if (isAbandonedStreamClosingMessage(message.raw))
+            return;
         this.finalMessages += 1;
         this.appendToolCalls(message.toolCalls, true);
         this.appendText(message.text);
@@ -67,7 +77,9 @@ class ChannelResponseAccumulator {
             // A final frame may omit arguments already supplied by its start frame.
             const args = toolCall.tool_call_args || previous?.tool_call_args;
             this.toolCalls.set(toolCall.tool_call_id, { ...toolCall, tool_call_args: args });
-            if (isChunk && this.filter.mode === 'full' && toolCall.tool_call_status !== ToolCallStatus.Finished) {
+            if (isChunk &&
+                this.filter.mode === 'full' &&
+                toolCall.tool_call_status !== ToolCallStatus.Finished) {
                 this.body += formatInlineToolCall(toolCall, args);
             }
         }
@@ -166,9 +178,33 @@ function collectFinalAux(message, thinkingMsgIds) {
         out.thinking = message.thinking_content;
     return out;
 }
+/**
+ * Message ids of attempts the runtime abandoned and resent: the half answer is
+ * closed with `finish_reason: 'length'` and no usage, and the resend streams
+ * under a new id. Dropping every frame of the abandoned id keeps the cron reply
+ * to the resent answer only. The chunks arrive before their closing message, so
+ * the ids are resolved over the whole drained stream first.
+ */
+function abandonedMessageIds(frames) {
+    const ids = new Set();
+    for (const resp of frames) {
+        const message = resp.type === RespDataType.AgentMessage ? resp.agent_message : undefined;
+        if (message?.msg_id && isAbandonedStreamClosingMessage(message))
+            ids.add(message.msg_id);
+    }
+    return ids;
+}
+function respMessageId(resp) {
+    if (resp.type === RespDataType.AgentMessageChunk)
+        return resp.agent_message_chunk?.msg_id;
+    if (resp.type === RespDataType.AgentMessage)
+        return resp.agent_message?.msg_id;
+    return undefined;
+}
 function decodeSseData(raw) {
     return raw.split(/\n\n/u).flatMap((event) => {
-        const dataLines = event.split(/\r?\n/u)
+        const dataLines = event
+            .split(/\r?\n/u)
             .filter((line) => line.startsWith('data:'))
             .map((line) => line.slice(5).replace(/^ /u, ''));
         return dataLines.length > 0 ? [dataLines.join('\n')] : [];
@@ -183,8 +219,9 @@ function safeJson(value) {
     }
 }
 function isErrorFrame(value) {
-    return !!value && typeof value === 'object' &&
+    return (!!value &&
+        typeof value === 'object' &&
         value.type === 'error' &&
-        typeof value.error === 'string';
+        typeof value.error === 'string');
 }
 //# sourceMappingURL=sse-collector.js.map

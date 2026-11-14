@@ -1,3 +1,5 @@
+import { isAssignmentOrigin } from '../../service/assignment/index.js';
+import { projectBunnyGreetingOrigin } from '../../service/bunny/index.js';
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
 import { isSideChatSendOrigin } from '@mavis/shared/sidechat-send-origin';
 import { sanitizeDisplayAttachment, } from '../../service/session-system/index.js';
@@ -239,10 +241,21 @@ function frameMessages(data) {
     return messages.filter(isRecord);
 }
 function toSseMessage(message) {
-    const withSteering = toSseSteeringFields(toSseSideChatOrigin(toSseMessageOrigin(message)));
+    const withSteering = toSseSteeringFields(toSseBunnyOrigin(toSseSideChatOrigin(toSseMessageOrigin(message))));
     if (!Array.isArray(withSteering.attachments))
         return withSteering;
     return { ...withSteering, attachments: withSteering.attachments.map(toSseAttachment) };
+}
+function toSseBunnyOrigin(message) {
+    const origin = projectBunnyGreetingOrigin(message, message.origin);
+    if (origin === message.origin && message.source !== 'greeting')
+        return message;
+    const projected = { ...message, origin };
+    if (message.source === 'greeting') {
+        delete projected.sourceContext;
+        delete projected.source_context;
+    }
+    return projected;
 }
 function toSseSteeringFields(message) {
     const queryKey = typeof message.query_key === 'string' ? message.query_key : undefined;
@@ -289,7 +302,9 @@ function toSseSideChatOrigin(message) {
     if (message.origin !== undefined || !isRecord(message.sourceContext))
         return message;
     const origin = message.sourceContext.origin;
-    return isSideChatSendOrigin(origin) ? { ...message, origin } : message;
+    return isSideChatSendOrigin(origin) || isAssignmentOrigin(origin)
+        ? { ...message, origin }
+        : message;
 }
 function toSseAttachment(value) {
     const sanitized = sanitizeDisplayAttachment(value);

@@ -35,6 +35,8 @@ const STRUCTURED_TAG_START_RE = /<(media|genui|deliver-assets)\b[^>]*(?:>|$)/giu
 export function formatToolSummary(toolCalls) {
     const lines = ['🔧 工具调用'];
     for (const tc of toolCalls.values()) {
+        if (tc.tool_name === 'wrap_up')
+            continue;
         let icon = '…';
         if (tc.tool_call_status === ToolCallStatus.Finished)
             icon = '✓';

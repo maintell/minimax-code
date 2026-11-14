@@ -1,8 +1,9 @@
 import { publishBestEffort } from '../events.js';
 import { ThinkingLevel } from '@mavis/protocol';
 import { getRuntimePresetKey, resolveModelAvailability, resolveModelReplacement, } from '@mavis/config';
-import { LocalModelProviderError, MANAGED_MINIMAX_PROVIDER_ID, formatModelKey, freezeManagedQueueModel, savedSessionModel, isLegacyMinimaxProvider, listLocalRuntimeModels, modelConfigForRef, modelRefForModel, parseSourceQualifiedModelKey, resolveLegacyMinimaxModel, } from '../../service/model-system/index.js';
+import { LocalModelProviderError, MANAGED_MINIMAX_PROVIDER_ID, formatModelKey, freezeManagedQueueModel, savedSessionModel, isLegacyMinimaxProvider, listLocalRuntimeModels, modelConfigForRef, modelRefForModel, parseSourceQualifiedModelKey, resolveLegacyMinimaxModel, validateAdvisorModel, isAdvisorReleased, } from '../../service/model-system/index.js';
 import { AgentServiceError } from '../../service/agent/index.js';
+import { advisorWriteNeedsValidation, nextAdvisorSelection, readStoredAdvisor, toAdvisorSelectionError, toAdvisorSelectionView, toDefaultAdvisorConfig, } from './model-provider-advisor.js';
 /** Cross-capability model catalog and selection workflow owned by Runtime V2. */
 export class ModelProviderApplication {
     deps;
@@ -10,6 +11,27 @@ export class ModelProviderApplication {
         this.deps = deps;
     }
     async list(input = {}) {
+        return (await this.readCatalog(input)).models;
+    }
+    /** The catalog plus its advisor: the Session's with `sessionId`, else the new-conversation default. */
+    async listWithAdvisor(input = {}) {
+        const { models, session, config } = await this.readCatalog(input);
+        const stored = input.sessionId ? session?.advisor : config.defaultAdvisor;
+        return { models, advisor: toAdvisorSelectionView(this.catalogConfig(), stored) };
+    }
+    /**
+     * One scope's advisor without the catalog: the Session's with `sessionId`, else the
+     * new-conversation default. The view needs only the config, so nothing is refreshed and no
+     * catalog is built; a client creating a Session reads this before its first message.
+     */
+    async readAdvisor(input = {}) {
+        const config = this.catalogConfig();
+        if (!input.sessionId)
+            return toAdvisorSelectionView(config, config.defaultAdvisor);
+        const session = await this.deps.sessions.get(input.sessionId);
+        return toAdvisorSelectionView(config, session?.advisor);
+    }
+    async readCatalog(input) {
         await this.refresh();
         const session = input.sessionId ? await this.deps.sessions.get(input.sessionId) : undefined;
         const config = this.deps.config();
@@ -23,7 +45,81 @@ export class ModelProviderApplication {
         // Stale extension catalogs (account changed/signed out) must not offer the old subject's models.
         const unavailable = this.deps.providers.unavailableModelAccessProviderIds?.() ?? new Set();
         const catalog = models.filter((model) => !isLegacyMinimaxProvider(config, model.providerId) && !unavailable.has(model.providerId));
-        return state.bypassStoredProjection ? catalog : projectStoredParameters(catalog, state.stored);
+        return {
+            models: state.bypassStoredProjection
+                ? catalog
+                : projectStoredParameters(catalog, state.stored),
+            session,
+            config,
+        };
+    }
+    /**
+     * Writes the advisor of one Session, or the new-conversation default without `sessionId`.
+     * The runtime never copies the default into Sessions it creates; clients do that for new
+     * conversations. IM channel Sessions have no advisor entry and are rejected.
+     */
+    async selectAdvisor(input) {
+        const session = input.sessionId ? await this.requireModelSession(input.sessionId) : undefined;
+        if (session?.sessionKind === 'channel') {
+            throw new LocalModelProviderError(409, 'The advisor is not available for IM channel Sessions.', 'ADVISOR_SESSION_UNSUPPORTED');
+        }
+        const config = this.deps.config();
+        const selection = this.resolveAdvisorWrite(session ? session.advisor : config.defaultAdvisor, input);
+        if (input.sessionId) {
+            await this.deps.sessions.updateAdvisor(input.sessionId, selection);
+        }
+        else {
+            await this.selectDefaultAdvisor(selection);
+        }
+        return toAdvisorSelectionView(this.catalogConfig(), selection);
+    }
+    /**
+     * The selection a write of `input` over `stored` stores, checked the way SelectAdvisorModel
+     * checks it; nothing is written. A new side chat's draft is a whole selection: no `stored`.
+     * A build without the advisor refuses every write, including one that turns it off.
+     */
+    resolveAdvisorWrite(stored, input) {
+        const config = this.catalogConfig();
+        if (!isAdvisorReleased(config)) {
+            throw new LocalModelProviderError(403, 'The advisor is not available in this build.', 'ADVISOR_DISABLED');
+        }
+        const selection = nextAdvisorSelection(readStoredAdvisor(config, stored), input);
+        if (advisorWriteNeedsValidation(selection)) {
+            this.assertAdvisorUsable(selection, input.contextLimit);
+        }
+        return selection;
+    }
+    assertAdvisorUsable(selection, contextLimit) {
+        const parsed = parseSourceQualifiedModelKey(selection.model);
+        if (!parsed) {
+            throw new LocalModelProviderError(400, `Unknown advisor model ${selection.model}`, 'MODEL_NOT_AVAILABLE_FOR_ROUTE');
+        }
+        const { providerId, modelId } = parsed;
+        this.assertModelAvailable(providerId, modelId);
+        this.deps.providers.assertModelSelectable(providerId, modelId);
+        const config = this.catalogConfig();
+        if (contextLimit !== undefined) {
+            const catalogEntry = listLocalRuntimeModels(config, undefined, {
+                cache: this.deps.providers.loadCacheData(),
+            }).find((entry) => entry.providerId === providerId && entry.modelId === modelId);
+            validateContextLimit({ contextLimit }, catalogEntry, modelConfigForRef(config, providerId, modelId));
+        }
+        try {
+            validateAdvisorModel(config, selection);
+        }
+        catch (error) {
+            throw toAdvisorSelectionError(error);
+        }
+    }
+    async selectDefaultAdvisor(selection) {
+        try {
+            await this.deps.setDefaultAdvisor(toDefaultAdvisorConfig(selection));
+        }
+        catch (error) {
+            throw new LocalModelProviderError(400, error instanceof Error ? error.message : String(error), 'CONFIG_WRITE_FAILED');
+        }
+        // Same signal as a default model write: clients refetch ListModels, which carries the advisor.
+        this.publishDefaultModelChanged();
     }
     async resolveListState(sessionId, session, config) {
         const channelSelection = await this.resolveChannelSelection(sessionId, session);

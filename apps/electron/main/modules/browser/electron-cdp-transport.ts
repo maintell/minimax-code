@@ -1,5 +1,6 @@
-import { browserTransportInterruptionError } from "@mavis/browser-core";
+import { INACTIVE_BROWSER_JS_DIALOG_SOURCE, browserTransportInterruptionError } from "@mavis/browser-core";
 import { isWebviewGuest, isGuestKeyboardCommand, sendGuestKeyboardCommand, withAgentPointer } from "./webview-guest-input.js";
+import { getBrowserJsDialogGate } from "./browser-js-dialog-registry.js";
 /**
  * Electron implementation of the provider-neutral BrowserPageTransport.
  *
@@ -20,6 +21,14 @@ export class ElectronCdpTransport {
     }
     get sessionId() {
         return String(this.webContents.id);
+    }
+    /**
+     * Electron dialogs are owned by BrowserJsDialogGate. Without the gate (its
+     * private-event contract did not hold) keep the existing native-box
+     * behavior instead of handling dialogs over CDP, which leaves the box open.
+     */
+    get jsDialogs() {
+        return getBrowserJsDialogGate(this.webContents) ?? INACTIVE_BROWSER_JS_DIALOG_SOURCE;
     }
     /** Let the shared Core claim OOPIF routing on an existing legacy transport. */
     enableOopifAutoAttach() {

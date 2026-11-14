@@ -15,7 +15,9 @@ import { isSkipOnlyReply, isV2Questionnaire, publishQuestionnaireState, question
  *
  * Invariants: status only moves pending -> answered | expired; a v2 row is
  * never dismissed or superseded; `injected_at` is written once, when the
- * answer is handed to the model.
+ * answer is handed to the model. Skip/close (manual, or the async card's
+ * countdown reaching zero) only records `dismissed_at`: the question stays
+ * pending and answerable, but no longer reads as waiting for the user.
  */
 export class QuestionnaireV2Lifecycle {
     deps;
@@ -23,7 +25,7 @@ export class QuestionnaireV2Lifecycle {
         this.deps = deps;
     }
     async reply(input) {
-        const record = await this.requireRecord(input.requestId, input.agentName, 'reply');
+        const record = await this.requireRecord(input.requestId, input.agentName, input.source === 'auto' ? 'auto_reply' : 'reply');
         await this.requireReplySession(record);
         // `auto`: the waiting ask_user call answers a Goal question nobody
         // answered in time (Goal + skip). It never replays or retries: an existing
@@ -36,20 +38,8 @@ export class QuestionnaireV2Lifecycle {
                 throw automaticNotApplied(record, 'already_answered');
             return this.replayAnswered(record, reply);
         }
-        if (isSkipOnlyReply(reply)) {
-            // No real choice or text: behave like skip/close so the single allowed
-            // answer is not consumed by an empty submission.
-            if (automatic)
-                throw automaticNotApplied(record, 'no_option_selected');
-            const now = this.deps.nowMs();
-            this.endSyncWait(record, 'skip_only_reply');
-            return {
-                ...baseResult(record),
-                answeredAt: now,
-                injected: false,
-                state: questionnaireState(record),
-            };
-        }
+        if (isSkipOnlyReply(reply))
+            return this.endSkipOnlyReply(record, automatic);
         // Checked right before the write with no await in between, so an ending
         // (new message, skip, Stop) that settled the wait first wins.
         if (automatic && this.deps.syncWaits?.isAwaitingReply(record.requestId) !== true) {
@@ -68,6 +58,18 @@ export class QuestionnaireV2Lifecycle {
         logger.info({ ...fieldsOf(answered), reason: 'answered' }, 'Questionnaire v2 answered');
         publishQuestionnaireState(this.deps, answered, 'answered');
         return this.deliver(answered, reply);
+    }
+    /** No real choice or text: the user skipped every step, handled like skip/close. */
+    async endSkipOnlyReply(record, automatic) {
+        if (automatic)
+            throw automaticNotApplied(record, 'no_option_selected');
+        const skipped = await this.markSkipped(record, 'skip_only_reply');
+        return {
+            ...baseResult(skipped),
+            answeredAt: skipped.dismissedAt ?? this.deps.nowMs(),
+            injected: false,
+            state: questionnaireState(skipped),
+        };
     }
     /** A reply to a row whose session is gone deletes the orphan row and fails. */
     async requireReplySession(record) {
@@ -109,12 +111,42 @@ export class QuestionnaireV2Lifecycle {
             logger.info({ ...fieldsOf(record), reason: 'already_answered' }, 'Questionnaire v2 dismiss rejected');
             throw new LocalQuestionnaireError(409, 'QUESTIONNAIRE_ALREADY_ANSWERED', 'Questionnaire request is answered');
         }
-        // Status stays pending (still answerable later), no dismissed_at and no
-        // questionnaire.dismiss event. Only an async row inside its countdown
-        // holds queued messages (findAsyncCountdownHold); skip/close releases it.
-        this.endSyncWait(record, 'dismiss');
+        const skipped = await this.markSkipped(record, 'dismiss');
+        return { ...baseResult(skipped), dismissedAt: skipped.dismissedAt ?? this.deps.nowMs() };
+    }
+    /**
+     * Skip/close records `dismissed_at` and nothing else: the row stays
+     * pending, so the user can still answer it (the answer then reaches the
+     * model like any late answer), while the task no longer reads as waiting
+     * for the user and its report and review are no longer held. A sync
+     * ask_user call returns as skipped; an async countdown releases the
+     * messages it held. Publishes `questionnaire.state` with `dismissedAt`;
+     * `questionnaire.dismiss` stays the "question finished" event, so a skip
+     * does not publish it. A repeated skip (a manual close racing the
+     * countdown, or a retry) changes nothing.
+     */
+    async markSkipped(record, reason) {
+        if (record.dismissedAt !== undefined)
+            return record;
+        const dismissedAt = this.deps.nowMs();
+        if (!(await this.deps.store.markV2Skipped(record.requestId, dismissedAt))) {
+            const current = await this.deps.store.get(record.requestId);
+            if (current?.status === 'pending' && current.dismissedAt !== undefined)
+                return current;
+            logger.info({ ...fieldsOf(record), status: current?.status, reason: 'skip_lost_race' }, 'Questionnaire v2 skip rejected');
+            if (current?.status === 'answered') {
+                throw new LocalQuestionnaireError(409, 'QUESTIONNAIRE_ALREADY_ANSWERED', 'Questionnaire request is answered');
+            }
+            throw notPending(current?.status ?? 'deleted');
+        }
+        const skipped = { ...record, dismissedAt };
+        logger.info({ ...fieldsOf(skipped), reason }, 'Questionnaire v2 skipped');
+        this.endSyncWait(record, reason);
+        // Only an async row inside its countdown holds queued messages
+        // (findAsyncCountdownHold); skip/close releases it and wakes the queue.
         this.releaseAsyncCountdown(record);
-        return { ...baseResult(record), dismissedAt: this.deps.nowMs() };
+        publishQuestionnaireState(this.deps, skipped, reason);
+        return skipped;
     }
     /**
      * Queue gate for AskUser v2 async questionnaires. An async ask_user returns
@@ -323,6 +355,10 @@ export class QuestionnaireV2Lifecycle {
             }
             logger.info({ ...fieldsOf(record), action, reason: 'expired' }, 'Questionnaire v2 request rejected');
             throw notPending('expired');
+        }
+        // A question the user skipped stays skipped; the deadline answer is not sent.
+        if (action === 'auto_reply' && record.dismissedAt !== undefined) {
+            throw automaticNotApplied(record, 'skipped');
         }
         if (record.status !== 'pending' && record.status !== 'answered') {
             logger.info({ ...fieldsOf(record), action, reason: `status_${record.status}` }, 'Questionnaire v2 request rejected');

@@ -69,6 +69,15 @@ function providerApiForRef(config, provider) {
 /** Protocols whose wire format carries audio and PDF parts as inline data. */
 const NATIVE_AUDIO_PDF_APIS = new Set(['google-generative-ai']);
 /**
+ * Protocols whose wire format has no video part. The openai-completions
+ * transport serialises every inline media block as
+ * `image_url: data:${mimeType};base64,…`, so a `video/mp4` block reaches the
+ * provider as an image it cannot decode: the request fails while the gateway
+ * counts tokens, and because the block stays in history every later turn of
+ * that session fails the same way.
+ */
+const VIDEO_INCAPABLE_APIS = new Set(['openai-completions']);
+/**
  * Adds audio and PDF input declared in the model's `modalities.input` to the
  * ModelRef capabilities, only when its provider's protocol sends them
  * natively. Other protocols keep treating them as files: their transports
@@ -88,6 +97,25 @@ export function withNativeAudioPdfCapabilities(model, config, provider, modelId)
         ...(pdf ? { support_pdf: true } : {}),
     };
     return { ...model, capabilities: { ...model.capabilities, ...added } };
+}
+/**
+ * Drops video input the model's `modalities.input` declares when its provider's
+ * protocol cannot carry it. Managed and MiniMax API sources have no protocol
+ * here and keep the declared capability.
+ *
+ * Without the capability the Read tool returns a text note instead of inlining
+ * the file, the request projection replaces a video already in history with a
+ * placeholder on the request copy, and the payload transform stops rewriting
+ * video blocks — so a session that already carries one keeps working.
+ */
+export function withProtocolVideoCapability(model, config, provider) {
+    const api = providerApiForRef(config, provider);
+    if (!api || !VIDEO_INCAPABLE_APIS.has(api))
+        return model;
+    const capabilities = model.capabilities;
+    if (capabilities?.support_video !== true)
+        return model;
+    return { ...model, capabilities: { ...capabilities, support_video: false } };
 }
 export function enabledCustomProviders(config) {
     return Object.entries(config.custom_provider ?? {}).filter(([, provider]) => provider.enabled !== false);
@@ -253,7 +281,7 @@ function modelEffortFields(model, managed) {
 }
 function modelThinkingFields(input) {
     const { model } = input;
-    const configuredThinking = normalizeModelThinkingConfig(model.thinking_config);
+    const configuredThinking = withResolvedSwitchableDefault(normalizeModelThinkingConfig(model.thinking_config), model.defaultVariant);
     const implicitThinking = configuredThinking ? undefined : implicitThinkingConfig(input);
     const thinkingConfig = configuredThinking ?? implicitThinking;
     const effortOptions = normalizeModelThinkingEffortOptions(model.thinking?.effortOptions);
@@ -270,6 +298,20 @@ function modelThinkingFields(input) {
         ...(defaultEffort ? { defaultEffort } : {}),
         ...(variant !== undefined ? { variant } : {}),
     };
+}
+/**
+ * A configured switchable model's default as the resolver runs it: `defaultVariant` wins over
+ * `default_value` (model-ref.ts `resolveSwitchableThinkingLevel`), the rule `defaultThinkingVariant`
+ * already applies. Reporting that one answer keeps every client, including a request that sends no
+ * variant such as the advisor's, on the state the runtime actually uses. Only configured modes take
+ * it: without one the resolver reads `reasoning`, which the implicit switch already mirrors.
+ */
+function withResolvedSwitchableDefault(config, defaultVariant) {
+    if (config?.mode !== 'switchable' || normalizeThinkingVariant(defaultVariant) === undefined) {
+        return config;
+    }
+    const variant = defaultThinkingVariant(config, defaultVariant);
+    return { ...config, default_value: variant === 'thinking' ? 'true' : 'false' };
 }
 function implicitThinkingConfig(input) {
     if (input.providerSource !== 'custom_provider')

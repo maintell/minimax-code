@@ -88,11 +88,18 @@ export function createMiniAppControlExtension(lifecycle) {
         },
     };
 }
+/**
+ * The model-facing `miniapp` definition. Hosts without a Mini App runtime reuse
+ * it for a refusal tool, so every surface lists the same name and schema.
+ */
+export const MINIAPP_TOOL_DEFINITION = {
+    name: 'miniapp',
+    description: "Initialize, list, open, inspect, publish, restart, or stop a Mini App. Init scaffolds or binds the package root in the current Session workspace for authoring without publishing it. Open accepts an optional origin-relative path with a query string to select a page in the current Session's Mini App tab. Inspect returns the installed Mini App's source (official or local) and runtime state. Inspect reads the current or latest run and bounded Host diagnostics without starting the runtime; diagnostics are kept in Host memory and exclude business logs and raw stdout/stderr. Before editing an installed Mini App, inspect its source; official Plugin implementations do not support local editing or republishing. Use miniapp-creator for authoring and recovery guidance. Publish starts or replaces the runtime. Init is not required for a complete package directory. Restart restarts an installed runtime. Stop releases an installed runtime without deleting its Mini App package; use the Mini App Plugin's own Skills, MCP servers, and Connectors for business operations.",
+    schema: MiniAppProviderInputSchema,
+};
 function createMiniAppTool(lifecycle) {
     return defineRuntimeTool({
-        name: 'miniapp',
-        description: "Initialize, list, open, inspect, publish, restart, or stop a Mini App. Init scaffolds or binds the package root in the current Session workspace for authoring without publishing it. Open accepts an optional origin-relative path with a query string to select a page in the current Session's Mini App tab. Inspect returns the installed Mini App's source (official or local) and runtime state. Inspect reads the current or latest run and bounded Host diagnostics without starting the runtime; diagnostics are kept in Host memory and exclude business logs and raw stdout/stderr. Before editing an installed Mini App, inspect its source; official Plugin implementations do not support local editing or republishing. Use miniapp-creator for authoring and recovery guidance. Publish starts or replaces the runtime. Init is not required for a complete package directory. Restart restarts an installed runtime. Stop releases an installed runtime without deleting its Mini App package; use the Mini App Plugin's own Skills, MCP servers, and Connectors for business operations.",
-        schema: MiniAppProviderInputSchema,
+        ...MINIAPP_TOOL_DEFINITION,
         source: 'builtin',
         operationClassifier: {
             allowedValues: MINIAPP_ACTIONS,

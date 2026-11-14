@@ -49,6 +49,7 @@ export function createSessionForkDataCapability(input) {
                     effectiveModelThinking: session.effectiveModelThinking,
                     effectiveModelContextWindow: session.effectiveModelContextWindow,
                     effectiveModelMaxOutputTokens: session.effectiveModelMaxOutputTokens,
+                    advisor: session.advisor,
                     ...(session.purpose ? { purpose: session.purpose } : {}),
                     origin: 'user',
                 });

@@ -36,6 +36,7 @@ export class RcDataPlane {
                 ...(opts.onSessionComposerModeChange
                     ? { onSessionComposerModeChange: opts.onSessionComposerModeChange }
                     : {}),
+                ...(opts.getAppLocale ? { getAppLocale: opts.getAppLocale } : {}),
             });
         }
         else

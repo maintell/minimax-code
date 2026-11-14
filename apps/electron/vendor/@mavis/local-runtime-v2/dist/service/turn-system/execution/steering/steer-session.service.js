@@ -5,7 +5,7 @@ import { steeringMessageKey, steeringReceiptId } from '../../steering-identity.j
 import { createUserMessageId } from '../../../session-system/index.js';
 import { sessionClioSteeringQueryId } from '../../../session-clio/index.js';
 export function createSteerSessionService(options) {
-    const run = (runOptions, input) => {
+    const run = async (runOptions, input) => {
         const submittedAtMs = (runOptions.nowMs ?? Date.now)();
         return deliver(runOptions, identifyVisibleSteering({
             ...input,

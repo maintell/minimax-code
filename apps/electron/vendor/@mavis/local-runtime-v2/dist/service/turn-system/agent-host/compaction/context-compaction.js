@@ -1,9 +1,17 @@
 import { CONTEXT_USAGE_COMPONENT_KINDS, } from '@mavis/agent-core/protocol';
+import { SEGMENT_COMPACTION_TIMEOUT } from './contracts.js';
+import { readBackgroundSegment, readSegmentCheckpointPlan, segmentPlanFields, timeSegmentCompactionWait, } from './segment-checkpoint-plan.js';
 import { copyCanonicalHistoryForPiCompatibility, validateCanonicalHistoryMessages, } from '../history/canonical-history-validation.js';
 import { captureSemanticSnapshot } from '../history/semantic-identity.js';
 import { recordSharedPrefixFallbackBestEffort } from './checkpoint-request-shape.js';
+import { recordCheckpointAttemptBestEffort } from './diagnostics/checkpoint-attempt.js';
+import { logCheckpointGeneratedBestEffort } from './diagnostics/checkpoint-generated.js';
+import { logCompactionFailureBestEffort } from './diagnostics/compaction-failure.js';
 import { compactionTokenUsageMetadata, createCompactionTokenUsageAccumulator, readCompactionTokenUsage, } from './token-usage.js';
 export { createCompactionTokenUsageAccumulator, readCompactionTokenUsage } from './token-usage.js';
+export { recordCheckpointAttemptBestEffort } from './diagnostics/checkpoint-attempt.js';
+export { logCheckpointGeneratedBestEffort } from './diagnostics/checkpoint-generated.js';
+export { logCompactionFailureBestEffort } from './diagnostics/compaction-failure.js';
 // Mark fire-and-forget deliveries as consumed without retaining a pending
 // observer forever. `deliverObservation` catches both sync and async failures.
 const nonAuthoritativeObservations = new WeakSet();
@@ -30,16 +38,139 @@ export class ContextCompactionAttemptFactory {
         return createContextCompactionAttemptId(this.namespace, ++this.sequence);
     }
 }
+/**
+ * The default ladder's deadline when the segment profile handed over a
+ * request it could not shrink in time; nothing left fails the Turn now.
+ */
+function fallbackDeadline(timeLimitMs) {
+    if (timeLimitMs === undefined)
+        return {};
+    if (timeLimitMs <= 0)
+        return { decision: { type: 'abort', reason: SEGMENT_COMPACTION_TIMEOUT } };
+    return { deadline: AbortSignal.timeout(timeLimitMs) };
+}
+/**
+ * Segment (Bunny) profile decision before an LLM request: continue, replace the
+ * history with a rebuilt segment, stop the request, or hand over to the default
+ * ladder after a failed rebuild or for a repeated request the provider rejected
+ * (`input.recovery`), with a deadline when the request must wait.
+ */
+async function decideSegmentCompaction(plan) {
+    const { input } = plan;
+    const outcome = await plan.turn.beforeLlm(input, {
+        onRebuildStarted: plan.startAttempt,
+        // An emergency rebuild holds the history but is no compaction to show or admit.
+        onEmergencyRebuildStarted: async () => {
+            if (plan.attempt.started)
+                return;
+            await plan.barrier?.begin(plan.context.sessionId, plan.attemptId, plan.context.turnId);
+            plan.attempt.started = true;
+        },
+        sharedPrefixAllowed: plan.sharedPrefixAllowed,
+        ...(plan.backgroundRoute ? { backgroundRoute: plan.backgroundRoute } : {}),
+    });
+    if (outcome.kind === 'continue')
+        return { decision: { type: 'continue' } };
+    if (outcome.kind === 'fail')
+        return { decision: { type: 'abort', reason: outcome.reason } };
+    if (outcome.kind === 'default' && outcome.quiet)
+        plan.attempt.quiet = true;
+    if (outcome.kind === 'default')
+        return fallbackDeadline(outcome.timeLimitMs);
+    let result;
+    try {
+        result = captureContextCompactionResult(outcome.commit.result, input.canonicalMessages.length);
+        if (result.status !== 'completed')
+            throw new ContextCompactionResultValidationError('status');
+    }
+    catch (error) {
+        // A hidden rebuild is the Turn's recovery: sending the request unchanged
+        // would only repeat the failure it recovers from.
+        if (!outcome.commit.result.segment.hidden)
+            throw error;
+        const reason = `segment_rebuild_invalid:${describeUnknownError(error)}`;
+        return { decision: { type: 'abort', reason } };
+    }
+    plan.onReplace();
+    return {
+        decision: {
+            type: 'replaceMessages',
+            messages: copyCanonicalHistoryForPiCompatibility(result.replacementMessages),
+            metadata: createCompactionReplaceMetadata(result, input.phase, plan.attemptId),
+            afterCommit: async () => {
+                try {
+                    await outcome.commit.afterCommit();
+                }
+                catch {
+                    // Post-commit bookkeeping never fails the Turn.
+                }
+                return undefined;
+            },
+        },
+    };
+}
 export function createAutomaticContextCompactionHook(dependencies, context, leaseId, options = {}) {
     const attempts = options.attempts ?? new ContextCompactionAttemptFactory();
     const trustedContext = captureSemanticSnapshot(context).value;
-    return async (input) => {
+    const decide = async (input, wait) => {
         const attemptId = attempts.create(trustedContext, leaseId, input.phase);
-        const attemptState = { started: false };
+        const attemptState = { started: false, quiet: false };
         const providerTokenUsage = createCompactionTokenUsageAccumulator();
         let awaitingHistoryCommit = false;
+        const startAttempt = async () => {
+            if (attemptState.started)
+                return;
+            if (dependencies.barrier) {
+                await dependencies.barrier.begin(trustedContext.sessionId, attemptId, trustedContext.turnId);
+            }
+            const admission = await options.beforeCompaction?.();
+            if (admission === false)
+                throw new AutomaticContextCompactionDeferredError();
+            if (typeof admission === 'object' && admission.abort) {
+                throw new AutomaticContextCompactionHookAbortError(admission.reason);
+            }
+            attemptState.started = true;
+            wait.started = true;
+            observeCompactionBestEffort(dependencies.observer, {
+                context: trustedContext,
+                attemptId,
+                status: 'started',
+                reason: 'automatic',
+                ...(attemptState.quiet ? { display: false } : {}),
+            });
+        };
+        // Set when the request cannot be sent as it is and the default ladder has a deadline.
+        let deadline;
         try {
-            const automaticInput = automaticContextCompactionInput(input, options.maxSerializedInputBytes, options.checkpointRequestShape);
+            const segment = options.segmentTurn
+                ? await decideSegmentCompaction({
+                    turn: options.segmentTurn,
+                    input,
+                    context: trustedContext,
+                    attemptId,
+                    barrier: dependencies.barrier,
+                    startAttempt,
+                    sharedPrefixAllowed: options.checkpointRequestShape === 'shared_prefix',
+                    backgroundRoute: options.segmentRoute,
+                    onReplace: () => {
+                        awaitingHistoryCommit = true;
+                        // The rebuilt segment keeps the anchored reply in its tail, so until
+                        // the commit advances the history every later hook of this request
+                        // would measure it as the pre-rebuild total plus that tail.
+                        try {
+                            dependencies.usageAnchor?.advanceHistory(trustedContext.sessionId);
+                        }
+                        catch {
+                            // Process-local usage hints never change the replacement.
+                        }
+                    },
+                    attempt: attemptState,
+                })
+                : {};
+            if ('decision' in segment)
+                return segment.decision;
+            deadline = segment.deadline;
+            const automaticInput = automaticContextCompactionInput(input, options.maxSerializedInputBytes, options.checkpointRequestShape, deadline);
             const probe = dependencies.automatic.probeBeforeLlm?.(automaticInput);
             if (probe?.shouldStart === false) {
                 return resolveAutomaticCompactionResult({
@@ -56,24 +187,7 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 ...automaticInput,
                 messages,
             }, {
-                onStarted: async () => {
-                    if (dependencies.barrier) {
-                        await dependencies.barrier.begin(trustedContext.sessionId, attemptId, trustedContext.turnId);
-                    }
-                    const admission = await options.beforeCompaction?.();
-                    if (admission === false)
-                        throw new AutomaticContextCompactionDeferredError();
-                    if (typeof admission === 'object' && admission.abort) {
-                        throw new AutomaticContextCompactionHookAbortError(admission.reason);
-                    }
-                    attemptState.started = true;
-                    observeCompactionBestEffort(dependencies.observer, {
-                        context: trustedContext,
-                        attemptId,
-                        status: 'started',
-                        reason: 'automatic',
-                    });
-                },
+                onStarted: startAttempt,
                 onCheckpointGenerated: (metadata) => {
                     attemptState.checkpoint = logCheckpointGeneratedBestEffort(options.logger, {
                         context: trustedContext,
@@ -119,11 +233,9 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 return { type: 'abort', reason: error.message };
             }
             if (!attemptState.started && input.signal?.aborted) {
-                return {
-                    type: 'skip',
-                    reason: 'context_compaction_aborted_before_start',
-                };
+                return { type: 'skip', reason: 'context_compaction_aborted_before_start' };
             }
+            const timedOut = ranOutOfTime(deadline, input.signal);
             logCompactionFailureBestEffort(options.logger, {
                 context: trustedContext,
                 attemptId,
@@ -136,6 +248,7 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 context: trustedContext,
                 attemptId,
                 error,
+                ...(attemptState.quiet ? { display: false } : {}),
             }));
             observeCompactionBestEffort(dependencies.observer, {
                 context: trustedContext,
@@ -144,28 +257,44 @@ export function createAutomaticContextCompactionHook(dependencies, context, leas
                 reason: describeUnknownError(error),
                 ...compactionTokenUsageMetadata(providerTokenUsage.snapshot()),
             });
-            // Automatic compaction is optional maintenance and always fails open:
-            // the parent Turn continues with pre-compaction history to the payload
-            // transform. Final byte admission runs there after Files API conversion;
-            // a pre-transform footprint must not reject a compact file reference.
-            // This also applies to POST_ADMISSION_FAILED.
-            return {
-                type: 'skip',
-                reason: lifecycle.failed
-                    ? 'context_compaction_failure_record_failed'
-                    : 'context_compaction_failed',
-            };
+            return failedCompactionDecision(timedOut, lifecycle.failed);
         }
         finally {
             endAutomaticCompactionBarrier(dependencies.barrier, trustedContext, attemptId, awaitingHistoryCommit);
         }
+    };
+    if (!options.segmentTurn)
+        return (input) => decide(input, { started: false });
+    // A segment (Bunny) Turn: how long the request was held for a compaction it had to wait for.
+    return timeSegmentCompactionWait(dependencies.metricsClient, decide);
+}
+/** The default ladder ran past its deadline, not into the user's stop. */
+function ranOutOfTime(deadline, signal) {
+    return deadline?.aborted === true && signal?.aborted !== true;
+}
+function failedCompactionDecision(timedOut, recordFailed) {
+    // A request over the input limit whose compaction ran out of time
+    // cannot be sent; the Turn fails with a reason the Desktop explains.
+    if (timedOut)
+        return { type: 'abort', reason: SEGMENT_COMPACTION_TIMEOUT };
+    // Automatic compaction is optional maintenance and always fails open:
+    // the parent Turn continues with pre-compaction history to the payload
+    // transform. Final byte admission runs there after Files API conversion;
+    // a pre-transform footprint must not reject a compact file reference.
+    // This also applies to POST_ADMISSION_FAILED.
+    return {
+        type: 'skip',
+        reason: recordFailed ? 'context_compaction_failure_record_failed' : 'context_compaction_failed',
     };
 }
 function endAutomaticCompactionBarrier(barrier, context, attemptId, awaitingHistoryCommit) {
     if (!awaitingHistoryCommit)
         barrier?.end(context.sessionId, attemptId);
 }
-function automaticContextCompactionInput(input, maxSerializedInputBytes, checkpointRequestShape) {
+function automaticContextCompactionInput(input, maxSerializedInputBytes, checkpointRequestShape, deadline) {
+    const signal = deadline && input.signal
+        ? AbortSignal.any([input.signal, deadline])
+        : (deadline ?? input.signal);
     return {
         sessionId: input.sessionId,
         phase: input.phase,
@@ -183,260 +312,11 @@ function automaticContextCompactionInput(input, maxSerializedInputBytes, checkpo
         systemPrompt: input.systemPrompt,
         tools: input.tools,
         thinkingLevel: input.thinkingLevel,
-        signal: input.signal,
+        signal,
     };
-}
-const CHECKPOINT_CONTENT_KINDS = new Set([
-    'text',
-    'thinking',
-    'toolCall',
-    'unknown',
-]);
-const CHECKPOINT_STOP_REASONS = new Set([
-    'stop',
-    'length',
-    'toolUse',
-    'error',
-    'aborted',
-]);
-const CHECKPOINT_CANDIDATES = new Set([
-    'h0',
-    'hall',
-    'hvideo',
-    'hmid',
-    'hmin',
-]);
-const CHECKPOINT_ATTEMPT_OUTCOMES = new Set([
-    'generated',
-    'input_too_large',
-    'output_exhausted',
-    'aborted',
-    'failed',
-]);
-const STABLE_COMPACTION_FAILURES = [
-    ['INVALID_HISTORY', 'history'],
-    ['INVALID_CHECKPOINT', 'llm_checkpoint'],
-    ['CHECKPOINT_PROVIDER_FAILED', 'llm_checkpoint'],
-    ['COMPACTION_INPUT_TOO_LARGE', 'llm_checkpoint'],
-    ['POST_ADMISSION_FAILED', 'post_admission'],
-];
-function captureCheckpointGenerationMetadata(value) {
-    if (!Array.isArray(value.responseContentKinds) ||
-        !CHECKPOINT_STOP_REASONS.has(value.stopReason) ||
-        !Number.isSafeInteger(value.outputTokens) ||
-        value.outputTokens < 0) {
-        return undefined;
-    }
-    const responseContentKinds = [
-        ...new Set(value.responseContentKinds.filter((kind) => CHECKPOINT_CONTENT_KINDS.has(kind))),
-    ];
-    return Object.freeze({
-        responseContentKinds: Object.freeze(responseContentKinds),
-        stopReason: value.stopReason,
-        outputTokens: value.outputTokens,
-        ...(value.requestShape === 'shared_prefix' || value.requestShape === 'isolated'
-            ? { requestShape: value.requestShape }
-            : {}),
-    });
-}
-export function logCheckpointGeneratedBestEffort(logger, input) {
-    let checkpoint;
-    try {
-        checkpoint = captureCheckpointGenerationMetadata(input.checkpoint);
-        if (!checkpoint)
-            return undefined;
-        logger?.info?.({
-            event: 'context_compaction_checkpoint_generated',
-            session_id: input.context.sessionId,
-            turn_id: input.context.turnId,
-            turn_sequence: input.context.turnSequence,
-            attempt_id: input.attemptId,
-            phase: input.phase,
-            thinking_level: input.thinkingLevel,
-            response_content_kinds: [...checkpoint.responseContentKinds],
-            stop_reason: checkpoint.stopReason,
-            output_tokens: checkpoint.outputTokens,
-            ...(checkpoint.requestShape ? { request_shape: checkpoint.requestShape } : {}),
-        }, '[local-runtime-v2] context compaction checkpoint generated');
-    }
-    catch {
-        // Engineering diagnostics must never change the compaction outcome.
-    }
-    return checkpoint;
-}
-export function recordCheckpointAttemptBestEffort(logger, metrics, input) {
-    const checkpoint = captureCheckpointAttemptMetadata(input.checkpoint);
-    if (!checkpoint)
-        return;
-    try {
-        logger?.info?.({
-            event: 'context_compaction_checkpoint_attempt_settled',
-            session_id: input.context.sessionId,
-            turn_id: input.context.turnId,
-            turn_sequence: input.context.turnSequence,
-            attempt_id: input.attemptId,
-            phase: input.phase,
-            thinking_level: input.thinkingLevel,
-            checkpoint_candidate: checkpoint.candidate,
-            checkpoint_attempt: checkpoint.attemptNumber,
-            ...checkpointAttemptLogFields(checkpoint),
-            outcome: checkpoint.outcome,
-            duration_ms: checkpoint.durationMs,
-        }, '[local-runtime-v2] context compaction checkpoint attempt settled');
-    }
-    catch {
-        // Engineering diagnostics must never change the compaction outcome.
-    }
-    try {
-        metrics?.counter('compact_checkpoint_candidate_total', 1, {
-            candidate: checkpoint.candidate,
-            outcome: checkpoint.outcome,
-        });
-    }
-    catch {
-        // Metrics must never change the compaction outcome.
-    }
-    try {
-        metrics?.histogram('compact_checkpoint_candidate_duration_ms', checkpoint.durationMs, {
-            candidate: checkpoint.candidate,
-        });
-    }
-    catch {
-        // Metrics must never change the compaction outcome.
-    }
-}
-function checkpointAttemptLogFields(checkpoint) {
-    return {
-        ...(checkpoint.inputMessageCount === undefined
-            ? {}
-            : { input_message_count: checkpoint.inputMessageCount }),
-    };
-}
-export function logCompactionFailureBestEffort(logger, input) {
-    try {
-        const failure = captureStableCompactionFailure(input.error) ??
-            (input.checkpoint?.stopReason === 'aborted'
-                ? ['COMPACTION_ABORTED', 'llm_checkpoint']
-                : undefined);
-        logger?.error?.({
-            event: 'context_compaction_failed',
-            session_id: input.context.sessionId,
-            turn_id: input.context.turnId,
-            turn_sequence: input.context.turnSequence,
-            attempt_id: input.attemptId,
-            phase: input.phase,
-            thinking_level: input.thinkingLevel,
-            ...(input.checkpoint === undefined
-                ? {}
-                : {
-                    response_content_kinds: [...input.checkpoint.responseContentKinds],
-                    stop_reason: input.checkpoint.stopReason,
-                    output_tokens: input.checkpoint.outputTokens,
-                }),
-            error_code: failure?.[0] ?? 'UNKNOWN_ERROR',
-            error_stage: failure?.[1] ?? 'unknown',
-            ...captureCompactionSizeDiagnosticsFields(input.error),
-        }, '[local-runtime-v2] context compaction failed');
-    }
-    catch {
-        // Engineering diagnostics must never change the compaction outcome.
-    }
-}
-const COMPACTION_SIZE_DIAGNOSTIC_FIELDS = [
-    ['historyMessageCount', 'history_message_count'],
-    ['protectedMessageCount', 'protected_message_count'],
-    ['protectedInputTokens', 'protected_input_tokens'],
-    ['protectedSerializedBytes', 'protected_serialized_bytes'],
-    ['providerInputLimit', 'provider_input_limit'],
-    ['maxSerializedInputBytes', 'max_serialized_input_bytes'],
-    ['beforeInputTokens', 'before_input_tokens'],
-    ['beforeSerializedBytes', 'before_serialized_bytes'],
-    ['afterInputTokens', 'after_input_tokens'],
-    ['afterSerializedBytes', 'after_serialized_bytes'],
-];
-/** Content-free sizing facts attached by the compaction algorithm, when present. */
-function captureCompactionSizeDiagnosticsFields(error) {
-    try {
-        if (error === null || typeof error !== 'object')
-            return {};
-        const diagnostics = Reflect.get(error, 'diagnostics');
-        if (!isRecord(diagnostics))
-            return {};
-        const fields = {};
-        for (const [source, target] of COMPACTION_SIZE_DIAGNOSTIC_FIELDS) {
-            const value = diagnostics[source];
-            if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
-                fields[target] = value;
-            }
-        }
-        const hminAvailable = diagnostics['hminAvailable'];
-        if (typeof hminAvailable === 'boolean')
-            fields['hmin_available'] = hminAvailable;
-        return fields;
-    }
-    catch {
-        return {};
-    }
 }
 function compactionFailureStatus(signal, checkpoint) {
     return signal?.aborted || checkpoint?.stopReason === 'aborted' ? 'aborted' : 'failed';
-}
-function captureStableCompactionFailure(error) {
-    if (error === null || typeof error !== 'object')
-        return undefined;
-    try {
-        const code = Reflect.get(error, 'code');
-        const stage = Reflect.get(error, 'stage');
-        return STABLE_COMPACTION_FAILURES.find(([stableCode, stableStage]) => code === stableCode && stage === stableStage);
-    }
-    catch {
-        return undefined;
-    }
-}
-function captureCheckpointAttemptMetadata(value) {
-    if (!isRecord(value))
-        return undefined;
-    try {
-        const candidate = Reflect.get(value, 'candidate');
-        const attemptNumber = Reflect.get(value, 'attemptNumber');
-        const outcome = Reflect.get(value, 'outcome');
-        const durationMs = Reflect.get(value, 'durationMs');
-        if (!CHECKPOINT_CANDIDATES.has(candidate)) {
-            return undefined;
-        }
-        if (typeof attemptNumber !== 'number' ||
-            !Number.isSafeInteger(attemptNumber) ||
-            attemptNumber < 1) {
-            return undefined;
-        }
-        if (!CHECKPOINT_ATTEMPT_OUTCOMES.has(outcome)) {
-            return undefined;
-        }
-        if (!isNonNegativeFiniteNumber(durationMs)) {
-            return undefined;
-        }
-        return {
-            candidate: candidate,
-            attemptNumber,
-            outcome: outcome,
-            durationMs,
-            ...captureCheckpointAttemptDetails(value),
-        };
-    }
-    catch {
-        return undefined;
-    }
-}
-function captureCheckpointAttemptDetails(value) {
-    const inputMessageCount = readOptionalNonNegativeSafeInteger(value, 'inputMessageCount');
-    return inputMessageCount === undefined ? {} : { inputMessageCount };
-}
-function readOptionalNonNegativeSafeInteger(value, key) {
-    const field = Reflect.get(value, key);
-    return typeof field === 'number' && Number.isSafeInteger(field) && field >= 0 ? field : undefined;
-}
-function isNonNegativeFiniteNumber(value) {
-    return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 function resolveAutomaticCompactionResult(plan) {
     const { dependencies, context, attemptId, input, result } = plan;
@@ -507,7 +387,7 @@ export function captureContextCompactionResult(result, expectedMessagesBefore) {
     }).value;
 }
 function validateCompletedCompaction(snapshot, expectedMessagesBefore) {
-    if (snapshot.method !== 'llm_checkpoint') {
+    if (snapshot.method !== 'llm_checkpoint' && snapshot.method !== 'llm_segment_checkpoint') {
         throw new ContextCompactionResultValidationError('method');
     }
     if (typeof snapshot.summary !== 'string') {
@@ -516,12 +396,19 @@ function validateCompletedCompaction(snapshot, expectedMessagesBefore) {
     validateHmidOverflowRecovery(snapshot);
     validateCompletedTokenUsage(snapshot);
     validateReplacement(snapshot, expectedMessagesBefore);
+    if (snapshot.method === 'llm_segment_checkpoint')
+        validateSegmentPlan(snapshot);
     validateCounts(snapshot, [
         'tokensBefore',
         'tokensAfter',
         'serializedBytesBefore',
         'serializedBytesAfter',
     ]);
+}
+function validateSegmentPlan(result) {
+    if (readSegmentCheckpointPlan(segmentPlanFields(result.segment), result.messagesAfter))
+        return;
+    throw new ContextCompactionResultValidationError('segment');
 }
 function validateCompletedTokenUsage(snapshot) {
     if (Object.hasOwn(snapshot, 'tokenUsage') &&
@@ -556,6 +443,7 @@ export function createCompactionReplaceMetadata(result, phase, attemptId) {
         messagesAfter: result.messagesAfter,
         compactionPhase: phase,
         ...(result.hmidOverflowRecovered ? { hmidOverflowRecovered: true } : {}),
+        ...(result.method === 'llm_segment_checkpoint' ? segmentPlanFields(result.segment) : {}),
         ...(contextUsage === undefined ? {} : { contextUsage }),
         ...compactionTokenUsageMetadata(tokenUsage),
     }).value;
@@ -607,6 +495,7 @@ export function readCompactionLifecycleMetadata(value) {
             : {}),
         ...(contextUsage === undefined ? {} : { contextUsage }),
         ...compactionTokenUsageMetadata(tokenUsage),
+        ...readBackgroundSegment(value, method),
     });
 }
 function readCompactionLifecycleCounts(value) {
@@ -633,7 +522,7 @@ function readCompactionLifecycleCounts(value) {
         : undefined;
 }
 function readCompactionMethod(value) {
-    return value === 'llm_checkpoint' ? value : undefined;
+    return value === 'llm_checkpoint' || value === 'llm_segment_checkpoint' ? value : undefined;
 }
 export function readPostCompactionContextUsage(value) {
     if (!isRecord(value) || Reflect.get(value, 'totalCountSource') !== 'LOCAL_ESTIMATE') {

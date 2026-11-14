@@ -280,7 +280,18 @@ function toDesktopModePayload(payload) {
         view.featureKey = payload.featureKey;
     if (payload.planReview)
         view.planReview = { ...payload.planReview };
+    if (payload.pluginPreparation) {
+        view.pluginPreparation = toDesktopPluginPreparation(payload.pluginPreparation);
+    }
     return view;
+}
+function toDesktopPluginPreparation(preparation) {
+    return {
+        pluginName: preparation.pluginName,
+        reason: preparation.reason,
+        ...(preparation.requiredApps ? { requiredApps: [...preparation.requiredApps] } : {}),
+        ...(preparation.outcome ? { outcome: preparation.outcome } : {}),
+    };
 }
 function toDesktopStep(step) {
     return {

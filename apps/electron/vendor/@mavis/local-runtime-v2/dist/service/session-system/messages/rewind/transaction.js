@@ -1,7 +1,9 @@
 import { and, asc, desc, eq, gte, inArray } from 'drizzle-orm';
 import { messageRows, sessionAssetIndexState, sessionAssets, } from '../../../../infra/db/schema/messages.js';
 import { tokenUsage } from '../../../../infra/db/schema/usage.js';
-export function commitSessionRewind(db, nowMs, input) {
+import { MessageWriteObservers } from '../repo/write-observers.js';
+const NO_OBSERVERS = new MessageWriteObservers();
+export function commitSessionRewind(db, nowMs, input, writes = NO_OBSERVERS) {
     return db.transaction((tx) => {
         const target = requireTargetOrIdempotent(tx, input);
         const deletedMessageIds = target
@@ -17,6 +19,7 @@ export function commitSessionRewind(db, nowMs, input) {
                     .where(and(eq(sessionAssets.sessionId, input.sessionId), inArray(sessionAssets.messageId, deletedMessageIds)))
                     .run();
             }
+            writes.deleted(tx, { sessionId: input.sessionId, messageIds: deletedMessageIds });
         }
         if (input.affectedTurnIds.length > 0) {
             tx.delete(tokenUsage)

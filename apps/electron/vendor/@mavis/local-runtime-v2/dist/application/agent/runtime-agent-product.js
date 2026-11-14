@@ -1,5 +1,7 @@
+import { createCoordinatorConfigRepair } from './coordinator-config-repair.js';
 import { createV2AgentExecutionSource } from './execution-source.js';
 import { createV2AgentProfileSource } from './profile-source.js';
+import { ownsElectronRuntimeCapabilities } from './runtime-browser-use-composition.js';
 import { createComputerUseTurnToolSafetyGuard, } from '../../service/computer-use/index.js';
 import { isGitRepo } from '../../service/workspace/index.js';
 import { createModelAccessAuthoring, withCapabilityOwnedSkills, } from './capability-owned-skills.js';
@@ -9,14 +11,22 @@ export function createRuntimeAgentProduct(options) {
     const { baseProduct, agentService, modelConfig, logger, nowMs, runtimeOwnerKind, capabilityProfile, miniappAvailable, pptPreviewAvailable, implicitCustomProviderThinking, systemPromptOverrides, agentReferenceProjection, inspector, promptSnapshots, internalTurnPromptReads, browserUse, globalInstructions, } = options;
     const baseSkills = baseProduct.preparation.configBuilder.skills;
     const authoring = createModelAccessAuthoring(options.modelAccessExtensionTool, runtimeOwnerKind);
+    // Same condition as the search_plugins / request_plugin extension (Electron local conversations).
+    const pluginRecommendationHost = ownsElectronRuntimeCapabilities(runtimeOwnerKind);
     return {
         ...baseProduct,
+        coordinatorConfigRepair: createCoordinatorConfigRepair(agentService),
         toolSources: {
             resolve: async (turnInput) => {
                 const base = await baseProduct.toolSources.resolve({
                     ...turnInput,
                     miniappAvailable,
                     pptPreviewAvailable,
+                    ...(pluginRecommendationHost &&
+                        turnInput.session.sessionKind === 'conversation' &&
+                        !turnInput.session.miniAppOrigin
+                        ? { pluginRecommendationAvailable: true }
+                        : {}),
                 });
                 if (turnInput.toolsDisabled)
                     return base;
@@ -74,6 +84,7 @@ export function createRuntimeAgentProduct(options) {
                 nowMs,
                 miniappAvailable,
                 pptPreviewAvailable,
+                pluginRecommendationAvailable: pluginRecommendationHost,
                 modelRepairLogger: logger,
                 staticPrompts: createLocalStaticPromptReader({ logger, globalInstructions }),
                 tuiProductPolicy: runtimeOwnerKind === 'tui',

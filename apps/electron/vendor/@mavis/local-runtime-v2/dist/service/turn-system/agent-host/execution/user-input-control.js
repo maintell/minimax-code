@@ -1,10 +1,22 @@
 import { toPiUserMessage, } from '@mavis/agent-core/pi-turn-runner';
 import { emitLocalPluginHookWarnings, localPluginHookCoordinator as pluginHookCoordinator, renderPluginHookRejectionReminder, } from '../assembly/local-turn-plugin-hooks.js';
+import { createWakeLineMessage, resolveInputWakeReason } from '../preparation/turn-wake-reasons.js';
+import { createRecallPointersMessage } from './turn-state-layer/state-delta-message.js';
 import { isHandedBackOnClose, isUserSteeringProducer } from '../runner/contracts.js';
 import { AgentHostTurnCloseError } from '../runner/turn-close-error.js';
 import { joinUserPrompt } from './prompt.js';
 const MAX_PLUGIN_STOP_CONTINUATIONS = 8;
-export function createContinuationControl(input, prepare, onConsumed) {
+/**
+ * Wait for the Turn's own background shell only at a natural exit with
+ * nothing else to run; never once the Turn's work is closed.
+ */
+export function waitsForChildBash(context, messageCount, continuation) {
+    return (context?.boundary === 'exit' &&
+        context.workClosed !== true &&
+        messageCount === 0 &&
+        !continuation.shouldStopAfterSteering?.());
+}
+export function createContinuationControl(input, prepare, onConsumed, options = {}) {
     const { control } = input;
     const hookFollowUps = [];
     const pluginStopState = { active: false, continuationCount: 0 };
@@ -22,6 +34,8 @@ export function createContinuationControl(input, prepare, onConsumed) {
             const batchId = snapshotBatchId(messages, input.lease.turnId);
             const acceptedUserMessageIds = [];
             const consumed = new Set();
+            /** Indices a Plugin Hook replaced with its rejection reminder. */
+            const hookDenied = new Set();
             // Deferred entries, a stopping prompt, and every item after it remain
             // unconsumed. Restore them in one FIFO claim ahead of newer arrivals.
             const restoreUnconsumed = () => {
@@ -30,46 +44,69 @@ export function createContinuationControl(input, prepare, onConsumed) {
                 if (unconsumed.length > 0)
                     control.restoreSteering(unconsumed);
             };
-            try {
-                for (const [index, message] of messages.entries()) {
-                    if (deferUserProducers &&
-                        isHandedBackOnClose(message.producerId, context?.workClosed === true)) {
-                        continue;
-                    }
-                    const result = await preparePluginSteeringMessage(input, message, prepare);
-                    if (result.kind === 'stop') {
-                        stopAfterSteering = true;
-                        consumed.clear();
-                        prepared.length = 0;
-                        acceptedUserMessageIds.length = 0;
-                        // The visible runtime warning explains why this turn stopped.
-                        break;
-                    }
-                    consumed.add(index);
-                    const memberBatchId = result.userBatchMember ? batchId : undefined;
-                    prepared.push(markBatchMessage(result.message, memberBatchId, message.createdAt));
-                    if (result.acceptedUserMessageId) {
-                        acceptedUserMessageIds.push({
-                            id: result.acceptedUserMessageId,
-                            batchId: memberBatchId,
-                        });
-                    }
+            const wakeLines = createWakeLineWriter(options.wakeLineBeforeUserSteering === true, options.recallPointers);
+            /**
+             * One drained message of this poll. Resolves `true` when a Plugin Hook
+             * stopped the Turn, which is where the old loop `break`ed; `false` is the
+             * old `continue` and the ordinary path. Every branch, its order and its
+             * side effects are unchanged — this only gives them their own frame.
+             */
+            const consumeOne = async (index, message) => {
+                if (deferUserProducers &&
+                    isHandedBackOnClose(message.producerId, context?.workClosed === true)) {
+                    return false;
                 }
+                const result = await preparePluginSteeringMessage(input, message, prepare);
+                if (result.kind === 'stop') {
+                    stopAfterSteering = true;
+                    consumed.clear();
+                    hookDenied.clear();
+                    prepared.length = 0;
+                    acceptedUserMessageIds.length = 0;
+                    // The visible runtime warning explains why this turn stopped.
+                    return true;
+                }
+                consumed.add(index);
+                if (result.hookDenied === true)
+                    hookDenied.add(index);
+                prepared.push(...wakeLines.before(message, result));
+                const memberBatchId = result.userBatchMember ? batchId : undefined;
+                prepared.push(markBatchMessage(result.message, memberBatchId, message.createdAt));
+                if (result.acceptedUserMessageId) {
+                    acceptedUserMessageIds.push({
+                        id: result.acceptedUserMessageId,
+                        batchId: memberBatchId,
+                    });
+                }
+                return false;
+            };
+            /** Report every consumed message in index order, once, after the pass. */
+            const reportConsumed = async () => {
                 for (const index of consumed) {
                     await onConsumed?.({
                         sessionId: input.lease.sessionId,
                         turnId: input.lease.turnId,
                         message: messages[index],
+                        ...(hookDenied.has(index) ? { hookDenied: true } : {}),
                     });
                 }
+            };
+            try {
+                for (const [index, message] of messages.entries()) {
+                    if (await consumeOne(index, message))
+                        break;
+                }
+                await reportConsumed();
             }
             catch (error) {
                 consumed.clear();
+                hookDenied.clear();
                 restoreUnconsumed();
                 throw error;
             }
             restoreUnconsumed();
             registerBatchIdentities(input, acceptedUserMessageIds);
+            notifyReplyInput(options.onAcceptedInput, consumed, messages, acceptedUserMessageIds);
             const accepted = new Set(messages.filter((_, index) => consumed.has(index)));
             const completeClaims = claims.filter((claim) => (claim.batchMembers ?? [claim]).every((message) => accepted.has(message)));
             if (completeClaims.length > 0)
@@ -97,6 +134,43 @@ export function createContinuationControl(input, prepare, onConsumed) {
             throw new AgentHostTurnCloseError(result.reason, result.reason === 'aborted' ? result.abortReason : undefined);
         },
     };
+}
+function createWakeLineWriter(enabled, recallPointers) {
+    let previousUserSteer = false;
+    return {
+        before(message, result) {
+            const fromUser = result.hookDenied !== true &&
+                resolveInputWakeReason({
+                    provenance: message.provenance,
+                    origin: message.message.origin,
+                }) === 'user';
+            const userSteer = enabled && fromUser;
+            const first = userSteer && !previousUserSteer;
+            previousUserSteer = userSteer;
+            const timestamp = message.createdAt ?? Date.now();
+            const pointers = fromUser
+                ? recallPointersOf(recallPointers, {
+                    userText: message.genuineUserQueryText,
+                    currentMessageIds: message.userMessageId ? [message.userMessageId] : [],
+                })
+                : '';
+            return [
+                ...(first ? [createWakeLineMessage(['user'], timestamp)] : []),
+                ...(pointers ? [createRecallPointersMessage(pointers, timestamp)] : []),
+            ];
+        },
+    };
+}
+/** A failed lookup never holds up the steered message. */
+function recallPointersOf(recallPointers, steered) {
+    if (!recallPointers || !steered.userText.trim())
+        return '';
+    try {
+        return recallPointers(steered);
+    }
+    catch {
+        return '';
+    }
 }
 async function finishPluginStopAndTrack(input, hookFollowUps, closeContext, state) {
     const closed = await finishPluginStop(input, hookFollowUps, {
@@ -149,6 +223,7 @@ async function preparePluginSteeringMessage(input, message, prepare) {
                 text: renderPluginHookRejectionReminder(hookResult.decision.reason),
             }),
             userBatchMember: false,
+            hookDenied: true,
             acceptedUserMessageId: undefined,
         };
     }
@@ -288,5 +363,29 @@ export async function resolveChildBashSteeringContext(context, childBash) {
         return { boundary: 'mid-turn' };
     }
     return context;
+}
+function notifyReplyInput(notify, consumed, messages, accepted) {
+    if (!notify || !consumed.size)
+        return;
+    const [index] = consumed;
+    notify(consumed.size === 1 && accepted.length === 1 ? messages[index] : undefined);
+}
+/** The Turn's user steering as seen by `interruptOnSteer` tools; absent without a probe. */
+export function userSteeringToolContext(control) {
+    const { hasPendingUserSteering, steeringSignal } = control;
+    if (!hasPendingUserSteering)
+        return {};
+    return {
+        userSteering: {
+            pending: () => hasPendingUserSteering(),
+            changed: () => steeringSignal?.(),
+        },
+    };
+}
+export function preparePlainSteering(input) {
+    return Promise.resolve({
+        userMessage: { text: input.message.text },
+        genuineUserQueryText: input.genuineUserQueryText,
+    });
 }
 //# sourceMappingURL=user-input-control.js.map

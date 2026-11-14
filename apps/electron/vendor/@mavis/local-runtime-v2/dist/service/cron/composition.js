@@ -41,22 +41,30 @@ export function composeCronService(options) {
         scheduler: options.scheduler,
         definitions,
         runs,
+        ...(options.mainConversationAgents
+            ? { mainConversationAgents: options.mainConversationAgents }
+            : {}),
     });
     const executor = new CronExecutor({
         db: options.db,
         definitions,
         runs,
+        scheduler: options.scheduler,
         lifecycle,
         sessionCreation: options.sessionPorts?.sessionCreation ?? FAIL_CLOSED_SESSION_CREATION,
         delivery: options.sessionPorts?.delivery ?? FAIL_CLOSED_DELIVERY,
         nowMs,
         logger: options.executionLogger ?? NOOP_EXECUTION_LOGGER,
         metrics,
+        ...(options.mainConversationAgents
+            ? { mainConversationAgents: options.mainConversationAgents }
+            : {}),
     });
-    const acceptScheduledTrigger = (schedulerId, job, metricTask) => {
+    const acceptScheduledTrigger = (schedulerId, job, scheduledForMs, metricTask) => {
         const accepted = executor.acceptScheduledTrigger({
             schedulerId,
             triggerId: `${schedulerId}:${job.scheduleGeneration}:${job.runCount}`,
+            scheduledForMs,
             ...(metricTask ? { triggerMetric: { source: 'schedule', task: metricTask } } : {}),
         });
         if (!accepted.accepted && metricTask) {
@@ -66,18 +74,20 @@ export function composeCronService(options) {
             throw new Error('Cron scheduled trigger persistence failed');
         }
     };
-    options.scheduler.registerHandler(CRON_SCHEDULER_HANDLER_KEY, async (schedulerId) => {
+    options.scheduler.registerHandler(CRON_SCHEDULER_HANDLER_KEY, async (schedulerId, scheduledForMs) => {
         const job = options.scheduler.get(schedulerId);
         if (!job)
             return;
         const metricTask = resolveScheduledMetricTask(definitions, job);
         const definition = definitions.getBySchedulerId(schedulerId);
-        if (definition && (await executor.isTargetArchived(definition))) {
+        if (definition &&
+            (options.isAgentPaused?.(definition.agentName) === true ||
+                (await executor.isTargetArchived(definition)))) {
             if (metricTask)
                 metrics.taskTriggered(metricTask, 'schedule', 'skipped');
             return;
         }
-        acceptScheduledTrigger(schedulerId, job, metricTask);
+        acceptScheduledTrigger(schedulerId, job, scheduledForMs, metricTask);
     });
     const service = createCronService({
         reviewContent: options.reviewContent,

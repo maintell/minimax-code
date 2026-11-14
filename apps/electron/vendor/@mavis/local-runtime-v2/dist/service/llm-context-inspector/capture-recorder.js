@@ -14,7 +14,11 @@ export function wrapResolvedFetchForCapture(baseFetch) {
         return baseFetch(input, init);
     };
 }
-/** Captures one successful logical Call while discarding every failed attempt. */
+/**
+ * Captures one logical Call with the request of its final attempt. A Call that
+ * failed is kept too (marked `outcome: 'error'`) so the rejected request body
+ * can be inspected; earlier retried attempts are never kept.
+ */
 export function createLlmCaptureRecorder(options) {
     let candidate;
     const persistedCallIds = new Set();
@@ -80,7 +84,8 @@ export function createLlmCaptureRecorder(options) {
             if (!shouldPersist(event, settled))
                 return;
             persistedCallIds.add(event.callId);
-            const expectedTools = event.expectedTools ?? [];
+            const failed = event.final.outcome === 'error';
+            const expectedTools = failed ? [] : (event.expectedTools ?? []);
             bindExpectedTools(toolOwners, event.callId, expectedTools);
             const persist = persistSettledCallIgnoringFailure(options.sink, {
                 sessionId: options.sessionId,
@@ -98,6 +103,7 @@ export function createLlmCaptureRecorder(options) {
                 ...(event.usage ? { usage: event.usage } : {}),
                 expectedTools,
                 captureEpoch: settled.captureEpoch,
+                ...(failed ? { outcome: 'error' } : {}),
             });
             pending.add(persist);
         },
@@ -111,7 +117,7 @@ export function createLlmCaptureRecorder(options) {
         },
     };
     function shouldPersist(event, settled) {
-        if (event.scope !== CAPTURED_SCOPE || event.final.outcome !== 'success')
+        if (event.scope !== CAPTURED_SCOPE || event.final.outcome === 'abort')
             return false;
         if (!settled || persistedCallIds.has(event.callId))
             return false;

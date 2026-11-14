@@ -5,8 +5,11 @@
  * 以 `来源: ` 起头列出来源 Session。程序依赖该前缀做确定性退出与直编。
  */
 import { formatProductTime } from '@mavis/shared/product-time';
+import { countTokens as countO200kBaseTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { REDACTION_MARK, redactMemorySecrets } from '../secret-redactor.js';
+import { noteFilePath } from './memory-files.js';
 const SOURCE_LINE_RE = /^\s*来源:\s*(.+)$/u;
-/** 把产物按行切成「条目块 / 其它行」序列，供删除与重组。 */
+/** 把产物按行切成「条目块 / 其它行」序列，供删除、重组与准入核对。 */
 function splitEntries(markdown) {
     const lines = markdown.split('\n');
     const parts = [];
@@ -150,6 +153,226 @@ export function simpleLineDiff(oldText, newText) {
     for (const line of newLines.slice(start, newEnd))
         parts.push(`+ ${line}`);
     return parts.join('\n');
+}
+const PREFERENCE_HEADING = '## 用户偏好';
+const SEARCH_KEY_RE = /\[搜:([^\]]+)\]/gu;
+const GLOBAL_SCOPE_RE = /适用[:：]\s*全局/u;
+const QUOTE_RE = /["“「]([^"”」\n]{4,})["”」]/gu;
+const SUPERSEDED_RE = /^-\s*~~/u;
+const SECTION_BOUNDARY_RE = /^#{1,2} /u;
+/** V1 记忆迁移生成的会话文档 ID 前缀（legacy-migration-service `deriveLegacySessionId`）。 */
+const LEGACY_SOURCE_PREFIX = 'legacy-';
+export function pruneUnverifiedSummaryPreferences(input) {
+    const lines = input.summaryMarkdown.split('\n');
+    const section = findSection(lines, PREFERENCE_HEADING);
+    if (!section)
+        return { markdown: input.summaryMarkdown, removed: 0 };
+    const entries = currentIndexEntries(input.indexMarkdown);
+    const kept = [];
+    let removed = 0;
+    for (const part of splitEntries(lines.slice(section.start + 1, section.end).join('\n'))) {
+        if (typeof part === 'string') {
+            kept.push(part);
+        }
+        else if (part.lines.every((line) => input.protectedLines.has(line)) ||
+            isVerified(part.lines.join('\n'), entries, input)) {
+            kept.push(...part.lines);
+        }
+        else {
+            removed += 1;
+        }
+    }
+    if (removed === 0)
+        return { markdown: input.summaryMarkdown, removed };
+    const markdown = [
+        ...lines.slice(0, section.start + 1),
+        ...kept,
+        ...lines.slice(section.end),
+    ].join('\n');
+    return { markdown, removed };
+}
+/** 摘要「用户偏好」区的正文行（不含标题），换行先统一为 LF。 */
+export function summaryPreferenceLines(summaryMarkdown) {
+    const lines = summaryMarkdown.replace(/\r\n?/gu, '\n').split('\n');
+    const section = findSection(lines, PREFERENCE_HEADING);
+    return section ? lines.slice(section.start + 1, section.end) : [];
+}
+/** 每个搜索键都必须唯一命中一条当前有效条目，且该条目是有原话来源的全局偏好。 */
+function isVerified(line, entries, evidence) {
+    const keys = [...line.matchAll(SEARCH_KEY_RE)].map((match) => match[1]);
+    if (keys.length === 0)
+        return false;
+    return keys.every((key) => {
+        const matched = entries.filter((entry) => entry.lines.some((text) => text.includes(key)));
+        return matched.length === 1 && isSourcedGlobalPreference(matched[0], evidence);
+    });
+}
+function isSourcedGlobalPreference(entry, evidence) {
+    const text = entry.lines.join('\n');
+    if (!GLOBAL_SCOPE_RE.test(text))
+        return false;
+    const quotes = extractQuotes(text);
+    return entry.sourceSessionIds.some((id) => {
+        const passages = evidencePassages(id, evidence);
+        return quotes.some((quote) => passages.some((passage) => passage.includes(quote)));
+    });
+}
+/** 来源中可作为原话依据的正文：会话文档取「用户偏好」条目，note 取去掉引用符号的全文。 */
+function evidencePassages(sourceId, evidence) {
+    if (sourceId.startsWith(LEGACY_SOURCE_PREFIX))
+        return [];
+    const note = evidence.noteDocs.get(sourceId);
+    if (note !== undefined)
+        return [normalize(note.replace(/^>\s?/gmu, ''))];
+    const doc = evidence.sessionDocs.get(sourceId);
+    return doc === undefined ? [] : preferenceItems(doc);
+}
+/** 当前有效条目：带来源标注且未被标为已替代。 */
+function currentIndexEntries(indexMarkdown) {
+    return splitEntries(indexMarkdown).filter((part) => typeof part !== 'string' &&
+        part.sourceSessionIds.length > 0 &&
+        !SUPERSEDED_RE.test(part.lines[0] ?? ''));
+}
+/** 会话文档「用户偏好」小节的全部条目（范围由模型判断，不在这里过滤），已归一化。 */
+function preferenceItems(doc) {
+    const lines = doc.split('\n');
+    const section = findSection(lines, PREFERENCE_HEADING);
+    if (!section)
+        return [];
+    return splitEntries(lines.slice(section.start + 1, section.end).join('\n'))
+        .filter((part) => typeof part !== 'string')
+        .map((part) => normalize(part.lines.join('\n')));
+}
+/** 标题行下标与小节结束下标（下一个一、二级标题或文末）；标题不存在时返回 undefined。 */
+function findSection(lines, heading) {
+    const start = lines.findIndex((line) => line.trim() === heading);
+    if (start < 0)
+        return undefined;
+    const next = lines.findIndex((line, index) => index > start && SECTION_BOUNDARY_RE.test(line));
+    return { start, end: next < 0 ? lines.length : next };
+}
+function extractQuotes(text) {
+    return [...text.matchAll(QUOTE_RE)].map((match) => normalize(match[1])).filter(Boolean);
+}
+function normalize(text) {
+    return text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+}
+// ---------------------------------------------------------------------------
+// 摘要「## 记忆请求」节（§5.18）
+//
+// 用户显式要求记住的内容由程序在保存 note 时直接写进已发布摘要，新开的会话读摘要即可看到。
+// 这一节不属于「## 用户偏好」：既不受准入门核对，也不受手改保护；整理把对应 note 归置进
+// 正式记忆后删除该行。
+// ---------------------------------------------------------------------------
+const REQUEST_HEADING = '## 记忆请求';
+/**
+ * 已发布摘要的最低合同（§5.6）：首行是精确的 `v2`。
+ * 整理发布与程序直编共用这一个判断，避免两处口径漂移。
+ */
+export function isPublishedSummary(markdown) {
+    return markdown.replace(/\r\n?/gu, '\n').split('\n')[0]?.trim() === 'v2';
+}
+/** 摘要注入预算的同一计数口径（§2.3 `maxSummaryInjectionTokens`）。 */
+export function exceedsSummaryBudget(markdown, maxSummaryTokens) {
+    return countO200kBaseTokens(markdown, { disallowedSpecial: new Set() }) > maxSummaryTokens;
+}
+/**
+ * 单行请求正文的字符上限。摘要整体预算默认只有 2,500 token，一条请求最多占其中一小段；
+ * 超长部分截断，模型按行尾的 note 路径用 `memories_read` 读全文。
+ */
+const MAX_REQUEST_BODY_CHARS = 200;
+/**
+ * 把一条记忆请求插进摘要的「## 记忆请求」节：正文压成一行、脱敏后截断、行尾附 note 路径。
+ * 项目范围标注取自 note frontmatter 或 workspace 路径，不是用户口述内容，不参与脱敏。
+ * 节不存在时紧跟首行 `v2` 新建，天然位于第一个二级标题之前；已存在时追加到节末尾。
+ * 按 note 路径查重，同一次保存重放不会写出第二行。
+ */
+export function insertSummaryRequestLine(input) {
+    if (!isPublishedSummary(input.summaryMarkdown))
+        return { status: 'rejected', reason: 'summary-not-v2' };
+    const lines = input.summaryMarkdown.replace(/\r\n?/gu, '\n').split('\n');
+    if (lines.some((line) => line.includes(input.notePath)))
+        return { status: 'already-present' };
+    const line = renderSummaryRequestLine(input.note, input.notePath, input.projectLabel);
+    const out = [...lines];
+    const section = findSection(lines, REQUEST_HEADING);
+    if (section) {
+        let at = section.end;
+        while (at > section.start + 1 && out[at - 1].trim() === '')
+            at -= 1;
+        out.splice(at, 0, line);
+    }
+    else {
+        out.splice(1, 0, '', REQUEST_HEADING, line, '');
+    }
+    const markdown = collapseBlankRuns(out).join('\n');
+    if (exceedsSummaryBudget(markdown, input.maxSummaryTokens))
+        return { status: 'rejected', reason: 'summary-budget-exceeded' };
+    return { status: 'inserted', markdown, line };
+}
+/** 单行请求：项目范围标注 + 正文一行化、脱敏后截断，行尾附 note 路径供模型读全文。 */
+function renderSummaryRequestLine(note, notePath, projectLabel) {
+    const oneLine = note.replace(/\s+/gu, ' ').trim();
+    // 先脱敏再截断：反过来会把密钥切成不匹配规则的碎片，反而留下残缺密钥。
+    const body = truncateRequestBody(redactMemorySecrets(oneLine).content);
+    const scope = projectLabel ? `[项目: ${projectLabel}] ` : '';
+    return `- ${scope}${body}（note: ${notePath}）`;
+}
+/**
+ * 从摘要的「## 记忆请求」节删掉指向给定 note 的行；节里删空后连标题一起去掉。
+ * 遗忘、排除与会话删除都走这里，请求行不会在 note 消失后继续留在摘要里(§5.18)。
+ */
+function removeSummaryRequestLines(markdown, notePaths) {
+    if (notePaths.size === 0)
+        return { markdown, removed: 0 };
+    const lines = markdown.replace(/\r\n?/gu, '\n').split('\n');
+    const section = findSection(lines, REQUEST_HEADING);
+    if (!section)
+        return { markdown, removed: 0 };
+    let removed = 0;
+    const kept = [];
+    for (const line of lines.slice(section.start + 1, section.end)) {
+        const matches = [...notePaths].some((path) => line.includes(`（note: ${path}）`));
+        if (matches)
+            removed += 1;
+        else
+            kept.push(line);
+    }
+    if (removed === 0)
+        return { markdown, removed };
+    const body = kept
+        .filter((line, index) => line.trim() !== '' || index > 0)
+        .join('\n')
+        .trim();
+    const head = body.length > 0 ? [REQUEST_HEADING, ...body.split('\n'), ''] : [];
+    return {
+        markdown: collapseBlankRuns([
+            ...lines.slice(0, section.start),
+            ...head,
+            ...lines.slice(section.end),
+        ]).join('\n'),
+        removed,
+    };
+}
+/** 删掉指向某个 note 的请求行，作为 editSummaryAndBaseline 的编辑回调。 */
+export function dropRequestLineEdit(markdown, noteSessionId) {
+    const edited = removeSummaryRequestLines(markdown, new Set([noteFilePath(noteSessionId)]));
+    return edited.removed > 0
+        ? { status: 'changed', markdown: edited.markdown }
+        : { status: 'unchanged' };
+}
+/** 按码点截断；截断落在脱敏标记中间时整体丢弃该标记，不留半个 `[REDACTED`。 */
+function truncateRequestBody(body) {
+    const chars = Array.from(body);
+    if (chars.length <= MAX_REQUEST_BODY_CHARS)
+        return body;
+    const cut = chars.slice(0, MAX_REQUEST_BODY_CHARS).join('');
+    for (let length = REDACTION_MARK.length - 1; length > 0; length -= 1) {
+        const prefix = REDACTION_MARK.slice(0, length);
+        if (cut.endsWith(prefix))
+            return `${cut.slice(0, -length)}…`;
+    }
+    return `${cut}…`;
 }
 /** 连续空行折叠为一行，避免直编后留下空洞。 */
 function collapseBlankRuns(lines) {

@@ -12,14 +12,16 @@
 // locally: they are sent unchanged and the upstream decides.
 //
 // Non-official routes (custom providers, configured providers) keep their own
-// contract: an unlisted Session pin is left to the BYOK resolver, while an
-// explicit, default or frozen reference is refused here, because past this gate
-// that resolver silently swaps an unresolvable provider for a builtin model.
+// contract, but a Session pin is no longer waved through unchecked: a pin this
+// route can call runs as stored, a pin that only lacks the `custom_provider:`
+// prefix the write side now writes is resolved under that prefix, and anything
+// else is refused here — past this gate an unresolvable provider id is parsed as
+// a builtin managed provider and fails with a credential error instead.
 //
 // Persistence is injected: this module (and the config builder) must not import
 // a repository or write SQL. Composition supplies `repairSessionModel` once the
 // SessionSystem is ready, backed by the existing record-service mutation.
-import { getRuntimePresetKey, resolveModelAvailability, resolveModelReplacement, } from '@mavis/config';
+import { CUSTOM_PROVIDER_ID_PREFIX, MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID, getRuntimePresetKey, resolveModelAvailability, resolveModelReplacement, } from '@mavis/config';
 import { resolveLegacyMinimaxModel, } from '../../../../model-system/index.js';
 /** Stable local failure; never produced after an upstream request was started. */
 export class ModelRouteAvailabilityError extends Error {
@@ -97,7 +99,13 @@ function keepUnreplaceable(input, selection, outcome, log) {
  * unresolvable provider for a builtin model the user did not choose.
  */
 function gateUnmanagedRoute(input, selection, log, from) {
-    if (selection.source === 'session_override') {
+    // A Session pin on a route that owns its model list stays with the BYOK
+    // resolver: that config can change between writes, so a miss here says
+    // nothing. The exception is a pin whose provider id is not a configured
+    // provider at all — it can only come from a write that dropped the
+    // `custom_provider:` prefix, and past this gate it parses as a builtin
+    // managed provider and fails on credentials instead of on the model.
+    if (selection.source === 'session_override' && !isBareProviderPin(input.config, selection)) {
         logModelGateOutcome(input.logger, {
             outcome: 'passthrough',
             reason: 'unmanaged_route',
@@ -115,6 +123,19 @@ function gateUnmanagedRoute(input, selection, log, from) {
     });
     if (availability.available)
         return selection;
+    if (selection.source === 'session_override') {
+        const canonical = canonicalCustomProviderSelection(input.config, selection);
+        if (canonical) {
+            logModelGateOutcome(input.logger, {
+                outcome: 'canonicalized',
+                reason: 'custom_provider_prefix',
+                ...log,
+                model: from,
+                to_model: `${canonical.providerId}/${canonical.modelId}`,
+            });
+            return canonical;
+        }
+    }
     logModelGateOutcome(input.logger, {
         outcome: 'rejected',
         ...log,
@@ -122,6 +143,43 @@ function gateUnmanagedRoute(input, selection, log, from) {
         code: availability.code,
     });
     throw new ModelRouteAvailabilityError(availability.code, availability.message);
+}
+/**
+ * A Session pin whose provider id is neither reserved, nor already a
+ * `custom_provider:` id, nor a provider this config declares. Only such a pin
+ * is judged here; every other unmanaged pin keeps its own route's contract.
+ */
+function isBareProviderPin(config, selection) {
+    const { providerId } = selection;
+    return !(providerId.startsWith(CUSTOM_PROVIDER_ID_PREFIX) ||
+        providerId === MANAGED_MINIMAX_PROVIDER_ID ||
+        providerId === MINIMAX_API_PROVIDER_ID ||
+        Object.hasOwn(config.provider, providerId));
+}
+/**
+ * The same model under the `custom_provider:` prefix the picker writes.
+ *
+ * A Session pinned before the write side canonicalized its key stores the bare
+ * provider key. That id parses as a builtin managed provider, so the Turn fails
+ * with `api_key not configured` / `managed-login requires a known managed
+ * base_url` even though the very same model is configured and callable. Only
+ * the provider id changes; the stored key is left for the user to re-save.
+ */
+function canonicalCustomProviderSelection(config, selection) {
+    if (selection.providerId.startsWith(CUSTOM_PROVIDER_ID_PREFIX) ||
+        selection.providerId === MANAGED_MINIMAX_PROVIDER_ID ||
+        selection.providerId === MINIMAX_API_PROVIDER_ID) {
+        return undefined;
+    }
+    const providerId = `${CUSTOM_PROVIDER_ID_PREFIX}${selection.providerId}`;
+    const availability = resolveModelAvailability({
+        config,
+        providerId,
+        modelId: selection.modelId,
+        preset: getRuntimePresetKey(),
+        source: selection.source,
+    });
+    return availability.available ? { ...selection, providerId } : undefined;
 }
 /** Maps a retired managed alias to its official model; only a Session pin is repaired. */
 async function resolveLegacySelection(input, selection) {
@@ -320,7 +378,8 @@ export function createSessionModelRepair(records, logger, onRepaired) {
         },
     };
 }
-function parseModelKey(value) {
+/** `provider/model` from config; the model id may itself contain `/`. */
+export function parseModelKey(value) {
     const parsed = parseModelReference(value);
     if (!parsed) {
         const raw = value?.trim();
@@ -354,5 +413,56 @@ function modelOverrideFromSession(session) {
             : {}),
         ...(session.effectiveModelThinking ? { thinking: session.effectiveModelThinking } : {}),
     };
+}
+// ── Frozen Session model ────────────────────────────────────────
+export function usesLegacyFrozenSelection(requested, frozen) {
+    return !requested && frozen !== undefined && !frozen.parameterSnapshot;
+}
+export function withFrozenParameters(selection, requested, frozen) {
+    if (!requested && frozen?.parameterSnapshot)
+        return { ...selection, parameterSnapshot: frozen.parameterSnapshot };
+    return selection;
+}
+export function withFrozenSessionModelLimits(model, session, selection, isTask) {
+    if (!isTask || session.effectiveModel !== `${selection.providerId}/${selection.modelId}`) {
+        return model;
+    }
+    const contextWindow = positiveSessionLimit(session.effectiveModelContextWindow);
+    const maxTokens = positiveSessionLimit(session.effectiveModelMaxOutputTokens);
+    if (contextWindow === undefined && maxTokens === undefined)
+        return model;
+    return {
+        ...model,
+        ...(contextWindow === undefined ? {} : { context_window: contextWindow }),
+        ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
+    };
+}
+export function sessionWithFrozenModel(session, model) {
+    if (!model)
+        return session;
+    return {
+        ...session,
+        effectiveModel: `${model.providerId}/${model.modelId}`,
+        ...(model.variant === undefined
+            ? { effectiveModelVariant: null }
+            : { effectiveModelVariant: model.variant }),
+        ...(model.thinking === undefined
+            ? { effectiveModelThinking: null }
+            : {
+                effectiveModelThinking: {
+                    ...model.thinking,
+                    ...(model.thinking.budgets ? { budgets: { ...model.thinking.budgets } } : {}),
+                },
+            }),
+        ...(model.contextWindow === undefined
+            ? { effectiveModelContextWindow: null }
+            : { effectiveModelContextWindow: model.contextWindow }),
+        ...(model.maxOutputTokens === undefined
+            ? { effectiveModelMaxOutputTokens: null }
+            : { effectiveModelMaxOutputTokens: model.maxOutputTokens }),
+    };
+}
+function positiveSessionLimit(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 //# sourceMappingURL=session-model-selection.js.map

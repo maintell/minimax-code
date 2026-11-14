@@ -49,8 +49,10 @@ export class LocalFeishuOnboardHttpClient {
             return isPendingText(poll.error) ? { ok: true, pending: true } : poll;
         const appId = readString(poll.data, 'client_id');
         const appSecret = readString(poll.data, 'client_secret');
+        const userInfo = readRecord(poll.data, 'user_info');
+        const creatorOpenId = userInfo ? readString(userInfo, 'open_id') : undefined;
         return appId && appSecret
-            ? { ok: true, pending: false, appId, appSecret }
+            ? { ok: true, pending: false, appId, appSecret, creatorOpenId }
             : { ok: true, pending: true };
     }
     async beginUserDeviceCode(appId) {
@@ -112,7 +114,7 @@ export class LocalFeishuOnboardHttpClient {
         const data = parseJsonObject(text);
         if (!response.ok)
             return { ok: false, error: text || `HTTP ${response.status}` };
-        if (readString(data, 'error') && readString(data, 'error') !== 'authorization_pending') {
+        if (readString(data, 'error')) {
             return { ok: false, error: readString(data, 'error') ?? 'request failed' };
         }
         const code = readNumber(data, 'code');

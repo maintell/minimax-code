@@ -25,8 +25,11 @@ export function withCloudToolTargetHooks(tools, hooks) {
             return { block: true, reason: 'Cloud tool calls require a named tool target.' };
         }
         const targetContext = projectTarget(context, resolution);
-        // Preserve the prepared argument object across every Hook and the final admission.
-        context.args.arguments = resolution.arguments;
+        // Preserve the prepared argument object across every Hook and the final admission;
+        // it replaces `arguments_json` so the input keeps exactly one argument field.
+        const args = context.args;
+        args.arguments = resolution.arguments;
+        delete args.arguments_json;
         try {
             const decision = await runBeforeHooks(hooks, targetContext, signal);
             if (decision?.block) {

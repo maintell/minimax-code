@@ -19,10 +19,7 @@ export function newHistory(turn, agent) {
         }
         catch (err) {
             deliveryFailure = err instanceof Error ? err : new Error(String(err));
-            turn.metrics.tryRecordTerminalFailure({
-                errorSource: 'history',
-                errorKind: 'persistence',
-            });
+            turn.metrics.tryRecordTerminalFailure({ errorSource: 'history', errorKind: 'persistence' }, err);
             try {
                 const errors = flattenHistoryErrors(err);
                 const loggedErrors = errors.slice(0, MAX_LOGGED_HISTORY_ERRORS);
@@ -90,6 +87,7 @@ export function newHistory(turn, agent) {
             if (delivered)
                 lastSnapshotLength = total;
         },
+        deliveryFailed: () => deliveryFailure !== undefined,
     };
 }
 function readMessageRole(message) {

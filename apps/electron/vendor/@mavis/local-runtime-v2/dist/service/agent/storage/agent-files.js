@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { isDefaultAgentAvatarMarker } from '@mavis/shared/agent-avatar';
+import { isDefaultAgentAvatarMarker, isBunnyAgentAvatarMarker } from '@mavis/shared/agent-avatar';
 import yaml from 'yaml';
+import lockfile from 'proper-lockfile';
 import { publishFileIfAbsent, replaceFileAtomically } from '../../../infra/file/jsonl.js';
 import { PRIMARY_AGENT_NAME, validateLookupName } from '../domain/names.js';
 import { isPrimaryFamilyName } from '../domain/primary-identity.js';
-import { AgentConfigError, assertSafeAgentAvatarDirectory, decodeAgentAvatarDataUrl, parseCanonicalAgentMarkdown, readBuiltinCanonicalAgentConfig, readCanonicalAgentConfig, readSafeAgentAvatar, readStableAgentMarkdown, serializeCanonicalAgentConfig, validateAgentAvatar, } from './canonical-agent-config.js';
+import { AgentConfigError, assertSafeAgentAvatarDirectory, contentTypeForAvatarExtension, decodeAgentAvatarDataUrl, parseCanonicalAgentMarkdown, readBuiltinCanonicalAgentConfig, readCanonicalAgentConfig, readSafeAgentAvatar, readStableAgentMarkdown, serializeCanonicalAgentConfig, validateAgentAvatar, } from './canonical-agent-config.js';
 import { assertBuiltinConfigModelOnlyUpdate, hasCanonicalPatch, isPerAgentReadAccessError, patchCanonicalMarkdown, rewriteMovedCanonicalCustomName, } from './canonical-agent-patch.js';
 export { BuiltinAgentConfigModelOnlyError } from './canonical-agent-patch.js';
 const CONFIG_FILE = 'config.yaml';
@@ -244,7 +245,7 @@ export class AgentFiles {
     async readCanonicalAvatar(name) {
         const config = await this.getCanonicalConfig(name);
         const avatar = config.xMavis?.avatar;
-        if (!avatar || isDefaultAgentAvatarMarker(avatar))
+        if (!avatar || isDefaultAgentAvatarMarker(avatar) || isBunnyAgentAvatarMarker(avatar))
             return undefined;
         const { bytes, extension } = await readSafeAgentAvatar(this.agentDir(name), avatar, this.dataDir);
         return { bytes, contentType: contentTypeForAvatarExtension(extension) };
@@ -666,6 +667,25 @@ export class AgentFiles {
             ? rm(this.agentDir(name), { recursive: true, force: true })
             : this.withLock(name, () => this.remove(name, true));
     }
+    /** Acquired before the service's existence check; not the instance-private file queue. */
+    async withCreationLock(name, operation) {
+        await this.ensureLayout(name);
+        // Canonicalize the directory so aliases/symlinks to the same profile share one lock.
+        // agent.md may not exist yet. proper-lockfile owns the sibling agent.md.lock directory.
+        const target = join(await realpath(this.agentDir(name)), SYSTEM_PROMPT_FILE);
+        const release = await lockfile.lock(target, {
+            realpath: false,
+            stale: 30_000,
+            update: 5_000,
+            retries: { retries: 100, factor: 1, minTimeout: 50, maxTimeout: 50 },
+        });
+        try {
+            return await operation();
+        }
+        finally {
+            await release();
+        }
+    }
     async withLock(name, operation) {
         const previous = this.locks.get(name) ?? Promise.resolve();
         let result;
@@ -820,24 +840,6 @@ export function documentRevision(content) {
 }
 function isAgentInstanceId(value) {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
-}
-function contentTypeForAvatarExtension(extension) {
-    switch (extension) {
-        case '.png':
-            return 'image/png';
-        case '.jpg':
-        case '.jpeg':
-            return 'image/jpeg';
-        case '.gif':
-            return 'image/gif';
-        case '.webp':
-            return 'image/webp';
-        default:
-            // readSafeAgentAvatar has already validated this extension. Keeping the
-            // impossible branch fail-closed protects the HTTP content type if that
-            // validator changes later.
-            throw new AgentConfigError('AGENT_CONFIG_AVATAR_INVALID', 'x-mavis.avatar', 'Avatar must be a supported image file.');
-    }
 }
 const isNotFound = (error) => error?.code === 'ENOENT';
 function isMalformedLegacyConfigPath(error) {

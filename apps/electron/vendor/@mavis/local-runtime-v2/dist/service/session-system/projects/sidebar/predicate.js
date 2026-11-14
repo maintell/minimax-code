@@ -5,6 +5,7 @@ import { projects as p } from '../../../../infra/db/schema/projects.js';
 import { turnIngress as t } from '../../../../infra/db/schema/turn.js';
 import { sessionAfterProjectRemoval } from '../../shared/project-removal.js';
 export const TRUSTED_IM_MARKER = '[mavis:trusted-legacy-im-root]';
+export const ordinarySidebarSession = or(isNull(s.purpose), ne(s.purpose, 'miniapp-authoring'));
 const trustedImRoot = and(eq(s.sessionType, 'root'), eq(s.sessionKind, 'conversation'), or(eq(s.purpose, TRUSTED_IM_MARKER), sql `substr(${s.purpose}, -${TRUSTED_IM_MARKER.length + 1}) = ${`\n${TRUSTED_IM_MARKER}`}`));
 export const canonicalOwner = sql `CASE WHEN ${s.agentName} IN ('main','mavis') THEN 'mavis' ELSE ${s.agentName} END`;
 export const isDone = sql `(${s.status} = 'idle' AND EXISTS (
@@ -15,8 +16,12 @@ function membership(column, values, negate = false) {
         ? sql `${column} NOT IN (SELECT value FROM json_each(${JSON.stringify(values)}))`
         : sql `${column} IN (SELECT value FROM json_each(${JSON.stringify(values)}))`;
 }
-export function eligible(includeHiddenProject = false, internalRootIds = [], includeArchived = false) {
-    return and(eq(s.columnarVersion, 3), includeArchived ? undefined : eq(s.archived, 0), isNull(s.parentSessionId), includeHiddenProject ? undefined : eq(p.hidden, 0), sessionAfterProjectRemoval(), membership(s.sessionId, internalRootIds, true), or(and(eq(s.sessionType, 'branch'), ne(s.visibility, 'hidden'), notInArray(s.sessionKind, ['peek', 'task', 'channel'])), and(eq(s.sessionType, 'branch'), eq(s.sessionKind, 'channel')), and(ne(s.visibility, 'hidden'), projectConversationRootPredicate())));
+export function eligible(includeHiddenProject = false, internalRootIds = [], includeArchived = false, bunny) {
+    return and(eq(s.columnarVersion, 3), includeArchived ? undefined : eq(s.archived, 0), isNull(s.parentSessionId), includeHiddenProject ? undefined : eq(p.hidden, 0), sessionAfterProjectRemoval(), membership(s.sessionId, internalRootIds, true), bunny && !bunny.showBunnyCreatedSessions && bunny.bunnyCreatedIds.length
+        ? membership(s.sessionId, bunny.bunnyCreatedIds, true)
+        : undefined, or(bunny?.showBunnyCreatedSessions && bunny.bunnyCreatedIds.length
+        ? and(eq(s.sessionKind, 'conversation'), membership(s.sessionId, bunny.bunnyCreatedIds))
+        : undefined, and(eq(s.sessionType, 'branch'), ne(s.visibility, 'hidden'), notInArray(s.sessionKind, ['peek', 'task', 'channel'])), and(eq(s.sessionType, 'branch'), eq(s.sessionKind, 'channel')), and(ne(s.visibility, 'hidden'), projectConversationRootPredicate())));
 }
 export function sidebarProjectPredicate(q) {
     return and(eq(p.hidden, 0), eq(p.pinned, 0), membership(p.projectId, q.excludedProjectIds, true));
@@ -33,7 +38,7 @@ export function sidebarPredicate(q) {
         done: isDone,
         unread: membership(s.sessionId, q.unreadIds),
     };
-    return and(eligible(false, q.internalRootIds), sidebarProjectPredicate(q), membership(s.sessionId, q.excludedIds, true), q.types.length ? or(...q.types.map((v) => typeConditions[v])) : undefined, q.statuses.length ? or(...q.statuses.map((v) => statusConditions[v])) : undefined, q.agentNames.length ? membership(canonicalOwner, q.agentNames) : undefined, q.activityDays ? sql `${s.updatedAtMs} >= ${q.nowMs - q.activityDays * 86400000}` : undefined);
+    return and(eligible(false, q.internalRootIds, false, q), ordinarySidebarSession, sidebarProjectPredicate(q), membership(s.sessionId, q.excludedIds, true), q.types.length ? or(...q.types.map((v) => typeConditions[v])) : undefined, q.statuses.length ? or(...q.statuses.map((v) => statusConditions[v])) : undefined, q.agentNames.length ? membership(canonicalOwner, q.agentNames) : undefined, q.activityDays ? sql `${s.updatedAtMs} >= ${q.nowMs - q.activityDays * 86400000}` : undefined);
 }
 export function tupleAfter(columns, values, descending) {
     if (!values)

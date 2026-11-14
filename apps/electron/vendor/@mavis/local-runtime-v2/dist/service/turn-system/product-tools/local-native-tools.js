@@ -104,6 +104,7 @@ function createLocalNativeSkillReader(input) {
             gates: {
                 computerUseActive: input.computerUseActive === true,
                 miniappAvailable: input.miniappAvailable === true,
+                pluginRecommendationAvailable: input.pluginRecommendationAvailable === true,
                 disabledSkillNames: input.disabledBuiltinSkillNames,
                 resumeCodexAvailable: input.resumeCodexAvailable === true,
             },
@@ -174,6 +175,7 @@ function nativeToolsInput(input, builtinCapabilities) {
         routingContextGetter: input.routingContextGetter,
         fetchImpl: input.fetchImpl,
         matrixLogger: input.matrixLogger,
+        webFetchAdapter: input.webFetchAdapter,
         webSearchEnabled: input.nativeWebSearchEnabled === true,
         taskAdapter: delegationEntryPointsEnabled ? input.taskAdapter : undefined,
         taskAppendAdapter: delegationEntryPointsEnabled ? input.taskAppendAdapter : undefined,
@@ -223,6 +225,9 @@ function nativeProductCapabilities(input) {
     return {
         ...(input.miniappAvailable === true ? { miniappAvailable: true } : {}),
         ...(input.pptPreviewAvailable === true ? { pptPreviewAvailable: true } : {}),
+        ...(input.pluginRecommendationAvailable === true
+            ? { pluginRecommendationAvailable: true }
+            : {}),
         desktopCapabilities: input.desktopCapabilities,
     };
 }

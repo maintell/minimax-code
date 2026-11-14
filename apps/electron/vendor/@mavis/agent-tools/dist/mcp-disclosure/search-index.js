@@ -1,6 +1,8 @@
 import { tokenize } from './tokenize.js';
 const BM25_K1 = 1.5;
 const BM25_B = 0.75;
+/** Added per query term that appears in the item name when name boosting is on. */
+const NAME_TOKEN_BOOST = 4;
 function flattenSchema(schema, max) {
     const parts = [];
     const walk = (node) => {
@@ -46,36 +48,34 @@ export function computeIndexSignature(candidates) {
         .sort()
         .join('|'));
 }
-export function buildIndex(candidates, opts) {
-    const docs = candidates.map((e) => {
-        const def = e.tool.def;
-        const schemaText = flattenSchema(def.schema, opts.maxSchemaTextLen);
-        const raw = `${def.name} ${def.description ?? ''} ${schemaText}`;
+/** Generic BM25 lexical index; callers keep their own identity and state on `item`. */
+export function buildTextSearchIndex(items, textOf, opts = {}) {
+    const docs = items.map((item) => {
+        const raw = textOf(item);
         const tokens = tokenize(raw);
         const tf = new Map();
         for (const t of tokens)
             tf.set(t, (tf.get(t) ?? 0) + 1);
+        const exactNames = opts.exactNamesOf?.(item) ?? [item.name];
         return {
-            name: def.name,
-            description: def.description ?? '',
-            input_schema: def.schema,
+            item,
             raw,
-            tokens,
             len: tokens.length,
             tf,
+            nameTokens: new Set(tokenize(item.name)),
+            exactNames: new Set(exactNames.map((name) => name.toLowerCase())),
         };
     });
     const N = docs.length;
     const df = new Map();
     for (const d of docs)
-        for (const t of new Set(d.tokens))
+        for (const t of d.tf.keys())
             df.set(t, (df.get(t) ?? 0) + 1);
     const avgdl = N === 0 ? 0 : docs.reduce((s, d) => s + d.len, 0) / N;
     const idf = (t) => {
         const n = df.get(t) ?? 0;
         return Math.log(1 + (N - n + 0.5) / (n + 0.5));
     };
-    const signature = computeIndexSignature(candidates);
     function bm25(queryTokens, d) {
         let score = 0;
         for (const qt of new Set(queryTokens)) {
@@ -96,12 +96,32 @@ export function buildIndex(candidates, opts) {
         let scored;
         if (input.query && input.query.trim()) {
             const qt = tokenize(input.query);
-            scored = pool.map((d) => ({ d, score: bm25(qt, d) })).filter((x) => x.score > 0);
+            const normalizedQuery = input.query.trim().toLowerCase();
+            const uniqueQuery = new Set(qt);
+            // A term unique to one item earns the full name boost; terms many names
+            // share ("get", "show", "history") earn proportionally less, so generic words
+            // in a name do not outrank a precise description match.
+            const maxIdf = Math.log(1 + (N + 0.5) / 0.5);
+            scored = pool
+                .map((d) => {
+                let score = bm25(qt, d);
+                if (input.nameBoost && score > 0) {
+                    if (d.exactNames.has(normalizedQuery))
+                        score += 100;
+                    for (const t of uniqueQuery) {
+                        if (d.nameTokens.has(t))
+                            score += (NAME_TOKEN_BOOST * idf(t)) / maxIdf;
+                    }
+                }
+                return { d, score };
+            })
+                .filter((x) => x.score > 0);
             // `regex` is a hard filter; `query` only ranks within it. When the query
             // adds no BM25 signal but a regex narrowed the pool, still return that pool
             // (flat score) so a narrowing regex never silently yields nothing. With no
-            // regex in play, a zero-hit query means no match. Either way `topK` bounds
-            // the result, so the fallback cannot flood the context.
+            // regex in play, a zero-hit query means no match. `topK` (or the caller's
+            // paging, as in `tool_search`) bounds the result, so the fallback cannot
+            // flood the context.
             if (scored.length === 0) {
                 if (!input.regex)
                     return [];
@@ -111,15 +131,88 @@ export function buildIndex(candidates, opts) {
         else {
             scored = pool.map((d) => ({ d, score: 1 }));
         }
-        scored.sort((a, b) => b.score - a.score || a.d.name.localeCompare(b.d.name));
-        return scored.slice(0, Math.max(0, input.topK)).map(({ d, score }) => ({
-            name: d.name,
-            description: d.description,
-            input_schema: d.input_schema,
-            score,
-        }));
+        scored.sort((a, b) => b.score - a.score || a.d.item.name.localeCompare(b.d.item.name));
+        const ranked = input.topK === undefined ? scored : scored.slice(0, Math.max(0, input.topK));
+        return ranked.map(({ d, score }) => ({ item: d.item, score }));
     }
-    return { search, size: N, signature };
+    return { search, size: N };
+}
+function toolHit(tool, score) {
+    return { name: tool.name, description: tool.description, input_schema: tool.input_schema, score };
+}
+export function buildIndex(candidates, opts) {
+    const tools = candidates.map((e) => {
+        const def = e.tool.def;
+        const schemaText = flattenSchema(def.schema, opts.maxSchemaTextLen);
+        return {
+            name: def.name,
+            description: def.description ?? '',
+            input_schema: def.schema,
+            raw: `${def.name} ${def.description ?? ''} ${schemaText}`,
+            lowerName: def.name.toLowerCase(),
+            bareName: bareToolName(def.name).toLowerCase(),
+        };
+    });
+    const index = buildTextSearchIndex(tools, (tool) => tool.raw, {
+        exactNamesOf: (tool) => [tool.lowerName, tool.bareName],
+    });
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    const byLowerName = new Map();
+    for (const t of tools) {
+        const group = byLowerName.get(t.lowerName);
+        if (group)
+            group.push(t);
+        else
+            byLowerName.set(t.lowerName, [t]);
+    }
+    /**
+     * A case-sensitive match wins; case is folded only when that leaves one tool,
+     * so `Foo` and `foo` never shadow each other.
+     */
+    function lookup(name) {
+        const key = name.trim();
+        const exact = byName.get(key);
+        if (exact)
+            return toolHit(exact, 1);
+        const lowerKey = key.toLowerCase();
+        const folded = byLowerName.get(lowerKey);
+        if (folded)
+            return folded.length === 1 ? toolHit(folded[0], 1) : undefined;
+        // A bare tool name (without the `mcp__<server>__` prefix) resolves only when unique.
+        const bare = tools.filter((t) => t.bareName === lowerKey);
+        const bareExact = bare.filter((t) => bareToolName(t.name) === key);
+        const found = bareExact.length > 0 ? bareExact : bare;
+        return found.length === 1 ? toolHit(found[0], 1) : undefined;
+    }
+    function withPrefix(prefix) {
+        const key = prefix.trim().toLowerCase();
+        return tools
+            .filter((t) => t.lowerName.startsWith(key))
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((t) => toolHit(t, 1));
+    }
+    return {
+        search: (input) => index.search(input).map(({ item, score }) => toolHit(item, score)),
+        lookup,
+        withPrefix,
+        names: () => tools.map((t) => t.name),
+        size: index.size,
+        signature: computeIndexSignature(candidates),
+    };
+}
+/** `mcp__server__tool` → `tool`; names without the MCP prefix are returned unchanged. */
+export function bareToolName(name) {
+    const match = /^mcp__.+?__(.+)$/u.exec(name);
+    return match ? match[1] : name;
+}
+/** `mcp__server__tool` → `server`; other names (built-in on-demand tools) have no server. */
+export function mcpServerOfToolName(name) {
+    const match = /^mcp__(.+?)__.+$/u.exec(name);
+    return match ? match[1] : undefined;
+}
+/** The server an entry belongs to: its provenance, else the server segment of its name. */
+export function serverOfToolEntry(entry) {
+    return entry.serverName ?? mcpServerOfToolName(entry.tool.def.name);
 }
 /**
  * Module-level bounded LRU of built indexes keyed by content signature. The

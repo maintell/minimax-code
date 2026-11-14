@@ -432,6 +432,7 @@ export const WorkShareKind = {
     UNSPECIFIED: 0,
     PLUGIN: 1,
     SKILL: 2,
+    MINI_APP: 3,
 };
 export const WorkShareStatus = {
     UNSPECIFIED: 0,

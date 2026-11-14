@@ -1,3 +1,4 @@
+import { PLUGIN_PREPARATION_READY_OPTION_ID, PLUGIN_PREPARATION_STEP_ID, } from './questionnaire.js';
 import { translateRuntimeText } from './runtime-i18n/index.js';
 /**
  * Serialize the structured questionnaire reply sent to the runtime/model.
@@ -20,6 +21,16 @@ export function serializeQuestionnaireResponse(payload, request) {
     if (request?.mode === 'feature-enable' && request.modePayload?.featureKey) {
         lines.push(`  <featureKey>${escapeXml(request.modePayload.featureKey)}</featureKey>`);
     }
+    const plugin = request?.mode === 'plugin-preparation' ? request.modePayload?.pluginPreparation : undefined;
+    if (plugin) {
+        const ready = payload.answers.some((answer) => answer.stepId === PLUGIN_PREPARATION_STEP_ID &&
+            answer.selectedOptionIds.includes(PLUGIN_PREPARATION_READY_OPTION_ID));
+        lines.push(`  <pluginName>${escapeXml(plugin.pluginName)}</pluginName>`);
+        lines.push(`  <preparationStatus>${ready ? 'ready' : 'declined'}</preparationStatus>`);
+        if (ready) {
+            lines.push('  <continuation>The plugin is now installed, enabled, and connected. Continue the latest user request with this plugin. Do not replay a task the user has abandoned. This is a system state update, not a new user instruction.</continuation>');
+        }
+    }
     lines.push('  <answers>');
     for (const answer of payload.answers)
         lines.push(serializeAnswer(answer));
@@ -29,7 +40,7 @@ export function serializeQuestionnaireResponse(payload, request) {
 }
 export function serializeQuestionnaireResponseMessage(request, reply, locale) {
     const response = serializeQuestionnaireResponse(reply, request);
-    return request.mode === 'feature-enable'
+    return request.mode === 'feature-enable' || request.mode === 'plugin-preparation'
         ? response
         : `${response}\n\n${formatAnswersAsText(request, reply.answers, locale)}`;
 }

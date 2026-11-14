@@ -99,7 +99,10 @@ const SHELL_EXPANSION_PATTERNS = [
  *     refused, so `net use Z: \\srv\share` cannot smuggle network reads past
  *     the built-in fs tools.
  * 3. Shell expansion syntax blocking (`$()`, backticks, `${}`)
- * 4. Path traversal detection (`..` components)
+ * 4. Normalization: `..` components are resolved against the working
+ *    directory, so `a/b/../c` is judged exactly like `a/c`. A `..` that the
+ *    platform's path semantics cannot resolve (a backslash-separated `..` on
+ *    POSIX, where `\` is an ordinary filename character) is still rejected.
  *
  * @returns The resolved absolute path, or an error object.
  */
@@ -144,14 +147,15 @@ export function validatePath(inputPath, workingDirectory, homeDir) {
             return { valid: false, error: `Shell expansion syntax is not allowed: ${pattern.source}` };
         }
     }
-    // 4. Path traversal check
-    if (containsPathTraversal(normalized)) {
-        return { valid: false, error: 'Path traversal (..) detected' };
-    }
-    // Resolve to absolute path
+    // 4. Normalize, then judge the normalized path. Every later rule (deny
+    // rules, sensitive paths, workspace boundary) sees only `resolved`, so a
+    // path with `..` gets exactly the verdict of the same path written without it.
     const resolved = path.isAbsolute(normalized)
         ? path.resolve(normalized)
         : path.resolve(workingDirectory ?? process.cwd(), normalized);
+    if (containsPathTraversal(resolved)) {
+        return { valid: false, error: 'Path traversal (..) detected' };
+    }
     return { valid: true, resolved };
 }
 /**
@@ -200,10 +204,10 @@ export function resolvesToNetworkDrive(inputPath) {
     return resolvedRoot.startsWith('\\\\') || resolvedRoot.startsWith('//');
 }
 /**
- * Check if a path contains traversal components (`..`).
+ * Check if a path contains traversal components (`..`), with either separator.
  *
- * Only flags `..` that would escape a safe boundary.
- * Resolved paths that still contain `..` components are suspicious.
+ * On an already-resolved path, a remaining `..` is one the platform's path
+ * semantics did not normalize and is treated as invalid.
  */
 export function containsPathTraversal(inputPath) {
     return inputPath.split(/[\\/]/).some((seg) => seg === '..');
@@ -611,6 +615,9 @@ function isProtectedRuntimeRead(filePath, context, recursive, scope) {
         // at credentials must not turn its destination into a trusted asset root.
         const readableAsset = isPathWithin(canonicalPath, path.join(canonicalRoot, 'skills')) ||
             isPathWithin(canonicalPath, path.join(canonicalRoot, '.builtin-skills')) ||
+            // Saved run_code scripts are the Agent's own reusable code; without this it
+            // could not list or read them, only run them.
+            isPathWithin(canonicalPath, path.join(canonicalRoot, 'ptc')) ||
             (context.agentName != null &&
                 (isPathWithin(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'workspace')) ||
                     isPathWithin(canonicalPath, path.join(canonicalRoot, 'agents', context.agentName, 'skills')) ||

@@ -1,5 +1,6 @@
 import { canonicalActiveHistoryRevision, inspectCanonicalHistorySequence, } from '../../../sessions/representation/canonical-history-contract.js';
 import { sanitizePtcSafetyHistoryMessage } from '../../ptc/safety-reconcile.js';
+import { canonicalHistoryRecordEntry, } from './canonical-history-scanner.js';
 /** Plans the existing abort/network tail fold against the latest envelopes. */
 export function planSettleTurnTail(active, input) {
     assertMutationIdentity(input);
@@ -51,18 +52,21 @@ function planSafetyTurnTail(active, input) {
     assertSettled(next, 'Safety Turn tail settlement');
     return { status: 'committed', active: next, deletedMessageIds };
 }
-/** Plans a target-Turn suffix removal across the reachable compaction lineage. */
-export function planRetractTurn(history, input) {
+/**
+ * The artifact holding the target Turn's first record: a snapshot index, `snapshots.length`
+ * for the active history, or -1 when the Turn is absent.
+ */
+export function retractTurnArtifactIndex(history, turnId) {
+    return retractArtifacts(history).findIndex(({ entries }) => entries.some((entry) => entry.turnId === turnId));
+}
+/**
+ * Plans a target-Turn suffix removal across the reachable compaction lineage. When the Turn
+ * starts in a snapshot, `targetSnapshotRecords` must hold that snapshot's records.
+ */
+export function planRetractTurn(history, input, targetSnapshotRecords) {
     validateRetractTurnInput(input);
-    const artifacts = [
-        ...history.snapshots.map((snapshot) => ({
-            generation: snapshot.generation,
-            records: snapshot.records,
-            snapshot,
-        })),
-        { generation: history.activeGeneration, records: history.active },
-    ];
-    const artifactIndex = artifacts.findIndex(({ records }) => records.some(({ turn_id }) => turn_id === input.turnId));
+    const artifacts = retractArtifacts(history);
+    const artifactIndex = retractTurnArtifactIndex(history, input.turnId);
     if (artifactIndex < 0) {
         if (containsCompactionMarker(artifacts, input.turnId)) {
             throw new Error('Retracted Turn source boundary is missing from canonical history');
@@ -75,16 +79,19 @@ export function planRetractTurn(history, input) {
             deletedMessageIds: [],
         };
     }
-    assertTargetIsCurrentTail(history.active, input.turnId);
     const target = artifacts[artifactIndex];
     if (!target)
         throw new Error('Retracted Turn source boundary is missing from canonical history');
-    const firstTargetIndex = target.records.findIndex(({ turn_id }) => turn_id === input.turnId);
-    const targetSuffix = target.records.slice(firstTargetIndex);
+    const records = artifactIndex === history.snapshots.length ? history.active : targetSnapshotRecords;
+    if (!records)
+        throw new Error('Retracted Turn snapshot records were not loaded');
+    const firstTargetIndex = records.findIndex(({ turn_id }) => turn_id === input.turnId);
+    const targetSuffix = records.slice(firstTargetIndex);
     if (targetSuffix.some(({ turn_id }) => turn_id !== input.turnId)) {
         throw new Error('Retracted Turn is not the canonical history tail');
     }
-    const active = target.records.slice(0, firstTargetIndex);
+    const active = records.slice(0, firstTargetIndex);
+    assertTargetIsCurrentTail(history.active, input.turnId, active);
     assertSettled(active, 'Turn retraction prefix');
     if (target.generation > 0 && active.length === 0) {
         throw new Error('Turn retraction cannot preserve a non-zero generation without its marker');
@@ -94,8 +101,17 @@ export function planRetractTurn(history, input) {
         generation: target.generation,
         active,
         snapshots: history.snapshots.slice(0, Math.min(artifactIndex, history.snapshots.length)),
-        deletedMessageIds: deletedTurnMessageIds(artifacts.slice(artifactIndex).flatMap(({ records }) => records), input.turnId),
+        deletedMessageIds: deletedTurnMessageIds(artifacts.slice(artifactIndex).flatMap(({ entries }) => entries), input.turnId, active),
     };
+}
+function retractArtifacts(history) {
+    return [
+        ...history.snapshots.map(({ generation, entries }) => ({ generation, entries })),
+        {
+            generation: history.activeGeneration,
+            entries: history.active.map(canonicalHistoryRecordEntry),
+        },
+    ];
 }
 export function validateRetractTurnInput(input) {
     assertMutationIdentity(input);
@@ -134,22 +150,34 @@ function containsToolCall(content) {
 }
 function containsCompactionMarker(artifacts, turnId) {
     const markerTurnId = `${turnId}:compaction`;
-    return artifacts.some(({ records }) => records.some(({ turn_id }) => turn_id === markerTurnId));
+    return artifacts.some(({ entries }) => entries.some((entry) => entry.turnId === markerTurnId));
 }
-function assertTargetIsCurrentTail(active, turnId) {
+/**
+ * No later Turn follows the target in the active history. A compaction in the
+ * target Turn, including a segment commit at its start, writes its records
+ * under `<turnId>:compaction` and carries earlier records over verbatim; those
+ * carried records stay after the retraction and do not end the Turn's tail.
+ */
+function assertTargetIsCurrentTail(active, turnId, retained) {
     const markerTurnId = `${turnId}:compaction`;
+    const retainedIds = new Set(retained.map(({ message_id }) => message_id));
     const boundary = active.findIndex(({ turn_id }) => turn_id === turnId || turn_id === markerTurnId);
     if (boundary < 0 ||
-        active.slice(boundary).some(({ turn_id }) => turn_id !== turnId && turn_id !== markerTurnId)) {
+        active
+            .slice(boundary)
+            .some(({ turn_id, message_id }) => turn_id !== turnId && turn_id !== markerTurnId && !retainedIds.has(message_id))) {
         throw new Error('Retracted Turn is not the canonical history tail');
     }
 }
-function deletedTurnMessageIds(records, turnId) {
+/** The Turn's own records; a compaction record the retraction keeps is not deleted. */
+function deletedTurnMessageIds(entries, turnId, retained) {
     const markerTurnId = `${turnId}:compaction`;
+    const retainedIds = new Set(retained.map(({ message_id }) => message_id));
     return [
-        ...new Set(records
-            .filter(({ turn_id }) => turn_id === turnId || turn_id === markerTurnId)
-            .map(({ message_id }) => message_id)),
+        ...new Set(entries
+            .filter((entry) => (entry.turnId === turnId || entry.turnId === markerTurnId) &&
+            !retainedIds.has(entry.messageId))
+            .map((entry) => entry.messageId)),
     ];
 }
 function assertSettled(records, operation) {

@@ -1,8 +1,7 @@
-import { createRequire } from 'node:module';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { ModelAccessRegistry } from '../../core/registry.js';
 import { ModelAccessCapabilityPolicy } from '../../core/policy.js';
 import { ModelAccessBindingService } from '../../credentials/binding.service.js';
@@ -107,7 +106,9 @@ export default {
   dispose: async () => { if (directory) await writeFile(path.join(directory, 'disposed-' + version), 'synthetic'); },
 };`;
 }
-export async function generationFixture(timeoutMs = 2_000) {
+// The caller passes the compiled host entry: this file is part of the package build (rootDir src),
+// so it cannot import the test helpers that compile it.
+export async function generationFixture(entryPath, timeoutMs = 2_000) {
     const root = await mkdtemp(path.join(os.tmpdir(), 'model-access-generation-'));
     const directories = { root, hostDataDir: root };
     const dataDir = path.join(root, 'data', 'synthetic');
@@ -207,8 +208,7 @@ export async function generationFixture(timeoutMs = 2_000) {
             packageGeneration: version,
             moduleUrl: pathToFileURL(modulePath).href,
             manifest,
-            entryPath: fileURLToPath(new URL('../shim/host-entry.ts', import.meta.url)),
-            nodeArgs: ['--import', createRequire(import.meta.url).resolve('tsx/esm')],
+            entryPath,
             cwd: root,
             environment: { PATH: process.env.PATH, HOME: root, USERPROFILE: root },
         });

@@ -35,9 +35,18 @@ const TEARDOWN_DURABLE_MACHINE_PRODUCERS = new Set([
     QUESTIONNAIRE_ANSWER_STEERING_PRODUCER,
     CHANNEL_STEER_PRODUCER_ID,
 ]);
+/**
+ * Every session send carries this prefix, one producer per sending Session. The
+ * sender was told its message arrived and that it may end its Turn, so nothing
+ * would ever send it again: teardown has to keep it like any acknowledged input.
+ */
+const SESSION_SEND_STEERING_PRODUCER_PREFIX = 'session-send:';
+function isTeardownDurableMachineProducer(producerId) {
+    return (TEARDOWN_DURABLE_MACHINE_PRODUCERS.has(producerId) ||
+        producerId.startsWith(SESSION_SEND_STEERING_PRODUCER_PREFIX));
+}
 export function isTeardownDurableSteeringProducer(producerId, workClosed = false) {
-    return (isHandedBackOnClose(producerId, workClosed) ||
-        TEARDOWN_DURABLE_MACHINE_PRODUCERS.has(producerId));
+    return (isHandedBackOnClose(producerId, workClosed) || isTeardownDurableMachineProducer(producerId));
 }
 /**
  * A normal exit defers user input; closed work also defers terminal input,
@@ -47,6 +56,6 @@ export function isHandedBackOnClose(producerId, workClosed) {
     return (isUserSteeringProducer(producerId) ||
         (workClosed &&
             (TERMINAL_USER_STEERING_PRODUCERS.has(producerId) ||
-                TEARDOWN_DURABLE_MACHINE_PRODUCERS.has(producerId))));
+                isTeardownDurableMachineProducer(producerId))));
 }
 //# sourceMappingURL=contracts.js.map

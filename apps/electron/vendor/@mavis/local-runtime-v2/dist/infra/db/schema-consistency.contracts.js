@@ -1,5 +1,25 @@
 import { MINIAPP_STATE_TABLE_METADATA } from './schema/miniapp.js';
+import { MESSAGE_SEARCH_TABLE_METADATA } from './schema/message-search.js';
 export const EXPECTED_TABLES = {
+    local_runtime_miniapp_creations: [
+        'account_id',
+        'deployment',
+        'id',
+        'plugin_id',
+        'status',
+        'session_id',
+        'source_session_id',
+        'recommendation_id',
+        'requirements',
+        'source_summary',
+        'source_title',
+        'source_captured_at_ms',
+        'workspace_dir',
+        'error',
+        'created_at_ms',
+    ],
+    ...Object.fromEntries(MESSAGE_SEARCH_TABLE_METADATA.map((table) => [table.name, table.columns])),
+    local_runtime_message_search_fts: ['words', 'chars'],
     local_runtime_ppt_preview_artifacts: [
         'artifact_id',
         'session_id',
@@ -206,6 +226,15 @@ export const EXPECTED_TABLES = {
         'usage_incomplete',
         'discard_reason',
         'created_at_ms',
+        'updated_at_ms',
+    ],
+    local_runtime_v2_session_auto_resume: [
+        'session_id',
+        'turn_id',
+        'resume_at_ms',
+        'interrupted_at_ms',
+        'auto_retry_count',
+        'model_name',
         'updated_at_ms',
     ],
     local_runtime_v2_goal_token_charges: [

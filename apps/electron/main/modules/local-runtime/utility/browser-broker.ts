@@ -1,28 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ELECTRON_BROWSER_PUBLIC_ACTIONS } from "../../browser/electron-browser-route-policy";
-import { BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH, isBrowserBrokerAbortMessage, isSafeBrokerRequestId, isBrowserBrokerRequestMessage, isStrictStructuredCloneValue, isBrowserBrokerResultMessage, isBrowserBrokerErrorMessage, isBrowserBrokerAction } from "./control";
-const BROWSER_ERROR_MESSAGES = {
-    aborted: 'Operation aborted',
-    ambiguous_target: 'AMBIGUOUS_TARGET: Browser target is not unique; inspect and narrow it',
-    browser_action_failed: 'Browser action failed in Electron main',
-    browser_operation_timeout: 'Browser action timed out',
-    browser_result_too_large: 'BROWSER_RESULT_TOO_LARGE: Browser result exceeded the safe response budget',
-    background_render_busy: 'Background Browser render queue is busy',
-    background_render_operation_timeout: 'Background Browser action timed out',
-    background_render_queue_timeout: 'Background Browser render queue wait timed out',
-    browser_unavailable: 'Browser broker is unavailable',
-    browser_session_poisoned: 'BROWSER_SESSION_POISONED: Browser recovery could not isolate the previous action; open a new Browser tab and inspect it before continuing',
-    current_tab_occupied: 'CURRENT_TAB_OCCUPIED: Current Browser tab already has a loaded page; retry with open_tab, or set replaceCurrentTab=true only when the user explicitly asked to reuse the current tab',
-    duplicate_request: 'Duplicate Browser broker request',
-    invalid_request: 'Invalid Browser broker request',
-    invalid_result: 'Invalid Browser broker result',
-    miniapp_tab_asleep: 'MINIAPP_TAB_ASLEEP: The selected Mini App tab is asleep to save memory; reopen it with the miniapp tool before using Browser on it',
-    snapshot_continuation_mismatch: 'SNAPSHOT_CONTINUATION_MISMATCH: Continue with the exact nextOffset returned by Browser',
-    snapshot_kind_mismatch: 'SNAPSHOT_KIND_MISMATCH: Continue the observation with its original Browser action',
-    stale_element_ref: 'STALE_ELEMENT_REF: Browser target expired; inspect the current page again',
-    stale_snapshot: 'STALE_SNAPSHOT: Browser observation expired; inspect the current page again',
-    frame_coordinates_unavailable: 'FRAME_COORDINATES_UNAVAILABLE: Browser cannot safely address this frame by viewport coordinates; inspect the current page and choose a main-frame target',
-};
+import { BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH, BROWSER_ERROR_MESSAGES, isBrowserBrokerAbortMessage, isSafeBrokerRequestId, isBrowserBrokerRequestMessage, isStrictStructuredCloneValue, isBrowserBrokerResultMessage, isBrowserBrokerErrorMessage, isBrowserBrokerAction } from "./control";
 const STRUCTURED_BROWSER_ERROR_CODES = {
     AMBIGUOUS_TARGET: 'ambiguous_target',
     ACTION_TIMEOUT: 'browser_operation_timeout',
@@ -30,6 +8,10 @@ const STRUCTURED_BROWSER_ERROR_CODES = {
     BROWSER_RESULT_TOO_LARGE: 'browser_result_too_large',
     CURRENT_TAB_OCCUPIED: 'current_tab_occupied',
     FRAME_COORDINATES_UNAVAILABLE: 'frame_coordinates_unavailable',
+    BROWSER_PAGE_UNAVAILABLE: 'browser_page_unavailable',
+    MINIAPP_CAPACITY_BUSY: 'miniapp_capacity_busy',
+    MINIAPP_BUSY: 'miniapp_busy',
+    MINIAPP_UNAVAILABLE: 'miniapp_unavailable',
     MINIAPP_TAB_ASLEEP: 'miniapp_tab_asleep',
     SNAPSHOT_CONTINUATION_MISMATCH: 'snapshot_continuation_mismatch',
     SNAPSHOT_KIND_MISMATCH: 'snapshot_kind_mismatch',

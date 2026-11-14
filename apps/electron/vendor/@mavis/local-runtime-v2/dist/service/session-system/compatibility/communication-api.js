@@ -1,3 +1,4 @@
+import { queuesPeerDelivery } from '@mavis/shared/agent-coordination';
 import { json, notFound, readFirstString, readJsonBody, } from '../../../infra/transport/host-http.js';
 import { observeSteerCompletion } from '../conversation/conversation-steer.js';
 import { logger } from '../../../infra/logging/logger.js';
@@ -116,6 +117,7 @@ async function routeLocalCommunicationSend(input, tail) {
         toSession,
         command,
         content,
+        queueWhileBusy: queuesEveryPeerMessage(input, target),
     });
 }
 async function unsupportedCommunicationCommand(input, message) {
@@ -152,25 +154,42 @@ function createSteerCompletionLogger(message) {
         warn: (ctx, text) => logger.warn({ ...origin, sessionId: ctx.sessionId, turnId: ctx.turnId }, text),
     };
 }
-async function sendThroughConversation(input, message) {
+/**
+ * The main conversation of an Agent that declares `peerDelivery: queue` never
+ * takes a peer message into its running Turn: the message queues and starts a
+ * Turn of its own (for Bunny, spec 4.3: judged `peer`).
+ */
+function queuesEveryPeerMessage(input, target) {
+    return (target.sessionType === 'root' && queuesPeerDelivery(input.coordinationOf?.(target.agentName)));
+}
+async function sendThroughConversation(input, { queueWhileBusy, ...message }) {
     try {
-        const steered = await input.conversation.ingress.steer({
+        const ingress = input.conversation.ingress;
+        const delivery = {
             sessionId: message.toSession,
             source: 'communication',
-            producerId: `communication:${message.fromSession}`,
-            idempotencyKey: String(message.messageId),
             message: {
                 content: message.content,
                 attachments: [],
                 origin: { fromSession: message.fromSession, command: message.command },
             },
-        });
-        // Communication reports delivery on admission; the target Turn runs on.
-        observeSteerCompletion(steered, {
-            sessionId: message.toSession,
-            producer: 'Local communication send',
-            matrixLogger: createSteerCompletionLogger(message),
-        });
+        };
+        if (queueWhileBusy) {
+            await ingress.submit({ ...delivery, allowQueue: true });
+        }
+        else {
+            const steered = await ingress.steer({
+                ...delivery,
+                producerId: `communication:${message.fromSession}`,
+                idempotencyKey: String(message.messageId),
+            });
+            // Communication reports delivery on admission; the target Turn runs on.
+            observeSteerCompletion(steered, {
+                sessionId: message.toSession,
+                producer: 'Local communication send',
+                matrixLogger: createSteerCompletionLogger(message),
+            });
+        }
         await recordCommunicationMessage(input, {
             ...message,
             messageId: String(message.messageId),

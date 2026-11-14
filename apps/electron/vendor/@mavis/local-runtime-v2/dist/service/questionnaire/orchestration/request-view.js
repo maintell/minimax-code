@@ -12,7 +12,8 @@ export function getQuestionnaireCountdownSeconds(request) {
         : ASYNC_QUESTIONNAIRE_COUNTDOWN_SECONDS;
 }
 /** Transient domain projection; never write syncWaiting back to request_json. */
-export function projectQuestionnaireRecord(deps, record) {
+export function projectQuestionnaireRecord(deps, source) {
+    const record = projectPluginPreparationOutcome(source);
     if (!record.responseMode)
         return record;
     const request = { ...record.request };
@@ -40,5 +41,27 @@ function projectResponseModeFields(deps, record) {
         return { countdownSeconds: getQuestionnaireCountdownSeconds(record.request) };
     }
     return deps.syncWaits ? { syncWaiting: deps.syncWaits.isAwaitingReply(record.requestId) } : {};
+}
+/**
+ * Plugin preparation outcome is derived from the row, never stored: an
+ * answered card was verified ready; a dismissed card was declined.
+ */
+export function projectPluginPreparationOutcome(record) {
+    const preparation = record.request.modePayload?.pluginPreparation;
+    if (record.request.mode !== 'plugin-preparation' || !preparation)
+        return record;
+    const projected = { ...preparation };
+    delete projected.outcome;
+    if (record.status === 'answered')
+        projected.outcome = 'ready';
+    if (record.status === 'dismissed')
+        projected.outcome = 'declined';
+    return {
+        ...record,
+        request: {
+            ...record.request,
+            modePayload: { ...record.request.modePayload, pluginPreparation: projected },
+        },
+    };
 }
 //# sourceMappingURL=request-view.js.map

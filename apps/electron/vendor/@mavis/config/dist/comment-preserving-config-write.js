@@ -4,16 +4,26 @@ import { isMap, isNode, isScalar, parseDocument, visit, } from 'yaml';
 /**
  * Parses config text into the plain-object "before" state used for the diff.
  * Callers keep this separate from the object they mutate, because several write
- * paths hand that mutable object to a callback that aliases into it.
+ * paths hand that mutable object to a callback that aliases into it. Runtime
+ * loading opts into strict validation so a broken file cannot erase its policy.
  */
-export function parseConfigText(text) {
+export function parseConfigText(text, options = {}) {
+    let parsed;
     try {
-        const parsed = yaml.load(text);
-        return isPlainRecord(parsed) ? parsed : {};
+        parsed = yaml.load(text);
     }
     catch {
+        // Parser errors include source snippets, which may contain credentials.
+        if (options.strict)
+            throw new Error('Invalid config.yaml: unable to parse YAML');
         return {};
     }
+    if (options.strict &&
+        parsed != null &&
+        (!isPlainRecord(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype)) {
+        throw new Error('Invalid config.yaml: expected a YAML mapping');
+    }
+    return isPlainRecord(parsed) ? parsed : {};
 }
 /**
  * Serializes `next` over `previous` while keeping comments and formatting from

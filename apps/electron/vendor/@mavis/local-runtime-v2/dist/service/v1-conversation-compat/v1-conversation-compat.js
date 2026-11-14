@@ -459,14 +459,29 @@ function toTurnResult(turnId, outcome, messages, workspaceDir) {
 }
 function toConversationCommittedFacts(facts) {
     const observation = facts.fileChangeObservation;
-    if (!observation)
+    const savedPtcScripts = facts.savedPtcScripts;
+    if (!observation && !savedPtcScripts?.length)
         return {};
     return {
-        fileChangeObservation: {
-            fileChange: observation.fileChange,
-            ...(observation.changedFiles ? { changedFiles: [...observation.changedFiles] } : {}),
-            observationNotes: [...observation.observationNotes],
-        },
+        ...(observation
+            ? {
+                fileChangeObservation: {
+                    fileChange: observation.fileChange,
+                    ...(observation.changedFiles ? { changedFiles: [...observation.changedFiles] } : {}),
+                    observationNotes: [...observation.observationNotes],
+                },
+            }
+            : {}),
+        ...(savedPtcScripts?.length
+            ? {
+                savedPtcScripts: savedPtcScripts.map((script) => ({
+                    path: script.path,
+                    scope: script.scope,
+                    ...(script.description ? { description: script.description } : {}),
+                    overwritten: script.overwritten,
+                })),
+            }
+            : {}),
     };
 }
 function toCompactionOutcome(result, sessionId) {

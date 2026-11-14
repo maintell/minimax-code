@@ -29,6 +29,7 @@ import { managedMiniAppAttentionSnapshot, subscribeManagedMiniAppAttention, dest
 import { MiniAppAttentionReporter } from "../../browser/miniapp-attention";
 import { enqueueElectronObservabilityEvent, isElectronObservabilityShuttingDown, getElectronObservabilityAppInstanceId } from "../../observability/outbox";
 import { recordElectronStartupRuntimeReady } from "../../observability/startup-performance";
+import { setLocalWorkActive } from "../../power";
 import { resolveLocalRuntimeDataDir } from "../data-dir";
 import { notifyDataDirRuntimeReady, notifyDataDirRuntimeTerminalFailure, notifyDataDirRuntimeStartAttempt } from "../data-dir-relocation-guard";
 import { prepareLocalRuntimeNativeSqliteEnv } from "../native-sqlite-env";
@@ -43,6 +44,7 @@ import { createExecutionContinuity } from "./execution-continuity";
 import { RUNTIME_TRANSPORT_LOST_CHANNEL } from "./control";
 import { serveUtilityPlaneBRequest } from "./plane-b";
 import { resolveUtilityProxyEnv } from "./proxy-env";
+import { SupervisorMetricsObserver } from "./supervisor-metrics";
 import { UtilityRuntimeObserver } from "./utility-runtime-observer";
 import { configureUtilityRuntimeDiagnosticsLogger, utilityRuntimeDiagnostics } from "./utility-runtime-diagnostics";
 import { DEFAULT_RUNTIME_MEMORY_MONITOR_INTERVAL_MS, MIN_RUNTIME_MEMORY_MONITOR_INTERVAL_MS, MAX_RUNTIME_MEMORY_MONITOR_INTERVAL_MS } from "./runtime-memory-monitor-contract";
@@ -214,10 +216,19 @@ function getManager() {
         return manager;
     installNetworkServiceGoneListener();
     const launchPlan = resolveLocalRuntimeLaunchPlan(process.env.NEXT_PUBLIC_BUILD_ENV, process.env.MAVIS_LOCAL_RUNTIME_ISOLATION);
-    const lifecycleObserver = new UtilityRuntimeObserver({
+    const runtimeObserver = new UtilityRuntimeObserver({
         emit: enqueueElectronObservabilityEvent,
         isQuitInProgress: isElectronObservabilityShuttingDown,
     });
+    const supervisorMetrics = new SupervisorMetricsObserver({
+        isQuitInProgress: isElectronObservabilityShuttingDown,
+    });
+    const lifecycleObserver = {
+        observe: (event) => {
+            runtimeObserver.observe(event);
+            supervisorMetrics.observe(event);
+        },
+    };
     if (!executionContinuityController) {
         executionContinuityController = createExecutionContinuity();
         // Read-only breadcrumb for OAuth refresh summaries; listener errors are
@@ -240,7 +251,16 @@ function getManager() {
             // Managed-env / sqlite mutations above land on process.env (merged by
             // the manager); the proxy env is fork-specific (§2.6): OS/PAC proxy
             // resolved once through Chromium, loopback pinned into NO_PROXY.
-            return resolveUtilityProxyEnv(undefined, process.env, (message) => logger.warn(`[UtilityRuntime] ${message}`));
+            const proxyEnv = resolveUtilityProxyEnv(undefined, process.env, (message) => logger.warn(`[UtilityRuntime] ${message}`));
+            let mcodeToolsHostBinDir;
+            try {
+                mcodeToolsHostBinDir = hooks?.getMcodeToolsHostBinDir?.();
+            }
+            catch {
+                logger.warn('[UtilityRuntime] mcode-tools host bin dir unavailable');
+            }
+            // Always set the key: an inherited value from another App must never reach this Runtime.
+            return { ...proxyEnv, MAVIS_MCODE_TOOLS_HOST_BIN_DIR: mcodeToolsHostBinDir };
         },
         getAuthContext: () => hooks?.getAuthContext(),
         recoverAuthContext: (rejectedAccessToken, loginEpoch) => hooks?.recoverAuthContext?.(rejectedAccessToken, loginEpoch),
@@ -254,7 +274,9 @@ function getManager() {
         }),
         getRunawayGuardConfig: () => hooks?.getRunawayGuardConfig?.() ?? {},
         getPromptSuggestionPolicy: () => hooks?.getPromptSuggestionPolicy?.() ?? {},
+        getBunnyPolicy: () => hooks?.getBunnyPolicy?.() ?? {},
         getToolResultCompactionConfig: () => hooks?.getToolResultCompactionConfig?.() ?? {},
+        getBunnyContextConfig: () => hooks?.getBunnyContextConfig?.() ?? {},
         getCollectionPolicy: () => hooks?.getCollectionPolicy?.() ?? DEFAULT_COLLECTION_POLICY,
         getStartupExecutionPolicy: () => hooks?.getStartupExecutionPolicy?.(),
         getAppVersion: () => hooks?.getAppVersion() ?? 'unknown',
@@ -288,6 +310,7 @@ function getManager() {
                 owner_user_id: ownerUserId,
             });
         },
+        onRuntimePowerDemand: setLocalWorkActive,
         onRuntimeReady: () => {
             runtimeFailReason = null;
             notifyDataDirRuntimeReady();
@@ -535,8 +558,14 @@ export function setUtilityRuntimeRunawayGuardConfig(config) {
 export function setUtilityRuntimePromptSuggestionPolicy(policy) {
     manager?.setPromptSuggestionPolicy(policy);
 }
+export function setUtilityRuntimeBunnyPolicy(policy) {
+    manager?.setBunnyPolicy(policy);
+}
 export function setUtilityRuntimeToolResultCompactionConfig(config) {
     manager?.setToolResultCompactionConfig(config);
+}
+export function setUtilityRuntimeBunnyContextConfig(config) {
+    manager?.setBunnyContextConfig(config);
 }
 /** Publishes the main-owned effective collection policy to the live utility. */
 export function setUtilityRuntimeCollectionPolicy(policy) {
@@ -557,6 +586,12 @@ export async function collectUtilityRuntimeSessionReport(sessionId) {
     if (!manager)
         throw new Error('session_report_runtime_unavailable');
     return manager.collectSessionReport(sessionId);
+}
+/** Bunny's recent Sessions and state, keyed by its current main Session. */
+export async function collectUtilityRuntimeBunnyFeedbackReport(mainSessionId) {
+    if (!manager)
+        throw new Error('session_report_runtime_unavailable');
+    return manager.collectSessionReport(mainSessionId, 'bunny');
 }
 /** Internal-build feedback: the utility writes the Session's Workspace snapshot into `outputDir`. */
 export async function captureUtilityRuntimeWorkspaceSnapshot(sessionId, outputDir) {

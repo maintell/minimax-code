@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isServerOwnedTurnId } from '@mavis/shared/turn-identity';
 import { readFile } from 'node:fs/promises';
 import { createUserMessageId, fallbackSessionTitle, stripSessionTitleInjectedTags, SideChatError, } from '../../service/session-system/index.js';
+import { LocalModelProviderError } from '../../service/model-system/index.js';
+import { advisorViewToInput } from './model-provider-advisor.js';
 import { toQueueInput, queueModelFromAgentHost, } from '../../service/turn-system/index.js';
 import { AppError } from '../errors.js';
 import { publishBestEffort } from '../events.js';
@@ -22,8 +24,6 @@ export class SideChatApplication {
         this.options = options;
     }
     async createSideChat(_context, req) {
-        if (req.advisor !== undefined)
-            throw new AppError(501, 'NOT_IMPLEMENTED', 'Side chat advisor selection is not implemented');
         if (!req.clientRequestId?.trim())
             throw new AppError(400, 'CLIENT_REQUEST_ID_REQUIRED', 'clientRequestId is required');
         if (req.createOnly &&
@@ -172,12 +172,15 @@ export class SideChatApplication {
         const source = await this.options.sessions.get(req.id);
         if (!source)
             throw new AppError(404, 'local_session_not_found', `Session not found: ${req.id}`);
+        // Checked before anything is staged, so a refused draft leaves no side chat behind.
+        const advisor = this.resolveAdvisorDraft(req.advisor);
         if (req.createOnly)
             return this.commitPrepared({
                 mainSessionId: req.id,
                 pending,
                 signal,
                 ...(req.model ? { model: queueModelFromAgentHost(toUserModelSelection(req.model)) } : {}),
+                ...advisor,
             });
         if (req.turnId && isServerOwnedTurnId(req.turnId))
             throw new AppError(400, 'local_turn_id_reserved', 'The requested Turn identity is reserved for an internal workflow.');
@@ -205,12 +208,28 @@ export class SideChatApplication {
                 agentName: source.agentName,
                 source: submission.provenance.source === 'code_review' ? 'code_review' : 'api',
             });
-            return await this.commitPrepared({ mainSessionId: req.id, pending, signal, input });
+            return await this.commitPrepared({
+                mainSessionId: req.id,
+                pending,
+                signal,
+                input,
+                ...advisor,
+            });
         }
         catch (error) {
             await prepared.discardCreated();
             throw error;
         }
+    }
+    /** The side chat's own advisor from its draft; without a draft it inherits Main's at commit. */
+    resolveAdvisorDraft(draft) {
+        if (!draft)
+            return {};
+        // A composition without the advisor owner rejects the draft before anything is staged.
+        if (!this.options.advisor) {
+            throw new AppError(501, 'NOT_IMPLEMENTED', 'Side chat advisor selection is not implemented');
+        }
+        return { advisor: this.options.advisor.resolve(advisorViewToInput(draft)) };
     }
     async prepareQueue(req, pending, signal) {
         pending.sourceQueueItemId = req.itemId;
@@ -277,7 +296,12 @@ export class SideChatApplication {
                 sessionId: pending.sessionId,
                 workspaceDir: source.workspaceDir,
                 display: [input],
-                history: { active: [], snapshots: [], historyRevision: '' },
+                history: {
+                    active: [],
+                    snapshots: [],
+                    historyRevision: '',
+                    forEachSnapshotRecord: async () => { },
+                },
                 registration: this.options.registration,
             });
             const result = await this.commitPrepared({
@@ -326,7 +350,7 @@ export class SideChatApplication {
                     const copied = await copySideChatAssets({
                         sessionId: pending.sessionId,
                         workspaceDir: source.workspaceDir,
-                        display: selectSideChatDisplayPrefix((await this.options.messages.listAfter(mainSessionId)).messages, frozen),
+                        display: await selectSideChatDisplayPrefix((await this.options.messages.listAfter(mainSessionId)).messages, frozen),
                         history: frozen,
                         registration: this.options.registration,
                     });
@@ -347,6 +371,7 @@ export class SideChatApplication {
                 sourceMessageId: staged.display.at(-1)?.msg_id,
                 display: staged.display,
                 ...(sourceClaim ? { sourceClaim } : {}),
+                advisor: request.advisor,
                 model,
                 ...(input ? { input: { ...input, ...(model ? { model } : {}) } } : {}),
             });
@@ -435,6 +460,9 @@ function stableJson(value) {
         : item);
 }
 function sideChatApplicationError(error) {
+    if (error instanceof LocalModelProviderError) {
+        return new AppError(error.status, error.code, error.message);
+    }
     if (error instanceof SideChatError) {
         // This error reaches the boundary only after the transaction and prepared files rolled back.
         if (error.code === 'SIDECHAT_PREPARATION_FAILED')

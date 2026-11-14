@@ -3,7 +3,7 @@
  */
 import { mutateDurableYaml } from '../storage/durable-yaml.js';
 import { findBindingForConnection, findBindingForTransportClient, invalidImStorage, nextBindingUpdatedAt, newImEntityId, readBindingData, requiredString, requireBindingSessionState, writeBindingData, } from './im-connection-store-data.js';
-import { advanceImBinding, ensureImBindingSession, } from './im-connection-store-conversations.js';
+import { advanceImBinding, ensureImBindingSession, repinCoordinatorBinding, } from './im-connection-store-conversations.js';
 import { assertImBindingRuntimeState, bindingConversationOperations, clearImPendingLegacyMigration, getImAuthorization, getImBindingForConnection, getImBindingForTransportClient, readImBindingState, requireImConnection, sameLegacyRouteKeys, normalizeLegacyRouteKeys, } from './im-connection-store-operations.js';
 import { LocalImConnectionError, } from '../im-connection-types.js';
 /** Read one physical Binding with the Connection that owns its live cursor. */
@@ -273,14 +273,24 @@ export async function resolveImRoute(operations, ctx) {
     if (!resolved)
         return undefined;
     const binding = requireBindingSessionState(resolved.binding).currentSessionId
-        ? resolved.binding
+        ? ((await repinCoordinatorBinding(bindingConversationOperations(operations), resolved.connection, resolved.binding.bindingId)) ?? resolved.binding)
         : await ensureImBindingSession(bindingConversationOperations(operations), resolved.connection, resolved.binding.bindingId);
     return toPinnedRoute(resolved.connection, binding);
 }
-/** Reads a physical IM route without creating a Session for an empty cursor. */
+/**
+ * Reads a physical IM route without creating a Session for an empty cursor.
+ * A populated coordinator (Bunny) cursor that drifted from the main
+ * conversation is re-pinned in place; that moves the cursor only and never
+ * creates a Session.
+ */
 export async function peekImRoute(operations, ctx) {
     const resolved = await resolveImBindingAndConnection(operations, ctx);
-    return resolved ? toPinnedRoute(resolved.connection, resolved.binding) : undefined;
+    if (!resolved)
+        return undefined;
+    const binding = requireBindingSessionState(resolved.binding).currentSessionId
+        ? ((await repinCoordinatorBinding(bindingConversationOperations(operations), resolved.connection, resolved.binding.bindingId)) ?? resolved.binding)
+        : resolved.binding;
+    return toPinnedRoute(resolved.connection, binding);
 }
 export async function advanceImRoute(operations, ctx, requestId, telemetry) {
     const resolved = await resolveImBindingAndConnection(operations, ctx);

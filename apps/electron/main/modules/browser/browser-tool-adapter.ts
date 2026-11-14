@@ -32,16 +32,23 @@ export function buildEmbeddedBrowserToolAdapter(options = {}) {
             const manager = await getManager();
             if (signal?.aborted)
                 throw new Error('Operation aborted');
+            let revealedAction = action;
             try {
                 // The Turn lets the manager re-align a background Agent page with the
                 // page the user is viewing when the next Turn starts.
-                return await manager.executeAgentTool(sessionId, action, trustedInput, signal, {
+                const result = await manager.executeAgentTool(sessionId, action, trustedInput, signal, {
                     turnId: ctx.turnId,
                 });
+                if (action === 'open_tab' &&
+                    typeof trustedInput.miniAppId === 'string' &&
+                    trustedInput.miniAppId.trim()) {
+                    revealedAction = 'open_miniapp';
+                }
+                return result;
             }
             finally {
                 try {
-                    options.onAgentAction?.({ sessionId, action });
+                    options.onAgentAction?.({ sessionId, action: revealedAction });
                 }
                 catch {
                     // Panel reveal is best-effort and must never replace the Browser

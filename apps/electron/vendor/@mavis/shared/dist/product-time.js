@@ -146,6 +146,21 @@ export function formatProductTime(timestampMs, options) {
             return formatSocialTime(timestampMs, nowMs, timestamp, now, locale, true);
         case 'social-compact':
             return formatSocialTime(timestampMs, nowMs, timestamp, now, locale, false);
+        case 'bunny-message-divider':
+        case 'message-divider': {
+            // A divider is rendered once and stays, so it never uses "Now" or weekday-only dates.
+            if (isSameDay(timestamp, now)) {
+                const clock = formatTime(timestamp);
+                return options.preset === 'bunny-message-divider'
+                    ? `${locale === 'zh' ? '今天' : 'Today'} ${clock}`
+                    : clock;
+            }
+            if (calendarDayIndex(now) - calendarDayIndex(timestamp) === 1) {
+                const yesterday = locale === 'zh' ? '昨天' : 'Yesterday';
+                return `${yesterday} ${formatTime(timestamp)}`;
+            }
+            return formatDateTime(timestamp, locale, !sameYear);
+        }
         case 'community-relative':
             return formatCommunityTime(timestampMs, nowMs, timestamp, now, locale);
         case 'common-precise':

@@ -21,7 +21,14 @@ export function observeDisposableRendererExit(contents, terminate) {
     contents.on('destroyed', dispose);
     return dispose;
 }
-const AUTO_RELOAD_REASONS = new Set(['crashed', 'oom', 'unresponsive', 'resume-health-failure']);
+/** `killed` is usually an external kill (`pkill`, Activity Monitor); a reload brings the window back. */
+const AUTO_RELOAD_REASONS = new Set([
+    'crashed',
+    'killed',
+    'oom',
+    'unresponsive',
+    'resume-health-failure',
+]);
 export class RendererIncidentController {
     constructor(dependencies) {
         this.dependencies = dependencies;
@@ -43,6 +50,7 @@ export class RendererIncidentController {
                 void this.report(window, 'unresponsive', 'unresponsive');
             },
             onRenderProcessGone: (_event, details) => {
+                this.dependencies.releaseRendererResources?.(window);
                 void this.report(window, 'render-process-gone', details.reason, details.exitCode);
             },
             onDestroyed: () => {

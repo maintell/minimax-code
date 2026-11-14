@@ -3,6 +3,7 @@ import fs, { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import yaml from 'js-yaml';
 import lockfile from 'proper-lockfile';
+import { isAdvisorContextWindow, isModelKey } from './advisor-config.js';
 import { getConfig, getConfigPath, resetConfig } from './config.js';
 import { minimaxApiModels } from './byok-config.js';
 import { serializeConfigPreservingComments } from './comment-preserving-config-write.js';
@@ -151,6 +152,29 @@ export async function updateLocalModelSelection(input) {
             delete raw.defaultModelVariant;
         else
             raw.defaultModelVariant = input.variant;
+        return { write: true, value: undefined };
+    }).then(({ config }) => ({ config }));
+}
+/** Atomically replace the new-conversation advisor selection. */
+export async function updateLocalAdvisorSelection(input) {
+    if (typeof input.enabled !== 'boolean') {
+        throw new LocalModelProviderConfigValidationError('Invalid default advisor');
+    }
+    const model = input.model?.trim();
+    if (model !== undefined && !isModelKey(model))
+        throw new LocalModelProviderConfigValidationError('Invalid default advisor model');
+    if (input.contextWindow !== undefined && !isAdvisorContextWindow(input.contextWindow))
+        throw new LocalModelProviderConfigValidationError('Invalid default advisor context');
+    const effort = input.thinking?.effort;
+    if (input.thinking !== undefined && (typeof effort !== 'string' || !effort.trim()))
+        throw new LocalModelProviderConfigValidationError('Invalid default advisor effort');
+    return withLockedConfig(async (raw) => {
+        raw.defaultAdvisor = {
+            enabled: input.enabled,
+            ...(model === undefined ? {} : { model }),
+            ...(effort === undefined ? {} : { thinking: { effort } }),
+            ...(input.contextWindow === undefined ? {} : { contextWindow: input.contextWindow }),
+        };
         return { write: true, value: undefined };
     }).then(({ config }) => ({ config }));
 }

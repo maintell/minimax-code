@@ -59,7 +59,6 @@ export const handleSessionUpdate = async (ctx, args, signal) => {
         session_id: args.session_id,
         ...(args.title !== undefined ? { title: args.title } : {}),
         ...(args.extra_data_json !== undefined ? { extra_data_json: args.extra_data_json } : {}),
-        ...(args.agent_id ? { agent_id: args.agent_id } : {}),
         ...(args.archived !== undefined ? { archived: args.archived } : {}),
     }, signal);
     return baseRespOrSuccess(ctx.command, resp, '/api/v1/sessions/update');

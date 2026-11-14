@@ -11,11 +11,6 @@ const logger = getCategoryLogger('update');
 export function isPublicReleaseChannel() {
     return isProd && !isInternalBuild && !isInsideBuild;
 }
-function cdnFeedUrl(releasePath: string) {
-    return isZh
-        ? `https://filecdn.minimax.chat/public/${releasePath}/release`
-        : `https://file.cdn.minimax.io/public/${releasePath}/release`;
-}
 /**
  * 更新通道由包身份决定，不由后端环境决定。
  *
@@ -23,10 +18,6 @@ function cdnFeedUrl(releasePath: string) {
  * `-preview.N` / `-inside.N` 版本号并上传到 `minimax-agent-prod-{internal,inside}`，
  * 因此即使 internal 包的后端环境是预发（buildEnv=staging），它仍必须读取
  * prod-internal 目录下的 preview manifest，否则会跨车道更新成预发包。
- *
- * 公开 prod 包返回 null：本发行版的安装包由 `.github/workflows/desktop-release.yml`
- * 发布成 `desktop-v*` 的 GitHub Release，检查前由 ensurePublicReleaseFeed()
- * 解析出具体 release 再交给 electron-updater（见 release-feed.ts）。
  */
 export function getUpdateServerUrl() {
     const variantPath = isInsideBuild
@@ -34,22 +25,29 @@ export function getUpdateServerUrl() {
         : isInternalBuild
             ? 'minimax-agent-prod-internal'
             : null;
-    if (variantPath)
-        return cdnFeedUrl(variantPath);
+    // 公开 prod 包没有固定 CDN 地址，由 ensurePublicReleaseFeed() 解析。
+    if (!variantPath && isPublicReleaseChannel())
+        return null;
+    const releasePath = variantPath ?? (isProd ? 'minimax-agent-prod' : null);
+    if (releasePath) {
+        return isZh
+            ? `https://filecdn.minimax.chat/public/${releasePath}/release`
+            : `https://file.cdn.minimax.io/public/${releasePath}/release`;
+    }
     if (isStaging) {
         // 预发布环境更新服务器
-        return cdnFeedUrl('minimax-agent-staging');
+        return isZh
+            ? 'https://filecdn.minimax.chat/public/minimax-agent-staging/release'
+            : 'https://file.cdn.minimax.io/public/minimax-agent-staging/release';
     }
     // 普通 test 的 feat 包读取安装包所在分支的指针，其余 test 包保留共享 feed。
     const testBuild = getTestBuildInfo();
     if (testBuild)
         return testBranchFeedUrl(testBuild.locale, testBuild.branchKey);
-    if (isTest) {
-        // 测试环境更新服务器
-        return cdnFeedUrl('minimax-agent-test');
-    }
-    // 公开 prod 包没有固定 CDN 地址，由 ensurePublicReleaseFeed() 解析。
-    return null;
+    // 测试环境更新服务器
+    return isZh
+        ? `https://filecdn.minimax.chat/public/minimax-agent-test/release`
+        : `https://file.cdn.minimax.io/public/minimax-agent-test/release`;
 }
 /**
  * 配置 autoUpdater

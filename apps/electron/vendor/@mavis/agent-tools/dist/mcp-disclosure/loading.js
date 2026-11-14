@@ -1,7 +1,9 @@
+import { renderToolAvailabilityNotice } from './catalog.js';
 import { createMcpInvokeTool, getMcpInvokeRegistries } from './mcp-invoke.js';
 import { buildOrReuseIndex } from './search-index.js';
 import { createBoundedToolSearchTool } from './bounded-tool-search.js';
 import { planMcpDisclosure } from './plan.js';
+import { attachToolSearchTurnFacts } from './turn-facts.js';
 /** Plans the final inventory after the host's capability and permission filters. */
 export function buildToolLoadingCatalog(input) {
     const { tools } = input;
@@ -32,8 +34,12 @@ export function buildToolLoadingCatalog(input) {
         model: input.model,
         options: input.options,
         retainedDeferredTools: new Set(existing?.registry.values()),
+        ...(input.ptc ? { ptc: true } : {}),
+        ...(input.window ? { window: input.window } : {}),
+        gatewaysExposed: Boolean(input.alwaysExpose || existing),
     });
-    if (!plan.deferred && !input.alwaysExpose && !existing) {
+    // A window that declared the gateways keeps them until it ends.
+    if (!plan.deferred && !input.alwaysExpose && !existing && !plan.window?.window.gateways) {
         return { tools: [...plan.inlineTools], plan };
     }
     const registry = plan.deferred ? plan.deferredRegistry : new Map();
@@ -41,14 +47,46 @@ export function buildToolLoadingCatalog(input) {
         ? plan.index
         : buildOrReuseIndex([], { maxSchemaTextLen: input.options?.maxSchemaTextLen ?? 4096 });
     const invoke = createMcpInvokeTool(registry, existing?.referenceRegistry);
+    const options = input.options;
+    const directCall = Boolean(options?.directCall) && !input.ptc;
+    const callForm = input.ptc ? 'ptc' : directCall ? 'direct' : 'mcp_invoke';
+    const catalogOptions = {
+        callForm,
+        exactSelect: Boolean(options?.exactSelect),
+        ...(options?.catalogBudgetTokens !== undefined
+            ? { budgetTokens: options.catalogBudgetTokens }
+            : {}),
+    };
+    const windowUpdate = plan.availability
+        ? renderToolAvailabilityNotice(plan.availability, catalogOptions)
+        : undefined;
+    // Nothing due: a notice already told states this deviation, in the very same words.
+    const availabilityNotice = windowUpdate ?? (plan.window?.deviation.size ? input.window?.told.text : undefined);
+    const toolSearch = attachToolSearchTurnFacts(createBoundedToolSearchTool(index, {
+        topKDefault: options?.topKDefault ?? 5,
+        topKMax: options?.topKMax ?? 20,
+        ...(input.ptc ? { ptc: true } : {}),
+        ...(options?.exactSelect ? { exactSelect: true } : {}),
+        ...(directCall ? { directCall: true } : {}),
+        // A removed tool's stand-in is declared but not callable: not "already available".
+        directToolNames: new Set(plan.inlineTools
+            .map((tool) => tool.def.name)
+            .filter((name) => plan.window?.deviation.get(name)?.status !== 'removed')),
+        ...(input.onToolSearch ? { onResult: input.onToolSearch } : {}),
+    }), {
+        deferredEntries: plan.deferred ? plan.deferredEntries : [],
+        ...(plan.window ? { catalogEntries: [...plan.window.window.deferred.values()] } : {}),
+        ...(windowUpdate ? { windowUpdate } : {}),
+        ...(availabilityNotice ? { availabilityNotice } : {}),
+        ...(options?.catalog ? { catalog: catalogOptions } : {}),
+        callForm,
+        directCall,
+        carryAcrossCompaction: Boolean(options?.carryAcrossCompaction),
+    });
     return {
         tools: [
             ...plan.inlineTools,
-            createBoundedToolSearchTool(index, {
-                topKDefault: input.options?.topKDefault ?? 5,
-                topKMax: input.options?.topKMax ?? 20,
-                ...(input.ptc ? { ptc: true } : {}),
-            }),
+            toolSearch,
             {
                 ...invoke,
                 ...(existingInvoke?.toolCallProvenanceResolver

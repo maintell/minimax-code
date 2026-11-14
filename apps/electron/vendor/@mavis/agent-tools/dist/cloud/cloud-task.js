@@ -62,6 +62,7 @@ import { buildCloudPluginHookAfterToolResult, CLOUD_PLUGIN_STOP_CONTINUATION_LIM
 import { isCloudPluginHookToolFailure, readCloudCompatibleToolResponse, readCloudCodexToolResponse, } from './cloud-plugin-hook-response.js';
 import { cloudPluginHookEffort } from './plugin-hook-effort.js';
 import { withPluginHookCompatibleToolResponse } from '../plugin-hooks/vendor-tool-response.js';
+import { createToolSearchContextHook, createToolSearchResponseHook, disposeToolSearchSession, } from '../mcp-disclosure/request-context.js';
 export { CloudTaskToolDef };
 export const INVALID_SUBAGENT_TARGET = 'INVALID_SUBAGENT_TARGET';
 export const CLOUD_UNIFIED_TASK_DISABLED = 'CLOUD_UNIFIED_TASK_DISABLED';
@@ -323,7 +324,7 @@ let CloudTaskTool = (() => {
                     }
                     try {
                         const assembled = this.runtime.assembleChildRuntime
-                            ? await this.runtime.assembleChildRuntime(response.agent_config, signal, ctx.workspaceRoot)
+                            ? await this.runtime.assembleChildRuntime(response.agent_config, signal, ctx.workspaceRoot, subSessionId)
                             : { config: response.agent_config, tools: [] };
                         resolved = {
                             ...assembled,
@@ -346,7 +347,7 @@ let CloudTaskTool = (() => {
             // exactly as received; no ListAgent/display_name reverse lookup exists here.
             if (!resolved) {
                 subTurnId = randomUUID();
-                resolved = this.subagents.resolve(target.value, ctx.parentAgentConfig);
+                resolved = this.subagents.resolve(target.value, ctx.parentAgentConfig, subSessionId);
             }
             if (!resolved) {
                 if (input.run_in_background === true) {
@@ -426,6 +427,8 @@ let CloudTaskTool = (() => {
                     mode: 'background',
                     result: 'background_not_enabled',
                 });
+                // The catalog build at resolve committed Tool Search state no child Turn will dispose.
+                disposeToolSearchSession(subSessionId);
                 const text = '<task_error>Background task execution is not enabled for this user</task_error>';
                 return {
                     tool_name: CloudTaskToolDef.name,
@@ -442,6 +445,7 @@ let CloudTaskTool = (() => {
             }
             const background = this.background;
             if (!background) {
+                disposeToolSearchSession(subSessionId);
                 const text = '<task_error>Background task execution is not enabled</task_error>';
                 return {
                     tool_name: CloudTaskToolDef.name,
@@ -478,6 +482,7 @@ let CloudTaskTool = (() => {
                 }, signal);
             }
             catch {
+                disposeToolSearchSession(subSessionId);
                 background.metrics?.recordBackgroundTaskTool({
                     tool: 'task',
                     mode: 'background',
@@ -703,6 +708,16 @@ let CloudTaskTool = (() => {
             }
         }
         async runSubagentTurn(ctx, input, resolved, subSessionId, subTurnId, signal) {
+            try {
+                return await this.runSubagentTurnOnce(ctx, input, resolved, subSessionId, subTurnId, signal);
+            }
+            finally {
+                // The child's Turn is over (or never started: setup failed after the catalog build
+                // committed its state), and nothing compacts or resumes this Tool Search state.
+                disposeToolSearchSession(subSessionId);
+            }
+        }
+        async runSubagentTurnOnce(ctx, input, resolved, subSessionId, subTurnId, signal) {
             const agentType = input.agent_name ?? input.subagent_type ?? 'unknown';
             // Buffer locally for the parent-facing ToolResult, while the persistent
             // path also reports every frame through a reporter bound to the child
@@ -951,8 +966,19 @@ let CloudTaskTool = (() => {
                         },
                     };
                     const pluginControl = buildSubagentPluginHooks(subToolContext, subSessionId, subTurnId, resolved.tools, childController.signal, pluginTranscript, resolved.config.model.model_id, cloudPluginHookEffort(resolved.config.model), agentType);
+                    // Request-only deferred-tool catalog, as on main Turns (child Turns do not compact).
+                    const toolSearchContext = createToolSearchContextHook({
+                        tools: resolved.tools,
+                        sessionId: subSessionId,
+                        logger,
+                    });
                     const hooks = {
                         ...(pluginControl?.hooks ?? {}),
+                        beforeLlmCallHook: [toolSearchContext],
+                        afterLlmCallHook: [
+                            createToolSearchResponseHook({ sessionId: subSessionId }),
+                            ...(pluginControl?.hooks.afterLlmCallHook ?? []),
+                        ],
                         ...(beforeToolCall
                             ? {
                                 beforeToolCallHook: [

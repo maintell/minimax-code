@@ -9,6 +9,12 @@ const PROJECT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9
  */
 export const RUNTIME_FEATURE_PROJECT_ICON_UPDATE = 'project.icon.update';
 /**
+ * Remote Runtime serves the per-Session advisor selection (DesktopService
+ * `SelectAdvisorModel`, `ListModelsResp.advisor`, `SessionInfoView.advisor`).
+ * Runtimes without it hide the advisor entry.
+ */
+export const RUNTIME_FEATURE_SESSION_ADVISOR = 'session.advisor';
+/**
  * Remote Computer Use on the SSH host. Declared only when the remote app-server
  * owns a Computer Use client; permissions are granted on that host only.
  */

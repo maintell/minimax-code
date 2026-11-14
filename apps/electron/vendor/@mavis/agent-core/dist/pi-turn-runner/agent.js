@@ -160,6 +160,10 @@ export async function runAgent(agent, turn, convergeAtIdle) {
         if (turn.input.signal?.aborted) {
             return { kind: 'aborted' };
         }
+        // A turn-failure hook restored the failure its recovery replaced: the
+        // Turn reports that one, not the host error of the repeated call.
+        if (turn.recovery.restoredFailure)
+            return turn.recovery.restoredFailure.termination;
         if (agent.state.errorMessage && !turn.requestStoppedBeforeSend) {
             return failureReason(agent.state.errorMessage, turn.metrics.getLLMFailureObservation()?.normalized);
         }

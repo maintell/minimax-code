@@ -22,6 +22,7 @@ export function serialize(session, now) {
         userExpiresInSec,
         userIntervalSec: session.userIntervalSec,
         error: session.error,
+        boundAgentName: session.boundAgentName,
     };
 }
 export function parseJsonObject(text) {

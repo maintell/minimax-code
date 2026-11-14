@@ -1,7 +1,9 @@
+import { QUESTIONNAIRE_TTL_MS, } from '@mavis/shared/questionnaire';
 import { LocalQuestionnaireError } from '../../../infra/legacy-db/questionnaire-errors.js';
 import { QuestionnaireValidationError, sanitizeReplyAnswers, validateQuestionnaireReply, } from '../../../infra/legacy-db/questionnaire-normalize.js';
 import { isOwnedQuestionnaireRequest, QuestionnaireOwnedActionLifecycle, } from './owned-action-lifecycle.js';
 import { isQuestionnaireAgentAllowed } from './request-lifecycle.js';
+import { isDeferredPluginContinuation } from './owned-action-deferral.js';
 export class QuestionnaireGenericReplyLifecycle {
     deps;
     ownedActionLifecycle;
@@ -16,6 +18,8 @@ export class QuestionnaireGenericReplyLifecycle {
         await this.requireSession(record);
         const reply = this.normalizeReply(record, input.reply);
         const ownedAction = isOwnedQuestionnaireRequest(record.request);
+        if (ownedAction && record.status === 'pending')
+            await this.validateOwnedReply(record, reply);
         const settled = await this.settleReply(record, reply, ownedAction);
         const answeredRecord = {
             ...record,
@@ -42,6 +46,22 @@ export class QuestionnaireGenericReplyLifecycle {
             answeredAt: settled.answeredAt,
             injected: completed?.completed === true,
         };
+    }
+    /** Owner rejection keeps the request pending and returns the owner's reason to the caller. */
+    async validateOwnedReply(record, reply) {
+        if (isExpiredPluginPreparation(record, this.deps.nowMs())) {
+            // Expiry is already decided above; the cutoff only selects this pending row.
+            await this.deps.store.expirePendingRequest(record.requestId, record.createdAt + 1);
+            throw new LocalQuestionnaireError(410, 'QUESTIONNAIRE_NOT_PENDING', 'Plugin preparation card is expired');
+        }
+        try {
+            await this.ownedActionLifecycle.validateReply(record, reply);
+        }
+        catch (err) {
+            if (err instanceof LocalQuestionnaireError)
+                throw err;
+            throw new LocalQuestionnaireError(409, 'QUESTIONNAIRE_REPLY_REJECTED', err instanceof Error ? err.message : String(err));
+        }
     }
     async requireSession(record) {
         if (await this.deps.getSessionById(record.sessionId))
@@ -98,11 +118,14 @@ export class QuestionnaireGenericReplyLifecycle {
             return completed;
         }
         catch (err) {
-            this.deps.emitBusEvent('questionnaire.inject_failed', {
-                requestId: answeredRecord.requestId,
-                sessionId: answeredRecord.sessionId,
-                error: err instanceof Error ? err.message : String(err),
-            });
+            // A busy session only defers a ready plugin card; the owner resumes it.
+            if (!isDeferredPluginContinuation(answeredRecord, err)) {
+                this.deps.emitBusEvent('questionnaire.inject_failed', {
+                    requestId: answeredRecord.requestId,
+                    sessionId: answeredRecord.sessionId,
+                    error: err instanceof Error ? err.message : String(err),
+                });
+            }
             const recoverOwnedAction = this.ownedActionRecovery(ownedAction);
             if (recoverOwnedAction) {
                 recoverOwnedAction(answeredRecord.requestId);
@@ -190,5 +213,11 @@ function canonicalAnswers(reply) {
             : {}),
     }))
         .sort((left, right) => left.stepId.localeCompare(right.stepId));
+}
+/** Plugin preparation rows carry `expiresAt = createdAt + TTL`; legacy rows fall back to the TTL. */
+function isExpiredPluginPreparation(record, now) {
+    if (record.request.mode !== 'plugin-preparation')
+        return false;
+    return (record.request.expiresAt ?? record.createdAt + QUESTIONNAIRE_TTL_MS) <= now;
 }
 //# sourceMappingURL=generic-reply-lifecycle.js.map

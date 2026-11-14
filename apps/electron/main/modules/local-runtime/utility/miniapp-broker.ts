@@ -513,7 +513,7 @@ export class MainMiniAppBrokerClient {
             (pending.method === 'stop' ||
                 pending.method === 'applyUpdate' ||
                 isAgentTurnMethod(pending.method) ||
-                (pending.method === 'open' && cancellation === 'deadline'));
+                (isSurfaceOpenMethod(pending.method) && cancellation === 'deadline'));
         if (!awaitAuthoritativeSettlement) {
             const taken = this.take(requestId, target);
             if (!taken)
@@ -608,6 +608,7 @@ export class UtilityMiniAppBrokerServer {
             if (!this.takePending(requestId, pending))
                 return;
             if (!isMiniAppBrokerResult(result)) {
+                this.logger.warn('miniapp broker rejected result', { requestId, method: value.method });
                 this.postError(requestId, failedResultCode(value.method));
                 return;
             }
@@ -616,9 +617,15 @@ export class UtilityMiniAppBrokerServer {
             if (!this.takePending(requestId, pending))
                 return;
             const code = normalizeErrorCode(error, value.method);
+            this.logger.warn('miniapp broker request failed', {
+                requestId,
+                method: value.method,
+                code,
+                errorName: error instanceof Error ? error.name : typeof error,
+            });
             this.postError(requestId, code, code === 'busy' ? normalizeBusyReason(error) : undefined, value.method === 'stop'
                 ? readStopErrorDiagnostic(error)
-                : value.method === 'open'
+                : isSurfaceOpenMethod(value.method)
                     ? readBrokerErrorDiagnostic(error)
                     : undefined);
         });
@@ -856,7 +863,7 @@ export class UtilityMiniAppBrokerServer {
         const pending = this.pending.get(requestId);
         if (!pending || pending.controller.signal.aborted)
             return;
-        if (pending.method !== 'open' &&
+        if (!isSurfaceOpenMethod(pending.method) &&
             pending.method !== 'stop' &&
             pending.method !== 'applyUpdate' &&
             !isAgentTurnMethod(pending.method)) {
@@ -947,6 +954,8 @@ async function execute(application, request, signal) {
     const pluginId = request.pluginId;
     if (!pluginId)
         throw miniAppError('invalid_request');
+    if (request.method === 'openForAgent')
+        return application.open({ pluginId, signal, initiator: 'agent' });
     if (request.method === 'open')
         return application.open({ pluginId, signal });
     if (request.method === 'credential')
@@ -1154,7 +1163,7 @@ function isMiniAppBrokerRequestMessage(value) {
     if (!isSafeBrokerRequestId(value.requestId))
         return false;
     if (value.method !== 'list' &&
-        value.method !== 'open' &&
+        !isSurfaceOpenMethod(value.method) &&
         value.method !== 'stop' &&
         value.method !== 'credential' &&
         value.method !== 'applyUpdate' &&
@@ -1162,6 +1171,9 @@ function isMiniAppBrokerRequestMessage(value) {
         return false;
     }
     return value.method === 'list' ? value.pluginId === undefined : isSafePluginId(value.pluginId);
+}
+function isSurfaceOpenMethod(method) {
+    return method === 'open' || method === 'openForAgent';
 }
 function isPermissionMethod(method) {
     return method === 'permissions.list' || method === 'permissions.set';
@@ -1372,6 +1384,7 @@ function isMiniAppSurfaceSummary(value) {
         'description',
         'iconUrl',
         'runtime',
+        'widget',
         'update',
         'memory',
     ])) {
@@ -1380,6 +1393,12 @@ function isMiniAppSurfaceSummary(value) {
     if (value.memory !== undefined && !isMiniAppSurfaceMemory(value.memory))
         return false;
     if (!isSafePluginId(value.pluginId))
+        return false;
+    if (value.widget !== undefined &&
+        (!isRecord(value.widget) ||
+            !hasOnlyKeys(value.widget, ['kind', 'size']) ||
+            !['display', 'interactive'].includes(value.widget.kind) ||
+            !['small', 'medium'].includes(value.widget.size)))
         return false;
     if ((value.displayName !== undefined && !isSafeLabel(value.displayName)) ||
         (value.description !== undefined && !isSafeDescription(value.description)) ||

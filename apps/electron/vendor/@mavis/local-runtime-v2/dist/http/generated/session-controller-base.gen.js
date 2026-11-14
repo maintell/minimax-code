@@ -10,6 +10,16 @@ export class SessionControllerBase {
         void req;
         throw new NotImplementedError('replaceRootSession');
     }
+    async getArtifactSpaceContext(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getArtifactSpaceContext');
+    }
+    async writeArtifactSpaceContext(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('writeArtifactSpaceContext');
+    }
     async listSessions(ctx, req) {
         void ctx;
         void req;
@@ -104,6 +114,11 @@ export class SessionControllerBase {
         void ctx;
         void req;
         throw new NotImplementedError('getSessionSourceDetail');
+    }
+    async getSessionToolCallResult(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getSessionToolCallResult');
     }
     async getSessionForkOptions(ctx, req) {
         void ctx;
@@ -224,6 +239,36 @@ export class SessionControllerBase {
         void ctx;
         void req;
         throw new NotImplementedError('reapplyTurnDiff');
+    }
+    async listArtifacts(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('listArtifacts');
+    }
+    async getArtifactSpace(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('getArtifactSpace');
+    }
+    async linkArtifactSpaceSession(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('linkArtifactSpaceSession');
+    }
+    async saveArtifactSpace(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('saveArtifactSpace');
+    }
+    async deleteArtifactSpace(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('deleteArtifactSpace');
+    }
+    async importArtifact(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('importArtifact');
     }
     async listSessionFiles(ctx, req) {
         void ctx;

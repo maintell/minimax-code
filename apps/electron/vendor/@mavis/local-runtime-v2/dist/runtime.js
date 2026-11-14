@@ -1,14 +1,15 @@
 import { acquireLocalRuntimeMigrationLock } from '@mavis/shared/local-runtime-migration-lock';
 import { DeferredRuntimeConversation } from '@mavis/conversation-contract';
-import { bindImFollowUpHostPorts, ownsElectronRuntimeCapabilities, startupRecoveryFaultOption, } from './application/index.js';
+import { bindImFollowUpHostPorts, createRuntimePtcDefault, ownsElectronRuntimeCapabilities, startupRecoveryFaultOption, } from './application/index.js';
+import { reportAgentCutover, reportAgentIdentityDetach, reportLegacyCustomAgentMaterialization, } from './application/agent/runtime-agent-startup-reporting.js';
 import { logger } from '@mavis/shared/local-runtime-logging';
 import { redactErrorForLog } from '@mavis/shared/logging/redact-log-secret';
 import { createBackgroundRuntime } from './background-runtime.js';
 import { createDeferredAgentRuntimeTelemetry, createV1RuntimeBridges, } from './compat/v1/runtime.js';
 import { cleanupFailedV1Startup, createV1RuntimeCompatibility, withAgentStorageScope, createLocalRuntimeV2FrontDoor, createLocalRuntimeHost as createLocalRuntimeHostV1, createV2AgentRuntimeManagementPort, ownerCapabilitiesForServices, } from './http/app.js';
-import { databaseInitializationTimingFields, initializeRuntimeStorage, migrationSafeModeWarning, } from './infra/db/initialize.js';
+import { databaseInitializationTimingFields, initializeRuntimeStorage, migrationSafeModeWarning, recordBunnyStoreOpenMetric, } from './infra/db/initialize.js';
 import { createCliService } from './local/app.js';
-import { createRuntimeAgentComposition, bindAskUserRuntimeProbes, createRuntimeServicePorts, createRuntimeServices, prepareRuntimeServices, } from './services.js';
+import { createPtcDeviceCohortStore, createRuntimeAgentComposition, bindAskUserRuntimeProbes, CRON_SCHEDULER_HANDLER_KEY, createRuntimeServicePorts, createRuntimeServices, prepareRuntimeServices, } from './services.js';
 const V2_LAYOUT_MIGRATION_RECEIPT_CARRIER = Symbol.for('mavis.local-runtime.v2-layout-migration-receipt');
 /** Creates a fully initialized local runtime. The returned compatibility `ready` is resolved. */
 export function createLocalRuntimeHostV2(options) {
@@ -34,9 +35,11 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
     let ownerRuntime;
     const agentTelemetry = createDeferredAgentRuntimeTelemetry();
     let database;
+    let bunnyStore;
     let preparedServices;
     const startupStartedAtMs = Date.now();
     const { stageTimings, measureStageAsync } = createStartupStageTimer();
+    const ptcDefault = createRuntimePtcDefault();
     try {
         // 2026-09-03: the startup generation checkpoint (whole-dataDir copy +
         // fingerprint verification for the manual `generation rollback` CLI) was
@@ -67,6 +70,7 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
                 stageTimings,
             });
             database = storage.database;
+            bunnyStore = storage.bunnyStore;
             const lockedDatabase = storage.database;
             reportStorageInitialization(storage.initialization);
             // The Agent cutover reads and rewrites legacy Agent storage, so it runs
@@ -107,6 +111,7 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
             sandboxOperationsFactory,
             prepared: preparedServices,
         });
+        configuredOptions.ptcDefault = ptcDefault;
         Object.defineProperty(configuredOptions, V2_LAYOUT_MIGRATION_RECEIPT_CARRIER, {
             value: completedLayoutMigration,
             enumerable: false,
@@ -119,8 +124,13 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
             metricsClient: resolvedV1.metricsClient,
             emitBusEvent: (type, payload) => resolvedV1.apiHost.emitBusEvent(type, payload),
         });
+        // The Bunny store opens on first use, which can come before the metrics client exists;
+        // its outcome is reported once, when it opens or here if it already has.
+        storage.bunnyStore.whenOpened((store) => recordBunnyStoreOpenMetric(resolvedV1.metricsClient, store));
         legacyClose = v1.apiHost.close.bind(v1.apiHost);
         await measureStageAsync('v1_host_ready_ms', async () => resolvedV1.ready);
+        // Storage is migrated and no request reaches the front door before it is assembled below.
+        decidePtcDeviceCohort({ options, ptcDefault, database: resolvedDatabase, v1: resolvedV1 });
         const legacyHandleRequest = v1.apiHost.handleRequest.bind(v1.apiHost);
         if (compatibility) {
             if (!preparedServices)
@@ -132,11 +142,14 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
                 compatibility,
                 agentOwner: owner,
                 database: resolvedDatabase,
+                bunnyStore: storage.bunnyStore,
                 sandboxOperationsFactory,
                 prepared,
                 disabledLegacyScheduleCount: initialization.disabledLegacyScheduleCount,
+                mainDatabaseSafeMode: initialization.safeMode,
                 options,
                 overrides,
+                ptcDefault,
             }));
             bindOwnerRuntimeIntegrations({
                 ownerRuntime,
@@ -161,6 +174,7 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
             agentTelemetry,
             v1,
             database,
+            bunnyStore,
         });
         const ownerCompromiseGuard = createRuntimeOwnerCompromiseGuard(ownerRuntime, close);
         ownerCompromiseGuard.assertHealthy();
@@ -202,6 +216,7 @@ async function createLocalRuntimeHostV2Internal(options, overrides) {
             agentOwner,
             agentTelemetry,
             database,
+            bunnyStore,
         });
         throw error;
     }
@@ -415,99 +430,6 @@ function reportProjectMigrationRecovery(result) {
     }
     logger.warn(result, 'local-runtime-v2 skipped malformed Project migration data');
 }
-function reportAgentCutover(event) {
-    const fields = {
-        migration_id: event.migrationId,
-        ...(event.collisionMigrationId ? { collision_migration_id: event.collisionMigrationId } : {}),
-        phase: event.phase,
-        status: event.status,
-        source_kind: event.sourceKind,
-        target_kind: event.targetKind,
-        conflict_count: event.conflictCount,
-        mapping: event.mapping,
-        reference_counts: event.referenceCounts,
-        source_row_count: event.sourceRowCount,
-        imported_row_count: event.importedRowCount,
-        recovered_timestamp_count: event.recoveredTimestampCount,
-        recoveries: event.recoveries,
-        target_row_count: event.targetRowCount,
-        duration_ms: event.durationMs,
-        ...(event.failureStep ? { failure_step: event.failureStep } : {}),
-        ...(event.secondaryFailureStep ? { secondary_failure_step: event.secondaryFailureStep } : {}),
-        ...(event.skipCode ? { skip_code: event.skipCode } : {}),
-        ...(event.errorCode ? { error_code: event.errorCode } : {}),
-    };
-    if (event.status === 'failed') {
-        logger.error(fields, 'V2 Agent cutover failed');
-        return;
-    }
-    logger.info(fields, 'V2 Agent cutover');
-}
-/**
- * Startup-only detached-identity record. The fields are deliberately bounded:
- * no Persona, Prompt, Memory, credential, avatar URL, or error text reaches
- * runtime logs.
- */
-function reportAgentIdentityDetach(event) {
-    const fields = {
-        event: 'legacy_builtin_identity_detach',
-        agent_name: event.agentName,
-        phase: event.phase,
-        outcome: event.outcome,
-        ...(event.asset ? { asset: event.asset } : {}),
-        ...(event.action ? { action: event.action } : {}),
-        ...(event.avatarDecision ? { avatar_decision: event.avatarDecision } : {}),
-    };
-    if (event.outcome === 'failed') {
-        logger.error(fields, 'V2 Agent identity detach failed');
-        return;
-    }
-    logger.info(fields, 'V2 Agent identity detach');
-}
-function reportLegacyCustomAgentMaterialization(event) {
-    if (event.kind === 'summary') {
-        reportLegacyCustomAgentMaterializationSummary(event);
-        return;
-    }
-    reportLegacyCustomAgentMaterializationAgent(event);
-}
-function reportLegacyCustomAgentMaterializationSummary(event) {
-    const fields = {
-        event: 'legacy_custom_agent_materialization_summary',
-        materialized: event.materialized,
-        canonical_identity_reconciled: event.canonicalIdentityReconciled,
-        already_canonical: event.alreadyCanonical,
-        not_legacy: event.notLegacy,
-        invalid: event.invalid,
-        failed: event.failed,
-        receipt_completed: event.receiptCompleted,
-    };
-    if (event.invalid > 0 || event.failed > 0) {
-        logger.warn(fields, 'V2 legacy Custom Agent materialization incomplete');
-        return;
-    }
-    logger.info(fields, 'V2 legacy Custom Agent materialization summary');
-}
-function reportLegacyCustomAgentMaterializationAgent(event) {
-    const deferred = event.outcome === 'invalid' || event.outcome === 'failed';
-    const fields = {
-        event: deferred
-            ? 'legacy_custom_agent_materialization_deferred'
-            : 'legacy_custom_agent_materialization',
-        agent_name: event.agentName,
-        outcome: event.outcome,
-        identity_source: event.identitySource,
-        recovered_fields: event.recoveredFields,
-        ...(event.errorCode ? { error_code: event.errorCode } : {}),
-        ...(event.stage ? { stage: event.stage } : {}),
-        ...(event.reason ? { reason: event.reason } : {}),
-    };
-    if (deferred) {
-        logger.warn(fields, 'V2 legacy Custom Agent materialization deferred');
-        return;
-    }
-    logger.info(fields, 'V2 legacy Custom Agent materialization');
-}
 /** Fail-closed non-owner startup: channel errors abort with a failed timing report. */
 async function awaitNonOwnerChannelStartup(input) {
     try {
@@ -531,6 +453,11 @@ function bindOwnerRuntimeIntegrations(input) {
     // the probe unset, which means never suppress.
     bindAskUserRuntimeProbes(apiHost, ownerRuntime.services.turnSystem);
     bindImFollowUpHostPorts(apiHost, ownerRuntime.services);
+    const turnInspection = ownerRuntime.services.turnSystem?.inspection;
+    if (turnInspection) {
+        apiHost.isTurnOwnedByOtherRuntime = async (sessionId) => (await turnInspection.activeTurn(sessionId))?.ownedByOtherRuntime === true;
+    }
+    apiHost.coordinatorRoster = ownerRuntime.services.sessionSystem?.coordinatorOwnership.roster;
 }
 /**
  * MR2 two-phase assembly, phase 2: hand the v2-owned channel subsystem to
@@ -628,11 +555,34 @@ function createBrowserUseServiceOptions(options) {
         ...(options.browserToolExposure ? { toolExposure: options.browserToolExposure } : {}),
     };
 }
+/**
+ * Decides this device's PTC cohort — Desktop only.
+ *
+ * The Desktop is the only host that fetches Apollo and can act on the answer, and the record it
+ * writes is written exactly once. A TUI, `mcode exec` or SSH App Server run shares the same data
+ * directory, database and config.yaml, yet never reads Apollo: a decision taken there could not
+ * be carried out, and because the record never changes, a data directory the TUI opened first
+ * would still call itself a fresh install the day the Desktop finally signs in, long after it
+ * stopped being one. Those hosts therefore leave the device undecided — `cohort()` stays
+ * `unknown`, `applied()` stays false, and an apply that cannot reach this process answers
+ * `none`.
+ */
+function decidePtcDeviceCohort(input) {
+    if (input.options.runtimeOwnerKind !== 'electron')
+        return;
+    input.ptcDefault.decideCohort({
+        store: createPtcDeviceCohortStore(input.database.db),
+        readExplicitPtc: () => input.v1.apiHost.configGetter().explicitPtc,
+        appVersion: input.options.appVersion ?? '',
+        nowMs: input.options.nowMs ?? Date.now,
+        logger,
+    });
+}
 function ownsBackgroundScheduler(runtimeOwnerKind) {
     return runtimeOwnerKind === 'electron' || runtimeOwnerKind === 'app-server';
 }
 async function initializeOwnerRuntime(input) {
-    const { v1, compatibility, agentOwner, database, prepared, options, overrides, sandboxOperationsFactory, } = input;
+    const { v1, compatibility, agentOwner, database, bunnyStore, prepared, options, overrides, sandboxOperationsFactory, } = input;
     let background;
     let services;
     try {
@@ -644,6 +594,8 @@ async function initializeOwnerRuntime(input) {
             logger,
             metrics: v1.metricsClient,
             ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+            onPowerDemandChanged: options.onPowerDemandChanged,
+            powerDemandSchedulerHandlerKey: CRON_SCHEDULER_HANDLER_KEY,
             restorePersistedJobExecution: startupExecutionEnabled,
             // The SSH app-server owns long-lived scheduled work independently of
             // attached Desktop clients. Interactive CLI/TUI hosts remain timer-free.
@@ -652,6 +604,7 @@ async function initializeOwnerRuntime(input) {
         });
         services = await createRuntimeServices({
             db: database.db,
+            bunnyStore,
             dataDir: v1.dataDir,
             logger,
             ...(background.clients.scheduler ? { scheduler: background.clients.scheduler } : {}),
@@ -667,6 +620,8 @@ async function initializeOwnerRuntime(input) {
             ...(options.configSource ? { configSource: options.configSource } : {}),
             ...(options.nowMs ? { nowMs: options.nowMs } : {}),
             recoverPersistedState: startupExecutionEnabled,
+            mainDatabaseSafeMode: input.mainDatabaseSafeMode,
+            onActiveTurnCountChanged: background.reportActiveTurnCount,
             ...startupRecoveryFaultOption(options.configGetter?.().startupRecoveryFault, logger),
             greetingEnabled: electronOwner && startupExecutionEnabled,
             runtimeOwnerKind: options.runtimeOwnerKind,
@@ -682,13 +637,18 @@ async function initializeOwnerRuntime(input) {
             modelAccessEnabled: modelAccessBuildEnabled(v1.apiHost.configGetter, options.configGetter),
             getRunawayGuardConfig: options.getRunawayGuardConfig,
             getPromptSuggestionPolicy: options.getPromptSuggestionPolicy,
+            isDeviceOnline: options.isDeviceOnline,
+            ptcDefault: input.ptcDefault,
             promptSuggestionSurface: options.promptSuggestionSurface,
+            partialStreamRecoverySurface: options.partialStreamRecoverySurface,
             resolveComputerUseCapture: options.resolveComputerUseCapture,
             ...(options.getToolResultCompactionConfig
                 ? {
                     getToolResultCompactionConfig: options.getToolResultCompactionConfig,
                 }
                 : {}),
+            getBunnyContextConfig: options.getBunnyContextConfig,
+            ...bunnyModelDefaultsOption(options),
             runtimeOwnerIdentity: background.clients.runtimeOwnerIdentity,
             ...exposeComputerUseClient(options.computerUseClient),
             sessionClio: {
@@ -711,6 +671,7 @@ async function initializeOwnerRuntime(input) {
         await services.ready();
         return {
             database,
+            bunnyStore,
             background,
             services,
             disabledLegacyScheduleCount: input.disabledLegacyScheduleCount,
@@ -723,6 +684,14 @@ async function initializeOwnerRuntime(input) {
 }
 function exposeComputerUseClient(client) {
     return client ? { computerUseClient: client } : {};
+}
+/**
+ * The Bunny rollout payload already carries `default_model` and `default_task_model`, so they ride
+ * the existing `getBunnyPolicy` channel rather than a second one. Hosts without that policy (TUI,
+ * CLI) get no option at all and keep the built-in defaults.
+ */
+function bunnyModelDefaultsOption(options) {
+    return options.getBunnyPolicy ? { getBunnyModelDefaults: options.getBunnyPolicy } : {};
 }
 function sandboxRuntimeOptions(options) {
     const sandboxConfig = options.configGetter?.().sandbox;
@@ -744,7 +713,7 @@ function createSharedClose(state) {
         return closePromise;
     };
 }
-async function closeRuntime({ ownerRuntime, closeV1, agentOwner, agentTelemetry, v1, database, }) {
+async function closeRuntime({ ownerRuntime, closeV1, agentOwner, agentTelemetry, v1, database, bunnyStore, }) {
     let firstError;
     await stopV1Producers(v1, (error) => {
         firstError ??= error;
@@ -770,14 +739,26 @@ async function closeRuntime({ ownerRuntime, closeV1, agentOwner, agentTelemetry,
     catch (error) {
         firstError ??= error;
     }
-    try {
-        database?.close();
-    }
-    catch (error) {
+    closeDatabases(bunnyStore, database, (_cleanupStep, error) => {
         firstError ??= error;
-    }
+    });
     if (firstError !== undefined)
         throw firstError;
+}
+/** Closes the Bunny store before the shared database; each failure is reported and the other still closes. */
+function closeDatabases(bunnyStore, database, recordError) {
+    const clients = [
+        ['close_bunny_store', bunnyStore],
+        ['close_database', database],
+    ];
+    for (const [cleanupStep, client] of clients) {
+        try {
+            client?.close();
+        }
+        catch (error) {
+            recordError(cleanupStep, error);
+        }
+    }
 }
 async function closeOwnerResources(background, services, operation, recordError) {
     const steps = [
@@ -800,7 +781,7 @@ async function closeOwnerResources(background, services, operation, recordError)
         }
     }
 }
-async function cleanupFailedStartup({ ownerRuntime, v1, closeV1, agentOwner, agentTelemetry, database, }) {
+async function cleanupFailedStartup({ ownerRuntime, v1, closeV1, agentOwner, agentTelemetry, database, bunnyStore, }) {
     await stopV1Producers(v1, (error) => {
         try {
             logger.warn({ cleanupStep: 'stop_v1_producers', err: error }, 'local-runtime-v2 startup cleanup failed');
@@ -840,17 +821,14 @@ async function cleanupFailedStartup({ ownerRuntime, v1, closeV1, agentOwner, age
             // Continue cleanup even when reporting itself fails.
         }
     });
-    try {
-        database?.close();
-    }
-    catch (error) {
+    closeDatabases(bunnyStore, database, (cleanupStep, err) => {
         try {
-            logger.warn({ cleanupStep: 'close_database', err: error }, 'local-runtime-v2 startup cleanup failed');
+            logger.warn({ cleanupStep, err }, 'local-runtime-v2 startup cleanup failed');
         }
         catch {
             // Continue cleanup.
         }
-    }
+    });
 }
 async function stopV1Producers(v1, recordError) {
     const steps = [

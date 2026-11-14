@@ -49,6 +49,13 @@ const VideoInfoSchema = Type.Object({
 // Web search — 无文件 I/O
 // ────────────────────────────────────────────────────────────────────────────
 export const MatrixWebSearchToolDef = WebSearchToolDef;
+/**
+ * `web_fetch` has no cloud-runtime Matrix tool: it is a local-runtime tool whose
+ * router may delegate a single read to the server. It still needs a name in the
+ * shared path/timeout tables, and deliberately stays out of `MATRIX_TOOL_NAMES`
+ * so cloud-runtime never registers a model-visible tool for it.
+ */
+export const MATRIX_WEB_FETCH_TOOL_NAME = 'web_fetch';
 // ────────────────────────────────────────────────────────────────────────────
 // Image understanding / synthesize / search / reverse-search
 // ────────────────────────────────────────────────────────────────────────────
@@ -410,6 +417,7 @@ export const MatrixTranscribeAudioToolDef = {
 // ────────────────────────────────────────────────────────────────────────────
 export const MATRIX_TOOL_PATHS = {
     [MatrixWebSearchToolDef.name]: '/matrix/api/v1/mcp/web_search',
+    [MATRIX_WEB_FETCH_TOOL_NAME]: '/matrix/api/v1/mcp/web_fetch',
     [MatrixImagesUnderstandToolDef.name]: '/matrix/api/v1/mcp/images_understand',
     [MatrixImageSynthesizeToolDef.name]: '/matrix/api/v1/mcp/image_synthesize',
     [MatrixImagesSearchAndDownloadToolDef.name]: '/matrix/api/v1/mcp/images_search_and_download',
@@ -441,8 +449,16 @@ export const MATRIX_TOOL_PATHS = {
 // ────────────────────────────────────────────────────────────────────────────
 const MATRIX_GEN_TIMEOUT_MS = 600_000;
 const MATRIX_DEFAULT_TIMEOUT_MS = 120_000;
+/**
+ * Server-side page reading is a single bounded upstream call (provider read plus
+ * optional fallback), not an open-ended generation, so it gets its own budget
+ * well below the 2 min default. The local router falls back to a direct fetch
+ * once this elapses.
+ */
+export const MATRIX_WEB_FETCH_TIMEOUT_MS = 25_000;
 export const MATRIX_TOOL_TIMEOUTS = {
     [MatrixWebSearchToolDef.name]: MATRIX_DEFAULT_TIMEOUT_MS,
+    [MATRIX_WEB_FETCH_TOOL_NAME]: MATRIX_WEB_FETCH_TIMEOUT_MS,
     [MatrixImagesUnderstandToolDef.name]: MATRIX_DEFAULT_TIMEOUT_MS,
     [MatrixImageSynthesizeToolDef.name]: MATRIX_GEN_TIMEOUT_MS,
     [MatrixImagesSearchAndDownloadToolDef.name]: MATRIX_GEN_TIMEOUT_MS,

@@ -2,11 +2,12 @@ import * as fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { clipboard } from "electron";
-import { BROWSER_TIMEOUTS, BrowserCore, sanitizeConsoleDiagnosticUrl } from "@mavis/browser-core";
+import { BROWSER_TIMEOUTS, BrowserCore, sanitizeConsoleDiagnosticUrl, browserScriptActionDeadlineMs } from "@mavis/browser-core";
 import { ElectronBrowserPageContext } from "./electron-browser-page-context";
 import { ELECTRON_BROWSER_CORE_ACTIONS } from "./electron-browser-route-policy";
 import { ElectronCdpTransport } from "./electron-cdp-transport";
-import { asString, AGENT_BROWSER_ACTIONS, OFFSCREEN_BOUNDS, asNumber, asRecord, safeError, nowMs, normalizeUrl, agentElementPriority, MAX_AGENT_SNAPSHOT_ELEMENTS, agentSnapshotElement, agentSnapshotSummary, MAX_AGENT_SNAPSHOTS_PER_TAB, AGENT_SNAPSHOT_TTL_MS, MAX_AGENT_SNAPSHOT_PAGE_LIMIT, DEFAULT_AGENT_SNAPSHOT_PAGE_LIMIT, buildAgentSnapshotPage, MAX_AGENT_SNAPSHOT_PAGE_BYTES, urlHost, isMainDocumentNavigation, requireTextArg, asStringArray, asBoolean, requireStringArg, finiteNumber, shortcutModifier } from "./embedded-browser-manager-helpers";
+import { installBrowserJsDialogGate } from "./browser-js-dialog-gate";
+import { asString, AGENT_BROWSER_ACTIONS, OFFSCREEN_BOUNDS, asNumber, asRecord, isWithinAgentKeepalive, safeError, nowMs, normalizeUrl, agentElementPriority, MAX_AGENT_SNAPSHOT_ELEMENTS, agentSnapshotElement, agentSnapshotSummary, MAX_AGENT_SNAPSHOTS_PER_TAB, AGENT_SNAPSHOT_TTL_MS, MAX_AGENT_SNAPSHOT_PAGE_LIMIT, DEFAULT_AGENT_SNAPSHOT_PAGE_LIMIT, buildAgentSnapshotPage, MAX_AGENT_SNAPSHOT_PAGE_BYTES, urlHost, isMainDocumentNavigation, requireTextArg, asStringArray, asBoolean, requireStringArg, finiteNumber, shortcutModifier } from "./embedded-browser-manager-helpers";
 const VERIFIED_FILL_SAMPLE_COUNT = 4;
 const VERIFIED_FILL_SAMPLE_DELAY_MS = 50;
 const TEXT_INPUT_COMPLETION_BUFFER_MS = 30000;
@@ -218,6 +219,24 @@ export class EmbeddedBrowserToolRuntime {
         }
         return this.stripAgentTarget(result);
     }
+    captureScriptPage(tab, contents) {
+        if (tab.miniApp) {
+            const current = this.host.captureMiniAppPage(tab, contents);
+            if (!current)
+                throw scriptPageUnavailable(tab);
+            return current;
+        }
+        const frame = contents.mainFrame;
+        const generation = tab.navigationGeneration;
+        if (!frame || frame.detached || !/^https?:\/\//i.test(frame.url))
+            throw scriptPageUnavailable(tab);
+        return () => this.host.getWebContents(tab) === contents &&
+            !contents.isDestroyed() &&
+            !frame.detached &&
+            contents.mainFrame === frame &&
+            tab.navigationGeneration === generation &&
+            /^https?:\/\//i.test(frame.url);
+    }
     async tryExecuteBrowserCore(agentTarget, tool, input, signal, explicitTab) {
         const { sessionId, tabId } = agentTarget;
         if (!ELECTRON_BROWSER_CORE_ACTIONS.some((action) => action === tool)) {
@@ -250,6 +269,8 @@ export class EmbeddedBrowserToolRuntime {
             typeof webContents.executeJavaScript !== 'function' ||
             typeof webContents.debugger?.sendCommand !== 'function';
         if (unusableWebContents) {
+            if (tool === 'run_script')
+                throw scriptPageUnavailable(tab);
             if (this.sharedCoreTabs.has(tab)) {
                 return {
                     used: true,
@@ -266,6 +287,12 @@ export class EmbeddedBrowserToolRuntime {
         }
         if (!webContents)
             return { used: false };
+        // Install before the Core session reads transport.jsDialogs; idempotent per WebContents.
+        installBrowserJsDialogGate(webContents, {
+            isOperationActive: () => (tab.agentOperationCount ?? 0) > 0,
+            agentKeepaliveSince: () => isWithinAgentKeepalive(tab) ? (tab.lastAgentOperationAt ?? null) : null,
+        });
+        const isCurrentScriptPage = tool === 'run_script' ? this.captureScriptPage(tab, webContents) : undefined;
         let pageContext = this.sharedPageContexts.get(webContents);
         if (!pageContext) {
             const controllerCdpHelper = tab.controller.getCDPHelper();
@@ -319,7 +346,11 @@ export class EmbeddedBrowserToolRuntime {
         if (tool === 'navigate' || tool === 'back' || tool === 'forward' || tool === 'reload') {
             tab.lastLoadError = null;
         }
-        const result = await this.host.withTabOperation(tab, `browser-core:${tool}`, (operationSignal) => pageContext.execute(tool, coreInput, operationSignal ?? signal), {
+        const result = await this.host.withTabOperation(tab, `browser-core:${tool}`, (operationSignal) => {
+            if (isCurrentScriptPage && !isCurrentScriptPage())
+                throw scriptPageUnavailable(tab);
+            return pageContext.execute(tool, coreInput, operationSignal ?? signal);
+        }, {
             signal,
             operationTimeoutMs: sharedCoreOperationTimeout(tool, coreInput),
         });
@@ -962,6 +993,9 @@ export class EmbeddedBrowserToolRuntime {
                 ? result.durationMs
                 : undefined;
         const download = projectBrowserDownload(result.download);
+        const dialogHandling = projectJsDialogHandling(result);
+        if (dialogHandling)
+            return dialogHandling;
         if (result.success === false) {
             if (result.code === 'UNEXPECTED_NAVIGATION') {
                 return {
@@ -1019,6 +1053,9 @@ export class EmbeddedBrowserToolRuntime {
         };
     }
     projectAgentNavigationResult(tab, projection, result) {
+        const dialogHandling = projectJsDialogHandling(result);
+        if (dialogHandling)
+            return dialogHandling;
         const runtimeTarget = asRecord(result.target);
         const target = this.projectAgentClickTarget(projection.element, runtimeTarget);
         const sourceNavigation = asRecord(result.navigation);
@@ -1892,7 +1929,14 @@ export class EmbeddedBrowserToolRuntime {
     }
 }
 
+function scriptPageUnavailable(tab) {
+    return new Error(tab.miniApp
+        ? 'MINIAPP_UNAVAILABLE: Reopen the Mini App before running a script'
+        : 'BROWSER_PAGE_UNAVAILABLE: Inspect the current web page before running a script');
+}
 function sharedCoreOperationTimeout(tool, input) {
+    if (tool === 'run_script')
+        return browserScriptActionDeadlineMs(input) + 1000;
     const requested = asNumber(input.timeout, BROWSER_TIMEOUTS.tabOperation);
     if (tool === 'fill' || tool === 'type') {
         // Browser Core owns the target-aware text deadline. Keep the host timeout
@@ -1950,6 +1994,10 @@ export function projectSharedCoreResult(tool, result) {
         'totalEntries',
         'returnedEntries',
         'selectorTail',
+        'dialog',
+        'trigger',
+        'awaitingUser',
+        'handled',
     ];
     const actionKeys = {
         click: ['target', 'effect', 'navigation', 'download'],
@@ -1977,9 +2025,26 @@ export function projectSharedCoreResult(tool, result) {
         scroll: ['target', 'effect'],
         wait: ['kind', 'waitedMs'],
         screenshot: ['format', 'width', 'height', 'data', 'file_path'],
+        run_script: [
+            'filename',
+            'value',
+            'valueTruncated',
+            'logs',
+            'logsTruncated',
+            'pageEvaluate',
+            'input',
+            'pageErrors',
+            'screenshots',
+            'screenshotsSkipped',
+        ],
         upload_files: ['target', 'effect', 'filesAttached', 'chooserOpened', 'navigation'],
     };
-    const keys = new Set([...commonKeys, ...(actionKeys[tool] ?? [])]);
+    const keys = new Set([
+        ...commonKeys,
+        ...(actionKeys[tool] ?? []),
+        // handle_js_dialog, or a click/press_key on a dialog ref, settled a dialog.
+        ...(source.handled === true ? ['type', 'action'] : []),
+    ]);
     for (const key of keys) {
         if (source[key] !== undefined)
             projected[key] = source[key];
@@ -2038,6 +2103,39 @@ export function projectSharedCoreResult(tool, result) {
         projected.error = tool === 'back' ? 'Cannot go back' : 'Cannot go forward';
     }
     return projected;
+}
+/**
+ * A click either landed on a JavaScript dialog button or was interrupted by a
+ * dialog. Neither is a page click, so keep Core's dialog contract instead of
+ * the click effect/navigation projection.
+ */
+function projectJsDialogHandling(result) {
+    if (result.handled === true) {
+        const projected = { success: true, handled: true };
+        for (const key of ['type', 'action', 'duration', 'durationMs']) {
+            if (result[key] !== undefined)
+                projected[key] = result[key];
+        }
+        return projected;
+    }
+    if (result.success === false && (isRecord(result.dialog) || result.awaitingUser === true)) {
+        const projected = { success: false };
+        for (const key of [
+            'code',
+            'error',
+            'message',
+            'dialog',
+            'trigger',
+            'awaitingUser',
+            'retryable',
+            'recovery',
+        ]) {
+            if (result[key] !== undefined)
+                projected[key] = result[key];
+        }
+        return projected;
+    }
+    return null;
 }
 function projectBrowserDownload(value) {
     if (!isRecord(value))

@@ -67,6 +67,7 @@ import { FRAME_TYPES, makeFrame, makeBusEventFrame } from './frame-codec.js';
 import { mapBusEventToFrame } from './event-frame-mapper.js';
 export const EVENTS_RETRY_DELAY_MS = 5_000;
 export const NOTIFICATION_EVENT_BUFFER_LIMIT = 100;
+const LOCAL_ONLY_QUESTIONNAIRE_LIMIT = 500;
 const NOTIFICATION_TRIGGER_EVENT_TYPES = new Set([
     'permission.ask',
     'questionnaire.ask',
@@ -94,6 +95,8 @@ export class PermissionUpstream {
     running = false;
     generation = 0;
     pendingNotificationEvents = new Map();
+    /** Plugin preparation cards seen on this bus (bounded); their later frames stay local too. */
+    localOnlyQuestionnaireIds = new Set();
     constructor(deps) {
         this.deps = deps;
     }
@@ -167,6 +170,8 @@ export class PermissionUpstream {
     handleGlobalEvent(event) {
         const { type, timestamp } = event;
         const { payload } = event;
+        if (this.isDesktopLocalQuestionnaireEvent(event))
+            return;
         this.cancelBufferedAskForTerminalEvent(event);
         this.cancelBufferedGoalStateForNewerState(event);
         if (type === 'permission.ask' || type === 'permission.resolved') {
@@ -225,6 +230,37 @@ export class PermissionUpstream {
         }
         this.deps.logger.debug(message);
     }
+    /**
+     * Plugin preparation cards are inline, non-blocking Desktop suggestions whose
+     * setup (install / enable / App connection) only runs on this machine. They
+     * never notify the phone or expose a remote Ready action, and their later
+     * answered / dismissed / superseded frames are withheld the same way.
+     */
+    isDesktopLocalQuestionnaireEvent(event) {
+        const requestId = readString(event.payload.requestId);
+        if (event.type === 'questionnaire.ask') {
+            if (!isPluginPreparationRequest(event.payload.request))
+                return false;
+            if (requestId) {
+                this.localOnlyQuestionnaireIds.add(requestId);
+                if (this.localOnlyQuestionnaireIds.size > LOCAL_ONLY_QUESTIONNAIRE_LIMIT) {
+                    const oldest = this.localOnlyQuestionnaireIds.values().next().value;
+                    if (oldest !== undefined)
+                        this.localOnlyQuestionnaireIds.delete(oldest);
+                }
+            }
+            return true;
+        }
+        if ((event.type === 'questionnaire.dismiss' || event.type === 'questionnaire.superseded') &&
+            requestId !== undefined &&
+            this.localOnlyQuestionnaireIds.has(requestId)) {
+            if (event.type === 'questionnaire.superseded' || event.payload.status !== 'answered') {
+                this.localOnlyQuestionnaireIds.delete(requestId);
+            }
+            return true;
+        }
+        return false;
+    }
     handlePermissionEvent(type, payload, timestamp) {
         const sessionId = readString(payload.sessionId);
         const requestId = readString(payload.requestId);
@@ -273,6 +309,11 @@ export class PermissionUpstream {
         }
         if (event.type === 'session.finish' && readString(event.payload.goalId)) {
             this.deps.logger.info(`component=rc_event_upstream event=notification_buffer event_type=${event.type}${identity} status=dropped_goal_turn_end`);
+            return true;
+        }
+        // A silent Turn end (system-woken, nothing said) is not a notification.
+        if (event.type === 'session.finish' && event.payload.silent === true) {
+            this.deps.logger.info(`component=rc_event_upstream event=notification_buffer event_type=${event.type}${identity} status=dropped_silent_turn_end`);
             return true;
         }
         // One pending notification per session: the newest replaces the older one.
@@ -415,6 +456,11 @@ function buildAskPayload(sessionId, requestId, payload) {
         ...(reason ? { reason } : {}),
         ts_ms: createdAt,
     };
+}
+function isPluginPreparationRequest(request) {
+    return (typeof request === 'object' &&
+        request !== null &&
+        request.mode === 'plugin-preparation');
 }
 function readString(value) {
     return typeof value === 'string' && value.length > 0 ? value : undefined;

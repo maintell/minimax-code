@@ -73,6 +73,7 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
         let response;
         let settled = false;
         let locallyAborted = false;
+        let redirected = false;
         const requestBodyAbortController = new AbortController();
         const settleResolve = (value) => {
             if (settled)
@@ -120,6 +121,12 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
             cleanupSignal();
         }
         function onRequestError(error) {
+            // Electron cancels a manual redirect it was not told to follow; the 3xx
+            // has already been returned, so this error is expected.
+            if (redirected) {
+                cancelRequestBody(error);
+                return;
+            }
             notify((target) => target.failed('request', error));
             cleanupSignal();
             cancelRequestBody(error);
@@ -190,6 +197,27 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
                 abortRequest();
             }
         }
+        function onRedirect(statusCode, _method, _redirectUrl, redirectHeaders) {
+            // Return the 3xx as Node fetch does for redirect: 'manual'. Electron
+            // exposes no body for it.
+            redirected = true;
+            if (settled || locallyAborted)
+                return;
+            notify((target) => target.headersReceived({ status: statusCode }));
+            try {
+                const headers = createResponseHeaders(redirectHeaders);
+                settleResolve(new Response(null, { headers, status: statusCode }));
+            }
+            catch (error) {
+                const isHeaderError = error instanceof InvalidResponseHeaderError;
+                if (isHeaderError && fetchRequest) {
+                    reportInvalidResponseHeader(fetchRequest, statusCode, error.details, onResponseHeaderRejected);
+                }
+                settleReject(isHeaderError ? createByteStringFetchError() : error);
+                notify((target) => target.failed('adapter', error));
+            }
+            cleanupSignal();
+        }
         function endRequestBody() {
             if (!request || !fetchRequest)
                 return;
@@ -228,6 +256,8 @@ function fetchHttpResource(electronNet, electronRequest, input, init, onResponse
             request = electronRequest.call(electronNet, buildHttpRequestOptions(fetchRequest));
             notify((target) => target.requestCreated());
             request.on('response', onResponse);
+            if (fetchRequest.redirect === 'manual')
+                request.on('redirect', onRedirect);
             request.on('error', onRequestError);
             signal.addEventListener('abort', onAbort, { once: true });
             if (signal.aborted) {
@@ -303,8 +333,8 @@ function createResponseHeaders(responseHeaders) {
     try {
         const headers = new Headers();
         for (const [name, rawValue] of Object.entries(responseHeaders ?? {})) {
-            const value = Array.isArray(rawValue) ? rawValue.join(', ') : (rawValue ?? '');
-            const character = findNonByteStringCharacter(name) ?? findNonByteStringCharacter(value);
+            const value = toByteStringValue(Array.isArray(rawValue) ? rawValue.join(', ') : (rawValue ?? ''));
+            const character = findNonByteStringCharacter(name);
             if (character) {
                 throw new InvalidResponseHeaderError({
                     headerName: sanitizeHeaderName(name),
@@ -325,6 +355,15 @@ function createResponseHeaders(responseHeaders) {
             throw error;
         throw new InvalidResponseHeaderError({ headerName: '<unknown>' });
     }
+}
+/**
+ * Electron decodes response header bytes as UTF-8, while fetch Headers hold one
+ * byte per character. A value with a character above U+00FF is re-encoded to its
+ * UTF-8 bytes, the same value Node fetch exposes for those bytes; every other
+ * value is kept as Electron returned it.
+ */
+function toByteStringValue(value) {
+    return findNonByteStringCharacter(value) ? Buffer.from(value, 'utf8').toString('latin1') : value;
 }
 function findNonByteStringCharacter(value) {
     for (let index = 0; index < value.length;) {

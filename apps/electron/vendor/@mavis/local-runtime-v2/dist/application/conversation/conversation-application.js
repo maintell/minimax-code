@@ -3,7 +3,7 @@ import { TurnContinuationState as TurnContinuationStateView } from '@mavis/thrif
 import { normalizeAbortSource } from '@mavis/agent-core/pi-turn-runner';
 import { isServerOwnedTurnId } from '@mavis/shared/turn-identity';
 import { isSameSessionAgentName, QueueServiceError, } from '../../service/session-system/index.js';
-import { DEFAULT_RETRY_CONTINUATION_PROMPT } from '../../service/turn-system/index.js';
+import { BunnyContextResetError, DEFAULT_RETRY_CONTINUATION_PROMPT, } from '../../service/turn-system/index.js';
 import { AttachmentRegistrationError, attachmentRegistrationResponse, materializeLocalAttachmentInputs, } from './attachment-registration.js';
 import { ApplicationError, turnAdmissionError } from './errors.js';
 import { outputContractField } from './output-contract.js';
@@ -60,8 +60,7 @@ export class ConversationApplication {
                 ...submission,
                 ...(options.pausedQueueAction ? { resumePausedQueue: true } : {}),
             });
-            if (!keepsCreatedAttachments(result))
-                await prepared.discardCreated();
+            await this.afterDirectSend(req.id, result, prepared);
             return mapV2TurnStreamResult(result);
         }
         catch (error) {
@@ -251,6 +250,30 @@ export class ConversationApplication {
             // Turn abort is authoritative; Goal pause remains a best-effort side effect.
         }
     }
+    /**
+     * A side message that only joined the Queue is accepted too, and starts no Turn
+     * that could report the user came back. Attachments the send did not keep are
+     * released here as well.
+     */
+    async afterDirectSend(sessionId, result, prepared) {
+        if (result.accepted)
+            await this.noteUserMessageAccepted(sessionId);
+        if (!keepsCreatedAttachments(result))
+            await prepared.discardCreated();
+    }
+    /**
+     * A message the user submitted means the user is attending this Session again,
+     * so a pending Token Plan auto-resume plan must not outlive it. Best effort:
+     * the submitted message is authoritative either way.
+     */
+    async noteUserMessageAccepted(sessionId) {
+        try {
+            await this.options.noteUserMessageAccepted?.(sessionId);
+        }
+        catch {
+            // The submission stands; dropping a pending plan is a side effect.
+        }
+    }
     async enqueueMessage(_ctx, req) {
         const reviewError = await this.reviewAdmissionError(req);
         if (reviewError)
@@ -279,6 +302,9 @@ export class ConversationApplication {
         if (result.mode !== 'queued') {
             throw new Error('Queue-enabled submit returned a non-queued result');
         }
+        // A Queue entry starts no Turn, so nothing else tells the Runtime the user
+        // is attending this Session again.
+        await this.noteUserMessageAccepted(req.id);
         return { itemId: result.queue.itemId, status: 'queued', position: result.queue.position };
     }
     async requestCompaction(_ctx, req) {
@@ -569,6 +595,11 @@ function compactionResponse(result, sessionId) {
     }
     if (outcome.status === 'failed') {
         const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+        // Bunny context reset spec 5.4: a file that could not be written has its own prompt.
+        if (outcome.error instanceof BunnyContextResetError &&
+            outcome.error.category === 'write_failed') {
+            throw new ApplicationError(500, 'local_bunny_reset_write_failed', message);
+        }
         throw new ApplicationError(500, 'local_compaction_failed', message);
     }
     throw new ApplicationError(409, 'local_compaction_aborted', outcome.reason ?? 'Compaction aborted');

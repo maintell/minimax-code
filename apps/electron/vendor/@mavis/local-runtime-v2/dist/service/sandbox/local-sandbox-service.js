@@ -262,7 +262,6 @@ export class LocalSandboxService {
         };
         this.#activeInvocations.set(key, active);
         this.#activeInvocationsByCommandId.set(srtCommandId, active);
-        this.#observability.activeInvocations(this.#activeInvocations.size);
         let finished = false;
         const finish = async (handle, outcome = {
             termination: 'unknown',
@@ -287,7 +286,6 @@ export class LocalSandboxService {
                 this.#activeInvocationsByCommandId.delete(srtCommandId);
                 backendRecord.references -= 1;
                 active.resolveSettled();
-                this.#observability.activeInvocations(this.#activeInvocations.size);
                 try {
                     await this.#cleanupRetiredBackendIfIdle(backendRecord);
                 }

@@ -1,13 +1,15 @@
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
-import { constants as fsConstants } from 'node:fs';
-import { link, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
+import { constants as fsConstants, createReadStream } from 'node:fs';
+import { chmod, copyFile, link, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { logger } from '../logging/logger.js';
 // Windows reports a handle held by another process (scanner, indexer, backup) as one of these
 // codes; the holder usually lets go within a second, so wait about 1.5s in total before failing.
 const FILE_LOCK_RETRY_DELAYS_MS = [50, 100, 200, 400, 800];
 const TRANSIENT_FILE_LOCK_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+/** Read and write unit for streamed JSONL; a record longer than this spans several chunks. */
+const STREAM_CHUNK_BYTES = 256 * 1024;
 export class JsonlAppendCommitUncertainError extends Error {
     filePath;
     cause;
@@ -42,6 +44,38 @@ export async function readJsonl(filePath, decode, onMalformedLine) {
         }
     }
     return records;
+}
+/**
+ * Strict read that visits records in file order while holding one chunk and one line at a time.
+ * Lines follow readJsonl: a trailing newline ends the file and a blank line is malformed. Returns
+ * the number of records visited.
+ */
+export async function forEachJsonlRecord(filePath, decode, visit) {
+    let count = 0;
+    const visitLine = async (line) => {
+        const record = decodeCachedLine(line, decode, { path: filePath, lineNo: count + 1 });
+        count += 1;
+        await visit(record, count - 1);
+    };
+    let pending = '';
+    const stream = createReadStream(filePath, {
+        encoding: 'utf8',
+        highWaterMark: STREAM_CHUNK_BYTES,
+    });
+    for await (const chunk of stream) {
+        pending += String(chunk);
+        let start = 0;
+        let newline = pending.indexOf('\n');
+        while (newline >= 0) {
+            await visitLine(pending.slice(start, newline));
+            start = newline + 1;
+            newline = pending.indexOf('\n', start);
+        }
+        pending = pending.slice(start);
+    }
+    if (pending.length > 0)
+        await visitLine(pending);
+    return count;
 }
 /**
  * Strict read that decodes only bytes appended since the cached read. The cached prefix is
@@ -284,24 +318,83 @@ export async function publishFileIfAbsent(filePath, contents, validateTemporary)
 export async function publishJsonlIfAbsent(filePath, records, validateTemporary) {
     return publishFileIfAbsentWithLabel(filePath, serializeRecords(records), validateTemporary, 'JSONL');
 }
+/**
+ * Publishes a byte copy of an existing file only when the target is absent. The copy shares
+ * storage where the filesystem supports copy-on-write; elsewhere Node copies the bytes.
+ */
+export async function publishFileCopyIfAbsent(sourcePath, filePath, validateTemporary) {
+    return publishStagedFileIfAbsent(filePath, async (stagingPath) => {
+        await copyFile(sourcePath, stagingPath, fsConstants.COPYFILE_EXCL | fsConstants.COPYFILE_FICLONE);
+        // A copy inherits the source mode; publication keeps the private mode every writer uses.
+        await chmod(stagingPath, 0o600);
+        await syncFile(stagingPath);
+    }, validateTemporary, 'copied file');
+}
+/**
+ * Publishes JSONL records produced one at a time only when the target is absent. At most one
+ * write buffer is held, however many records the producer writes.
+ */
+export async function publishJsonlStreamIfAbsent(filePath, produce, validateTemporary) {
+    return publishStagedFileIfAbsent(filePath, async (stagingPath) => {
+        const handle = await open(stagingPath, 'wx', 0o600);
+        try {
+            const buffered = [];
+            let bufferedBytes = 0;
+            const flush = async () => {
+                if (buffered.length === 0)
+                    return;
+                await writeInOneCall(handle, Buffer.from(buffered.join(''), 'utf8'), 'JSONL stream');
+                buffered.length = 0;
+                bufferedBytes = 0;
+            };
+            let index = 0;
+            await produce(async (record) => {
+                index += 1;
+                assertJsonSerializable(record, `record ${String(index)}`);
+                const line = JSON.stringify(record);
+                if (line === undefined)
+                    throw jsonSerializationError(`record ${String(index)}`);
+                buffered.push(line, '\n');
+                bufferedBytes += line.length + 1;
+                if (bufferedBytes >= STREAM_CHUNK_BYTES)
+                    await flush();
+            });
+            await flush();
+            await handle.sync();
+        }
+        catch (error) {
+            await closeBestEffort(handle);
+            throw error;
+        }
+        await handle.close();
+    }, validateTemporary, 'JSONL stream');
+}
 async function publishFileIfAbsentWithLabel(filePath, payload, validateTemporary, label) {
+    return publishStagedFileIfAbsent(filePath, async (stagingPath) => {
+        const handle = await open(stagingPath, 'wx', 0o600);
+        try {
+            await writeInOneCall(handle, payload, label);
+            await handle.sync();
+        }
+        catch (error) {
+            await closeBestEffort(handle);
+            throw error;
+        }
+        await handle.close();
+    }, validateTemporary, label);
+}
+/**
+ * The staging file is private, durable, and in the target directory. Publication uses an
+ * atomic hard link so a racing target is authoritative and is never overwritten.
+ */
+async function publishStagedFileIfAbsent(filePath, createStaging, validateTemporary, label) {
     const parentPath = dirname(filePath);
     const stagingPath = join(parentPath, `.${basename(filePath)}.${process.pid}.${randomUUID()}.publish`);
     await mkdir(parentPath, { recursive: true });
-    let handle;
-    let stagingCreated = false;
     let outcome;
     let failure;
     try {
-        handle = await open(stagingPath, 'wx', 0o600);
-        stagingCreated = true;
-        const { bytesWritten } = await handle.write(payload);
-        if (bytesWritten !== payload.length) {
-            throw new Error(`Short ${label} publication: wrote ${bytesWritten} of ${payload.length} bytes`);
-        }
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
+        await createStaging(stagingPath);
         if (validateTemporary) {
             await validateTemporary(stagingPath);
             await syncFile(stagingPath);
@@ -320,10 +413,8 @@ async function publishFileIfAbsentWithLabel(filePath, payload, validateTemporary
         failure = error;
     }
     finally {
-        if (handle)
-            await closeBestEffort(handle);
-        if (stagingCreated)
-            await removeBestEffort(stagingPath);
+        // The staging name is unique to this call, so removing it never touches another writer.
+        await removeBestEffort(stagingPath);
     }
     await syncDirectoryBestEffort(parentPath);
     if (failure !== undefined)
@@ -331,6 +422,13 @@ async function publishFileIfAbsentWithLabel(filePath, payload, validateTemporary
     if (outcome === undefined)
         throw new Error(`${label} publication produced no outcome`);
     return outcome;
+}
+/** Writes the payload in one call; a short write fails the publication and is not resumed. */
+async function writeInOneCall(handle, payload, label) {
+    const { bytesWritten } = await handle.write(payload);
+    if (bytesWritten !== payload.length) {
+        throw new Error(`Short ${label} publication: wrote ${bytesWritten} of ${payload.length} bytes`);
+    }
 }
 function errorReason(error) {
     return error instanceof Error ? error.message : String(error);

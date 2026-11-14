@@ -1,13 +1,27 @@
 import { createSubagentFinishTelemetrySink } from '../../agent/index.js';
 import { createBackgroundTaskId } from '../../../infra/legacy-db/background-task-contracts.js';
-import { createLocalSubagentTaskRow, persistLocalSubagentTaskTerminal, taskTurnId, isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, logTaskAdmissionRejectedAfterPrecheck, precheckTaskConcurrency, readTaskOccupancy, runInjectedConversationTaskTurn, requireTaskConversation, normalizeLocalTaskInput, taskModelSelectionFor, resolveLocalTaskAgentTarget, taskSessionOwner, } from '../../background-bash/index.js';
+import { createLocalSubagentTaskRow, persistLocalSubagentTaskTerminal, taskTurnId, isSubagentConcurrencyLimitRejection, localTaskAdmissionFailure, logTaskAdmissionRejectedAfterPrecheck, precheckTaskConcurrency, readTaskOccupancy, runInjectedConversationTaskTurn, requireTaskConversation, normalizeLocalTaskInput, taskModelSelectionFor, resolveLocalTaskAgentTarget, TaskDispatchNotAllowedError, taskSessionOwner, } from '../../background-bash/index.js';
 import { resolveV2SessionArtifactPathsSync } from '../../../infra/legacy-db/v2-session-artifacts.js';
 export async function runForegroundLocalTask(input) {
     if (input.signal?.aborted)
         throw new Error('Operation aborted');
     const taskInput = normalizeLocalTaskInput(input.taskInput);
     const conversation = requireTaskConversation(input.host);
-    const target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name, input.toolCtx.pluginAgents);
+    let target;
+    try {
+        target = await resolveLocalTaskAgentTarget(input.host, taskInput.agent_name, input.toolCtx.pluginAgents);
+    }
+    catch (error) {
+        // Rejected before admission, so no task row and no child Session exist.
+        if (error instanceof TaskDispatchNotAllowedError) {
+            return {
+                status: 'failed',
+                requestedAgentName: taskInput.agent_name,
+                errorMessage: error.message,
+            };
+        }
+        throw error;
+    }
     if (!target) {
         // No runnable target, so there is nothing to track: the failure carries no
         // task handle because no task row was ever created.
@@ -49,7 +63,6 @@ async function executeForegroundLocalTask(input, taskInput, conversation, target
         target,
     });
     let childSession;
-    let releaseOwnerWaitEdge;
     try {
         childSession = await createForegroundChildSession(input, taskInput, target);
         await input.host.backgroundTaskService.patch(taskId, {
@@ -58,7 +71,6 @@ async function executeForegroundLocalTask(input, taskInput, conversation, target
             metadata: { childSessionId: childSession.sessionId, subTurnId: turnId, agentName },
         });
         await prepareForegroundChild(input, childSession.sessionId, turnId);
-        releaseOwnerWaitEdge = input.host.sessionSendWaitGraph?.register(input.parentSession.sessionId, childSession.sessionId);
         notifyChildStarted(input, childSession.sessionId, turnId);
         const pluginStartContext = await input.toolCtx.pluginSubagentLifecycle?.start({
             childSessionId: childSession.sessionId,
@@ -104,9 +116,6 @@ async function executeForegroundLocalTask(input, taskInput, conversation, target
         });
         await finalizeForegroundTask(input.host, taskId, failure, turnId);
         return failure;
-    }
-    finally {
-        releaseOwnerWaitEdge?.();
     }
 }
 function createForegroundChildSession(input, taskInput, target) {

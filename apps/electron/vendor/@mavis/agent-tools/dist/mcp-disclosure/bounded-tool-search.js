@@ -1,7 +1,17 @@
 import { Buffer } from 'node:buffer';
 import { Type } from '@sinclair/typebox';
-import { defineRuntimeTool } from '@mavis/agent-core/tools';
+import { defineRuntimeTool, } from '@mavis/agent-core/tools';
+import { mcpServerOfToolName } from './search-index.js';
 import { TOOL_SEARCH_PTC_CALL_SENTENCE } from './tool-search.js';
+/** Upper bound on names accepted by one `select:` query. */
+const MAX_SELECT_NAMES = 64;
+/** Server names listed when an `mcp__` name matches no indexed tool. */
+const MAX_LISTED_SERVERS = 32;
+/**
+ * Default tool_search response budget; also the size above which one tool
+ * definition is reported `oversized` instead of returned.
+ */
+export const TOOL_SEARCH_MAX_RESULT_BYTES = 32 * 1024;
 export function createBoundedToolSearchTool(index, opts) {
     const maxResults = Number.isFinite(opts.topKMax)
         ? Math.max(1, Math.min(20, Math.trunc(opts.topKMax)))
@@ -12,7 +22,9 @@ export function createBoundedToolSearchTool(index, opts) {
     const schema = Type.Object({
         query: Type.Optional(Type.String({
             maxLength: 512,
-            description: 'Keyword search (BM25, supports Chinese) over tool name/description/params.',
+            description: opts.exactSelect
+                ? 'Use "select:<name>[,<name>...]" for exact tool names, "mcp__<server>" to list one server\'s tools, or English keywords (BM25, also supports Chinese) over tool name/description/params.'
+                : 'Keyword search (BM25, supports Chinese) over tool name/description/params, or "mcp__<server>" to list one server\'s tools.',
         })),
         regex: Type.Optional(Type.String({
             maxLength: 256,
@@ -21,7 +33,11 @@ export function createBoundedToolSearchTool(index, opts) {
         top_k: Type.Optional(Type.Integer({
             minimum: 1,
             maximum: maxResults,
-            description: `Max results (default ${defaultResults}, max ${maxResults}).`,
+            description: `Max results per page (default ${defaultResults}, max ${maxResults}; an "mcp__<server>" listing defaults to ${maxResults}).`,
+        })),
+        offset: Type.Optional(Type.Integer({
+            minimum: 0,
+            description: 'Skip this many results. Pass `next_offset` from the previous response to read the next page.',
         })),
     });
     const err = (text) => ({
@@ -30,17 +46,22 @@ export function createBoundedToolSearchTool(index, opts) {
         content: [{ type: 'text', text }],
         isError: true,
     });
+    const callSentence = opts.ptc
+        ? TOOL_SEARCH_PTC_CALL_SENTENCE
+        : opts.directCall
+            ? 'Then call the chosen tool directly by its exact name with arguments matching its input_schema (`mcp_invoke` also works).'
+            : 'Then call `mcp_invoke` with the chosen tool_name and arguments to use one.';
     return defineRuntimeTool({
         name: 'tool_search',
         description: [
             'Discover on-demand tools, including scheduled-task management and configured integrations, that are absent from your default tool list.',
-            'Search by keyword `query` and/or `regex`; returns the full definitions (name, description, input_schema) of the top matches.',
-            opts.ptc
-                ? TOOL_SEARCH_PTC_CALL_SENTENCE
-                : 'Then call `mcp_invoke` with the chosen tool_name and arguments to use one.',
+            opts.exactSelect
+                ? 'Query with "select:<name>[,<name>...]" to load exact tools (for example names from the deferred tool catalog), "mcp__<server>" to list one server\'s tools, or keywords/`regex`; returns the full definitions (name, description, input_schema).'
+                : 'Search by keyword `query` and/or `regex`, or query "mcp__<server>" to list one server\'s tools; returns the full definitions (name, description, input_schema) of the matches, one page at a time.',
+            callSentence,
         ].join(' '),
         schema,
-        execute: async (_ctx, input) => {
+        execute: async (ctx, input) => {
             if (!input.query?.trim() && !input.regex?.trim())
                 return err('Provide at least one of `query` or `regex`.');
             if ((input.query?.length ?? 0) > 512 || (input.regex?.length ?? 0) > 256)
@@ -48,6 +69,8 @@ export function createBoundedToolSearchTool(index, opts) {
             if (input.top_k !== undefined &&
                 (!Number.isInteger(input.top_k) || input.top_k < 1 || input.top_k > maxResults))
                 return err(`top_k must be an integer between 1 and ${maxResults}.`);
+            if (input.offset !== undefined && (!Number.isInteger(input.offset) || input.offset < 0))
+                return err('offset must be a non-negative integer.');
             if (input.regex) {
                 try {
                     const _validate = new RegExp(input.regex, 'i');
@@ -58,29 +81,232 @@ export function createBoundedToolSearchTool(index, opts) {
                 }
             }
             const topK = Math.max(1, Math.min(maxResults, Math.trunc(input.top_k ?? defaultResults)));
-            const matches = index.search({ query: input.query, regex: input.regex, topK });
+            const resolved = opts.exactSelect
+                ? resolveExact(index, input, opts.directToolNames)
+                : (resolveByName(index, input) ??
+                    resolveMcpName(index, input, opts.directToolNames) ?? {
+                    mode: 'keyword',
+                    matches: index.search({
+                        // Only the declared inputs: extra keys from the model (`topK`) must not reach the index.
+                        ...(input.query !== undefined ? { query: input.query } : {}),
+                        ...(input.regex !== undefined ? { regex: input.regex } : {}),
+                        nameBoost: true,
+                    }),
+                });
+            const { matches } = resolved;
+            const pageSize = resolved.mode === 'select'
+                ? matches.length
+                : resolved.mode === 'prefix'
+                    ? (input.top_k ?? maxResults)
+                    : topK;
+            const offset = input.offset ?? 0;
+            const pageEnd = Math.min(matches.length, offset + pageSize);
             const hits = [];
-            const budget = opts.maxResultBytes ?? 32 * 1024;
-            const serialize = () => JSON.stringify({
-                hits,
-                total: matches.length,
-                returned: hits.length,
-                omitted: matches.length - hits.length,
-                ...(hits.length < matches.length
-                    ? {
-                        notice: 'Some complete definitions exceeded the response budget. Narrow the search or lower top_k. A single oversized definition requires a smaller tool contract.',
-                    }
-                    : {}),
-            });
-            for (const match of matches) {
+            const oversized = [];
+            const budget = opts.maxResultBytes ?? TOOL_SEARCH_MAX_RESULT_BYTES;
+            const guidance = resolved.unknownName
+                ? unknownNameNotice(index, resolved.unknownName)
+                : opts.exactSelect && matches.length === 0 && !resolved.alreadyAvailable?.length
+                    ? zeroHitGuidance(index)
+                    : undefined;
+            const ignored = resolved.ignoredCount
+                ? `${resolved.ignoredCount} names beyond the first ${MAX_SELECT_NAMES} were ignored; select them in another call.`
+                : undefined;
+            const serialize = (consumed) => {
+                const more = consumed < matches.length;
+                return JSON.stringify({
+                    hits,
+                    total: matches.length,
+                    returned: hits.length,
+                    ...(more ? { next_offset: consumed } : {}),
+                    ...(oversized.length > 0 ? { oversized } : {}),
+                    ...(resolved.notFound?.length ? { not_found: resolved.notFound } : {}),
+                    ...(resolved.alreadyAvailable?.length
+                        ? {
+                            already_available: resolved.alreadyAvailable,
+                            already_available_note: opts.ptc
+                                ? 'These tools are already declared this Turn; call them without searching. Call a tool in your tool list directly; call any other tool inside run_code: await tools.<name>(args), or await tools["<name>"](args) when the name contains characters such as "-".'
+                                : 'These tools are already in your tool list; call them directly without searching.',
+                        }
+                        : {}),
+                    ...noticeOf(more
+                        ? `More results remain: repeat this search with offset ${consumed}, or narrow it.`
+                        : undefined, oversized.length > 0
+                        ? '`oversized` definitions exceed the response budget and need a smaller tool contract.'
+                        : undefined, guidance, ignored),
+                });
+            };
+            // A page stops at the first definition that does not fit, so `next_offset` never
+            // skips one. A page's first definition is always returned unless it alone, without
+            // notes, exceeds the budget; only then is it named `oversized` (later ones are left
+            // for the next page). Such a page may exceed the budget by its notes and the
+            // `not_found`/`already_available` lists, which the 512-character query bounds.
+            const aloneBytes = (match) => Buffer.byteLength(JSON.stringify({ hits: [match], total: matches.length, returned: 1 }), 'utf8');
+            let consumed = Math.min(offset, matches.length);
+            while (consumed < pageEnd) {
+                const match = matches[consumed];
                 hits.push(match);
-                if (Buffer.byteLength(serialize(), 'utf8') > budget) {
+                if (Buffer.byteLength(serialize(consumed + 1), 'utf8') > budget) {
                     hits.pop();
+                    if (hits.length > 0 || oversized.length > 0)
+                        break;
+                    if (aloneBytes(match) > budget)
+                        oversized.push(match.name);
+                    else
+                        hits.push(match);
                 }
+                consumed += 1;
             }
-            const text = serialize();
+            const text = serialize(consumed);
+            try {
+                opts.onResult?.(ctx, {
+                    mode: resolved.mode,
+                    returnedNames: hits.map((h) => h.name),
+                    total: matches.length,
+                    notFoundCount: resolved.notFound?.length ?? (resolved.unknownName ? 1 : 0),
+                });
+            }
+            catch {
+                // Observation must never change the tool result.
+            }
             return { tool_name: 'tool_search', text, content: [{ type: 'text', text }] };
         },
     });
+}
+function noticeOf(...notices) {
+    const notice = notices.filter(Boolean).join(' ');
+    return notice ? { notice } : {};
+}
+/**
+ * The catalog prints names in JSON quotes; a query copied with its quotes
+ * (`"mcp__s__x"`, `` `mcp__s` ``) still names that tool or server. One
+ * surrounding pair of quotes or backticks is dropped.
+ */
+function unquotedQuery(query) {
+    const trimmed = query?.trim() ?? '';
+    const quoted = /^["'`](.*)["'`]$/su.exec(trimmed);
+    return quoted ? quoted[1].trim() : trimmed;
+}
+/**
+ * A plain query that is a full tool name (case-insensitive) loads just that
+ * tool. A bare word ("search", "browser") stays a keyword search: the name
+ * boost still ranks an exact bare name first, and other matches are not hidden.
+ */
+function resolveByName(index, input) {
+    const query = unquotedQuery(input.query);
+    const exact = query && !input.regex ? index.lookup(query) : undefined;
+    return exact && exact.name.toLowerCase() === query.toLowerCase()
+        ? { mode: 'exact', matches: [exact] }
+        : undefined;
+}
+/**
+ * `mcp__<server>` lists that server's tools; undefined for queries that are not
+ * an `mcp__` name. A name that matches no indexed server or tool (a server that
+ * went away, a misspelling) returns nothing: a keyword search would match every
+ * MCP tool on the `mcp` token and pass other servers' tools off as the answer.
+ */
+function resolveMcpName(index, input, directToolNames) {
+    const query = unquotedQuery(input.query);
+    if (input.regex || !/^mcp__[^\s,]+$/iu.test(query))
+        return undefined;
+    const prefix = query.endsWith('__') ? query : `${query}__`;
+    const listed = index.withPrefix(prefix);
+    if (listed.length > 0)
+        return { mode: 'prefix', matches: listed };
+    const lowerName = query.toLowerCase();
+    // Tools whose names differ only in case: the exact lookup refused to pick one,
+    // so let the keyword search list them rather than call the name unknown.
+    if (index.names().some((name) => name.toLowerCase() === lowerName))
+        return undefined;
+    const lowerPrefix = prefix.toLowerCase();
+    const direct = [...(directToolNames ?? [])].filter((name) => {
+        const lower = name.toLowerCase();
+        return lower === lowerName || lower.startsWith(lowerPrefix);
+    });
+    return direct.length > 0
+        ? { mode: 'prefix', matches: [], alreadyAvailable: direct.sort() }
+        : { mode: 'prefix', matches: [], unknownName: query };
+}
+function resolveExact(index, input, directToolNames) {
+    const query = input.query?.trim() ?? '';
+    const select = /^select:(.*)$/isu.exec(unquotedQuery(query));
+    if (select) {
+        const named = [
+            ...new Set(select[1]
+                .split(',')
+                .map((name) => name
+                .trim()
+                .replace(/^["'`]+|["'`]+$/gu, '')
+                .trim())
+                .filter(Boolean)),
+        ];
+        const requested = named.slice(0, MAX_SELECT_NAMES);
+        const matches = [];
+        const notFound = [];
+        const alreadyAvailable = [];
+        const seen = new Set();
+        for (const name of requested) {
+            const found = index.lookup(name);
+            if (found) {
+                if (!seen.has(found.name))
+                    matches.push(found);
+                seen.add(found.name);
+            }
+            else if (directToolNames?.has(name)) {
+                alreadyAvailable.push(name);
+            }
+            else {
+                notFound.push(name);
+            }
+        }
+        return {
+            mode: 'select',
+            matches,
+            notFound,
+            alreadyAvailable,
+            ignoredCount: named.length - requested.length,
+        };
+    }
+    const byName = resolveByName(index, input);
+    if (byName)
+        return byName;
+    const mcpName = resolveMcpName(index, input, directToolNames);
+    if (mcpName)
+        return mcpName;
+    const named = unquotedQuery(query);
+    const matches = index.search({
+        ...(input.query !== undefined ? { query: input.query } : {}),
+        ...(input.regex !== undefined ? { regex: input.regex } : {}),
+        nameBoost: true,
+    });
+    const direct = matches.length === 0 && named && !input.regex && directToolNames?.has(named);
+    return { mode: 'keyword', matches, ...(direct ? { alreadyAvailable: [named] } : {}) };
+}
+function unknownNameNotice(index, name) {
+    const servers = [
+        ...new Set(index.names().flatMap((tool) => mcpServerOfToolName(tool) ?? [])),
+    ].sort();
+    const shown = servers.slice(0, MAX_LISTED_SERVERS).join(', ');
+    const more = servers.length > MAX_LISTED_SERVERS ? ` and ${servers.length - MAX_LISTED_SERVERS} more` : '';
+    return [
+        `No tools are available under "${name}" now.`,
+        servers.length > 0
+            ? `Servers with deferred tools: ${shown}${more}; list one with "mcp__<server>".`
+            : 'No MCP server has deferred tools now.',
+    ].join(' ');
+}
+function zeroHitGuidance(index) {
+    const servers = [
+        ...new Set(index.names().flatMap((name) => mcpServerOfToolName(name) ?? [])),
+    ].sort();
+    const builtins = index.names().filter((name) => !mcpServerOfToolName(name));
+    return [
+        'No deferred tool matched.',
+        'Retry with English keywords taken from tool names or descriptions, "select:<name>" for an exact name, or "mcp__<server>" to list one server\'s tools.',
+        servers.length > 0 ? `Servers with deferred tools: ${servers.join(', ')}.` : '',
+        builtins.length > 0 ? `Built-in on-demand tools: ${builtins.join(', ')}.` : '',
+    ]
+        .filter(Boolean)
+        .join(' ');
 }
 //# sourceMappingURL=bounded-tool-search.js.map

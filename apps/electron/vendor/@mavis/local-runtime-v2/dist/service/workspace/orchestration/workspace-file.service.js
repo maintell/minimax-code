@@ -7,6 +7,10 @@ export class WorkspaceFileServiceImpl {
     maxInlineFileBytes;
     pendingSaves = new Map();
     watcher = new WorkspaceFileWatcher();
+    saveInterceptor;
+    bindSaveInterceptor(interceptor) {
+        this.saveInterceptor = interceptor;
+    }
     watchFiles(targets) {
         return this.watcher.open(targets);
     }
@@ -46,7 +50,10 @@ export class WorkspaceFileServiceImpl {
             catch {
                 // A rejected save must not block later writes to this file.
             }
-            return saveWorkspaceFile(input);
+            const save = () => saveWorkspaceFile(input);
+            return this.saveInterceptor
+                ? this.saveInterceptor(target, input.content ?? Buffer.from(input.contentBase64 ?? '', 'base64').toString('utf8'), save)
+                : save();
         })();
         this.pendingSaves.set(target, saving);
         try {

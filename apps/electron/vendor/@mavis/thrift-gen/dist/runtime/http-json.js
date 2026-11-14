@@ -461,7 +461,12 @@ function decodeScalar(binding, value) {
 async function readJsonBody(request) {
     if (request.method === 'GET' || request.method === 'HEAD')
         return {};
-    return request.json();
+    // Callers of base_req-only POST routes may omit the body entirely; an empty
+    // body carries the same meaning as `{}`.
+    const text = await request.text();
+    if (text.trim().length === 0)
+        return {};
+    return JSON.parse(text);
 }
 async function readOptionalJsonRecord(request) {
     if (request.method === 'GET' || request.method === 'HEAD')

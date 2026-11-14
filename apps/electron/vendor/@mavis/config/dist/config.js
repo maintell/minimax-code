@@ -1,7 +1,8 @@
 import { MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID, MINIMAX_MODELS } from './minimax-model-catalog.js';
+import { QUOTA_AUTO_RESUME_DEFAULTS, parseQuotaAutoResumeConfig, } from './quota-auto-resume-config.js';
 import fs from 'node:fs';
 import { configFileSignature } from './config-file-signature.js';
-import { parseNotificationsConfig, parseStartupRecoveryFault } from './config-section-parsers.js';
+import { parseNotificationsConfig, parsePluginsConfig, parseStartupRecoveryFault, } from './config-section-parsers.js';
 import { restrictConfigFileSync, writePrivateConfigFileSync } from './private-config-file.js';
 import { parseConfigText, serializeConfigPreservingComments, } from './comment-preserving-config-write.js';
 import { resolveRunawayGuardConfig } from './runaway-guard-config.js';
@@ -13,8 +14,12 @@ import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 import { parseTuiConfig } from './tui-config.js';
 import { applyManagedMinimaxContextLimits, applyRequiredProviderOverrides, migrateLegacyByokProvidersOnDisk, restrictLegacyByokBackups, normalizeLegacyThinkingEfforts, parseCustomProvidersConfig, parseMinimaxApiConfig, parseModelContextLimits, } from './byok-config.js';
+import { parseExplicitPtc } from './ptc-default-config.js';
 import { parseReviewConfig } from './review-config.js';
+import { parseBunnyConfig } from './bunny-local-config.js';
+import { parseDiagnosticsConfig } from './diagnostics-config.js';
 import { parseOpenCodeAdapterConfig } from './opencode-config.js';
+import { parseExplicitEnabled } from './prompt-suggestion-config.js';
 import { ASR_DEFAULTS, parseAsrConfig } from './asr.js';
 import { parsePermissionConfig } from './permission-config.js';
 import { DEFAULT_SKILLS_CONFIG, parseSkillsConfig } from './skills-config.js';
@@ -24,7 +29,10 @@ import { parseAgentsConfig } from './agent-capabilities.js';
 import { ASK_USER_CONFIG_DEFAULTS, parseAskUserConfig, } from './ask-user-config.js';
 import { DATA_CONTRIBUTION_CONFIG_DEFAULTS, parseDataContributionConfig, } from './data-contribution-config.js';
 import { GOAL_CONFIG_DEFAULTS, parseGoalConfig } from './goal-config.js';
+import { parseDefaultAdvisorConfig } from './advisor-config.js';
+import { parsePluginRecommendationConfig } from './plugin-recommendation-config.js';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from './tool-result-compaction-config.js';
+import { parseMcpToolSearchConfig } from './mcp-tool-search-config.js';
 import { REQUEST_MEDIA_DEFAULTS, parseRequestMediaConfig, } from './request-media-config.js';
 import { BROWSER_CONFIG_DEFAULTS, parseBrowserConfig, } from './browser-config.js';
 import { parseSandboxConfig, SANDBOX_CONFIG_DEFAULTS, } from './sandbox-config.js';
@@ -33,10 +41,8 @@ export { MEMORY_V2_DEFAULTS } from './memory-config.js';
 function isLegacyRuntimeEnvAllowed() {
     return process.env.__MAVIS_ALLOW_LEGACY_RUNTIME_ENV === '1';
 }
-// Electron loads the config package before local-runtime's managed-env
-// bootstrap has copied the build-time NEXT_PUBLIC_* values into MAVIS_*.
-// Keep this mapping local to config so the first (sticky) beta-flag read sees
-// the packaged build environment. Electron's dev build uses the test runtime.
+// Electron loads config before local-runtime's managed-env bootstrap copies NEXT_PUBLIC_*
+// into MAVIS_*, so the first (sticky) beta-flag read needs this mapping; dev builds use `test`.
 const ELECTRON_BUILD_ENV_TO_RUNTIME = {
     dev: 'test',
     test: 'test',
@@ -178,6 +184,19 @@ export const BETA_FEATURE_DEFS = {
         defaultBuildVariants: ['internal', 'inside'],
         configurableVisibility: 'online',
     },
+    // Same rollout as `ptc`: it gates the saved run_code script files (the
+    // `save_run_code_script` tool, the catalog reminder and the `import()`
+    // loader), which are only reachable from a PTC Turn anyway.
+    ptcScripts: {
+        defaultVisibility: 'test',
+        defaultBuildVariants: ['internal', 'inside'],
+        configurableVisibility: 'online',
+    },
+    ptcStore: {
+        defaultVisibility: 'test',
+        defaultBuildVariants: ['internal', 'inside'],
+        configurableVisibility: 'online',
+    },
     peek: { defaultVisibility: 'test', configurableVisibility: 'test' },
     keepAlive: { defaultVisibility: 'test', configurableVisibility: 'test' },
     promptOverride: { defaultVisibility: 'test', configurableVisibility: 'test' },
@@ -190,12 +209,10 @@ export const BETA_FEATURE_DEFS = {
         defaultPlatforms: ['darwin', 'linux', 'win32'],
         configurableVisibility: 'online',
     },
-    codexOAuth: {
-        defaultVisibility: 'online',
-        configurableVisibility: 'online',
-    },
+    codexOAuth: { defaultVisibility: 'online', configurableVisibility: 'online' },
     pluginMarketplaces: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
     modelAccess: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
+    advisor: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
 };
 assertBetaFeatureDefinitions(BETA_FEATURE_DEFS);
 function getBetaFeatureChannel(context) {
@@ -703,9 +720,14 @@ const DEFAULTS = {
         // Default ON. See `SessionTitleConfig`.
         enabled: true,
     },
+    miniAppSuggestion: { enabled: true },
     promptSuggestion: {
     // Unset: the effective default is resolved with the remote policy.
     },
+    quotaAutoResume: QUOTA_AUTO_RESUME_DEFAULTS,
+    nextStepBox: {},
+    plugins: parsePluginsConfig(undefined),
+    pluginRecommendation: parsePluginRecommendationConfig({}),
     cli: {
         spawn: {
             enabled: false,
@@ -732,7 +754,7 @@ const DEFAULTS = {
         disableSystemReminderModels: [],
         cuMaxScreenshotsInContext: 2,
     },
-    runawayGuard: { enabled: true },
+    runawayGuard: { enabled: true, bunnyRoundBudgetBlock: false },
     toolResultCompaction: { ...TOOL_RESULT_COMPACTION_DEFAULTS },
     requestMedia: { ...REQUEST_MEDIA_DEFAULTS },
     agentRuntime: {
@@ -797,16 +819,18 @@ function ensureConfigFile() {
     });
     writePrivateConfigFileSync(configPath, content, true);
 }
-function readConfigFile(configPath = getConfigPath()) {
-    return parseConfigText(readConfigFileText(configPath));
-}
-function readConfigFileText(configPath = getConfigPath()) {
+function readConfigFile(configPath = getConfigPath(), options = {}) {
+    let text;
     try {
-        return fs.readFileSync(configPath, 'utf-8');
+        text = fs.readFileSync(configPath, 'utf-8');
     }
-    catch {
-        return '';
+    catch (error) {
+        if (options.strict && error.code !== 'ENOENT') {
+            throw new Error('Unable to read config.yaml');
+        }
+        return {};
     }
+    return parseConfigText(text, options);
 }
 let _cached = null;
 // ── BYOK config parsing + required provider overrides: see ./byok-config.ts ──
@@ -849,7 +873,7 @@ export function getConfig() {
     // read, and the next call reads again. The other order could pair new content's signature
     // with old content and keep it until the file changed again.
     const readSignature = configFileSignature(getConfigPath());
-    _cached = resolveConfigFromRaw(readConfigFile(), getDataDir());
+    _cached = resolveConfigFromRaw(readConfigFile(getConfigPath(), { strict: true }), getDataDir());
     cachedConfigSignature = readSignature;
     return _cached;
 }
@@ -876,7 +900,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         defaultModel: typeof raw.defaultModel === 'string' ? raw.defaultModel : undefined,
     }, REQUIRED_PROVIDER_OVERRIDE_DEPS);
     const minimaxModelContextLimits = parseModelContextLimits(raw.minimaxModelContextLimits);
-    const beta = parseBetaConfig(raw);
+    const { explicitPtc, ...beta } = parseBetaConfig(raw);
     return {
         logLevel: typeof raw.logLevel === 'string' ? raw.logLevel : DEFAULTS.logLevel,
         devPort,
@@ -893,6 +917,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
             Number(raw.defaultModelContextWindow) <= 2_147_483_647
             ? Number(raw.defaultModelContextWindow)
             : undefined,
+        defaultAdvisor: parseDefaultAdvisorConfig(raw.defaultAdvisor),
         minimax_api: parseMinimaxApiConfig(raw.minimax_api),
         minimaxModelContextLimits,
         custom_provider: parseCustomProvidersConfig(raw.custom_provider),
@@ -956,6 +981,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
         harnessesDir: path.join(dataDir, 'harnesses'),
         subAgentsDir: path.join(dataDir, 'subagents'),
         beta,
+        explicitPtc,
         agents: parseAgentsConfig(raw.agents),
         // 构建变体在模块加载后注入，默认值随配置解析计算。
         memory: parseMemoryConfig(raw, resolveMemoryDefaults(DEFAULTS.memory, isInternalBuild() || isInsideBuild())),
@@ -968,7 +994,13 @@ export function resolveConfigFromRaw(raw, dataDir) {
         askUser: parseAskUserConfig(raw, DEFAULTS.askUser),
         dataContribution: parseDataContributionConfig(raw, DEFAULTS.dataContribution),
         sessionTitle: parseSessionTitleConfig(raw),
-        promptSuggestion: parsePromptSuggestionConfig(raw),
+        promptSuggestion: parseExplicitEnabled(raw.promptSuggestion),
+        quotaAutoResume: parseQuotaAutoResumeConfig(raw),
+        nextStepBox: parseExplicitEnabled(raw.nextStepBox),
+        bunny: parseBunnyConfig(raw),
+        plugins: parsePluginsConfig(raw.plugins),
+        pluginRecommendation: parsePluginRecommendationConfig(raw),
+        miniAppSuggestion: parseMiniAppSuggestionConfig(raw),
         cli: parseCliConfig(raw),
         browser: parseBrowserConfig(raw.browser),
         tui: parseTuiConfig(raw),
@@ -989,15 +1021,6 @@ export function resolveConfigFromRaw(raw, dataDir) {
         sandbox: parseSandboxConfig(raw.sandbox),
     };
 }
-/** Only an absolute, non-empty `steerFaultFile` string enables the tree. */
-export function parseDiagnosticsConfig(raw) {
-    if (raw == null || typeof raw !== 'object' || Array.isArray(raw))
-        return undefined;
-    const steerFaultFile = Reflect.get(raw, 'steerFaultFile');
-    if (typeof steerFaultFile !== 'string' || !path.isAbsolute(steerFaultFile))
-        return undefined;
-    return { steerFaultFile };
-}
 // ── Beta features config parsing ────────────────────────────────
 function parseBetaConfig(raw) {
     const obj = raw.beta != null && typeof raw.beta === 'object' && !Array.isArray(raw.beta)
@@ -1008,7 +1031,7 @@ function parseBetaConfig(raw) {
     for (const key of Object.keys(BETA_FEATURE_DEFS)) {
         result[key] = resolveBetaFeature(key, obj[key], context);
     }
-    return result;
+    return Object.assign(result, parseExplicitPtc(raw));
 }
 /**
  * The build facts `parseBetaConfig` resolves every flag with. Exported so a caller holding a
@@ -1239,15 +1262,20 @@ function parseSessionTitleConfig(raw) {
         enabled: typeof obj.enabled === 'boolean' ? obj.enabled : defaults.enabled,
     };
 }
-// ── prompt suggestion config parsing ────────────────────────────
-function parsePromptSuggestionConfig(raw) {
-    const value = raw.promptSuggestion;
-    const enabled = value != null && typeof value === 'object' && !Array.isArray(value)
-        ? value.enabled
-        : undefined;
-    // Keep "never chose" distinct from an explicit `false`: the effective default
-    // depends on the remote policy, which parsing cannot see.
-    return typeof enabled === 'boolean' ? { enabled } : {};
+/** Proactive composer recommendations, separate from Pad and MiniApp creation. */
+function parseMiniAppSuggestionConfig(raw) {
+    const value = raw.miniAppSuggestion;
+    const obj = value && typeof value === 'object' && !Array.isArray(value)
+        ? value
+        : {};
+    return {
+        enabled: typeof obj.enabled === 'boolean' ? obj.enabled : true,
+        ...(typeof obj.enabledSince === 'number' &&
+            Number.isFinite(obj.enabledSince) &&
+            obj.enabledSince >= 0
+            ? { enabledSince: obj.enabledSince }
+            : {}),
+    };
 }
 // ── CLI config parsing ──────────────────────────────────────────
 function parseCliConfig(raw) {
@@ -1295,11 +1323,6 @@ function parseContextManagementConfig(raw) {
         ...(compactionTriggerAt === undefined ? {} : { compactionTriggerAt }),
     };
 }
-// ── Agent Runtime config parsing — see ./agent-runtime-config.ts for the
-// canonical implementation. Re-exposed here so the public `getConfig()`
-// surface keeps a single import point for callers; the helper is the
-// source of truth for the `AgentRuntimeFramework` string union and the
-// Pi-only runtime selection parser.
 // ── Log Retention config parsing ────────────────────────────────
 function parseLogRetentionDays(raw) {
     const val = raw.logRetentionDays;
@@ -1323,53 +1346,11 @@ function parseContentReviewConfig(raw) {
     }
     return Object.keys(result).length > 0 ? result : undefined;
 }
-// ── MCP tool-search config parsing ──────────────────────────────
-function parseMcpToolSearchConfig(raw) {
-    const obj = raw.mcpToolSearch;
-    if (obj == null || typeof obj !== 'object' || Array.isArray(obj))
-        return undefined;
-    const result = {};
-    const enabled = Reflect.get(obj, 'enabled');
-    if (typeof enabled === 'boolean')
-        result.enabled = enabled;
-    const systemHint = Reflect.get(obj, 'systemHint');
-    if (typeof systemHint === 'boolean')
-        result.systemHint = systemHint;
-    const thresholdPct = Reflect.get(obj, 'thresholdPct');
-    if (typeof thresholdPct === 'number')
-        result.thresholdPct = thresholdPct;
-    const minDeferCount = Reflect.get(obj, 'minDeferCount');
-    if (typeof minDeferCount === 'number')
-        result.minDeferCount = minDeferCount;
-    const topKDefault = Reflect.get(obj, 'topKDefault');
-    if (typeof topKDefault === 'number')
-        result.topKDefault = topKDefault;
-    const topKMax = Reflect.get(obj, 'topKMax');
-    if (typeof topKMax === 'number')
-        result.topKMax = topKMax;
-    const maxSchemaTextLen = Reflect.get(obj, 'maxSchemaTextLen');
-    if (typeof maxSchemaTextLen === 'number')
-        result.maxSchemaTextLen = maxSchemaTextLen;
-    const modelWhitelist = Reflect.get(obj, 'modelWhitelist');
-    if (Array.isArray(modelWhitelist)) {
-        result.modelWhitelist = modelWhitelist.filter((v) => typeof v === 'string');
-    }
-    return Object.keys(result).length > 0 ? result : undefined;
-}
 // ---------------------------------------------------------------------------
 // Port resolution — compute the target local runtime port from env / git / defaults
 // ---------------------------------------------------------------------------
 /**
- * Resolve the target local runtime port.
- *
- * Priority:
- * 0. DISABLE_GIT_AUTO_CONFIG=1 → skip git auto-detection
- * 1. Explicit profile-scoped port (__MAVIS_RUNTIME_PROFILE + __MAVIS_RUNTIME_PORT both set)
- * 2. Git auto-detection (hash-based offset from branch name in mavis repo)
- * 3. __MAVIS_RUNTIME_PORT env var (only when git detection is not active)
- * 4. DEFAULT_PORT (5321)
- *
- * Not cached — env vars and git state can change between calls.
+ * Resolve on every call: explicit profile port → enabled git detection → env port → default.
  */
 export function resolvePort() {
     const explicitPort = getExplicitPortEnv();

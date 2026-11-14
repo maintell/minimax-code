@@ -19,6 +19,7 @@ export class CDPHelper {
     debuggerResetPromise;
     interruptionRecoveryGeneration = 0;
     lastInterruptionRecoverySucceeded = true;
+    interruptionRecoveryGuard;
     dragProbeSequence = 0;
     pageScanner;
     // DOM 变化监听相关
@@ -125,6 +126,26 @@ export class CDPHelper {
     async recoverDebuggerAfterInterruption(timeoutMs = BROWSER_TIMEOUTS.cdpCommand) {
         await this.recoverTransportAfterInterruption(timeoutMs);
     }
+    /**
+     * Defer interruption resets while the guard reports true. A held JavaScript
+     * dialog is lost when the debugger reconnects (CDP cannot handle it again
+     * and Page.enable stalls), so the connection is kept until it is handled.
+     */
+    setInterruptionRecoveryGuard(guard) {
+        this.interruptionRecoveryGuard = guard;
+        return () => {
+            if (this.interruptionRecoveryGuard === guard)
+                this.interruptionRecoveryGuard = undefined;
+        };
+    }
+    isInterruptionRecoveryDeferred() {
+        try {
+            return this.interruptionRecoveryGuard?.() === true;
+        }
+        catch {
+            return false;
+        }
+    }
     /** Return the helper-owned recovery epoch so Core avoids a duplicate reset. */
     getInterruptionRecoveryState() {
         return {
@@ -138,6 +159,13 @@ export class CDPHelper {
         // must not turn a failed reset into a successful one.
         if (!force && !this.cdpDebuggerAttached && !this.debuggerResetPromise) {
             return this.lastInterruptionRecoverySucceeded;
+        }
+        if (this.isInterruptionRecoveryDeferred()) {
+            // The command is blocked by a held JavaScript dialog, not by a broken
+            // connection. Keep the connection so the dialog can still be handled.
+            this.interruptionRecoveryGeneration += 1;
+            this.lastInterruptionRecoverySucceeded = true;
+            return true;
         }
         this.removeDOMListener();
         this.pageScanner.reset();

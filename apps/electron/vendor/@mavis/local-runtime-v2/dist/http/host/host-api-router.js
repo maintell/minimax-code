@@ -68,6 +68,7 @@ async function routeConfigurationApi({ host, request, method, parts, url, }) {
         const response = await routeLocalConfigApi({
             configGetter: host.configGetter,
             configUpdater: host.configUpdater,
+            ptcDefault: host.ptcDefault,
             publishGlobalEvent: host.publishGlobalEvent,
             permissionSeedRunner: async (body) => {
                 if (mayHaveSetAcceptEditsMode(body))
@@ -194,6 +195,7 @@ const resourceRoutes = new Map([
             listAllSessions: host.listAllSessions,
             communicationMessageStore: host.communicationMessageStore,
             ...(host.runtimeConversation ? { conversation: host.runtimeConversation } : {}),
+            coordinationOf: (agentName) => host.coordinatorRoster?.coordinationOf(agentName),
         }),
     ],
     ['agent', routeAgentApi],

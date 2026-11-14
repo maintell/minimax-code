@@ -35,6 +35,7 @@ export class SqliteCronRunRepository {
             deliveryInputJson: sql `NULL`.as('delivery_input_json'),
             retryAtMs: sql `NULL`.as('retry_at_ms'),
             retryAttempt: sql `0`.as('retry_attempt'),
+            scheduledForMs: sql `NULL`.as('scheduled_for_ms'),
         })
             .from(cronDefinitions)
             .where(and(eq(cronDefinitions.cronId, activeCronId), isNull(cronDefinitions.deletedAtMs)));
@@ -44,9 +45,10 @@ export class SqliteCronRunRepository {
         }
         return this.require(manualRunId);
     }
-    insertPendingScheduled(cronId, schedulerTriggerId, createdAtMs) {
+    insertPendingScheduled(cronId, schedulerTriggerId, createdAtMs, scheduledForMs) {
         text(cronId, 'cronId');
         text(schedulerTriggerId, 'schedulerTriggerId');
+        timestamp(scheduledForMs, 'scheduledForMs');
         const existing = this.getBySchedulerTriggerId(schedulerTriggerId);
         if (existing) {
             if (existing.cronId !== cronId || existing.triggerSource !== 'scheduled') {
@@ -61,6 +63,7 @@ export class SqliteCronRunRepository {
                 schedulerTriggerId,
                 triggerSource: 'scheduled',
                 createdAtMs,
+                scheduledForMs,
             });
         }
         catch (error) {
@@ -140,13 +143,13 @@ export class SqliteCronRunRepository {
             .run();
         return changes(result) === 1 ? this.require(runId) : undefined;
     }
-    attachSession(runId, sessionId, deliveryInput) {
+    attachSession(runId, sessionId, deliveryInput, options) {
         text(runId, 'runId');
         text(sessionId, 'sessionId');
         const result = this.db
             .update(cronRuns)
             .set({ sessionId, deliveryInputJson: deliveryInput ? JSON.stringify(deliveryInput) : null })
-            .where(and(eq(cronRuns.runId, runId), eq(cronRuns.status, 'pending'), isNull(cronRuns.sessionId), isNotNull(cronRuns.executionClaimedAtMs)))
+            .where(and(eq(cronRuns.runId, runId), eq(cronRuns.status, 'pending'), options?.replaceSession === true ? undefined : isNull(cronRuns.sessionId), isNotNull(cronRuns.executionClaimedAtMs)))
             .run();
         if (changes(result) === 1)
             return true;
@@ -194,6 +197,26 @@ export class SqliteCronRunRepository {
             return true;
         return sameTerminal(this.get(input.runId), 'failed');
     }
+    failPendingForCronId(input) {
+        text(input.cronId, 'cronId');
+        timestamp(input.failedAtMs, 'failedAtMs');
+        text(input.errorCode, 'errorCode');
+        return changes(this.db
+            .update(cronRuns)
+            .set({
+            status: 'failed',
+            // A terminal Run is always claimed; a queued one is claimed by this settlement.
+            executionClaimedAtMs: sql `COALESCE(${cronRuns.executionClaimedAtMs}, ${input.failedAtMs})`,
+            retryAtMs: null,
+            failedAtMs: input.failedAtMs,
+            errorCode: input.errorCode,
+            error: input.error ?? null,
+        })
+            .where(and(eq(cronRuns.cronId, input.cronId), eq(cronRuns.status, 'pending'), 
+        // Queued (unclaimed) or deferred to a retry; a first attempt in flight finishes.
+        or(isNull(cronRuns.executionClaimedAtMs), isNotNull(cronRuns.retryAtMs))))
+            .run());
+    }
     deleteByCronId(cronId) {
         text(cronId, 'cronId');
         return changes(this.db.delete(cronRuns).where(eq(cronRuns.cronId, cronId)).run());
@@ -202,6 +225,8 @@ export class SqliteCronRunRepository {
         const runId = text(input.runId, 'runId');
         const cronId = text(input.cronId, 'cronId');
         timestamp(input.createdAtMs, 'createdAtMs');
+        if (input.scheduledForMs !== undefined)
+            timestamp(input.scheduledForMs, 'scheduledForMs');
         this.db
             .insert(cronRuns)
             .values({
@@ -213,6 +238,7 @@ export class SqliteCronRunRepository {
             sessionId: null,
             status: 'pending',
             createdAtMs: input.createdAtMs,
+            scheduledForMs: input.scheduledForMs ?? null,
             executionClaimedAtMs: null,
             deliveredAtMs: null,
             failedAtMs: null,
@@ -245,6 +271,9 @@ function mapRun(value) {
         triggerSource,
         status,
         createdAtMs: storedTimestamp(row.createdAtMs, 'createdAtMs'),
+        ...(row.scheduledForMs !== null
+            ? { scheduledForMs: storedTimestamp(row.scheduledForMs, 'scheduledForMs') }
+            : {}),
         ...optionalRunFields(row),
         ...(row.deliveryInputJson ? { deliveryInput: parseDeliveryInput(row.deliveryInputJson) } : {}),
         ...(row.retryAtMs !== null ? { retryAtMs: storedTimestamp(row.retryAtMs, 'retryAtMs') } : {}),

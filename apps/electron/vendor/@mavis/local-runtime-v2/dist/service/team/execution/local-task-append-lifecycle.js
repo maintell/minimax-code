@@ -205,6 +205,14 @@ function toAppendRunResult(result, sourceTask, childSessionId) {
     const resolvedAgentName = stringMetadata(metadata.resolvedAgentName) ?? stringMetadata(metadata.agentName);
     const status = appendResultStatus(result.status);
     const errorMessage = appendResultError(result);
+    // The same projection the first run and the injected turn use, so a continued
+    // task reports the scripts this round saved and nothing from earlier rounds.
+    const savedPtcScripts = result.committedFacts?.savedPtcScripts?.map((script) => ({
+        path: script.path,
+        scope: script.scope,
+        ...(script.description ? { description: script.description } : {}),
+        overwritten: script.overwritten,
+    }));
     return {
         status,
         requestedAgentName,
@@ -212,6 +220,7 @@ function toAppendRunResult(result, sourceTask, childSessionId) {
         subSessionId: childSessionId,
         subTurnId: result.turnId,
         ...(finalText ? { finalText } : {}),
+        ...(savedPtcScripts?.length ? { savedPtcScripts } : {}),
         ...(errorMessage ? { errorMessage } : {}),
     };
 }
@@ -223,7 +232,9 @@ function appendResultStatus(status) {
     return 'failed';
 }
 function appendResultError(result) {
-    return result.status === 'completed' ? undefined : result.error ?? `Conversation turn ${result.status}`;
+    return result.status === 'completed'
+        ? undefined
+        : (result.error ?? `Conversation turn ${result.status}`);
 }
 function stringMetadata(value) {
     return typeof value === 'string' && value ? value : undefined;

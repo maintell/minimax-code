@@ -1,4 +1,5 @@
 import { countTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { MEMORY_SUMMARY_FILE } from '../contracts.js';
 import { renderSessionMirror } from './session-doc.js';
 const MAX_OUTPUT_TOKENS = 20_000;
 const MAX_READ_LINES = 200;
@@ -20,6 +21,46 @@ export function noteFilePath(sessionId) {
 }
 export function renderStateMirror(state) {
     return renderSessionMirror(state, state.content ?? '');
+}
+/**
+ * 磁盘摘要与基线摘要做同一个编辑(§5.18)：先改磁盘，再以基线行当前内容为条件更新基线。
+ * 基线做同样的编辑而不是抄磁盘内容，用户在上次整理后的手改才保持"相对基线的修改"身份。
+ * `requireBoth` 时两侧任一缺失就不动手（写入请求行）；否则缺哪侧跳过哪侧（删除请求行）。
+ * 调用方必须已持有 scope 互斥区。
+ */
+export async function editSummaryAndBaseline(deps, scopeKey, edit, options = {}) {
+    const baseline = (await deps.repository.listBaselineFiles(scopeKey)).find((file) => file.fileName === MEMORY_SUMMARY_FILE);
+    if (options.requireBoth && !baseline)
+        return { status: 'missing', reason: 'no-baseline-summary' };
+    const current = await deps.fileStore.readMemorySummary(scopeKey);
+    if (options.requireBoth && current === undefined)
+        return { status: 'missing', reason: 'summary-missing' };
+    const onDisk = editOrKeep(current, edit);
+    if (onDisk.status === 'rejected')
+        return { status: 'rejected', side: 'disk', reason: onDisk.reason };
+    const onBaseline = editOrKeep(baseline?.content, edit);
+    if (onDisk.status === 'changed')
+        await deps.fileStore.writeMemorySummary(scopeKey, onDisk.markdown);
+    return commitBaselineEdit(deps, scopeKey, baseline?.content, onBaseline);
+}
+function editOrKeep(markdown, edit) {
+    return markdown === undefined ? { status: 'unchanged' } : edit(markdown);
+}
+/** 以基线行当前内容为条件写回；被并发改写时返回 baseline-stale，不覆盖。 */
+async function commitBaselineEdit(deps, scopeKey, expectedContent, onBaseline) {
+    if (onBaseline.status === 'rejected')
+        return { status: 'rejected', side: 'baseline', reason: onBaseline.reason };
+    if (onBaseline.status === 'unchanged' || expectedContent === undefined)
+        return { status: 'ok' };
+    const committed = await deps.repository.updateBaselineSummary({
+        scopeKey,
+        expectedContent,
+        content: onBaseline.markdown,
+        updatedAtMs: deps.nowMs(),
+    });
+    return committed === 'committed'
+        ? { status: 'ok' }
+        : { status: 'baseline-stale', reason: committed };
 }
 function outputFits(value, maxBytes = Number.POSITIVE_INFINITY) {
     const json = JSON.stringify(value);

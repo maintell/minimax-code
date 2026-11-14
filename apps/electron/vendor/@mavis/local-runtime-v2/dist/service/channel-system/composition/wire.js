@@ -277,6 +277,9 @@ function optionalSessionInfraOptions(input) {
             : {}),
         ...(input.revealMigratedSession ? { revealMigratedSession: input.revealMigratedSession } : {}),
         ...(input.createRootSession ? { createRootSession: input.createRootSession } : {}),
+        ...(input.resolveCoordinatorMainSession
+            ? { resolveCoordinatorMainSession: input.resolveCoordinatorMainSession }
+            : {}),
         ...(input.rootlessV2 ? { rootlessV2: input.rootlessV2 } : {}),
         ...(input.imConversationModel ? { imConversationModel: true } : {}),
     };
@@ -318,6 +321,7 @@ function buildChannelPermissionBridge(input, channelBridgeInfra) {
     return new LocalChannelPermissionBridge({
         bindingStore: channelBridgeInfra.bindingStore,
         adapterRegistry: channelBridgeInfra.adapterRegistry,
+        canDeliverToChannel: (ctx, sessionId) => channelBridgeInfra.canDeliverToChannel(ctx, sessionId),
         nowMs: input.nowMs,
         ...(imRoutes ? { imRoutes } : {}),
         ...(input.resolveChannelTurnOrigin ? { resolveOrigin: input.resolveChannelTurnOrigin } : {}),
@@ -336,6 +340,8 @@ function buildFeishuCardActionSeam(scope) {
     return createFeishuCardActionHandler({
         agentName: input.agentName,
         feishuPlatformAdapter,
+        authorizeCardAction: async (ctx, sessionId) => (await channelBridgeInfra.canDeliverToChannel(ctx, sessionId)) &&
+            !(await channelBridgeInfra.denyCoordinatorAccess(ctx)),
         feishuPendingQuestionnaires: scope.feishuPendingQuestionnaires,
         feishuPendingPermissions: scope.feishuPendingPermissions,
         questionnaireBridge: scope.questionnaireBridge,
@@ -453,6 +459,11 @@ function wrapSubmitQuestionnaireReply(rawSubmitQuestionnaireReply) {
         return outcome;
     };
 }
+function coordinatorMainSessionOption(input) {
+    return input.resolveCoordinatorMainSession
+        ? { resolveCoordinatorMainSession: input.resolveCoordinatorMainSession }
+        : {};
+}
 /** Infra construction with the wire's owner/AC stores threaded in. */
 function buildWireBridgeInfra(input, channelOwnerStore, channelAccessControlStore) {
     return createChannelBridgeInfra({
@@ -469,6 +480,7 @@ function buildWireBridgeInfra(input, channelOwnerStore, channelAccessControlStor
         createSession: input.createSession,
         ...(input.revealMigratedSession ? { revealMigratedSession: input.revealMigratedSession } : {}),
         createRootSession: input.createRootSession,
+        ...coordinatorMainSessionOption(input),
         ...(input.rootlessV2 ? { rootlessV2: input.rootlessV2 } : {}),
         ...(input.imConversationModel ? { imConversationModel: true } : {}),
         enqueueMessage: input.enqueueMessage,
@@ -514,6 +526,12 @@ function buildChannelRunner(scope) {
             }
             : {}),
         questionnaireReplyHandler: async ({ ctx, reply }) => {
+            if (input.getQuestionnaireSessionId) {
+                const sessionId = await input.getQuestionnaireSessionId(reply.requestId);
+                if (!sessionId || !(await channelBridgeInfra.canDeliverToChannel(ctx, sessionId))) {
+                    return { status: 'terminal', code: 'CHANNEL_QUESTIONNAIRE_TARGET_REVOKED' };
+                }
+            }
             // Mirror the Feishu card-action handler: bridge.submit lets the bridge
             // run its own bookkeeping (`submittedAt` defaulting), then we drive the
             // host's reply route so the suspended agent turn actually resumes.
@@ -588,6 +606,9 @@ export function wireChannelSubsystem(input) {
     // `feishuCardActionHandler` decodes Feishu card callbacks into a structured
     // reply payload before handing them to the bridge's submit hook (which the
     // host wires later when the questionnaire store is plumbed in).
+    channelBridgeInfra.checkCoordinatorCreator = (ctx, mode) => ctx.platform === 'wechat'
+        ? channelApis.wechatStore.checkCreator(ctx, mode)
+        : channelApis.feishuStore.checkCreator(ctx, mode);
     const feishuPlatformAdapter = channelApis.feishuAdapter;
     const feishuPendingQuestionnaires = channelApis.feishuPendingQuestionnaires;
     const feishuPendingPermissions = channelApis.feishuPendingPermissions;

@@ -3,6 +3,7 @@ import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logge
 export function toRenderablePermission(request) {
     return {
         requestId: request.requestId,
+        sessionId: request.sessionId,
         toolName: request.toolName,
         ...(request.toolDescription ? { toolDescription: request.toolDescription } : {}),
         ...(request.toolInput ? { toolInput: request.toolInput } : {}),
@@ -46,6 +47,8 @@ export class LocalChannelPermissionBridge {
             const targets = await this.resolveTargets(event, origin);
             const renderable = toRenderablePermission(event.request);
             for (const target of targets) {
+                if ((await this.options.canDeliverToChannel?.(target.ctx, event.sessionId)) === false)
+                    continue;
                 await this.renderPermissionForTarget({ event, target, renderable });
             }
         }
@@ -194,6 +197,8 @@ export class LocalChannelPermissionBridge {
         const key = this.keyFor(ctx.platform, ctx.clientName, ctx.chatId);
         const pending = this.pending.get(key);
         if (!pending)
+            return null;
+        if ((await this.options.canDeliverToChannel?.(ctx, pending.request.sessionId)) === false)
             return null;
         const adapter = this.options.adapterRegistry.getForContext(ctx);
         if (!adapter?.parsePermissionReply)

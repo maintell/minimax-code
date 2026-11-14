@@ -1,6 +1,7 @@
 import { DesktopHookServiceBase } from './desktop-hook-service-base.js';
 /** Generated Mini App methods stay unavailable until their Electron Runtime owner is bound. */
 export class DesktopMiniAppServiceBase extends DesktopHookServiceBase {
+    ensureMiniAppHostSession = () => this.unimplementedGeneratedMethod('ensureMiniAppHostSession');
     suggestMiniAppCreationIdeas = () => this.unimplementedGeneratedMethod('suggestMiniAppCreationIdeas');
     startMiniAppCreation = () => this.unimplementedGeneratedMethod('startMiniAppCreation');
     stopMiniAppCreation = () => this.unimplementedGeneratedMethod('stopMiniAppCreation');

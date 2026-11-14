@@ -2,12 +2,31 @@ import { constants as fsConstants } from 'node:fs';
 import { lstat, open, readlink, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
-import { isDefaultAgentAvatarMarker } from '@mavis/shared/agent-avatar';
+import { isDefaultAgentAvatarMarker, isBunnyAgentAvatarMarker } from '@mavis/shared/agent-avatar';
 import yaml from 'yaml';
 import { logger } from '../../../infra/logging/index.js';
 // Leaf import on purpose: the ModelSystem barrel pulls in provider/OAuth
 // runtimes, and this parser is also loaded by the UI Agent config tests.
 import { parseSourceQualifiedModelKey } from '../../model-system/resolution/model-key.js';
+import { AGENT_SURFACE_SWITCH_FIELDS, parseAgentSurfaceSwitches, serializeAgentSurfaceSwitches, } from './agent-surface-switches.js';
+export function contentTypeForAvatarExtension(extension) {
+    switch (extension) {
+        case '.png':
+            return 'image/png';
+        case '.jpg':
+        case '.jpeg':
+            return 'image/jpeg';
+        case '.gif':
+            return 'image/gif';
+        case '.webp':
+            return 'image/webp';
+        default:
+            // readSafeAgentAvatar has already validated this extension. Keeping the
+            // impossible branch fail-closed protects the HTTP content type if that
+            // validator changes later.
+            throw new AgentConfigError('AGENT_CONFIG_AVATAR_INVALID', 'x-mavis.avatar', 'Avatar must be a supported image file.');
+    }
+}
 export class AgentConfigError extends Error {
     code;
     field;
@@ -61,6 +80,7 @@ const KNOWN_MAVIS_FIELDS = new Set([
     'maxOutputTokens',
     'defaultWorkspaceDir',
     'extensionSkills',
+    ...AGENT_SURFACE_SWITCH_FIELDS,
 ]);
 const LEGACY_DESCRIPTION_NON_PLAIN_PREFIXES = '"\'[]{}&,*!|>@`#';
 const loggedAgentDirectoryLinks = new Set();
@@ -130,6 +150,44 @@ export function parseBuiltinCanonicalAgentMarkdown(raw, routeName, options = {})
         : optionalBuiltinFeaturePolicy(source.frontmatter);
     const config = canonicalConfigFromSource(source.frontmatter, routeName, source.body, BUILTIN_KNOWN_FIELDS);
     return { config, ...(features ? { features } : {}) };
+}
+/**
+ * The model group an unusable Builtin source still holds. Undefined when the
+ * bytes are not UTF-8 or the frontmatter does not parse as a YAML mapping;
+ * otherwise each of the four values that passes the same check as the full
+ * read, and none that fails it.
+ */
+export function parseBuiltinModelGroup(raw) {
+    let source;
+    try {
+        source = parseCanonicalAgentMarkdownSource(decodeCanonicalUtf8(raw)).frontmatter;
+    }
+    catch (error) {
+        if (error instanceof AgentConfigError)
+            return undefined;
+        throw error;
+    }
+    const mavis = asPlainObject(source['x-mavis']) ?? {};
+    const model = validOrUndefined(() => optionalModel(source));
+    const effort = validOrUndefined(() => optionalText(source, 'effort'));
+    const contextWindow = validOrUndefined(() => optionalPositiveInteger(mavis, 'contextWindow'));
+    const maxOutputTokens = validOrUndefined(() => optionalPositiveInteger(mavis, 'maxOutputTokens'));
+    return {
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+        ...(contextWindow === undefined ? {} : { contextWindow }),
+        ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+    };
+}
+function validOrUndefined(read) {
+    try {
+        return read();
+    }
+    catch (error) {
+        if (error instanceof AgentConfigError)
+            return undefined;
+        throw error;
+    }
 }
 function parseFrontmatterSource(frontmatter) {
     const document = parseFrontmatterDocument(frontmatter);
@@ -335,7 +393,7 @@ function decodeCanonicalUtf8(bytes) {
 export async function validateAgentAvatar(agentDir, avatar, trustedRoot) {
     // Marker-only avatars are virtual token SVGs rendered by the shared UI. They
     // deliberately own no file under the Desktop data directory.
-    if (isDefaultAgentAvatarMarker(avatar))
+    if (isDefaultAgentAvatarMarker(avatar) || isBunnyAgentAvatarMarker(avatar))
         return;
     await readSafeAgentAvatar(agentDir, avatar, trustedRoot);
 }
@@ -712,6 +770,7 @@ function mavisFields(source, defaultWorkspaceDir) {
         ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
         ...(defaultWorkspaceDir ? { defaultWorkspaceDir } : {}),
         ...(extensionSkills === undefined ? {} : { extensionSkills }),
+        ...parseAgentSurfaceSwitches(source, invalid),
     };
 }
 function serializeMavis(value) {
@@ -730,6 +789,7 @@ function serializeMavis(value) {
         result.defaultWorkspaceDir = value.defaultWorkspaceDir;
     if (value.extensionSkills !== undefined)
         result.extensionSkills = [...value.extensionSkills];
+    Object.assign(result, serializeAgentSurfaceSwitches(value));
     return Object.keys(result).length === 0 ? undefined : result;
 }
 function optionalBuiltinFeaturePolicy(source) {

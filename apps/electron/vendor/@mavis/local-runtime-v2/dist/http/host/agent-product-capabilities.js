@@ -1,5 +1,7 @@
 import { LocalMatrixClient } from '../../service/matrix/index.js';
 import { createHookExtension } from '@mavis/agent-runtime';
+import { coordinatorSystemReminderAllowlist } from '@mavis/shared/agent-coordination';
+import { readTrustedAgentCoordination, } from '../../service/turn-system/index.js';
 /** Exposes only durable local attachment registration to v2 ingress owners. */
 export function createV1AttachmentRegistration(source) {
     const attachments = source.createHostedAgentCapabilities().attachments;
@@ -7,6 +9,7 @@ export function createV1AttachmentRegistration(source) {
         register: attachments.register,
         discard: attachments.discard,
         resolveSource: attachments.resolveSource,
+        inspectStoredAsset: attachments.inspectStoredAsset,
     };
 }
 /**
@@ -62,6 +65,8 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
                 buildBackground: hosted.reminders.buildBackground,
                 buildSystem: (input) => {
                     const model = systemReminderModel(input.agentConfig);
+                    // A coordinator with its own reminder set runs only the providers it allows.
+                    const reminderAllowlist = coordinatorSystemReminderAllowlist(readTrustedAgentCoordination(input.agentConfig));
                     return hosted.reminders.buildSystem({
                         session: input.session,
                         resourceAgentName: input.agent.resourceAgentName ?? input.agent.agentName,
@@ -73,6 +78,7 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
                             ? input.agentConfig.skills
                             : []).flatMap((skill) => isRecord(skill) && typeof skill.name === 'string' ? [skill.name] : []),
                         ...(input.sessionIdInContext ? { sessionIdInContext: true } : {}),
+                        ...(reminderAllowlist ? { reminderAllowlist } : {}),
                         ...(model ? { model } : {}),
                     });
                 },

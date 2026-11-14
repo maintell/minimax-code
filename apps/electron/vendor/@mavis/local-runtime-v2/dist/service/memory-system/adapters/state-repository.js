@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { memoryV2BaselineFiles, memoryV2CaptureAttempts, memoryV2Scopes, memoryV2SessionStates, } from '../../../infra/db/schema/memory-v2.js';
+import { MEMORY_SUMMARY_FILE } from '../contracts/storage-contracts.js';
 export class MemoryStateRepositoryImpl {
     db;
     nowMs;
@@ -119,6 +120,7 @@ export class MemoryStateRepositoryImpl {
                 updatedAtMs: now,
             })
                 .run();
+            // 显式记忆请求不走治理版本：绕过成功冷却会让每条 note 都立刻触发一轮整理(§5.6)。
             return 'committed';
         }, { behavior: 'immediate' });
     }
@@ -251,6 +253,22 @@ export class MemoryStateRepositoryImpl {
             .where(eq(memoryV2BaselineFiles.scopeKey, scopeKey))
             .orderBy(asc(memoryV2BaselineFiles.fileName))
             .all();
+    }
+    async updateBaselineSummary(input) {
+        return this.db.transaction((tx) => {
+            const current = tx
+                .select({ content: memoryV2BaselineFiles.content })
+                .from(memoryV2BaselineFiles)
+                .where(and(eq(memoryV2BaselineFiles.scopeKey, input.scopeKey), eq(memoryV2BaselineFiles.fileName, MEMORY_SUMMARY_FILE)))
+                .get();
+            if (!current || current.content !== input.expectedContent)
+                return 'stale-input';
+            tx.update(memoryV2BaselineFiles)
+                .set({ content: input.content, updatedAtMs: input.updatedAtMs })
+                .where(and(eq(memoryV2BaselineFiles.scopeKey, input.scopeKey), eq(memoryV2BaselineFiles.fileName, MEMORY_SUMMARY_FILE)))
+                .run();
+            return 'committed';
+        }, { behavior: 'immediate' });
     }
     async applyContentEdit(input) {
         return this.db.transaction((tx) => {

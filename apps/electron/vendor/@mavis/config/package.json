@@ -12,9 +12,17 @@
       "import": "./dist/data-dir.js",
       "default": "./dist/data-dir.js"
     },
+    "./model-availability": {
+      "import": "./dist/model-availability.js",
+      "default": "./dist/model-availability.js"
+    },
     "./sandbox-settings": {
       "import": "./dist/sandbox-settings.js",
       "default": "./dist/sandbox-settings.js"
+    },
+    "./ptc-default-config": {
+      "import": "./dist/ptc-default-config.js",
+      "default": "./dist/ptc-default-config.js"
     }
   },
   "dependencies": {

@@ -1,9 +1,20 @@
 import { lstat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { canonicalActiveHistoryRevision, canonicalHistoryRevision, } from '../../../sessions/representation/canonical-history-contract.js';
+import { canonicalActiveHistoryRevision, canonicalHistoryRevision, verifyCanonicalHistorySnapshotFile, } from '../../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../../sessions/representation/canonical-history.js';
 const SNAPSHOT_NAME = /^g(\d{12})--([A-Za-z0-9][A-Za-z0-9._-]*)\.jsonl$/u;
 const EXTERNAL_USER_ID = /^msg-user-v1-.+$/u;
+export function canonicalHistoryRecordEntry(envelope) {
+    const message = envelope.message;
+    const base = { messageId: envelope.message_id, turnId: envelope.turn_id, role: message.role };
+    if (message.role === 'toolResult' && typeof message.toolCallId === 'string') {
+        return { ...base, toolCallId: message.toolCallId };
+    }
+    if (message.role !== 'assistant' || !Array.isArray(message.content))
+        return base;
+    const toolCallIds = message.content.flatMap((block) => isRecord(block) && block.type === 'toolCall' && typeof block.id === 'string' ? [block.id] : []);
+    return toolCallIds.length > 0 ? { ...base, toolCallIds } : base;
+}
 export class HistoryScannerError extends Error {
     code;
     constructor(code, cause) {
@@ -12,16 +23,20 @@ export class HistoryScannerError extends Error {
         this.name = 'HistoryScannerError';
     }
 }
-export async function scanCanonicalHistoryArtifacts(paths, files = createCanonicalHistoryFileAdapter()) {
+/**
+ * Walks the reachable lineage newest first. Snapshots are streamed one record at a time, so
+ * memory stays bounded by the active history and one record however long the lineage grows.
+ */
+export async function scanCanonicalHistoryArtifacts(paths, files = createCanonicalHistoryFileAdapter(), options = {}) {
     const lineage = createExternalUserLineage();
     const { active, activeMarker } = await readActiveArtifact(files, paths.activePath, lineage);
     const names = await listSnapshotNames(paths.snapshotsPath);
     const chain = await scanReachableSnapshots({
-        files,
         activeGeneration: active.generation,
         activeMarker,
         names,
         lineage,
+        collectEntries: options.collectEntries === true,
     });
     lineage.assertConsistent();
     return {
@@ -35,6 +50,7 @@ export async function scanCanonicalHistoryArtifacts(paths, files = createCanonic
         orphans: names
             .filter((entry) => !chain.reachedNames.has(entry.fileName))
             .map((entry) => entry.fileName),
+        ...(chain.entries ? { snapshotEntries: chain.entries } : {}),
     };
 }
 /**
@@ -42,42 +58,76 @@ export async function scanCanonicalHistoryArtifacts(paths, files = createCanonic
  * active marker points to. Walking the whole lineage here would hold every generation
  * ever compacted in memory, which grows without bound in long sessions.
  */
-export async function verifyCompactionParent(input, files = createCanonicalHistoryFileAdapter()) {
+export async function verifyCompactionParent(input) {
     const generation = inferActiveGeneration(input.activeRecords);
     const marker = readV2Marker(input.activeRecords, generation);
     if (generation === 0)
         return;
     await readReachableParent({
-        files,
         generation,
         marker,
         byGeneration: groupSnapshotsByGeneration(await listSnapshotNames(input.snapshotsPath)),
         reachedNames: new Set(),
     });
 }
+/**
+ * A planned active history must name the newest kept snapshot as its parent, and the kept
+ * snapshots must be generations 0..generation-1. The kept snapshots' own links were verified by
+ * the scan that produced the plan; publication scans the whole lineage again.
+ */
+export function assertPlannedLineage(generation, active, snapshots) {
+    let marker;
+    try {
+        if (inferActiveGeneration(active) !== generation)
+            throw unreachablePlan();
+        marker = readV2Marker(active, generation);
+    }
+    catch (error) {
+        throw unreachablePlan(error);
+    }
+    const generations = snapshots.map((snapshot) => snapshot.generation).sort((a, b) => a - b);
+    if (generations.length !== generation || generations.some((value, index) => value !== index)) {
+        throw unreachablePlan();
+    }
+    if (generation === 0)
+        return;
+    const parent = snapshots.find((snapshot) => snapshot.generation === generation - 1);
+    if (!parent ||
+        marker?.parentSnapshot.generation !== parent.generation ||
+        marker.parentSnapshot.compactionId !== SNAPSHOT_NAME.exec(parent.fileName)?.[2] ||
+        marker.parentSnapshot.revision !== parent.revision) {
+        throw unreachablePlan();
+    }
+}
+function unreachablePlan(cause) {
+    return new Error('Staged canonical history generation is not reachable', cause === undefined ? undefined : { cause });
+}
 async function scanReachableSnapshots(input) {
-    const { files, activeGeneration, activeMarker, names, lineage } = input;
+    const { activeGeneration, activeMarker, names, lineage, collectEntries } = input;
     const byGeneration = groupSnapshotsByGeneration(names);
-    // Newest first; each generation's records are released once its user lineage is recorded,
-    // so memory stays bounded by one snapshot however many times the session compacted.
     const artifacts = [];
+    const entries = collectEntries
+        ? new Map()
+        : undefined;
     const reachedNames = new Set();
     let generation = activeGeneration;
     let marker = activeMarker;
     while (generation > 0) {
         const parent = await readReachableParent({
-            files,
             generation,
             marker,
             byGeneration,
             reachedNames,
+            lineage,
+            collectEntries,
         });
-        lineage.observe(parent.artifact.records, parent.artifact.generation);
-        artifacts.unshift(catalogArtifact(parent.artifact));
+        artifacts.unshift(parent.artifact);
+        if (entries && parent.entries)
+            entries.set(parent.artifact.fileName, parent.entries);
         generation = parent.artifact.generation;
         marker = parent.marker;
     }
-    return { artifacts, reachedNames };
+    return { artifacts, reachedNames, ...(entries ? { entries } : {}) };
 }
 function groupSnapshotsByGeneration(names) {
     const grouped = new Map();
@@ -89,7 +139,7 @@ function groupSnapshotsByGeneration(names) {
     return grouped;
 }
 async function readReachableParent(input) {
-    const { files, generation, marker, byGeneration, reachedNames } = input;
+    const { generation, marker, byGeneration, reachedNames } = input;
     if (!marker)
         throw new HistoryScannerError('invalid-generation-marker');
     const parent = marker.parentSnapshot;
@@ -106,13 +156,53 @@ async function readReachableParent(input) {
         throw new HistoryScannerError('invalid-generation-marker');
     }
     reachedNames.add(snapshot.fileName);
-    const scanned = await readArtifact(files.readStrict(snapshot.path), snapshot.path, 'snapshot');
-    if (scanned.revision !== parent.revision) {
-        throw new HistoryScannerError('artifact-revision-mismatch');
+    const scanned = await streamSnapshotArtifact({
+        path: snapshot.path,
+        generation: snapshot.generation,
+        revision: parent.revision,
+        ...(input.lineage ? { lineage: input.lineage } : {}),
+        collectEntries: input.collectEntries === true,
+    });
+    return {
+        artifact: {
+            generation: snapshot.generation,
+            kind: 'snapshot',
+            fileName: snapshot.fileName,
+            revision: scanned.revision,
+            byteLength: scanned.byteLength,
+            messageCount: scanned.messageCount,
+        },
+        marker: readV2Marker(scanned.first ? [scanned.first] : [], snapshot.generation),
+        ...(scanned.entries ? { entries: scanned.entries } : {}),
+    };
+}
+/** One pass over a snapshot file that keeps only its first record and, if asked, entries. */
+async function streamSnapshotArtifact(input) {
+    const info = await lstat(input.path);
+    if (!info.isFile() || info.isSymbolicLink())
+        throw new HistoryScannerError('unsafe-artifact');
+    let first;
+    const entries = input.collectEntries ? [] : undefined;
+    let streamed;
+    try {
+        streamed = await verifyCanonicalHistorySnapshotFile(input.path, input.revision, (envelope, index) => {
+            if (index === 0)
+                first = envelope;
+            input.lineage?.observeRecord(envelope, input.generation);
+            entries?.push(canonicalHistoryRecordEntry(envelope));
+        });
+    }
+    catch (error) {
+        throw isRecord(error) && error.code === 'artifact-revision-mismatch'
+            ? new HistoryScannerError('artifact-revision-mismatch', error)
+            : classifyReadError(error);
     }
     return {
-        artifact: { ...scanned, generation: snapshot.generation, fileName: snapshot.fileName },
-        marker: readV2Marker(scanned.records, snapshot.generation),
+        revision: streamed.revision,
+        messageCount: streamed.messageCount,
+        byteLength: info.size,
+        first,
+        ...(entries ? { entries } : {}),
     };
 }
 async function readActiveArtifact(files, activePath, lineage) {
@@ -138,22 +228,25 @@ function catalogArtifact({ path: _path, records: _records, ...artifact }) {
 function createExternalUserLineage() {
     const oldestSeen = new Map();
     let conflict = false;
+    const observeRecord = (record, generation) => {
+        if (!isExternalUserId(record.message_id))
+            return;
+        if (record.message.role !== 'user') {
+            conflict = true;
+            return;
+        }
+        const fingerprint = externalUserFingerprint(record);
+        const newer = oldestSeen.get(record.message_id);
+        if (newer && (newer.fingerprint !== fingerprint || newer.generation !== generation + 1)) {
+            conflict = true;
+        }
+        oldestSeen.set(record.message_id, { fingerprint, generation });
+    };
     return {
+        observeRecord,
         observe(records, generation) {
-            for (const record of records) {
-                if (!isExternalUserId(record.message_id))
-                    continue;
-                if (record.message.role !== 'user') {
-                    conflict = true;
-                    continue;
-                }
-                const fingerprint = externalUserFingerprint(record);
-                const newer = oldestSeen.get(record.message_id);
-                if (newer && (newer.fingerprint !== fingerprint || newer.generation !== generation + 1)) {
-                    conflict = true;
-                }
-                oldestSeen.set(record.message_id, { fingerprint, generation });
-            }
+            for (const record of records)
+                observeRecord(record, generation);
         },
         assertConsistent() {
             if (conflict)
@@ -176,9 +269,7 @@ async function readArtifact(promise, path, kind) {
         records = await promise;
     }
     catch (error) {
-        throw new HistoryScannerError(error instanceof Error && /sequence|tool|history ends/iu.test(error.message)
-            ? 'sequence-corruption'
-            : 'malformed-jsonl', error);
+        throw classifyReadError(error);
     }
     const info = await lstat(path);
     if (!info.isFile() || info.isSymbolicLink())
@@ -197,7 +288,13 @@ async function readArtifact(promise, path, kind) {
         messageCount: records.length,
     };
 }
-async function listSnapshotNames(path) {
+function classifyReadError(error) {
+    return new HistoryScannerError(error instanceof Error && /sequence|tool|history ends/iu.test(error.message)
+        ? 'sequence-corruption'
+        : 'malformed-jsonl', error);
+}
+/** Snapshot files named `g<generation>--<compactionId>.jsonl`, in file name order. */
+export async function listSnapshotNames(path) {
     let entries;
     try {
         entries = await readdir(path, { withFileTypes: true, encoding: 'utf8' });

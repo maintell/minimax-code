@@ -69,11 +69,12 @@ export function createProcessLocalMiniAppApplication(plugins, supervisor, memory
             throw Object.assign(applicationError('BUSY', { cause: error }), { busyReason });
         }
     };
-    const open = async (pluginId, signal) => {
+    const open = async (pluginId, signal, initiator = 'user') => {
         signal?.throwIfAborted();
         await requireProjection(pluginId);
-        memory?.recordAttention(pluginId);
-        await runPluginAction(() => plugins.ensureMiniAppStarted({ pluginId, initiator: 'user', ...(signal ? { signal } : {}) }));
+        if (initiator === 'user')
+            memory?.recordAttention(pluginId);
+        await runPluginAction(() => plugins.ensureMiniAppStarted({ pluginId, initiator, ...(signal ? { signal } : {}) }));
         signal?.throwIfAborted();
         return launch(await requireProjection(pluginId), supervisor.inspect(pluginId)[0]);
     };
@@ -91,7 +92,7 @@ export function createProcessLocalMiniAppApplication(plugins, supervisor, memory
                 ...(view ? { capacity: view.capacity } : {}),
             };
         },
-        open: ({ pluginId, signal }) => open(pluginId, signal),
+        open: ({ pluginId, signal, initiator }) => open(pluginId, signal, initiator),
         stop: async ({ pluginId, signal }) => {
             signal?.throwIfAborted();
             try {
@@ -171,6 +172,7 @@ function summary(projection, status, memory) {
     const surfaceMemory = runtimeStatus === 'running' ? summaryMemory(memory) : undefined;
     return {
         pluginId: available.candidate.pluginId,
+        ...(available.widget ? { widget: available.widget } : {}),
         ...(available.displayName ? { displayName: available.displayName } : {}),
         ...(available.description ? { description: available.description } : {}),
         ...(available.iconPath ? { iconUrl: localIconUrl(available.iconPath) } : {}),

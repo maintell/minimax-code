@@ -13,6 +13,10 @@ export function initializeCronService(options) {
         ...(options.sessionPorts ? { sessionPorts: options.sessionPorts } : {}),
         ...(options.nowMs ? { nowMs: options.nowMs } : {}),
         ...(options.modelSelection ? { modelSelection: options.modelSelection } : {}),
+        ...(options.mainConversationAgents
+            ? { mainConversationAgents: options.mainConversationAgents }
+            : {}),
+        ...(options.isAgentPaused ? { isAgentPaused: options.isAgentPaused } : {}),
         metrics,
     });
     let readyPromise;

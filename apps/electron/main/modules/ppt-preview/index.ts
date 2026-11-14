@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from "url";
 import { IPC_CHANNELS } from "../../config/constants";
 import logger from "../../utils/logger";
 import { resolvePptSelectionElementFromSidecar } from "./element-map";
-import { buildPPTSelectionBridgeScript } from "./selection-bridge";
+import { normalizeSelectionInstruction, buildPPTSelectionBridgeScript } from "./selection-bridge";
 const PPTX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
 const MAX_SELECTION_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 1000;
@@ -301,6 +301,7 @@ class PPTPreviewViewController {
         this.currentFileName = null;
         this.currentMimeType = PPTX_MIME_TYPE;
         this.selectionToken = '';
+        this.selectionModeEnabled = false;
         this.selectionEventSeq = 0;
         this.selectionEvents = [];
     }
@@ -520,7 +521,7 @@ class PPTPreviewViewController {
         const selection = input.selection;
         if (!selection || typeof selection !== 'object')
             return null;
-        const instruction = limitText(input.instruction, MAX_INSTRUCTION_LENGTH);
+        const instruction = normalizeSelectionInstruction(input.instruction, MAX_INSTRUCTION_LENGTH);
         if (!instruction)
             return null;
         const slideIndexRaw = finiteNumber(input.slideIndex);
@@ -587,7 +588,9 @@ class PPTPreviewViewController {
             return { success: false, error: 'Invalid PPT preview event envelope' };
         }
         const message = envelope;
-        if (message.token !== this.selectionToken || message.type !== 'selection-submitted') {
+        if (!this.selectionToken ||
+            message.token !== this.selectionToken ||
+            (message.type !== 'selection-submitted' && message.type !== 'selection-box-drawn')) {
             logPptSelectionDebug({
                 msg: '[PPTSelectionDebug] rejected bridge envelope',
                 tokenMatched: message.token === this.selectionToken,
@@ -596,6 +599,24 @@ class PPTPreviewViewController {
                 currentFileName: this.currentFileName,
             });
             return { success: false, error: 'Invalid PPT preview selection token or type' };
+        }
+        if (message.type === 'selection-box-drawn') {
+            if (!this.selectionModeEnabled) {
+                return { success: false, error: 'PPT preview selection intent is inactive' };
+            }
+            const payload = message.payload;
+            if (!payload ||
+                typeof payload !== 'object' ||
+                payload.source !== 'native') {
+                return { success: false, error: 'Invalid PPT preview selection intent' };
+            }
+            if (this.parentWindow && !this.parentWindow.isDestroyed()) {
+                this.parentWindow.webContents.send(IPC_CHANNELS.PPT_PREVIEW_SELECTION_INTENT_EVENT, {
+                    type: 'selection-box-drawn',
+                    source: 'native',
+                });
+            }
+            return { success: true };
         }
         logPptSelectionDebug({
             msg: '[PPTSelectionDebug] bridge envelope received',
@@ -680,6 +701,7 @@ class PPTPreviewViewController {
                     preload: preloadPath,
                 },
             });
+            this.selectionModeEnabled = false;
             this.configureSecurityBoundary(this.webContentsView);
             this.bindOwnerLifecycle(window);
             this.lastRequestedBounds = bounds;
@@ -759,6 +781,7 @@ class PPTPreviewViewController {
                 return { success: true };
             }
             this.selectionToken = randomUUID();
+            this.selectionModeEnabled = false;
             this.pendingHtmlUrl = fileUrl;
             try {
                 await view.webContents.loadURL(fileUrl);
@@ -919,6 +942,7 @@ class PPTPreviewViewController {
                 token,
                 placeholder: options.placeholder,
             }), true);
+            this.selectionModeEnabled = options.enabled;
             return { success: true };
         }
         catch (error) {
@@ -1008,6 +1032,7 @@ class PPTPreviewViewController {
             this.parentWindow = null;
             this.selectionEvents = [];
             this.selectionToken = '';
+            this.selectionModeEnabled = false;
             this.currentHtmlFilePath = null;
             this.pendingHtmlUrl = null;
             this.currentFilePath = null;

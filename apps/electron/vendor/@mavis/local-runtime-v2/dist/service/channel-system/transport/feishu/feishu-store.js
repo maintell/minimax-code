@@ -7,7 +7,8 @@
  * normalization rules; the HTTP Api surface stays with v1 until the MR3
  * delivery takeover, and event parsing moves to the transport adapter files.
  */
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import yaml from 'js-yaml';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
@@ -25,6 +26,8 @@ export class LocalFeishuChannelStore {
     loadPromise = null;
     bindings = new Map();
     familyHook;
+    pendingCreatorChats = new Set();
+    saveTail = Promise.resolve();
     constructor(dataDir, nowMs) {
         this.dataDir = dataDir;
         this.nowMs = nowMs;
@@ -128,6 +131,41 @@ export class LocalFeishuChannelStore {
         const record = this.bindings.get(feishuClientId(agentName.trim()));
         return record ? { ...record } : undefined;
     }
+    /** No bootstrap: old owner YAML, manual credentials and other ID namespaces are not proof. */
+    async checkCreator(ctx, mode) {
+        await this.load();
+        const record = this.bindings.get(ctx.clientName);
+        if (!isCreatorChatContext(ctx))
+            return false;
+        const creator = activeRegistrationCreator(record);
+        if (!record || !creator || this.pendingCreatorChats.has(record.clientId))
+            return false;
+        if (mode === 'delivery')
+            return record.creatorChatId === ctx.chatId;
+        if (!isCreatorSender(ctx, record, creator.openId))
+            return false;
+        if (record.creatorChatId === ctx.chatId)
+            return true;
+        return this.confirmCreatorChat(record, ctx.chatId);
+    }
+    async confirmCreatorChat(record, chatId) {
+        const candidate = { ...record, creatorChatId: chatId };
+        this.pendingCreatorChats.add(record.clientId);
+        this.bindings.set(record.clientId, candidate);
+        try {
+            await this.save();
+            // A concurrent unbind/rebind revokes this in-flight admission too.
+            return this.bindings.get(record.clientId) === candidate;
+        }
+        catch (error) {
+            if (this.bindings.get(record.clientId) === candidate)
+                this.bindings.set(record.clientId, record);
+            throw error;
+        }
+        finally {
+            this.pendingCreatorChats.delete(record.clientId);
+        }
+    }
     async list() {
         await this.load();
         return [...this.bindings.values()]
@@ -184,16 +222,38 @@ export class LocalFeishuChannelStore {
         }
     }
     async save() {
+        // Snapshot inside the serialized write so an earlier slow save cannot resurrect revoked proof.
+        const previous = this.saveTail;
+        let release = () => { };
+        this.saveTail = new Promise((resolve) => {
+            release = resolve;
+        });
+        await previous;
+        try {
+            await this.persist();
+        }
+        finally {
+            release();
+        }
+    }
+    async persist() {
         const payload = {
             schemaVersion: 1,
             bindings: Object.fromEntries([...this.bindings.entries()].sort(([left], [right]) => left.localeCompare(right))),
         };
         await mkdir(dirname(this.filePath), { recursive: true });
-        await writeFile(this.filePath, yaml.dump(payload, { lineWidth: 120, noRefs: true }), {
-            encoding: 'utf8',
-            mode: 0o600,
-        });
-        await chmod(this.filePath, 0o600);
+        const temporaryPath = `${this.filePath}.${randomUUID()}.tmp`;
+        try {
+            await writeFile(temporaryPath, yaml.dump(payload, { lineWidth: 120, noRefs: true }), {
+                encoding: 'utf8',
+                mode: 0o600,
+                flag: 'wx',
+            });
+            await rename(temporaryPath, this.filePath);
+        }
+        finally {
+            await rm(temporaryPath, { force: true });
+        }
     }
     get filePath() {
         return join(this.dataDir(), 'feishu-channel.yaml');
@@ -228,6 +288,15 @@ function buildFeishuBindingRecord(build) {
             : {}),
         ...(input.encryptKey?.trim() ? { encryptKey: input.encryptKey.trim() } : {}),
         ...(input.botName?.trim() ? { botName: input.botName.trim() } : {}),
+        ...(input.registrationCreatorOpenId?.startsWith('ou_')
+            ? {
+                registrationCreator: {
+                    source: 'app-registration',
+                    appId: input.appId.trim(),
+                    openId: input.registrationCreatorOpenId,
+                },
+            }
+            : {}),
         connected: true,
         enabled: !primaryFamily,
         mode: input.mode ??
@@ -254,6 +323,37 @@ function readOptionalPersistedFeishuFields(value) {
         ...(botName ? { botName } : {}),
     };
 }
+function isCreatorSender(ctx, record, openId) {
+    return (ctx.feishuWsSource?.clientName === record.clientId &&
+        ctx.feishuWsSource.appId === record.appId &&
+        ctx.feishuSenderOpenId === openId &&
+        ctx.senderId === openId);
+}
+function isCreatorChatContext(ctx) {
+    return ctx.platform === 'feishu' && ctx.chatType === 'p2p' && Boolean(ctx.chatId);
+}
+function activeRegistrationCreator(record) {
+    if (!record?.enabled || !record.connected || record.mode !== 'websocket')
+        return undefined;
+    const creator = record.registrationCreator;
+    return creator?.source === 'app-registration' && creator.appId === record.appId
+        ? creator
+        : undefined;
+}
+/** Strict, versioned proof codec; never promotes historical owner or user OAuth fields. */
+function readRegistrationCreator(value, appId) {
+    const proof = value.registrationCreator;
+    if (!isRecord(proof) || proof.source !== 'app-registration' || proof.appId !== appId)
+        return {};
+    const openId = readFirstString(proof, ['openId']);
+    if (!openId?.startsWith('ou_'))
+        return {};
+    const creatorChatId = readFirstString(value, ['creatorChatId']);
+    return {
+        registrationCreator: { source: 'app-registration', appId, openId },
+        ...(creatorChatId ? { creatorChatId } : {}),
+    };
+}
 function normalizeFeishuBinding(fallbackClientId, value) {
     if (!isRecord(value))
         return undefined;
@@ -268,6 +368,7 @@ function normalizeFeishuBinding(fallbackClientId, value) {
         appId,
         appSecret,
         ...readOptionalPersistedFeishuFields(value),
+        ...readRegistrationCreator(value, appId),
         ...normalizePersistedFeishuState(value),
         createdAt: readNumber(value.createdAt) ?? Date.now(),
         updatedAt: readNumber(value.updatedAt) ?? Date.now(),

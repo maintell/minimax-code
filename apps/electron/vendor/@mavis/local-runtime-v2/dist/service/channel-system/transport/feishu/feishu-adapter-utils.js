@@ -36,4 +36,44 @@ export function errorMessage(err) {
         return err.message;
     return String(err);
 }
+/** Credential + mode gates for bind(); mock mode is rejected outright. */
+export function validateFeishuBindCredentials(credentials, clientName) {
+    const appId = pickString(credentials, ['appId', 'app_id']);
+    const appSecret = pickString(credentials, ['appSecret', 'app_secret']);
+    if (!appId || !appSecret) {
+        return {
+            error: {
+                ok: false,
+                clientName,
+                error: 'appId and appSecret are required',
+                code: 'VALIDATION_ERROR',
+            },
+        };
+    }
+    const requestedMode = pickString(credentials, ['mode'])?.toLowerCase();
+    if (requestedMode === 'mock') {
+        return {
+            error: {
+                ok: false,
+                clientName,
+                error: 'mock channel mode is not supported',
+                code: 'CHANNEL_MOCK_MODE_UNSUPPORTED',
+            },
+        };
+    }
+    if (requestedMode && !['webhook', 'websocket', 'ws'].includes(requestedMode)) {
+        return {
+            error: {
+                ok: false,
+                clientName,
+                error: 'unsupported channel mode',
+                code: 'VALIDATION_ERROR',
+            },
+        };
+    }
+    return { appId, appSecret, mode: normalizeMode(requestedMode) };
+}
+export function sameWsCredentials(left, right) {
+    return left?.appId === right.appId && left.appSecret === right.appSecret;
+}
 //# sourceMappingURL=feishu-adapter-utils.js.map

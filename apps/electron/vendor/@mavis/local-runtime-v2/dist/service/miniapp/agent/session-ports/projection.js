@@ -1,6 +1,13 @@
 import { MsgType, RespDataType, Role, RuntimeEventStatus, RuntimeEventType, ToolCallStatus, } from '@mavis/agent-core/protocol';
 export function createFrameProjector(sessionId, turnId, model) {
-    const state = { sessionId, turnId, model, started: false, tools: new Map() };
+    const state = {
+        sessionId,
+        turnId,
+        model,
+        started: false,
+        tools: new Map(),
+        startedTools: new Set(),
+    };
     return {
         project(frame) {
             if (frame.kind !== 'runtime-event' || frame.turnId !== turnId)
@@ -62,6 +69,10 @@ function projectToolCall(state, value) {
     const name = call.name ?? known?.name;
     if (!name)
         return [];
+    if (call.started)
+        state.startedTools.add(call.id);
+    if (isDisplayOnlyToolCall(call, state.startedTools))
+        return [];
     const events = [];
     const tool = known ?? { name, finished: false };
     if (!known) {
@@ -94,9 +105,29 @@ function readToolCall(value) {
     return {
         id: value.tool_call_id,
         ...(name ? { name } : {}),
+        started: status === ToolCallStatus.Start,
         done: status !== ToolCallStatus.Start,
         ok: status === ToolCallStatus.Finished,
+        unexecuted: status === ToolCallStatus.Failed && !hasToolCallResult(value),
     };
+}
+/**
+ * A terminal failure that carries no result and that this run never saw start is
+ * not an execution result.
+ *
+ * When a mid-stream retry closes an abandoned attempt it marks the half-written
+ * call `Failed` so the card stops showing "preparing". Reporting that here would
+ * pin the call to failed even after the resend runs it for real, because a Mini
+ * App reports each call once — and providers may reuse the same call id across
+ * physical requests.
+ */
+function isDisplayOnlyToolCall(call, startedTools) {
+    return call.unexecuted && !startedTools.has(call.id);
+}
+/** A real tool failure always reports its result or error payload. */
+function hasToolCallResult(value) {
+    const result = value.tool_call_result_data;
+    return typeof result === 'string' && result.length > 0;
 }
 function isRunningStatus(event) {
     return (event.type === RuntimeEventType.SESSION_STATUS &&

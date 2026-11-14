@@ -21,7 +21,10 @@ export let ELECTRON_BROWSER_PUBLIC_ACTIONS = [
     'wait',
     'screenshot',
     'upload_files',
+    'get_js_dialog',
+    'handle_js_dialog',
     'open_tab',
+    'run_script',
 ];
 const ELECTRON_BROWSER_ROUTE_OWNERS = {
     inspect: 'core',
@@ -46,7 +49,10 @@ const ELECTRON_BROWSER_ROUTE_OWNERS = {
     wait: 'core',
     screenshot: 'core',
     upload_files: 'core',
+    get_js_dialog: 'core',
+    handle_js_dialog: 'core',
     open_tab: 'host',
+    run_script: 'core',
 };
 export let ELECTRON_BROWSER_CORE_ACTIONS = ELECTRON_BROWSER_PUBLIC_ACTIONS.filter((action) => ELECTRON_BROWSER_ROUTE_OWNERS[action] === 'core');
 /**

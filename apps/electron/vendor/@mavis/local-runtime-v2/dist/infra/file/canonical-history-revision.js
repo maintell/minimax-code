@@ -17,6 +17,20 @@ export function extendRevisionHash(state, records, to) {
     }
     return { count: to, hash };
 }
+/** Hashes records one at a time; the digest equals computeRevision over the same records. */
+export function createRevisionHasher() {
+    const hash = createHash('sha256').update('[');
+    let count = 0;
+    return {
+        add(record) {
+            if (count > 0)
+                hash.update(',');
+            hash.update(canonicalJson(record), 'utf8');
+            count += 1;
+        },
+        digest: () => revisionDigest(hash),
+    };
+}
 export function revisionDigest(hash) {
     return `sha256:${hash.copy().update(']').digest('hex')}`;
 }

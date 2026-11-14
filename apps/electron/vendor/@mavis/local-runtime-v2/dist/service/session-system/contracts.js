@@ -1,4 +1,5 @@
 export * from './sessions/repo/contract.js';
+export * from './assignment-tasks/repo/contract.js';
 export * from './sessions/representation/canonical-history-contract.js';
 export * from './usage/repo/contract.js';
 export * from './projects/repo/contract.js';

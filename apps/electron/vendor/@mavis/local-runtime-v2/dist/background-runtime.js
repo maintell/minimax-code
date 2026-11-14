@@ -1,6 +1,7 @@
 import { EventBus } from './infra/event-bus/index.js';
 import { startHeapUsageMetrics } from './infra/observability/heap-usage-metrics.js';
 import { createForkWorktreeAdapter } from './infra/git/fork-worktree-adapter.js';
+import { createRuntimePowerDemand } from './infra/power-demand/index.js';
 import { createProcessLocalRuntimeOwnerIdentity, createRuntimeOwnerIdentity, } from './infra/runtime-owner/index.js';
 import { Scheduler } from './infra/scheduler/index.js';
 import { pruneTransientStorage } from './infra/storage-retention/index.js';
@@ -11,6 +12,7 @@ export async function createBackgroundRuntime(options) {
     let scheduler;
     let eventBus;
     let forkWorktree;
+    const powerDemand = createRuntimePowerDemand(options.onPowerDemandChanged);
     try {
         scheduler =
             options.enableScheduler === false
@@ -19,6 +21,14 @@ export async function createBackgroundRuntime(options) {
                     db: options.db,
                     ...(options.metrics ? { metrics: options.metrics } : {}),
                     ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+                    ...(options.powerDemandSchedulerHandlerKey
+                        ? {
+                            activeJobObserver: {
+                                handlerKey: options.powerDemandSchedulerHandlerKey,
+                                onCountChanged: powerDemand.setActiveScheduledJobCount,
+                            },
+                        }
+                        : {}),
                 });
         eventBus = new EventBus();
         forkWorktree = createForkWorktreeAdapter({});
@@ -134,6 +144,7 @@ export async function createBackgroundRuntime(options) {
             runtimeOwnerIdentity,
             forkWorktree,
         },
+        reportActiveTurnCount: (count) => powerDemand.setActiveTurnCount(count),
         start,
         registerMaintenance,
         startMaintenance,

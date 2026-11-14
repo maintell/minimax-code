@@ -12,7 +12,7 @@ import { wakeSessionQueueAfterDependencyRelease as wakeHostSessionQueue } from '
 import { routeHostApi } from './host-api-router.js';
 import { createHostCronRuntime, startHostCronRuntime } from './host-cron-runtime.js';
 import { buildDesktopServiceHandler as buildDesktopHandler } from './desktop-service-handler.js';
-import { createSessionSendWaitGraph, LocalSessionController, LocalMessageQueueStore, } from '../../service/session-system/index.js';
+import { LocalSessionController, LocalMessageQueueStore, LocalPiHistoryStore, } from '../../service/session-system/index.js';
 import { createLocalMavisAgentAdapter, } from '../../service/agent/index.js';
 import { copyPendingQuestionnaireForFork as copyPendingQuestionnaire, reopenQuestionnaireAfterSafetyRecall as reopenQuestionnaire, } from '../../service/questionnaire/index.js';
 import { startQuestionnaireRecovery } from '../../service/questionnaire/index.js';
@@ -20,7 +20,7 @@ import { hasActiveLocalTeamOwner, runForegroundLocalTask } from '../../service/t
 import { isLocalRuntimeStartupExecutionEnabled } from '../../infra/runtime-owner/startup-execution-policy.js';
 import { LocalHookService } from '../../service/hook/index.js';
 import { LocalBrowserBroker } from '../../service/browser-use/index.js';
-import { LocalPiHistoryStore } from '../../service/session-system/index.js';
+import { initializeWebFetchRouter } from '../../service/web-fetch/index.js';
 import { LocalTurnFileChangeCaptureService } from '../../service/turn-system/index.js';
 import {} from '../../infra/conversation/session-record.js';
 import { createLocalGreetingSystemReminderSender, createHostHookService, } from './turn/host-turn-service-factories.js';
@@ -44,6 +44,9 @@ import { settleInBackground } from '../../service/plugin-system/index.js';
 import { createGlobalEventSource, } from '../../infra/events/global-events.js';
 import { createWorkspaceIndexingHostSubsystem, hostCaptureWorkspaceFeedbackSnapshot, hostCaptureWorkspaceRevisionAfterTurn, hostLogWorkspaceSemanticSearchUnavailable, hostPrewarmWorkspaceIndexingForWorkspace, hostPrepareWorkspaceIndexingForSessionStart, } from '../../service/workspace/index.js';
 export class LocalRuntimeApiHost {
+    assignmentTools;
+    /** Built-in coordinator Agents, late-bound by the V2 runtime (unset: no Agent coordinates). */
+    coordinatorRoster;
     controller;
     runtimeConversation;
     /** Trusted Desktop / embedded CLI / TUI / app-server gate for direct Task admission. */
@@ -63,6 +66,8 @@ export class LocalRuntimeApiHost {
     isQuestionnaireOriginTurnRunning;
     /** AskUser v2 sync-wait probe: user input queued at/after `sinceMs` (late-bound by V2). */
     hasQueuedUserInputSinceProbe;
+    /** Whether another live Runtime on this dataDir owns a Session's running Turn (late-bound by V2). */
+    isTurnOwnedByOtherRuntime;
     /** Read-only projection from the V2 Pin owner for legacy Session responses. */
     readSessionPinned;
     legacyRuntime;
@@ -73,8 +78,11 @@ export class LocalRuntimeApiHost {
     surfaces;
     telemetry;
     matrixLogger;
+    /** Runtime-wide `web_fetch` routing owner; injected into every Turn's tools. */
+    webFetchRouter;
     metricsClient;
     configGetter;
+    ptcDefault;
     shellFamily;
     /** TUI-only opt-out, frozen at startup rather than read from tool/session input. */
     skipWindowsHardSafetyChecks;
@@ -93,7 +101,6 @@ export class LocalRuntimeApiHost {
      * edge it is supposed to detect. One graph per host instance also keeps two
      * hosts in one process from reading each other's waits as cycles.
      */
-    sessionSendWaitGraph = createSessionSendWaitGraph();
     /** V2-owned desktop composer send preference; absent means the `queue` default. */
     composerSendBehavior;
     remoteSessionHost;
@@ -187,6 +194,7 @@ export class LocalRuntimeApiHost {
         workspaceIndexingRemoteWorker: this.workspaceIndexingRemoteWorker,
         globalEvents: this.globalEvents,
         errorReporter: this.errorReporter,
+        webFetchRouter: this.webFetchRouter,
     }));
     mavisCronAdapterProvider;
     deleteAgentCronTasksOverride;
@@ -217,6 +225,7 @@ export class LocalRuntimeApiHost {
         this.capabilities = buildLocalRuntimeCapabilities(this.runtimeMode, options.capabilities);
         this.surfaces = buildLocalRuntimeSurfaceCapabilities(this.runtimeMode);
         this.configGetter = config.configGetter;
+        this.ptcDefault = options.ptcDefault;
         this.shellFamily = resolveHostShellFamily(options.shellFamily);
         this.skipWindowsHardSafetyChecks = readTuiWindowsHardSafetyOptOut(options.runtimeOwnerKind, this.configGetter);
         this.authContextGetter = options.authContextGetter;
@@ -319,6 +328,7 @@ export class LocalRuntimeApiHost {
             this.hookService.registry.registerBuiltin(registration);
         }
         this.metrics = options.metricsReporter;
+        this.webFetchRouter = this.buildWebFetchRouter();
         this.browserBroker =
             options.browserBroker ??
                 new LocalBrowserBroker({
@@ -686,6 +696,7 @@ export class LocalRuntimeApiHost {
             channelCapabilityEnabled: this.channelCapabilityEnabled,
             configGetter: this.configGetter,
             configUpdater: this.configUpdater,
+            ptcDefault: this.ptcDefault,
             authContextGetter: this.authContextGetter,
             routingContextGetter: this.routingContextGetter,
             fetchImpl: this.fetchImpl,
@@ -695,6 +706,7 @@ export class LocalRuntimeApiHost {
             communicationMessageStore: this.communicationMessageStore,
             tokenUsageStore: this.tokenUsageStore,
             runtimeConversation: this.runtimeConversation,
+            coordinatorRoster: this.coordinatorRoster,
             legacyMigrator: this.legacyMigrator,
             contentSafety: this.contentSafety,
             cronRuntime: this.cronRuntime,
@@ -779,6 +791,29 @@ export class LocalRuntimeApiHost {
     }
     logWorkspaceSemanticSearchUnavailable(sessionId, error) {
         hostLogWorkspaceSemanticSearchUnavailable(sessionId, error);
+    }
+    /**
+     * One router per Runtime: its backoff, breaker, learned intranet hosts and
+     * daily counts must outlive a Turn.
+     */
+    buildWebFetchRouter() {
+        const metricsClient = this.metricsClient;
+        return initializeWebFetchRouter({
+            dataDir: () => this.configGetter().dataDir,
+            ...(metricsClient
+                ? {
+                    histogram: (name, value, labels) => metricsClient.histogram(name, value, labels),
+                }
+                : {}),
+            ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+            ...(this.authContextGetter ? { authContextGetter: this.authContextGetter } : {}),
+            ...(this.authContextInvalidator
+                ? { authContextInvalidator: this.authContextInvalidator }
+                : {}),
+            ...(this.routingContextGetter ? { routingContextGetter: this.routingContextGetter } : {}),
+            ...(this.metrics ? { metrics: this.metrics } : {}),
+            ...(this.matrixLogger ? { matrixLogger: this.matrixLogger } : {}),
+        });
     }
     getRuntimeOwnerKind() {
         return this.lockOwner.ownerKind;

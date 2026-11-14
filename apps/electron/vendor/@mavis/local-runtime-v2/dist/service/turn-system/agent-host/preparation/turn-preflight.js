@@ -1,10 +1,10 @@
 import { parsePluginMentions } from '@mavis/shared/plugin-mention';
-import { createSecretFreeTurnAssemblyContext } from '../assembly-context.js';
+import { arrivedThroughChannel, createSecretFreeTurnAssemblyContext } from '../assembly-context.js';
 import { createCanonicalAgentHostUserInput } from '../canonical-user-input.js';
 import { detectReferencedOfficialHostCapabilityPlugins } from '../assembly/local-turn-plugin-capabilities.js';
 import { captureAgentHostSession } from './session-read.js';
 import { copyCanonicalHistoryForPiCompatibility } from '../history/canonical-history-validation.js';
-import { readSessionAgentExecutionSnapshot } from './session-agent-execution-snapshot.js';
+import { readSessionAgentExecutionSnapshot } from './config/session-agent-execution-snapshot.js';
 import { continuationRunnerHistory } from '../history/continuation-history.js';
 export class AgentExecutionSnapshotNotFoundError extends Error {
     agentName;
@@ -76,7 +76,11 @@ export class TurnPreflight {
             selected: selected.active,
         });
         const history = await observeAgentTurnSetupStage(this.dependencies.logger, logContext, 'history_read', () => this.dependencies.history.read(input.lease.sessionId));
-        const runnerHistory = input.request.executionMode === 'continuation' ? continuationRunnerHistory(history) : history;
+        const runnerHistory = input.request.executionMode === 'continuation'
+            ? continuationRunnerHistory(history, {
+                ...(input.request.continuationAfterFailedTurn ? { previousTurnFailed: true } : {}),
+            })
+            : history;
         const canonicalUserInput = createCanonicalAgentHostUserInput(input.request);
         const internalPromptRead = this.dependencies.internalTurnPromptReads?.take(input.lease.turnId);
         const prepared = await observeAgentTurnSetupStage(this.dependencies.logger, logContext, 'agent_preparation', () => this.dependencies.preparation.prepare({
@@ -234,9 +238,9 @@ function isComputerUseDefaultEligible(session, request) {
         (request.executionMode === 'continuation'
             ? request.provenance.source === 'turn-continuation'
             : request.provenance.source === 'api') &&
-        !request.input.channelContext &&
+        !arrivedThroughChannel(request) &&
         !request.input.origin &&
-        !request.input.queuedMessages?.some((message) => message.channelContext || message.origin));
+        !request.input.queuedMessages?.some((message) => message.origin));
 }
 /** Materializes the behaviour owner so every later stage reads one frozen value. */
 function freezeExecutionOwner(agent) {

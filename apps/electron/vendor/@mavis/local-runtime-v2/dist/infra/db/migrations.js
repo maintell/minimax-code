@@ -1,3 +1,5 @@
+import { migration as m0063 } from './migrations/session/migration-0063-hidden-session-purpose-index.js';
+import { migration as m0062 } from './migrations/miniapp/migration-0062-create-miniapp-launchpad.js';
 import { migration as m0014 } from './migrations/agent/migration-0014-create-agents.js';
 import { migration as m0024 } from './migrations/canvas/migration-0024-create-canvas.js';
 import { migration as m0031 } from './migrations/canvas/migration-0031-repair-canvas-version-collision.js';
@@ -51,6 +53,9 @@ import { migration as m0052 } from './migrations/goal/migration-0052-add-goal-re
 import { migration as m0049 } from './migrations/background-task/migration-0049-adopt-background-tasks.js';
 import { migration as m0053 } from './migrations/session/migration-0053-add-project-display-name.js';
 import { migration as m0054 } from './migrations/runtime/migration-0054-create-ppt-preview.js';
+import { migration as m0055 } from './migrations/session/migration-0055-create-message-search-index.js';
+import { migration as m0064 } from './migrations/session/migration-0064-create-session-auto-resume.js';
+import { migration as m0065 } from './migrations/cron/migration-0065-add-cron-run-scheduled-for.js';
 export const ALL_MIGRATIONS = [
     m0001,
     m0002,
@@ -105,5 +110,10 @@ export const ALL_MIGRATIONS = [
     m0052,
     m0053,
     m0054,
+    m0055,
+    m0062,
+    m0063,
+    m0064,
+    m0065,
 ];
 //# sourceMappingURL=migrations.js.map

@@ -4,6 +4,8 @@ export { readLocalPermissionMode } from './request-contracts.js';
 export { replyLocalPermissionRequests } from './approval/permissions.js';
 export { serializePermissionRequest } from './request-contracts.js';
 export { buildLocalPermissionRuleContents } from './host-rules.js';
+export { createProtectedRootDecisions, } from './protected-roots/protected-roots.js';
+export { isInside } from './protected-roots/canonical-paths.js';
 export { LocalPermissionApprovalService } from './approval.service.js';
 export { LocalPermissionRuleStore } from './rules/rules.js';
 export { abortLocalPermissionRequests } from './approval/permissions.js';

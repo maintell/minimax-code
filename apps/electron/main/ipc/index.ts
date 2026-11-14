@@ -39,6 +39,7 @@ import { setupEmbeddedBrowserIPC } from "./embeddedBrowser.ipc";
 import { setupBrowserBackendIPC } from "./browserBackend.ipc.js";
 import { setupBrowserWebviewIPC } from "./browserWebview.ipc.js";
 import { setupBrowserTelemetryIPC } from "./browserTelemetry.ipc.js";
+import { setupUiMetricsIPC } from "./uiMetrics.ipc.js";
 import { setupMiniAppIPC } from "./miniApp.ipc";
 import { setupMiniAppComposerIPC } from "./miniAppComposer.ipc";
 import { setupMiniAppAgentIPC } from "./miniAppAgent.ipc";
@@ -196,6 +197,7 @@ export async function setupAllIPC(options) {
     let disposeBrowserBackend;
     let disposeBrowserWebview;
     let disposeBrowserTelemetry;
+    let disposeUiMetrics;
     const disposeModelMenuPopup = setupModelMenuPopupIPC();
     try {
         documentPreview = setupDocumentPreviewIPC({
@@ -217,6 +219,7 @@ export async function setupAllIPC(options) {
         disposeBrowserBackend = setupBrowserBackendIPC();
         disposeBrowserWebview = setupBrowserWebviewIPC();
         disposeBrowserTelemetry = setupBrowserTelemetryIPC();
+        disposeUiMetrics = setupUiMetricsIPC();
         disposePptQueries = setupPptPreviewQueryIPC();
         disposePptEditing = setupPptxEditingIPC();
         setupMiniAppIPC();
@@ -240,6 +243,7 @@ export async function setupAllIPC(options) {
         disposeBrowserBackend?.();
         disposeBrowserWebview?.();
         disposeBrowserTelemetry?.();
+        disposeUiMetrics?.();
         disposeModelMenuPopup();
         disposeFeedbackLogQueue();
         disposeOSSSharedAuth();
@@ -268,6 +272,7 @@ export async function setupAllIPC(options) {
         disposeBrowserBackend?.();
         disposeBrowserWebview?.();
         disposeBrowserTelemetry?.();
+        disposeUiMetrics?.();
         disposeModelMenuPopup();
         disposeFeedbackLogQueue();
         disposeOSSSharedAuth();

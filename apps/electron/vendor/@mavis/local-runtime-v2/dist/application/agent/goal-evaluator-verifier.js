@@ -248,7 +248,8 @@ function evaluateFinalMessage(final, contextWindow, signal) {
         incomplete: usage.incomplete,
     };
 }
-function isFinalContextOverflow(final, contextWindow) {
+/** A final response that says the request exceeded the model's context window. */
+export function isFinalContextOverflow(final, contextWindow) {
     const usage = Reflect.get(final, 'usage');
     if (usage && typeof usage === 'object')
         return isContextOverflow(final, contextWindow);
@@ -291,7 +292,8 @@ function abortReason(signal, fallback) {
         return fallback;
     return new Error('Evaluator model request was aborted.');
 }
-function isExplicitInputTooLargeError(error) {
+/** A thrown provider error or error text that says the input was too large for the model. */
+export function isExplicitInputTooLargeError(error) {
     if (typeof error === 'string') {
         return /context window|context length|input too large|request too large|prompt is too long/iu.test(error);
     }

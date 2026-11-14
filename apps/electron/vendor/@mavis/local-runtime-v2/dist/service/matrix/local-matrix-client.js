@@ -24,15 +24,31 @@ export class LocalMatrixClient extends DesktopMatrixClient {
      * managed login, the 401 is returned unchanged: the host token is not what was rejected.
      */
     async postGatewayJson(...request) {
+        const [pathname, , signal] = request;
+        return this.withTokenRecovery({
+            pathname,
+            signal,
+            send: () => super.postGatewayJson(...request),
+        });
+    }
+    async getGatewayJson(...request) {
+        const [pathname, signal] = request;
+        return this.withTokenRecovery({
+            pathname,
+            signal,
+            send: () => super.getGatewayJson(...request),
+        });
+    }
+    async withTokenRecovery(request) {
         const { authContextGetter, authContextInvalidator } = this.liveAuth;
         if (!this.useManagedAuth || !authContextGetter || !authContextInvalidator) {
-            return super.postGatewayJson(...request);
+            return request.send();
         }
         // super reads the same getter synchronously before its first await, so this is the
         // auth the request carries.
         const sentAuth = authContextGetter();
         try {
-            return await super.postGatewayJson(...request);
+            return await request.send();
         }
         catch (err) {
             const sentToken = sentAuth?.accessToken?.trim();
@@ -42,7 +58,7 @@ export class LocalMatrixClient extends DesktopMatrixClient {
         }
     }
     async retryAfterTokenRecovery(unauthorized, sentToken, loginEpoch, request) {
-        const [pathname, , signal] = request;
+        const { pathname, signal, send } = request;
         try {
             await this.liveAuth.authContextInvalidator?.(sentToken, loginEpoch);
         }
@@ -59,7 +75,7 @@ export class LocalMatrixClient extends DesktopMatrixClient {
             throw unauthorized;
         }
         try {
-            const response = await super.postGatewayJson(...request);
+            const response = await send();
             logRecovery(pathname, 'ok');
             return response;
         }

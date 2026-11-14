@@ -16,10 +16,34 @@ import { createSteeringRequeue, } from './execution/steering/steering-requeue.js
 import { createSteeringTeardownCommit } from './execution/steering/steering-teardown-commit.js';
 import { createTurnSubmissionService } from './turn-submission.service.js';
 import { createHistoryMutationCapability } from './lifecycle/history-mutation-capability.js';
+import { createCoordinatorExtensionSlot } from './lifecycle/coordinator-extension.js';
 import { createUserMessageId, SessionMaintenanceService } from '../session-system/index.js';
 import { createTurnContinuationService } from './execution/turn-continuation.service.js';
+function createTurnInspection(repository, execution, controller, sessions) {
+    return {
+        backgroundTaskWait: (sessionId) => controller.backgroundTaskWait(sessionId),
+        activeTurnId: (sessionId) => execution.activeTurnId(sessionId),
+        hasPendingUserSteering: (sessionId) => controller.hasPendingUserSteering(sessionId),
+        hasQueuedUserInputSince: async (sessionId, sinceMs) => hasUserQueueInputSince(await sessions.queue.submission.list(sessionId), sinceMs),
+        activeTurn: async (sessionId) => {
+            const active = await repository.findActiveTurn(sessionId);
+            return active
+                ? { ...active, locallyOwned: execution.activeTurnId(sessionId) === active.turnId }
+                : undefined;
+        },
+        latestTurnActivity: (sessionId) => repository.findLatestTurnActivity(sessionId),
+        previousTurnStartedAt: (sessionId, turnId) => repository.findPreviousTurnStartedAt(sessionId, turnId),
+    };
+}
+function hostPluginHookSessionOwnership(repository) {
+    return {
+        prepare: (input) => repository.preparePluginHookSessionOwnership(input),
+        activate: (input) => repository.activatePluginHookSessionOwnership(input),
+    };
+}
 /** Initializes one production Turn graph over the SessionSystem persistence owner. */
 export async function initializeTurnSystem(options) {
+    const coordinatorExtension = createCoordinatorExtensionSlot();
     const repository = createRuntimeTurnRepository(options);
     const released = createTurnReleasedSignal();
     const steeringRequeue = createRuntimeSteeringRequeue(options, released);
@@ -33,12 +57,10 @@ export async function initializeTurnSystem(options) {
     const maintenance = createOperationGatedMaintenance(repository, operations, released, (sessionId) => exclusiveSession.getStore() === sessionId);
     const sessionEndMaintenance = new SessionMaintenanceService(maintenance);
     const host = await options.createHost({
+        coordinatorExtension: coordinatorExtension.read,
         turnControl: controller,
         turnFacts: createTurnFactProjector(repository),
-        pluginHookSessionOwnership: {
-            prepare: (input) => repository.preparePluginHookSessionOwnership(input),
-            activate: (input) => repository.activatePluginHookSessionOwnership(input),
-        },
+        pluginHookSessionOwnership: hostPluginHookSessionOwnership(repository),
     });
     const queue = options.sessions.queue.createDispatch(repository);
     const subagentSiblingWake = createSubagentSiblingWake(options.subagentConcurrency);
@@ -58,6 +80,7 @@ export async function initializeTurnSystem(options) {
         // ownership, so a stop-then-send Turn reads the rows (TS-75).
         steeringTeardown: steeringRequeue,
         ...(options.turnSettlement ? { turnSettlement: options.turnSettlement } : {}),
+        wakesQueueWhileWaitingForUser: options.wakesQueueWhileWaitingForUser,
         ...(options.logger ? { logger: options.logger } : {}),
     });
     const execution = createTurnExecutionService({
@@ -85,10 +108,11 @@ export async function initializeTurnSystem(options) {
         queue,
         executor: messageDelivery.queue,
         onPreparing: prepareQueuedExecution,
-        onExecution: (claim, result) => completions.observe(claim, result),
+        onExecution: completions.observe,
         isCancellationRequested: (item) => item.requestedTurnId !== undefined &&
             completions.cancellationReason(item.sessionId, item.requestedTurnId) !== undefined,
         ...queueSelectionOverrides(options),
+        ...(options.classifyQueuedItem ? { classifyQueuedItem: options.classifyQueuedItem } : {}),
         recoverState: recovery.recoverState,
     });
     subagentSiblingWake.bind(queue, dispatcher, recovery.requestSubagentRetry, recovery.recoverSubagentTaskOwners);
@@ -150,6 +174,7 @@ export async function initializeTurnSystem(options) {
     let closed = false;
     let closePromise;
     return {
+        bindCoordinatorExtension: coordinatorExtension.bind,
         turns,
         ...subagentCapabilities(options.subagentConcurrency, recovery),
         sessionLifecycle: {
@@ -168,19 +193,7 @@ export async function initializeTurnSystem(options) {
         },
         pluginHookSessionOwnership: pluginHookSessionOwnership(repository),
         queueSteer: createRuntimeQueueSteer(queue, completions, prepareQueuedExecution),
-        inspection: {
-            backgroundTaskWait: (sessionId) => controller.backgroundTaskWait(sessionId),
-            activeTurnId: (sessionId) => execution.activeTurnId(sessionId),
-            hasPendingUserSteering: (sessionId) => controller.hasPendingUserSteering(sessionId),
-            hasQueuedUserInputSince: async (sessionId, sinceMs) => hasUserQueueInputSince(await options.sessions.queue.submission.list(sessionId), sinceMs),
-            activeTurn: async (sessionId) => {
-                const active = await repository.findActiveTurn(sessionId);
-                return active
-                    ? { ...active, locallyOwned: execution.activeTurnId(sessionId) === active.turnId }
-                    : undefined;
-            },
-            latestTurnActivity: (sessionId) => repository.findLatestTurnActivity(sessionId),
-        },
+        inspection: createTurnInspection(repository, execution, controller, options.sessions),
         processLifecycle: createProcessLifecycle(controller),
         maintenance,
         receipts: receiptReader(repository),
@@ -331,6 +344,7 @@ function turnExecutionOverrides(options) {
         ...(options.nowMs ? { nowMs: options.nowMs } : {}),
         ...(options.makeTurnId ? { makeTurnId: options.makeTurnId } : {}),
         ...(options.userStop ? { userStop: options.userStop } : {}),
+        ...(options.contextReset ? { contextReset: options.contextReset } : {}),
         ...(options.logger ? { logger: options.logger } : {}),
     };
 }
@@ -359,6 +373,10 @@ function createRuntimeTurnContinuation(options, execution) {
     return createTurnContinuationService({
         history: options.sessions.canonicalHistory,
         execution,
+        previousTurn: {
+            readTerminal: (sessionId) => options.sessions.sessions.repository.readAgentTurnTerminal(sessionId),
+        },
+        ...(options.logger ? { logger: options.logger } : {}),
     });
 }
 function turnSubmissionOptions(options) {
@@ -583,8 +601,20 @@ function createQueuedTurnControl(options, repository, steeringRequeue) {
     const controller = createTurnController({
         renew: repository.renew,
         onBackgroundTaskWaitChanged: options.onBackgroundTaskWaitChanged,
+        ...(options.onActiveTurnCountChanged
+            ? { onActiveTurnCountChanged: options.onActiveTurnCountChanged }
+            : {}),
         onRegister: completions.beginExecution,
-        onSteeringDiscarded: (batch) => steeringRequeue.discard(batch),
+        onSteeringAdmitted: options.steeringObserver?.admitted,
+        onSteeringDiscarded: (batch) => {
+            try {
+                options.steeringObserver?.discarded?.(batch);
+            }
+            catch {
+                // Observation never changes where unconsumed steering goes.
+            }
+            steeringRequeue.discard(batch);
+        },
         ...(options.logger ? { logger: options.logger } : {}),
     });
     return { controller, completions };

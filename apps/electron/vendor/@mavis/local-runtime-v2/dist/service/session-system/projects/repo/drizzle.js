@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { and, asc, desc, eq, getTableColumns, gt, isNotNull, lt, or, sql, } from 'drizzle-orm';
 import { DEFAULT_PROJECT_ORDER_INDEX, projects } from '../../../../infra/db/schema/projects.js';
 import { sessions } from '../../../../infra/db/schema/sessions.js';
@@ -22,6 +23,19 @@ class DrizzleProjectRepository {
     constructor(options) {
         this.options = options;
     }
+    async privateRoots() {
+        return (await this.options.privateWorkspaceRoots?.())?.map((root) => path.resolve(root)) ?? [];
+    }
+    async isPrivateDirectory(dir) {
+        const resolved = path.resolve(dir);
+        return (await this.privateRoots()).some((root) => resolved === root || resolved.startsWith(root + path.sep));
+    }
+    async userProjectPredicate() {
+        const roots = (await this.privateRoots()).map((root) => root.replaceAll('\\', '/'));
+        if (roots.length === 0)
+            return undefined;
+        return and(...roots.map((root) => sql `(${projects.workspaceDir} IS NULL OR (replace(${projects.workspaceDir}, char(92), '/') <> ${root} AND substr(replace(${projects.workspaceDir}, char(92), '/'), 1, ${root.length + 1}) <> ${`${root}/`}))`));
+    }
     async getById(projectId) {
         return decode(this.options.db
             .select(projectSelection)
@@ -38,6 +52,8 @@ class DrizzleProjectRepository {
     }
     async getByWorkspaceDir(workspaceDir) {
         const canonical = canonicalProjectWorkspaceDir(workspaceDir);
+        if (canonical && (await this.isPrivateDirectory(canonical)))
+            return undefined;
         return canonical
             ? decode(this.options.db
                 .select(projectSelection)
@@ -57,6 +73,8 @@ class DrizzleProjectRepository {
         const canonical = canonicalProjectWorkspaceDir(workspaceDir);
         if (!canonical)
             return undefined;
+        if (await this.isPrivateDirectory(canonical))
+            return this.ensureDefault(nowMs);
         this.options.db
             .insert(projects)
             .values({
@@ -86,6 +104,7 @@ class DrizzleProjectRepository {
         return value;
     }
     async listPage(options) {
+        const userProjects = await this.userProjectPredicate();
         const includeHiddenProjects = options.includeHiddenProjects === true || options.includeHidden === true;
         const kind = includeHiddenProjects ? 'catalog-all' : 'catalog-visible';
         const cursor = decodeProjectCursor(options.cursor, kind);
@@ -98,9 +117,7 @@ class DrizzleProjectRepository {
             listActivityAtMs: projectListActivityExpression,
         })
             .from(projects)
-            .where(and(includeHiddenProjects ? undefined : eq(projects.hidden, 0), hasSessionFilter(options)
-            ? gt(sessionCountExpression, 0)
-            : or(gt(sessionCountExpression, 0), explicitWorkspaceProjectPredicate), cursor?.kind === 'catalog-visible' || cursor?.kind === 'catalog-all'
+            .where(and(userProjects, includeHiddenProjects ? undefined : eq(projects.hidden, 0), projectSessionCountPredicate(options, sessionCountExpression), cursor?.kind === 'catalog-visible' || cursor?.kind === 'catalog-all'
             ? catalogCursorPredicate(cursor)
             : undefined))
             .orderBy(desc(projects.pinned), asc(projects.orderIndex), desc(projectListActivityExpression), asc(projects.projectId))
@@ -114,12 +131,13 @@ class DrizzleProjectRepository {
         return projectPageFromRows(values, limit, kind);
     }
     async listRecent(options) {
+        const userProjects = await this.userProjectPredicate();
         const cursor = decodeProjectCursor(options.cursor, 'recent');
         const limit = normalizeProjectLimit(options.limit);
         const values = this.options.db
             .select(projectSelection)
             .from(projects)
-            .where(and(isNotNull(projects.recentAtMs), cursor?.kind === 'recent' ? recentCursorPredicate(cursor) : undefined))
+            .where(and(userProjects, isNotNull(projects.recentAtMs), cursor?.kind === 'recent' ? recentCursorPredicate(cursor) : undefined))
             .orderBy(desc(projects.recentAtMs), asc(projects.projectId))
             .limit(limit + 1)
             .all()
@@ -227,6 +245,14 @@ const DEFAULT_PROJECT_SESSION_FILTER = {
 };
 function projectRootPredicate(options) {
     return and(eq(sessions.columnarVersion, 3), eq(sessions.projectId, projects.projectId), sessionAgentNamePredicate(options.agentName), projectTaskRootPredicate(options.sessionFilter ?? DEFAULT_PROJECT_SESSION_FILTER));
+}
+/** Undefined when empty projects are listed too. */
+function projectSessionCountPredicate(options, sessionCountExpression) {
+    if (options.includeEmptyProjects === true)
+        return undefined;
+    return hasSessionFilter(options)
+        ? gt(sessionCountExpression, 0)
+        : or(gt(sessionCountExpression, 0), explicitWorkspaceProjectPredicate);
 }
 /** Agent or purpose scoping lists only projects that have matching conversations. */
 function hasSessionFilter(options) {

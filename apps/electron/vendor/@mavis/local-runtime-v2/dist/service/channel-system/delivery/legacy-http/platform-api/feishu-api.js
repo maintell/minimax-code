@@ -16,6 +16,12 @@ import { isFeishuUrlVerification, parseLocalFeishuEvent, readFeishuVerificationT
 import { isUsableFeishuBinding } from '../../../transport/feishu/feishu-adapter-utils.js';
 import { LocalFeishuChannelClient, } from '../../../transport/feishu/outbound/feishu-outbound-client.js';
 import { json, readFirstString, readJsonBody } from '../http-helpers.js';
+/**
+ * Stable refusal code: one Feishu app is one bot, and a bot cannot serve two
+ * Agents at the same time. Mirrored in the 409 body and passed to non-HTTP
+ * callers (the onboarding flow) through {@link FeishuBindFailure}.
+ */
+const FEISHU_APP_ALREADY_BOUND = 'FEISHU_APP_ALREADY_BOUND';
 export class LocalFeishuChannelApi {
     store;
     runner;
@@ -141,7 +147,9 @@ export class LocalFeishuChannelApi {
             ...serializeFeishuBinding(bound.record, this.resolveWsStatus(bound.record)),
         });
     }
-    async bindBody(body) {
+    async bindBody(body, 
+    // Internal only: supplied by the completed app-registration flow, never from bind JSON.
+    registrationCreatorOpenId) {
         const agentName = readFeishuAgentName(body, this.defaultAgentName);
         const appId = readFirstString(body, ['appId', 'app_id']);
         const appSecret = readFirstString(body, ['appSecret', 'app_secret']);
@@ -161,6 +169,29 @@ export class LocalFeishuChannelApi {
         if (requestedMode && requestedMode !== 'webhook' && requestedMode !== 'websocket') {
             return invalidBindMode('feishu');
         }
+        const duplicate = await this.findDuplicateAppBinding(agentName, appId);
+        if (duplicate) {
+            const boundAgentName = duplicate.agentName;
+            logger.warn({
+                agentName,
+                boundAgentName,
+                platform: 'feishu',
+                code: FEISHU_APP_ALREADY_BOUND,
+            }, 'Feishu bind rejected: app already bound to another Agent');
+            return {
+                errorCode: FEISHU_APP_ALREADY_BOUND,
+                boundAgentName,
+                error: json({
+                    ok: false,
+                    error: 'This Feishu bot is already bound to another Agent. Unbind it there before binding it here.',
+                    code: FEISHU_APP_ALREADY_BOUND,
+                    boundAgentName,
+                    platform: 'feishu',
+                    clientId: feishuClientId(agentName),
+                    localRuntime: true,
+                }, { status: 409 }),
+            };
+        }
         const record = await this.store.bind({
             agentName,
             appId,
@@ -178,6 +209,7 @@ export class LocalFeishuChannelApi {
             ]),
             botName: readFirstString(body, ['botName', 'bot_name']),
             mode: requestedMode === 'webhook' ? 'webhook' : 'websocket',
+            registrationCreatorOpenId,
         });
         // Plan §5.2: bind no longer starts its own transport unconditionally. A
         // staged / non-winner record (primary-family loser, or a candidate the
@@ -189,6 +221,48 @@ export class LocalFeishuChannelApi {
         this.registerClient(record);
         await this.onBindingChanged?.(record);
         return { record };
+    }
+    /**
+     * The stored record that already owns `appId` for a different Agent, or
+     * undefined when this bind may proceed.
+     *
+     * One Feishu app is one bot and a bot cannot serve two Agents, so a second
+     * Agent is refused before anything is persisted or started. Allowed:
+     *   - the same Agent re-binding its own appId (e.g. rotating the secret);
+     *   - the primary Agent family, which deliberately shares one credential
+     *     across its members (`cloneBindingForAgent`; only one stays enabled).
+     */
+    async findDuplicateAppBinding(agentName, appId) {
+        const normalizedAppId = appId.trim();
+        if (!normalizedAppId)
+            return undefined;
+        const requester = agentName.trim();
+        const clientId = feishuClientId(agentName);
+        const sameApp = (await this.store.list()).filter((record) => record.appId.trim() === normalizedAppId &&
+            record.clientId !== clientId &&
+            record.agentName.trim() !== requester);
+        if (sameApp.length === 0)
+            return undefined;
+        const requesterIsFamily = await this.isPrimaryFamilyMember(requester);
+        for (const record of sameApp) {
+            if (requesterIsFamily && (await this.isPrimaryFamilyMember(record.agentName)))
+                continue;
+            return record;
+        }
+        return undefined;
+    }
+    /**
+     * Read-only primary-family membership probe. The `unbind` kind never
+     * rejects, so a manual reserved-name conflict cannot turn this pre-bind
+     * check into a failed request; an unresolvable family simply is not one.
+     */
+    async isPrimaryFamilyMember(agentName) {
+        try {
+            return await this.store.isPrimaryFamilyAgent(agentName, 'unbind');
+        }
+        catch {
+            return false;
+        }
     }
     async unbind(request) {
         const body = await readJsonBody(request);
@@ -221,20 +295,17 @@ export class LocalFeishuChannelApi {
     }
     async handleEvent(request, dispatch, requireBinding = false) {
         const body = await readJsonBody(request);
+        const binding = requireBinding ? await this.authenticateBinding(body) : undefined;
+        if (binding instanceof Response)
+            return binding;
         if (isFeishuUrlVerification(body)) {
-            const gate = requireBinding ? await this.assertBinding(body) : undefined;
-            if (gate)
-                return gate;
             return json({ challenge: body.challenge, localRuntime: true });
-        }
-        if (requireBinding) {
-            const gate = await this.assertBinding(body);
-            if (gate)
-                return gate;
         }
         const envelope = parseLocalFeishuEvent(body, this.defaultAgentName);
         if ('error' in envelope)
             return wireValidationResponse(envelope.error);
+        if (binding)
+            envelope.ctx.clientName = binding.clientId;
         if (!dispatch)
             return json({ ok: true, envelope, localRuntime: true });
         return this.dispatchEvent(envelope);
@@ -288,7 +359,7 @@ export class LocalFeishuChannelApi {
             return undefined;
         }
     }
-    async assertBinding(body) {
+    async authenticateBinding(body) {
         const agentName = readFeishuAgentName(body, this.defaultAgentName);
         const record = await this.store.get(agentName);
         if (!record?.enabled || !record.appId || !record.appSecret) {
@@ -312,7 +383,13 @@ export class LocalFeishuChannelApi {
                 localRuntime: true,
             }, { status: 401 });
         }
-        return undefined;
+        if (['clientName', 'clientId', 'client_id'].some((key) => {
+            const requested = readFirstString(body, [key]);
+            return requested !== undefined && requested !== record.clientId;
+        })) {
+            return json({ ok: false, code: 'FEISHU_CLIENT_MISMATCH' }, { status: 403 });
+        }
+        return record;
     }
 }
 /** Shared shape for every attachment outcome (marker, success, failure). */

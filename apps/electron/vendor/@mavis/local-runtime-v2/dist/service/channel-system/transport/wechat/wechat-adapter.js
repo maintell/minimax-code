@@ -21,6 +21,7 @@
  * live in `wechat-attachments.ts` / `wechat-questionnaire.ts` so this file
  * stays within the 500-line layout budget.
  */
+import { extname } from 'node:path';
 import { detach } from '../../settle.js';
 import { prepareChannelOutboundMessage } from '../../delivery/outbound-message.js';
 import { LocalChannelClientUnavailableError, } from '../../ingress/runner.js';
@@ -163,7 +164,7 @@ export class LocalWeChatChannelAdapter {
         }
         const record = await this.store.get(this.agentName);
         const currentToken = record?.botToken ?? '';
-        if (this.monitorWire.needsRestart(currentToken)) {
+        if (this.monitorWire.needsRestart(currentToken, record?.registrationCreator?.bindingId)) {
             this.monitorWire.stop();
             this.monitorWire = null;
             await this.startMonitor();
@@ -392,6 +393,16 @@ export class LocalWeChatChannelAdapter {
             ...(mediaErrors.length > 0 ? { error: mediaErrors.join('\n') } : {}),
         };
     }
+    deliveryFileName(media) {
+        const originalName = extractFileName(media.path);
+        const extension = media.path.startsWith('data:') ? '' : extname(originalName);
+        const title = media.name?.trim() || originalName;
+        // A delivery title is not necessarily a filename. Keep its wording while preserving
+        // the source file type so WeChat can select a viewer.
+        return extension && !title.toLowerCase().endsWith(extension.toLowerCase())
+            ? `${title}${extension}`
+            : title;
+    }
     /**
      * Send one outbound media item; a failure records a user-visible marker in
      * `mediaErrors` and never aborts the remaining items. Uses the
@@ -404,6 +415,7 @@ export class LocalWeChatChannelAdapter {
      */
     async sendOneMedia(send) {
         const { media } = send;
+        const fileName = this.deliveryFileName(media);
         try {
             const buf = await readMediaBuffer(media.path);
             const mimeType = (media.mimeType && media.mimeType.includes('/') ? media.mimeType : undefined) ??
@@ -420,7 +432,7 @@ export class LocalWeChatChannelAdapter {
                 to: send.chatId,
                 contextToken: send.contextToken,
                 uploaded: upload,
-                fileName: media.name ?? extractFileName(media.path),
+                fileName,
                 mimeType,
             });
             logger.info({ kind: media.kind, name: media.name ?? extractFileName(media.path), mimeType }, 'WeChat outbound media sent');
@@ -520,10 +532,17 @@ export class LocalWeChatChannelAdapter {
     }
     /**
      * Try to interpret an inbound text as a numbered-text questionnaire
-     * reply for THIS chat. Returns `null` when there is no pending ask for
-     * the chat — the runner then forwards the inbound as a plain user
-     * message. On a complete hit, the pending entry is marked in-flight until
-     * the host settles the reply.
+     * reply for THIS chat.
+     *
+     * Returns `null` — the runner then forwards the inbound as a plain user
+     * message — when there is no pending ask for the chat, when the text is
+     * empty, or when the text is not a pure numbered answer. In that last case
+     * the pending entry is dropped first: the user has moved on to talking to
+     * the agent, and a later bare number (answering the agent's own follow-up
+     * question) must not be re-parsed against the stale questionnaire.
+     *
+     * On a hit, the pending entry is marked in-flight until the host settles
+     * the reply.
      */
     async tryHandleQuestionnaireReply(input) {
         const pending = this.pendingByChat.get(input.ctx.chatId);
@@ -532,11 +551,14 @@ export class LocalWeChatChannelAdapter {
         if (pending.inFlight)
             return { handled: true };
         const text = (input.text ?? '').trim();
+        // Empty text carries no answer — keep the pending ask as-is.
         if (!text)
             return null;
         const reply = parseNumberedReply({ text, request: pending.request });
-        if (!reply)
+        if (!reply) {
+            this.pendingByChat.delete(input.ctx.chatId);
             return null;
+        }
         pending.inFlight = true;
         return { ctx: input.ctx, reply };
     }

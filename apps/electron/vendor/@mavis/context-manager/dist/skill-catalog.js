@@ -6,6 +6,12 @@ import { createDefaultTokenEstimator } from './token-estimator.js';
 const LOCAL_SKILL_CATALOG_MAX_BUDGET_TOKENS = 5_000;
 const LOCAL_SKILL_DESCRIPTION_MAX_CODE_POINTS = 1_024;
 const PROTECTED_SKILL_NAMES = new Set(['mcode-tools-master', 'minimax-code-product']);
+/**
+ * Official Office plugin Skills replaced the bundled `docx` / `xlsx` / `pdf` /
+ * `pptx` Skills. Hosts project plugin Skills as non-builtin, so keep these four
+ * runtime names in the builtin description tier they had before the move.
+ */
+const BUILTIN_TIER_PLUGIN_SKILL_NAMES = new Set(['excel:xlsx', 'pdf:pdf', 'ppt:pptx', 'word:docx']);
 const PARTIAL_DESCRIPTION_NOTICE = 'Skill descriptions were shortened to fit the catalog budget.';
 const PARTIAL_SKILL_NOTICE = 'Some skills were omitted because not every skill name fits within the skills context budget.';
 const LOCAL_NON_MONOTONIC_RECOVERY_MAX_CONSECUTIVE_MISSES = 8;
@@ -93,7 +99,7 @@ function prepareSkills(skills) {
         const protectedDescription = isProtectedSkill(skill.name);
         return {
             name: skill.name,
-            builtin: skill.builtin,
+            builtin: skill.builtin || BUILTIN_TIER_PLUGIN_SKILL_NAMES.has(skill.name),
             description: protectedDescription
                 ? normalizedDescription
                 : normalizedDescription.slice(0, LOCAL_SKILL_DESCRIPTION_MAX_CODE_POINTS),

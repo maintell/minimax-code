@@ -61,11 +61,15 @@ export function initializeSessionApplicationSystem(options) {
         deleteCommunication: (sessionId) => options.compatibility.communication.deleteSession(sessionId),
         deleteChannelBindings: (sessionId) => options.compatibility.channelBindings.deleteSession(sessionId),
         deleteQuestionnaires: (sessionId) => options.compatibility.questionnaires.deleteSession(sessionId),
+        deleteAssignment: async (sessionId) => {
+            await owner.repositories.assignmentCleanup.deleteForSession(sessionId);
+        },
         deletePermissions: (sessionId) => options.compatibility.permissions.deleteSession(sessionId),
         deleteGoal: (sessionId) => options.compatibility.goals.deleteSession(sessionId),
         deleteQueryCollapse: (sessionId) => owner.queryCollapse.state.deleteSession(sessionId),
         removePin: (sessionId) => options.pin.removeSession(sessionId),
         markLegacyMigrationDeleted: (sessionId) => owner.legacy.markDeleted(sessionId),
+        deletePptPreview: async (sessionId) => options.pptPreview?.deleteSession(sessionId),
     };
     return {
         repositories: owner.repositories,
@@ -94,6 +98,7 @@ export function initializeSessionApplicationSystem(options) {
             peekContext,
         },
         files: owner.files,
+        artifactCatalog: owner.artifactCatalog,
         mediaIdentity: options.compatibility.mediaIdentityCloud
             ? new SessionMediaIdentityService({
                 sessions: owner.repositories.sessions,

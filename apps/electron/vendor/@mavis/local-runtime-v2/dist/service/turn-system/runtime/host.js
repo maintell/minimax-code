@@ -13,7 +13,7 @@ import { PI_TURN_RUNNER_LOGGER, withLlmResponseIdentifierLogging, } from './repo
 import { runLocalRuntimeEvalTurn } from './reporting/host-eval.js';
 import { ContextUsageTurnTracker, withContextUsageEventWriter, } from '../context-usage/context-usage-turn-tracker.js';
 import { createContextUsageRuntime } from './context-usage-runtime.js';
-export { deriveLocalRuntimeTurnOutcome } from './reporting/turn-outcome.js';
+export { deriveLocalRuntimeTurnOutcome, } from './reporting/turn-outcome.js';
 const TOOL_CONTEXT_SIZE_ESTIMATOR = new BpeTokenEstimator();
 export class LocalRuntimeHost {
     piRunner;
@@ -30,6 +30,7 @@ export class LocalRuntimeHost {
         this.piRunner =
             options.piRunner ??
                 new PiTurnRunner({
+                    registryMetrics: true,
                     ...(options.metricsClient ? { metricsClient: options.metricsClient } : {}),
                     logger: PI_TURN_RUNNER_LOGGER,
                     toolContextSizeEstimator: TOOL_CONTEXT_SIZE_ESTIMATOR,

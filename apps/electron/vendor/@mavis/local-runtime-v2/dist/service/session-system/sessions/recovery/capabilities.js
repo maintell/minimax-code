@@ -1,3 +1,15 @@
+/**
+ * `errorSource` of a Session whose Turn the runtime aborted while shutting
+ * down; the Turn controller aborts running Turns with this reason on close.
+ */
+export const SESSION_SHUTDOWN_SOURCE = 'runtime-shutdown';
+/**
+ * A Turn the runtime aborted while shutting down keeps that on its Session, so
+ * its stop does not read as one the user made (`stoppedByRestart`).
+ */
+export function stopSourceOf(abortReason) {
+    return abortReason === SESSION_SHUTDOWN_SOURCE ? { errorSource: SESSION_SHUTDOWN_SOURCE } : {};
+}
 export function createSessionsService(repository) {
     return repository;
 }
@@ -39,8 +51,9 @@ export function createSessionExecutionSource(repository, readiness) {
 function terminalStateUpdate(input) {
     if (input.outcome === 'completed')
         return { status: 'idle' };
+    // A stop carries only why it happened, such as the runtime shutting down; it is no error.
     if (input.outcome === 'aborted')
-        return { status: 'aborted' };
+        return { status: 'aborted', ...(input.errorSource ? { errorSource: input.errorSource } : {}) };
     return {
         status: 'error',
         errorMessage: input.errorMessage ?? 'Agent turn failed',

@@ -163,7 +163,7 @@ export class RcConnection {
         const ws = this.ws;
         if (!ws || this.state !== 'connected')
             return false;
-        return this.sendRaw(ws, frame);
+        return this.sendRaw(ws, frame).ok;
     }
     /**
      * Byte-level outbound path (M3): `text` is a complete, already-serialized
@@ -188,19 +188,28 @@ export class RcConnection {
             return { ok: false, reason: 'send_failed' };
         }
     }
+    /**
+     * Encode + write one frame. The result separates "the frame never fit the
+     * negotiated cap" from "the socket refused it": only the former is something
+     * the peer can be told about, and only the former is worth answering with a
+     * substitute err frame.
+     */
     sendRaw(ws, frame) {
         const encoded = encodeFrame(frame, { maxMessageBytes: this.maxMessageBytes });
         if (!encoded.ok) {
             this.opts.logger.error(`[rc.conn] drop outbound ${frame.type}: ${encoded.error.code} ${encoded.error.message}`);
-            return false;
+            if (encoded.error.code === 'frame_too_large') {
+                return { ok: false, reason: 'frame_too_large', sizeBytes: encoded.error.sizeBytes };
+            }
+            return { ok: false, reason: 'send_failed' };
         }
         try {
             ws.send(encoded.text);
-            return true;
+            return { ok: true };
         }
         catch (err) {
             this.opts.logger.warn(`[rc.conn] send ${frame.type} failed: ${connectionErrorForLog(err)}`);
-            return false;
+            return { ok: false, reason: 'send_failed' };
         }
     }
     async attempt() {
@@ -298,7 +307,7 @@ export class RcConnection {
         this.handshakeTimer = setTimeout(() => {
             this.opts.logger.warn('[rc.conn] handshake timeout waiting for ctrl.hello');
             this.forcedCloseCause = 'handshake_timeout';
-            this.forceClose(ws);
+            this.forceClose(ws, 'terminate');
         }, HANDSHAKE_TIMEOUT_MS);
         ws.on('open', () => {
             this.opts.logger.debug('[rc.conn] ws open; awaiting ctrl.hello');
@@ -363,8 +372,20 @@ export class RcConnection {
             this.opts.logger.info(`[rc.conn] event=cmd_in trace_id=${frame.trace_id ?? ''} rc_cmd_id=${frame.id} type=${frame.type}${frame.in_reply_to ? ` in_reply_to=${frame.in_reply_to}` : ''}`);
             void this.commandRouter
                 .handleCommand(frame, (reply) => {
-                if (!signal.aborted && this.ws === ws)
-                    this.sendRaw(ws, reply);
+                if (signal.aborted || this.ws !== ws)
+                    return;
+                const result = this.sendRaw(ws, reply);
+                if (result.ok || result.reason !== 'frame_too_large')
+                    return;
+                // Silently dropping the reply leaves the phone waiting for RGW's
+                // ack timeout and then re-issuing the same command. Answer the
+                // command explicitly instead so it fails fast and visibly.
+                this.opts.logger.error(`[rc.conn] event=reply_frame_too_large trace_id=${frame.trace_id ?? ''} rc_cmd_id=${frame.id} cmd_type=${frame.type} reply_type=${reply.type} size_bytes=${result.sizeBytes ?? 0} max_frame=${this.maxMessageBytes}B`);
+                this.sendRaw(ws, makeFrame(errTypeForCmd(frame.type), {
+                    code: 'PAYLOAD_TOO_LARGE',
+                    message: `the ${frame.type} reply is ${result.sizeBytes ?? 0} bytes, over this connection's ${this.maxMessageBytes} byte frame limit`,
+                    retryable: false,
+                }, { inReplyTo: frame.id, traceId: frame.trace_id }));
             }, { streamScope: this.currentConnectionId, signal, commandScope: this.opts.commandScope })
                 .catch((err) => {
                 if (signal.aborted || this.ws !== ws)
@@ -552,7 +573,7 @@ export class RcConnection {
                 // Gateway went silent past the liveness window — assume dead.
                 this.opts.logger.warn('[rc.conn] no inbound frames for 15s; forcing reconnect');
                 this.forcedCloseCause = 'idle_timeout';
-                this.forceClose(ws);
+                this.forceClose(ws, 'terminate');
                 return;
             }
             this.sendRaw(ws, makeFrame(FRAME_TYPES.CTRL_PING, {}));
@@ -627,14 +648,26 @@ export class RcConnection {
             void this.attempt();
         }, HEALTH_RECOVERY_POLL_MS);
     }
-    forceClose(ws) {
+    /**
+     * Close a socket this connection has already given up on.
+     *
+     * `terminate` (idle / handshake timeout) drops the socket outright: the peer
+     * is assumed dead, and a graceful close would let it keep draining a queued
+     * multi-megabyte reply onto the same uplink the replacement connection now
+     * needs. Deliberate shutdowns (`stop`, health gate) keep using `close` so the
+     * gateway still receives ctrl.disconnect_reason.
+     */
+    forceClose(ws, mode = 'close') {
         if (this.ws === ws)
             this.attemptController.abort();
         try {
-            ws.close(1000);
+            if (mode === 'terminate' && typeof ws.terminate === 'function')
+                ws.terminate();
+            else
+                ws.close(1000);
         }
         catch {
-            // ignore — close() on a broken socket
+            // ignore — close()/terminate() on a broken socket
         }
         // If the socket never opened, `close` may not fire; treat as closed now.
         if (this.ws === ws && ws.readyState !== WebSocket.OPEN) {

@@ -1,4 +1,15 @@
 import path from 'node:path';
+import { BUNNY_AGENT_NAME } from './agent-avatar.js';
+/** Home directory of the built-in Bunny Agent inside a profile data directory. */
+export function resolveBunnyHomeDir(dataDir) {
+    return path.join(resolveDataDir(dataDir), BUNNY_AGENT_NAME);
+}
+/** Bunny 独立 SQLite 相对 profile data directory 的路径段。 */
+export const BUNNY_DATABASE_RELATIVE_PATH = path.join(BUNNY_AGENT_NAME, 'data', 'bunny.sqlite');
+/** Bunny 独立 SQLite：`<dataDir>/bunny/data/bunny.sqlite`，与桌面端大库分开。 */
+export function resolveBunnyDatabasePath(dataDir) {
+    return path.join(resolveDataDir(dataDir), BUNNY_DATABASE_RELATIVE_PATH);
+}
 export function resolveV2Root(dataDir) {
     return path.join(resolveDataDir(dataDir), 'v2');
 }
@@ -78,16 +89,33 @@ export function formatV2TimestampParts(epochMs) {
         compact: `${year}${month}${day}-${hh}${mm}${ss}-${ms}`,
     };
 }
+const MAX_V2_PATH_SEGMENT_CHARS = 180;
 export function sanitizeV2PathSegment(value, fallback = 'item') {
     const trimmed = value.trim();
-    const sanitized = trimmed
+    const cleaned = trimmed
         .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
         .replace(/\s+/g, ' ')
         .replace(/^\.+/g, '')
         .replace(/^\.+$/g, '')
-        .slice(0, 180)
         .trim();
+    const sanitized = truncatePathSegmentPreservingExtension(cleaned, MAX_V2_PATH_SEGMENT_CHARS);
     return sanitized || fallback;
+}
+function truncatePathSegmentPreservingExtension(value, maxChars) {
+    if (value.length <= maxChars)
+        return value;
+    const extMatch = /^(.+?)(\.[A-Za-z0-9]{1,16})$/u.exec(value);
+    const rawStem = extMatch?.[1];
+    const ext = extMatch?.[2];
+    if (rawStem && ext) {
+        const stemBudget = maxChars - ext.length;
+        if (stemBudget > 0) {
+            const stem = rawStem.slice(0, stemBudget).trim();
+            if (stem)
+                return `${stem}${ext}`;
+        }
+    }
+    return value.slice(0, maxChars).trim();
 }
 export function isPathInside(parent, child) {
     const relative = path.relative(path.resolve(parent), path.resolve(child));

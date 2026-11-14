@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { MsgType, RespDataType, Role, ToolCallStatus, } from '@mavis/agent-core/protocol/agent-message';
-import { RuntimeEventType } from '@mavis/agent-core/protocol';
+import { isAbandonedStreamClosingEvent, isAbandonedStreamClosingMessage, RuntimeEventType, } from '@mavis/agent-core/protocol';
 import { callableTurnToolNames, ComputerUseCaptureReporter, isComputerUseTool, } from './computer-use-capture/reporter.js';
 /** Keeps eval capture fail-open around the native V2 runner. */
 export async function runWithLocalEvalReporter(factory, input, execute, logger) {
@@ -206,6 +206,15 @@ function withReporterHooks(hooks, observation) {
 function observeApprovedMessages(writer, observation) {
     let observedEventCount = writer.events.length;
     const observe = (event) => {
+        // Frames the bridge synthesises while closing an abandoned attempt are
+        // display only: the model never ran those tool calls, and the half answer is
+        // not a model output. Reporting them would put a phantom tool failure into
+        // the eval record — which strict Computer Use capture reads as `tool_error`
+        // and then blocks the retried tool on — and would add a phantom assistant
+        // message to the model-output statistics here and in session telemetry. The
+        // failed attempt itself is already recorded by the retry metrics.
+        if (isAbandonedStreamClosingEvent(event))
+            return;
         const response = parseRuntimeResponse(event);
         if (response?.type === RespDataType.AgentMessageChunk) {
             for (const toolCall of response.agent_message_chunk?.tool_calls ?? []) {
@@ -214,6 +223,14 @@ function observeApprovedMessages(writer, observation) {
         }
         const message = parseAssistantMessage(response);
         if (!message)
+            return;
+        // The bridge materialises an abandoned attempt's half answer so the user sees
+        // a finished message instead of a card stuck on "preparing". It is not a
+        // model output: it carries no provider usage, which every real reply does,
+        // even one that stopped on the length limit or failed. Keeping it out of the
+        // record stops eval capture and session telemetry from counting a phantom
+        // assistant message; the failed attempt itself is in the retry metrics.
+        if (isAbandonedStreamClosingMessage(message))
             return;
         capture(observation.logger, 'assistant_message', () => {
             observation.reporter.reportAssistantMessage({
@@ -248,6 +265,16 @@ function observeApprovedMessages(writer, observation) {
 function observeTerminalToolCall(toolCall, observation) {
     if (!isTerminalToolCall(toolCall))
         return;
+    // A failed call with no result never ran: the bridge marks an abandoned
+    // attempt's half-written call failed so its card stops showing "preparing".
+    // Reporting it would put a phantom tool failure in the record, which strict
+    // Computer Use capture reads as `tool_error` and then blocks the retried tool
+    // on. Every real failure carries its result or error payload. This is the same
+    // rule the Mini App projection applies, and it survives the serialisation
+    // between the bridge and here.
+    if (toolCall.tool_call_status === ToolCallStatus.Failed && !toolCall.tool_call_result_data) {
+        return;
+    }
     const callAlreadyReported = observation.reportedToolCallIds.has(toolCall.tool_call_id);
     if (!callAlreadyReported) {
         observation.reportedToolCallIds.add(toolCall.tool_call_id);

@@ -329,14 +329,24 @@ export async function relocateLocalRuntimeDataDir(options) {
     const requestedTargetParentDir = normalizeDir(options.targetParentDir);
     await assertReadableWritableDirectory(requestedTargetParentDir, 'INVALID_PARENT');
     const targetParentDir = await dataDirFs.realpath(requestedTargetParentDir);
+    // Windows also reports internal disks as removable when the BIOS enables SATA hot-plug,
+    // so this rule alone asks the user instead of rejecting. Every earlier rule already passed.
+    let hotPlugRisk;
     try {
         await assertInternalDataDirStorage(targetParentDir);
     }
     catch (error) {
-        if (error instanceof DataDirStorageError) {
+        if (error instanceof DataDirStorageError &&
+            error.code === 'TARGET_NOT_INTERNAL_DISK' &&
+            error.diskCheck?.reason === 'removable') {
+            hotPlugRisk = error;
+        }
+        else if (error instanceof DataDirStorageError) {
             throw new LocalRuntimeDataDirRelocationError(error.code, error.message, undefined, error.diskCheck);
         }
-        throw error;
+        else {
+            throw error;
+        }
     }
     const currentDataDir = normalizeDir(options.currentDataDir ?? resolveLocalRuntimeDataDir());
     const currentDataDirName = resolveSupportedCurrentDataDirName(currentDataDir);
@@ -384,6 +394,9 @@ export async function relocateLocalRuntimeDataDir(options) {
         throw new LocalRuntimeDataDirRelocationError('TARGET_UNAVAILABLE', `Target write probe failed: ${String(error)}`);
     }
     // Asked last so that a confirmed warning is not followed by another rejection.
+    if (hotPlugRisk && !options.hotPlugRiskAcknowledged) {
+        throw new LocalRuntimeDataDirRelocationError('TARGET_HOT_PLUG_SUSPECTED', `Target disk is marked removable or hot-pluggable; user confirmation is required (${hotPlugRisk.message})`, undefined, hotPlugRisk.diskCheck);
+    }
     if (!options.cloudSyncRiskAcknowledged &&
         (looksLikeCloudSyncedPath(targetParentDir) ||
             looksLikeCloudSyncedPath(requestedTargetParentDir))) {

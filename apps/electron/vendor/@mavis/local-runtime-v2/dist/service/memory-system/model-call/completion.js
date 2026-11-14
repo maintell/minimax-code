@@ -64,15 +64,17 @@ export function createGlobalMemoryModelCompletion(input) {
     return {
         async resolveModel(request) {
             const { resolved } = await resolve(request.reasoningEffort, request.modelName);
-            // 整理在 INIT 时要一次写出整份 MEMORY.md（现约 70KB），迁移要把一份旧记忆文件
-            // （单文件可达数十 KB）一次改写成会话文档，上限都需容纳整份产物；输入预算等于上下文
-            // 窗口减去该值，取 32768 兼顾单次可写体量与可读输入。抽取产物是单会话文档，8192 足够。
-            const maxOutputTokens = Math.min(request.kind === 'capture' ? 8_192 : 32_768, resolved.model.maxTokens);
+            // 输出上限取模型自身上限：产物体量由 maxSessionDocBytes、maxMemoryMarkdownBytes 等字节上限
+            // 在程序侧约束；再压一层 token 上限，长会话整份重写文档时会被截断。
+            const maxOutputTokens = resolved.model.maxTokens;
+            // 输出上限按配置可能接近上下文窗口；为输入预算至少留出一半窗口，避免历史被压到不可用。
+            const outputReserve = Math.min(maxOutputTokens, Math.floor(resolved.model.contextWindow / 2));
             return {
                 modelName: `${resolved.model.provider}/${resolved.model.id}`,
                 managedProvider: resolved.managedProvider === true,
                 parameters: { reasoning: resolved.thinkingLevel ?? 'off' },
-                maxInputTokens: Math.max(1, resolved.model.contextWindow - maxOutputTokens),
+                contextWindow: resolved.model.contextWindow,
+                maxInputTokens: Math.max(1, resolved.model.contextWindow - outputReserve),
                 maxOutputTokens,
             };
         },
@@ -179,9 +181,15 @@ export function createGlobalMemoryModelCompletion(input) {
                 });
                 messages.push(result);
                 const toolCalls = result.content.filter((part) => part.type === 'toolCall');
-                // 完成协议：模型不再调用工具即视为完成，最终文本不参与结果。
-                if (toolCalls.length === 0)
-                    return { status: 'completed' };
+                if (toolCalls.length === 0) {
+                    // 完成协议：模型主动停止调用工具才算完成，最终文本不参与结果。撞上输出上限的回复
+                    // 只是没写完——回填提示后继续下一步，前几步已完成的编辑不作废，也不会把空转当成
+                    // 完成去发布未改动的产物。用满轮次上限才按 agent-limit-exceeded 失败。
+                    if (result.stopReason !== 'length')
+                        return { status: 'completed' };
+                    messages.push(truncationNudge(input.nowMs));
+                    continue;
+                }
                 messages.push(
                 // 输出撞上长度上限时，工具调用参数已被截断，执行它只会写入残缺内容。
                 ...(result.stopReason === 'length'
@@ -226,6 +234,16 @@ async function runMemoryLoopStep(step) {
 }
 const TRUNCATED_TOOL_CALL_MESSAGE = 'The response reached the output token limit, so this tool call was cut off and not executed. ' +
     'Retry with smaller calls: split large content across several calls.';
+const TRUNCATED_TURN_MESSAGE = 'The previous reply reached the output token limit before any tool call, so nothing was applied. ' +
+    'Continue directly with tool calls and split large content across several calls.';
+/** 整步没有任何工具调用就被截断时的回填提示；模型据此在下一步继续编辑。 */
+function truncationNudge(nowMs) {
+    return {
+        role: 'user',
+        content: TRUNCATED_TURN_MESSAGE,
+        timestamp: nowMs(),
+    };
+}
 /** 响应被长度截断时不执行任何调用，统一回填可重试的错误，引导模型拆分输出。 */
 function rejectTruncatedToolCalls(toolCalls, nowMs) {
     return toolCalls.map((call) => ({

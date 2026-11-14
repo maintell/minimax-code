@@ -326,6 +326,10 @@ export class Scheduler {
         const active = this.getActiveTrigger(schedulerId, timer);
         if (!active)
             return;
+        // Read the planned moment before advanceJob overwrites it with the following run.
+        // Croner's own currentRun() reports the wall clock the callback actually fired at,
+        // so this record is the only place the planned time survives a late firing.
+        const scheduledForMs = active.record.nextRunAtMs ?? this.nowMs();
         const next = this.advanceJob(active.record, timer);
         this.persistTriggeredJob(next, timer);
         this.jobs.set(schedulerId, next);
@@ -334,7 +338,7 @@ export class Scheduler {
             this.timers.delete(schedulerId);
         }
         this.reportActiveJobs();
-        await this.invokeHandler(next);
+        await this.invokeHandler(next, scheduledForMs);
     }
     getActiveTrigger(schedulerId, timer) {
         if (this.timers.get(schedulerId) !== timer)
@@ -372,7 +376,7 @@ export class Scheduler {
             throw error;
         }
     }
-    async invokeHandler(record) {
+    async invokeHandler(record, scheduledForMs) {
         const handler = this.handlers.get(record.handlerKey);
         if (!handler) {
             this.reportSkipped('missing_handler');
@@ -380,7 +384,7 @@ export class Scheduler {
         }
         const startedAtMs = this.nowMs();
         try {
-            await handler(record.schedulerId);
+            await handler(record.schedulerId, scheduledForMs);
             this.reportTrigger(record.handlerKey, 'success', startedAtMs);
         }
         catch {
@@ -392,26 +396,41 @@ export class Scheduler {
             throw new Error('scheduler has not started');
         return this.options.db;
     }
+    /**
+     * Tells the active-job observer how many timers its handler has armed. The
+     * Desktop reports no gauge: the server keeps only the last client's value.
+     */
     reportActiveJobs() {
-        this.reportMetric(() => this.options.metrics?.gauge('scheduler_active_jobs', this.timers.size));
+        const observer = this.options.activeJobObserver;
+        if (observer) {
+            this.reportBestEffort(() => observer.onCountChanged(this.countArmedTimers(observer.handlerKey)));
+        }
+    }
+    countArmedTimers(handlerKey) {
+        let count = 0;
+        for (const schedulerId of this.timers.keys()) {
+            if (this.jobs.get(schedulerId)?.handlerKey === handlerKey)
+                count += 1;
+        }
+        return count;
     }
     reportSkipped(reason) {
-        this.reportMetric(() => this.options.metrics?.counter('scheduler_skipped_total', 1, { reason }));
+        this.reportBestEffort(() => this.options.metrics?.counter('scheduler_skipped_total', 1, { reason }));
     }
     reportConsistencyMismatch(kind) {
-        this.reportMetric(() => this.options.metrics?.counter('scheduler_consistency_mismatch_total', 1, { kind }));
+        this.reportBestEffort(() => this.options.metrics?.counter('scheduler_consistency_mismatch_total', 1, { kind }));
     }
     reportTrigger(handlerKey, outcome, startedAtMs) {
         const labels = { handlerKey, outcome };
-        this.reportMetric(() => this.options.metrics?.counter('scheduler_trigger_total', 1, labels));
-        this.reportMetric(() => this.options.metrics?.histogram('scheduler_callback_duration_ms', Math.max(0, this.nowMs() - startedAtMs), labels));
+        this.reportBestEffort(() => this.options.metrics?.counter('scheduler_trigger_total', 1, labels));
+        this.reportBestEffort(() => this.options.metrics?.histogram('scheduler_callback_duration_ms', Math.max(0, this.nowMs() - startedAtMs), labels));
     }
-    reportMetric(report) {
+    reportBestEffort(report) {
         try {
             report();
         }
         catch {
-            // Metrics are best-effort and must never change Scheduler behavior.
+            // Metrics and observers are best-effort and must never change Scheduler behavior.
         }
     }
 }

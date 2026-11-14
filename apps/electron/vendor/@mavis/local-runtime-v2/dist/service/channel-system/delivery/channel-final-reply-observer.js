@@ -18,34 +18,43 @@ export class ChannelFinalReplyObserver {
         if (!status)
             return;
         try {
-            const channelContext = await this.resolveChannelContext(input.context);
-            if (!channelContext)
-                return;
-            const [messages, session] = await Promise.all([
-                this.options.messages.listTurn(input.context.sessionId, input.context.turnId),
-                this.options.sessions.get(input.context.sessionId),
-            ]);
-            const hasAssistantReply = messages.some(isAssistantReply);
-            if (status !== 'failed' && !hasAssistantReply)
-                return;
-            const error = status === 'failed' ? terminalError(input.event) : undefined;
-            await this.options.delivery.deliver({
-                channelContext,
-                sessionId: input.context.sessionId,
-                messages: messages.map(toConversationCommittedMessage),
-                ...(session ? { workspaceDir: session.workspaceDir } : {}),
-                ...(error ? { error } : {}),
-            });
+            await this.deliverTerminal(input.context, input.event, status);
         }
         finally {
             await this.options.turnLifecycle.end(input.context);
         }
     }
-    async resolveChannelContext(context) {
-        const admitted = resolveChannelRoute(context.provenance);
-        if (admitted)
-            return admitted;
-        return this.resolvePersistedTurnChannel(context.sessionId, context.turnId);
+    async deliverTerminal(context, event, status) {
+        const route = await this.resolveReplyChannel(context);
+        if (!route)
+            return;
+        const [messages, session] = await Promise.all([
+            this.options.messages.listTurn(context.sessionId, context.turnId),
+            this.options.sessions.get(context.sessionId),
+        ]);
+        if (status !== 'failed' && !messages.some(isAssistantReply))
+            return;
+        const error = status === 'failed' ? terminalError(event) : undefined;
+        await this.options.delivery.deliver({
+            channelContext: route,
+            sessionId: context.sessionId,
+            messages: messages.map(toConversationCommittedMessage),
+            ...(session ? { workspaceDir: session.workspaceDir } : {}),
+            ...(error ? { error } : {}),
+        });
+    }
+    async resolveReplyChannel(context) {
+        let route = resolveChannelRoute(context.provenance) ??
+            (await this.resolvePersistedTurnChannel(context.sessionId, context.turnId));
+        // A retry has a fresh Turn id and no new user message. Resolve only the
+        // original input selected by continuation, not an unrelated earlier IM.
+        const continuedFromTurnId = context.provenance?.sourceContext?.continuedFromTurnId;
+        if (!route &&
+            context.provenance?.source === 'turn-continuation' &&
+            typeof continuedFromTurnId === 'string') {
+            route = await this.resolvePersistedTurnChannel(context.sessionId, continuedFromTurnId);
+        }
+        return route;
     }
     /**
      * Routing from the Turn's first persisted user message. It stays readable

@@ -1,5 +1,6 @@
 import { BuiltinAgentCatalog, resolveCanonicalCapabilities, } from '../../builtin/catalog.js';
 import { LEGACY_PRIMARY_AGENT_NAME } from '../../domain/names.js';
+import { DEFAULT_AGENT_SURFACE_FLAGS, } from '../../contracts.js';
 import { AgentConfigError } from '../../storage/canonical-agent-config.js';
 import { BuiltinAgentConfigRepairError } from '../../storage/builtin-agent-files.js';
 import { resolveLocale } from '../../domain/validation.js';
@@ -75,6 +76,96 @@ export async function reseedMissingBuiltinCanonicalFile(input) {
     });
 }
 /**
+ * Use-time counterpart of the startup repair, for Bunny only (Bunny emergency
+ * rebuild spec 8): archives a corrupted source byte-for-byte as startup does
+ * and rewrites it from the bundled template, so the Turn whose preparation
+ * failed on it can prepare again. Unlike startup, the model group the file
+ * still holds survives when its YAML parses (8.2): each of the four values
+ * that passes the full read's check and then the live catalog's check (see
+ * resolvingEachKeptValue). YAML that does not parse gets the group a fresh
+ * seed gets. A source that is valid or missing when inspected or once the
+ * lock is held is `skipped`; a failed step leaves the original in place, as at
+ * startup. A source that cannot be read at all (not a config error) throws.
+ */
+export async function repairCorruptedBuiltinCanonicalFileAtUseTime(input) {
+    const { definition } = input;
+    const existing = await inspectExistingBuiltinConfig(input.repository, definition.name);
+    if (existing.kind !== 'corrupted') {
+        return { status: 'skipped', reason: existing.kind === 'valid' ? 'now_valid' : 'missing' };
+    }
+    const capabilities = resolveCanonicalCapabilities(undefined, definition.capabilityOverride);
+    const factory = {
+        ...input,
+        ...(input.modelGroupResolver
+            ? { modelGroupResolver: resolvingEachKeptValue(input.modelGroupResolver) }
+            : {}),
+    };
+    const progress = { stage: 'archive' };
+    try {
+        const result = await repairCorruptedBuiltinCanonicalFile(input, {
+            agentName: definition.name,
+            corruption: existing.error,
+            config: async (kept) => (await buildBuiltinFactoryConfig(factory, definition, capabilities, presentGroup(kept)))
+                .config,
+            trigger: 'use_time',
+        }, progress);
+        if ('skipped' in result)
+            return { status: 'skipped', reason: result.skipped };
+        return { status: 'repaired', backupFile: result.archiveFile, errorCode: existing.error.code };
+    }
+    catch (error) {
+        emitBuiltinAgentConfigRepair(input.report, {
+            kind: 'repair_failed',
+            agentName: definition.name,
+            errorCode: repairFailureCode(error),
+            stage: progress.stage,
+            trigger: 'use_time',
+        });
+        return {
+            status: 'failed',
+            stage: progress.stage,
+            ...(progress.archiveFile ? { backupFile: progress.archiveFile } : {}),
+        };
+    }
+}
+function presentGroup(group) {
+    return group && Object.keys(group).length > 0 ? group : undefined;
+}
+const KEPT_MODEL_VALUES = ['effort', 'contextWindow', 'maxOutputTokens'];
+/**
+ * Bunny emergency rebuild spec 8.2 keeps each kept value the live catalog
+ * accepts, while the resolver accepts or rejects a group as a whole. When it
+ * rejects the kept group, the model is checked alone and each other value is
+ * added back while the catalog still accepts the group; a rejected value is
+ * left out, so the model's default applies. Effort and limits were set for
+ * that model: a rejected model takes them with it and the bundled group
+ * applies.
+ */
+function resolvingEachKeptValue(resolver) {
+    return async ({ previous, bundled }) => (previous?.model ? await acceptedKeptValues(resolver, previous, previous.model) : undefined) ??
+        resolver({ bundled });
+}
+async function acceptedKeptValues(resolver, previous, model) {
+    const whole = await resolver({ previous });
+    if (whole)
+        return whole;
+    let kept = { model };
+    let resolved = await resolver({ previous: kept });
+    if (!resolved)
+        return undefined;
+    for (const key of KEPT_MODEL_VALUES) {
+        if (previous[key] === undefined)
+            continue;
+        const candidate = { ...kept, [key]: previous[key] };
+        const next = await resolver({ previous: candidate });
+        if (!next)
+            continue;
+        kept = candidate;
+        resolved = next;
+    }
+    return resolved;
+}
+/**
  * The current bundled content of one Builtin file: the raw V2 template plus
  * the resolved model group. A missing file passes no previous group; a reload
  * passes the existing file's group so the resolver keeps it when still usable.
@@ -136,6 +227,7 @@ async function reloadBuiltinCanonicalFile(input, definition, capabilities) {
  */
 async function repairCorruptedBuiltinCanonicalFile(input, repair, progress) {
     const { agentName, corruption, config } = repair;
+    const trigger = repair.trigger ? { trigger: repair.trigger } : {};
     progress.stage = 'archive';
     if (!input.repository.replaceCorruptedBuiltinCanonicalConfig)
         throw corruption;
@@ -148,11 +240,13 @@ async function repairCorruptedBuiltinCanonicalFile(input, repair, progress) {
             throw error;
         progress.stage = error.stage;
         if (error.archiveFile) {
+            progress.archiveFile = error.archiveFile;
             emitBuiltinAgentConfigRepair(input.report, {
                 kind: 'archived',
                 agentName,
                 errorCode: corruption.code,
                 archiveFile: error.archiveFile,
+                ...trigger,
             });
         }
         throw error.failure;
@@ -163,15 +257,18 @@ async function repairCorruptedBuiltinCanonicalFile(input, repair, progress) {
             agentName,
             errorCode: corruption.code,
             reason: result.skipped,
+            ...trigger,
         });
-        return;
+        return result;
     }
     emitBuiltinAgentConfigRepair(input.report, {
         kind: 'archived',
         agentName,
         errorCode: corruption.code,
         archiveFile: result.archiveFile,
+        ...trigger,
     });
+    return result;
 }
 /**
  * Generates the dynamic bundled baseline returned by Config GET. The caller
@@ -234,7 +331,7 @@ function toBuiltinCanonicalConfig(definition, modelGroup, capabilities, content)
     return {
         name: definition.name,
         description: definition.identity.description?.trim() || definition.name,
-        ...(xMavis ? { xMavis } : {}),
+        xMavis,
         ...(modelGroup?.model ? { model: modelGroup.model } : {}),
         ...(modelGroup?.effort ? { effort: modelGroup.effort } : {}),
         ...(capabilities.tools === undefined ? {} : { tools: capabilities.tools }),
@@ -246,17 +343,24 @@ function toBuiltinCanonicalConfig(definition, modelGroup, capabilities, content)
         systemPrompt: mergeBuiltinAgentSystemPrompt(content),
     };
 }
+/**
+ * The three surface / dispatch switches are always written, so every launch
+ * restores the bundled Builtin preset in the canonical file. The runtime reads
+ * that file (see surface-flags.ts), which is what lets a user edit take effect
+ * without a restart and still be reset by the next startup.
+ */
 function builtinMavisConfig(definition, modelGroup) {
     const displayName = definition.identity.displayName?.trim() || undefined;
     const contextWindow = modelGroup?.contextWindow;
     const maxOutputTokens = modelGroup?.maxOutputTokens;
-    if (displayName === undefined && contextWindow === undefined && maxOutputTokens === undefined) {
-        return undefined;
-    }
+    const { showInImBinding, showInAgentList, dispatchable } = definition.surfaceFlags ?? DEFAULT_AGENT_SURFACE_FLAGS;
     return {
         ...(displayName ? { displayName } : {}),
         ...(contextWindow === undefined ? {} : { contextWindow }),
         ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+        showInImBinding,
+        showInAgentList,
+        dispatchable,
     };
 }
 async function resolveBuiltinModelGroup(input) {

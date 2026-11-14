@@ -273,12 +273,7 @@ export function inspectCanonicalHistorySequence(records) {
     const cached = ownedSequences.get(records);
     if (cached)
         return copyInspection(cached);
-    const state = {
-        messageIds: new Set(),
-        toolCallIds: new Set(),
-        userTurnIds: new Set(),
-        boundarySeen: false,
-    };
+    const state = newSequenceState();
     for (let index = 0; index < records.length; index += 1) {
         if (!Object.hasOwn(records, index))
             sequenceError(index, 'sparse history record');
@@ -287,16 +282,28 @@ export function inspectCanonicalHistorySequence(records) {
             sequenceError(index, 'missing history record');
         validateSequenceRecord(envelope, index, state);
     }
-    const inspection = state.pendingToolCallIds && state.pendingToolCallIds.size > 0
-        ? {
-            status: 'pending-tool-results',
-            settledPrefixLength: state.pendingToolCallStartIndex ?? records.length,
-            pendingToolCallIds: [...state.pendingToolCallIds],
-        }
-        : { status: 'settled' };
+    const inspection = sequenceInspection(state, records.length);
     if (ownedRecordArrays.has(records))
         ownedSequences.set(records, copyInspection(inspection));
     return inspection;
+}
+/** Sequence state for records checked one at a time with validateSequenceRecord. */
+export function newSequenceState() {
+    return {
+        messageIds: new Set(),
+        toolCallIds: new Set(),
+        userTurnIds: new Set(),
+        boundarySeen: false,
+    };
+}
+export function sequenceInspection(state, recordCount) {
+    return state.pendingToolCallIds && state.pendingToolCallIds.size > 0
+        ? {
+            status: 'pending-tool-results',
+            settledPrefixLength: state.pendingToolCallStartIndex ?? recordCount,
+            pendingToolCallIds: [...state.pendingToolCallIds],
+        }
+        : { status: 'settled' };
 }
 function copyInspection(value) {
     return value.status === 'settled'
@@ -693,7 +700,7 @@ function containsWordSequence(words, sequence) {
     }
     return false;
 }
-function validateSequenceRecord(envelope, index, state) {
+export function validateSequenceRecord(envelope, index, state) {
     if (envelope.history_artifact !== undefined && index !== 0) {
         sequenceError(index, 'history artifact marker must be attached only to the first envelope');
     }
@@ -718,12 +725,7 @@ function assertCanonicalHistoryAppend(active, appended) {
     appended.forEach((envelope, index) => validateSequenceRecord(envelope, active.length + index, state));
 }
 function deriveAppendState(active) {
-    const state = {
-        messageIds: new Set(),
-        toolCallIds: new Set(),
-        userTurnIds: new Set(),
-        boundarySeen: false,
-    };
+    const state = newSequenceState();
     for (const envelope of active)
         updateAppendStateFromActive(envelope, state);
     return state;
@@ -932,7 +934,7 @@ function nonEmptyString(value) {
 function invalidEnvelope(reason) {
     throw new Error(`Canonical history envelope is invalid: ${reason}`);
 }
-function sequenceError(index, reason) {
+export function sequenceError(index, reason) {
     throw new Error(`Canonical history sequence is invalid at record ${index + 1}: ${reason}`);
 }
 function ignoreMalformedLine(_line) {

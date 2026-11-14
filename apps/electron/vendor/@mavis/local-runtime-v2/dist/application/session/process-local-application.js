@@ -4,6 +4,7 @@ import { watchGlobalEvents, watchProcessEvents } from '../events.js';
 /** Composes peripheral product capabilities for process-local delivery. */
 export function createProcessLocalApplication(options) {
     const sessionReports = options.sessionReports;
+    const bunnyFeedback = options.bunnyFeedback;
     return {
         events: {
             watch: (signal) => watchGlobalEvents((subscriber) => options.eventBus.subscribe({ next: subscriber }), signal),
@@ -62,6 +63,11 @@ export function createProcessLocalApplication(options) {
             ...(sessionReports
                 ? {
                     collectSessionReport: (sessionId) => sessionReports.collect(sessionId),
+                }
+                : {}),
+            ...(bunnyFeedback
+                ? {
+                    collectBunnyFeedbackReport: (mainSessionId) => bunnyFeedback.collect({ mainSessionId }),
                 }
                 : {}),
         },
@@ -149,10 +155,15 @@ function toUserModelInputs(models) {
 function createModelsApplication(modelProvider) {
     const favorites = modelProvider.favorites;
     const list = (request = {}) => modelProvider.application.list(request);
+    const advisor = {
+        getAdvisor: (request = {}) => modelProvider.application.readAdvisor(request),
+        selectAdvisor: (request) => modelProvider.application.selectAdvisor(request),
+    };
     if (!favorites) {
-        return { list, select: (request) => modelProvider.application.select(request) };
+        return { list, select: (request) => modelProvider.application.select(request), ...advisor };
     }
     return {
+        ...advisor,
         list: async (request = {}) => {
             const models = await list(request);
             // A broken preference row must never hide the catalog.

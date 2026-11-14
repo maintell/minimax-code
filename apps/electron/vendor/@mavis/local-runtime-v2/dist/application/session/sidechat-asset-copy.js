@@ -1,11 +1,15 @@
-import { basename, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, extname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { collectMessageAssetItems } from '@mavis/shared/asset-markup';
+import { inferAssetMimeType, isImageAsset, MIME_BY_EXTENSION, } from '@mavis/shared/media-asset-meta';
 import { rewriteForkAssetMarkup } from '../../service/session-system/index.js';
 import { registrationFailureReason, } from '../conversation/attachment-registration.js';
+const V2_STORED_ASSET_PREFIX_RE = /^\d{2}-\d{2}-\d{2}-\d{3}-asset_\d{8}-\d{6}-\d{3}_[a-f0-9]{12}_[a-f0-9]{8}-(.+)$/iu;
+const EXTENSION_BY_MIME = new Map(Object.entries(MIME_BY_EXTENSION).map(([ext, mime]) => [mime.toLowerCase(), `.${ext}`]));
 /** Registration creates child-owned assets; both history and display use the same exact mapping. */
 export async function copySideChatAssets(input) {
-    const { sources, markupValues } = collectAssetSources(input.display, input.history);
+    const { sources, markupValues } = await collectAssetSources(input.display, input.history, input.workspaceDir, input.registration);
     const replacements = new Map();
     const receipts = [];
     const discard = async () => {
@@ -14,9 +18,7 @@ export async function copySideChatAssets(input) {
     };
     try {
         for (const [original, source] of sources) {
-            const filePath = original.startsWith('file:')
-                ? fileURLToPath(original)
-                : resolve(input.workspaceDir, original);
+            const filePath = resolveLocalAssetPath(input.workspaceDir, original);
             // Dropping the source asset identity prevents the ordinary registration fast path from reusing Main ownership.
             const { assetId: oldId, ...attachment } = source;
             const registered = await registerInheritedSource(input.registration, input.sessionId, {
@@ -83,14 +85,11 @@ function rewriteAssetReferences(value, replacements) {
             : rewriteAssetReferences(item, replacements),
     ]));
 }
-function collectAssetSources(display, history) {
+async function collectAssetSources(display, history, workspaceDir, registration) {
     const sources = new Map();
     const markupValues = new Set();
     const attachmentLists = [];
-    const canonicalMessages = [
-        ...history.active,
-        ...history.snapshots.flatMap((snapshot) => snapshot.records),
-    ].map((record) => record.message);
+    const canonical = await collectCanonicalAssets(history);
     for (const value of display) {
         const record = value;
         // The caller supplies either display rows or queued input, whose batch members own their attachments.
@@ -101,7 +100,7 @@ function collectAssetSources(display, history) {
                 attachmentLists.push(asRecord(asRecord(member)?.message)?.attachments);
         }
     }
-    attachmentLists.push(...canonicalMessages.map((message) => message.attachments));
+    attachmentLists.push(...canonical.attachments);
     for (const attachments of attachmentLists) {
         if (!Array.isArray(attachments))
             continue;
@@ -120,9 +119,31 @@ function collectAssetSources(display, history) {
             ? [record.msg_content]
             : [];
     });
-    for (const content of [...assistantText, ...canonicalMessages.flatMap(assistantTextContents)])
-        addMarkupSources(content, sources, markupValues);
+    for (const content of [...assistantText, ...canonical.markupText]) {
+        addMarkupSources(content, { workspaceDir, registration, sources, markupValues });
+    }
     return { sources, markupValues };
+}
+/**
+ * Canonical history is visited one record at a time, active first and then each archived
+ * generation; only attachment lists and Assistant text that carries asset markup are kept.
+ */
+async function collectCanonicalAssets(history) {
+    const attachments = [];
+    const markupText = [];
+    const visit = (record) => {
+        const list = record.message.attachments;
+        if (Array.isArray(list) && list.length > 0)
+            attachments.push(list);
+        for (const content of assistantTextContents(record.message)) {
+            if (collectMessageAssetItems(content).length > 0)
+                markupText.push(content);
+        }
+    };
+    history.active.forEach(visit);
+    for (const snapshot of history.snapshots)
+        await history.forEachSnapshotRecord(snapshot, visit);
+    return { attachments, markupText };
 }
 function assistantTextContents(message) {
     if (message.role !== 'assistant')
@@ -136,20 +157,59 @@ function assistantTextContents(message) {
         return block?.type === 'text' && typeof block.text === 'string' ? [block.text] : [];
     });
 }
-function addMarkupSources(content, sources, markupValues) {
+/**
+ * SideChat shares Main's workspaceDir, so ordinary workspace deliverables stay at their original
+ * paths like a non-isolated Fork (`records-only`). Only files stored inside `<dataDir>/v2/assets`
+ * are Session-scoped and must be copied to Side ownership, preserving their real file extension.
+ */
+function addMarkupSources(content, context) {
     const assets = collectMessageAssetItems(content);
     if (assets.length)
-        markupValues.add(content);
+        context.markupValues.add(content);
     for (const asset of assets) {
-        if (!asset.path || /^(https?:|data:|drive:)/iu.test(asset.path) || sources.has(asset.path))
+        if (!asset.path ||
+            /^(https?:|data:|drive:)/iu.test(asset.path) ||
+            context.sources.has(asset.path))
             continue;
-        sources.set(asset.path, {
-            type: 'file',
-            filePath: asset.path,
-            fileName: asset.name ?? basename(asset.path),
-            mimeType: 'application/octet-stream',
-        });
+        const resolvedPath = resolveLocalAssetPath(context.workspaceDir, asset.path);
+        const stored = context.registration.inspectStoredAsset?.(resolvedPath);
+        if (!stored)
+            continue;
+        context.sources.set(asset.path, storedMarkupSource(asset, resolvedPath, stored));
     }
+}
+function storedMarkupSource(asset, resolvedPath, stored) {
+    const mimeType = usableMimeType(stored.mimeType) ?? inferAssetMimeType(asset) ?? 'application/octet-stream';
+    const isImage = stored.kind === 'image' || mimeType.startsWith('image/') || isImageAsset(asset);
+    const pathBaseName = stripStoredAssetPrefix(basename(resolvedPath));
+    const fallbackExt = extname(pathBaseName) || EXTENSION_BY_MIME.get(mimeType.toLowerCase()) || '';
+    const fileName = ensureExtension(stored.fileName.trim() || pathBaseName, fallbackExt);
+    return {
+        type: isImage ? 'image' : 'file',
+        filePath: asset.path,
+        fileName,
+        mimeType,
+        ...(stored.assetId ? { assetId: stored.assetId } : {}),
+    };
+}
+function resolveLocalAssetPath(workspaceDir, rawPath) {
+    if (rawPath.startsWith('file:'))
+        return fileURLToPath(rawPath);
+    if (rawPath.startsWith('~/'))
+        return resolve(homedir(), rawPath.slice(2));
+    return resolve(workspaceDir, rawPath);
+}
+function stripStoredAssetPrefix(name) {
+    return V2_STORED_ASSET_PREFIX_RE.exec(name)?.[1] ?? name;
+}
+function usableMimeType(value) {
+    const trimmed = value?.trim();
+    return trimmed && trimmed.toLowerCase() !== 'application/octet-stream' ? trimmed : undefined;
+}
+function ensureExtension(fileName, fallbackExt) {
+    if (!fallbackExt || extname(fileName))
+        return fileName;
+    return `${fileName}${fallbackExt}`;
 }
 function attachmentSource(record) {
     const local = asRecord(record.local) ?? record;

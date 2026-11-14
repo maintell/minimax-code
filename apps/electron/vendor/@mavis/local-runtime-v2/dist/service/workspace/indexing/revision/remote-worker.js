@@ -6,6 +6,8 @@ import { WorkspaceIndexingCancellations } from './revision-cancellation.js';
 import { normalizeWorkspaceRevisionSchedule } from './revision-context.js';
 import { WorkspaceRevisionPolicyGate } from './revision-policy-gate.js';
 import { WorkspaceRevisionRunner } from './revision-runner.js';
+/** Default interval between two polls of the durable remote queue. */
+const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_CONCURRENT_REVISIONS = 2;
 const DEFAULT_MAX_CONCURRENT_INSTALLS = 1;
 /**
@@ -29,6 +31,8 @@ export class WorkspaceIndexingRemoteWorker {
     closed = false;
     closePromise;
     timer;
+    /** How often `start` polls; a backlog read by a poll stays fresh for two of them. */
+    pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     scheduledOperations = new Map();
     schedule(operation) {
         const id = Symbol('workspace-indexing-operation');
@@ -80,15 +84,17 @@ export class WorkspaceIndexingRemoteWorker {
             onError: options.onError,
         });
     }
-    start(intervalMs = 5_000) {
+    start(intervalMs = DEFAULT_POLL_INTERVAL_MS) {
         if (this.closed || this.timer)
             return;
+        this.pollIntervalMs = Math.max(250, intervalMs);
         this.schedule(() => this.processDue());
-        this.timer = setInterval(() => this.schedule(() => this.processDue()), Math.max(250, intervalMs));
+        this.timer = setInterval(() => this.schedule(() => this.processDue()), this.pollIntervalMs);
         this.timer.unref?.();
     }
     close() {
         this.closed = true;
+        this.metrics.clearBacklog();
         clearInterval(this.timer);
         this.timer = undefined;
         for (const active of this.inFlight.values())
@@ -150,7 +156,14 @@ export class WorkspaceIndexingRemoteWorker {
             active.controller.abort();
     }
     async processDue(limit = 10) {
-        if (this.closed || !(await this.indexingEnabled()) || this.closed)
+        if (this.closed)
+            return;
+        if (!(await this.indexingEnabled())) {
+            // Nothing works the queue while indexing is off: there is no backlog to observe.
+            this.metrics.clearBacklog();
+            return;
+        }
+        if (this.closed)
             return;
         const nowMs = this.nowMs();
         let records;
@@ -174,7 +187,7 @@ export class WorkspaceIndexingRemoteWorker {
         }
         if (this.closed)
             return;
-        this.metrics.backlog(backlog.pending, backlog.oldestCreatedAtMs === undefined ? 0 : Math.max(0, nowMs - backlog.oldestCreatedAtMs));
+        this.metrics.backlog(backlog.pending, backlog.oldestCreatedAtMs === undefined ? 0 : Math.max(0, nowMs - backlog.oldestCreatedAtMs), 2 * this.pollIntervalMs);
         await Promise.all(records
             .filter((record) => !this.cancellations.isSessionCancelled(record.sessionId))
             .map((record) => this.processRevision(record)));

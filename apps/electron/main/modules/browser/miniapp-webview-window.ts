@@ -1,6 +1,7 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { BrowserWindow } from "electron";
+import { registerTransparentWindow } from "../../windows/utils";
 import { browserGuestRegistry } from "./browser-guest-registry.js";
 export function createMiniAppWebviewWindow(options) {
     const window = new BrowserWindow({
@@ -14,6 +15,10 @@ export function createMiniAppWebviewWindow(options) {
             preload: path.join(__dirname, 'webview-host-preload.js'),
         },
     });
+    // getBackgroundColor() drops alpha, so theme sync would paint a declared
+    // transparent pop-out with the Host theme color unless it is registered.
+    if (options.transparent === true)
+        registerTransparentWindow(window);
     const file = path.join(__dirname, '../../../webview-host/index.html');
     const url = pathToFileURL(file).href;
     browserGuestRegistry.install(window, (candidate) => candidate === url, 'miniapp_window');

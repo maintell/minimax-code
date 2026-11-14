@@ -5,6 +5,7 @@ import { LocalQuestionnaireError } from '../../../infra/legacy-db/questionnaire-
 import { emitQuestionnaireAsk } from '../orchestration/ask-delivery.js';
 import { generateQuestionnaireRequestId, normalizeAskUserInput, QuestionnaireNormalizationError, } from '../../../infra/legacy-db/questionnaire-normalize.js';
 import { isOwnedQuestionnaireRequest } from './owned-action-lifecycle.js';
+import { PLUGIN_PREPARATION_MODE, PLUGIN_PREPARATION_PRESENTATION } from './plugin-preparation.js';
 export class QuestionnaireRequestLifecycle {
     deps;
     constructor(deps) {
@@ -20,7 +21,10 @@ export class QuestionnaireRequestLifecycle {
         return this.beginWithPolicy(input, input.mode, input.modePayload);
     }
     async getPending(input) {
-        const record = await this.deps.store.findLatestPendingBySession(input.sessionId, this.deps.nowMs() - QUESTIONNAIRE_TTL_MS, input.legacyOnly ? { legacyOnly: true } : {});
+        const record = await this.deps.store.findLatestPendingBySession(input.sessionId, this.deps.nowMs() - QUESTIONNAIRE_TTL_MS, {
+            ...(input.legacyOnly ? { legacyOnly: true } : {}),
+            ...(input.excludeSkipped ? { excludeSkipped: true } : {}),
+        });
         if (!record || !isQuestionnaireAgentAllowed(record, input.agentName))
             return null;
         return record;
@@ -97,7 +101,7 @@ export class QuestionnaireRequestLifecycle {
         if (this.deps.store.beginPendingWithPolicy) {
             return this.deps.store.beginPendingWithPolicy({
                 record,
-                policy: isOwnedQuestionnaireRequest({ mode }) ? 'exclusive' : 'replaceable',
+                policy: createPolicyFor(mode),
                 createdAtCutoff: createdAt - QUESTIONNAIRE_TTL_MS,
             });
         }
@@ -165,6 +169,12 @@ export class QuestionnaireRequestLifecycle {
         }
     }
 }
+/** Plugin cards coexist; other owned cards are exclusive; model questionnaires replace legacy rows. */
+function createPolicyFor(mode) {
+    if (mode === PLUGIN_PREPARATION_MODE)
+        return 'coexist';
+    return isOwnedQuestionnaireRequest({ mode }) ? 'exclusive' : 'replaceable';
+}
 function resolveResponseMode(input, mode, sessionId) {
     const responseMode = mode === 'questionnaire' ? input.responseMode : undefined;
     if (input.responseMode && !responseMode) {
@@ -193,6 +203,11 @@ function normalizeRequest(input, context) {
             ...(responseMode ? { recommendations: recommendationPolicy(input) } : {}),
         });
         request.mode = mode;
+        if (mode === PLUGIN_PREPARATION_MODE) {
+            request.presentation = { ...PLUGIN_PREPARATION_PRESENTATION };
+            // The shared 24h TTL, surfaced so the card can show itself expired.
+            request.expiresAt = createdAt + QUESTIONNAIRE_TTL_MS;
+        }
         if (modePayload !== undefined)
             request.modePayload = structuredClone(modePayload);
         if (responseMode) {

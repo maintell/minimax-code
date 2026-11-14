@@ -273,6 +273,10 @@ const VERIFIED_TOOL_MARKERS = new Map([
     ],
     // glob (desktop/local-glob.ts): page beyond `limit` or ripgrep byte cap -> details.truncated.
     ['glob', (details) => [booleanMarker(details, 'truncated')]],
+    // save_run_code_script (desktop/ptc-script-save.ts): the result is one fixed
+    // sentence plus the saved path, written whole on every success path, so it
+    // has no truncation marker of its own and the generic ones still apply.
+    ['save_run_code_script', () => []],
     // web_fetch (desktop/local-webfetch.ts): adapter cut or 16k-token clip ->
     // details.truncated (plus token_truncated for the clip).
     [

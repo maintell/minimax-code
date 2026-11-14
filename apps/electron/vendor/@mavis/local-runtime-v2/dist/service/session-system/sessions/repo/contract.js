@@ -28,6 +28,7 @@ export const SESSION_REPOSITORY_CAPABILITIES = [
     'swapRoot',
     'reparentChildren',
     'applyAgentState',
+    'readAgentTurnTerminal',
     'list',
     'count',
     'listPage',

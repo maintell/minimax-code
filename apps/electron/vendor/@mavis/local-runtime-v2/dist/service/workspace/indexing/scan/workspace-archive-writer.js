@@ -80,10 +80,14 @@ export const writeWorkspaceArchive = async (input) => {
         // 65,535+ files (feedback snapshots allow 100k) overflow only the 16-bit
         // entry count; offsets and sizes stay below 4GB (checked above), so a
         // ZIP64 end record is the only ZIP64 structure needed.
-        if (centralDirectory.length >= ZIP32_MAX_ENTRIES) {
-            await write(zip64EndOfCentralDirectory(centralDirectory.length, centralDirectorySize, centralDirectoryOffset, offset));
-        }
-        await write(endOfCentralDirectory(Math.min(centralDirectory.length, ZIP32_MAX_ENTRIES), centralDirectorySize, centralDirectoryOffset));
+        const end = {
+            entryCount: centralDirectory.length,
+            centralDirectorySize,
+            centralDirectoryOffset,
+            recordOffset: offset,
+        };
+        for (const record of endRecords(end, input.zip64EntryThreshold))
+            await write(record);
         output.end();
         await finished(output);
         return { sha256: archiveHash.digest('hex'), sizeBytes: offset };
@@ -200,6 +204,19 @@ function centralDirectoryHeader(name, mode, entry, headerOffset) {
     header.writeUInt32LE(((REGULAR_FILE | (mode & 0o7777)) << 16) >>> 0, 38);
     header.writeUInt32LE(headerOffset, 42);
     return Buffer.concat([header, name]);
+}
+/**
+ * The ZIP64 end record when the entry count needs it, then the ZIP32 end record. Starting at
+ * `zip64EntryThreshold` entries the ZIP32 count holds 0xffff, which tells readers to take the
+ * count from the ZIP64 record.
+ */
+function endRecords(end, zip64EntryThreshold = ZIP32_MAX_ENTRIES) {
+    const zip64 = end.entryCount >= zip64EntryThreshold;
+    const zip32 = endOfCentralDirectory(zip64 ? ZIP32_MAX_ENTRIES : end.entryCount, end.centralDirectorySize, end.centralDirectoryOffset);
+    if (!zip64)
+        return [zip32];
+    const zip64Record = zip64EndOfCentralDirectory(end.entryCount, end.centralDirectorySize, end.centralDirectoryOffset, end.recordOffset);
+    return [zip64Record, zip32];
 }
 /** ZIP64 end of central directory record (56 bytes) followed by its locator (20 bytes). */
 function zip64EndOfCentralDirectory(entries, size, offset, recordOffset) {

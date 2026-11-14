@@ -5,7 +5,7 @@ import { BROWSER_CONTROL_DISABLED_GUIDANCE, buildInAppBrowserContext, hasExplici
 import { createBrowserScreenshotPreprocessor } from './assets/screenshot-preprocessor.js';
 import { BrowserSkillSessionStore, BrowserTurnContextStore } from './session-state.js';
 import { createWorkspaceBrowserAssetAdapter } from './assets/workspace-assets.adapter.js';
-const DESKTOP_PLUGIN_DISABLED_GUIDANCE = 'Browser control is provided by a Browser Use Plugin with an admitted Host Binding. Ask the user to enable or install that Plugin from Plugins; do not call request_feature_enable and do not claim that the legacy Browser Use switch can authorize control.';
+const DESKTOP_PLUGIN_DISABLED_GUIDANCE = 'Browser control is unavailable in this turn. Report the unavailable Browser capability; do not call request_feature_enable.';
 export class LocalBrowserUseService {
     options;
     turnContext = new BrowserTurnContextStore();

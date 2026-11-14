@@ -1,20 +1,23 @@
 import { Type } from '@sinclair/typebox';
-import { coerceRuntimeToolInput, defineRuntimeTool, validateRuntimeToolInput, } from '@mavis/agent-core/tools';
+import { defineRuntimeTool, repairRuntimeToolInput, validateRuntimeToolInput, } from '@mavis/agent-core/tools';
+import { TOOL_SEARCH_MAX_RESULT_BYTES } from './bounded-tool-search.js';
 const METADATA = new WeakMap();
 const MCP_INVOKE_METADATA = Symbol('mavis.mcp-invoke.metadata');
 const MAX_ARGUMENTS_JSON_BYTES = 256 * 1024;
 const MAX_ARGUMENTS_JSON_DEPTH = 64;
 const MAX_ARGUMENTS_JSON_NODES = 10_000;
 const UNSAFE_JSON_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const MAX_RECEIVED_PREVIEW_LENGTH = 60;
+const ARGUMENT_TYPE_GUIDANCE = 'Send each value with its schema type: numbers and booleans unquoted, arrays as JSON arrays, objects as JSON objects; or pass the whole object as a JSON string in arguments_json.';
 export function createMcpInvokeTool(registry, referenceRegistry = new Map()) {
     const schema = Type.Object({
         tool_name: Type.Optional(Type.String({ description: 'Exact tool name from a prior tool_search result.' })),
         tool_ref: Type.Optional(Type.String({ description: 'Opaque tool reference supplied by an installed Plugin Skill.' })),
         arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
-            description: 'Free-form arguments object used with tool_name and accepted for legacy tool_ref calls. Omitted tool_name arguments default to an empty object. Host tool contracts use arguments_json instead.',
+            description: 'Arguments object for the target tool; omitted means {} with tool_name. Values keep their JSON types: numbers and booleans unquoted, arrays as JSON arrays, objects as JSON objects.',
         })),
         arguments_json: Type.Optional(Type.String({
-            description: 'A JSON-encoded object string available only with tool_ref. Omit arguments when using this field. Runtime validation applies a bounded UTF-8 byte limit.',
+            description: 'The same arguments object encoded as a JSON string, preserving exact types. Accepted with tool_name or tool_ref; omit arguments when using it. Size-limited.',
         })),
     });
     const metadata = {
@@ -26,9 +29,8 @@ export function createMcpInvokeTool(registry, referenceRegistry = new Map()) {
     };
     const tool = defineRuntimeTool({
         name: 'mcp_invoke',
-        description: 'Execute an on-demand tool, including built-in scheduled-task management and integrations. Pass exactly one selector. `tool_name` from tool_search uses free-form `arguments` (or an empty object when omitted). ' +
-            'An opaque `tool_ref` supplied by an installed Plugin Skill accepts legacy `arguments` or the structure-preserving ' +
-            '`arguments_json` string required by current Host tool contracts, never both.',
+        description: 'Execute an on-demand tool, including built-in scheduled-task management and integrations. Pass exactly one selector: `tool_name` from tool_search, or an opaque `tool_ref` supplied by an installed Plugin Skill. ' +
+            'Pass the target arguments as `arguments` or as the type-preserving `arguments_json` string (required by Host tool contracts), never both.',
         schema,
         execute: async (ctx, input, signal, onUpdate) => {
             const authorized = metadata.authorizedInputs.get(input);
@@ -120,6 +122,12 @@ function resolveTarget(input, registry, referenceRegistry) {
     const reference = hasToolRef ? referenceRegistry.get(selector) : undefined;
     const target = hasToolName ? registry.get(selector) : reference?.tool;
     if (!target) {
+        if (hasToolRef && registry.has(selector)) {
+            return {
+                kind: 'error',
+                message: `"${selector}" is a tool_name, not a tool_ref. Call mcp_invoke with tool_name: "${selector}".`,
+            };
+        }
         return {
             kind: 'error',
             message: hasToolName
@@ -146,15 +154,20 @@ function resolveTarget(input, registry, referenceRegistry) {
         return { kind: 'error', message: `Prepared arguments for "${selector}" must be an object.` };
     }
     const inputSchema = reference?.inputSchema ?? target.def.schema;
-    // Built-in deferred tools get the same primitive coercion a direct call would
-    // ("2" -> 2 for integer fields). Host-bound tool_ref payloads stay structure-preserving.
+    // Built-in deferred tools get lossless repair of transport artifacts (stringified
+    // scalars, {"item": ...} array wrappers, JSON-text objects/arrays). Host-bound
+    // tool_ref payloads stay structure-preserving.
     let finalArguments = prepared;
+    let mismatch;
     if (selectorKind === 'tool_name') {
-        const coerced = coerceRuntimeToolInput(inputSchema, prepared);
-        if (isRecord(coerced))
-            finalArguments = coerced;
+        const repaired = repairRuntimeToolInput(inputSchema, prepared);
+        mismatch = formatMismatch(inputSchema, selector, repaired.value, repaired.validation, false);
+        if (!mismatch && isRecord(repaired.value))
+            finalArguments = repaired.value;
     }
-    const mismatch = schemaMismatch(inputSchema, selector, finalArguments, selectorKind === 'tool_ref');
+    else {
+        mismatch = schemaMismatch(inputSchema, selector, prepared, true);
+    }
     if (mismatch)
         return { kind: 'error', message: mismatch };
     return {
@@ -170,13 +183,7 @@ function resolveTarget(input, registry, referenceRegistry) {
 function decodeArguments(input, selectorKind) {
     const hasArguments = Object.prototype.hasOwnProperty.call(input, 'arguments');
     const hasArgumentsJson = Object.prototype.hasOwnProperty.call(input, 'arguments_json');
-    if (selectorKind === 'tool_name' && hasArgumentsJson) {
-        return {
-            kind: 'error',
-            message: 'arguments_json is only available with tool_ref; pass arguments with tool_name.',
-        };
-    }
-    if (selectorKind === 'tool_name' && !hasArguments) {
+    if (selectorKind === 'tool_name' && !hasArguments && !hasArgumentsJson) {
         return { kind: 'resolved', arguments: {} };
     }
     if (hasArguments === hasArgumentsJson) {
@@ -206,18 +213,34 @@ function decodeArguments(input, selectorKind) {
         }
         return { kind: 'resolved', arguments: input.arguments };
     }
-    if (typeof input.arguments_json !== 'string') {
+    return decodeArgumentsJson(input.arguments_json, selectorKind);
+}
+/**
+ * Host references (`tool_ref`) keep the size, depth and node limits. A `tool_name`
+ * call gets no limits beyond those of `arguments`, which arrive already parsed from
+ * the tool call; only a `__proto__` key is refused, so a later merge of the decoded
+ * object cannot reach a prototype.
+ */
+function decodeArgumentsJson(text, selectorKind) {
+    if (typeof text !== 'string') {
         return { kind: 'error', message: 'arguments_json must be a JSON string.' };
     }
-    if (Buffer.byteLength(input.arguments_json, 'utf8') > MAX_ARGUMENTS_JSON_BYTES) {
+    const bounded = selectorKind === 'tool_ref';
+    if (bounded && Buffer.byteLength(text, 'utf8') > MAX_ARGUMENTS_JSON_BYTES) {
         return {
             kind: 'error',
             message: `arguments_json must not exceed ${MAX_ARGUMENTS_JSON_BYTES} UTF-8 bytes.`,
         };
     }
     let decoded;
+    let protoKey = false;
+    const reviver = (key, value) => {
+        if (key === '__proto__')
+            protoKey = true;
+        return value;
+    };
     try {
-        decoded = JSON.parse(input.arguments_json);
+        decoded = JSON.parse(text, bounded ? undefined : reviver);
     }
     catch {
         return { kind: 'error', message: 'arguments_json is not valid JSON.' };
@@ -225,13 +248,13 @@ function decodeArguments(input, selectorKind) {
     if (!isRecord(decoded)) {
         return { kind: 'error', message: 'arguments_json must encode a JSON object.' };
     }
-    const structuralError = validateDecodedJson(decoded, 'arguments_json');
-    if (structuralError) {
-        return {
-            kind: 'error',
-            message: structuralError,
-        };
-    }
+    const structuralError = bounded
+        ? validateDecodedJson(decoded, 'arguments_json')
+        : protoKey
+            ? 'arguments_json contains the disallowed object key "__proto__".'
+            : undefined;
+    if (structuralError)
+        return { kind: 'error', message: structuralError };
     return { kind: 'resolved', arguments: decoded };
 }
 function validateDecodedJson(value, fieldName) {
@@ -291,14 +314,104 @@ function validateDecodedJson(value, fieldName) {
     return undefined;
 }
 function schemaMismatch(inputSchema, selector, prepared, hostReference) {
-    const validation = validateRuntimeToolInput(inputSchema, prepared);
+    return formatMismatch(inputSchema, selector, prepared, validateRuntimeToolInput(inputSchema, prepared), hostReference);
+}
+function formatMismatch(inputSchema, selector, value, validation, hostReference) {
     if (validation.valid)
         return undefined;
     if (validation.reason === 'unsupported') {
         return `${hostReference ? 'Host schema' : 'Schema'} validation is unavailable for "${selector}".`;
     }
-    const summary = `Arguments do not match the schema for "${selector}":\n${validation.issues.join('\n')}`;
-    return hostReference ? summary : `${summary}\ninput_schema: ${JSON.stringify(inputSchema)}`;
+    if (hostReference) {
+        return `Arguments do not match the schema for "${selector}":\n${validation.issues.join('\n')}`;
+    }
+    const issues = validation.issues.map((issue, index) => `${issue}${describeReceived(value, validation.paths?.[index])}`);
+    let schemaLine;
+    try {
+        const schemaText = JSON.stringify(inputSchema);
+        // tool_search reports a definition this large as `oversized`; attaching it to every
+        // failed call would push the error into an artifact and hide the issues above.
+        schemaLine =
+            Buffer.byteLength(schemaText, 'utf8') > TOOL_SEARCH_MAX_RESULT_BYTES
+                ? 'input_schema omitted: it exceeds the tool_search response budget and needs a smaller tool contract.'
+                : `input_schema: ${schemaText}`;
+    }
+    catch {
+        // e.g. BigInt keywords: the issues still stand without the schema text.
+    }
+    return [
+        `Arguments do not match the schema for "${selector}":`,
+        ...issues,
+        ARGUMENT_TYPE_GUIDANCE,
+        ...(schemaLine === undefined ? [] : [schemaLine]),
+    ].join('\n');
+}
+/** Pointer walks past this many steps give up on the preview. */
+const MAX_POINTER_STEPS = 1_000;
+function describeReceived(value, pointer) {
+    if (pointer === undefined)
+        return '';
+    const targets = pointerTargets(value, pointer);
+    // None: the walk gave up or found nothing. Several keys spelling the same
+    // pointer: any preview might show another field.
+    if (targets === undefined || targets.length !== 1)
+        return '';
+    let text;
+    try {
+        text = JSON.stringify(targets[0]) ?? String(targets[0]);
+    }
+    catch {
+        // e.g. BigInt, cycles, or nesting deep enough to overflow the stack.
+        return '';
+    }
+    if (text.length > MAX_RECEIVED_PREVIEW_LENGTH) {
+        text = `${text.slice(0, MAX_RECEIVED_PREVIEW_LENGTH - 3)}...`;
+    }
+    return ` (received ${text})`;
+}
+/**
+ * Values `pointer` can reach by walking whole keys of `value`, stopping at two.
+ * Validator paths do not escape keys (`a/b` is one key or two), and appended
+ * property names may be `~`-escaped, so both spellings of a key are tried.
+ * `undefined` when the walk exceeds its step budget.
+ */
+function pointerTargets(value, pointer) {
+    const targets = [];
+    let steps = 0;
+    const visit = (current, offset) => {
+        if (targets.length > 1)
+            return true;
+        steps += 1;
+        if (steps > MAX_POINTER_STEPS)
+            return false;
+        if (offset === pointer.length) {
+            targets.push(current);
+            return true;
+        }
+        if (pointer[offset] !== '/')
+            return true;
+        const start = offset + 1;
+        if (Array.isArray(current)) {
+            const end = pointer.indexOf('/', start);
+            const token = pointer.slice(start, end === -1 ? undefined : end);
+            return /^(0|[1-9]\d*)$/.test(token) && Number(token) < current.length
+                ? visit(current[Number(token)], start + token.length)
+                : true;
+        }
+        if (!isRecord(current))
+            return true;
+        for (const key of Object.keys(current)) {
+            const escaped = key.replaceAll('~', '~0').replaceAll('/', '~1');
+            for (const token of escaped === key ? [key] : [key, escaped]) {
+                const next = start + token.length;
+                const whole = next === pointer.length || pointer[next] === '/';
+                if (whole && pointer.startsWith(token, start) && !visit(current[key], next))
+                    return false;
+            }
+        }
+        return true;
+    };
+    return visit(value, 0) ? targets : undefined;
 }
 function readInput(value) {
     if (!isRecord(value))

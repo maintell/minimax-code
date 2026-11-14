@@ -158,6 +158,30 @@ export class SessionController extends SessionControllerBase {
     async reapplyTurnDiff(ctx, req) {
         return this.requireApplications().session.diff.reapplyTurnDiff(ctx, req);
     }
+    async getArtifactSpace(ctx, req) {
+        return this.requireApplications().session.content.getArtifactSpace(ctx, req);
+    }
+    async linkArtifactSpaceSession(ctx, req) {
+        return this.requireApplications().session.content.linkArtifactSpaceSession(ctx, req);
+    }
+    async getArtifactSpaceContext(ctx, req) {
+        return this.requireApplications().session.content.getArtifactSpaceContext(ctx, req);
+    }
+    async writeArtifactSpaceContext(ctx, req) {
+        return this.requireApplications().session.content.writeArtifactSpaceContext(ctx, req);
+    }
+    async saveArtifactSpace(ctx, req) {
+        return this.requireApplications().session.content.saveArtifactSpace(ctx, req);
+    }
+    async deleteArtifactSpace(ctx, req) {
+        return this.requireApplications().session.content.deleteArtifactSpace(ctx, req);
+    }
+    async importArtifact(ctx, req) {
+        return this.requireApplications().session.content.importArtifact(ctx, req);
+    }
+    async listArtifacts(ctx, req) {
+        return this.requireApplications().session.content.listArtifacts(ctx, req);
+    }
     async listSessionFiles(ctx, req) {
         return this.requireApplications().session.content.listSessionFiles(ctx, req);
     }

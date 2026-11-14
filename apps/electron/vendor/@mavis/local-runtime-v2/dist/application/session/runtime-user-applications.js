@@ -1,6 +1,9 @@
+import { getRuntimeBuildEnv, getRuntimeRegion } from '@mavis/config';
+import { createMiniAppLaunchpadService } from './miniapp-launchpad-application.js';
+import { LaunchpadApplication } from './launchpad-application.js';
 import { ModelFavoritesPreference } from '../../service/model-system/index.js';
 import { composeProcessLocalApplication } from './process-local-composition.js';
-import { readLocalInstructionSources } from '../../service/turn-system/index.js';
+import { readLocalInstructionSources, createMiniAppIdeasCompletion, } from '../../service/turn-system/index.js';
 import { createRuntimeConversationApplication } from '../conversation/runtime-conversation-application.js';
 import { RemoteMessageDelivery } from '../conversation/remote-message-delivery.js';
 import { ComposerSendBehaviorPreference, } from '../../service/session-system/index.js';
@@ -20,32 +23,56 @@ export function createRuntimeUserApplications(input) {
     // stop pausing or resuming it (spec 4.6).
     input.goalPort.observeObjectiveReplaced((goal) => undeliveredMessages.detachGoal(goal.sessionId, goal.goalId));
     const composerSendBehavior = new ComposerSendBehaviorPreference(input.options.db);
+    const conversation = createRuntimeConversationApplication({
+        undeliveredMessages,
+        sessionSystem: input.sessionSystem,
+        turnSystem: input.owners.turnSystem,
+        runtimeConversation: input.owners.runtimeConversation,
+        prepareForSessionStart: async (sessionId) => {
+            await input.workspaceIndexing.prepareSessionStart(sessionId);
+        },
+        attachmentRegistration: input.options.compatibility.attachmentRegistration,
+        pauseActiveForAbort: input.goalPort.pauseActiveForAbort,
+        noteUserMessageAccepted: input.noteUserMessageAccepted,
+        metrics: input.options.metrics,
+        queryCollapseKeys: input.queryCollapseKeys,
+    });
+    const launchpad = new LaunchpadApplication({
+        db: input.options.db,
+        deployment: `${getRuntimeRegion()}-${getRuntimeBuildEnv()}`,
+        publish: input.publish,
+        suggestIdeas: input.miniAppIdeaModel
+            ? {
+                complete: createMiniAppIdeasCompletion(input.miniAppIdeaModel, (id) => input.sessionSystem.sessions.repository.get(id)),
+                readUserInputs: (id, options) => input.sessionSystem.messages.query.recentUserInputs(id, options),
+            }
+            : undefined,
+        applications: input.owners.applications,
+        conversation,
+        plugins: input.owners.plugin,
+        hasPendingQuestion: async (sessionId) => Boolean(await input.options.compatibility.peripherals.questionnaires.getPending({
+            agentName: 'mavis',
+            sessionId,
+        })),
+    });
     return {
-        conversation: createRuntimeConversationApplication({
-            undeliveredMessages,
-            sessionSystem: input.sessionSystem,
-            turnSystem: input.owners.turnSystem,
-            runtimeConversation: input.owners.runtimeConversation,
-            prepareForSessionStart: async (sessionId) => {
-                await input.workspaceIndexing.prepareSessionStart(sessionId);
-            },
-            attachmentRegistration: input.options.compatibility.attachmentRegistration,
-            pauseActiveForAbort: input.goalPort.pauseActiveForAbort,
-            metrics: input.options.metrics,
-            queryCollapseKeys: input.queryCollapseKeys,
-        }),
-        /** Messages from sessions on other devices (SendRemoteMessage); `auto` follows the composer. */
-        remoteMessage: new RemoteMessageDelivery({
-            sessions: input.owners.runtimeConversation.query,
-            ingress: input.owners.runtimeConversation.ingress,
-            composerSendBehavior: () => composerSendBehavior.get(),
-            ...(input.options.metrics ? { metrics: input.options.metrics } : {}),
-        }),
-        skill: input.createSkillApplication(input.owners.plugin, input.sessionSystem.sessions.query, input.agentSessionPorts, { nowMs: input.nowMs, management: input.owners.skillSystem.management }),
+        launchpad,
+        services: {
+            conversation,
+            /** Messages from sessions on other devices (SendRemoteMessage); `auto` follows the composer. */
+            remoteMessage: new RemoteMessageDelivery({
+                sessions: input.owners.runtimeConversation.query,
+                ingress: input.owners.runtimeConversation.ingress,
+                composerSendBehavior: () => composerSendBehavior.get(),
+                ...(input.options.metrics ? { metrics: input.options.metrics } : {}),
+            }),
+            ...createMiniAppLaunchpadService(input.options.runtimeOwnerKind, launchpad, input.options.compatibility.plugin.authContextGetter),
+            skill: input.createSkillApplication(input.owners.plugin, input.sessionSystem.sessions.query, input.agentSessionPorts, { nowMs: input.nowMs, management: input.owners.skillSystem.management }),
+        },
     };
 }
 export function createRuntimeProcessLocalApplication(input) {
-    const { goals, modelAccess, options, owners, sessionSystem, skill, planEntryEnabled, modelSystem, modelProviderApplication, } = input;
+    const { goals, modelAccess, options, owners, sessionSystem, skill, planEntryEnabled, bunnyFeedback, modelSystem, modelProviderApplication, } = input;
     return {
         ...composeProcessLocalApplication({
             goals,
@@ -67,6 +94,7 @@ export function createRuntimeProcessLocalApplication(input) {
                 : {}),
             planEntryEnabled,
             sessionReports: sessionSystem.reporting,
+            ...(bunnyFeedback ? { bunnyFeedback } : {}),
             instructions: {
                 listSources: (request) => readLocalInstructionSources({ ...request, dataDir: options.dataDir }),
             },

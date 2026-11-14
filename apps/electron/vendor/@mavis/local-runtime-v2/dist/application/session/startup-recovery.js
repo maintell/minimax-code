@@ -8,6 +8,7 @@ export const STARTUP_RECOVERY_STEP_NAMES = [
     'goal-takeover',
     'plan-lifecycle-recovery',
     'cron-recovery',
+    'assignment-recovery',
 ];
 /** How long close waits for the active step before releasing services anyway. */
 const STARTUP_RECOVERY_CLOSE_GRACE_MS = 3_000;

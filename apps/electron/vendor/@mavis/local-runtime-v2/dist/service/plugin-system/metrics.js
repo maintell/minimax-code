@@ -1,3 +1,4 @@
+import { observeMetric } from '../../infra/logging/metrics.js';
 /** Bounded, privacy-safe metrics emitted by the Desktop Plugin System. */
 export class PluginSystemMetrics {
     client;
@@ -37,7 +38,11 @@ export class PluginSystemMetrics {
         this.client?.incr('plugin_publication_total', { status });
         this.client?.latency('plugin_publication_wait_duration_ms', Date.now() - queuedAt, { status });
     }
+    /** One observation per component of every published snapshot. */
     snapshot(snapshot) {
+        const client = this.client;
+        if (!client)
+            return;
         const appProviders = new Set(snapshot.enabledPlugins.flatMap((plugin) => plugin.appProviders));
         const counts = {
             official_plugin: snapshot.officialPackages.length,
@@ -49,8 +54,10 @@ export class PluginSystemMetrics {
             mcp_tool: snapshot.turnCapabilities.runtimeToolBindings.filter((binding) => binding.kind === 'mcp').length,
             diagnostic: snapshot.diagnostics.length,
         };
-        for (const [component, count] of Object.entries(counts)) {
-            this.client?.gauge('plugin_snapshot_component_count', count, { component });
+        // The port's latency() is the client's histogram().
+        const sink = { histogram: client.latency.bind(client) };
+        for (const component of Object.keys(counts)) {
+            observeMetric(sink, 'plugin_snapshot_component_items', counts[component], { component });
         }
     }
 }

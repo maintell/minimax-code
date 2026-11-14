@@ -117,7 +117,6 @@ export async function sendToRemoteSession(deps, req, signal) {
         callerSessionId: req.sender.sessionId,
         sessionId: req.sessionId,
         sync,
-        forceSteer: req.forceSteer === true,
     }, 'Remote session send requested');
     const sentAtMs = now();
     const result = await deps.remote.sendMessage({
@@ -126,7 +125,9 @@ export async function sendToRemoteSession(deps, req, signal) {
         ...(req.deviceId ? { deviceId: req.deviceId } : {}),
         content: req.content,
         sender: req.sender,
-        delivery: req.forceSteer === true ? 'steer' : 'auto',
+        // Same default as a local send: steer. A sync send needs a Turn of its own
+        // to wait on, so it leaves the routing to the target's own preference.
+        delivery: sync ? 'auto' : 'steer',
     }, signal);
     logger.info({
         source: req.source,

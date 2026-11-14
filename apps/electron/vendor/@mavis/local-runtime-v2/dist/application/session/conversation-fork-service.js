@@ -142,6 +142,7 @@ export class ForkService {
             effectiveModelThinking: source.effectiveModelThinking,
             effectiveModelContextWindow: source.effectiveModelContextWindow,
             effectiveModelMaxOutputTokens: source.effectiveModelMaxOutputTokens,
+            // A side question has no advisor switch, so it must not inherit one it cannot turn off.
             ...(request.sidePresentation
                 ? {
                     parentSessionId: request.sidePresentation.parentSessionId,
@@ -149,7 +150,7 @@ export class ForkService {
                     purpose: request.sidePresentation.purpose,
                     sessionKind: 'peek',
                 }
-                : {}),
+                : { advisor: source.advisor }),
         });
     }
     async publishHistory(context) {
@@ -246,6 +247,9 @@ export class ForkService {
             sourceSessionId: context.source.sessionId,
             targetSessionId: context.child.sessionId,
             latestBoundary: context.boundary.isLatestConversationMessage,
+            ...(stateCopyAssistantBoundary(context.boundary)
+                ? { throughAssistantMessageId: stateCopyAssistantBoundary(context.boundary) }
+                : {}),
             ...(context.progress.manifest.request.planState
                 ? { planState: context.progress.manifest.request.planState }
                 : {}),
@@ -595,6 +599,18 @@ function historyForkInput(context) {
         operationId: request.operationId,
         ...(request.sidePresentation ? { hiddenContextBoundary: BTW_SIDE_BOUNDARY } : {}),
     };
+}
+/**
+ * The canonical Assistant message the state copy may need, or undefined.
+ *
+ * A side conversation carries its own boundary and keeps the PTC store
+ * behaviour it has today, and a legacy next-User boundary already ends on a
+ * Turn edge, so neither needs the boundary message.
+ */
+function stateCopyAssistantBoundary(boundary) {
+    if (boundary.sideHistoryMessageId)
+        return undefined;
+    return boundary.assistantCanonicalMessageId;
 }
 function canonicalHistoryBoundaryInput(boundary) {
     if (boundary.sideHistoryMessageId) {

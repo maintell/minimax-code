@@ -34,7 +34,7 @@ export function createSessionRewindCapability(input) {
             };
         },
         commit: async (request) => {
-            const result = commitSessionRewind(input.db, nowMs, request);
+            const result = commitSessionRewind(input.db, nowMs, request, input.writeObservers);
             const session = await input.sessions.update(request.sessionId, {
                 status: 'idle',
                 errorMessage: undefined,

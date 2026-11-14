@@ -117,6 +117,11 @@ export function renderPtcToolSdk(tools, nativeTools = new Set()) {
         const mavis = readPtcMavisChildTarget(tool)?.tool;
         return mavis && nativeTools.has(mavis) ? MAVIS_DATA_TYPE : undefined;
     };
+    const aliasNames = new Set();
+    const signatures = tools.map((tool) => {
+        const type = dataType(tool);
+        return toolSignature(tool.def.name, tool.def.schema, `Promise<ToolResult${type ? `<${type.name}>` : ''}>`, aliasNames);
+    });
     return [
         'type ToolResult<T = Record<string, unknown> | undefined> = {',
         '  status: "complete" | "truncated" | "resized" | "omitted" | "failed" | "unverified"; // check it first',
@@ -129,10 +134,11 @@ export function renderPtcToolSdk(tools, nativeTools = new Set()) {
         '  error?: { code: string; message: string; retryable?: boolean; toolCallId: string; raw?: unknown }; // only when isError',
         '};',
         ...new Set(tools.flatMap((tool) => declarations(dataType(tool)))),
+        ...signatures.flatMap(({ aliases }) => aliases),
         'declare const tools: {',
-        ...tools.flatMap((tool) => [
+        ...tools.flatMap((tool, index) => [
             ...tool.def.description.split('\n').map((line) => `  // ${line}`),
-            ...toolSignature(tool.def.name, tool.def.schema, `Promise<ToolResult${dataType(tool) ? `<${dataType(tool)?.name}>` : ''}>`),
+            ...(signatures[index]?.lines ?? []),
         ]),
         '};',
         "// Arguments are validated against each tool's schema when called; an invalid argument returns isError.",
@@ -146,25 +152,103 @@ function declarations(type) {
  * members, types and order as the one-line form), each argument followed by
  * `// <its schema description>` with line breaks turned into spaces; an
  * argument without a description gets no comment. Any other schema (no
- * properties, a union, a $ref) keeps the one-line signature.
+ * properties, a union, a $ref) keeps the one-line signature. `aliases` are
+ * the type aliases of the local refs it uses, printed before `tools`.
  */
-function toolSignature(name, schema, result) {
-    const members = topLevelMembers(schema);
-    if (!members)
-        return [`  ${JSON.stringify(name)}: (args: ${schemaType(schema)}) => ${result};`];
-    return [
-        `  ${JSON.stringify(name)}: (args: {`,
-        ...members.map(({ text, description }) => `    ${text}${description ? ` // ${description}` : ''}`),
-        `  }) => ${result};`,
-    ];
+function toolSignature(name, schema, result, aliasNames) {
+    const refs = {
+        root: schema,
+        prefix: `T_${name.replace(/[^\w$]/gu, '_')}_`,
+        names: aliasNames,
+        byRef: new Map(),
+        unguardedUses: new Map(),
+    };
+    const scope = { refs, unguarded: NO_REFS };
+    const members = topLevelMembers(schema, scope);
+    const lines = members
+        ? [
+            `  ${JSON.stringify(name)}: (args: {`,
+            ...members.map(({ text, description }) => `    ${text}${description ? ` // ${description}` : ''}`),
+            `  }) => ${result};`,
+        ]
+        : [`  ${JSON.stringify(name)}: (args: ${schemaType(schema, 0, scope)}) => ${result};`];
+    return {
+        aliases: [...refs.byRef.values()].map((alias) => `type ${alias.name} = ${alias.type};`),
+        lines,
+    };
 }
-function topLevelMembers(schema) {
+const NO_REFS = new Set();
+/** Ref → alias name, rendering the alias on first use. */
+function refType(ref, scope) {
+    const target = resolveLocalRef(ref, scope.refs.root);
+    if (!target || typeof ref !== 'string' || reachesAny(ref, scope.unguarded, scope.refs)) {
+        return 'unknown';
+    }
+    if (scope.owner !== undefined) {
+        const uses = scope.refs.unguardedUses.get(scope.owner);
+        if (uses)
+            uses.add(ref);
+        else
+            scope.refs.unguardedUses.set(scope.owner, new Set([ref]));
+    }
+    const known = scope.refs.byRef.get(ref);
+    if (known)
+        return known.name;
+    const alias = { name: aliasName(ref, scope.refs), type: 'unknown' };
+    scope.refs.byRef.set(ref, alias);
+    alias.type = schemaType(target, 0, {
+        refs: scope.refs,
+        unguarded: new Set([...scope.unguarded, ref]),
+        owner: ref,
+    });
+    return alias.name;
+}
+/** Whether `ref` is in `targets` or leads to one through unguarded uses. */
+function reachesAny(ref, targets, refs) {
+    if (targets.size === 0)
+        return false;
+    const seen = new Set();
+    const pending = [ref];
+    for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+        if (targets.has(next))
+            return true;
+        if (seen.has(next))
+            continue;
+        seen.add(next);
+        pending.push(...(refs.unguardedUses.get(next) ?? []));
+    }
+    return false;
+}
+function aliasName(ref, refs) {
+    const segment = ref
+        .slice(ref.lastIndexOf('/') + 1)
+        .replace(/~1/gu, '/')
+        .replace(/~0/gu, '~');
+    const base = `${refs.prefix}${segment.replace(/[^\w$]/gu, '_') || 'Ref'}`;
+    let name = base;
+    for (let suffix = 2; refs.names.has(name); suffix += 1)
+        name = `${base}_${suffix}`;
+    refs.names.add(name);
+    return name;
+}
+function resolveLocalRef(ref, root) {
+    if (typeof ref !== 'string' || !ref.startsWith('#/'))
+        return undefined;
+    let node = root;
+    for (const part of ref.slice(2).split('/')) {
+        if (!isRecord(node))
+            return undefined;
+        node = node[part.replace(/~1/gu, '/').replace(/~0/gu, '~')];
+    }
+    return isRecord(node) ? node : undefined;
+}
+function topLevelMembers(schema, scope) {
     if (!isRecord(schema) || '$ref' in schema || 'const' in schema || schema.type !== 'object') {
         return undefined;
     }
-    if (compositeSchemaType(schema, 0) !== undefined)
+    if (compositeSchemaType(schema, 0, scope) !== undefined)
         return undefined;
-    const members = objectMembers(schema, 0);
+    const members = objectMembers(schema, 0, scope);
     return members.length > 0 ? members : undefined;
 }
 function schemaDescription(schema) {
@@ -173,31 +257,34 @@ function schemaDescription(schema) {
     // A line break would end the // comment early.
     return schema.description.trim().replace(/\r\n?|[\n\u2028\u2029]/gu, ' ') || undefined;
 }
-function schemaType(value, depth = 0) {
+function schemaType(value, depth, scope) {
     if (value === false)
         return 'never';
-    if (!isRecord(value) || depth > 12 || '$ref' in value)
+    if (!isRecord(value) || depth > 12)
         return 'unknown';
+    if ('$ref' in value)
+        return refType(value.$ref, scope);
     if ('const' in value)
         return literalType(value.const);
-    return compositeSchemaType(value, depth) ?? typedSchemaType(value, depth);
+    return compositeSchemaType(value, depth, scope) ?? typedSchemaType(value, depth, scope);
 }
-function compositeSchemaType(value, depth) {
+function compositeSchemaType(value, depth, scope) {
     if (Array.isArray(value.enum))
         return value.enum.map(literalType).join(' | ') || 'never';
     const union = value.anyOf ?? value.oneOf;
     if (Array.isArray(union)) {
-        return union.map((entry) => `(${schemaType(entry, depth + 1)})`).join(' | ') || 'never';
+        return union.map((entry) => `(${schemaType(entry, depth + 1, scope)})`).join(' | ') || 'never';
     }
     if (Array.isArray(value.allOf)) {
-        return value.allOf.map((entry) => `(${schemaType(entry, depth + 1)})`).join(' & ') || 'unknown';
+        return (value.allOf.map((entry) => `(${schemaType(entry, depth + 1, scope)})`).join(' & ') ||
+            'unknown');
     }
     if (Array.isArray(value.type)) {
-        return value.type.map((type) => schemaType({ ...value, type }, depth + 1)).join(' | ');
+        return value.type.map((type) => schemaType({ ...value, type }, depth + 1, scope)).join(' | ');
     }
     return undefined;
 }
-function typedSchemaType(value, depth) {
+function typedSchemaType(value, depth, scope) {
     switch (value.type) {
         case 'null':
             return 'null';
@@ -208,18 +295,21 @@ function typedSchemaType(value, depth) {
         case 'integer':
             return 'number';
         case 'array':
-            return `Array<${schemaType(value.items, depth + 1)}>`;
+            // An array item may name an alias still being rendered.
+            return `Array<${schemaType(value.items, depth + 1, { refs: scope.refs, unguarded: NO_REFS })}>`;
         case 'object':
-            return objectSchemaType(value, depth);
+            return objectSchemaType(value, depth, scope);
         default:
             return 'unknown';
     }
 }
-function objectMembers(value, depth) {
+function objectMembers(value, depth, scope) {
     const properties = isRecord(value.properties) ? value.properties : {};
     const required = new Set(Array.isArray(value.required) ? value.required : []);
+    // An object member may name an alias still being rendered.
+    const memberScope = { refs: scope.refs, unguarded: NO_REFS };
     const members = Object.entries(properties).map(([key, schema]) => ({
-        text: `${JSON.stringify(key)}${required.has(key) ? '' : '?'}: ${schemaType(schema, depth + 1)};`,
+        text: `${JSON.stringify(key)}${required.has(key) ? '' : '?'}: ${schemaType(schema, depth + 1, memberScope)};`,
         description: schemaDescription(schema),
     }));
     if (members.length > 0 && value.additionalProperties !== false) {
@@ -227,10 +317,10 @@ function objectMembers(value, depth) {
     }
     return members;
 }
-function objectSchemaType(value, depth) {
-    const members = objectMembers(value, depth);
+function objectSchemaType(value, depth, scope) {
+    const members = objectMembers(value, depth, scope);
     if (members.length === 0) {
-        return `Record<string, ${value.additionalProperties === false ? 'never' : schemaType(value.additionalProperties, depth + 1)}>`;
+        return `Record<string, ${value.additionalProperties === false ? 'never' : schemaType(value.additionalProperties, depth + 1, scope)}>`;
     }
     return `{ ${members.map(({ text }) => text).join(' ')} }`;
 }

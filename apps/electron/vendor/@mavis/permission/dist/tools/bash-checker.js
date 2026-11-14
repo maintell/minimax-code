@@ -29,7 +29,7 @@ import { parseScriptPlainCommands } from './bash-ast.js';
 import { encodeArgvPrefixRule } from './bash-rule-match.js';
 import { checkBashPermission, evaluateBashStatic, splitCommand, parseRmCommand, buildTrashCommand, resolveHomeInTarget, resolveRmCommandPaths, shellQuote, } from './bash-permission.js';
 import { findHeredocBodyRanges } from './bash-split.js';
-import { evaluatePathCapability, extractBashPathIntents, READ_PATH_COMMANDS, SEARCH_PATH_COMMANDS, } from './path-capability.js';
+import { commandChangesDirectory, evaluatePathCapability, extractBashPathIntents, isRelativeTraversalOperand, READ_PATH_COMMANDS, SEARCH_PATH_COMMANDS, } from './path-capability.js';
 import { pureReadFirstWord } from './bash-fast-allow.js';
 import { rewritePosixRm, readPosixTrashExecution, withPosixTrashExecution, } from './rm-shell-rewrite.js';
 const ENV_VAR_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -621,37 +621,56 @@ export class BashToolPermissionChecker {
             // only surfaced when no intent denies.
             let pendingAsk;
             let pendingAskImmune = false;
+            const changesDirectory = commandChangesDirectory(command);
             for (const intent of pathIntents) {
                 // Only shell operands use MSYS mounts; native filesystem tool paths do not.
                 const capabilityPath = context.platform === 'win32' && context.shellFamily === 'posix'
                     ? (resolvePermissionPath(intent.path, context, 'posix').resolved ?? intent.path)
                     : intent.path;
-                const pathDecision = evaluatePathCapability(capabilityPath, intent.action, context, {
-                    // Grade each intent under the capability namespace that may authorize
-                    // it: read → `read`, write/delete → `write`, and execute → its OWN
-                    // `execute` namespace. Executing a script is read-and-run code, so it
-                    // must NOT be authorizable by a generic `write(dir/**)` rule (a rule
-                    // granted only to drop output files would otherwise let
-                    // `source /downloads/x.sh` run) NOR by a broad `read` capability
-                    // (external non-sensitive reads are allowed by default, which would
-                    // wave through ANY external script). The dedicated `execute` namespace
-                    // matches no user content rule, so an external script keeps ASKing;
-                    // legitimate temp/workspace runs stay allowed via `allowTempWrite`
-                    // below, and a previously-approved `bash`-namespace path rule is still
-                    // honored via `originToolName`.
-                    toolName: intent.action === 'read' ? 'read' : intent.action === 'execute' ? 'execute' : 'write',
-                    // `execute` shares the write temp/workspace fallback: executing a
-                    // generated temp/workspace script (`bash /tmp/build.sh`) is a common
-                    // flow that must stay allowed. Without this an execute intent is graded
-                    // as a workspace-external write ASK and preempts the local-script
-                    // allow below. A non-temp external script (`source ~/secret.sh`) still
-                    // ASKs because it is neither temp nor workspace.
-                    allowTempWrite: intent.action === 'write' || intent.action === 'delete' || intent.action === 'execute',
-                    // Approvals of bash path asks persist under the `bash` namespace
-                    // (permission-flow applyDecision) — let the resolver honor them so the
-                    // user is not re-prompted for an already-approved path.
-                    originToolName: _toolName,
-                });
+                // After `cd` / `pushd` a relative `..` operand no longer resolves against
+                // the session working directory, so its target cannot be judged here.
+                // Ask (auto mode routes this to the classifier) instead of guessing.
+                const pathDecision = changesDirectory && isRelativeTraversalOperand(intent.path)
+                    ? {
+                        behavior: 'ask',
+                        reason: {
+                            type: 'safetyCheck',
+                            description: `The command changes directory before using the relative path ${intent.path}, so its target cannot be checked in advance.`,
+                            classifierApprovable: true,
+                        },
+                    }
+                    : evaluatePathCapability(capabilityPath, intent.action, context, {
+                        // Grade each intent under the capability namespace that may authorize
+                        // it: read → `read`, write/delete → `write`, and execute → its OWN
+                        // `execute` namespace. Executing a script is read-and-run code, so it
+                        // must NOT be authorizable by a generic `write(dir/**)` rule (a rule
+                        // granted only to drop output files would otherwise let
+                        // `source /downloads/x.sh` run) NOR by a broad `read` capability
+                        // (external non-sensitive reads are allowed by default, which would
+                        // wave through ANY external script). The dedicated `execute` namespace
+                        // matches no user content rule, so an external script keeps ASKing;
+                        // legitimate temp/workspace runs stay allowed via `allowTempWrite`
+                        // below, and a previously-approved `bash`-namespace path rule is still
+                        // honored via `originToolName`.
+                        toolName: intent.action === 'read'
+                            ? 'read'
+                            : intent.action === 'execute'
+                                ? 'execute'
+                                : 'write',
+                        // `execute` shares the write temp/workspace fallback: executing a
+                        // generated temp/workspace script (`bash /tmp/build.sh`) is a common
+                        // flow that must stay allowed. Without this an execute intent is graded
+                        // as a workspace-external write ASK and preempts the local-script
+                        // allow below. A non-temp external script (`source ~/secret.sh`) still
+                        // ASKs because it is neither temp nor workspace.
+                        allowTempWrite: intent.action === 'write' ||
+                            intent.action === 'delete' ||
+                            intent.action === 'execute',
+                        // Approvals of bash path asks persist under the `bash` namespace
+                        // (permission-flow applyDecision) — let the resolver honor them so the
+                        // user is not re-prompted for an already-approved path.
+                        originToolName: _toolName,
+                    });
                 if (pathDecision.behavior === 'allow')
                     continue;
                 if (pathDecision.behavior === 'deny') {

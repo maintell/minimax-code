@@ -1,6 +1,6 @@
 import { readPromptWithBuiltinFallback } from '../../../agent/index.js';
 import { TitleGenerationBudget } from '../title/title-generation-budget.js';
-import { archiveTitleSystemPrompt, archivedRootPrefix, ARCHIVE_TITLE_MAX_TOKENS, ARCHIVE_TITLE_PER_MESSAGE_CHAR_CAP, ARCHIVE_TITLE_RECENT_MESSAGE_LIMIT, ARCHIVE_TITLE_TIMEOUT_MS, ARCHIVE_TITLE_SYSTEM_PROMPT_EN_KEY, ARCHIVE_TITLE_SYSTEM_PROMPT_ZH_KEY, buildArchiveTitlePrompts, isArchiveTitleFallback, } from './archived-root-title.js';
+import { archiveTitleSystemPrompt, resolveArchiveTitleLocale, archivedRootPrefix, ARCHIVE_TITLE_MAX_TOKENS, ARCHIVE_TITLE_PER_MESSAGE_CHAR_CAP, ARCHIVE_TITLE_RECENT_MESSAGE_LIMIT, ARCHIVE_TITLE_TIMEOUT_MS, ARCHIVE_TITLE_SYSTEM_PROMPT_EN_KEY, ARCHIVE_TITLE_SYSTEM_PROMPT_ZH_KEY, buildArchiveTitlePrompts, isArchiveTitleFallback, } from './archived-root-title.js';
 import { RootArchiveTitleModelError, } from './root-archive-title-model.js';
 export class RootArchiveTitleService {
     options;
@@ -60,7 +60,7 @@ export class RootArchiveTitleService {
         }
     }
     async generateCandidate(sessionId, input, budget) {
-        const locale = this.options.locale?.() ?? 'en';
+        const locale = this.options.locale?.() ?? resolveArchiveTitleLocale();
         const session = await this.readEligibleSession(sessionId, input.fallbackName, locale);
         if (!session || budget.remainingMs === 0)
             return;

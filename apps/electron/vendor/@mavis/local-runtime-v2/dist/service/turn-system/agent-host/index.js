@@ -8,8 +8,8 @@ export { CanonicalHistoryValidationError, DurableCanonicalHistoryStore, } from '
 export { createAgentHostProductionDependencies, } from './production-dependencies.js';
 export { createAgentHostRuntimeLifecycle, createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, } from './native-production-dependencies.js';
 export * from './preparation/index.js';
-export { buildLocalTurnToolCatalog, createLocalAgentCapabilitySelector, filterLocalTurnCapabilityInventory, resolveLocalMcpDisclosureOptions, } from './assembly/local-turn-tool-catalog.js';
-export { buildLocalTurnPayloadTransform } from './assembly/local-turn-payload-transform.js';
+export { ADVISOR_TOOL_NAME, buildLocalTurnToolCatalog, createLocalAgentCapabilitySelector, filterLocalTurnCapabilityInventory, } from './assembly/local-turn-tool-catalog.js';
+export { buildLocalRequestPayloadTransform, buildLocalTurnPayloadTransform, } from './assembly/payload/local-turn-payload-transform.js';
 export { NativeLocalTurnExecutionPreparationSource, } from './assembly/local-turn-execution-preparation.js';
 export { LocalTurnInputPreparer, } from './assembly/local-turn-input-preparation.js';
 export * from './runner/index.js';
@@ -18,4 +18,5 @@ export { LocalRuntimeTurnExecutor, } from './execution/executor.js';
 export { LocalRuntimeTerminalError, LocalRuntimeTerminalIdentityError, } from './events/turn-commit-pipeline.js';
 export { AgentHostUserInputValidationError, captureAgentHostExecutionRequest, createCanonicalAgentHostUserInput, } from './canonical-user-input.js';
 export { normalizeModelSelection, } from './preparation/config/model-selection-input.js';
+export { PtcSessionStore } from './execution/ptc/session-store/index.js';
 //# sourceMappingURL=index.js.map

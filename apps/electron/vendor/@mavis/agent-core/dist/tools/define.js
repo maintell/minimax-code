@@ -3,7 +3,7 @@
  * protocol-level split between LLM-facing `def` and side-effecting `impl`.
  */
 export function defineRuntimeTool(tool) {
-    const { name, label, description, schema, loading, promptGuidelines, prepareArguments, executionMode, operationClassifier, source, execute, } = tool;
+    const { name, label, description, schema, loading, promptGuidelines, prepareArguments, executionMode, operationClassifier, interruptOnSteer, source, execute, } = tool;
     const def = {
         name,
         ...(label !== undefined ? { label } : {}),
@@ -16,6 +16,7 @@ export function defineRuntimeTool(tool) {
             : {}),
         ...(executionMode !== undefined ? { executionMode } : {}),
         ...(operationClassifier !== undefined ? { operationClassifier } : {}),
+        ...(interruptOnSteer !== undefined ? { interruptOnSteer } : {}),
     };
     return {
         def,

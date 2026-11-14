@@ -25,4 +25,14 @@ export function parseDefaultAgentAvatarMarker(value) {
 export function isDefaultAgentAvatarMarker(value) {
     return parseDefaultAgentAvatarMarker(value) !== undefined;
 }
+/** Stable product identity shared by the runtime and its built-in Agent assets. */
+export const BUNNY_AGENT_NAME = 'bunny';
+export function isBunnyAgentName(name) {
+    return name === BUNNY_AGENT_NAME;
+}
+/** Product-owned avatar of the built-in Bunny Agent (rendered by the UI, not a URL). */
+export const BUNNY_AGENT_AVATAR_MARKER = 'mavis-agent-avatar://bunny/v1';
+export function isBunnyAgentAvatarMarker(value) {
+    return value === BUNNY_AGENT_AVATAR_MARKER;
+}
 //# sourceMappingURL=agent-avatar.js.map

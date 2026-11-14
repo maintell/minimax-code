@@ -15,6 +15,7 @@ const READ_ONLY_CANONICAL_BLOCKED_TOOL_NAMES = new Set([
     'memory',
     'ask_user',
     'request_feature_enable',
+    'request_plugin',
 ]);
 /** Computer-use tools share the computer_* namespace across native and MCP paths. */
 export function isComputerUseRuntimeToolName(name) {

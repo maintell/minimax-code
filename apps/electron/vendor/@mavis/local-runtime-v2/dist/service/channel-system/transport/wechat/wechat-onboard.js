@@ -15,6 +15,7 @@
  * runners; production (Electron main) shares the same call surface. Tests
  * stub `globalThis.fetch` to drive deterministic transitions.
  */
+import { randomUUID } from 'node:crypto';
 import { settleOr } from '../../settle.js';
 import { buildIlinkCommonHeaders } from './sdk/ilink-wire.js';
 const DEFAULT_ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com';
@@ -166,6 +167,17 @@ async function finaliseBinding(store, pending, input) {
         agentName: pending.agentName,
         botToken: input.botToken,
         ilinkBotId: input.ilinkBotId,
+        expectedPendingSessionId: pending.bindSessionId,
+        ...(input.userId?.trim()
+            ? {
+                registrationCreator: {
+                    source: 'qr-login',
+                    userId: input.userId.trim(),
+                    botId: input.ilinkBotId,
+                    bindingId: randomUUID(),
+                },
+            }
+            : {}),
         ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
         ...(pending.botName ? { botName: pending.botName } : {}),
         ...(pending.bindSessionId ? { bindSessionId: pending.bindSessionId } : {}),
@@ -257,6 +269,7 @@ async function settleConfirmed(input) {
     await finaliseBinding(store, record, {
         botToken: resp.bot_token,
         ilinkBotId: resp.ilink_bot_id,
+        userId: resp.ilink_user_id,
         baseUrl: resp.baseurl,
     });
     return {

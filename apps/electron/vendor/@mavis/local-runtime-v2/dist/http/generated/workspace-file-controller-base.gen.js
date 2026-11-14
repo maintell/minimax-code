@@ -20,6 +20,26 @@ export class WorkspaceFileControllerBase {
         void req;
         throw new NotImplementedError('saveWorkspaceFile');
     }
+    async beginWorkspaceFileUpload(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('beginWorkspaceFileUpload');
+    }
+    async appendWorkspaceFileUpload(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('appendWorkspaceFileUpload');
+    }
+    async commitWorkspaceFileUpload(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('commitWorkspaceFileUpload');
+    }
+    async abortWorkspaceFileUpload(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('abortWorkspaceFileUpload');
+    }
     async searchWorkspaceFiles(ctx, req) {
         void ctx;
         void req;

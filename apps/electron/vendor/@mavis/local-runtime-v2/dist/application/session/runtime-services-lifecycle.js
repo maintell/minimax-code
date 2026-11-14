@@ -357,6 +357,7 @@ export function createRuntimeServicesLifecycle(input) {
             () => Promise.resolve(input.memory?.close()),
             () => Promise.resolve(input.closeTitles?.()),
             () => Promise.resolve(input.turnSystem.close()),
+            () => Promise.resolve(input.closeLaunchpad?.()),
             () => Promise.resolve(input.closeBrowserUse?.()),
             () => Promise.resolve(input.disposePluginHookSessions?.()),
             () => Promise.resolve(input.plugin.close()),
@@ -446,6 +447,14 @@ function createStartupRecoverySteps(input) {
             run: async (signal) => {
                 if (!signal.aborted)
                     await input.cron?.ready();
+            },
+        },
+        {
+            name: 'assignment-recovery',
+            owner: 'assignment',
+            run: async (signal) => {
+                if (!signal.aborted)
+                    await input.recoverAssignments?.(signal);
             },
         },
     ];
@@ -558,22 +567,36 @@ async function recoverPendingForksFailSoft(input) {
         reportStartupFailure(input, 'pending-fork-recovery', `owner=session;stage=pending-fork-recovery;error=${describeError(error)}`);
     }
 }
-export async function closeRuntimeServiceResources(promptLifecycle, hookPermissions, safety) {
+/**
+ * Closes the Turn System and then the Agent Host's own resources.
+ *
+ * The Host resources (the PTC session store's temp tree) must be released even
+ * when the Turn System close fails, which it does when a drain times out; and
+ * the first failure is the one the caller sees, so a cleanup error never hides
+ * the real one.
+ */
+export async function closeRuntimeTurnSystem(closeTurnSystem, closeAgentHostResources) {
+    let failure;
     try {
-        await promptLifecycle.close();
+        await closeTurnSystem();
     }
-    finally {
-        try {
-            await hookPermissions.close();
-        }
-        finally {
-            await safety.close();
-        }
+    catch (error) {
+        failure = error;
     }
+    try {
+        await closeAgentHostResources();
+    }
+    catch (error) {
+        failure ??= error;
+    }
+    if (failure !== undefined)
+        throw failure;
 }
-/** Closes owners in order; every owner is closed even when an earlier one fails. */
-export function closeRuntimeOwners(sessionClio, miniApp, goal) {
+/** Closes telemetry and quota recovery timers before the Mini App owner. */
+export function closeRuntimeOwners(sessionClio, miniApp, goal, quotaAutoResume) {
     sessionClio?.close();
+    // Stop the plan timers; the durable rows keep every schedule for the next start.
+    quotaAutoResume?.service.close();
     // Stop Goal account-quota recovery timers; the durable rows keep each schedule.
     goal.close();
     return miniApp.close();

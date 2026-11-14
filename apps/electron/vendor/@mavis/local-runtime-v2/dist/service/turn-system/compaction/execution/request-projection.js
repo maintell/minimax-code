@@ -1,9 +1,13 @@
 import { projectRequestMedia, } from './request-media-projection.js';
-export function createMainRequestProjection(filterMessages) {
+export function createMainRequestProjection(filterMessages, turnContext) {
     const filter = (sessionId, messages) => filterMessages?.(sessionId, messages) ?? messages;
     return {
         hooks: [createRequestFilterHook(filter), createRequestMediaGuardHook()],
-        project: (input) => projectRequestMedia({ ...input, messages: filter(input.sessionId, input.messages) }).messages,
+        project: (input) => {
+            const messages = turnContext?.(input.sessionId, input.messages) ?? input.messages;
+            return projectRequestMedia({ ...input, messages: filter(input.sessionId, messages) })
+                .messages;
+        },
     };
 }
 function createRequestFilterHook(filter) {

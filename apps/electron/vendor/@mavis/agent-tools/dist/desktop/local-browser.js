@@ -91,7 +91,7 @@ async function executeWithDeadline(operation, timeoutMs, timeoutLabel, externalS
             const specific = await Promise.race([
                 operationPromise.then(() => undefined, (operationError) => operationError),
                 new Promise((resolve) => {
-                    const graceTimer = setTimeout(resolve, ABORT_DETAIL_GRACE_MS);
+                    const graceTimer = setTimeout(() => resolve(undefined), ABORT_DETAIL_GRACE_MS);
                     cancelGrace = () => clearTimeout(graceTimer);
                 }),
             ]);
@@ -314,7 +314,7 @@ function createBrowserRuntimeTool(def, action, adapter, options) {
 }
 function browserProviderNavigationGuidance(provider) {
     if (provider === 'electron-file-panel') {
-        return 'Active Browser provider: electron-file-panel. Use navigate only when the current FilePanel tab is absent or blank. A loaded FilePanel tab is user-visible, so use open_tab by default to preserve it. Use navigate with replaceCurrentTab: true only when the user explicitly asks to replace the current tab; omitting the flag on a loaded tab fails closed, and you must not add it merely to recover from choosing navigate incorrectly.';
+        return 'Active Browser provider: electron-file-panel. Inspect an already selected Mini App directly. To open one, use open_tab input { miniAppId: "<plugin ID>" }. If only the app name is known, use the miniapp list action to resolve its plugin ID. Call open_tab without observe, wait for its result, then call inspect separately. Use run_script on the selected HTTP(S) web page or managed Mini App. Use navigate only when the current FilePanel tab is absent or blank. A loaded FilePanel tab is user-visible, so use open_tab by default to preserve it. Use navigate with replaceCurrentTab: true only when the user explicitly asks to replace the current tab; omitting the flag on a loaded tab fails closed, and you must not add it merely to recover from choosing navigate incorrectly.';
     }
     if (provider === 'native-headless-chrome') {
         return 'Active Browser provider: native-headless-chrome. Use fully qualified absolute HTTP(S) URLs. Use navigate to replace the current headless working page by default. Use open_tab only when the user explicitly requests another tab or the task requires preserving the current page.';
@@ -581,6 +581,13 @@ function summarizeScriptResult(result, imagesOmitted = false) {
         if (result[key] !== undefined)
             summary[key] = sanitizeBrowserResult(result[key]);
     }
+    const jsDialog = boundedJsDialogIdentity(result.dialog);
+    if (jsDialog !== undefined)
+        summary.dialog = jsDialog;
+    if (typeof result.trigger === 'string')
+        summary.trigger = result.trigger.slice(0, 64);
+    if (result.awaitingUser === true)
+        summary.awaitingUser = true;
     if (Array.isArray(result.screenshots)) {
         summary.screenshots = result.screenshots.filter(isRecord).map((shot, index) => ({
             image: index + 1,
@@ -1302,6 +1309,20 @@ function summarizeCompactActionResult(action, result) {
     if (action === 'return_to_previous_tab' && typeof result.returnedToPreviousTab === 'boolean') {
         summary.returnedToPreviousTab = result.returnedToPreviousTab;
     }
+    const jsDialog = boundedJsDialogIdentity(result.dialog);
+    if (jsDialog !== undefined)
+        summary.dialog = jsDialog;
+    if (typeof result.trigger === 'string')
+        summary.trigger = result.trigger.slice(0, 64);
+    if (result.awaitingUser === true)
+        summary.awaitingUser = true;
+    if (result.handled === true) {
+        summary.handled = true;
+        if (typeof result.type === 'string')
+            summary.type = result.type.slice(0, 32);
+        if (result.action === 'accept' || result.action === 'dismiss')
+            summary.action = result.action;
+    }
     const preservedTabs = result.preservedTabs;
     if (typeof preservedTabs === 'number' && Number.isFinite(preservedTabs)) {
         summary.preservedTabs = Math.max(0, Math.floor(preservedTabs));
@@ -1378,6 +1399,15 @@ function summarizeCompactActionResult(action, result) {
     if (selectorTail)
         summary.selectorTail = selectorTail;
     return summary;
+}
+/** Dialog identity only; dialog text reaches the model through inspect's virtual modal. */
+function boundedJsDialogIdentity(value) {
+    if (value === null)
+        return null;
+    if (!isRecord(value) || typeof value.dialogId !== 'string' || typeof value.type !== 'string') {
+        return undefined;
+    }
+    return { dialogId: value.dialogId.slice(0, 64), type: value.type.slice(0, 32) };
 }
 const MAX_COMPACT_SELECT_OPTIONS = 30;
 function boundedSelectOptions(value) {

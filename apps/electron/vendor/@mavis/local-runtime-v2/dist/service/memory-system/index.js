@@ -8,6 +8,14 @@ export { initializeRuntimeMemoryV2System, initializeProductionMemoryV2System, } 
 // §5.15 DesktopAdapter 需要的作用域展示标识；全局单作用域下即 scopeKey 本身。
 export { GLOBAL_SCOPE_KEY } from './contracts.js';
 export { createMemoryExecutionQuery } from './execution/query.js';
+// Shared mechanics only; Bunny owns independent files, policy, sources and cursors.
+export { MemoryExecutionLedger } from './execution/ledger.js';
+export { MemoryScopeMutationCoordinator } from './policies/scope-mutation.js';
+export { redactMemorySecrets } from './secret-redactor.js';
+export { MemoryV2ModelGateway } from './adapters/model-gateway.js';
+export { createConsolidationWorkdirTools, } from './adapters/consolidation-workdir-tools.js';
+export { MemorySubscriptionQuota, } from './model-call/memory-quota.js';
+export { resolveMemoryV2Config } from './config.js';
 export { DesktopMemoryService } from './desktop/desktop-memory-service.js';
 export { handleMemoryBusEvent } from './files/local-memory-orchestration.js';
 export { createLocalMemorySubsystem } from './host-memory.js';

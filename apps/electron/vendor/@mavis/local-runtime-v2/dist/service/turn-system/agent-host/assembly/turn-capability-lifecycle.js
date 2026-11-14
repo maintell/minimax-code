@@ -5,7 +5,8 @@ export function createPluginAgentRoster(agents) {
         resolve: (scopedName) => byName.get(pluginAgentKey(scopedName)),
     });
 }
-function pluginAgentKey(name) {
+/** Scoped-name key of the Plugin Agent roster; grant matching uses the same one. */
+export function pluginAgentKey(name) {
     return name.trim().normalize('NFKC').toLowerCase();
 }
 /**
@@ -54,6 +55,10 @@ export class AgentHostTurnCapabilityLifecycle {
             ...(capabilities ? { capabilities } : {}),
             release: () => this.release(token, turn),
         };
+    }
+    /** Capability views captured by this Session's in-flight executions. */
+    capturedCapabilities(sessionId) {
+        return [...this.inFlight.values()].flatMap((turn) => turn.sessionId === sessionId && turn.capabilities ? [turn.capabilities] : []);
     }
     release(token, turn) {
         if (this.inFlight.get(token) !== turn)

@@ -1,3 +1,4 @@
+import { isNavigableUserInput, projectNavigationText } from '../input-navigation/text.js';
 import { MessageDataCorruptionError } from '../repo/contract.js';
 const DEFAULT_MESSAGE_PAGE_SIZE = 80;
 export class MessageQueryServiceError extends Error {
@@ -18,6 +19,19 @@ export class MessageQueryService {
     async list(input) {
         return this.read(input, normalizeRequestedLimit(input.limit, this.defaultPageSize), true);
     }
+    async recentUserInputs(sessionId, options = {}) {
+        // Bound work even when a conversation contains many synthetic user messages.
+        const page = await this.read({ sessionId }, 32, true, 'user');
+        const recent = page.messages.filter((message) => (message.timestamp ?? message.created_at ?? 0) >= (options.since ?? 0));
+        return recent
+            .filter(isNavigableUserInput)
+            .filter((message) => !message.source || message.source === 'api')
+            .map(projectNavigationText)
+            .filter((text) => text.trim() &&
+            !/^(?:ok|okay|yes|thanks|continue|retry|好|好的|是|收到|明白|谢谢|继续|重试)[.!。！\s]*$/iu.test(text.trim()))
+            .slice(-4)
+            .map((text) => text.slice(0, 1500));
+    }
     async listExact(input) {
         return this.read(input, input.limit);
     }
@@ -28,7 +42,7 @@ export class MessageQueryService {
             throw new MessageQueryServiceError('session-not-found', `Session not found: ${sessionId}`);
         return this.options.messages.listAfter(sessionId, afterMsgId, this.visibleBoundary(session));
     }
-    async read(input, limit, visibleOnly = false) {
+    async read(input, limit, visibleOnly = false, role) {
         await this.options.readiness?.ensureDisplayReady(input.sessionId);
         const session = await this.options.sessions.get(input.sessionId);
         if (!session) {
@@ -37,15 +51,13 @@ export class MessageQueryService {
         try {
             const afterMessageId = visibleOnly ? this.visibleBoundary(session) : undefined;
             const page = await this.options.messages.list(input.sessionId, {
-                ...(limit !== undefined ? { limit } : {}),
+                limit,
+                role,
                 ...(input.before ? { before: input.before } : {}),
+                ...(input.systemEventsOnly ? { systemEventsOnly: true } : {}),
                 ...(afterMessageId ? { afterMessageId } : {}),
             });
-            return {
-                messages: page.messages,
-                ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
-                hasMore: page.hasMore,
-            };
+            return messageQueryPage(page);
         }
         catch (error) {
             if (error instanceof MessageDataCorruptionError) {
@@ -62,6 +74,14 @@ export class MessageQueryService {
         }
         return session.sideChatOrigin.inheritedThroughMessageId;
     }
+}
+function messageQueryPage(page) {
+    return {
+        messages: page.messages,
+        ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+        hasMore: page.hasMore,
+        ...(page.rowStats ? { rowStats: page.rowStats } : {}),
+    };
 }
 function normalizeDefaultPageSize(value) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {

@@ -1,4 +1,5 @@
 import { isRuntimeToolInputValid } from '@mavis/agent-core/tools';
+import { resolveTurnWakeLabel } from '../preparation/turn-wake-reasons.js';
 import { resolveAskUserReminder, } from '../preparation/config/ask-user-reminder.js';
 import { LocalTurnPermissionGate } from '../runner/policy/local-turn-permission-gate.js';
 import { LocalTurnInputPreparer } from './local-turn-input-preparation.js';
@@ -59,6 +60,8 @@ export class NativeLocalTurnExecutionPreparationSource {
             initialBatchGenuineUserQueryTexts: prepared.initialBatchGenuineUserQueryTexts,
             userMessage: prepared.userMessage,
             caller: prepared.caller,
+            agentKind: prepared.agentKind,
+            wake: resolveTurnWakeLabel(input.execution.request),
             // AskUser blocks trail the other Turn reminders; order only matters for
             // readability because history detection matches complete blocks.
             reminderBlocks: askUserReminder
@@ -222,6 +225,9 @@ function createToolContext(execution, eventWriter, browserAssets, channelContext
         eventWriter,
         browserAssets,
         ...(forceReadOnlyFilesystem ? { forceReadOnlyFilesystem: true } : {}),
+        // readTrustedBuiltinAgentProfileIdentity returns coordination only for a
+        // trusted built-in profile, so an untrusted declaration never reaches tools.
+        ...(identity.coordination ? { coordination: identity.coordination } : {}),
         ...(execution.pluginHookEventReporter ? { reporter: execution.pluginHookEventReporter } : {}),
         trustedExactWritePaths: execution.assemblyContext.plan
             ? [execution.assemblyContext.plan.canonicalPath]

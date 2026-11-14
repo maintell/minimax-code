@@ -1,7 +1,9 @@
 import { isMemoryV2Enabled } from '@mavis/config';
+import { logger } from '@mavis/shared/local-runtime-logging';
 import { createHash } from 'node:crypto';
-import { fileFailure, noteFilePath, renderStateMirror } from './memory-files.js';
-import { removeEntriesBySource, removeLinesMatching } from './artifact-edit.js';
+import { editSummaryAndBaseline, fileFailure, noteFilePath, renderStateMirror, } from './memory-files.js';
+import { dropRequestLineEdit, insertSummaryRequestLine, removeEntriesBySource, removeLinesMatching, } from './artifact-edit.js';
+import { MIN_CONSOLIDATION_CONTEXT_WINDOW } from './consolidation-service.js';
 import { computeOutputDigest, renderRulesMirror, renderSessionMirror } from './session-doc.js';
 /** 整会话遗忘写入的排除原因；同时是 §2.3 资格检查的程序级挡板。 */
 const USER_FORGOTTEN_REASON = 'user-forgotten';
@@ -83,15 +85,15 @@ export class MemoryGovernanceService {
                     return fileFailure('store-unavailable', 'Memory was reset during this request.');
                 if (commit === 'conflicting-call')
                     return fileFailure('invalid-arguments', 'This call identity already belongs to a different or removed request.');
-                try {
-                    const stored = commit === 'unchanged'
-                        ? await this.deps.repository.getSessionState(scopeKey, noteSessionId)
-                        : undefined;
-                    await this.deps.fileStore.writeAdHocNoteMirror(scopeKey, `${noteSessionId}.md`, stored ? renderStateMirror(stored) : mirror);
-                }
-                catch {
-                    /* 持久化已完成，镜像交给协调器恢复。 */
-                }
+                await this.settleNoteCommit({
+                    scopeKey,
+                    noteSessionId,
+                    mirror,
+                    commit,
+                    note: input.note,
+                    projectLabel: ctx.projectName ?? ctx.workspaceDir,
+                    publishSummary: this.deps.isRootInputTurn(input.requestSessionId, input.turnId),
+                });
                 return {
                     status: 'ok',
                     result: { status: 'saved', path: noteFilePath(noteSessionId) },
@@ -102,10 +104,133 @@ export class MemoryGovernanceService {
             return fileFailure('store-unavailable', 'The memory request could not be saved. Try again later.');
         }
     }
+    /**
+     * note 落库之后的收尾：补写镜像，并把请求写进已发布摘要。两步都是 best-effort——
+     * note 已经持久化，失败只发诊断事件，由协调器与后续整理收敛(§5.18)。
+     */
+    async settleNoteCommit(input) {
+        try {
+            const stored = input.commit === 'unchanged'
+                ? await this.deps.repository.getSessionState(input.scopeKey, input.noteSessionId)
+                : undefined;
+            await this.deps.fileStore.writeAdHocNoteMirror(input.scopeKey, `${input.noteSessionId}.md`, stored ? renderStateMirror(stored) : input.mirror);
+        }
+        catch {
+            /* 持久化已完成，镜像交给协调器恢复。 */
+        }
+        if (input.commit !== 'committed')
+            return;
+        try {
+            await this.publishNoteRequest(input);
+        }
+        catch (error) {
+            this.noteWarn(input.noteSessionId, 'note.summary-failed', String(error));
+        }
+    }
+    /**
+     * 把这条记忆请求写进已发布摘要的「## 记忆请求」节，并对基线中的摘要行做同样的插入(§5.18)。
+     * 新开的会话读摘要即可看到用户要求；整理把它当成已有内容，归置 note 后按 prompt 规则删行。
+     * 基线做同样的插入而不是抄磁盘内容，用户在上次整理后的手改才保持"相对基线的修改"身份。
+     *
+     * 四道前置条件各自对应一种"写了也没人看"或"写了会被误当成手改"的情况：
+     * 非真实用户输入的根会话 Turn（子 agent 与纯工具链触发的保存）、记忆写入关闭、
+     * 整理模型窗口不足（整理跑不起来，请求行会一直悬在摘要里）、以及还没有已发布摘要。
+     * 任一不满足都只保存 note，由后续整理归置。
+     */
+    async publishNoteRequest(input) {
+        const { scopeKey, noteSessionId } = input;
+        const blocked = await this.summaryWriteBlocker(input);
+        if (blocked)
+            return this.noteSkip(noteSessionId, blocked);
+        const config = this.deps.config();
+        // 召回只在已发布摘要时读摘要；还没有完成视图的用户等首次整理即可，本次保存会触发它。
+        const scope = await this.deps.repository.getScope(scopeKey);
+        if (scope?.consolidatedDigest === undefined)
+            return this.noteSkip(noteSessionId, 'no-published-summary');
+        const notePath = noteFilePath(noteSessionId);
+        const outcome = await editSummaryAndBaseline(this.deps, scopeKey, (markdown) => {
+            const inserted = insertSummaryRequestLine({
+                summaryMarkdown: markdown,
+                note: input.note,
+                notePath,
+                projectLabel: input.projectLabel,
+                maxSummaryTokens: config.maxSummaryInjectionTokens,
+            });
+            if (inserted.status === 'inserted')
+                return { status: 'changed', markdown: inserted.markdown };
+            if (inserted.status === 'rejected')
+                return inserted;
+            return { status: 'unchanged' };
+        }, { requireBoth: true });
+        this.reportSummaryEdit(noteSessionId, outcome, {
+            disk: 'note.summary-skipped',
+            baseline: 'note.summary-baseline-rejected',
+        });
+    }
+    /**
+     * 摘要编辑的结果统一留痕：前置条件缺失记 info，拒绝与基线并发改写记 warn。
+     * 磁盘已写而基线未同步时，这一行在整理看来是手改，按 prompt 规则 12 删除。
+     */
+    reportSummaryEdit(noteSessionId, outcome, rejectedEvents) {
+        if (outcome.status === 'ok')
+            return;
+        if (outcome.status === 'missing')
+            return this.noteSkip(noteSessionId, outcome.reason);
+        if (outcome.status === 'rejected')
+            return this.noteWarn(noteSessionId, rejectedEvents[outcome.side], outcome.reason);
+        this.noteWarn(noteSessionId, 'note.summary-baseline-stale', outcome.reason);
+    }
+    /** 摘要写入的前置条件；返回 undefined 表示可以写，否则是跳过原因。 */
+    async summaryWriteBlocker(input) {
+        if (!input.publishSummary)
+            return 'not-root-input-turn';
+        const config = this.deps.config();
+        // 保存入口按 V2 启用放行 note（召回关闭也能排队），摘要只有召回开启时才会注入新会话。
+        if (!config.recallEnabled)
+            return 'recall-disabled';
+        if (!config.writeEnabled)
+            return 'write-disabled';
+        const contract = await this.deps.model.resolveContract('consolidation');
+        return contract.contextWindow < MIN_CONSOLIDATION_CONTEXT_WINDOW
+            ? 'model-context-too-small'
+            : undefined;
+    }
+    /** 前置条件不满足：note 已保存，摘要这条通道本次不写。属于预期状态，记 info 不告警。 */
+    noteSkip(noteSessionId, reason) {
+        this.event('note.summary-skipped', { noteSessionId, reason });
+        logger.info({ noteSessionId, reason }, '[memory-v2] note summary write skipped');
+    }
+    /** 写摘要这条通道确实失败了：note 仍在，摘要没拿到这一行。只记身份与原因，不记正文。 */
+    noteWarn(noteSessionId, event, reason) {
+        this.event(event, { noteSessionId, reason });
+        logger.warn({ noteSessionId, event, reason }, '[memory-v2] note summary write failed');
+    }
+    /**
+     * 删除会话的文档镜像。note-* 还要顺带撤掉摘要里指向它的请求行——遗忘、排除、留存清理与
+     * 会话删除都经过这里，note 消失后摘要不会留下一条指向已删文件的请求(§5.18)。
+     */
     async deleteDocumentMirror(scopeKey, sessionId) {
-        if (sessionId.startsWith('note-'))
+        if (sessionId.startsWith('note-')) {
             await this.deps.fileStore.deleteAdHocNoteMirror(scopeKey, `${sessionId}.md`);
+            await this.dropSummaryRequestLines(scopeKey, sessionId);
+        }
         await this.deps.fileStore.deleteSessionMemory(scopeKey, sessionId);
+    }
+    /**
+     * 磁盘摘要与基线摘要各删一次同一个 note 的请求行。best-effort：失败只留痕，不打断调用方
+     * 后续的清理步骤；没删掉的行由下一轮整理按规则 12「note 已被移除」删除。
+     */
+    async dropSummaryRequestLines(scopeKey, noteSessionId) {
+        try {
+            const outcome = await editSummaryAndBaseline(this.deps, scopeKey, (markdown) => dropRequestLineEdit(markdown, noteSessionId));
+            this.reportSummaryEdit(noteSessionId, outcome, {
+                disk: 'note.summary-cleanup-rejected',
+                baseline: 'note.summary-cleanup-rejected',
+            });
+        }
+        catch (error) {
+            this.noteWarn(noteSessionId, 'note.summary-cleanup-failed', String(error));
+        }
     }
     async forgetContent(input) {
         const targetText = input.targetText.trim();
@@ -433,6 +558,9 @@ export class MemoryGovernanceService {
         else
             await this.deps.fileStore.writeMemorySummary(scopeKey, next);
         return true;
+    }
+    event(event, payload) {
+        this.deps.diagnostics?.event(event, payload);
     }
     async materializeSession(scopeKey, sessionId, mirror, state) {
         try {

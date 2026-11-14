@@ -145,7 +145,11 @@ function synthesizeErrorResponse(frame) {
     if (frame.code === ABORTED_ERROR_CODE) {
         return new Response(null, { status: 499 });
     }
-    return new Response(JSON.stringify({ error: frame.code ?? DEFAULT_ERROR_CODE, message: frame.message }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({
+        error: frame.code ?? DEFAULT_ERROR_CODE,
+        message: frame.message,
+        transportError: true,
+    }), { status: 502, headers: { 'Content-Type': 'application/json' } });
 }
 function synthesizeResponse(frame, body, onMalformed) {
     try {

@@ -1,6 +1,15 @@
 import { withMiniMaxCodeUserAgent } from '@mavis/shared';
 import { managedBackendRoutingHeaders, } from '@mavis/agent-tools/desktop';
 const MANAGED_PROVIDER_USER_AGENT = 'MiniMaxAgent';
+/**
+ * Turn phase of each model request (initial, iteration, compaction), read by
+ * biz-gateway. Only managed Token Plan requests carry it: BYOK and third-party
+ * upstreams never see it.
+ */
+const TURN_PHASE_HEADER = 'X-Mavis-Turn-Phase';
+export function turnPhaseHeaderFor(route) {
+    return route === 'managed_token_plan' ? { turnPhaseHeader: TURN_PHASE_HEADER } : {};
+}
 export function buildLocalProviderHeaders(input) {
     // Third-party providers see MiniMax Code instead of the SDK default unless the
     // user configured a User-Agent; managed routes keep their own identity below.
@@ -20,6 +29,13 @@ export function buildLocalProviderHeaders(input) {
         Object.assign(headers, managedBackendRoutingHeaders(input.routingContext, currentBuildEnv()));
     }
     return headers;
+}
+/** The part of the effective config `resolveModelCallRoute` reads. */
+export function modelCallRouteView(providerConfig, byok) {
+    return {
+        ...(providerConfig ? { provider: providerConfig } : {}),
+        ...(byok?.minimaxModelSource ? { minimaxModelSource: byok.minimaxModelSource } : {}),
+    };
 }
 function currentBuildEnv() {
     const value = process.env.MAVIS_BUILD_ENV;

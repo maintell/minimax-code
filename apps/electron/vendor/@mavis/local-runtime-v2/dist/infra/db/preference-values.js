@@ -27,6 +27,17 @@ export function upsertPreferenceValue(db, key, value) {
         .onConflictDoUpdate({ target: preferences.key, set: { valueJson } })
         .run();
 }
+/** Insert one JSON value only when the key is still free; the first writer wins. */
+export function insertPreferenceValueIfAbsent(db, key, value) {
+    const valueJson = JSON.stringify(value);
+    if (valueJson === undefined) {
+        throw new TypeError('Preference value must be JSON-serializable');
+    }
+    db.insert(preferences)
+        .values({ key, valueJson })
+        .onConflictDoNothing({ target: preferences.key })
+        .run();
+}
 /** Delete one value; deleting a missing row is intentionally idempotent. */
 export function deletePreferenceValue(db, key) {
     db.delete(preferences).where(eq(preferences.key, key)).run();

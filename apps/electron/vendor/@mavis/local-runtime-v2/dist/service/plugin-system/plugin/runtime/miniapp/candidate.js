@@ -32,6 +32,7 @@ export function listEnabledMiniAppDefinitions(snapshot) {
         ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
         ...(plugin.description ? { description: plugin.description } : {}),
         ...(plugin.iconPath ? { iconPath: plugin.iconPath } : {}),
+        ...(plugin.miniapp?.surface.widget ? { widget: plugin.miniapp.surface.widget } : {}),
         ...(plugin.version ? { version: plugin.version } : {}),
         candidate: miniAppCandidateFromPackage({ plugin }),
     }))

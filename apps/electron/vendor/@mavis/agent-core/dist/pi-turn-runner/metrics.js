@@ -10,9 +10,13 @@
  * - Bare metric names (no `local_runtime_` prefix — the reporting layer
  *   rejects prefixed names since MR0); labels are low-cardinality only.
  */
-import { normalizeLLMError, toLLMMetricErrorKind, } from '@mavis/shared/llm-error-classifier';
+import { createBusyTimeAccumulator, incrementMetric, observeMetric, } from '@mavis/shared/local-runtime-logging/metric-registry';
+import { normalizeLLMError, toLLMFailureErrorKind, toLLMMetricErrorKind, } from '@mavis/shared/llm-error-classifier';
+import { classifyLocalResourceError } from '@mavis/shared/local-resource-errors';
+import { isLLMCallPreempted } from './llm-preemption.js';
 import { LLMRequestStoppedError, } from './llm-retry.js';
 import { normalizeAbortSource, } from './types.js';
+import { isEffectiveOutputEvent, managedTransportMs, parseGatewayServerTiming, readTurnRequestPhase, responseHeader, turnPrepareStages, } from './turn-timing.js';
 import { createToolContextHistogramBucketsByName, measureToolArguments, measureToolContext, measureToolResult, } from './tool-context-size.js';
 import { fingerprintAssembly } from './assembly-fingerprint.js';
 const LARGE_TOOL_IO_TOKEN_THRESHOLD = 8_000;
@@ -20,6 +24,24 @@ const MAX_ASSEMBLY_FINGERPRINT_BASELINES = 2_048;
 const MAX_LLM_REQUEST_GAP_BASELINES = 2_048;
 const MAX_TOOL_OPERATION_VALUES = 128;
 const MAX_TOOL_OPERATION_VALUE_LENGTH = 64;
+function shippedRequestLabels(labels) {
+    return { provider: labels.provider, model: labels.model, caller: labels.caller };
+}
+/**
+ * A host without registry metrics (the cloud runtime) reports these metrics
+ * with the label set they shipped with before the registry, which has no
+ * `route`; the registry's typed labels would add it.
+ */
+function countShippedShape(client, name, labels) {
+    swallow(() => client.counter(name, 1, labels));
+}
+function observeShippedShape(client, name, value, labels) {
+    swallow(() => client.histogram(name, value, labels));
+}
+/** The phases whose requests the first-output metrics measure; compaction is not one. */
+function measuredPhase(phase) {
+    return phase === 'initial' || phase === 'iteration';
+}
 const FIRST_TOKEN_EVENT_TYPES = new Set([
     'text_start',
     'text_delta',
@@ -33,8 +55,8 @@ const noopMetricsClient = {
     gauge() { },
     histogram() { },
 };
-export function newPiTurnMetrics(client, nowMs, onLLMRequestFailure, observeLLMRequest) {
-    return new PiTurnMetrics(client ?? noopMetricsClient, nowMs, client !== undefined, onLLMRequestFailure, observeLLMRequest);
+export function newPiTurnMetrics(client, nowMs, onLLMRequestFailure, observeLLMRequest, registryMetrics = false) {
+    return new PiTurnMetrics(client ?? noopMetricsClient, nowMs, client !== undefined, onLLMRequestFailure, observeLLMRequest, registryMetrics);
 }
 export function createPiTurnHistogramBucketsByName() {
     return createToolContextHistogramBucketsByName();
@@ -44,29 +66,52 @@ export function createPiTurnHistogramBucketsByName() {
  * its physical retry attempts. All labels are fixed-cardinality framework
  * classifications.
  */
-export function recordPiLLMCallMetrics(client, caller, event) {
+export function recordPiLLMCallMetrics(client, caller, event, route = 'unknown', agentKind) {
     if (!client)
         return;
     const baseLabels = {
         provider: event.provider,
         model: event.model,
         caller,
+        ...agentKindLabels(agentKind),
         scope: event.scope,
     };
-    swallow(() => client.counter('pi_llm_logical_call_total', 1, {
+    incrementMetric(client, 'pi_llm_logical_call_total', 1, {
         ...baseLabels,
+        route,
         outcome: event.final.outcome,
         errorKind: event.final.errorKind,
-        retryTriggered: String(event.retryTriggered),
-    }));
+        retryTriggered: event.retryTriggered ? 'true' : 'false',
+    });
+    recordRetryEpisode(client, baseLabels, event, event.final.outcome);
+}
+/**
+ * {@link recordPiLLMCallMetrics} for a host without registry metrics: the
+ * label set and error kinds the call metrics shipped with, no `route` and no
+ * local resource kinds.
+ */
+function recordShippedLLMCallMetrics(client, caller, event, agentKind) {
+    const final = event.legacyFinal ?? event.final;
+    const baseLabels = {
+        provider: event.provider,
+        model: event.model,
+        caller,
+        ...agentKindLabels(agentKind),
+        scope: event.scope,
+    };
+    countShippedShape(client, 'pi_llm_logical_call_total', {
+        ...baseLabels,
+        outcome: final.outcome,
+        errorKind: final.errorKind,
+        retryTriggered: event.retryTriggered ? 'true' : 'false',
+    });
+    recordRetryEpisode(client, baseLabels, event, final.outcome);
+}
+function recordRetryEpisode(client, baseLabels, event, finalOutcome) {
     const reason = event.retryReason;
     if (!event.retryTriggered || !reason)
         return;
-    const outcome = event.final.outcome === 'success'
-        ? 'recovered'
-        : event.final.outcome === 'abort'
-            ? 'cancelled'
-            : 'failed';
+    const outcome = finalOutcome === 'success' ? 'recovered' : finalOutcome === 'abort' ? 'cancelled' : 'failed';
     swallow(() => client.counter('pi_llm_retry_episode_total', 1, {
         ...baseLabels,
         reason,
@@ -74,12 +119,20 @@ export function recordPiLLMCallMetrics(client, caller, event) {
     }));
 }
 /**
- * Per-`PiTurnRunner` metrics host. Owns the concurrent-turn gauge state and
- * hands out one {@link TurnMetricsRecorder} per `runTurn` call.
+ * Per-`PiTurnRunner` metrics host. Owns the running-turn state and hands out
+ * one {@link TurnMetricsRecorder} per `runTurn` call.
  */
 export class PiTurnMetrics {
     client;
     nowMs;
+    /**
+     * The host reports with the Desktop metric registry: busy time instead of
+     * the active-turn gauge, `route` on the request metrics, the first-output,
+     * preparation, response-header and transport metrics, and local resource
+     * error kinds. Otherwise (the cloud runtime) the runner reports the Pi
+     * metrics it shipped before the registry.
+     */
+    registryMetrics;
     enabled;
     /**
      * 宿主为 LLM 物理请求失败注入的接收端，用于错误日志上报。它不依赖
@@ -88,22 +141,31 @@ export class PiTurnMetrics {
      */
     onLLMRequestFailure;
     observeLLMRequest;
-    // ponytail: gauge scope is per-runner instance — the local product path
-    // constructs a single PiTurnRunner per process, which is what the gauge is
-    // meant to describe. Move to a shared registry if multiple runners ever
-    // share one MetricsClient.
+    // Running turns of this runner. Runners that share one MetricsClient each
+    // add their own busy time, so the counter still sums to the process total.
+    // Without registry metrics they feed the per-runner pi_active_turns gauge.
     activeTurns = new Map();
+    /** `pi_turn_busy_ms_total`; only a host with registry metrics reports it. */
+    busyTime;
     assemblyFingerprints = new Map();
     lastLLMRequestSettledAtBySession = new Map();
-    constructor(client, nowMs, enabled = true, onLLMRequestFailure, observeLLMRequest) {
+    constructor(client, nowMs, enabled = true, onLLMRequestFailure, observeLLMRequest, registryMetrics = false) {
         this.client = client;
         this.nowMs = nowMs;
         this.enabled = enabled;
+        this.registryMetrics = registryMetrics;
         this.onLLMRequestFailure = onLLMRequestFailure;
         this.observeLLMRequest = observeLLMRequest;
+        // Accrues once per report and at every turn begin and end.
+        this.busyTime = registryMetrics
+            ? createBusyTimeAccumulator('pi_turn_busy_ms_total', {
+                sink: enabled ? client : undefined,
+                nowMs,
+            })
+            : undefined;
     }
-    beginTurn(caller, model, diagnostics) {
-        return new TurnMetricsRecorder(this, caller ?? 'unknown', model, diagnostics);
+    beginTurn(caller, model, diagnostics, turn = {}) {
+        return new TurnMetricsRecorder(this, caller ?? 'unknown', model, diagnostics, turn);
     }
     bumpActiveTurns(caller, delta) {
         const next = Math.max(0, (this.activeTurns.get(caller) ?? 0) + delta);
@@ -113,7 +175,10 @@ export class PiTurnMetrics {
         else {
             this.activeTurns.set(caller, next);
         }
-        this.client.gauge('pi_active_turns', next, { caller });
+        if (this.busyTime)
+            this.busyTime.set({ caller }, next);
+        else
+            this.client.gauge('pi_active_turns', next, { caller });
     }
     observeLLMRequestStarted(sessionId, startedAt) {
         const previous = this.lastLLMRequestSettledAtBySession.get(sessionId);
@@ -176,12 +241,18 @@ export class PiTurnMetrics {
 }
 /**
  * Per-turn recorder. `PiTurnRunner.runTurn` creates one before any work and
- * always calls {@link finish} in a `finally`, so turn totals/gauges stay
- * balanced on every exit path (completed / failed / aborted / thrown).
+ * always calls {@link finish} in a `finally`, so turn totals and busy time
+ * stay balanced on every exit path (completed / failed / aborted / thrown).
  */
 export class TurnMetricsRecorder {
     owner;
     caller;
+    route;
+    /** `{ agentKind }` when the host classified the Turn; empty keeps the legacy label set. */
+    agentLabels;
+    agentKind;
+    wake;
+    modelId;
     turnLabels;
     turnStartedAt;
     diagnostics;
@@ -202,17 +273,39 @@ export class TurnMetricsRecorder {
     // The provider result object is also carried by pi's message_end event. Keep the
     // physical request duration beside that identity until EventBridge materialises usage.
     requestDurationsMs = new WeakMap();
-    constructor(owner, caller, model, diagnostics) {
+    // First-output marks of this turn; they go away with the recorder.
+    timing;
+    runningAtMs;
+    firstRequestStarted = false;
+    compactedBeforeFirstRequest = false;
+    turnFirstOutputRecorded = false;
+    constructor(owner, caller, model, diagnostics, turn = {}) {
         this.owner = owner;
         this.caller = caller;
+        this.route = turn.route ?? 'unknown';
+        this.timing = turn.timing;
+        this.agentKind = turn.agentKind;
+        this.agentLabels = agentKindLabels(turn.agentKind);
+        this.wake = turn.wake ?? 'system';
+        this.modelId = String(model.id);
         this.turnLabels = {
             provider: String(model.provider),
-            model: String(model.id),
+            model: this.modelId,
             caller,
+            ...this.agentLabels,
         };
         this.turnStartedAt = owner.nowMs();
         this.diagnostics = diagnostics;
         swallow(() => owner.bumpActiveTurns(caller, +1));
+        // The first visible text may come in a later attempt of the turn, after
+        // this recorder finished: the binding outlives it with the turn's mark.
+        if (this.timing && owner.registryMetrics) {
+            turn.visibleText?.bind(() => swallow(() => this.observeFirstVisibleText()));
+        }
+    }
+    /** The turn's running status is written: ends the `persisting` stage. */
+    markRunning() {
+        this.runningAtMs ??= this.owner.nowMs();
     }
     /**
      * Wrap the fully composed streamFn so one LLM request maps to exactly one
@@ -221,12 +314,18 @@ export class TurnMetricsRecorder {
     wrapStreamFn(inner, settings = {}) {
         const recordTerminalFailure = settings.recordTerminalFailure ?? true;
         return (async (model, context, streamOptions) => {
-            const labels = {
+            const requestLabels = {
                 provider: String(model.provider),
                 model: String(model.id),
                 caller: this.caller,
+                route: this.route,
+                ...this.agentLabels,
             };
             const requestStartedAt = this.owner.nowMs();
+            const { registryMetrics } = this.owner;
+            const phase = readTurnRequestPhase(streamOptions);
+            if (registryMetrics)
+                swallow(() => this.observeRequestStarted(phase, requestStartedAt));
             const interRequestGapMs = this.owner.observeLLMRequestStarted(this.diagnostics.sessionId, requestStartedAt);
             const settlementObserver = swallowValue(() => this.owner.observeLLMRequest?.({
                 sessionId: this.diagnostics.sessionId,
@@ -239,6 +338,17 @@ export class TurnMetricsRecorder {
             let providerError;
             let hasProviderError = false;
             const callerOnProviderError = streamOptions?.onProviderError;
+            const callerOnResponse = streamOptions?.onResponse;
+            let responseObserved = false;
+            // Providers call onResponse once the response headers arrive, before any
+            // event; the Google providers only with the first stream chunk.
+            const observeResponse = async (response, observedModel) => {
+                if (!responseObserved) {
+                    responseObserved = true;
+                    swallow(() => this.observeResponseHeaders(phase, requestLabels, requestStartedAt, response));
+                }
+                await callerOnResponse?.(response, observedModel);
+            };
             const observedStreamOptions = {
                 ...streamOptions,
                 onProviderError(error, observedModel) {
@@ -246,10 +356,16 @@ export class TurnMetricsRecorder {
                     hasProviderError = true;
                     swallow(() => callerOnProviderError?.(error, observedModel));
                 },
+                ...(registryMetrics ? { onResponse: observeResponse } : {}),
             };
             swallow(() => this.owner.observeAssembly(this.caller, model, this.diagnostics, context));
             swallow(() => this.recordToolContextResidency(model, context.messages));
-            swallow(() => this.owner.client.counter('pi_llm_request_total', 1, labels));
+            if (registryMetrics) {
+                incrementMetric(this.owner.client, 'pi_llm_request_total', 1, requestLabels);
+            }
+            else {
+                countShippedShape(this.owner.client, 'pi_llm_request_total', this.shippedLabels(requestLabels));
+            }
             let stream;
             try {
                 stream = await inner(model, context, observedStreamOptions);
@@ -257,7 +373,7 @@ export class TurnMetricsRecorder {
             catch (err) {
                 // StreamFn contract says failures should be encoded in the stream,
                 // but custom streamFns may still throw — count it, then rethrow.
-                swallow(() => this.recordLLMSettled(labels, requestStartedAt, model, undefined, err, hasProviderError ? providerError : undefined, recordTerminalFailure, interRequestGapMs, settlementObserver));
+                swallow(() => this.recordLLMSettled(requestLabels, requestStartedAt, model, undefined, err, hasProviderError ? providerError : undefined, recordTerminalFailure, interRequestGapMs, settlementObserver));
                 throw err;
             }
             // A custom stream may throw from iteration without ever resolving its
@@ -268,16 +384,27 @@ export class TurnMetricsRecorder {
                 Promise.resolve().then(() => stream.result()),
                 iteratorFailure.promise,
             ]).then((final) => {
-                swallow(() => this.recordLLMSettled(labels, requestStartedAt, model, final, undefined, hasProviderError ? providerError : undefined, recordTerminalFailure, interRequestGapMs, settlementObserver));
+                swallow(() => this.recordLLMSettled(requestLabels, requestStartedAt, model, final, undefined, hasProviderError ? providerError : undefined, recordTerminalFailure, interRequestGapMs, settlementObserver));
                 return final;
             }, (err) => {
-                swallow(() => this.recordLLMSettled(labels, requestStartedAt, model, undefined, err, hasProviderError ? providerError : undefined, recordTerminalFailure, interRequestGapMs, settlementObserver));
+                swallow(() => this.recordLLMSettled(requestLabels, requestStartedAt, model, undefined, err, hasProviderError ? providerError : undefined, recordTerminalFailure, interRequestGapMs, settlementObserver));
                 throw err;
             });
             this.pendingSettlements.push(observedResult.catch(() => undefined));
-            return observeFirstToken(stream, observedResult, () => {
-                const observedAt = this.owner.nowMs();
-                swallow(() => this.owner.client.histogram('pi_llm_first_token_ms', observedAt - requestStartedAt, labels));
+            return observeFirstToken(stream, observedResult, {
+                onFirstToken: () => {
+                    observeMetric(this.owner.client, 'pi_llm_first_token_ms', this.owner.nowMs() - requestStartedAt, {
+                        provider: requestLabels.provider,
+                        model: requestLabels.model,
+                        caller: this.caller,
+                        ...this.agentLabels,
+                    });
+                },
+                ...(registryMetrics
+                    ? {
+                        onFirstOutput: () => swallow(() => this.observeFirstOutput(phase, requestLabels, requestStartedAt)),
+                    }
+                    : {}),
             }, iteratorFailure.reject);
         });
     }
@@ -288,14 +415,26 @@ export class TurnMetricsRecorder {
     }
     /** Observe only the final logical call outcome, without recounting provider requests. */
     wrapLogicalStreamFn(inner, settings = {}) {
-        const recordTerminalFailure = settings.recordTerminalFailure ?? true;
+        const recordFailureByDefault = settings.recordTerminalFailure ?? true;
         return (async (model, context, options) => {
+            // A preempted call settles as aborted while its Turn goes on; it is not a failure.
+            const recordsFailure = () => recordFailureByDefault && !isLLMCallPreempted(options?.signal);
+            // The latest provider error of this logical call, for its system error code only.
+            let providerError;
+            const callerOnProviderError = options?.onProviderError;
+            const observedOptions = {
+                ...options,
+                onProviderError(error, observedModel) {
+                    providerError = error;
+                    swallow(() => callerOnProviderError?.(error, observedModel));
+                },
+            };
             let stream;
             try {
-                stream = await inner(model, context, options);
+                stream = await inner(model, context, observedOptions);
             }
             catch (error) {
-                if (recordTerminalFailure) {
+                if (recordsFailure()) {
                     swallow(() => this.recordLogicalLLMFailure(undefined, error));
                 }
                 throw error;
@@ -305,18 +444,107 @@ export class TurnMetricsRecorder {
                 Promise.resolve().then(() => stream.result()),
                 iteratorFailure.promise,
             ]).then((final) => {
-                if (recordTerminalFailure) {
-                    swallow(() => this.recordLogicalLLMFailure(final));
+                if (recordsFailure()) {
+                    swallow(() => this.recordLogicalLLMFailure(final, undefined, providerError));
                 }
                 return final;
             }, (error) => {
-                if (recordTerminalFailure) {
+                if (recordsFailure()) {
                     swallow(() => this.recordLogicalLLMFailure(undefined, error));
                 }
                 throw error;
             });
             this.pendingSettlements.push(observedResult.catch(() => undefined));
-            return observeFirstToken(stream, observedResult, () => { }, iteratorFailure.reject);
+            return observeFirstToken(stream, observedResult, {}, iteratorFailure.reject);
+        });
+    }
+    /**
+     * The first request of a phase other than compaction ends preparation; a
+     * compaction request before it marks the turn as compacted.
+     */
+    observeRequestStarted(phase, startedAtMs) {
+        if (this.firstRequestStarted)
+            return;
+        if (phase === 'compaction') {
+            this.compactedBeforeFirstRequest = true;
+            return;
+        }
+        if (phase !== 'initial')
+            return;
+        this.firstRequestStarted = true;
+        if (!this.timing)
+            return;
+        const stages = turnPrepareStages(this.timing, {
+            runningAtMs: this.runningAtMs,
+            firstRequestAtMs: startedAtMs,
+            compacted: this.compactedBeforeFirstRequest,
+        });
+        for (const { stage, ms } of stages) {
+            observeMetric(this.owner.client, 'pi_turn_prepare_ms', ms, {
+                stage,
+                caller: this.caller,
+                wake: this.wake,
+                ...this.agentLabels,
+            });
+        }
+    }
+    observeResponseHeaders(phase, labels, startedAtMs, response) {
+        if (!measuredPhase(phase))
+            return;
+        const { client } = this.owner;
+        const waitMs = this.owner.nowMs() - startedAtMs;
+        const { route, model, caller } = labels;
+        observeMetric(client, 'pi_llm_response_header_ms', waitMs, { route, model, caller });
+        if (route !== 'managed_token_plan')
+            return;
+        const timing = parseGatewayServerTiming(responseHeader(response.headers, 'server-timing'));
+        const transportMs = managedTransportMs(waitMs, timing);
+        if (transportMs !== undefined) {
+            observeMetric(client, 'pi_llm_transport_ms', transportMs, { model, caller });
+        }
+    }
+    observeFirstOutput(phase, labels, startedAtMs) {
+        if (!measuredPhase(phase))
+            return;
+        const { client } = this.owner;
+        const now = this.owner.nowMs();
+        const { route, model, caller } = labels;
+        observeMetric(client, 'pi_llm_first_output_ms', now - startedAtMs, {
+            route,
+            model,
+            caller,
+            phase,
+            ...this.agentLabels,
+        });
+        if (phase !== 'initial' || this.turnFirstOutputRecorded || !this.timing)
+            return;
+        this.turnFirstOutputRecorded = true;
+        const sinceAcceptedMs = now - this.timing.acceptedAtMs;
+        if (!Number.isFinite(sinceAcceptedMs) || sinceAcceptedMs < 0)
+            return;
+        observeMetric(client, 'pi_turn_first_output_ms', sinceAcceptedMs, {
+            route,
+            model,
+            caller,
+            compacted: this.compactedBeforeFirstRequest ? 'true' : 'false',
+            wake: this.wake,
+            ...this.agentLabels,
+        });
+    }
+    /** The host marked the turn's first visible text; labelled like `pi_turn_first_output_ms`. */
+    observeFirstVisibleText() {
+        if (!this.timing)
+            return;
+        const sinceAcceptedMs = this.owner.nowMs() - this.timing.acceptedAtMs;
+        if (!Number.isFinite(sinceAcceptedMs) || sinceAcceptedMs < 0)
+            return;
+        observeMetric(this.owner.client, 'pi_turn_first_visible_text_ms', sinceAcceptedMs, {
+            route: this.route,
+            model: this.modelId,
+            caller: this.caller,
+            compacted: this.compactedBeforeFirstRequest ? 'true' : 'false',
+            wake: this.wake,
+            ...this.agentLabels,
         });
     }
     observeRetry(event) {
@@ -324,7 +552,15 @@ export class TurnMetricsRecorder {
         if (!reason)
             return;
         const labels = { ...this.turnLabels, reason, scope: event.scope };
-        if (event.status === 'waiting') {
+        if (event.status === 'waiting' && event.waitingFor === 'network') {
+            // An offline device is not a provider failure: keep it out of the retry
+            // rate and backoff distribution, which alert on the service.
+            swallow(() => this.owner.client.counter('pi_llm_offline_wait_total', 1, {
+                ...this.turnLabels,
+                scope: event.scope,
+            }));
+        }
+        else if (event.status === 'waiting') {
             swallow(() => this.owner.client.counter('pi_llm_retry_total', 1, labels));
             const { delayMs } = event;
             if (delayMs !== undefined) {
@@ -336,7 +572,12 @@ export class TurnMetricsRecorder {
         }
     }
     observeLLMCall(event) {
-        recordPiLLMCallMetrics(this.owner.client, this.caller, event);
+        if (this.owner.registryMetrics) {
+            recordPiLLMCallMetrics(this.owner.client, this.caller, event, this.route, this.agentKind);
+        }
+        else {
+            recordShippedLLMCallMetrics(this.owner.client, this.caller, event, this.agentKind);
+        }
     }
     /** Second lightweight subscription — tool/loop/batch observations. */
     observeAgent(agent, runtimeTools) {
@@ -375,13 +616,21 @@ export class TurnMetricsRecorder {
     forgetLLMFailureObservation() {
         this.llmFailure = undefined;
     }
-    tryRecordTerminalFailure(provenance) {
-        if (provenance.errorSource !== 'llm') {
-            this.firstNonLlmTerminalFailure ??= provenance;
+    /**
+     * Record the first terminal failure of the turn. `cause` is the error behind
+     * it: a local resource it ran out of replaces the kind, never the source.
+     */
+    tryRecordTerminalFailure(provenance, cause) {
+        const localResource = this.owner.registryMetrics
+            ? classifyLocalResourceError(cause)
+            : undefined;
+        const recorded = localResource ? { ...provenance, errorKind: localResource } : provenance;
+        if (recorded.errorSource !== 'llm') {
+            this.firstNonLlmTerminalFailure ??= recorded;
         }
         if (this.terminalFailure)
             return false;
-        this.terminalFailure = provenance;
+        this.terminalFailure = recorded;
         return true;
     }
     recordDegradation(errorSource, errorKind, err) {
@@ -399,7 +648,8 @@ export class TurnMetricsRecorder {
     async settle() {
         await Promise.all(this.pendingSettlements);
     }
-    finish(termination, abortReason) {
+    /** `thrown` is what `runTurn` threw when it ended without a terminal frame. */
+    finish(termination, abortReason, thrown) {
         swallow(() => {
             if (this.finished)
                 return;
@@ -409,8 +659,13 @@ export class TurnMetricsRecorder {
             const caller = this.caller;
             const labels = this.turnLabels;
             this.owner.bumpActiveTurns(caller, -1);
-            // Prometheus freezes a metric family's label keys. Keep the legacy
-            // family schema stable and put model dimensions under a new name.
+            // pi_turn_total keeps its caller-only labels; the model dimensions live
+            // on pi_turn_model_total, which shipped with them. Adding a bounded label
+            // in place would also work: gateway-app accepts one metric's series with
+            // different label keys (v0.2.51), and sums over the old labels stay the
+            // same. `agentKind` rides only on the newer families (turnLabels,
+            // pi_turn_failure_total and the pi_tool_call_total / _error_total
+            // counters), never on pi_turn_total / pi_turn_error_total.
             client.counter('pi_turn_total', 1, { caller });
             client.counter('pi_turn_model_total', 1, labels);
             const isCancellation = termination?.kind === 'aborted';
@@ -419,10 +674,13 @@ export class TurnMetricsRecorder {
                 failure = this.firstNonLlmTerminalFailure;
             }
             if (!failure && termination?.kind === 'failed' && this.llmFailure) {
-                failure = { errorSource: 'llm', errorKind: this.llmFailure.metricKind };
+                failure = { errorSource: 'llm', errorKind: this.failureKind(this.llmFailure) };
             }
             else if (!failure && termination === undefined) {
-                failure = { errorSource: 'runner', errorKind: 'runtime_error' };
+                const localResource = this.owner.registryMetrics
+                    ? classifyLocalResourceError(thrown)
+                    : undefined;
+                failure = { errorSource: 'runner', errorKind: localResource ?? 'runtime_error' };
             }
             else if (!failure && termination?.kind === 'failed') {
                 failure = { errorSource: 'unknown', errorKind: 'unknown' };
@@ -434,7 +692,11 @@ export class TurnMetricsRecorder {
                     caller,
                     errorKind: failure.errorKind,
                 });
-                client.counter('pi_turn_failure_total', 1, { caller, ...failure });
+                incrementMetric(client, 'pi_turn_failure_total', 1, {
+                    caller,
+                    ...this.agentLabels,
+                    ...failure,
+                });
             }
             if (isCancellation) {
                 // Preserve the legacy error family while keeping cancellations out of
@@ -466,7 +728,9 @@ export class TurnMetricsRecorder {
                 const toolName = this.metricToolName(event.toolName);
                 this.toolStartedAt.set(event.toolCallId, now);
                 this.batchStartedAt ??= now;
-                client.counter('pi_tool_call_total', 1, { toolName, caller });
+                // Counters carry agentKind so the dashboard can attribute assignment_*
+                // calls to Bunny; duration/batch histograms keep their legacy keys.
+                client.counter('pi_tool_call_total', 1, { toolName, caller, ...this.agentLabels });
                 const operation = this.metricToolOperation(toolName, event.args);
                 this.toolIOStarted.set(event.toolCallId, {
                     toolName,
@@ -490,6 +754,7 @@ export class TurnMetricsRecorder {
                     client.counter('pi_tool_call_error_total', 1, {
                         toolName,
                         caller,
+                        ...this.agentLabels,
                         errorKind: toolErrorKind(event.result),
                     });
                 }
@@ -589,8 +854,9 @@ export class TurnMetricsRecorder {
             caller: this.caller,
         });
     }
-    recordLLMSettled(labels, requestStartedAt, model, final, thrown, providerError, recordTerminalFailure = true, interRequestGapMs, settlementObserver) {
+    recordLLMSettled(requestLabels, requestStartedAt, model, final, thrown, providerError, recordTerminalFailure = true, interRequestGapMs, settlementObserver) {
         const { client } = this.owner;
+        const labels = this.shippedLabels(requestLabels);
         const responseCompletedAt = this.owner.nowMs();
         swallow(() => this.owner.observeLLMRequestSettled(this.diagnostics.sessionId, responseCompletedAt));
         const requestDurationMs = responseCompletedAt - requestStartedAt;
@@ -602,11 +868,16 @@ export class TurnMetricsRecorder {
         if (settlementObserver) {
             swallow(() => settlementObserver({ endedAtMs: responseCompletedAt, cacheOutcome }));
         }
-        client.histogram('pi_llm_response_ms', requestDurationMs, labels);
+        if (this.owner.registryMetrics) {
+            observeMetric(client, 'pi_llm_response_ms', requestDurationMs, requestLabels);
+        }
+        else {
+            observeShippedShape(client, 'pi_llm_response_ms', requestDurationMs, labels);
+        }
         if (final && Number.isFinite(requestDurationMs) && requestDurationMs > 0) {
             this.requestDurationsMs.set(final, requestDurationMs);
         }
-        const observation = observeLLMFailure(final, thrown);
+        const observation = observeLLMFailure(final, thrown, providerError);
         const gapClass = classifyLLMGap(interRequestGapMs);
         swallow(() => client.counter('pi_llm_cache_outcome_total', 1, {
             ...labels,
@@ -623,7 +894,10 @@ export class TurnMetricsRecorder {
         if (observation) {
             if (recordTerminalFailure) {
                 this.llmFailure ??= observation;
-                this.tryRecordTerminalFailure({ errorSource: 'llm', errorKind: observation.metricKind });
+                this.tryRecordTerminalFailure({
+                    errorSource: 'llm',
+                    errorKind: this.failureKind(observation),
+                });
             }
             client.counter('pi_llm_request_error_total', 1, {
                 ...labels,
@@ -655,16 +929,24 @@ export class TurnMetricsRecorder {
             }
         }
     }
-    recordLogicalLLMFailure(final, thrown) {
+    recordLogicalLLMFailure(final, thrown, providerError) {
         // A request the host refused to send never reached a provider and ends
         // the Turn normally; it is neither an LLM failure nor a Turn failure.
         if (thrown instanceof LLMRequestStoppedError)
             return;
-        const observation = observeLLMFailure(final, thrown);
+        const observation = observeLLMFailure(final, thrown, providerError);
         if (!observation)
             return;
         this.llmFailure ??= observation;
-        this.tryRecordTerminalFailure({ errorSource: 'llm', errorKind: observation.metricKind });
+        this.tryRecordTerminalFailure({ errorSource: 'llm', errorKind: this.failureKind(observation) });
+    }
+    /** A turn failure's kind: local resource kinds only for hosts with registry metrics. */
+    failureKind(observation) {
+        return this.owner.registryMetrics ? observation.failureKind : observation.metricKind;
+    }
+    /** Request labels without `route`, as the metrics next to the request ones report them. */
+    shippedLabels(requestLabels) {
+        return { ...shippedRequestLabels(requestLabels), ...this.agentLabels };
     }
 }
 function classifyLLMGap(gapMs) {
@@ -672,17 +954,22 @@ function classifyLLMGap(gapMs) {
         return 'first_request';
     return gapMs < 300_000 ? 'lt_5m' : 'gte_5m';
 }
-function observeLLMFailure(final, thrown) {
+function observeLLMFailure(final, thrown, providerError) {
     if (thrown === undefined && final?.stopReason !== 'error' && final?.stopReason !== 'aborted') {
         return undefined;
     }
     const normalized = normalizeLLMError({
         ...(thrown !== undefined ? { raw: thrown } : {}),
+        ...(providerError !== undefined ? { providerError } : {}),
         finishReason: final?.stopReason,
         errorMessage: final?.errorMessage,
         explicitAbort: final?.stopReason === 'aborted',
     });
-    return { normalized, metricKind: toLLMMetricErrorKind(normalized.facts) };
+    return {
+        normalized,
+        metricKind: toLLMMetricErrorKind(normalized.facts),
+        failureKind: toLLMFailureErrorKind(normalized.facts),
+    };
 }
 function emitTokens(client, labels, kind, count) {
     if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0)
@@ -729,12 +1016,13 @@ function toolErrorKind(result) {
     return 'error';
 }
 /**
- * Duck-type stream wrapper: forwards iteration/result untouched and fires
- * `onFirstToken` once on the first content-bearing event. The agent loop only
- * consumes `[Symbol.asyncIterator]()` and `result()`.
+ * Duck-type stream wrapper: forwards iteration/result untouched and fires each
+ * observer once, when the turn reads its first matching event. The agent loop
+ * only consumes `[Symbol.asyncIterator]()` and `result()`.
  */
-function observeFirstToken(stream, result, onFirstToken, onIteratorError) {
-    let seen = false;
+function observeFirstToken(stream, result, observers, onIteratorError) {
+    let seenToken = false;
+    let seenOutput = false;
     const wrapped = {
         [Symbol.asyncIterator]() {
             const inner = createObservedIterator(stream, onIteratorError);
@@ -742,9 +1030,14 @@ function observeFirstToken(stream, result, onFirstToken, onIteratorError) {
                 next: async (...args) => {
                     try {
                         const step = await inner.next(...args);
-                        if (!seen && !step.done && step.value && FIRST_TOKEN_EVENT_TYPES.has(step.value.type)) {
-                            seen = true;
-                            onFirstToken();
+                        const event = step.done ? undefined : step.value;
+                        if (event && !seenToken && FIRST_TOKEN_EVENT_TYPES.has(event.type)) {
+                            seenToken = true;
+                            observers.onFirstToken?.();
+                        }
+                        if (event && !seenOutput && isEffectiveOutputEvent(event)) {
+                            seenOutput = true;
+                            observers.onFirstOutput?.();
                         }
                         return step;
                     }
@@ -779,6 +1072,9 @@ function newIteratorFailure() {
         rejectPromise = reject;
     });
     return { promise, reject: rejectPromise };
+}
+function agentKindLabels(agentKind) {
+    return agentKind ? { agentKind } : {};
 }
 /** Metrics must never break the product path — not even on client bugs. */
 function swallow(fn) {

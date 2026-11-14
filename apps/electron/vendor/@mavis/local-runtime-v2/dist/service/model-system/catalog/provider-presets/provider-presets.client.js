@@ -1,4 +1,5 @@
-import { DEFAULT_MODEL_PRESETS, getRuntimePresetKey, getRuntimeRegion } from '@mavis/config';
+import { DEFAULT_MODEL_PRESETS, getRuntimeBuildEnv, getRuntimePresetKey, getRuntimeRegion, } from '@mavis/config';
+import { applyPreCommonConfigOverrides, withPreCommonConfigKeys, } from '@mavis/shared/common-config-pre-override';
 import { MODELS_DEV_CATALOG_SOURCE_URL } from '@mavis/shared/models-dev';
 export const MODELS_DEV_URL = MODELS_DEV_CATALOG_SOURCE_URL;
 const MODELS_DEV_TIMEOUT_MS = 8_000;
@@ -73,12 +74,14 @@ async function fetchModelsDevDescriptor(options) {
 }
 /**
  * Reads one Desktop `common_config` key (Apollo) and returns its raw value.
+ * Staging builds apply the shared pre_<key> override like every other reader.
  * Throws on HTTP or business failure; callers own parsing and fallback.
  */
 export async function fetchCommonConfig(key, options = {}) {
     const origin = (options.originGetter ?? resolveCommonConfigOrigin)();
+    const readsPreKeys = options.readsPreKeys ?? getRuntimeBuildEnv() === 'staging';
     const url = new URL(COMMON_CONFIG_PATH, origin);
-    url.searchParams.set('filter', key);
+    url.searchParams.set('filter', readsPreKeys ? withPreCommonConfigKeys(key) : key);
     url.searchParams.set('client', 'desktop');
     const response = await (options.fetchImpl ?? fetch)(url, {
         headers: commonConfigRequestHeaders(options.previewSecret, options.lane),
@@ -88,8 +91,12 @@ export async function fetchCommonConfig(key, options = {}) {
         throw new Error(`common_config returned HTTP ${response.status}`);
     const body = await response.json();
     assertCommonConfigBusinessSuccess(body);
-    const data = isRecord(body) && isRecord(body.data) ? body.data : undefined;
-    return data?.[key];
+    return readCommonConfigKey(body, key, readsPreKeys);
+}
+function readCommonConfigKey(body, key, readsPreKeys) {
+    if (!isRecord(body) || !isRecord(body.data))
+        return undefined;
+    return (readsPreKeys ? applyPreCommonConfigOverrides(body.data) : body.data)[key];
 }
 export async function fetchPinnedProviderIdsConfig(options) {
     return fetchCommonConfig(PINNED_PROVIDER_IDS_CONFIG_KEY, options);

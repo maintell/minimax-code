@@ -2,6 +2,12 @@ const LOCAL_RUNTIME_ORIGIN = 'http://rc-bridge.local';
 const REMOTE_CONTROL_EVENT_STREAM_SCOPE = 'remote-control';
 const EVENT_STREAM_SCOPE_QUERY = '_mavis_stream_scope';
 /**
+ * Local-only events never sent upstream. Worktree creation progress carries
+ * local paths and Git output at ~150ms per frame; no controller renders it, and
+ * a `workspace.*` frame would make every controller re-pull the resource snapshot.
+ */
+const LOCAL_ONLY_EVENT_TYPES = new Set(['workspace.worktree.progress']);
+/**
  * Electron host adapter for the public Global Events SSE contract.
  *
  * This is the only RC layer that knows the generated DesktopService frame
@@ -31,6 +37,8 @@ export function createRemoteControlGlobalEventSource(invoke, loadTransport) {
             for await (const frame of stream.frames) {
                 const decoded = decodeGlobalEventFrame(frame);
                 if (decoded?.kind !== 'event')
+                    continue;
+                if (LOCAL_ONLY_EVENT_TYPES.has(decoded.event.type))
                     continue;
                 yield {
                     type: decoded.event.type,

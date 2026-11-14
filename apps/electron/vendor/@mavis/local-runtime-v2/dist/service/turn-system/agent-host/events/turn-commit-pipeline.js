@@ -1,6 +1,7 @@
 import { RuntimeEventStatus, RuntimeEventType, } from '@mavis/agent-core/protocol';
 import { readCompactionAttemptId, readCompactionLifecycleMetadata, } from '../compaction/context-compaction.js';
 import { buildHostFailedEvent } from './host-failed-event.js';
+import { UnmadeSegmentRebuildError, } from '../history/committed-history-writer.js';
 import { AgentHistoryOperationIdentityError, AgentHistoryOperationReplayCoordinator, } from '../history/history-operation-replay.js';
 import { captureSemanticSnapshot } from '../history/semantic-identity.js';
 import { TurnCommittedHistoryState } from '../history/turn-committed-history-state.js';
@@ -112,7 +113,10 @@ export class TurnCommitPipeline {
             }
         });
     };
-    onHistoryChanged = (change) => this.enqueueHistory(change, false);
+    onHistoryChanged = (change) => {
+        const kept = withoutStoppedEmptyAssistantTail(change, this.dependencies.lease.signal);
+        return kept ? this.enqueueHistory(kept, false) : Promise.resolve();
+    };
     registerCanonicalUserMessageIds = (messageIds, batchId) => {
         this.userMessageIdentities.register(messageIds, batchId);
     };
@@ -185,19 +189,41 @@ export class TurnCommitPipeline {
         const replay = this.historyOperations.get(prepared.value.operationId);
         if (replay)
             return this.historyReplay.resolve(replay, prepared.value);
-        const execution = this.historyReplay.enqueuePrepared(prepared.value, () => this.commitAndHandleHistory(prepared.value.change, (commit) => {
-            this.committedHistoryState.record(commit);
-        }));
+        const execution = this.enqueueHistoryCommit(prepared.value);
         this.historyOperations.set(prepared.value.operationId, {
             fingerprint: prepared.value.fingerprint,
             execution,
         });
         return execution;
     }
+    /**
+     * Commits a change in order. A segment rebuild that was not made rejects
+     * without holding up the lane: the history is as it was, so the Turn's
+     * later events and records still commit.
+     */
+    async enqueueHistoryCommit(prepared) {
+        const outcome = {};
+        await this.historyReplay.enqueuePrepared(prepared, async () => {
+            try {
+                await this.commitAndHandleHistory(prepared.change, (commit) => {
+                    this.committedHistoryState.record(commit);
+                });
+            }
+            catch (error) {
+                if (!(error instanceof UnmadeSegmentRebuildError))
+                    throw error;
+                outcome.unmade = error;
+            }
+        });
+        if (outcome.unmade)
+            throw outcome.unmade;
+    }
     async commitAndHandleHistory(change, onCommitted) {
         const compactionAttemptId = readCompactionAttemptId(change.metadata);
+        const baseIdentity = this.committedHistoryState.currentIdentityVectorValue;
         await this.dependencies.committedHistory.commit(this.dependencies.context, change, {
             ...(compactionAttemptId ? { compactionAttemptId } : {}),
+            ...(baseIdentity ? { baseIdentity } : {}),
             onDurableCommitted: (committed) => {
                 onCommitted?.({
                     revision: committed.committedRevision,
@@ -219,7 +245,8 @@ export class TurnCommitPipeline {
         });
     }
     async deliverTerminal(event, outcome) {
-        const result = await this.dependencies.events.handleRuntimeEvent(this.dependencies.context, event);
+        // An aborted Turn's lease signal carries why it stopped, such as the runtime shutting down.
+        const result = await this.dependencies.events.handleRuntimeEvent(this.dependencies.context, event, ...(outcome.status === 'aborted' ? [this.dependencies.lease.signal] : []));
         const confirmation = new TerminalConfirmation();
         confirmation.observe(event, result);
         confirmation.confirm(outcome);
@@ -447,6 +474,30 @@ function validateHistoryOperation(change, turnId, allowHostReservedOperation) {
     if (expectedAppend !== actualAppend) {
         throw new AgentHistoryOperationIdentityError('kind-mismatch', operationId);
     }
+}
+/**
+ * A stopped Turn's model call ends with an `aborted` assistant message. When it
+ * carries no text and no tool call there is nothing to keep: abort settlement
+ * would only remove it again, which costs a full history rewrite. Drop it here
+ * so a stop with nothing approved never touches canonical history.
+ */
+function withoutStoppedEmptyAssistantTail(change, signal) {
+    if (change.reason !== 'messageDelta' || !signal.aborted)
+        return change;
+    const tailIndex = change.messages.length - 1;
+    const tail = change.messages[tailIndex];
+    if (!tail || !isEmptyAbortedAssistant(tail))
+        return change;
+    if (change.identityHints?.some(({ index }) => index === tailIndex))
+        return change;
+    if (tailIndex === 0)
+        return undefined;
+    return { ...change, messages: change.messages.slice(0, tailIndex) };
+}
+function isEmptyAbortedAssistant(message) {
+    if (message.role !== 'assistant' || message.stopReason !== 'aborted')
+        return false;
+    return message.content.every((part) => part.type === 'thinking' || (part.type === 'text' && !part.text.trim()));
 }
 function fallbackHistoryOperation(turnId, sequence, change) {
     const compaction = readCompactionLifecycleMetadata(change.metadata);

@@ -270,6 +270,8 @@ function collectWebProjections(result, input, context) {
 function readInputWebUrl(input) {
     const inputRecord = readRecord(parseJsonValue(input));
     const nestedInput = readRecord(parseJsonValue(inputRecord?.arguments)) ??
+        // mcp_invoke may carry its target arguments as the `arguments_json` string.
+        readRecord(parseJsonValue(inputRecord?.arguments_json)) ??
         readRecord(parseJsonValue(inputRecord?.args)) ??
         readRecord(parseJsonValue(inputRecord?.parameters));
     return safeHttpUrl(readString(inputRecord?.url) ??

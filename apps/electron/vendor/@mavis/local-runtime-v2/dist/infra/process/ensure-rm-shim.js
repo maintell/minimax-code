@@ -40,6 +40,7 @@
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { resolveBashEnvPolicy } from '@mavis/agent-core/bash-subprocess-env';
+import { resolveMcodeToolsHostBinDir } from './mcode-tools-host-bin.js';
 /**
  * Delegates to the sibling `../bin/mavis-trash` rather than an absolute path so
  * the shim keeps working if the dataDir is moved or mounted elsewhere.
@@ -107,6 +108,11 @@ export function resolveManagedBinDir(dataDir) {
  * prepends the same directory into `process.env.PATH`, but that happens too
  * early: a login shell re-running the user's rc files can reorder it back.
  *
+ * A Desktop host that owns a per-App launcher directory (see
+ * `mcode-tools-host-bin.ts`) gets it in front of `<dataDir>/bin`: several Desktop
+ * packages may share one dataDir, and only that directory is guaranteed to hold
+ * this App's own launcher.
+ *
  * Unlike the rm shim, a missing launcher deliberately has NO spawn preflight.
  * Blocking every bash spawn because `<dataDir>/bin` is absent would be far worse
  * than letting the command fail with its own `not found`.
@@ -114,16 +120,17 @@ export function resolveManagedBinDir(dataDir) {
 export function resolveAgentBashEnvPolicy(dataDir, platform = process.platform, nativeDelete = false) {
     if (!dataDir)
         return resolveBashEnvPolicy({});
-    const managedBinDir = resolveManagedBinDir(dataDir);
+    const hostBinDir = resolveMcodeToolsHostBinDir(dataDir, process.env, platform);
+    const managedBinDirs = [...(hostBinDir ? [hostBinDir] : []), resolveManagedBinDir(dataDir)];
     const shimDir = resolveRmShimDir(dataDir);
     if (nativeDelete) {
-        return resolveBashEnvPolicy({ prependPath: [managedBinDir], removePath: [shimDir] });
+        return resolveBashEnvPolicy({ prependPath: managedBinDirs, removePath: [shimDir] });
     }
     if (platform === 'win32')
-        return resolveBashEnvPolicy({ prependPath: [managedBinDir] });
+        return resolveBashEnvPolicy({ prependPath: managedBinDirs });
     const shimPath = path.join(shimDir, 'rm');
     return resolveBashEnvPolicy({
-        prependPath: [managedBinDir, shimDir],
+        prependPath: [...managedBinDirs, shimDir],
         spawnPreflight: () => {
             try {
                 accessSync(shimPath, constants.X_OK);

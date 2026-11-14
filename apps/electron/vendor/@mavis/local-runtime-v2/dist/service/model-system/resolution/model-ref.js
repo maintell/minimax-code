@@ -485,6 +485,64 @@ export function isThinkingEffortDisabled(value) {
     const effort = normalizeModelThinkingEffort(value)?.toLowerCase();
     return effort === 'none' || effort === 'off';
 }
+/** Request-local auxiliary policy; never changes the saved conversation selection. */
+export function withMinimumModelThinking(model, config) {
+    const effort = minimumModelThinkingEffort(model, config);
+    const capabilities = { ...model.capabilities };
+    Reflect.deleteProperty(capabilities, SELECTED_THINKING_EFFORT_CAPABILITY);
+    if (effort)
+        Reflect.set(capabilities, SELECTED_THINKING_EFFORT_CAPABILITY, effort);
+    const result = { ...model, capabilities };
+    delete result.thinking_budgets;
+    delete result.thinking_effort;
+    return {
+        ...result,
+        thinking_level: minimumModelThinkingBudget(model, config, effort),
+        ...(effort ? { thinking_effort: effort } : {}),
+    };
+}
+function minimumModelThinkingEffort(model, config) {
+    const options = normalizeModelThinkingEffortOptions(config?.thinking?.effortOptions) ?? [];
+    const fixedEffort = normalizeModelThinkingEffort(config?.thinking?.defaultEffort) ??
+        (options.length === 0
+            ? (model.thinking_effort ?? readSelectedThinkingEffort(model.capabilities))
+            : undefined);
+    const disabled = options.find(isThinkingEffortDisabled) ??
+        (isThinkingEffortDisabled(fixedEffort) ? fixedEffort : undefined);
+    if (canDisableModelThinking(config, disabled))
+        return disabled ?? 'off';
+    return minimumEnabledEffort(options, fixedEffort);
+}
+function canDisableModelThinking(config, disabled) {
+    const mode = config?.thinking_config?.mode;
+    if (mode === 'forced_on')
+        return false;
+    return (mode === 'forced_off' ||
+        mode === 'switchable' ||
+        disabled !== undefined ||
+        config?.reasoning === false);
+}
+function minimumEnabledEffort(options, fixedEffort) {
+    const enabled = options.filter((effort) => !isThinkingEffortDisabled(effort) && effort !== 'default');
+    // Standard effort names have a known order. Vendor-specific names retain
+    // the catalog's order; never invent an effort the provider did not offer.
+    const order = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+    const minimum = enabled.every((effort) => order.includes(effort))
+        ? order.find((effort) => enabled.includes(effort))
+        : enabled[0];
+    return minimum ?? (isThinkingEffortDisabled(fixedEffort) ? undefined : fixedEffort);
+}
+function minimumModelThinkingBudget(model, config, effort) {
+    if (isThinkingEffortDisabled(effort))
+        return ThinkingLevel.OFF;
+    if (effort !== undefined ||
+        config?.reasoning === true ||
+        config?.thinking_config?.mode === 'forced_on')
+        return ThinkingLevel.MINIMAL;
+    return model.thinking_level === undefined || model.thinking_level === ThinkingLevel.OFF
+        ? ThinkingLevel.OFF
+        : ThinkingLevel.MINIMAL;
+}
 export function normalizeModelThinkingEffortOptions(value) {
     if (!Array.isArray(value))
         return undefined;

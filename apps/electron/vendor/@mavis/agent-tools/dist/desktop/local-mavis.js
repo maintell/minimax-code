@@ -32,23 +32,25 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     }
     return useValue ? value : void 0;
 };
-import { bindTool } from '@mavis/agent-core/tools';
+import { isCoordinatorAgent } from '@mavis/shared/agent-coordination';
+import { bindTool, TURN_TERMINATING_TOOL_RESULT_DETAIL, } from '@mavis/agent-core/tools';
 import { createDefaultTokenEstimator } from '@mavis/context-manager';
 import { z } from 'zod';
 import { normalizeMavisCommand } from '../shared/mavis-operation-classifier.js';
 import { CRON_CREATE_ME_REJECTED_MESSAGE, isCronDedicatedSessionTarget, isCronFixedSessionId, isMeSessionSentinel, } from '../shared/cron-schedule-input.js';
 import { LocalMavisToolDef } from './builtin-defs.js';
-import { LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, localMavisArchiveCall, mavisRecoveryInstruction, ptcMavisHelpOutput, ptcMavisRunCodeTool, } from './local-mavis-commands.js';
+import { COORDINATOR_LISTED_MAVIS_COMMANDS, LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, localMavisArchiveCall, mavisRecoveryInstruction, ptcMavisHelpOutput, ptcMavisRunCodeTool, } from './local-mavis-commands.js';
+import { BUNNY_MAVIS_COMMAND_HANDLERS, BUNNY_MAVIS_COMMAND_SCHEMAS, coordinatorSchedulePrompt, keepScheduleSpaceMarker, } from './local-mavis-bunny.js';
+import { BUNNY_COMMAND_REPLACEMENTS, BUNNY_WITHHELD_COMMAND_REPLACEMENTS, } from './local-mavis-coordinator-text.js';
 import { LocalMavisCronUnsupportedError, LocalMavisCronValidationError, } from './local-mavis-cron-adapter.js';
+import { failure, idString, LocalMavisRuntimeError, LocalMavisValidationError, optionalBoolean, optionalNumber, optionalString, requireSessionAdapter, success, } from './local-mavis-shared.js';
+import { sessionMessagesWindow } from './local-mavis-output-window.js';
 import { projectSessionMessagesPage, sessionMessagesView } from './local-mavis-session-messages.js';
 import { createDesktopOutputContinuation, isPtcChildCall } from './output-limit.js';
 import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 import { toAgentRequestRef } from './subagent-roles.js';
 export const DESKTOP_MANAGEMENT_MAX_TOKENS = 16_000;
 const MAVIS_TOKEN_ESTIMATOR = createDefaultTokenEstimator();
-const optionalString = z.string().optional();
-const optionalNumber = z.number().int().nonnegative().optional();
-const optionalBoolean = z.boolean().optional();
 const pageParamSchema = z.object({
     search: optionalString,
     offset: optionalNumber,
@@ -79,7 +81,6 @@ const agentUpdateSchema = z.object({
 });
 const agentDeleteSchema = z.object({ agent_name: z.string().min(1) });
 const helpSchema = z.object({});
-const idString = z.string().min(1, 'ID must be a non-empty string');
 const activeHoursSchema = z
     .object({
     start: z.string().regex(/^\d{2}:\d{2}$/, 'start must be HH:MM 24h'),
@@ -108,6 +109,10 @@ const cronResolveModelSchema = z.object({ model: z.string().trim().min(1) }).str
 const cronCreateSchema = z
     .object({
     ...cronExecutionFields,
+    space: z
+        .string()
+        .regex(/^[A-Za-z0-9_-]+$/)
+        .optional(),
     agent_name: optionalString,
     cron_name: z.string().min(1),
     schedule: z.string().min(1),
@@ -131,6 +136,10 @@ const cronSelfSchema = z.object({
 const cronOnceSchema = z
     .object({
     ...cronExecutionFields,
+    space: z
+        .string()
+        .regex(/^[A-Za-z0-9_-]+$/)
+        .optional(),
     agent_name: optionalString,
     cron_name: optionalString,
     after: optionalString,
@@ -199,12 +208,8 @@ const sessionSendSchema = z
     .object({
     session_id: idString,
     content: z.string().trim().min(1, 'content must be a non-empty string'),
-    // Default false: a send is a delivery, not a request/response call. Opt in
-    // to sync only when the reply text is required to continue.
+    // Remote targets only: a local target sends its answer back instead.
     sync: optionalBoolean,
-    // Default false: routing follows the desktop composer send preference
-    // unless the caller explicitly demands the steer entry point.
-    force_steer: optionalBoolean,
     // ssh / rc / cloud deliver through SendRemoteMessage on the target's own runtime.
     source: sessionReadSource,
     device_id: deviceIdArg,
@@ -319,6 +324,7 @@ export const LOCAL_MAVIS_COMMAND_SCHEMAS = {
     'cron trigger': cronTriggerSchema,
     'cron sessions': cronSessionsSchema,
     'cron help': helpSchema,
+    ...BUNNY_MAVIS_COMMAND_SCHEMAS,
     'session list': sessionListSchema,
     'session get': sessionGetSchema,
     'session send': sessionSendSchema,
@@ -334,6 +340,26 @@ export const LOCAL_MAVIS_COMMAND_SCHEMAS = {
     'mcp help': helpSchema,
 };
 const KNOWN_COMMANDS = [...LOCAL_MAVIS_COMMANDS, ...LOCAL_CRON_COMMANDS];
+/**
+ * The coordinator's whole mavis vocabulary is the `COORDINATOR_LISTED_MAVIS_COMMANDS`
+ * whitelist: its own space, project and task model commands plus the read-only session
+ * reads. Everything else is withheld, and mavis answers it with what to use instead.
+ *
+ * `COORDINATOR_KNOWN_COMMANDS` is what `dispatchLocalMavis` accepts, and the coordinator's own
+ * cron_* tools call it with `currentCoordinator`; it keeps the internal cron vocabulary for that
+ * path. No cron command appears in any mavis definition, and `LocalMavisTool.execute` answers
+ * every `cron ` command with CRON_TOOL_MOVED before dispatch, so this adds nothing a model reaches.
+ */
+const COORDINATOR_MAVIS_COMMANDS = COORDINATOR_LISTED_MAVIS_COMMANDS;
+const COORDINATOR_KNOWN_COMMANDS = [...COORDINATOR_LISTED_MAVIS_COMMANDS, ...LOCAL_CRON_COMMANDS];
+/**
+ * The coordinator's own arguments of shared commands: `offset` reads a long
+ * `session messages` page in windows (see `sessionMessagesWindow`). Every other
+ * Agent validates against the shared schema, where the argument does not exist.
+ */
+export const COORDINATOR_COMMAND_SCHEMAS = {
+    'session messages': sessionMessagesSchema.extend({ offset: optionalNumber }),
+};
 const HANDLERS = {
     'agent list': handleAgentList,
     'agent get': handleAgentGet,
@@ -352,6 +378,7 @@ const HANDLERS = {
     'cron trigger': handleCronTrigger,
     'cron sessions': handleCronSessions,
     'cron help': handleCronHelp,
+    ...BUNNY_MAVIS_COMMAND_HANDLERS,
     'session list': handleSessionList,
     'session get': handleSessionGet,
     'session send': handleSessionSend,
@@ -391,21 +418,37 @@ let LocalMavisTool = (() => {
             this.mcpAdapter = mcpAdapter;
         }
         async execute(ctx, input, signal) {
-            if (normalizeCommand(input.command) === 'session create') {
+            const coordinator = isCoordinatorAgent(ctx.coordination);
+            const command = normalizeCommand(input.command);
+            const withheld = BUNNY_WITHHELD_COMMAND_REPLACEMENTS[command];
+            if (coordinator && withheld) {
                 const text = JSON.stringify({
                     ok: false,
-                    command: 'session create',
+                    command,
                     error: {
                         kind: 'validation',
-                        code: 'SESSION_CREATE_MOVED',
-                        message: isCallableInRunCode(ctx, 'session_create')
-                            ? 'Search for session_create with tool_search, then call it inside run_code, e.g. await tools.session_create(args).'
-                            : 'Search for session_create with tool_search, then call mcp_invoke.',
+                        code: 'BUNNY_COMMAND_NOT_AVAILABLE',
+                        message: withheld,
                     },
                 });
                 return mavisRefusal(text);
             }
-            if (normalizeCommand(input.command) === 'session delete') {
+            const bunnyReplacement = BUNNY_COMMAND_REPLACEMENTS[command];
+            if (coordinator && bunnyReplacement) {
+                const text = JSON.stringify({
+                    ok: false,
+                    command,
+                    error: {
+                        kind: 'validation',
+                        code: 'BUNNY_ASSIGNMENT_TOOL_REQUIRED',
+                        message: bunnyReplacement,
+                    },
+                });
+                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+            }
+            if (command === 'session create')
+                return sessionCreateMoved(ctx, this.sessionAdapter);
+            if (command === 'session delete') {
                 // Deletion stays a user action. Answering here, before the unknown-command
                 // branch, keeps the command out of the advertised vocabulary while still
                 // telling the model what to do instead.
@@ -420,7 +463,7 @@ let LocalMavisTool = (() => {
                 });
                 return mavisRefusal(text);
             }
-            if (normalizeCommand(input.command).startsWith('cron ')) {
+            if (command.startsWith('cron ')) {
                 const text = JSON.stringify({
                     ok: false,
                     error: {
@@ -432,15 +475,15 @@ let LocalMavisTool = (() => {
                 });
                 return mavisRefusal(text);
             }
-            const command = normalizeCommand(input.command);
-            if (!LOCAL_MAVIS_COMMANDS.includes(command)) {
+            const commands = coordinator ? COORDINATOR_MAVIS_COMMANDS : LOCAL_MAVIS_COMMANDS;
+            if (!commands.includes(command)) {
                 const text = JSON.stringify({
                     ok: false,
                     command,
                     error: {
                         kind: 'validation',
                         message: 'Unknown mavis command.',
-                        known_commands: LOCAL_MAVIS_COMMANDS,
+                        known_commands: commands,
                     },
                 });
                 return mavisRefusal(text);
@@ -451,11 +494,17 @@ let LocalMavisTool = (() => {
                 ...(this.sessionAdapter ? { sessionAdapter: this.sessionAdapter } : {}),
                 ...(this.mcpAdapter ? { mcpAdapter: this.mcpAdapter } : {}),
                 currentAgentName: ctx.agentName,
+                ...(coordinator ? { currentCoordinator: true } : {}),
                 currentSessionId: ctx.sessionId,
                 currentTurnId: ctx.turnId,
                 currentModel: currentLocalCronModel(ctx),
             }, input.command, input.args, signal);
             const text = JSON.stringify(ptcMavisHelpOutput(ctx, output), null, 2);
+            // Only the coordinator reads a long messages page in windows; the offset is its argument.
+            const offset = coordinator && output.ok && command === 'session messages' ? input.args?.offset : undefined;
+            if (offset !== undefined) {
+                return sessionMessagesWindow(text, offset, (window) => estimateMavisResultTokens(ctx, window, false), DESKTOP_MANAGEMENT_MAX_TOKENS);
+            }
             const historyOutput = JSON.parse(text);
             const result = {
                 tool_name: LocalMavisToolDef.name,
@@ -473,14 +522,15 @@ let LocalMavisTool = (() => {
                     ...(uncappedOutput ? { uncappedOutput } : {}),
                 });
             }
-            const recovery = mavisRecoveryInstruction(output.command, ptcMavisRunCodeTool(ctx, output.command));
+            const recovery = mavisRecoveryInstruction(output.command, ptcMavisRunCodeTool(ctx, output.command), coordinator);
             const limited = limitLocalManagementOutput(ctx, text, output, 'mavis', recovery);
+            const finish = (reported) => coordinator && output.ok && endsTurnAfterWrite(command, input.args)
+                ? endTurn(reported)
+                : reported;
             // PTC data is the object the text serializes; a head+tail preview cannot
             // be matched by a partial object, so a cut keeps only ok and command.
             if (!limited.truncated) {
-                return withDesktopCompletenessReport(LocalMavisToolDef.name, result, {
-                    data: historyOutput,
-                });
+                return finish(withDesktopCompletenessReport(LocalMavisToolDef.name, result, { data: historyOutput }));
             }
             const continuation = createDesktopOutputContinuation({
                 continuation_hint: {
@@ -489,7 +539,7 @@ let LocalMavisTool = (() => {
                     instruction: recovery,
                 },
             });
-            return withDesktopCompletenessReport(LocalMavisToolDef.name, {
+            return finish(withDesktopCompletenessReport(LocalMavisToolDef.name, {
                 ...result,
                 text: limited.text,
                 content: [{ type: 'text', text: limited.text }],
@@ -505,13 +555,48 @@ let LocalMavisTool = (() => {
                     },
                     desktop_output_continuation: continuation,
                 },
-            }, { data: { ok: output.ok, command: output.command } });
+            }, { data: { ok: output.ok, command: output.command } }));
         }
     };
     return LocalMavisTool = _classThis;
 })();
 export { LocalMavisTool };
 /** A command answered before dispatch; PTC data is the same object as the text. */
+/** `session create` moved to session_create; a caller that may not create Sessions learns why. */
+async function sessionCreateMoved(ctx, sessionAdapter) {
+    const refusal = ctx.sessionId
+        ? await sessionAdapter?.sessionCreateRefusal?.(ctx.sessionId)
+        : undefined;
+    const text = JSON.stringify({
+        ok: false,
+        command: 'session create',
+        error: {
+            kind: 'validation',
+            ...(refusal ?? {
+                code: 'SESSION_CREATE_MOVED',
+                message: isCallableInRunCode(ctx, 'session_create')
+                    ? 'Search for session_create with tool_search, then call it inside run_code, e.g. await tools.session_create(args).'
+                    : 'Search for session_create with tool_search, then call mcp_invoke.',
+            }),
+        },
+    });
+    return mavisRefusal(text);
+}
+/**
+ * A coordinator's top-level `space context write` with `end_turn: true` ends the Turn
+ * once the write succeeds, so writing context.md after the answer needs no closing reply.
+ */
+function endsTurnAfterWrite(command, args) {
+    return command === 'space context write' && Reflect.get(args ?? {}, 'end_turn') === true;
+}
+/** Same marker as send_to_user's end_turn: the agent loop consumes `terminate`. */
+function endTurn(result) {
+    return {
+        ...result,
+        details: { ...result.details, [TURN_TERMINATING_TOOL_RESULT_DETAIL]: true },
+        terminate: true,
+    };
+}
 function mavisRefusal(text) {
     return {
         tool_name: 'mavis',
@@ -608,11 +693,12 @@ export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
     const sourceFailure = validateSessionSourceArgs(command, rawArgs);
     if (sourceFailure)
         return sourceFailure;
-    if (!isKnownCommand(command)) {
+    const knownCommands = ctx.currentCoordinator ? COORDINATOR_KNOWN_COMMANDS : KNOWN_COMMANDS;
+    if (!isKnownCommand(command, knownCommands)) {
         if (command === 'help' || command.endsWith(' help')) {
             return failure(command, 'validation', 'Unknown help target. Valid help commands: agent help, cron help, session help, mcp help.', { valid_help_commands: ['agent help', 'cron help', 'session help', 'mcp help'] });
         }
-        return failure(command, 'validation', `unknown command: ${JSON.stringify(rawCommand)}. Did you mean one of: ${suggestCommands(command).join(', ')}?`, { known_commands: KNOWN_COMMANDS });
+        return failure(command, 'validation', `unknown command: ${JSON.stringify(rawCommand)}. Did you mean one of: ${suggestCommands(command, knownCommands).join(', ')}?`, { known_commands: knownCommands });
     }
     // Answered before arg validation and before any other adapter lookup. A host
     // without a Cron adapter can never run these, so reporting a missing
@@ -630,7 +716,14 @@ export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
             code: 'CRON_CREATE_ME_REJECTED',
         });
     }
-    const schema = LOCAL_MAVIS_COMMAND_SCHEMAS[command];
+    // `space` (the task space of a schedule) is the coordinator's own argument.
+    if ((command === 'cron create' || command === 'cron once') &&
+        rawArgs?.space !== undefined &&
+        !ctx.currentCoordinator) {
+        return failure(command, 'validation', 'Unknown argument: space');
+    }
+    const schema = (ctx.currentCoordinator ? COORDINATOR_COMMAND_SCHEMAS[command] : undefined) ??
+        LOCAL_MAVIS_COMMAND_SCHEMAS[command];
     let substitutedArgs;
     try {
         substitutedArgs = substituteMe(rawArgs ?? {}, ctx.currentAgentName, ctx.currentSessionId);
@@ -795,7 +888,7 @@ async function handleCronCreate(ctx, args, signal) {
         cronName: args.cron_name,
         schedule: args.schedule,
         ...cronExecutionConfig(args),
-        prompt: args.prompt,
+        prompt: coordinatorSchedulePrompt(ctx, agentName, args.prompt, args.space),
         ...(args.timezone ? { timezone: args.timezone } : {}),
         ...(args.active_hours ? { activeHours: args.active_hours } : {}),
         session,
@@ -848,7 +941,7 @@ async function handleCronOnce(ctx, args, signal) {
         ...(args.after ? { after: args.after } : {}),
         ...cronExecutionConfig(args),
         ...(args.at !== undefined ? { at: args.at } : {}),
-        prompt: args.prompt,
+        prompt: coordinatorSchedulePrompt(ctx, agentName, args.prompt, args.space),
         ...(args.timezone ? { timezone: args.timezone } : {}),
         session,
         ...(project === undefined ? {} : { project }),
@@ -882,12 +975,15 @@ async function handleCronUpdate(ctx, args, signal) {
     if (session?.mode === 'sessionId') {
         await validateCronUpdateTargetOwner(ctx, adapter, args.cron_id, session.sessionId, signal);
     }
+    const prompt = args.prompt === undefined
+        ? undefined
+        : await keepScheduleSpaceMarker(adapter, args.cron_id, args.prompt, signal);
     return success(ctx.command, await adapter.updateCron({
         cronId: args.cron_id,
         ...(args.schedule !== undefined ? { schedule: args.schedule } : {}),
         ...(args.cron_name === undefined ? {} : { cronName: args.cron_name }),
         ...cronExecutionConfig(args),
-        ...(args.prompt !== undefined ? { prompt: args.prompt } : {}),
+        ...(prompt !== undefined ? { prompt } : {}),
         ...(args.timezone !== undefined ? { timezone: args.timezone } : {}),
         ...(args.active_hours ? { activeHours: args.active_hours } : {}),
         ...(session ? { session } : {}),
@@ -1058,10 +1154,8 @@ async function handleSessionSend(ctx, args, signal) {
         ...(ctx.currentTurnId ? { callerTurnId: ctx.currentTurnId } : {}),
         sessionId,
         content: args.content,
-        // Both switches are passed only when the caller set them, so the
-        // adapter owns the defaults (async delivery, preference routing).
+        // Passed only when the caller set it, so the adapter owns the default.
         ...(Object.hasOwn(args, 'sync') ? { sync: args.sync } : {}),
-        ...(Object.hasOwn(args, 'force_steer') ? { forceSteer: args.force_steer } : {}),
         ...(args.source ? { source: args.source } : {}),
         ...(args.device_id ? { deviceId: args.device_id } : {}),
     }, signal));
@@ -1069,6 +1163,7 @@ async function handleSessionSend(ctx, args, signal) {
 async function handleSessionUpdate(ctx, args, signal) {
     const sessionId = resolveSessionId(ctx, args.session_id);
     return success(ctx.command, await requireSessionAdapter(ctx).updateSession({
+        ...(ctx.currentSessionId ? { callerSessionId: ctx.currentSessionId } : {}),
         sessionId,
         ...(Object.hasOwn(args, 'title') ? { title: args.title } : {}),
         ...(Object.hasOwn(args, 'archived') ? { archived: args.archived } : {}),
@@ -1105,73 +1200,73 @@ async function handleSessionMessages(ctx, args, signal) {
     // so a stored multi-megabyte tool result is never copied whole.
     return success(ctx.command, projectSessionMessagesPage(page, sessionMessagesView(args)));
 }
+const SESSION_HELP = {
+    group: 'session',
+    summary: 'Read and manage desktop Mavis sessions. list/get/messages/send also reach sessions on SSH projects (ssh), devices this desktop controls with Remote Control (rc) and the cloud (cloud); every other command works on local sessions only.',
+    commands: [
+        {
+            command: 'session list',
+            args: [
+                'agent_name?',
+                'parent_session_id? (local only)',
+                'archive_filter? (local only)',
+                'cursor?',
+                'limit?',
+                'source? (local|ssh|rc|cloud; default local)',
+                'device_id? (ssh|rc)',
+            ],
+            summary: "ssh/rc without device_id lists every connected device; limit applies per device, each row carries device_id, and devices reports each device and its paging. Page one device with device_id + cursor. rc lists only the Mavis sidebar sessions of each controlled device, so agent_name is not accepted for rc; rc pages follow the device's project order (sessions sorted by activity within a page), so rows are not newest first across pages. cloud lists one agent: the account Mavis agent unless agent_name names a cloud agent (cloud agent names are the numeric agentName values in cloud rows).",
+        },
+        {
+            command: 'session get',
+            args: ['session_id', 'source? (local|ssh|rc|cloud; default local)', 'device_id? (ssh|rc)'],
+            summary: 'ssh/rc find the device holding session_id. When the same ID exists on several devices, the error lists candidates; pass one device_id.',
+        },
+        {
+            command: 'session send',
+            args: [
+                'session_id',
+                'content',
+                'sync? (ssh|rc|cloud only; default false)',
+                'source? (local|ssh|rc|cloud; default local)',
+                'device_id? (ssh|rc)',
+            ],
+            summary: 'Deliver a message to an existing unarchived session. Returns as soon as the message is admitted: an idle local session starts a turn with it, a busy one reads it in the turn already running. A local session that answers sends its answer back to you as a cross-session message; do not poll for it. ssh / rc / cloud targets are on another device: they receive the message as from this session but cannot send back, so read their reply with sync: true or with session messages (same source). A remote sync wait gives up after 10 minutes and returns the ACK. The cloud answers started or steered only.',
+            examples: [
+                'mavis({ command: "session send", args: { session_id: "mvs_target", content: "Continue with the follow-up requirement." } })',
+                'mavis({ command: "session send", args: { session_id: "mvs_target", content: "What did you conclude?" } })',
+                'mavis({ command: "session send", args: { session_id: "mvs_remote", source: "ssh", content: "Run the tests on the server and report.", sync: true } })',
+            ],
+        },
+        {
+            command: 'session update',
+            args: ['session_id', 'title?', 'archived?', 'model?'],
+        },
+        {
+            command: 'session interrupt',
+            args: ['session_id', 'turn_id?'],
+            summary: "Stop the target session's current turn and keep the session. Queued messages still run afterwards; background work and the goal are untouched. Returns outcome aborted or not_running. Cannot target the calling session.",
+            examples: ['mavis({ command: "session interrupt", args: { session_id: "mvs_target" } })'],
+        },
+        {
+            command: 'session messages',
+            args: [
+                'session_id',
+                'source? (local|ssh|rc|cloud; default local)',
+                'device_id? (ssh|rc)',
+                'limit? (ssh/rc/cloud default 20, max 100)',
+                'before?',
+                'include_tool_outputs? (default false)',
+                'max_output_chars? (default 2000, max 20000)',
+                'include_thinking? (default false)',
+            ],
+            summary: 'Message text is returned in full. Each tool call is summarized as tool_name, tool_call_id, status, parent_tool_call_id (the run_code that made a child call), args_preview (first 200 characters), args_chars and result_chars, without its result; thinking and usage statistics are omitted. include_tool_outputs: true returns args and result instead, include_thinking: true adds thinking_content, each cut to max_output_chars with *_truncated: true when cut.',
+        },
+    ],
+};
 async function handleSessionHelp(ctx) {
-    return success(ctx.command, {
-        group: 'session',
-        summary: 'Read and manage desktop Mavis sessions. list/get/messages/send also reach sessions on SSH projects (ssh), devices this desktop controls with Remote Control (rc) and the cloud (cloud); every other command works on local sessions only.',
-        commands: [
-            {
-                command: 'session list',
-                args: [
-                    'agent_name?',
-                    'parent_session_id? (local only)',
-                    'archive_filter? (local only)',
-                    'cursor?',
-                    'limit?',
-                    'source? (local|ssh|rc|cloud; default local)',
-                    'device_id? (ssh|rc)',
-                ],
-                summary: "ssh/rc without device_id lists every connected device; limit applies per device, each row carries device_id, and devices reports each device and its paging. Page one device with device_id + cursor. rc lists only the Mavis sidebar sessions of each controlled device, so agent_name is not accepted for rc; rc pages follow the device's project order (sessions sorted by activity within a page), so rows are not newest first across pages. cloud lists one agent: the account Mavis agent unless agent_name names a cloud agent (cloud agent names are the numeric agentName values in cloud rows).",
-            },
-            {
-                command: 'session get',
-                args: ['session_id', 'source? (local|ssh|rc|cloud; default local)', 'device_id? (ssh|rc)'],
-                summary: 'ssh/rc find the device holding session_id. When the same ID exists on several devices, the error lists candidates; pass one device_id.',
-            },
-            {
-                command: 'session send',
-                args: [
-                    'session_id',
-                    'content',
-                    'sync? (default false)',
-                    'force_steer? (default false)',
-                    'source? (local|ssh|rc|cloud; default local)',
-                    'device_id? (ssh|rc)',
-                ],
-                summary: 'Deliver a message to an existing unarchived session. Returns an admission ACK by default without waiting; a busy session queues (or merges into the running turn) instead of failing. sync: true waits for the turn and returns its reply text, except for a merged steer, which has no separate reply. force_steer: true merges into the running turn instead of following the desktop composer send preference. ssh / rc / cloud targets are on another device: they receive the message as from this session but cannot send back, so read their reply with sync: true or with session messages (same source). A remote sync wait gives up after 10 minutes and returns the ACK. The cloud answers started or steered only and ignores force_steer.',
-                examples: [
-                    'mavis({ command: "session send", args: { session_id: "mvs_target", content: "Continue with the follow-up requirement." } })',
-                    'mavis({ command: "session send", args: { session_id: "mvs_target", content: "What did you conclude?", sync: true } })',
-                    'mavis({ command: "session send", args: { session_id: "mvs_target", content: "Also cover the rollback path.", force_steer: true } })',
-                    'mavis({ command: "session send", args: { session_id: "mvs_remote", source: "ssh", content: "Run the tests on the server and report.", sync: true } })',
-                ],
-            },
-            {
-                command: 'session update',
-                args: ['session_id', 'title?', 'archived?', 'model?'],
-            },
-            {
-                command: 'session interrupt',
-                args: ['session_id', 'turn_id?'],
-                summary: "Stop the target session's current turn and keep the session. Queued messages still run afterwards; background work and the goal are untouched. Returns outcome aborted or not_running. Cannot target the calling session.",
-                examples: ['mavis({ command: "session interrupt", args: { session_id: "mvs_target" } })'],
-            },
-            {
-                command: 'session messages',
-                args: [
-                    'session_id',
-                    'source? (local|ssh|rc|cloud; default local)',
-                    'device_id? (ssh|rc)',
-                    'limit? (ssh/rc/cloud default 20, max 100)',
-                    'before?',
-                    'include_tool_outputs? (default false)',
-                    'max_output_chars? (default 2000, max 20000)',
-                    'include_thinking? (default false)',
-                ],
-                summary: 'Message text is returned in full. Each tool call is summarized as tool_name, tool_call_id, status, parent_tool_call_id (the run_code that made a child call), args_preview (first 200 characters), args_chars and result_chars, without its result; thinking and usage statistics are omitted. include_tool_outputs: true returns args and result instead, include_thinking: true adds thinking_content, each cut to max_output_chars with *_truncated: true when cut.',
-            },
-        ],
-    });
+    // The coordinator's mavis withholds `session help`, so this only answers other Agents.
+    return success(ctx.command, SESSION_HELP);
 }
 async function handleMcpList(ctx, args, signal) {
     return success(ctx.command, await requireMcpAdapter(ctx).listServers({ ...(args.search ? { search: args.search } : {}) }, signal));
@@ -1300,15 +1395,6 @@ function requireMcpAdapter(ctx) {
         });
     }
     return ctx.mcpAdapter;
-}
-function requireSessionAdapter(ctx) {
-    if (!ctx.sessionAdapter) {
-        throw new LocalMavisRuntimeError('Local session service is not configured', {
-            code: 'SESSION_UNAVAILABLE',
-            status: 503,
-        });
-    }
-    return ctx.sessionAdapter;
 }
 function toAdapterCronSession(ctx, session) {
     if (session.mode === 'new')
@@ -1551,31 +1637,11 @@ function cronCreationSessionId(rawArgs) {
         return undefined;
     return session.session_id;
 }
-function success(command, response) {
-    return { ok: true, command, response };
-}
-function failure(command, kind, message, extra = {}) {
-    return { ok: false, command, error: { kind, message, ...extra } };
-}
-class LocalMavisValidationError extends Error {
-    details;
-    constructor(message, details = {}) {
-        super(message);
-        this.details = details;
-        this.name = 'LocalMavisValidationError';
-    }
-}
-class LocalMavisRuntimeError extends Error {
-    status;
-    code;
-    constructor(message, details = {}) {
-        super(message);
-        this.name = 'LocalMavisRuntimeError';
-        this.status = details.status;
-        this.code = details.code;
-    }
-}
 const INPUT_CONDITION_ERROR_CODES = new Set([
+    'ASSIGNMENT_INVALID_WORKLINE',
+    'ASSIGNMENT_NESTED_TASK',
+    'ASSIGNMENT_TASK_TO_BUNNY',
+    'WORKLINE_ALREADY_EXISTS',
     'SESSION_UPDATE_INVALID_FIELD',
     'SESSION_INTERRUPT_SELF',
     'SESSION_INTERRUPT_TURN_MISMATCH',
@@ -1638,6 +1704,7 @@ function errorToFailure(command, error) {
             ...(error.requestedTurnId ? { requested_turn_id: error.requestedTurnId } : {}),
             ...(error.reason ? { reason: error.reason } : {}),
             ...(error.field ? { field: error.field } : {}),
+            ...(error.worklineId ? { workline_id: error.worklineId } : {}),
             // Only details a host marks as model-facing reach the output, under their own key.
             ...(isPlainRecord(error.modelDetails) ? { details: error.modelDetails } : {}),
         });
@@ -1665,11 +1732,11 @@ function isLocalRuntimeNotFound(error) {
 function normalizeCommand(raw) {
     return normalizeMavisCommand(raw);
 }
-function isKnownCommand(command) {
-    return KNOWN_COMMANDS.includes(command);
+function isKnownCommand(command, knownCommands) {
+    return knownCommands.includes(command);
 }
-function suggestCommands(unknown) {
-    const scored = KNOWN_COMMANDS.map((name) => ({ name, score: sharedPrefixLen(name, unknown) }));
+function suggestCommands(unknown, knownCommands) {
+    const scored = knownCommands.map((name) => ({ name, score: sharedPrefixLen(name, unknown) }));
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, 5).map((item) => item.name);
 }

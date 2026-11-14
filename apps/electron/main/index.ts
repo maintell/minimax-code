@@ -9,6 +9,9 @@
  */
 
 // 必须最先导入，加载环境变量
+// SIGTRAP 守卫必须排在所有 import 之前：编译后 require 顺序即源码顺序，
+// 任何先加载的依赖都可能把 signal-exit 拉进来注册 SIGTRAP（见 sigtrap-guard.ts）。
+require("./sigtrap-guard");
 import os from "node:os";
 import { app } from "electron";
 import { recordElectronStartupMainEntry } from "./modules/observability/startup-performance";

@@ -22,7 +22,7 @@ const MINIAPP_FIELDS = new Set([
 ]);
 const ARTIFACT_FIELDS = new Set(['client', 'node']);
 const PROCESS_RUNTIME_FIELDS = new Set(['kind', 'entry', 'lifecycle']);
-const SURFACE_FIELDS = new Set(['path', 'window']);
+const SURFACE_FIELDS = new Set(['path', 'window', 'widget']);
 const MCP_ENDPOINT_FIELDS = new Set(['server', 'path']);
 const HOST_CONNECTOR_ACCESS_FIELDS = new Set(['providers']);
 const ENGINES_FIELDS = new Set(['mcode']);
@@ -120,11 +120,24 @@ async function readProcessRuntime(root, value, artifacts) {
 }
 function readSurface(value) {
     if (!isRecord(value) || hasUnknownField(value, SURFACE_FIELDS)) {
-        miniAppFail('SURFACE_INVALID', 'surface must contain only path and window');
+        miniAppFail('SURFACE_INVALID', 'surface must contain only path and optional window/widget');
     }
-    const surfacePath = normalizeRoutePath(value.path, 'surface.path');
-    const surfaceWindow = readSurfaceWindow(value.window);
-    return { path: surfacePath, ...(surfaceWindow ? { window: surfaceWindow } : {}) };
+    const route = normalizeRoutePath(value.path, 'surface.path');
+    const window = readSurfaceWindow(value.window);
+    const base = { path: route, ...(window ? { window } : {}) };
+    const widget = readSurfaceWidget(value.widget);
+    return { ...base, ...(widget ? { widget } : {}) };
+}
+function readSurfaceWidget(widget) {
+    if (widget === undefined)
+        return undefined;
+    if (!isRecord(widget) ||
+        hasUnknownField(widget, new Set(['kind', 'size'])) ||
+        (widget.kind !== 'display' && widget.kind !== 'interactive') ||
+        (widget.size !== 'small' && widget.size !== 'medium')) {
+        miniAppFail('SURFACE_INVALID', 'widget must declare its kind and supported size');
+    }
+    return { kind: widget.kind, size: widget.size };
 }
 /**
  * Defaults, position, `parent`, `title`, and close behavior are applied by the

@@ -2,10 +2,12 @@
  * Power Management Module
  *
  * Owns the lifecycle of Electron's `powerSaveBlocker` assertion(s). The
- * effective assertion is derived from four independent inputs:
+ * effective assertion is derived from five independent inputs:
  *
  * - `keepAwakeEnabled` — user-controlled toggle (`config.keepAwake`).
  * - `remoteAccessEnabled` — this computer currently has an RC producer binding.
+ * - `localWorkActive` — the local Runtime has a running Turn or an enabled
+ *   scheduled task.
  * - `onExternalPower` — the OS reports that this computer is connected to AC power.
  * - `computerUseActive` — true while an eligible Turn may drive the screen,
  *   so the display must NOT sleep.
@@ -13,7 +15,7 @@
  * Effective mode summary (see `computeMode`):
  *
  * - CU active → `display-sleep`, regardless of the other inputs.
- * - keep-awake + RC producer binding + AC power → `app-suspension`.
+ * - keep-awake + AC power + (RC producer binding or local work) → `app-suspension`.
  * - every other combination → `off`.
  *
  * Invariants enforced by `reconcile`:
@@ -37,9 +39,13 @@ import logger from "../../utils/logger";
 const state = {
     keepAwakeEnabled: false,
     remoteAccessEnabled: false,
+    localWorkActive: false,
     onExternalPower: false,
     computerUseActive: false,
 };
+/** Back-to-back Turns must not churn the OS assertion between them. */
+const LOCAL_WORK_RELEASE_DELAY_MS = 30000;
+let localWorkReleaseTimer = null;
 let currentMode = 'off';
 let currentBlockerId = null;
 let monitoringPowerSource = false;
@@ -62,7 +68,8 @@ const handleBatteryPower = () => {
 function computeMode(input) {
     if (input.computerUseActive)
         return 'display-sleep';
-    if (input.keepAwakeEnabled && input.remoteAccessEnabled && input.onExternalPower) {
+    const hasWork = input.remoteAccessEnabled || input.localWorkActive;
+    if (input.keepAwakeEnabled && hasWork && input.onExternalPower) {
         return 'app-suspension';
     }
     return 'off';
@@ -144,10 +151,37 @@ export function startPowerSourceMonitoring() {
     monitoringPowerSource = true;
     reconcile();
 }
-/** Keep-awake applies only while this computer is available as an RC producer. */
+/** Being available as an RC producer is one of the reasons keep-awake applies. */
 export function setRemoteAccessEnabled(enabled) {
     state.remoteAccessEnabled = enabled;
     reconcile();
+}
+function clearLocalWorkReleaseTimer() {
+    if (localWorkReleaseTimer === null)
+        return;
+    clearTimeout(localWorkReleaseTimer);
+    localWorkReleaseTimer = null;
+}
+/**
+ * Set whether the local Runtime has work. Called only from Electron main's
+ * utility lifecycle; renderer state must never write this flag. Work starting
+ * applies at once, and work ending applies after a short delay.
+ */
+export function setLocalWorkActive(active) {
+    if (active) {
+        clearLocalWorkReleaseTimer();
+        state.localWorkActive = true;
+        reconcile();
+        return;
+    }
+    if (!state.localWorkActive || localWorkReleaseTimer !== null)
+        return;
+    localWorkReleaseTimer = setTimeout(() => {
+        localWorkReleaseTimer = null;
+        state.localWorkActive = false;
+        reconcile();
+    }, LOCAL_WORK_RELEASE_DELAY_MS);
+    localWorkReleaseTimer.unref?.();
 }
 /**
  * Set the Computer Use active flag.
@@ -172,8 +206,10 @@ export function stopPowerSaveBlocker() {
         powerMonitor.removeListener('on-battery', handleBatteryPower);
         monitoringPowerSource = false;
     }
+    clearLocalWorkReleaseTimer();
     state.keepAwakeEnabled = false;
     state.remoteAccessEnabled = false;
+    state.localWorkActive = false;
     state.onExternalPower = false;
     state.computerUseActive = false;
     reconcile();

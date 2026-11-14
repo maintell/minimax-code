@@ -88,6 +88,10 @@ export function createDeferredLocalAgentRuntimePort(resolver) {
         resolveAgentWriteTarget: (requestedName) => (currentResolver ?? failClosed).resolveAgentWriteTarget(requestedName),
         requireExactAgentKey: (requestedName) => (currentResolver ?? failClosed).requireExactAgentKey(requestedName),
         resolveAgentExecutionTarget: (exactOwnerName) => (currentResolver ?? failClosed).resolveAgentExecutionTarget(exactOwnerName),
+        // Read through the currently bound resolver on every call: the dispatch
+        // switch comes from the Agent's live canonical file, so it must never be
+        // captured before `bindResolver` runs.
+        resolveAgentDispatchable: async (exactOwnerName) => (currentResolver ?? failClosed).resolveAgentDispatchable?.(exactOwnerName),
         listAgents: (request) => management().listAgents(request),
         createAgent: (request) => management().createAgent(request),
         getAgent: (request) => management().getAgent(request),

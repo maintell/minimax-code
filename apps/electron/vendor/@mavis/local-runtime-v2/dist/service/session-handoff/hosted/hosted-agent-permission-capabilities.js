@@ -46,7 +46,10 @@ export function createHostedAgentPermissionCapabilities(host) {
                         ? { nativeDeleteSnapshot: input.nativeDeleteSnapshot }
                         : {}),
                 });
-                return toHostedPermissionDecision(decision);
+                if (decision.behavior === 'deny')
+                    return toHostedPermissionDecision(decision);
+                const assignment = await checkAssignmentPermission(host, ctx, input);
+                return assignment ?? toHostedPermissionDecision(decision);
             },
         },
         approval: {
@@ -94,6 +97,81 @@ export function createHostedAgentPermissionCapabilities(host) {
             },
         },
     };
+}
+/**
+ * Only assignment semantics carry project approval: `session create` with a
+ * project (results report back by default) and `session send` that reports
+ * back. Bunny's assignment tools reach here mapped to these commands. An
+ * ordinary send between sessions keeps the general policy.
+ */
+function needsAssignmentProjectPermission(input) {
+    if (input.toolName !== 'mavis')
+        return false;
+    const args = input.toolInput.args;
+    const record = typeof args === 'object' && args !== null ? args : undefined;
+    if (input.toolInput.command === 'session create')
+        return record !== undefined && Reflect.get(record, 'project') !== undefined;
+    if (input.toolInput.command !== 'session send' || !record)
+        return false;
+    if (Reflect.get(record, 'report_back') !== true)
+        return false;
+    const target = Reflect.get(record, 'session_id');
+    return target !== 'me' && target !== input.sessionId;
+}
+/**
+ * Approving Bunny's own assignment tools saves the rule under that tool's name
+ * (the approval keeps the original call), while `mavis` approvals save it
+ * under `mavis`; the command pattern is the same, so both match.
+ */
+const ASSIGNMENT_RULE_TOOL_NAMES = new Set(['mavis', 'assignment_create', 'assignment_send']);
+async function checkAssignmentPermission(host, ctx, input) {
+    if (!needsAssignmentProjectPermission(input))
+        return undefined;
+    // Resolve the target and apply its project deny before any mode can allow:
+    // as in the base engine, bypass and off never lift a deny.
+    if (!host.assignmentTools?.resolveAssignmentProject)
+        return { behavior: 'deny', reason: 'Assignment project resolver is unavailable' };
+    let project;
+    try {
+        project = await host.assignmentTools.resolveAssignmentProject(input.sessionId, input.toolInput);
+    }
+    catch (error) {
+        return {
+            behavior: 'deny',
+            reason: assignmentProjectError(error),
+        };
+    }
+    if (!project)
+        return { behavior: 'deny', reason: 'Assignment project could not be resolved' };
+    const pattern = `${input.toolInput.command}:${project}`;
+    const rules = await ctx.permissionRules.listRules({
+        agentName: input.agentName,
+        sessionId: input.sessionId,
+    });
+    const matching = rules.filter((rule) => ASSIGNMENT_RULE_TOOL_NAMES.has(rule.ruleValue.toolName.toLowerCase()) &&
+        rule.ruleValue.matcher?.kind === 'command' &&
+        rule.ruleValue.matcher.pattern === pattern);
+    const denied = matching.find((rule) => rule.ruleBehavior === 'deny');
+    if (denied)
+        return { behavior: 'deny', reason: 'Assignment denied by project rule' };
+    const mode = input.permissionMode ?? readLocalPermissionMode(ctx.configGetter().permissionMode);
+    if (mode === 'bypassPermissions' || mode === 'off')
+        return { behavior: 'allow', reason: 'Assignment allowed by permission mode' };
+    if (matching.some((rule) => rule.ruleBehavior === 'allow'))
+        return { behavior: 'allow', reason: 'Assignment allowed by project rule' };
+    return {
+        behavior: 'ask',
+        reason: 'Approval is required to assign work to this project',
+        ruleContents: [`mavis(${pattern})`],
+        ruleMatchers: [{ kind: 'command', pattern }],
+    };
+}
+function assignmentProjectError(error) {
+    if (!(error instanceof Error))
+        return 'Invalid assignment project';
+    if ('candidates' in error)
+        return JSON.stringify({ message: error.message, candidates: error.candidates });
+    return error.message;
 }
 function normalizeHostedPermissionRuleMatchers(matchers) {
     if (!matchers)

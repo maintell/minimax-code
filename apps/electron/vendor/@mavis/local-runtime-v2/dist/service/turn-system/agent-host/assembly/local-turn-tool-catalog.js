@@ -1,10 +1,14 @@
-import { MAVIS_CAPABILITY_TOOL_NAMES, createLocalBashToolDefinition, resolveLocalBashShell, filterCanonicalNativeToolCeiling, createMcpInvokeTool, createPtcMavisTools, getMcpInvokeRegistries, getSuppressedToolNamesForModelCapabilities, isCanonicalBuiltinTurn, modelInWhitelist, renderMcpToolSearchHintBlock, withLocalBrowserObserve, } from '@mavis/agent-tools';
+import { MAVIS_CAPABILITY_TOOL_NAMES, createLocalBashToolDefinition, resolveLocalBashShell, filterCanonicalNativeToolCeiling, createMcpInvokeTool, createPtcMavisTools, getSuppressedToolNamesForModelCapabilities, isCanonicalBuiltinTurn, readToolSearchTurnFacts, renderMcpToolSearchHintBlock, resolveMcpDisclosureOptions, toolSearchTurnWiring, withLocalBrowserObserve, createSavePtcScriptTool, } from '@mavis/agent-tools';
 import { AGENT_BUILTIN_MCP_TOOL_IDS, AGENT_BUILTIN_TOOL_IDS, isPtcTurnEnabled as isSharedPtcTurnEnabled, } from '@mavis/config';
 import { getBrowserHostBinding } from './host-capability/browser.js';
 import { mergeAgentHostTurnCapabilities } from './local-turn-plugin-capabilities.js';
+import { DELEGATION_TOOL_NAMES, isAgentAuthorityToolAllowed, isTrustedCoordinator, keepsCoordinatorCliTool, shapeCoordinatorTools, } from './local-turn-tool-authority.js';
 import { createPtcRunCodeTool } from '../runner/ptc/run-code-tool.js';
+import { isPtcSaveScriptAllowed, ptcScriptSupport } from './local-turn-tool-ptc-scripts.js';
 import { registerPtcNativeCatalog, registerPtcTurnReminder } from '../execution/ptc/catalog.js';
-import { isPtcChildTool, isPtcDirectMcpTarget, isPtcDirectTool, } from '../runner/policy/local-turn-tool-ptc-policy.js';
+import { isPtcChildTool, isPtcDirectTool, logPtcOnDemandTools, splitPtcOnDemandTools, } from '../runner/policy/local-turn-tool-ptc-policy.js';
+/** The zero-parameter tool that forwards the conversation to the Session's advisor model. */
+export const ADVISOR_TOOL_NAME = 'advisor';
 export function prepareBashTurnTools(admittedTools, background, nativeDelete = false, agentShell) {
     const hasNativeBash = admittedTools.some((tool) => tool.def.name === 'bash' && (tool.source === undefined || tool.source === 'builtin'));
     const unboundShell = process.platform === 'win32' ? 'pending' : undefined;
@@ -133,14 +137,17 @@ function desktopToolServers(capabilities) {
  * prompt hint are decided here from the frozen turn/model facts.
  */
 export function buildLocalTurnToolCatalog(input) {
-    const options = resolveLocalMcpDisclosureOptions(input.config, input.env);
-    // Decided before disclosure only to pick wording: deferral itself follows the
-    // same switch, whitelist and threshold with or without PTC.
+    const options = resolveMcpDisclosureOptions(input.config, input.env);
+    // Decided before disclosure: it picks the call wording and the deferral threshold
+    // (PTC Turns keep `thresholdPct`; non-PTC Turns use `deferBudgetTokens`).
     const ptc = isPtcTurnEnabled(input);
     const excludedNames = getSuppressedToolNamesForModelCapabilities(input.modelCapabilities);
     const inventory = filterLocalTurnCapabilityInventory(input);
     logAgentToolSelectorSummary(input, inventory.selectorSummary);
-    const { nativeTools, mcpEntries, threadGoalTools } = inventory;
+    const shaped = shapeCoordinatorTools(input.agentProfile, inventory);
+    const { mcpEntries } = shaped;
+    const nativeTools = withoutUnboundAdvisor(shaped.nativeTools, input.advisorBound === true);
+    const { threadGoalTools } = inventory;
     const model = input.llmModel;
     const tools = [
         ...nativeTools,
@@ -157,6 +164,7 @@ export function buildLocalTurnToolCatalog(input) {
         });
     }
     const desktopCapabilities = inventory.desktopCapabilities;
+    const toolSearch = toolSearchTurnWiring(input, options, ptc);
     const merged = mergeAgentHostTurnCapabilities({
         tools,
         mcpEntries,
@@ -170,31 +178,66 @@ export function buildLocalTurnToolCatalog(input) {
         ...(input.userText !== undefined ? { userText: input.userText } : {}),
         ...(desktopCapabilities ? { capabilities: desktopCapabilities } : {}),
         ...(ptc ? { ptc: true } : {}),
+        ...toolSearch.mergeInput,
     });
-    input.emitDiagnostic?.('mcp.tools_deferred', {
-        sessionId: input.sessionId,
-        deferred: merged.plan.deferred,
-        whitelisted: modelInWhitelist(model.provider, model.id, options.modelWhitelist),
-        model: `${model.provider}/${model.id}`,
-        ...(merged.plan.deferred ? merged.plan.stats : {}),
-    });
+    toolSearch.settle(merged, model);
     // When a Plugin declares an App, Attribution wraps bash (App calls go through
     // it); the wrapper runs the same native implementation, so it is the native
     // tool run_code lists and must keep its builtin evidence and data type.
     const trustedNativeTools = merged.attributed
         ? nativeTools.map((tool) => merged.attributed?.get(tool) ?? tool)
         : nativeTools;
-    const catalog = resolvedTurnCatalog(merged.tools, ptc, trustedNativeTools, input);
+    const catalog = resolvedTurnCatalog(merged.tools, ptc, {
+        trustedNativeTools,
+        input,
+        gates: {
+            excludedNames,
+            selector: inventory.selector,
+            cuRuntimeAvailable: input.sources.cuRuntimeAvailable,
+        },
+    });
     return {
         tools: catalog.tools,
-        userPromptPrefix: renderUserPromptPrefix([merged.reminder, catalog.reminder, renderComputerUseHint(catalog.tools, catalog.childTools)]
+        userPromptPrefix: renderUserPromptPrefix([
+            merged.reminder,
+            catalog.reminder,
+            renderComputerUseHint(catalog.tools, catalog.childTools),
+            // Tool changes within the prefix window: announced here, appended to history.
+            input.commitWindow === false
+                ? undefined
+                : readToolSearchTurnFacts(merged.tools)?.windowUpdate,
+        ]
             .filter(Boolean)
-            .join('\n\n'), true, options.systemHint, ptc),
+            .join('\n\n'), merged.plan, options, { ptc, builtinToolNames: deferredBuiltinToolNames(merged.plan) }),
     };
 }
-function resolvedTurnCatalog(tools, ptc, trustedNativeTools, input) {
+/** Native tools that load on demand and survived this Turn's capability filters. */
+function deferredBuiltinToolNames(plan) {
+    if (!plan.deferred)
+        return [];
+    return [...plan.deferredRegistry.values()]
+        .filter((tool) => tool.def.loading === 'on_demand' && tool.source === undefined)
+        .map((tool) => tool.def.name);
+}
+/**
+ * Joins the plugin reminder with the MCP tool-search hint when it applies. On
+ * a PTC Turn the hint names the run_code call form, because there the hidden
+ * tools are run_code children and mcp_invoke does not route them. The hint
+ * names this Turn's on-demand built-ins so the model knows they exist.
+ *
+ * `tool_search` stays registered for a stable tool list, but with an empty
+ * index every search misses, so the hint would only invite those wasted calls;
+ * the catalog, inserted into every request, announces deferred tools instead of the per-turn hint.
+ */
+function renderUserPromptPrefix(reminder, plan, options, hintOptions) {
+    const hint = options.systemHint && plan.deferred && plan.deferredRegistry.size > 0 && !options.catalog;
+    return [reminder, hint ? renderMcpToolSearchHintBlock(hintOptions) : '']
+        .filter(Boolean)
+        .join('\n\n');
+}
+function resolvedTurnCatalog(tools, ptc, options) {
     return ptc
-        ? buildPtcCatalog(tools, trustedNativeTools, input)
+        ? buildPtcCatalog(tools, options.trustedNativeTools, options.input, options.gates)
         : { tools, reminder: '', childTools: [] };
 }
 function isPtcTurnEnabled(input) {
@@ -203,14 +246,38 @@ function isPtcTurnEnabled(input) {
     // Turn whose catalog kept them native, or the reverse.
     return isSharedPtcTurnEnabled({ requested: input.ptcEnabled === true });
 }
-function buildPtcCatalog(tools, trustedNativeTools, input) {
+function buildPtcCatalog(tools, trustedNativeTools, input, gates) {
     const onDemand = splitPtcOnDemandTools(tools, reservesInlineGateway(input));
     logPtcOnDemandTools(input, onDemand);
     const observable = withPtcBrowserObserve(onDemand.tools.filter(isPtcChildTool), trustedNativeTools);
-    const { childTools, directTools } = withPtcMavisTools(observable.childTools, onDemand.tools.filter(isPtcDirectTool), observable.trustedNativeTools);
+    const { childTools, directTools } = withPtcMavisTools(observable.childTools, onDemand.tools.filter(isPtcDirectTool), observable.trustedNativeTools, isTrustedCoordinator(input.agentProfile));
+    // The save tool is a run_code child like any other, so it is listed with them
+    // and gated like one: the `tools` allowlist, `disallowedTools`, the model's
+    // suppressed names, the canonical role ceiling and the Agent authority rules
+    // all decide it, because it never passes through the inventory above.
+    const scripts = ptcScriptSupport(input);
+    const saveTool = scripts ? createSavePtcScriptTool(scripts.save) : undefined;
+    // The Agent and model gate is this module's own; ptc-scripts owns the save
+    // tool's two-step decision and takes the gate as an argument, so neither
+    // module has to import the other.
+    const isSaveScriptAllowedByTurn = (candidate) => isReadyTurnToolAllowed({
+        tool: candidate,
+        source: 'builtin',
+        options: {},
+        excludedNames: gates.excludedNames,
+        cuRuntimeAvailable: gates.cuRuntimeAvailable,
+        selector: gates.selector,
+        profile: input.agentProfile,
+    });
+    const listedChildTools = [
+        ...childTools,
+        ...(saveTool && isPtcSaveScriptAllowed(saveTool, input.agentProfile, isSaveScriptAllowedByTurn)
+            ? [saveTool]
+            : []),
+    ];
     // Name the hidden tools so the model does not spend a turn calling one directly
     // (the pilot lost three turns that way). Catalog order matches the run_code SDK.
-    const childToolNames = childTools.map((tool) => tool.def.name);
+    const childToolNames = listedChildTools.map((tool) => tool.def.name);
     const reminder = [
         'PTC is enabled for this turn. Use run_code with await tools.<name>(args) for eligible ordinary tools and explicitly return a JSON result. Keep the visible control tools as direct calls. Do not call run_code from inside run_code.',
         ...(childToolNames.length > 0
@@ -223,8 +290,19 @@ function buildPtcCatalog(tools, trustedNativeTools, input) {
     // executor can put it back verbatim after compaction drops that user message.
     // The long tail is callable but stays out of this list and the run_code SDK:
     // listing it would put back the definitions Tool Search keeps out.
-    const runCode = registerPtcNativeCatalog(registerPtcTurnReminder(createPtcRunCodeTool(childTools, input.writePtcReturnArtifact ? { writeReturnArtifact: input.writePtcReturnArtifact } : {}, observable.trustedNativeTools, onDemand.callable), reminder), tools);
-    return { tools: [runCode, ...directTools], reminder, childTools };
+    const runCode = registerPtcNativeCatalog(registerPtcTurnReminder(createPtcRunCodeTool(listedChildTools, {
+        ...(input.writePtcReturnArtifact
+            ? { writeReturnArtifact: input.writePtcReturnArtifact }
+            : {}),
+        ...(input.ptcSessionStore ? { sessionStore: input.ptcSessionStore } : {}),
+        ...(scripts ? { scriptRoots: scripts.roots } : {}),
+        // A program calling one of these gets "<name> 只能直接调用" instead of "not a function".
+        directToolNames: [
+            ...directTools.map((tool) => tool.def.name),
+            ...(input.appendedDirectToolNames ?? []),
+        ],
+    }, observable.trustedNativeTools, onDemand.callable), reminder), tools);
+    return { tools: [runCode, ...directTools], reminder, childTools: listedChildTools };
 }
 /**
  * The Desktop mavis tool on a PTC Turn: run_code lists one mavis_* tool per
@@ -235,14 +313,16 @@ function buildPtcCatalog(tools, trustedNativeTools, input) {
  * place was refused only after the model had made it. run_code still runs
  * each call as mavis({ command, args }), so permission rules and Plugin hooks
  * keep matching tool `mavis`. Only the trusted native mavis is split; a Turn
- * without it (TUI, PTC off) keeps its catalog byte for byte.
+ * without it (TUI, PTC off) keeps its catalog byte for byte. A trusted
+ * coordinator's split documents its space and project commands on the top
+ * level and lists neither session send nor session interrupt.
  */
-function withPtcMavisTools(childTools, directTools, trustedNativeTools) {
+function withPtcMavisTools(childTools, directTools, trustedNativeTools, coordinator) {
     const trusted = new Set(trustedNativeTools);
     const mavis = directTools.find((tool) => tool.def.name === 'mavis' && trusted.has(tool));
     if (!mavis || !childTools.includes(mavis))
         return { childTools, directTools };
-    const split = createPtcMavisTools(mavis);
+    const split = createPtcMavisTools(mavis, { coordinator });
     return {
         childTools: childTools.flatMap((tool) => (tool === mavis ? split.children : [tool])),
         directTools: directTools.map((tool) => (tool === mavis ? split.direct : tool)),
@@ -277,101 +357,6 @@ function withPtcBrowserObserve(childTools, trustedNativeTools) {
         childTools: children,
         trustedNativeTools: trustedNativeTools.map((tool) => variants.get(tool) ?? tool),
     };
-}
-/**
- * Tool Search's result decides the long tail; no PTC-specific rule is added.
- * After buildToolLoadingCatalog the mcp_invoke name registry holds exactly
- * this Turn's deferred tools: MCP and App tools plus on-demand built-ins (cron_*).
- * Inside a program a name-routed gateway is a needless hop, so every target
- * that is an ordinary PTC child becomes a run_code child of its own, with its
- * own schema, permission source and hooks. mcp_invoke stays only for what it
- * still routes, unchanged: Plugin Skill `tool_ref` references and targets
- * that are not PTC children. With neither, the gateway is removed.
- *
- * Tool loading now attaches an empty gateway to every Turn. When nothing moves
- * (no deferral this Turn) that gateway has no reason on a PTC Turn either and
- * is removed, so run_code gains no `tools.mcp_invoke`. The one exception is
- * the gateway the Host reserves (`reservedByHost`, Desktop): it was on every
- * Desktop Turn before tool loading and stays a run_code child as it was.
- */
-function splitPtcOnDemandTools(tools, reservedByHost) {
-    const gateway = tools.find((tool) => tool.def.name === 'mcp_invoke');
-    const registries = gateway ? getMcpInvokeRegistries(gateway) : undefined;
-    if (!gateway || !registries)
-        return { tools, callable: [], nameConflicts: 0 };
-    const listedNames = new Set(tools.filter((tool) => tool !== gateway).map((tool) => tool.def.name));
-    const { callable, kept, nameConflicts } = partitionGatewayTargets(registries.registry, listedNames);
-    const routesSomething = kept.size > 0 || registries.referenceRegistry.size > 0;
-    if (callable.length === 0 && (reservedByHost || routesSomething)) {
-        return {
-            tools,
-            callable,
-            nameConflicts,
-            ...(routesSomething ? {} : { hostReservedOnly: true }),
-        };
-    }
-    const narrowed = narrowedGateway(gateway, kept, registries.referenceRegistry);
-    return {
-        tools: tools.flatMap((tool) => {
-            if (tool !== gateway)
-                return [tool];
-            return narrowed ? [narrowed] : [];
-        }),
-        callable,
-        nameConflicts,
-    };
-}
-function partitionGatewayTargets(registry, listedNames) {
-    const callable = [];
-    const kept = new Map();
-    let nameConflicts = 0;
-    for (const [name, target] of registry) {
-        if (isPtcDirectMcpTarget(target)) {
-            kept.set(name, target);
-        }
-        else if (listedNames.has(target.def.name)) {
-            // run_code exposes one function per name; a second one would break the
-            // guest setup, so this target keeps today's mcp_invoke route.
-            kept.set(name, target);
-            nameConflicts += 1;
-        }
-        else {
-            callable.push(target);
-        }
-    }
-    return { callable, kept, nameConflicts };
-}
-/** The gateway for what it still routes, unchanged; undefined when nothing is left. */
-function narrowedGateway(gateway, kept, references) {
-    if (kept.size === 0 && references.size === 0)
-        return undefined;
-    return {
-        ...createMcpInvokeTool(kept, references),
-        ...(gateway.toolCallProvenanceResolver
-            ? { toolCallProvenanceResolver: gateway.toolCallProvenanceResolver }
-            : {}),
-    };
-}
-/** Counts and booleans only: no tool names, arguments or schemas. */
-function logPtcOnDemandTools(input, split) {
-    const gateway = split.tools.find((tool) => tool.def.name === 'mcp_invoke');
-    const references = gateway ? getMcpInvokeRegistries(gateway)?.referenceRegistry : undefined;
-    try {
-        input.logger?.info?.({
-            session_id: input.sessionId,
-            callable_mcp_tools: split.callable.filter((tool) => tool.source === 'configured').length,
-            callable_builtin_tools: split.callable.filter((tool) => tool.source !== 'configured')
-                .length,
-            mcp_invoke_kept: gateway !== undefined,
-            mcp_invoke_tool_ref: (references?.size ?? 0) > 0,
-            mcp_invoke_direct_target: gateway ? isPtcDirectTool(gateway) : false,
-            ...(split.nameConflicts > 0 ? { name_conflicts: split.nameConflicts } : {}),
-            ...(split.hostReservedOnly ? { mcp_invoke_host_reserved: true } : {}),
-        }, 'ptc on-demand tools resolved');
-    }
-    catch {
-        // Diagnostics must not affect the Turn.
-    }
 }
 /**
  * One line per catalog build for an Agent with a `tools` allowlist, so a
@@ -415,26 +400,28 @@ function createInlineHostGateway(input) {
 }
 /** Preserve Desktop's gateway; CLI and its children add it only for real refs/deferred tools. */
 function reservesInlineGateway(input) {
-    return (input.hostCapabilityRegistry !== undefined &&
-        input.hostCapabilityRegistry.reserveInlineGateway !== false);
+    if (input.hostCapabilityRegistry === undefined)
+        return false;
+    // A coordinator lists one tool catalog on Desktop and TUI (Bunny P0 section 6): the
+    // CLI keeps its gateway, and an unroutable call answers with mcp_invoke's own error.
+    if (isTrustedCoordinator(input.agentProfile))
+        return true;
+    return input.hostCapabilityRegistry.reserveInlineGateway !== false;
 }
 function isReadyTurnToolAllowed(input) {
+    if (!isAgentAuthorityToolAllowed(input.profile, input.tool.def.name, input.source))
+        return false;
     if (input.excludedNames.has(input.tool.def.name))
         return false;
     if (!isComputerToolAvailable(input.tool, input.cuRuntimeAvailable))
         return false;
     if (!input.selector.allowsTool(input.tool.def.name, input.options.selectorAlias, {
-        featureOwned: isFeatureOwnedBuiltinTool(input.profile, input.tool.def.name, input.source),
+        featureOwned: isAllowlistExempt(input.profile, input.tool.def.name, input.source),
         pluginTool: input.options.pluginTool === true,
     }))
         return false;
     if (!isMcpServerAllowed(input.selector, input.tool.def.name, input.options.serverName))
         return false;
-    if ((DELEGATION_TOOL_NAMES.has(input.tool.def.name) ||
-        (input.source !== 'builtin' && TASK_CONTROL_TOOL_NAMES.has(input.tool.def.name))) &&
-        !isAuthoritativeMainProfile(input.profile)) {
-        return false;
-    }
     if (!input.profile)
         return true;
     return isProfileToolAllowed(input.profile, input.tool, input.source);
@@ -450,6 +437,19 @@ function isFeatureOwnedBuiltinTool(profile, name, source) {
         name === 'web_search' &&
         (source === 'builtin' || source === 'builtin-matrix'));
 }
+/**
+ * The advisor is the user's choice for the conversation: on any surface but a task child, an
+ * Agent's `tools` allowlist and its capability tools do not drop it (`disallowedTools` still
+ * does). A task child gets it only when its own definition names it.
+ */
+function isUserSelectedBuiltinTool(profile, name, source) {
+    return name === ADVISOR_TOOL_NAME && source === 'builtin' && profile?.surface !== 'task-child';
+}
+/** Tools an Agent's `tools` allowlist cannot name away; only `disallowedTools` applies to them. */
+function isAllowlistExempt(profile, name, source) {
+    return (isFeatureOwnedBuiltinTool(profile, name, source) ||
+        isUserSelectedBuiltinTool(profile, name, source));
+}
 function isComputerToolAvailable(tool, cuRuntimeAvailable) {
     return cuRuntimeAvailable || !tool.def.name.startsWith('computer_');
 }
@@ -461,19 +461,18 @@ function isProfileToolAllowed(profile, tool, source) {
     if (profile.surface === 'task-child' && TASK_CHILD_BLOCKED_TOOL_NAMES.has(tool.def.name)) {
         return false;
     }
+    if (profile.surface === 'task-child' &&
+        TASK_CHILD_EXPLICIT_TOOL_NAMES.has(tool.def.name) &&
+        !selectsToolExplicitly(profile.configSelection, tool.def.name)) {
+        return false;
+    }
     if (isBuiltinSubagentTaskChild(profile) && MAVIS_CAPABILITY_TOOL_NAMES.includes(tool.def.name))
         return false;
+    if (keepsCoordinatorCliTool(profile, tool.def.name))
+        return true;
+    if (isUserSelectedBuiltinTool(profile, tool.def.name, source))
+        return true;
     return isProfileCapabilityEnabled(profile.capabilityCeiling, tool.def.name, source);
-}
-/**
- * Task operations are an owner-only authority. These facts are frozen from the
- * trusted Agent profile while assembling the Turn, rather than from a mutable
- * display name or a product capability flag.
- */
-function isAuthoritativeMainProfile(profile) {
-    return ((profile?.surface === 'interactive' || profile?.surface === 'cli') &&
-        profile.trustedBuiltin === true &&
-        profile.canonicalRole === 'mavis');
 }
 /**
  * The one rule for an Agent's `tools`, `disallowedTools` and `mcpServers`,
@@ -612,21 +611,51 @@ function renderComputerUseHint(tools, ptcChildTools) {
         '</system-reminder>',
     ].join('\n');
 }
-/**
- * Joins the plugin reminder with the MCP tool-search hint when both apply. On a
- * PTC Turn the hint names the run_code call form, because there the hidden
- * tools are run_code children and mcp_invoke does not route them.
- */
-function renderUserPromptPrefix(reminder, deferred, systemHint, ptc) {
-    return [reminder, deferred && systemHint ? renderMcpToolSearchHintBlock({ ptc }) : '']
-        .filter(Boolean)
-        .join('\n\n');
-}
-const TASK_CONTROL_TOOL_NAMES = new Set(['task_query', 'task_output', 'task_stop']);
-const DELEGATION_TOOL_NAMES = new Set(['task', 'task_append']);
 const TASK_CHILD_BLOCKED_TOOL_NAMES = new Set([...DELEGATION_TOOL_NAMES, 'todowrite', 'ask_user']);
+/**
+ * A task child gets these only when its own Agent definition names them in `tools`; an Agent
+ * without a `tools` list does not. The other capability gates still apply on top.
+ */
+const TASK_CHILD_EXPLICIT_TOOL_NAMES = new Set([ADVISOR_TOOL_NAME]);
 const BUILTIN_NATIVE_TOOL_NAMES = new Set(AGENT_BUILTIN_TOOL_IDS);
 const BUILTIN_MCP_TOOL_NAMES = new Set(AGENT_BUILTIN_MCP_TOOL_IDS);
+function selectsToolExplicitly(selection, name) {
+    const target = normalizedSelectorName(name);
+    return selection?.tools?.some((entry) => normalizedSelectorName(entry) === target) === true;
+}
+/**
+ * The advisor tool is in the raw inventory of every Turn so Task capture can freeze it, but a
+ * Turn offers it only when its preparation bound an advisor model.
+ */
+function withoutUnboundAdvisor(tools, advisorBound) {
+    if (advisorBound)
+        return tools;
+    return tools.filter((tool) => tool.def.name !== ADVISOR_TOOL_NAME);
+}
+/**
+ * Whether a builtin native tool with this name passes the same Agent and surface gates
+ * `filterLocalTurnCapabilityInventory` applies to the Turn's inventory. Preparation uses it to
+ * decide, before assembly, whether this Turn will offer the tool.
+ */
+export function isLocalTurnBuiltinToolAllowed(name, agentProfile) {
+    const probe = {
+        // Only the name and source are gated; the probe never reaches a model or runs.
+        def: { name, description: '', schema: {} },
+        impl: {
+            execute: () => Promise.reject(new Error('Capability probe tools are never executed.')),
+        },
+        source: 'builtin',
+    };
+    return (filterLocalTurnCapabilityInventory({
+        sources: {
+            nativeTools: [probe],
+            mcpEntries: [],
+            threadGoalTools: [],
+            cuRuntimeAvailable: false,
+        },
+        ...(agentProfile ? { agentProfile } : {}),
+    }).nativeTools.length > 0);
+}
 function isProfileCapabilityEnabled(ceiling, toolName, source) {
     if (!isFeatureEnabled(ceiling, toolName))
         return false;
@@ -646,47 +675,5 @@ function isFeatureEnabled(ceiling, toolName) {
     if (toolName === 'web_search')
         return ceiling.features.webSearch;
     return true;
-}
-export function resolveLocalMcpDisclosureOptions(raw, env = process.env) {
-    return {
-        enabled: resolveOption(env.MAVIS_MCP_TOOL_SEARCH_ENABLED, raw?.enabled, true, parseBoolean),
-        modelWhitelist: resolveModelWhitelist(env.MAVIS_MCP_TOOL_SEARCH_WHITELIST, raw),
-        thresholdPct: resolveOption(env.MAVIS_MCP_TOOL_SEARCH_THRESHOLD_PCT, raw?.thresholdPct, 0.15, parseNumber),
-        minDeferCount: resolveOption(env.MAVIS_MCP_TOOL_SEARCH_MIN_DEFER_COUNT, raw?.minDeferCount, 1, parseNumber),
-        topKDefault: resolveOption(env.MAVIS_MCP_TOOL_SEARCH_TOP_K_DEFAULT, raw?.topKDefault, 5, parseNumber),
-        topKMax: resolveOption(env.MAVIS_MCP_TOOL_SEARCH_TOP_K_MAX, raw?.topKMax, 20, parseNumber),
-        systemHint: resolveOption(env.MAVIS_MCP_TOOL_SEARCH_SYSTEM_HINT, raw?.systemHint, true, parseBoolean),
-        maxSchemaTextLen: resolveOption(env.MAVIS_MCP_TOOL_SEARCH_MAX_SCHEMA_TEXT_LEN, raw?.maxSchemaTextLen, 4_096, parseNumber),
-    };
-}
-function resolveOption(envValue, configured, fallback, parse) {
-    return parse(envValue) ?? configured ?? fallback;
-}
-function resolveModelWhitelist(envValue, raw) {
-    const parsed = parseStringList(envValue);
-    if (parsed)
-        return parsed;
-    return raw?.modelWhitelist ? [...raw.modelWhitelist] : ['*'];
-}
-function parseBoolean(value) {
-    const normalized = value?.trim().toLowerCase();
-    if (normalized === 'true' || normalized === '1')
-        return true;
-    if (normalized === 'false' || normalized === '0')
-        return false;
-    return undefined;
-}
-function parseNumber(value) {
-    if (!value?.trim())
-        return undefined;
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-}
-function parseStringList(value) {
-    const entries = value
-        ?.split(',')
-        .map((entry) => entry.trim())
-        .filter(Boolean);
-    return entries && entries.length > 0 ? entries : undefined;
 }
 //# sourceMappingURL=local-turn-tool-catalog.js.map

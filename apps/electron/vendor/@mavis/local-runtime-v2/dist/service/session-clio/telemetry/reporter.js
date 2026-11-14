@@ -38,6 +38,30 @@ export class LocalEvalReporter {
     refreshSessionFields(context) {
         this.sessionMetadata = collectLocalEvalSessionMetadata(context);
     }
+    /**
+     * The last-known session metadata snapshot for this reporter. Used by the factory to
+     * inherit the same fields onto a late-event runtime reporter for the same session, so
+     * post-turn events (bunny.turn_ended, bunny.idle, compaction, etc.) carry the same
+     * `extra` fields as the turn's own steps — without re-querying any store.
+     */
+    get lastSessionMetadata() {
+        return this.sessionMetadata;
+    }
+    /**
+     * Adopt another reporter's session metadata snapshot, used by the late-event runtime
+     * reporter so post-turn steps carry the same `extra` fields as the Turn's own steps.
+     * Steps already queued keep the snapshot they were produced under: they are flushed
+     * before the new one is adopted, never relabelled by it. An empty snapshot leaves this
+     * reporter's fields untouched.
+     */
+    inheritSessionMetadata(metadata) {
+        if (Object.keys(metadata).length === 0)
+            return;
+        if (this.pendingSteps.length > 0 && this.pendingSessionMetadata !== metadata)
+            this.flushPending();
+        this.sessionMetadata = metadata;
+        this.pendingSessionMetadata = metadata;
+    }
     hasActiveTurn() {
         return this.turnId.length > 0;
     }

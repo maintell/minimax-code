@@ -1,4 +1,4 @@
-import { collectFetchedWebSources, collectWebSourceCitations, } from '@mavis/agent-runtime';
+import { collectFetchedWebSources, collectWebSourceCitations, readMcpInvokeArguments, } from '@mavis/agent-runtime';
 import { escapeMarkdownLabel, invokedToolName, normalizeToolName, parseMcpToolName, readNonEmptyString, readRecord, safeHttpUrl, } from './source-reference-utils.js';
 export function renderWebFetchSourceMarker(reference) {
     return `Final URL: [${escapeMarkdownLabel(reference.name)}](${reference.url})`;
@@ -19,7 +19,7 @@ export function webFetchSourceReferenceForToolResult(input) {
     if (details?.ok === false)
         return undefined;
     const args = readRecord(input.args);
-    const nestedArgs = readRecord(args?.arguments) ?? readRecord(args?.args);
+    const nestedArgs = readMcpInvokeArguments(args) ?? readRecord(args?.args);
     const resultUrl = safeHttpUrl(readNonEmptyString(details?.final_url) ??
         readNonEmptyString(details?.finalUrl) ??
         readNonEmptyString(details?.url));

@@ -1,3 +1,4 @@
+import { formatSavedPtcScripts } from '@mavis/agent-tools/desktop';
 import { logger } from '../../../infra/logging/logger.js';
 import { scheduleLocalBackgroundTaskDelivery } from './delivery.js';
 import { isTerminalTaskStatus, normalizeTaskError, } from '../../../infra/legacy-db/background-task-contracts.js';
@@ -90,12 +91,9 @@ function toTerminalProjection(result) {
         };
     }
     const status = terminalStatus(result.status);
-    const failureText = result.status === 'succeeded'
-        ? ''
-        : `\n\n[${result.status}] ${result.errorMessage ?? 'Local background task did not complete.'}`;
     return {
         status,
-        outputText: `${result.finalText ?? ''}${failureText}`,
+        outputText: terminalOutputText(result),
         ...(result.finalText !== undefined ? { summary: result.finalText } : {}),
         ...(result.status === 'succeeded'
             ? {}
@@ -106,6 +104,15 @@ function toTerminalProjection(result) {
                 },
             }),
     };
+}
+/** Final text, then the failure line, then any PTC scripts the child saved. */
+function terminalOutputText(result) {
+    const failureText = result.status === 'succeeded'
+        ? ''
+        : `\n\n[${result.status}] ${result.errorMessage ?? 'Local background task did not complete.'}`;
+    // Absent when the child saved nothing, so today's output stays byte-identical.
+    const savedScripts = formatSavedPtcScripts(result.savedPtcScripts);
+    return `${result.finalText ?? ''}${failureText}${savedScripts ? `\n\n${savedScripts}` : ''}`;
 }
 function terminalStatus(status) {
     if (status === 'succeeded')

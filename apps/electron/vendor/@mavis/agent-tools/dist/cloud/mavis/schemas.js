@@ -182,12 +182,31 @@ export const sessionListSchema = z.union([
     }),
 ]);
 export const sessionGetSchema = z.object({ session_id: idString });
+/**
+ * `session update` 只允许改标题、`extra_data_json` 与归档状态。
+ *
+ * 早期版本还接受 `agent_name`,用来把会话改挂到另一个 Agent。该能力已下线:
+ * 改挂只动 Session 的 `agent_id`,渠道侧(如飞书)的绑定仍指向原 Agent,之后的
+ * 入站消息会被丢弃。
+ *
+ * `z.object` 默认静默丢弃未知字段,直接删掉 `agent_name` 会让模型拿到"成功但
+ * 什么也没改"的假成功,所以这里把两个改挂字段声明成"必须缺省",让调用方拿到明确
+ * 的 validation 失败。其余未知字段保持原有的静默丢弃行为,不做 `.strict()`。
+ */
+function removedSessionUpdateField(field) {
+    return z.undefined({
+        errorMap: () => ({
+            message: `session update no longer supports ${field}: a session cannot be moved to another agent`,
+        }),
+    });
+}
 export const sessionUpdateSchema = z.object({
     session_id: idString,
     title: optionalString,
     extra_data_json: optionalString,
-    agent_name: optionalString,
     archived: optionalBoolean,
+    agent_name: removedSessionUpdateField('agent_name'),
+    agent_id: removedSessionUpdateField('agent_id'),
 });
 /**
  * `session messages` —— read recent messages of a session. Implementation

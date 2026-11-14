@@ -19,7 +19,7 @@ import { LocalTelegramChannelStore, telegramClientId, } from '../transport/teleg
 import { LocalTelegramChannelApi } from '../delivery/legacy-http/platform-api/telegram-api.js';
 import { TelegramPlatformAdapter } from '../transport/telegram/telegram-adapter.js';
 import { TelegramAttachmentDownloader } from '../transport/telegram/telegram-attachment-downloader.js';
-import { TelegramSender } from '../transport/telegram/telegram-sender.js';
+import { TelegramSender } from '../transport/telegram/outbound/telegram-sender.js';
 import { LocalWeChatChannelStore, wechatClientId } from '../transport/wechat/wechat-store.js';
 import { LocalWeChatChannelApi } from '../delivery/legacy-http/platform-api/wechat-api.js';
 import { LocalWeChatChannelClient } from '../transport/wechat/wechat-outbound-client.js';
@@ -37,11 +37,11 @@ function buildFeishuWsInputFactory(input) {
         ...(input.preflightInbound ? { preflightInbound: input.preflightInbound } : {}),
         // Route Feishu Card 2.0 form submissions (questionnaire) through the same
         // `feishuCardActionHandler` that the public webhook uses.
-        onCardAction: async (data) => {
+        onCardAction: async (data, source) => {
             const handler = input.cardActionHandlerProvider?.();
             if (!handler)
                 return {};
-            const resp = await handler((data ?? {}));
+            const resp = await handler((data ?? {}), source);
             try {
                 const body = await resp.json();
                 if (body && typeof body === 'object' && 'toast' in body)
@@ -230,6 +230,7 @@ function buildFeishuArm(input) {
             // concrete SDK/fetch wiring. Re-register the exact edge here so a
             // successful rebind cannot retain the API's unconfigured direct client
             // (and test injection follows the same production path).
+            getOrCreateFeishuAdapter(record.agentName).invalidateTransport();
             registerFeishuClient(record);
             detach(startBindTimeFeishuWs(record.agentName));
         },

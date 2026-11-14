@@ -6,6 +6,14 @@
  * supplied to `PiTurnRunner.runTurn(...)`; hosts may own event identity when
  * Pi attempts and native tools must share one logical-Turn sequence.
  */
+/** Spreads `agentKind` into a turn input only when the host classified it. */
+export function agentKindField(agentKind) {
+    return agentKind ? { agentKind } : {};
+}
+/** Spreads `wake` into a turn input only when the host classified it. */
+export function wakeField(wake) {
+    return wake ? { wake } : {};
+}
 export function normalizeAbortSource(value) {
     switch (value) {
         case 'user_stop':

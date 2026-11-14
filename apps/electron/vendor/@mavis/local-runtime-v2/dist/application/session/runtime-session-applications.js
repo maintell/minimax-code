@@ -20,11 +20,13 @@ import { initializeSessionApplicationSystem, } from '../../service/session-syste
 import {} from '../../service/plugin-system/index.js';
 import { AgentHostTurnCapabilityLifecycle, } from '../../service/turn-system/index.js';
 import { composeV1Conversation } from '../../service/v1-conversation-compat/index.js';
+import { sessionDeletionWithQuotaAutoResume } from './quota-auto-resume-runtime.js';
 export async function initializeSessionApplications(input, turnSystem, plugin, ownership) {
     const sessionApplications = initializeSessionApplicationSystem({
         owner: input.sessionSystem,
         pin: input.pinService,
         canvas: input.canvas,
+        pptPreview: input.pptPreview,
         compatibility: { ...input.options.compatibility.sessionV2, goals: input.goalPort },
         archiveTitleModel: input.archiveTitleModel,
         maintenance: turnSystem.maintenance,
@@ -34,7 +36,6 @@ export async function initializeSessionApplications(input, turnSystem, plugin, o
     });
     ownership.ownArchiveTitle(sessionApplications.root.archiveTitle);
     const sessionHandoff = await createSessionHandoffComposition({
-        ...(input.options.metrics ? { metrics: input.options.metrics } : {}),
         dataDir: input.options.dataDir,
         compatibility: input.options.compatibility.sessionHandoff,
         ...(input.options.logger ? { logger: input.options.logger } : {}),
@@ -53,6 +54,10 @@ export async function initializeSessionApplications(input, turnSystem, plugin, o
         sidebarAgents: { list: () => input.options.agentService.list() },
         sidebarCronTargets: () => listCronTargetSessionIds(input.options.db),
         sessionSystem: sessionApplications,
+        // The same check a SelectAdvisorModel write gets; the draft is a whole selection.
+        sideChatAdvisor: {
+            resolve: (draft) => input.modelProviderApplication.resolveAdvisorWrite(undefined, draft),
+        },
         pinService: input.pinService,
         workspaceIndexing: input.workspaceIndexing,
         compatibility: input.options.compatibility.sessionV2,
@@ -72,6 +77,7 @@ export async function initializeSessionApplications(input, turnSystem, plugin, o
             sessionFork: input.sessionSystem.fork,
             forkState: createForkState({
                 ...input.options.compatibility.sessionV2,
+                ptcStore: input.options.prepared?.ptcStoreBinding?.forkState,
                 plan: {
                     documents: input.sessionSystem.planDocuments,
                     modes: input.sessionSystem.sessions.interactionMode,
@@ -93,7 +99,7 @@ export async function initializeSessionApplications(input, turnSystem, plugin, o
         publishGlobalEvent: input.writeGlobalEvent,
         ...(input.options.nowMs ? { nowMs: input.options.nowMs } : {}),
         ...(input.options.metrics ? { metrics: input.options.metrics } : {}),
-        ...(input.memory ? { memory: input.memory.sessionDeletion } : {}),
+        memory: sessionDeletionWithQuotaAutoResume(input.memory?.sessionDeletion, input.quotaAutoResume),
         onRootBestEffortFailure: (failure) => reportRootBestEffortFailure(input.product.executor.reportFailure, failure),
     });
     bindRuntimeHostedCloudHandoff({

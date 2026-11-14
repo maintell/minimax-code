@@ -15,8 +15,9 @@ const CLIENT_SECRETS_FILE = 'client-secrets.json';
  * Waiters poll for ~15s (300 × 50ms). `stale` is a liveness bound, not a hold limit: the holder
  * refreshes the lock mtime every stale/2, so a live holder is never taken over however long it
  * holds the lock.
+ * @internal Exported only for focused tests.
  */
-const LOCK_OPTIONS = {
+export const LOCK_OPTIONS = {
     realpath: false,
     stale: 15_000,
     retries: { retries: 300, factor: 1, minTimeout: 50, maxTimeout: 50 },

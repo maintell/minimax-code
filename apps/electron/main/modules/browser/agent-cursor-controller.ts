@@ -118,6 +118,7 @@ export class AgentCursorController {
                 await this.send({
                     type: 'move',
                     ...restore,
+                    ...(this.identity() ?? {}),
                     animateMovement: false,
                     restore: true,
                 });

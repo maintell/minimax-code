@@ -1,5 +1,6 @@
 import { isCollectionPolicy } from "@mavis/shared/collection-policy";
 import { parseWorkspaceIndexingObservation } from "../../observability/workspace-indexing";
+import { ELECTRON_BROWSER_PUBLIC_ACTIONS } from "../../browser/electron-browser-route-policy";
 /** IPC channel used to deliver a transport MessagePort to a renderer. */
 export let RUNTIME_TRANSPORT_PORT_CHANNEL = 'runtime:transport-port';
 /** IPC channels used to release the renderer's runtime startup gate. */
@@ -213,6 +214,10 @@ function isUtilityRunawayGuardConfig(value) {
 function isUtilityPromptSuggestionPolicy(value) {
     return isRecord(value) && !Array.isArray(value);
 }
+/** Same lenient envelope check as the prompt-suggestion policy; Main parses fields. */
+function isUtilityBunnyPolicy(value) {
+    return isRecord(value) && !Array.isArray(value);
+}
 function isUtilityToolResultCompactionConfig(value) {
     if (value === undefined)
         return true;
@@ -225,6 +230,14 @@ function isUtilityToolResultCompactionConfig(value) {
             isPositiveSafeInteger(value.mcpDetailsMaxInlineBytes)) &&
         (value.checkpointSharedPrefix === undefined ||
             typeof value.checkpointSharedPrefix === 'boolean'));
+}
+/**
+ * Envelope check only, like the Bunny policy: main normalizes the switches and the runtime
+ * reads each one on its own. Rejecting a message for a key or value this side does not know
+ * would drop every switch with it and, on `runtime-init`, block the runtime start.
+ */
+function isUtilityBunnyContextConfig(value) {
+    return value === undefined || (isRecord(value) && !Array.isArray(value));
 }
 function isPromptConfigKey(value) {
     return (value === undefined ||
@@ -244,8 +257,10 @@ export function isUtilityControlMessage(value) {
                 'evalCapture',
                 'contextWindowUsageEnabled',
                 'toolResultCompactionConfig',
+                'bunnyContextConfig',
                 'runawayGuardConfig',
                 'promptSuggestionPolicy',
+                'bunnyPolicy',
                 'startupExecutionPolicy',
                 'collectionPolicy',
                 'computerUseGeneration',
@@ -270,10 +285,12 @@ export function isUtilityControlMessage(value) {
                 isRuntimeRoutingContext(value.routingContext) &&
                 isUtilityEvalCaptureConfig(value.evalCapture) &&
                 isUtilityToolResultCompactionConfig(value.toolResultCompactionConfig) &&
+                isUtilityBunnyContextConfig(value.bunnyContextConfig) &&
                 (value.runawayGuardConfig === undefined ||
                     isUtilityRunawayGuardConfig(value.runawayGuardConfig)) &&
                 (value.promptSuggestionPolicy === undefined ||
                     isUtilityPromptSuggestionPolicy(value.promptSuggestionPolicy)) &&
+                (value.bunnyPolicy === undefined || isUtilityBunnyPolicy(value.bunnyPolicy)) &&
                 (value.collectionPolicy === undefined || isCollectionPolicy(value.collectionPolicy)) &&
                 (value.contextWindowUsageEnabled === undefined ||
                     typeof value.contextWindowUsageEnabled === 'boolean') &&
@@ -297,19 +314,24 @@ export function isUtilityControlMessage(value) {
             return hasMessageKeys(value, ['type', 'config']) && isUtilityRunawayGuardConfig(value.config);
         case 'runtime-prompt-suggestion-policy':
             return (hasMessageKeys(value, ['type', 'policy']) && isUtilityPromptSuggestionPolicy(value.policy));
+        case 'runtime-bunny-policy':
+            return hasMessageKeys(value, ['type', 'policy']) && isUtilityBunnyPolicy(value.policy);
         case 'runtime-tool-result-compaction-config':
             return (hasMessageKeys(value, ['type', 'config']) &&
                 isUtilityToolResultCompactionConfig(value.config));
+        case 'runtime-bunny-context-config':
+            return hasMessageKeys(value, ['type', 'config']) && isUtilityBunnyContextConfig(value.config);
         case 'runtime-collection-policy':
             return hasMessageKeys(value, ['type', 'policy']) && isCollectionPolicy(value.policy);
         case 'runtime-flush-logs':
             return hasMessageKeys(value, ['type', 'requestId']) && isSafeBrokerRequestId(value.requestId);
         case 'runtime-session-report-request':
-            return (hasMessageKeys(value, ['type', 'requestId', 'sessionId']) &&
+            return (hasMessageKeys(value, ['type', 'requestId', 'sessionId'], ['scope']) &&
                 isSafeBrokerRequestId(value.requestId) &&
                 typeof value.sessionId === 'string' &&
                 value.sessionId.length > 0 &&
-                value.sessionId.length <= 512);
+                value.sessionId.length <= 512 &&
+                (value.scope === undefined || value.scope === 'bunny'));
         case 'runtime-workspace-snapshot-request':
             return (hasMessageKeys(value, ['type', 'requestId', 'sessionId', 'outputDir']) &&
                 isSafeBrokerRequestId(value.requestId) &&
@@ -373,6 +395,8 @@ export function isUtilityStatusMessage(value) {
             return (hasMessageKeys(value, ['type', 'event']) && isSkillRegistryDiagnosticEvent(value.event));
         case 'runtime-workspace-indexing-observation':
             return isWorkspaceIndexingObservationMessage(value);
+        case 'runtime-power-demand':
+            return hasMessageKeys(value, ['type', 'active']) && typeof value.active === 'boolean';
         case 'runtime-database-migration':
             return (hasMessageKeys(value, ['type', 'event']) && isDatabaseMigrationObservation(value.event));
         case 'runtime-bootstrap-progress':
@@ -420,31 +444,9 @@ function isPositiveSafeInteger(value) {
     return isNonNegativeSafeInteger(value) && value > 0;
 }
 export let BROWSER_BROKER_ACTIONS = [
-    'inspect',
-    'query',
-    'navigate',
-    'open_tab',
-    'back',
-    'forward',
-    'reload',
-    'click',
-    'click_and_wait_for_navigation',
-    'double_click',
-    'triple_click',
-    'drag',
-    'fill',
-    'type',
-    'press_key',
-    'check',
-    'uncheck',
-    'select_option',
-    'scroll',
-    'hover',
-    'wait',
+    ...ELECTRON_BROWSER_PUBLIC_ACTIONS,
     'wait_for',
     'get_dom',
-    'screenshot',
-    'upload_files',
     'paste',
     'verify_text',
     'inspect_editable_targets',
@@ -509,29 +511,7 @@ export function isBrowserBrokerResultMessage(value) {
         Object.prototype.hasOwnProperty.call(value, 'result') &&
         isStrictStructuredCloneValue(value.result));
 }
-const BROWSER_ERROR_CODES = new Set([
-    'aborted',
-    'ambiguous_target',
-    'browser_action_failed',
-    'browser_operation_timeout',
-    'browser_result_too_large',
-    'browser_session_poisoned',
-    'background_render_busy',
-    'background_render_operation_timeout',
-    'background_render_queue_timeout',
-    'browser_unavailable',
-    'current_tab_occupied',
-    'duplicate_request',
-    'frame_coordinates_unavailable',
-    'invalid_request',
-    'invalid_result',
-    'miniapp_tab_asleep',
-    'snapshot_continuation_mismatch',
-    'snapshot_kind_mismatch',
-    'stale_element_ref',
-    'stale_snapshot',
-]);
-const BROWSER_ERROR_MESSAGES = {
+export let BROWSER_ERROR_MESSAGES = {
     aborted: 'Operation aborted',
     ambiguous_target: 'AMBIGUOUS_TARGET: Browser target is not unique; inspect and narrow it',
     browser_action_failed: 'Browser action failed in Electron main',
@@ -547,6 +527,10 @@ const BROWSER_ERROR_MESSAGES = {
     frame_coordinates_unavailable: 'FRAME_COORDINATES_UNAVAILABLE: Browser cannot safely address this frame by viewport coordinates; inspect the current page and choose a main-frame target',
     invalid_request: 'Invalid Browser broker request',
     invalid_result: 'Invalid Browser broker result',
+    browser_page_unavailable: 'BROWSER_PAGE_UNAVAILABLE: Open or inspect an HTTP(S) page in the current Browser tab before using run_script',
+    miniapp_capacity_busy: 'MINIAPP_CAPACITY_BUSY: The device has reached its running Mini App limit. Ask which app the user wants to stop before retrying open_tab.',
+    miniapp_busy: 'MINIAPP_BUSY: Another Mini App operation is in progress. Wait before retrying open_tab.',
+    miniapp_unavailable: 'MINIAPP_UNAVAILABLE: Check the Mini App lifecycle status before retrying open_tab.',
     miniapp_tab_asleep: 'MINIAPP_TAB_ASLEEP: The selected Mini App tab is asleep to save memory; reopen it with the miniapp tool before using Browser on it',
     snapshot_continuation_mismatch: 'SNAPSHOT_CONTINUATION_MISMATCH: Continue with the exact nextOffset returned by Browser',
     snapshot_kind_mismatch: 'SNAPSHOT_KIND_MISMATCH: Continue the observation with its original Browser action',
@@ -559,7 +543,7 @@ export function isBrowserBrokerErrorMessage(value) {
         hasMessageKeys(value, ['type', 'requestId', 'code', 'message'], ['label', 'timeoutMs', 'detail']) &&
         isSafeBrokerRequestId(value.requestId) &&
         typeof value.code === 'string' &&
-        BROWSER_ERROR_CODES.has(value.code) &&
+        Object.prototype.hasOwnProperty.call(BROWSER_ERROR_MESSAGES, value.code) &&
         value.message === BROWSER_ERROR_MESSAGES[value.code] &&
         (value.detail === undefined ||
             (typeof value.detail === 'string' &&

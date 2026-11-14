@@ -48,7 +48,6 @@ export function composeLocalSandboxService(input) {
                 metrics: {
                     counter: (name, delta, labels) => input.metrics?.counter(name, delta, labels),
                     histogram: (name, value, labels) => input.metrics?.histogram(name, value, labels),
-                    gauge: (name, value) => input.metrics?.gauge?.(name, value),
                 },
             }
             : {}),

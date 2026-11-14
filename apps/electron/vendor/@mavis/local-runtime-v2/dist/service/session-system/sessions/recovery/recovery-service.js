@@ -1,5 +1,16 @@
 import { recoverPtcCrashState, } from '../../messages/ptc/crash-recovery.js';
+import { SESSION_SHUTDOWN_SOURCE } from './capabilities.js';
 export const SESSION_INTERRUPTION_MESSAGE = 'This session was interrupted because the previous local runtime stopped.';
+/** `errorSource` of a Session whose running Turn the previous process left behind. */
+const SESSION_CRASH_RECOVERY_SOURCE = 'crash-recovery';
+/**
+ * Whether the Session's last Turn was cut off by the app stopping, by a
+ * shutdown abort or by crash recovery, and not stopped by anyone.
+ */
+export function stoppedByRestart(session) {
+    return ((session.status === 'aborted' && session.errorSource === SESSION_SHUTDOWN_SOURCE) ||
+        (session.status === 'interrupted' && session.errorSource === SESSION_CRASH_RECOVERY_SOURCE));
+}
 const DEFAULT_RECOVERY_BATCH_SIZE = 1000;
 /**
  * One startup-only Session recovery policy.
@@ -44,7 +55,7 @@ export class SessionRecoveryService {
                     status: 'interrupted',
                     errorMessage: SESSION_INTERRUPTION_MESSAGE,
                     errorCode: undefined,
-                    errorSource: 'crash-recovery',
+                    errorSource: SESSION_CRASH_RECOVERY_SOURCE,
                     errorDetail: undefined,
                     errorProviderId: undefined,
                 });

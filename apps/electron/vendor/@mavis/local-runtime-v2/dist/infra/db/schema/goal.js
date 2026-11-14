@@ -106,7 +106,7 @@ export const localRuntimeV2GoalTokenCharges = sqliteTable('local_runtime_v2_goal
     goalId: text('goal_id').notNull(),
     sessionId: text('session_id').notNull(),
     turnId: text('turn_id').notNull(),
-    /** compaction (in a Goal Turn) | sub_session (any request of an attributed round) */
+    /** compaction | advisor (in a Goal Turn or a round) | sub_session (other requests of an attributed round) */
     source: text('source').notNull(),
     /** open | settled | unresolved | discarded */
     phase: text('phase').notNull(),

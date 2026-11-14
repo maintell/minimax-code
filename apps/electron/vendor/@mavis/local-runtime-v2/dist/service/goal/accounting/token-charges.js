@@ -1,9 +1,9 @@
 /**
  * Token charges of a full-usage Goal for requests outside the request ledger
  * (`local_runtime_v2_goal_token_charges`, migration 48): automatic compaction
- * in a Goal Turn, and every request of a sub-session round a Goal Turn started
- * (subagent tasks, the subagent verifier, their compaction, and rounds those
- * started in turn).
+ * and advisor requests in a Goal Turn, and every request of a sub-session round
+ * a Goal Turn started (subagent tasks, the subagent verifier, their compaction,
+ * and rounds those started in turn).
  *
  * These requests count tokens only. They are not Goal requests: they take no
  * work budget, are never reserved or admitted, and never appear in the request

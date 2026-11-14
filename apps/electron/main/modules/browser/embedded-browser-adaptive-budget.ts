@@ -36,10 +36,10 @@ function readSystemMemory() {
 export function deviceHiddenTabCap(totalBytes) {
     const gib = totalBytes / 1024 ** 3;
     if (gib <= 8)
-        return 1;
+        return 3;
     if (gib <= 16)
-        return 2;
-    return 3;
+        return 6;
+    return 12;
 }
 export function classifyBrowserMemoryPressure(sample) {
     const ratio = sample.totalBytes > 0 ? sample.availableBytes / sample.totalBytes : 0;
@@ -74,7 +74,7 @@ export class EmbeddedBrowserAdaptiveBudget {
         const hiddenTabBudget = this.pressure === 'critical'
             ? 0
             : this.pressure === 'moderate'
-                ? Math.min(1, deviceCap)
+                ? Math.min(deviceCap, Math.max(2, Math.floor(deviceCap / 2)))
                 : deviceCap;
         const estimatedWorkingSetKiBByTabId = this.estimateWorkingSet(tabs);
         return {

@@ -15,10 +15,6 @@ const STANDALONE_TOOL_REQUIREMENTS = {
     'code-review': ['read'],
     'deploy-website': ['read', 'write', 'bash', 'website_deploy'],
     'edit-deployed-website': ['read', 'edit', 'bash', 'website_deploy'],
-    docx: ['read', 'write', 'bash'],
-    pdf: ['read', 'write', 'bash'],
-    pptx: ['read', 'write', 'bash'],
-    xlsx: ['read', 'write', 'bash'],
     init: ['read', 'write', 'bash'],
     'plugin-creator': ['read', 'write', 'bash'],
     'skill-creator': ['read', 'write', 'bash'],
@@ -41,15 +37,19 @@ function isStandaloneSkillUsable(skillName, capabilities) {
     return required !== undefined && hasTools(capabilities, required);
 }
 function addFeatureSkills(selected, capabilities, gates) {
+    // Product knowledge has no Tool or feature owner, so every surface and Agent keeps it.
+    selected.add('minimax-code-product');
     if (capabilities.features.mavis) {
         selected.add('mavis');
         selected.add('create-agent');
-        selected.add('minimax-code-product');
     }
     if (gates.miniappAvailable === true &&
         hasTools(capabilities, ['read', 'write', 'edit', 'bash'])) {
         selected.add('miniapp-creator');
     }
+    // Workflow guidance owned by the search_plugins / request_plugin extension tools.
+    if (gates.pluginRecommendationAvailable === true)
+        selected.add('plugin-management');
 }
 function addRuntimeSkills(selected, capabilities, gates) {
     if (gates.resumeCodexAvailable === true && isAgentBuiltinToolEnabled(capabilities, 'bash')) {

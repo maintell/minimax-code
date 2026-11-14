@@ -44,6 +44,9 @@ export class DrizzleAgentRepository {
     withDisplayNameLock(operation) {
         return this.files.withLock(DISPLAY_NAME_LOCK_KEY, operation);
     }
+    withCreationLock(name, operation) {
+        return this.files.withCreationLock(name, operation);
+    }
     normalizePrimaryFamilyRows() {
         const rows = this.options.db
             .select({
@@ -224,7 +227,7 @@ export class DrizzleAgentRepository {
     async getConfig(name) {
         const builtin = await this.getTrustedBuiltinMeta(name);
         if (builtin)
-            return this.files.getConfig(name);
+            return this.builtinFiles.config(name);
         const config = await this.readCanonicalCustomConfigIfPresent(name);
         if (config) {
             return config.xMavis?.defaultWorkspaceDir

@@ -70,7 +70,30 @@
 !macroend
 
 !macro customInit
-  ; No legacy migrations needed
+  ; Windows ships one installer per architecture (nsis.buildUniversalInstaller=false).
+  ; An arm64-only package on an x64 machine leaves packageArch empty in
+  ; extractAppPackage.nsh and would "succeed" without copying any app files, so
+  ; stop before touching the existing installation. Silent runs (auto-update,
+  ; enterprise deployment) skip the dialog via /SD and exit with a non-zero code.
+  !ifdef APP_ARM64
+    !ifndef APP_64
+      ${IfNot} ${IsNativeARM64}
+        !insertmacro MavisInstallerTrace "event=installer_arch_mismatch package=arm64"
+        ; BUILD_LOCALE is defined by installer-zh.nsh / installer-en.nsh wrappers
+        !if "${BUILD_LOCALE}" == "en"
+        MessageBox MB_OK|MB_ICONSTOP \
+          "This installer is for Windows (ARM64) devices only.$\n$\n\
+Please download the Windows (64-bit) installer of ${PRODUCT_NAME}." /SD IDOK
+        !else
+        MessageBox MB_OK|MB_ICONSTOP \
+          "此安装包仅适用于 Windows（ARM64）设备。$\n$\n\
+请下载 ${PRODUCT_NAME} 的 Windows（64 位）安装包。" /SD IDOK
+        !endif
+        SetErrorLevel 2
+        Quit
+      ${EndIf}
+    !endif
+  !endif
 !macroend
 
 !macro customInstall

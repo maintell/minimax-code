@@ -1,5 +1,6 @@
 import { nativeImage } from "electron";
 import { normalizeAgentCursorBridgeMessage } from "./agent-cursor-bridge";
+import { getBrowserJsDialogGate } from "./browser-js-dialog-registry";
 import { captureWebviewFullPage } from "./webview-full-page-screenshot";
 export function withDevicePreviewLease(tab, operation) {
     const previous = tab.devicePreviewTaskTail ?? Promise.resolve();
@@ -7,19 +8,58 @@ export function withDevicePreviewLease(tab, operation) {
     tab.devicePreviewTaskTail = task.then(() => undefined, () => undefined);
     return task;
 }
+function heldJsDialogGate(tab) {
+    const webContents = tab.controller.getWebContents?.();
+    return webContents ? getBrowserJsDialogGate(webContents) : undefined;
+}
+/**
+ * Agent surface commands run as page JavaScript, which an open JavaScript
+ * dialog blocks until it closes. Stop waiting while a dialog is held or shown
+ * in the native box: the command still runs, in order, after the dialog
+ * closes, but the Browser action result and handle_js_dialog must not wait
+ * for it.
+ */
+async function awaitUnlessJsDialogHeld(tab, task) {
+    const settled = task.then(() => undefined, () => undefined);
+    const gate = heldJsDialogGate(tab);
+    if (!gate)
+        return settled;
+    if (gate.hasOpenDialog())
+        return;
+    let stopWatching = () => undefined;
+    const held = new Promise((resolve) => {
+        stopWatching = gate.onChange((dialog) => {
+            if (dialog)
+                resolve();
+        });
+    });
+    try {
+        await Promise.race([settled, held]);
+    }
+    finally {
+        stopWatching();
+    }
+}
+function startSurfaceCommand(run) {
+    try {
+        return Promise.resolve(run());
+    }
+    catch (error) {
+        return Promise.reject(error);
+    }
+}
 export function withAgentCursorHiddenForCapture(tab, capture) {
+    // Hiding the cursor needs page JavaScript, which an open dialog blocks.
+    if (heldJsDialogGate(tab)?.hasOpenDialog())
+        return capture();
     const withHidden = tab.controller.withAgentCursorHiddenForCapture;
     return typeof withHidden === 'function'
         ? withHidden.call(tab.controller, capture)
         : capture();
 }
 export async function bestEffortHideAgentCursor(tab) {
-    try {
-        await tab.controller.hideAgentCursor?.();
-    }
-    catch {
-        // Cursor cleanup must never replace the browser action result or error.
-    }
+    // Cursor cleanup must never replace the browser action result or error.
+    await awaitUnlessJsDialogHeld(tab, startSurfaceCommand(() => tab.controller.hideAgentCursor?.()));
 }
 export async function executeWithAgentCursorLease(tab, execute, options = {}) {
     return withDevicePreviewLease(tab, async () => {
@@ -33,12 +73,8 @@ export async function executeWithAgentCursorLease(tab, execute, options = {}) {
     });
 }
 async function bestEffortSetAgentExecutionGlow(tab, active) {
-    try {
-        await tab.controller.setAgentExecutionGlow?.(active);
-    }
-    catch {
-        // Visual feedback must never replace the Browser action result or error.
-    }
+    // Visual feedback must never replace the Browser action result or error.
+    await awaitUnlessJsDialogHeld(tab, startSurfaceCommand(() => tab.controller.setAgentExecutionGlow?.(active)));
 }
 export async function executeWithAgentExecutionGlow(tab, execute) {
     const previousLeases = tab.agentExecutionGlowLeases ?? 0;

@@ -2,6 +2,7 @@ import { delimiter } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
+import { toolResultIsError, } from '@mavis/agent-core/tools';
 import { DesktopMatrixClient, } from './matrix-client.js';
 import { getDesktopMatrixEndpoint } from './matrix-env.js';
 import { DesktopMatrixMediaClient } from './matrix-media-client.js';
@@ -121,7 +122,9 @@ function formatToolResultAsMcp(toolName, result) {
     }
     return {
         content,
-        isError: result.isError === true,
+        // A failure the tool reports only through details (callMatrixTool sets
+        // details.ok false) must reach MCP clients as isError.
+        isError: toolResultIsError(result),
         _meta: {
             matrix: { server: 'matrix', tool: toolName },
             ...(result.details ? { details: result.details } : {}),

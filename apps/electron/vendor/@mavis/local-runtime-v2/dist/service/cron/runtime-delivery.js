@@ -5,10 +5,17 @@ function createRuntimeCronTurnDelivery(turns, reportFailure) {
         deliver: (request) => deliverRuntimeCron(turns, request, reportFailure),
     };
 }
-export function createOptionalRuntimeCronTurnDelivery(cronEnabled, override, turns, reportFailure) {
+function createOptionalRuntimeCronTurnDelivery(cronEnabled, override, turns, reportFailure) {
     return cronEnabled
         ? (override ?? createRuntimeCronTurnDelivery(turns, reportFailure))
         : undefined;
+}
+/** Binds Cron Agent cleanup and returns the Session-side Cron delivery port, if Cron is owned. */
+export function composeRuntimeCronDelivery(owners, options, product) {
+    const { cron } = owners;
+    if (cron)
+        options.compatibility.cron.bindAgentCleanup(cron.service);
+    return createOptionalRuntimeCronTurnDelivery(Boolean(cron), options.overrides?.cron?.turnDelivery, owners.turnSystem.turns, product.executor.reportFailure);
 }
 export async function deliverRuntimeCron(turns, request, reportFailure) {
     let result;
@@ -23,7 +30,10 @@ export async function deliverRuntimeCron(turns, request, reportFailure) {
             idempotencyKey: request.runId,
             // Every Cron run needs a durable receipt, including deliveries to an active Turn.
             preDelivery: {
-                accept: async () => {
+                accept: async ({ mode }) => {
+                    if (request.deferWhileBusy === true && mode === 'steered') {
+                        throw new CronDeliveryDeferredError('CRON_DELIVERY_ACTIVE_TURN');
+                    }
                     await request.beforeDelivery?.();
                 },
             },

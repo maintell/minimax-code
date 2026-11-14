@@ -280,14 +280,9 @@ export class LocalChannelRunner {
         // transport failed to tear itself down, a message that slips through here
         // is discarded with no session work and no reply. `handled: true` so the
         // HTTP layer answers 200; `accessDeniedReason` tags it for ops.
-        if (this.hasActiveChannelBinding && !(await this.hasActiveChannelBinding(input.ctx))) {
-            const inbound = {
-                handled: true,
-                lane: input.ctx.lane ?? 'interactive',
-                accessDeniedReason: 'channel-unbound',
-            };
-            return { inbound };
-        }
+        const creatorDenied = await this.denyInbound(input.ctx);
+        if (creatorDenied)
+            return this.settleInboundOutcome(input.ctx, creatorDenied);
         // Permission reply interception — MUST run BEFORE the questionnaire
         // interception (see tryInterceptPermissionReply for the full rationale).
         const permission = await this.tryInterceptPermissionReply(input);
@@ -311,6 +306,16 @@ export class LocalChannelRunner {
             },
         });
         return this.settleInboundOutcome(input.ctx, inbound);
+    }
+    async denyInbound(ctx) {
+        if (this.hasActiveChannelBinding && !(await this.hasActiveChannelBinding(ctx))) {
+            return {
+                handled: true,
+                lane: ctx.lane ?? 'interactive',
+                accessDeniedReason: 'channel-unbound',
+            };
+        }
+        return this.options.infra.denyCoordinatorAccess?.(ctx);
     }
     /** Post-bridge outcome handling: dedup pass-through, direct reply, queue notice. */
     async settleInboundOutcome(ctx, inbound) {
@@ -508,6 +513,8 @@ export class LocalChannelRunner {
     }
     /** Best-effort product hook used by both legacy and v2 Turn execution. */
     async notifyTurnStart(ctx) {
+        if ((await this.options.infra.canDeliverToChannel?.(ctx)) === false)
+            return;
         const adapter = this.options.infra.adapterRegistry?.get(ctx.platform, ctx.clientName);
         logger.info({
             platform: ctx.platform,
@@ -558,6 +565,9 @@ export class LocalChannelRunner {
     }
     /** Delivers a continuation from the v2 committed-message projection. */
     async deliverReplyFromMessages(deliver) {
+        if ((await this.options.infra.canDeliverToChannel?.(deliver.ctx, deliver.sessionId)) === false) {
+            return undefined;
+        }
         const filter = await this.resolveMessageFilter(deliver.ctx);
         const collected = collectChannelResponseFromMessages(deliver.messages, filter, deliver.error);
         return this.sendCollected({

@@ -2,6 +2,7 @@ import { LegacyOpencodeMigrator } from '../../../infra/legacy-db/legacy-opencode
 import { resolveLocalAppMode } from '../../../infra/runtime-owner/app-mode.js';
 import { json, readString } from '../../../infra/transport/host-http.js';
 import { readPersistedLocalModelThinkingSelection } from '../../../infra/conversation/model-selection.js';
+import { resolveWritableModelSelection } from './model-selection-write.js';
 export const DEFAULT_LOCAL_AGENT_AVATAR_URL = 'https://filecdn.minimax.chat/public/d92edcbe-2404-417b-a133-b770b0b9bf61.svg';
 export function buildLegacyAgentIdentity(agent, name) {
     const displayName = agent?.displayName ?? name;
@@ -20,20 +21,33 @@ export function readSessionAppMode(body, parent) {
     const requested = readString(body, 'appMode') ?? readString(body, 'app_mode');
     return resolveLocalAppMode(requested ?? parent?.appMode);
 }
-export function readSessionModelSelection(value) {
-    if (!value || typeof value !== 'object' || Array.isArray(value))
-        return {};
+/**
+ * Reads the model a new Session is created with. The key is canonicalized
+ * and route-checked before it is stored, because a Session only ever sees
+ * this string again: a BYOK provider written without its `custom_provider:`
+ * prefix would resolve as a built-in managed provider on the first Turn.
+ */
+export function readSessionModelSelection(config, value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return { ok: true, fields: {} };
+    }
     const model = Object.fromEntries(Object.entries(value));
     const providerId = readString(model, 'provider_id');
     const modelId = readString(model, 'model_id');
     if (!providerId || !modelId)
-        return {};
+        return { ok: true, fields: {} };
+    const resolved = resolveWritableModelSelection(config, providerId, modelId);
+    if (!resolved.ok)
+        return resolved;
     return {
-        effectiveModel: `${providerId}/${modelId}`,
-        effectiveModelVariant: readString(model, 'variant') ?? null,
-        ...(Object.prototype.hasOwnProperty.call(model, 'thinking')
-            ? { effectiveModelThinking: readPersistedLocalModelThinkingSelection(model.thinking) }
-            : {}),
+        ok: true,
+        fields: {
+            effectiveModel: resolved.selection.modelKey,
+            effectiveModelVariant: readString(model, 'variant') ?? null,
+            ...(Object.prototype.hasOwnProperty.call(model, 'thinking')
+                ? { effectiveModelThinking: readPersistedLocalModelThinkingSelection(model.thinking) }
+                : {}),
+        },
     };
 }
 export function readOnlyLegacySessionResponse() {

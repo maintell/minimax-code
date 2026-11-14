@@ -117,6 +117,8 @@ const OWNED_UPDATE_FIELDS = [
     'isDefaultWorkspace',
     'title',
     'titleSource',
+    'titleReviewState',
+    'titleReviewTurnId',
     'parentSessionId',
     'purpose',
     'runLocation',
@@ -134,6 +136,7 @@ const OWNED_UPDATE_FIELDS = [
     'effectiveModelThinking',
     'effectiveModelContextWindow',
     'effectiveModelMaxOutputTokens',
+    'advisor',
     'scratchpadPath',
     'origin',
 ];

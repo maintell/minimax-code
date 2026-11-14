@@ -1,5 +1,10 @@
 export const BACKGROUND_CADENCE_REMINDER_CUSTOM_TYPE = 'background_task_cadence_reminder';
 export const BACKGROUND_TASK_READ_SETTLEMENT_CUSTOM_TYPE = 'background_task_read_settlement';
+/**
+ * Hidden messages the Turn state layer writes into canonical history; compaction, rewind and
+ * history identity tell them apart by these types.
+ */
+export { isRecallPointersMessage, isStateDeltaMessage, RECALL_POINTERS_CUSTOM_TYPE, STATE_DELTA_CUSTOM_TYPE, } from './execution/turn-state-layer/hidden-messages.js';
 /** Reads current nested metadata and the pre-hostMetadata persisted shape. */
 export function readBackgroundTaskOriginMetadata(message) {
     if (!isProtocolRecord(message))
@@ -58,11 +63,19 @@ function isProviderOmitHostMetadata(value) {
  * Accepts exactly the origin `mavis-session-send.ts` freezes at delivery.
  *
  * Extra keys fail closed: a caller that smuggles fields past the shape must
- * not have them reach the model-facing envelope. A SideChat origin
- * (`kind: 'sidechat-send'`) has no `command` and falls out here, which keeps
- * it on its own display path instead of the peer envelope.
+ * not have them reach the model-facing envelope.
+ *
+ * A SideChat hand-back to its main Session is stored with a SideChat origin
+ * (`kind: 'sidechat-send'`) so the desktop can label its bubble. For the model
+ * it is still a message from another local Session that may need an answer, so
+ * it reads as a peer origin naming the SideChat: the main Session gets the same
+ * envelope and reply note as any other session send. Display keeps reading the
+ * stored SideChat origin.
  */
 export function parsePeerSessionOrigin(value) {
+    const sideChatSessionId = sideChatHandBackSender(value);
+    if (sideChatSessionId)
+        return { fromSession: sideChatSessionId, command: 'session send' };
     if (!isPeerSessionOriginShape(value))
         return undefined;
     const fromAgent = optionalProtocolString(value, 'fromAgent');
@@ -78,6 +91,17 @@ export function parsePeerSessionOrigin(value) {
         ...(fromDevice !== undefined ? { fromDevice } : {}),
         ...(value['remote'] === true ? { remote: true } : {}),
     };
+}
+/**
+ * The SideChat id of a stored SideChat hand-back origin
+ * (`@mavis/shared/sidechat-send-origin`, read by shape because the AgentHost
+ * core stays self-contained). Lenient on extra keys like the shared reader.
+ */
+function sideChatHandBackSender(value) {
+    if (!isProtocolRecord(value) || value['kind'] !== 'sidechat-send')
+        return undefined;
+    const id = value['sideChatSessionId'];
+    return typeof id === 'string' && id.trim().length > 0 ? id : undefined;
 }
 const PEER_SESSION_ORIGIN_OPTIONAL_KEYS = [
     'fromAgent',

@@ -8,9 +8,9 @@ import { buildEnv, LOCALE, isDev, isTest, isStaging, isInternalBuild, isInsideBu
 import { DOMAIN_URL, IPC_CHANNELS } from "../config/constants";
 import { setupAllIPC, initDesktopSettings, cleanupDesktopSettings, startHotUpdateAutoCheck, stopHotUpdateAutoCheck } from "../ipc";
 import { cleanupPPTPreviewCache } from "../ipc/pptPreview.ipc";
+import { abortRendererProxyStreams, handleCloudProtocolJsonRequest } from "../ipc/proxy.ipc";
 import { flushBrowserTelemetryOnQuit } from "../modules/browser/browser-telemetry-runtime";
 import { browserBackendPolicy } from "../modules/browser/browser-backend-policy";
-import { handleCloudProtocolJsonRequest } from "../ipc/proxy.ipc";
 import { getTokens, clearTokens, getDesktopConfig, replaceSharedUserInfo } from "../ipc/storage.ipc";
 import { createDesktopAccountIdentitySource } from "../modules/auth/account-identity";
 import { flushDockFileQueue, setupDockFileOpenHandler } from "../modules/dock";
@@ -29,7 +29,9 @@ import { createRuntimeFetchDevToolsInitializer } from "../modules/runtime-fetch-
 import { initializeMcodeToolsIntegration, disposeMcodeToolsIntegration } from "../modules/mcode-tools";
 import { disconnectRemoteControlBridgeBeforeQuit } from "../modules/remote-control-bridge/ipc";
 import { markElectronObservabilityExpectedRendererExit, enqueueElectronObservabilityEvent, getElectronObservabilityAppInstanceId, setElectronObservabilityShuttingDown, setupElectronObservabilityOutbox, installElectronObservabilityProbes } from "../modules/observability/outbox";
+import { closeDesktopMetrics } from "../modules/observability/desktop-metrics";
 import { recordElectronStartupMainMilestone } from "../modules/observability/startup-performance";
+import { stopMainMemoryLogging, startMainMemoryLogging } from "../modules/observability/main-memory-logger";
 import { stopPowerSaveBlocker } from "../modules/power";
 import { registerProtocolScheme, setupDocumentPreviewProtocolHandler, setupProtocolHandler } from "../modules/protocol";
 import { initScreenshots } from "../modules/screenshot";
@@ -47,6 +49,7 @@ import { RendererIncidentController } from "./renderer-incident-controller";
 import { createElectronTerminalActionAdapters } from "./quit-coordinator";
 import { createElectronLifecycleTelemetry } from "./telemetry";
 import { invalidateWorkspaceGitSnapshotsAfterResume } from "./workspace-git-resume";
+import { reconcileQuotaAutoResumePlansAfterResume } from "./quota-auto-resume-wake";
 import { confirmQuitWithRunningTasks } from "./quit-confirmation";
 function logLifecycleError(message, error) {
     logger_1.default.error(error === undefined ? message : `${message}: ${String(error)}`);
@@ -93,6 +96,11 @@ function createPowerResumeRecovery(controller) {
             logger_1.default.info('[Power] System resumed from sleep');
             void invalidateWorkspaceGitSnapshotsAfterResume(handleLocalRuntimeRequest).catch((error) => {
                 logLifecycleWarning('[Power] Failed to invalidate Workspace Git snapshots', error);
+            });
+            // A suspended process does not advance its timers, so the Runtime
+            // recomputes every stored Token Plan auto-resume plan against the clock.
+            void reconcileQuotaAutoResumePlansAfterResume(handleLocalRuntimeRequest).catch((error) => {
+                logLifecycleWarning('[Power] Failed to reconcile Token Plan auto-resume plans', error);
             });
             const window = windowManager.getWindow();
             if (!window || window.isDestroyed() || window.webContents.isDestroyed())
@@ -260,7 +268,10 @@ function createProductionComposition(options = {}) {
                     }
                 },
             },
-            beforeQuit: clearGpuSentinel,
+            beforeQuit: () => {
+                stopMainMemoryLogging();
+                clearGpuSentinel();
+            },
             confirmNormalQuit: () => confirmQuitWithRunningTasks(windowManager.getWindowByType('archon')),
             focusNormalQuitConfirmation: () => {
                 const window = windowManager.getWindowByType('archon');
@@ -296,6 +307,7 @@ function createProductionComposition(options = {}) {
                 now: () => Date.now(),
                 isShuttingDown: () => windowManager.isAppQuitting(),
                 isWindowAlive,
+                releaseRendererResources: (window) => abortRendererProxyStreams(window.webContents),
                 observeIncident: (incident) => {
                     logger_1.default.error({
                         msg: '[RendererIncidentController] Primary renderer incident',
@@ -397,7 +409,13 @@ function createProductionComposition(options = {}) {
                     // App shutdown owns a global cutoff and may proceed while the old
                     // Utility remains quarantined. Data-dir relocation consumes the
                     // structured stop result directly and has stricter semantics.
-                    await stopLocalRuntime();
+                    try {
+                        await stopLocalRuntime();
+                    }
+                    finally {
+                        // Send the last supervisor and UI points once the runtime has stopped.
+                        await closeDesktopMetrics();
+                    }
                 },
                 flushMainProcessLogs: logger_1.flushLogs,
                 initializeMcodeToolsIntegration: () => initializeMcodeToolsIntegration({ sharedAuthSession }),
@@ -430,6 +448,8 @@ function createProductionComposition(options = {}) {
         },
         onReady: () => {
             recordElectronStartupMainMilestone('app_ready');
+            // Heap/RSS breadcrumb for the whole session; stopped on before-quit.
+            startMainMemoryLogging();
             logDisplayInformation();
             app.once('browser-window-created', (_event, window) => {
                 window.once('ready-to-show', () => clearGpuSentinel());

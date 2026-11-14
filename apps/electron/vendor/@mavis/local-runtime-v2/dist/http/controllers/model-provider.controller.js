@@ -1,4 +1,5 @@
 import { LocalModelProviderError, readPersistedLocalModelThinkingSelection, } from '../../service/model-system/index.js';
+import { advisorViewToInput } from '../../application/session/model-provider-advisor.js';
 import { AppError } from '../errors.js';
 import { ModelProviderControllerBase } from '../generated/model-provider-controller-base.gen.js';
 import { toApiKeyInfo, toApiKeyProbe, toByokPresetModelInput, toCandidateView, toModelInfo, toModelInputView, toModelStatus, toProviderInfo, } from './model-provider-mappers.js';
@@ -9,11 +10,24 @@ export class ModelProviderController extends ModelProviderControllerBase {
         this.facade = facade;
     }
     listModels(_ctx, req) {
-        return this.mapErrors(async () => ({
-            models: (await this.require().application.list({
+        return this.mapErrors(async () => {
+            const listed = await this.require().application.listWithAdvisor({
                 ...(req.sessionId ? { sessionId: req.sessionId } : {}),
-            })).map(toModelInfo),
-        }));
+            });
+            return { models: listed.models.map(toModelInfo), advisor: listed.advisor };
+        });
+    }
+    selectAdvisorModel(_ctx, req) {
+        return this.mapErrors(async () => {
+            if (typeof req.enabled !== 'boolean') {
+                throw new AppError(400, 'VALIDATION_ERROR', 'enabled must be a boolean');
+            }
+            const advisor = await this.require().application.selectAdvisor({
+                ...advisorViewToInput(req),
+                ...(req.sessionId ? { sessionId: req.sessionId } : {}),
+            });
+            return { advisor };
+        });
     }
     selectModel(_ctx, req) {
         return this.mapErrors(async () => ({

@@ -1,3 +1,4 @@
+import { logger } from '../../../../infra/logging/logger.js';
 import { isPeekSession } from '../repo/normalization.js';
 import { SessionServiceError } from '../errors.js';
 export class SessionDeletionService {
@@ -28,12 +29,16 @@ export class SessionDeletionService {
         await this.options.cleanup.deleteCommunication(sessionId);
         await this.options.cleanup.deleteChannelBindings(sessionId);
         await this.options.cleanup.deleteQuestionnaires(sessionId);
+        await this.deleteAssignmentBestEffort(sessionId);
         await this.options.cleanup.deletePermissions(sessionId);
         await this.options.cleanup.deleteGoal(sessionId);
         await this.options.cleanup.deleteQueryCollapse(sessionId);
         await this.options.cleanup.removePin(sessionId);
         await this.options.sessions.reparentChildren(sessionId, current.parentSessionId ?? null);
         await this.options.clearSessionReference(current);
+        // Last before the record: an earlier cleanup failure keeps the Session and
+        // its previews intact; a missed file is reclaimed by the startup sweep.
+        await this.options.cleanup.deletePptPreview(sessionId);
         await this.options.records.deleteSessionRecord(sessionId);
         this.options.facts.handle({
             kind: 'deleted',
@@ -41,6 +46,15 @@ export class SessionDeletionService {
             ...(previousMainSessionId ? { previousMainSessionId } : {}),
         });
         return current;
+    }
+    /** The Bunny store never blocks deleting a Session; the startup orphan sweep retries. */
+    async deleteAssignmentBestEffort(sessionId) {
+        try {
+            await this.options.cleanup.deleteAssignment(sessionId);
+        }
+        catch (error) {
+            logger.warn({ sessionId, error: error instanceof Error ? error.message : String(error) }, 'Could not delete the Session task row; the startup orphan sweep removes it');
+        }
     }
 }
 //# sourceMappingURL=deletion-service.js.map

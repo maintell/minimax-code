@@ -5,8 +5,11 @@ import { GlobalInstructions } from '../../service/turn-system/index.js';
 import { channelModelInvalidReceiptText } from '../../service/channel-system/index.js';
 import { initializeComputerUseProductCapabilities } from '../../service/computer-use/index.js';
 import { resolveRuntimeMiniAppOptions } from '../../service/miniapp/index.js';
+import { initializeQuotaAutoResume } from '../../service/quota-auto-resume/index.js';
+import { createSubscriptionQuota } from '../../service/subscription-quota/index.js';
 import { resolvePluginServiceLogger } from './plugin-service-logger.js';
 import { LocalPromptSnapshotSource } from '../../service/agent/index.js';
+import { readCoordinatorRoster } from './coordinator-roster.js';
 import { initializeRuntimePromptSupport, } from '../../service/prompt-config/index.js';
 /** Keeps Prompt-specific wiring outside the shared service composition flow. */
 export async function initializeRuntimeServicePromptSupport(input) {
@@ -37,7 +40,19 @@ export async function createRuntimePromptSessionSupport(input) {
     const { promptSnapshots, internalTurnPromptReads } = promptSupport;
     const agentSessionPorts = createAgentSessionPorts(options.agentService);
     const serviceLogger = resolvePluginServiceLogger(options.logger);
-    const productionSessionComposition = createRuntimeSessionComposition({
+    const configGetter = options.compatibility.agentHost.preparation.configBuilder.config;
+    const quotaAutoResume = initializeQuotaAutoResume({
+        db: options.db,
+        nowMs,
+        // Absent means on; only an explicit `false` turns the setting off.
+        enabled: () => configGetter().quotaAutoResume?.enabled !== false,
+        desktopHost: options.runtimeOwnerKind === 'electron',
+        quota: createSubscriptionQuota({ ...options.compatibility.sessionHandoff.cloud, nowMs }),
+        usesBuiltinAccountModel: (modelName) => modelName.startsWith('minimax/') && configGetter().minimaxModelSource !== 'minimax_api_key',
+        ...(options.logger ? { logger: options.logger } : {}),
+    });
+    const coordinatorRoster = await readCoordinatorRoster(options.agentService, serviceLogger);
+    const productionSessionComposition = closeRosterIfThrown(coordinatorRoster, () => createRuntimeSessionComposition({
         // IM MR2/MR3: the pre-queue channel model rejection text is owned by the
         // v2 channel system copy; products no longer inject a v1 formatter.
         options: { ...options, formatChannelModelInvalid: channelModelInvalidReceiptText },
@@ -67,6 +82,7 @@ export async function createRuntimePromptSessionSupport(input) {
             nowMs,
             publishGlobalEvent: writeGlobalEvent,
             agentSessionPorts,
+            coordinatorRoster,
             agentReferenceProjection: createRuntimeAgentReferenceProjection(options.compatibility, options.agentService, serviceLogger),
             inspector,
             internalTurnPromptReads,
@@ -75,8 +91,28 @@ export async function createRuntimePromptSessionSupport(input) {
             browserUse,
             promptSnapshots,
             globalInstructions,
+            quotaAutoResume: quotaAutoResume.turnObserver,
         },
-    });
-    return { globalInstructions, promptSupport, productionSessionComposition, agentSessionPorts };
+    }));
+    return {
+        globalInstructions,
+        promptSupport,
+        productionSessionComposition,
+        agentSessionPorts,
+        quotaAutoResume,
+    };
+}
+/**
+ * The roster's background retries end with the Session System's close once it
+ * is composed; a composition that throws first ends them here.
+ */
+function closeRosterIfThrown(roster, compose) {
+    try {
+        return compose();
+    }
+    catch (error) {
+        roster.close?.();
+        throw error;
+    }
 }
 //# sourceMappingURL=runtime-prompt-support.js.map

@@ -1,4 +1,7 @@
+import { MINIAPP_CREATION_INDEX_NAMES } from './schema/miniapp-launchpad.js';
 import { EXPECTED_TABLES, SESSION_QUERY_INDEX_NAMES, AGENT_COLUMN_DEFINITIONS, MEMORY_TABLE_NAMES, MEMORY_COLUMN_DEFINITIONS, MEMORY_CHECKS, } from './schema-consistency.contracts.js';
+import { migration as messageSearchMigration } from './migrations/session/migration-0055-create-message-search-index.js';
+import { migration as sessionAutoResumeMigration } from './migrations/session/migration-0064-create-session-auto-resume.js';
 import { readName, readNullableString, readNumber, readSql, readString, } from './schema-consistency.metadata-rows.js';
 import { readIndexColumns, readIndexDefinition } from './schema-consistency.index-metadata.js';
 import { canonicalizeSqlContract as compactSql, canonicalizeSqlDefault, canonicalizeSqlDefinition as normalizeDefinition, canonicalizeSqlExpression, extractSqlCheckContracts, } from './sql-contract.js';
@@ -80,6 +83,7 @@ const SESSION_HISTORY_LOCATION_COLUMNS = new Set(['history_relative_dir']);
 /** Added by m0053; required only after that migration ran or the column exists. */
 const PROJECT_DISPLAY_NAME_COLUMNS = new Set(['display_name']);
 const REQUIRED_INDEXES = [
+    ...MINIAPP_CREATION_INDEX_NAMES,
     'idx_v2_cron_definitions_scheduler',
     'idx_v2_cron_definitions_active_name',
     'idx_v2_cron_definitions_page',
@@ -169,19 +173,20 @@ function assertRequiredTableColumns(db) {
         }
     }
 }
-/** Goal tables, each checked only once the migration that creates it has run. */
-const GOAL_TABLE_MIGRATIONS = new Map([
+/** Tables checked only once the migration that creates each table has run. */
+const TABLE_MIGRATIONS = new Map([
     ['local_runtime_v2_goals', 46],
     ['local_runtime_v2_goal_requests', 47],
     ['local_runtime_v2_goal_token_charges', 48],
-]);
-/** Tables checked only once the migration that creates them has run. */
-const TABLE_MIGRATIONS = new Map([
-    ...GOAL_TABLE_MIGRATIONS,
     ['local_runtime_plugin_miniapp_permission', 50],
+    ['local_runtime_miniapp_creations', 62],
+    ['local_runtime_message_search_docs', messageSearchMigration.version],
+    ['local_runtime_message_search_fts', messageSearchMigration.version],
+    ['local_runtime_message_search_state', messageSearchMigration.version],
     ['local_runtime_ppt_preview_artifacts', 54],
     ['local_runtime_ppt_preview_requests', 54],
     ['local_runtime_ppt_preview_events', 54],
+    ['local_runtime_v2_session_auto_resume', sessionAutoResumeMigration.version],
 ]);
 function shouldSkipRequiredTableCheck(db, table) {
     const tableMigration = TABLE_MIGRATIONS.get(table);
@@ -391,6 +396,11 @@ function indexMigrationGates(db) {
         { applied: memoryMigrationApplied(db), names: MEMORY_INDEX_NAMES },
         { applied: memoryExecutionsApplied(db), names: MEMORY_EXECUTION_INDEX_NAMES },
         { applied: migrationApplied(db, 41), names: SESSION_CLIO_INDEX_NAMES },
+        { applied: migrationApplied(db, 62), names: MINIAPP_CREATION_INDEX_NAMES },
+        {
+            applied: migrationApplied(db, 63),
+            names: new Set(['idx_local_runtime_sessions_hidden_purpose_v3']),
+        },
     ];
 }
 function isIndexExpected(name, gates) {
@@ -469,6 +479,11 @@ function assertLegacyHistoryNoticeRepairMetadata(db) {
     const rows = db
         .prepare(`SELECT singleton, cutoff_at_ms FROM ${LEGACY_HISTORY_NOTICE_REPAIR_CUTOFF_TABLE}`)
         .all();
+    // The safe-mode snapshot creates this table without its row. An empty table
+    // means the repair never ran, which is a valid state; a recorded row must
+    // still be the single well-formed cutoff the repair migration writes.
+    if (rows.length === 0)
+        return;
     if (rows.length !== 1 ||
         readNumber(rows[0], 'singleton') !== 1 ||
         !Number.isSafeInteger(readNumber(rows[0], 'cutoff_at_ms'))) {

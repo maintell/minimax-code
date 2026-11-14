@@ -3,6 +3,7 @@ import { json, readFirstString, readJsonBody } from '../../../infra/transport/ho
 import { modelSelectionFromSession } from '../session/host-model-helpers.js';
 import { listLocalRuntimeModels } from '../host-support.js';
 import { readPersistedLocalModelThinkingSelection } from '../../../infra/conversation/model-selection.js';
+import { resolveWritableModelSelection } from './model-selection-write.js';
 export async function routeLocalModelApi(ctx, { request, method, parts, url }) {
     if (parts[0] !== 'models')
         return undefined;
@@ -28,15 +29,21 @@ async function selectModel(ctx, body) {
     if (!providerId || !modelId) {
         return json({ error: 'providerId and modelId are required' }, { status: 400 });
     }
+    // The stored key is the only thing a later Turn sees: canonicalize the BYOK
+    // prefix here and refuse a model this route could not call.
+    const resolved = resolveWritableModelSelection(ctx.configGetter(), providerId, modelId);
+    if (!resolved.ok) {
+        return json({ success: false, error: resolved.message, code: resolved.code }, { status: 400 });
+    }
     if (sessionId) {
         return selectSessionModel(ctx, sessionId, body, {
-            effectiveModel: `${providerId}/${modelId}`,
+            effectiveModel: resolved.selection.modelKey,
             effectiveModelVariant: variant ?? null,
         });
     }
     try {
         await ctx.configUpdater({
-            defaultModel: `${providerId}/${modelId}`,
+            defaultModel: resolved.selection.modelKey,
             defaultModelVariant: variant ?? null,
         });
     }

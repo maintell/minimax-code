@@ -1,3 +1,8 @@
+export const DEFAULT_AGENT_SURFACE_FLAGS = Object.freeze({
+    showInImBinding: true,
+    showInAgentList: true,
+    dispatchable: true,
+});
 /** `capabilities.selectorVersion` of Task snapshots captured with the current selector rules. */
 export const FROZEN_SELECTOR_VERSION = 2;
 /**

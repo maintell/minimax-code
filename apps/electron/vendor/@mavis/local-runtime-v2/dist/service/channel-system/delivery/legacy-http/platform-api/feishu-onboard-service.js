@@ -1,3 +1,4 @@
+import { isBunnyAgentName } from '@mavis/shared/agent-avatar';
 import { json, notFound, readFirstString, readJsonBody } from '../http-helpers.js';
 import { AgentContractHttpError, isAgentContractLikeError } from '../agent-contract-error.js';
 import { captureConnectionBindingCompensation, logConnectionBindingState, } from './connection-binding.js';
@@ -212,6 +213,11 @@ export class LocalFeishuOnboardService {
         }
         if (poll.pending)
             return;
+        if (isBunnyAgentName(session.agentName) && !poll.creatorOpenId?.startsWith('ou_')) {
+            this.markError(session, 'FEISHU_CREATOR_IDENTITY_UNAVAILABLE');
+            return;
+        }
+        session.registrationCreatorOpenId = poll.creatorOpenId;
         session.appId = poll.appId;
         session.appSecret = poll.appSecret;
         if (!(await this.bindBotWithCompensation(session)))
@@ -254,7 +260,11 @@ export class LocalFeishuOnboardService {
         }
         const bound = await this.bindBot(session);
         if (!bound.ok) {
-            this.markError(session, 'FEISHU_ONBOARD_FAILED');
+            if (bound.boundAgentName)
+                session.boundAgentName = bound.boundAgentName;
+            // Keep the platform's stable refusal code (e.g. a duplicate bot) so the
+            // client can explain the failure instead of showing a generic one.
+            this.markError(session, bound.code ?? 'FEISHU_ONBOARD_FAILED');
             return false;
         }
         session.clientName = bound.clientName;
@@ -318,10 +328,7 @@ export class LocalFeishuOnboardService {
         this.metrics?.incr('channel_onboard_total', { channel: 'feishu', status: 'error' });
         const connectionLink = this.connectionLink(session);
         if (!wasError && connectionLink) {
-            logConnectionBindingState(connectionLink, 'failed', {
-                status: 502,
-                code: 'FEISHU_ONBOARD_FAILED',
-            });
+            logConnectionBindingState(connectionLink, 'failed', { status: 502, code: error });
         }
     }
     markExpired(session) {
@@ -347,9 +354,13 @@ export class LocalFeishuOnboardService {
             appSecret: session.appSecret,
             botName: 'Mavis Feishu Bot',
             mode: 'websocket',
-        });
+        }, session.registrationCreatorOpenId);
         if ('error' in result) {
-            return { ok: false };
+            return {
+                ok: false,
+                ...(result.errorCode ? { code: result.errorCode } : {}),
+                ...(result.boundAgentName ? { boundAgentName: result.boundAgentName } : {}),
+            };
         }
         return { ok: true, clientName: result.record.clientId };
     }
@@ -423,7 +434,7 @@ export class LocalFeishuOnboardService {
             await this.imConnectionStore.expireAuthorization(session.connectionId);
             return;
         }
-        await this.imConnectionStore.markAuthorizationError(session.connectionId, 'feishu', 'FEISHU_ONBOARD_FAILED');
+        await this.imConnectionStore.markAuthorizationError(session.connectionId, 'feishu', session.error ?? 'FEISHU_ONBOARD_FAILED');
     }
     async sweep() {
         const now = this.nowMs();

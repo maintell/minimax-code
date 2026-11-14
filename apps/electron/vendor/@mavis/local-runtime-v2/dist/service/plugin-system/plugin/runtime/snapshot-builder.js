@@ -147,6 +147,10 @@ function appendOfficialPackages(packages, state, options) {
     const sorted = [...packages].sort((left, right) => collisionKey(left.plugin.name).localeCompare(collisionKey(right.plugin.name)) ||
         left.contentDigest.localeCompare(right.contentDigest));
     for (const entry of sorted) {
+        if (options.forbiddenPluginNames?.has(entry.plugin.name.trim().normalize('NFKC').toLocaleLowerCase('en-US'))) {
+            state.diagnostics.push({ code: 'FORBIDDEN_BY_CONFIG', pluginName: entry.plugin.name });
+            continue;
+        }
         const plugin = gateMiniAppEngines(entry.plugin, options, state.diagnostics);
         const accepted = acceptPackageCapabilities({
             plugin,
@@ -179,7 +183,9 @@ function appendOfficialPackages(packages, state, options) {
 function appendLocalPackages(input, state, options) {
     const candidates = localCandidates(input, state);
     for (const candidate of candidates) {
-        if (!candidate.enabled || candidate.entry.unavailableReason)
+        if (!candidate.enabled ||
+            candidate.entry.unavailableReason ||
+            options.forbiddenPluginNames?.has(candidate.entry.plugin.name.trim().normalize('NFKC').toLocaleLowerCase('en-US')))
             continue;
         const key = collisionKey(candidate.entry.plugin.name);
         if (!state.nameOwners.has(key))
@@ -233,6 +239,14 @@ function acceptLocalPackage(plugin, diagnostics) {
 }
 function appendLocalPlugin(candidate, state, options) {
     const { entry, id } = candidate;
+    if (options.forbiddenPluginNames?.has(entry.plugin.name.trim().normalize('NFKC').toLocaleLowerCase('en-US'))) {
+        state.localPlugins.push(freeze({
+            ...localProjection(candidate, entry.plugin, undefined),
+            unavailableReason: 'FORBIDDEN_BY_CONFIG',
+        }));
+        state.diagnostics.push({ code: 'FORBIDDEN_BY_CONFIG', pluginName: entry.plugin.name });
+        return;
+    }
     // A package whose only capability is a withheld Mini App stays visible and uninstallable:
     // `localCandidates` admits it on the authored package, and only the served one is gated.
     const plugin = gateMiniAppEngines(entry.plugin, options, state.diagnostics);

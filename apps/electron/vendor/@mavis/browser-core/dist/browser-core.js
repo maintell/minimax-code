@@ -1,10 +1,11 @@
 import { classifyBrowserNavigationEvent } from './browser-action-helpers.js';
 import { BrowserExtendedActionSupport } from './browser-extended-actions.js';
 import { isHoverSemanticSnapshot, resolveBrowserHoverSemantic } from './browser-hover-semantic.js';
+import { browserJsDialogActiveResult, browserJsDialogAwaitingUserResult, browserJsDialogKeyDecision, browserJsDialogNotActiveResult, browserJsDialogSnapshot, isBrowserJsDialogNotActiveError, JsDialogTracker, parseBrowserJsDialogHandleInput, parseBrowserJsDialogRef, resolveBrowserJsDialogDecision, } from './browser-js-dialog.js';
 import { asNumber, asString, delay, inputCoordinate, isRecord, invalidateBrowserFrame, resolveBrowserSnapshotElement, } from './browser-state.js';
 import { CDPHelper } from './cdp-helper.js';
 import { ElementMapManager } from './element-map-manager.js';
-import { BROWSER_SCRIPT_CLEANUP_BUDGET_MS, BROWSER_SCRIPT_DEFAULT_TIMEOUT_MS, BROWSER_SCRIPT_MAX_CODE_BYTES, BROWSER_SCRIPT_MAX_TIMEOUT_MS, BrowserScriptRun, deliverInputRelease, stopPageExecution, } from './browser-script.js';
+import { browserScriptTimeoutMs, browserScriptActionDeadlineMs, BROWSER_SCRIPT_MAX_CODE_BYTES, BrowserScriptRun, deliverInputRelease, stopPageExecution, } from './browser-script.js';
 import { isBrowserOperationInterruption, withTimeout } from './operation-timeout.js';
 const DEFAULT_ACTION_TIMEOUT_MS = 30_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
@@ -16,6 +17,8 @@ const TEXT_INPUT_CDP_EVENT_ESTIMATE_MS = 20;
 const ACTION_COMPLETION_BUFFER_MS = 1_000;
 const HOVER_SEMANTIC_SAMPLE_DELAY_MS = 160;
 const HOVER_SEMANTIC_SAMPLE_COUNT = 6;
+/** Bound for the action a JavaScript dialog interrupted to finish after the dialog closes. */
+const ABANDONED_ACTION_SETTLE_MS = 3_000;
 /**
  * Shared top layer for Browser providers.
  *
@@ -74,6 +77,14 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
     poisoned = false;
     externalNavigationGeneration = 0;
     navigationEventDisposer;
+    jsDialogs;
+    jsDialogRecoveryGuardDisposer;
+    /** Text typed into the virtual prompt textbox, keyed by dialogId. */
+    jsDialogPromptDraft;
+    /** Dialog the Agent has read through inspect or addressed by its ref. */
+    jsDialogSeenId;
+    /** An action a dialog interrupted; its blocked command completes after the dialog closes. */
+    abandonedAction;
     constructor(transport, options = {}) {
         super(options.clipboardProvider);
         if (options.cdpHelper && options.cdpHelper.getTransport() !== transport) {
@@ -99,7 +110,10 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
         };
         this.actionTimeoutMs = positiveDeadline(options.actionTimeoutMs, DEFAULT_ACTION_TIMEOUT_MS);
         this.commandTimeoutMs = positiveDeadline(options.commandTimeoutMs, DEFAULT_COMMAND_TIMEOUT_MS);
+        this.jsDialogs = new JsDialogTracker(transport);
+        this.jsDialogRecoveryGuardDisposer = cdpHelper.setInterruptionRecoveryGuard(() => this.jsDialogs.current() !== null || this.jsDialogs.awaitingUser());
         this.navigationEventDisposer = transport.onEvent((event) => {
+            this.jsDialogs.observeTransportEvent(event);
             const params = isRecord(event.params) ? event.params : {};
             const frame = isRecord(params.frame) ? params.frame : {};
             const frameId = asString(frame.id) || asString(params.frameId);
@@ -180,8 +194,32 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
     resolveFrameRef(frameId = 'main') {
         return this.state.snapshot?.frameRefs?.get(frameId) ?? null;
     }
+    /** Current page JavaScript dialog held for the Agent, if any. */
+    get jsDialog() {
+        return this.jsDialogs.current();
+    }
+    /**
+     * Close a held dialog without an Agent decision. Only providers without a
+     * user-visible surface use this when Agent control ends; it dismisses
+     * (alert: closes) so no business action is confirmed on the user's behalf.
+     */
+    async dismissJsDialog() {
+        const dialog = this.jsDialogs.current();
+        if (!dialog)
+            return false;
+        try {
+            const { accept } = resolveBrowserJsDialogDecision(dialog, { decision: 'dismiss' });
+            await this.jsDialogs.handle(dialog.dialogId, accept);
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
     /** Release the lifecycle listener before the provider closes its transport. */
     dispose() {
+        this.jsDialogRecoveryGuardDisposer();
+        this.jsDialogs.dispose();
         this.navigationEventDisposer();
         if (this.ownsCdpHelper)
             this.state.cdpHelper.stopDOMListener();
@@ -202,20 +240,38 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
         }
         if (signal?.aborted)
             throw new Error('ABORTED: Browser action was cancelled');
-        const requestedTimeoutMs = asNumber(input.timeout, this.actionTimeoutMs);
-        const ref = asString(input.ref);
-        const textTarget = ref && (action === 'fill' || action === 'type')
-            ? (resolveBrowserSnapshotElement(this.state, ref)?.element ??
-                this.state.elementMap.getElementByOpaqueRef(ref))
-            : null;
-        const timeoutMs = actionDeadline(action, input, requestedTimeoutMs, this.actionTimeoutMs, textTarget?.virtualEditor === true);
-        // Validate the complete action deadline before claiming the session. The
-        // deadline calculation can reject synchronously (for example, delayed
-        // input that cannot fit within the maximum action budget); such a rejected
-        // request must not leave the session permanently busy.
+        // Claim the session before the first await so a concurrent action gets
+        // BROWSER_SESSION_BUSY. Every exit before the action runs releases it,
+        // including a rejected deadline.
         this.active = true;
+        let timeoutMs;
+        let admitted = false;
+        try {
+            // A held JavaScript dialog queues every page command until it closes, so
+            // decide here, before any command reaches the page.
+            const dialogOutcome = await this.executeJsDialogGate(action, input);
+            if (dialogOutcome !== undefined)
+                return dialogOutcome;
+            await this.settleAbandonedAction();
+            const reopenedDialog = this.jsDialogs.current();
+            if (reopenedDialog)
+                return browserJsDialogActiveResult(reopenedDialog, action);
+            const requestedTimeoutMs = asNumber(input.timeout, this.actionTimeoutMs);
+            const ref = asString(input.ref);
+            const textTarget = ref && (action === 'fill' || action === 'type')
+                ? (resolveBrowserSnapshotElement(this.state, ref)?.element ??
+                    this.state.elementMap.getElementByOpaqueRef(ref))
+                : null;
+            timeoutMs = actionDeadline(action, input, requestedTimeoutMs, this.actionTimeoutMs, textTarget?.virtualEditor === true);
+            admitted = true;
+        }
+        finally {
+            if (!admitted)
+                this.active = false;
+        }
         const controller = new AbortController();
         let timedOut = false;
+        let dialogInterrupted = false;
         const forwardAbort = () => controller.abort();
         signal?.addEventListener('abort', forwardAbort, { once: true });
         const timer = setTimeout(() => {
@@ -228,7 +284,11 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
         const recoveryGeneration = this.state.cdpHelper.getInterruptionRecoveryState().generation;
         const abortResult = new Promise((_resolve, reject) => {
             controller.signal.addEventListener('abort', () => {
-                void this.state.transport.stopLoading().catch(() => undefined);
+                // Page.stopLoading would queue behind a held dialog and later cancel
+                // the navigation the Agent's dialog decision starts.
+                if (!dialogInterrupted && !this.jsDialogs.current()) {
+                    void this.state.transport.stopLoading().catch(() => undefined);
+                }
                 reject(new Error(timedOut
                     ? `ACTION_TIMEOUT: Browser action exceeded ${timeoutMs}ms`
                     : 'ABORTED: Browser action was cancelled'));
@@ -236,6 +296,8 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
         });
         let startResult;
         let actionResult;
+        const dialogOpening = this.jsDialogs.watchOpening();
+        const dialogResult = dialogOpening.promise.then((dialog) => ({ dialog }));
         try {
             // A provider may have reset its CDP connection after the previous
             // command was cancelled. Starting here makes handler/session recovery a
@@ -257,9 +319,40 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
                     await abortResult;
                 return scriptResult;
             }
-            return await Promise.race([actionResult, abortResult]);
+            const settled = await Promise.race([
+                actionResult.then((value) => ({ value })),
+                abortResult,
+                dialogResult,
+            ]);
+            if ('dialog' in settled) {
+                // The command that opened the dialog (for example mouseReleased)
+                // stays blocked until the dialog closes. Return now instead of letting
+                // the action run into its deadline; never report the action as done.
+                dialogInterrupted = true;
+                this.abandonedAction = actionResult;
+                // Stop the rest of the interrupted action locally so its follow-up
+                // steps cannot run against the page after the Agent handles the dialog.
+                controller.abort();
+                this.invalidate(this.state);
+                return browserJsDialogActiveResult(settled.dialog, action);
+            }
+            return settled.value;
         }
         catch (error) {
+            const heldDialog = this.jsDialogs.current();
+            if (heldDialog && (controller.signal.aborted || isBrowserOperationInterruption(error))) {
+                // A held dialog, not a broken connection, blocked the command. A
+                // reconnect would lose the dialog, so leave the connection as is.
+                dialogInterrupted = true;
+                if (actionResult)
+                    this.abandonedAction = actionResult;
+                this.state.pendingInputRelease = undefined;
+                this.state.pageUnresponsive = undefined;
+                this.invalidate(this.state);
+                if (signal?.aborted)
+                    throw error;
+                return browserJsDialogActiveResult(heldDialog, action);
+            }
             // A provider command can hit its own deadline before the encompassing
             // action timer fires. Either interruption leaves an already-sent CDP
             // side effect uncertain, so never release the action gate until the
@@ -294,6 +387,7 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
             throw error;
         }
         finally {
+            dialogOpening.cancel();
             clearTimeout(timer);
             signal?.removeEventListener('abort', forwardAbort);
             this.state.commandSignal = undefined;
@@ -301,6 +395,123 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
             this.state.commandSessionId = undefined;
             this.active = false;
         }
+    }
+    /**
+     * Resolve dialog actions and block page actions while a dialog is held.
+     * Returns undefined when the action should run normally.
+     */
+    async executeJsDialogGate(action, input) {
+        if (action === 'get_js_dialog') {
+            const dialog = this.jsDialogs.current();
+            return {
+                success: true,
+                dialog: dialog ? { dialogId: dialog.dialogId, type: dialog.type } : null,
+                ...(!dialog && this.jsDialogs.awaitingUser() ? { awaitingUser: true } : {}),
+            };
+        }
+        if (action === 'handle_js_dialog') {
+            const request = parseBrowserJsDialogHandleInput(input);
+            const dialog = this.jsDialogs.current();
+            if (request.decision === 'accept' &&
+                dialog?.dialogId === request.dialogId &&
+                this.needsInspectBeforeAccept(dialog)) {
+                return browserJsDialogActiveResult(dialog, action);
+            }
+            return this.handleJsDialog(request.dialogId, request.decision, request.promptText);
+        }
+        const dialog = this.jsDialogs.current();
+        const dialogRef = parseBrowserJsDialogRef(asString(input.ref));
+        if (!dialog) {
+            // A virtual dialog ref outlives its dialog only as a stale reference.
+            if (dialogRef)
+                return browserJsDialogNotActiveResult();
+            // A dialog handed back to the user still blocks every page command.
+            return this.jsDialogs.awaitingUser() ? browserJsDialogAwaitingUserResult(action) : undefined;
+        }
+        if (action === 'inspect') {
+            this.jsDialogSeenId = dialog.dialogId;
+            return browserJsDialogSnapshot(dialog);
+        }
+        if (dialogRef && dialogRef.dialogId !== dialog.dialogId) {
+            return browserJsDialogNotActiveResult();
+        }
+        if (dialogRef &&
+            (action === 'click' ||
+                action === 'double_click' ||
+                action === 'triple_click' ||
+                action === 'click_and_wait_for_navigation')) {
+            if (dialogRef.part === 'text') {
+                return { success: true, effect: { dispatched: true, verified: true } };
+            }
+            if (dialogRef.part === 'accept' && this.needsInspectBeforeAccept(dialog)) {
+                return browserJsDialogActiveResult(dialog, action);
+            }
+            return this.handleJsDialog(dialog.dialogId, dialogRef.part, dialogRef.part === 'accept' ? this.promptDraft(dialog) : undefined);
+        }
+        if (dialogRef?.part === 'text' && (action === 'fill' || action === 'type')) {
+            const previous = action === 'type' && this.jsDialogPromptDraft?.dialogId === dialog.dialogId
+                ? this.jsDialogPromptDraft.text
+                : '';
+            this.jsDialogPromptDraft = {
+                dialogId: dialog.dialogId,
+                text: previous + asString(input.text),
+            };
+            return { success: true, effect: { dispatched: true, verified: true } };
+        }
+        if (action === 'press_key' && (!asString(input.ref) || dialogRef)) {
+            const decision = browserJsDialogKeyDecision(dialog, asString(input.key));
+            // Accepting confirms a page action, so it needs a dialog the Agent has read.
+            if (decision === 'dismiss')
+                return this.handleJsDialog(dialog.dialogId, decision);
+            if (decision === 'accept' && this.jsDialogSeenId === dialog.dialogId) {
+                return this.handleJsDialog(dialog.dialogId, decision, this.promptDraft(dialog));
+            }
+        }
+        return browserJsDialogActiveResult(dialog, action);
+    }
+    /**
+     * Accepting a confirm or prompt performs a page action, so the Agent must
+     * have read the dialog through inspect first. Ref actions do not count as reads.
+     */
+    needsInspectBeforeAccept(dialog) {
+        return ((dialog.type === 'confirm' || dialog.type === 'prompt') &&
+            this.jsDialogSeenId !== dialog.dialogId);
+    }
+    promptDraft(dialog) {
+        if (dialog.type !== 'prompt')
+            return undefined;
+        return this.jsDialogPromptDraft?.dialogId === dialog.dialogId
+            ? this.jsDialogPromptDraft.text
+            : dialog.defaultPrompt;
+    }
+    async handleJsDialog(dialogId, decision, promptText) {
+        const dialog = this.jsDialogs.current();
+        if (!dialog || dialog.dialogId !== dialogId)
+            return browserJsDialogNotActiveResult();
+        const resolved = resolveBrowserJsDialogDecision(dialog, {
+            decision,
+            ...(promptText !== undefined ? { promptText } : {}),
+        });
+        // execute() holds the session for the whole call.
+        try {
+            await this.jsDialogs.handle(dialogId, resolved.accept, resolved.promptText);
+        }
+        catch (error) {
+            if (isBrowserJsDialogNotActiveError(error))
+                return browserJsDialogNotActiveResult();
+            throw error;
+        }
+        if (this.jsDialogPromptDraft?.dialogId === dialogId)
+            this.jsDialogPromptDraft = undefined;
+        return { success: true, handled: true, type: dialog.type, action: decision };
+    }
+    /** Let an action a dialog interrupted finish before the next action reuses the page. */
+    async settleAbandonedAction() {
+        const abandoned = this.abandonedAction;
+        if (!abandoned)
+            return;
+        this.abandonedAction = undefined;
+        await withTimeout(abandoned.then(() => undefined, () => undefined), ABANDONED_ACTION_SETTLE_MS, 'Browser dialog-interrupted action settlement').catch(() => undefined);
     }
     async recoverInterruptedOperation(recoveryGeneration, timeoutMs) {
         const helperRecovery = this.state.cdpHelper.getInterruptionRecoveryState();
@@ -380,6 +591,10 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
                 return this.query(this.state, { ...input, kind: 'editable' });
             case 'run_script':
                 return this.runScript(input);
+            case 'get_js_dialog':
+            case 'handle_js_dialog':
+                // Resolved by executeJsDialogGate before any page command is sent.
+                throw new Error(`Unsupported Browser Core action: ${action}`);
             case 'open_tab':
                 throw new Error('PROVIDER_LIFECYCLE_ACTION: open_tab must be handled by the provider');
             default:
@@ -402,7 +617,7 @@ export class BrowserCoreSession extends BrowserExtendedActionSupport {
             return await new BrowserScriptRun(this.state, {
                 code,
                 filename,
-                timeoutMs: scriptTimeout(input),
+                timeoutMs: browserScriptTimeoutMs(input),
                 signal,
                 captureScreenshot: (captureInput) => this.screenshot(this.state, captureInput),
             }).run();
@@ -610,10 +825,6 @@ function positiveDeadline(value, fallback) {
         ? Math.floor(value)
         : fallback;
 }
-function scriptTimeout(input) {
-    const requested = asNumber(input.timeout, BROWSER_SCRIPT_DEFAULT_TIMEOUT_MS);
-    return Math.max(1_000, Math.min(BROWSER_SCRIPT_MAX_TIMEOUT_MS, Math.floor(requested)));
-}
 function actionDeadline(action, input, requestedMs, fallback, focusedKeyboard = false) {
     const requested = Math.min(MAX_ACTION_TIMEOUT_MS, positiveDeadline(requestedMs, fallback));
     if (action === 'fill' || action === 'type') {
@@ -647,7 +858,7 @@ function actionDeadline(action, input, requestedMs, fallback, focusedKeyboard = 
         return Math.max(requested, NAVIGATION_ACTION_TIMEOUT_MS);
     }
     if (action === 'run_script')
-        return scriptTimeout(input) + BROWSER_SCRIPT_CLEANUP_BUDGET_MS;
+        return browserScriptActionDeadlineMs(input);
     if (action !== 'wait' && action !== 'wait_for')
         return requested;
     // `wait.timeout` is the condition budget. Keep a small cleanup margin so a

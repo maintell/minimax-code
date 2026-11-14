@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { getConfig, getConfigPath, minimaxApiModels, parseConfigText, resetConfig, serializeConfigPreservingComments, } from '@mavis/config';
 import lockfile from 'proper-lockfile';
 import { LocalConfigValidationError, readLocalRawConfig } from './raw-config.js';
-import { ASK_USER_POLICY_FIELDS, assertMutableConfigField, assertSafeConfigRecord, DANGEROUS_CONFIG_PATH_SEGMENTS, isPlainRecord, validateAskUserConfigRecord, validateLocalConfigValue, validateReviewConfigRecord, validateSubagentConfigRecord, } from './update-policy.js';
+import { ASK_USER_POLICY_FIELDS, assertMutableConfigField, assertSafeConfigRecord, DANGEROUS_CONFIG_PATH_SEGMENTS, isPlainRecord, validateAskUserConfigRecord, validateEnabledOnlyConfigRecord, validateBunnyConfigRecord, validateLocalConfigValue, validateReviewConfigRecord, validatePluginRecommendationConfigRecord, validateSubagentConfigRecord, } from './update-policy.js';
 const LOCAL_CONFIG_WRITE_ERROR_MESSAGE = 'Local runtime failed to update config file';
 const LOCAL_CONFIG_FILE_MODE = 0o600;
 class LocalConfigWriteError extends Error {
@@ -111,7 +111,9 @@ function validateModelContextTarget(input) {
 }
 function applyModelContextLimit(raw, input) {
     if (input.providerId === 'minimax') {
-        const limits = isPlainRecord(raw.minimaxModelContextLimits) ? raw.minimaxModelContextLimits : {};
+        const limits = isPlainRecord(raw.minimaxModelContextLimits)
+            ? raw.minimaxModelContextLimits
+            : {};
         raw.minimaxModelContextLimits = { ...limits, [input.modelId]: input.contextLimit };
         return;
     }
@@ -251,17 +253,29 @@ function applyLocalConfigUpdate(raw, body) {
 }
 // put 会把对象深合并到目标上；对标量叶子字段做 put 会绕过取值校验，一律拒绝。
 const PUT_REJECTED_LEAF_FIELDS = new Set([
+    'miniAppSuggestion.enabled',
     'review.mode',
     'review.turnDiffCard',
     'permission.nativeDelete',
     'worktreeRefreshBeforeCreate',
     'promptSuggestion.enabled',
+    'quotaAutoResume.enabled',
+    'nextStepBox.enabled',
+    'bunny.enabled',
+    'pluginRecommendation.enabled',
+    // Arrays are replaced with `set`; a deep-merge put would drop the list.
+    'pluginRecommendation.dismissedPlugins',
     'subagent.maxConcurrentPerSession',
 ]);
 const PUT_RECORD_VALIDATORS = new Map([
     ['review', validateReviewConfigRecord],
     ['askUser', validateAskUserConfigRecord],
+    ['bunny', validateBunnyConfigRecord],
     ['subagent', validateSubagentConfigRecord],
+    ['promptSuggestion', (record) => validateEnabledOnlyConfigRecord('promptSuggestion', record)],
+    ['quotaAutoResume', (record) => validateEnabledOnlyConfigRecord('quotaAutoResume', record)],
+    ['nextStepBox', (record) => validateEnabledOnlyConfigRecord('nextStepBox', record)],
+    ['pluginRecommendation', validatePluginRecommendationConfigRecord],
 ]);
 function applyLocalConfigPut(raw, field, value) {
     if (PUT_REJECTED_LEAF_FIELDS.has(field) || ASK_USER_POLICY_FIELDS.has(field)) {
@@ -282,13 +296,17 @@ function applyLocalConfigSet(raw, field, value) {
         return;
     }
     const validated = validateLocalConfigValue(field, value);
-    if (field === 'askUser' && isPlainRecord(validated)) {
-        // Whole-object writes may only carry the three policy fields, so replacing
-        // the object would silently drop keys the user keeps in config.yaml by
-        // hand (notably `enabled: false`, which hides the ask_user tool). Merge
+    if ((field === 'askUser' || field === 'pluginRecommendation') && isPlainRecord(validated)) {
+        // askUser whole-object writes may only carry the three policy fields, so
+        // replacing the object would silently drop keys the user keeps in
+        // config.yaml by hand (notably `enabled: false`, which hides the ask_user
+        // tool). pluginRecommendation writes may carry either key alone. Merge
         // instead; the leaf values are already validated above.
         target[key] = { ...(isPlainRecord(target[key]) ? target[key] : {}), ...validated };
         return;
+    }
+    if (field === 'miniAppSuggestion.enabled' && validated === true && target[key] === false) {
+        target.enabledSince = Date.now();
     }
     target[key] = validated;
 }

@@ -1,4 +1,6 @@
 import { isPtcMavisChildToolName } from '@mavis/agent-tools';
+import { reportPtcStoreMetrics } from '../observability/ptc-store-metrics.js';
+import { ptcScriptInvocation } from '../../execution/ptc/contracts.js';
 /**
  * Classifies one settled child from its guest-facing result; never reads payloads.
  * `aborted` means the child settled after its Turn was cancelled or its program
@@ -28,18 +30,57 @@ export function ptcChildCallStatus(result, aborted = false) {
     }
 }
 /** A finished program as the Turn observer counts it. */
-export function ptcProgramOutcome(result, durationMs) {
+function ptcProgramOutcome(result, durationMs, source = 'inline') {
     const completed = result.status === 'completed';
     return {
         status: completed ? 'ok' : 'error',
         errorCode: completed ? 'none' : result.error.code,
         durationMs,
         childCalls: result.details.child_calls.length,
+        storeWrites: result.storeWrites?.keys.length ?? 0,
+        storeLoads: result.storeLoads ?? 0,
+        source,
     };
 }
-/** A run_code call refused before any program ran (no Worker, no children). */
+/** A run_code call that ran a saved script; every other one ran its own code. */
+export function ptcRunCodeSource(args, scriptsEnabled) {
+    // With saved scripts switched off, no call can have run one: `prepareArguments`
+    // leaves a `path` alone, so a call that carried both `code` and `path` runs its
+    // own program and must not be counted as a script run.
+    if (!scriptsEnabled)
+        return 'inline';
+    // A call carrying a real `path` together with `code` is refused
+    // (run-code-description.ts), so a script invocation here is always a call
+    // that really ran the script. The rule itself lives in contracts.ts, shared
+    // with the expander that acts on it.
+    return ptcScriptInvocation(args).kind === 'script' ? 'path' : 'inline';
+}
+/**
+ * Reports what one finished program did. The script loads go first, so a
+ * failed program's `import()` attempts still reach the metric.
+ */
+export function reportPtcProgramFinished(observer, result, durationMs, 
+/** From `ptcRunCodeSource`; the caller knows whether scripts are on. */
+source) {
+    for (const load of result.scriptLoads ?? [])
+        observer?.scriptLoaded(load.scope, load.status);
+    observer?.programFinished(ptcProgramOutcome(result, durationMs, source));
+}
+/**
+ * A run_code call refused before any program ran (no Worker, no children).
+ *
+ * @internal Exported for tests; run_code logs it through logRunCodeRejected.
+ */
 export function ptcRejectedProgram(errorCode) {
-    return { status: 'error', errorCode, durationMs: 0, childCalls: 0 };
+    return {
+        status: 'error',
+        errorCode,
+        durationMs: 0,
+        childCalls: 0,
+        storeWrites: 0,
+        storeLoads: 0,
+        source: 'inline',
+    };
 }
 /** Program failure codes of the QuickJS executor (`PtcFailureCode`), reported as is. */
 const PROGRAM_ERROR_LABELS = new Set([
@@ -128,6 +169,7 @@ export function createPtcToolLabeler(bindings = []) {
 export function createPtcTurnObserver(options) {
     const metrics = options.metricsClient;
     const surface = options.surface ?? 'other';
+    const scriptCaller = options.scriptCaller ?? 'root';
     const labelTool = options.labelTool ?? createPtcToolLabeler();
     const summary = {
         programs: 0,
@@ -137,8 +179,13 @@ export function createPtcTurnObserver(options) {
         child_denied: 0,
         direct_calls: 0,
         direct_sr_appended: 0,
+        store_writes: 0,
+        store_loads: 0,
         wall_clock_exceeded: 0,
         program_ms_total: 0,
+        script_loads: 0,
+        script_load_failures: 0,
+        script_saves: 0,
     };
     const directCallValid = new Map();
     let finished = false;
@@ -151,14 +198,20 @@ export function createPtcTurnObserver(options) {
             if (outcome.errorCode === 'wall_clock_exceeded')
                 summary.wall_clock_exceeded += 1;
             summary.child_calls += outcome.childCalls;
+            summary.store_writes += outcome.storeWrites ?? 0;
+            summary.store_loads += outcome.storeLoads ?? 0;
             summary.program_ms_total += durationMs;
             // Failure rate and causes, run time and children per program.
             report(() => {
                 const status = outcome.status;
                 const error_code = programErrorLabel(outcome.errorCode);
-                metrics?.counter('ptc_run_code_total', 1, { status, error_code, surface });
+                const source = outcome.source;
+                metrics?.counter('ptc_run_code_total', 1, { status, error_code, surface, source });
                 metrics?.histogram('ptc_run_code_duration_ms', durationMs, { status });
                 metrics?.histogram('ptc_run_code_child_calls', outcome.childCalls, { status });
+                // Registered metrics: reported through the typed API, which lives
+                // outside runner/ptc because this directory's dependencies are bounded.
+                reportPtcStoreMetrics(metrics, { writes: outcome.storeWrites ?? 0, loads: outcome.storeLoads ?? 0 }, surface);
             });
         },
         childCallSettled(toolName, status) {
@@ -168,6 +221,20 @@ export function createPtcTurnObserver(options) {
                 summary.child_denied += 1;
             // Which tools programs use most and which fail.
             report(() => metrics?.counter('ptc_child_call_total', 1, { tool: labelTool(toolName), status }));
+        },
+        scriptLoaded(scope, status) {
+            if (status === 'ok')
+                summary.script_loads += 1;
+            else
+                summary.script_load_failures += 1;
+            // Are saved scripts reused at all, and how often a load is refused.
+            report(() => metrics?.counter('ptc_script_load_total', 1, { scope, status }));
+        },
+        scriptSaved(scope, status) {
+            if (status === 'ok')
+                summary.script_saves += 1;
+            // How often the model saves, to which level, and how much of it is a subagent.
+            report(() => metrics?.counter('ptc_script_save_total', 1, { scope, status, caller: scriptCaller }));
         },
         directCallResolved(toolCallId, valid) {
             summary.direct_calls += 1;
@@ -215,6 +282,56 @@ export function ptcChildOutputFields(result, uncappedChildren, returnSpilled) {
         oversized_children: result.oversizedChildren ?? 0,
         return_spilled: returnSpilled,
     };
+}
+/**
+ * `store` / `load` fields of the `ptc run_code finished` line: how much this
+ * program persisted, how often it read a value back, how many writes the host
+ * refused and how large the Session's store file has become. Counts, keys and
+ * byte totals only; a stored value never reaches a log line.
+ */
+function ptcStoreFields(result, sessionBytes) {
+    const writes = result.storeWrites;
+    return {
+        store_writes: writes?.keys.length ?? 0,
+        ...(writes && writes.keys.length > 0 ? { store_keys: [...writes.keys] } : {}),
+        store_write_bytes: writes?.bytes ?? 0,
+        store_loads: result.storeLoads ?? 0,
+        store_rejected: result.storeRejected ?? 0,
+        ...(sessionBytes === undefined ? {} : { store_session_bytes: sessionBytes }),
+    };
+}
+/**
+ * Display-preview fields of the `ptc run_code finished` line, read from the
+ * host preview once per program. A Turn whose host wires no preview, or a
+ * program none of whose children were shortened, reports zeros.
+ */
+function ptcChildDisplayFields(read, parentToolCallId) {
+    const stats = read?.(parentToolCallId);
+    return {
+        display_preview_children: stats?.previewChildren ?? 0,
+        display_spill_failed: stats?.spillFailed ?? 0,
+        max_child_display_original_bytes: stats?.maxOriginalBytes ?? 0,
+    };
+}
+/**
+ * `timeout_ms` is the resolved request (default, as given, or capped);
+ * `wall_clock_ms` is what the program actually had, which is less when an
+ * earlier run_code in the same response used part of the shared deadline and
+ * more when a foreground Bash child's long timeout extended it.
+ */
+function ptcTimeoutLogFields(wallClock, wallClockMs) {
+    return {
+        timeout_ms: wallClock.ms,
+        timeout_ms_source: wallClock.source,
+        timeout_ms_capped: wallClock.source === 'capped',
+        ...(wallClockMs === undefined ? {} : { wall_clock_ms: Math.round(wallClockMs) }),
+    };
+}
+/** Failure code or the incomplete flag; never guest messages, which may echo code. */
+function ptcProgramOutcomeFields(result) {
+    if (result.status !== 'completed')
+        return { error_code: result.error.code };
+    return result.incomplete ? { incomplete: true } : {};
 }
 /**
  * Aggregate child timing for the `ptc run_code finished` line, so a slow
@@ -323,5 +440,99 @@ export function report(write) {
 }
 function nonNegativeMs(value) {
     return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+/** Admission failures also end a run_code call; record why no program ran. */
+export function logRunCodeRejected(context, parentToolCallId, code, wallClock) {
+    writeRunCodeLog(context, {
+        parent_tool_call_id: parentToolCallId ?? null,
+        program_status: 'rejected',
+        error_code: code,
+        child_calls: 0,
+        ...ptcTimeoutLogFields(wallClock),
+    });
+    context.ptcObserver?.programFinished(ptcRejectedProgram(code));
+}
+/**
+ * One line per finished program so every outer hint can be traced to its
+ * rule: completeness classes with reason codes, failed children with their
+ * host error codes, refused calls and dropped return fields. Child arguments,
+ * outputs and raw third-party errors are never logged.
+ */
+export function logRunCodeFinished(context, parentToolCallId, result, children) {
+    const { verdicts, failures, returnTruncated, wallClock, wallClockMs, admissionWaitMs } = children;
+    const truncated = [];
+    const unknown = [];
+    const completeTools = [];
+    const skipped = [];
+    for (const call of result.details.child_calls) {
+        // A call that never returned an outcome (budget stop, cancellation) has no verdict.
+        const verdict = verdicts.get(call.child_tool_call_id) ?? {
+            state: 'skipped',
+            reason: 'not_completed',
+        };
+        const child = { child_tool_call_id: call.child_tool_call_id, tool: call.tool_name };
+        if (verdict.state === 'truncated')
+            truncated.push(child);
+        else if (verdict.state === 'complete')
+            completeTools.push(call.tool_name);
+        else if (verdict.state === 'unknown')
+            unknown.push({ ...child, reason: verdict.reason });
+        else
+            skipped.push({ ...child, reason: verdict.reason });
+    }
+    const failed = [...failures.entries()].map(([childToolCallId, failure]) => ({
+        child_tool_call_id: childToolCallId,
+        tool: failure.tool,
+        code: failure.code,
+    }));
+    writeRunCodeLog(context, {
+        parent_tool_call_id: parentToolCallId,
+        program_status: result.status,
+        ...ptcProgramOutcomeFields(result),
+        child_calls: result.details.child_calls.length,
+        truncated_count: truncated.length,
+        truncated,
+        unknown_count: unknown.length,
+        unknown,
+        complete_count: completeTools.length,
+        complete_tools: completeTools,
+        skipped_count: skipped.length,
+        skipped,
+        failed_count: failed.length,
+        failed,
+        refused_calls: result.refusedToolCalls ?? 0,
+        dropped_undefined_fields: result.status === 'completed' ? (result.droppedUndefinedCount ?? 0) : 0,
+        console_bytes: result.console?.bytes ?? 0,
+        console_truncated: result.console?.truncated === true,
+        return_truncated: returnTruncated,
+        ...children.childOutput,
+        ...ptcStoreFields(result, children.storeBytes),
+        ...ptcChildDisplayFields(context.ptcChildDisplayStats, parentToolCallId),
+        ...ptcTimeoutLogFields(wallClock, wallClockMs),
+        admission_wait_ms: Math.round(admissionWaitMs),
+        ...children.timing,
+    });
+}
+function writeRunCodeLog(context, fields) {
+    try {
+        context.ptcLogger?.info?.({ session_id: context.sessionId, turn_id: context.turnId, ...fields }, 'ptc run_code finished');
+    }
+    catch {
+        // Diagnostics must not change the run_code result.
+    }
+}
+/** Child-level decisions that change what the guest receives (never payload content). */
+export function writeRunCodeEvent(context, parentToolCallId, event, fields) {
+    try {
+        context.ptcLogger?.info?.({
+            session_id: context.sessionId,
+            turn_id: context.turnId,
+            parent_tool_call_id: parentToolCallId,
+            ...fields,
+        }, event);
+    }
+    catch {
+        // Diagnostics must not change the run_code result.
+    }
 }
 //# sourceMappingURL=ptc-observability.js.map

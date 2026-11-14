@@ -11,7 +11,9 @@ const MAX_PTC_RECOVERY_INPUT_BYTES = 2 * 1024;
  * rows. It never resumes a Worker, invokes a tool, or infers a call from JS.
  * A synthetic outer ToolResult closes Pi's pending `run_code` round so the
  * next turn can consume the preserved PTC facts rather than silently dropping
- * them through canonical-history recovery.
+ * them through canonical-history recovery. A round whose assistant message
+ * was aborted or errored only has its display cards closed: requests skip
+ * that message, and the next request starts from the state before it.
  */
 export async function recoverPtcCrashState(options, input) {
     const terminalFacts = input.terminalFacts ?? [];
@@ -77,13 +79,20 @@ async function recoverSessionPtcCrashState(options, input) {
     const detailsByParent = collectPtcDetails(listed.messages, parentIds);
     const completedAtMs = input.terminalFacts.find((fact) => fact.turnId === turnId)?.completedAtMs ??
         input.processStartedAtMs;
-    await persistRecoveredDisplayFacts(options.messages, {
+    const closedCards = await persistRecoveredDisplayFacts(options.messages, {
         sessionId: input.sessionId,
         turnId,
         messages: listed.messages,
         parentIds,
         detailsByParent,
     });
+    if (pendingRound.abandoned) {
+        // Nothing goes into canonical history, so a later pass finds the same
+        // round; once its cards are closed there is nothing left to recover.
+        if (closedCards === 0)
+            return { outcome: 'no_pending_round' };
+        return { outcome: 'recovered', turnId, programs: parentIds.size, closedCalls: 0 };
+    }
     const syntheticResults = pendingRound.calls.map((call) => call.name === 'run_code' && parentIds.has(call.id)
         ? recoveredRunCodeToolResult(call.id, detailsByParent.get(call.id) ?? emptyPtcDetails())
         : interruptedToolResult(call.id, call.name));
@@ -155,6 +164,7 @@ function collectPtcDetails(messages, parentIds) {
     }));
 }
 async function persistRecoveredDisplayFacts(messages, input) {
+    let upserted = 0;
     for (const message of input.messages) {
         const toolCalls = readDisplayToolCalls(message);
         if (toolCalls.length === 0)
@@ -180,7 +190,9 @@ async function persistRecoveredDisplayFacts(messages, input) {
             turnId: messageTurnId(message) ?? input.turnId,
             message: { ...message, tool_calls: nextToolCalls },
         });
+        upserted += 1;
     }
+    return upserted;
 }
 function recoveredRunCodeDisplayCall(call, details) {
     return {
@@ -451,7 +463,8 @@ function findPendingCanonicalRound(messages) {
                 completed.add(id);
         }
         const pending = calls.filter((call) => !completed.has(call.id));
-        return pending.length > 0 ? { calls: pending } : undefined;
+        const abandoned = assistant.stopReason === 'aborted' || assistant.stopReason === 'error';
+        return pending.length > 0 ? { calls: pending, abandoned } : undefined;
     }
     return undefined;
 }

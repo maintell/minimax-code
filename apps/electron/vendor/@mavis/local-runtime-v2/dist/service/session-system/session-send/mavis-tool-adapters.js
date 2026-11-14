@@ -1,10 +1,59 @@
+import { isBunnyAgentName } from '@mavis/shared/agent-avatar';
+import { logger } from '../../../infra/logging/logger.js';
+import { NESTED_TASK_REFUSAL, SESSION_FOREIGN_TARGET, TASK_TO_COORDINATOR_REFUSAL, } from '../../coordinator-text/index.js';
 import { createSessionWithFirstMessage } from './mavis-session-create.js';
 import { interruptLocalSession } from './mavis-session-interrupt.js';
 import { sendToLocalSession } from './mavis-session-send.js';
+import { sessionSendError } from './mavis-session-send-errors.js';
 import { isAbortError } from './remote-sessions/device-source.js';
 import { countRemoteSessionOp, localDeviceName, sendToRemoteSession, } from './remote-sessions/remote-session-send.js';
 export function buildMavisSessionAdapter(deps) {
+    const { isBunnyTask, confirmBunnyTask, ...assignmentTools } = deps.assignmentTools ?? {};
+    /**
+     * Bunny reads every Session but stops, edits and messages only its own task
+     * Sessions. Checked here, on the server side, so no permission mode or tool
+     * path can widen it; without the Bunny owner a Bunny caller may target none.
+     */
+    const requireBunnyTarget = async (callerSessionId, sessionId) => {
+        if (!callerSessionId)
+            return;
+        const caller = await deps.getSessionById(callerSessionId);
+        if (!isBunnyAgentName(caller?.agentName))
+            return;
+        if ((confirmBunnyTask ?? isBunnyTask)?.(sessionId))
+            return;
+        throw sessionSendError(SESSION_FOREIGN_TARGET, {
+            status: 403,
+            code: 'BUNNY_TARGET_NOT_OWN_TASK',
+            sessionId,
+            reason: 'bunny-foreign-target',
+        });
+    };
+    /** Reads nothing, so a caller that is not one of Bunny's tasks pays nothing for the task rules. */
+    const isTask = (sessionId) => sessionId !== undefined && isBunnyTask?.(sessionId) === true;
+    /**
+     * A task's results reach Bunny only as its report (3.3). A message from the
+     * task to a Bunny conversation would wake Bunny outside its wake sources.
+     */
+    const requireNotToBunny = async (callerSessionId, sessionId) => {
+        if (!isTask(callerSessionId))
+            return;
+        const target = await deps.getSessionById(sessionId);
+        if (!isBunnyAgentName(target?.agentName) || isTask(sessionId))
+            return;
+        throw sessionSendError(TASK_TO_COORDINATOR_REFUSAL, {
+            status: 403,
+            code: 'ASSIGNMENT_TASK_TO_BUNNY',
+            sessionId,
+            reason: 'task-to-bunny',
+        });
+    };
+    /** A task never starts Sessions beside it (3.1); the refusal points to its sub-Agents. */
+    const sessionCreateRefusal = async (callerSessionId) => isTask(callerSessionId)
+        ? { code: 'ASSIGNMENT_NESTED_TASK', message: NESTED_TASK_REFUSAL }
+        : undefined;
     return {
+        ...assignmentTools,
         listSessions: async (req, signal) => {
             if (isRemoteSource(req.source)) {
                 const source = req.source;
@@ -38,6 +87,7 @@ export function buildMavisSessionAdapter(deps) {
             return { ...(session ? { session: await deps.serializeSession(session) } : {}) };
         },
         updateSession: async (req) => {
+            await requireBunnyTarget(req.callerSessionId, req.sessionId);
             const invalid = invalidUpdateField(req);
             if (invalid) {
                 throw Object.assign(new Error(`${invalid} is not a valid value`), {
@@ -72,24 +122,75 @@ export function buildMavisSessionAdapter(deps) {
             };
         },
         sendSession: async (req, signal) => {
-            if (!isRemoteSource(req.source))
+            await requireBunnyTarget(req.callerSessionId, req.sessionId);
+            await requireNotToBunny(req.callerSessionId, req.sessionId);
+            if (isRemoteSource(req.source)) {
+                const source = req.source;
+                return countRemoteOp(deps, { op: 'send', source, signal }, async () => {
+                    const remote = requireRemote(deps, source);
+                    return sendToRemoteSession({ remote, ...(deps.metrics ? { metrics: deps.metrics } : {}) }, {
+                        source,
+                        sessionId: req.sessionId,
+                        ...(req.deviceId ? { deviceId: req.deviceId } : {}),
+                        content: req.content,
+                        ...(req.sync !== undefined ? { sync: req.sync } : {}),
+                        sender: await remoteSender(deps, req.callerSessionId),
+                    }, signal);
+                });
+            }
+            if (req.reportBack !== true)
                 return sendToLocalSession(deps, req, signal);
-            const source = req.source;
-            return countRemoteOp(deps, { op: 'send', source, signal }, async () => {
-                const remote = requireRemote(deps, source);
-                return sendToRemoteSession({ remote, ...(deps.metrics ? { metrics: deps.metrics } : {}) }, {
-                    source,
-                    sessionId: req.sessionId,
-                    ...(req.deviceId ? { deviceId: req.deviceId } : {}),
-                    content: req.content,
-                    ...(req.sync !== undefined ? { sync: req.sync } : {}),
-                    ...(req.forceSteer !== undefined ? { forceSteer: req.forceSteer } : {}),
-                    sender: await remoteSender(deps, req.callerSessionId),
+            if (!assignmentTools.prepareAssignment)
+                throw new Error('Session assignment is unavailable on this host');
+            const { origin, rollback, admittedHook, ...info } = withRollback(await assignmentTools.prepareAssignment(req, signal));
+            let admitted = false;
+            try {
+                const result = await sendToLocalSession(deps, {
+                    ...req,
+                    assignmentOrigin: origin,
+                    onAdmitted: () => {
+                        admitted = true;
+                        admittedHook?.();
+                    },
                 }, signal);
-            });
+                return { ...result, ...info };
+            }
+            catch (error) {
+                // A rejected delivery must not cost the task the assignment, and the
+                // report, it had before this send.
+                if (!admitted)
+                    await rollBackAssignment(rollback, req.sessionId);
+                throw error;
+            }
         },
-        interruptSession: (req) => interruptLocalSession(deps, req),
-        createSession: (req, signal) => createSessionWithFirstMessage(deps, req, signal),
+        interruptSession: async (req) => {
+            await requireBunnyTarget(req.callerSessionId, req.sessionId);
+            return interruptLocalSession(deps, req);
+        },
+        sessionCreateRefusal,
+        createSession: async (req, signal) => {
+            const refusal = await sessionCreateRefusal(req.callerSessionId);
+            if (refusal)
+                throw Object.assign(new Error(refusal.message), { status: 403, ...refusal });
+            return createSessionWithFirstMessage(deps, req, signal);
+        },
+    };
+}
+async function rollBackAssignment(rollback, sessionId) {
+    try {
+        await rollback?.();
+    }
+    catch (error) {
+        logger.warn({ sessionId, error: error instanceof Error ? error.message : String(error) }, 'Assignment rollback after a rejected send failed');
+    }
+}
+function withRollback(prepared) {
+    // `admitted` is heard once the message was admitted, so a send rolled back is never counted.
+    const { rollback, admitted, ...rest } = prepared;
+    return {
+        ...rest,
+        rollback: typeof rollback === 'function' ? rollback : undefined,
+        admittedHook: typeof admitted === 'function' ? admitted : undefined,
     };
 }
 function isRemoteSource(source) {

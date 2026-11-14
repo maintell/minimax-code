@@ -4,6 +4,13 @@ import { withLLMStreamFailure } from './llm-stream-failure.js';
 /** Marker included in every synthesized timeout message; matches the shared timeout classifier. */
 export const LLM_STREAM_TIMEOUT_MESSAGE_PREFIX = 'LLM request timed out';
 /**
+ * Marker of a stream dropped after a system resume. It names the network, so
+ * the shared classifier treats it as a retryable network failure.
+ */
+export const LLM_RESUME_STALL_MESSAGE_PREFIX = 'LLM network connection lost after system resume';
+/** Default wait for a provider event after a system resume before the stream counts as dead. */
+export const LLM_RESUME_STALL_MS = 20_000;
+/**
  * Resolve effective timeouts. Precedence: explicit host config, then the
  * environment override, then the built-in default. Invalid values (negative,
  * non-integer, non-numeric) fall through to the next source.
@@ -34,12 +41,12 @@ export function resolveLLMStreamTimeouts(config = {}, env = readProcessEnv()) {
  * transport timeout rather than a user cancellation. A caller abort is passed
  * through unchanged and never reported as a timeout.
  */
-export function withLLMStreamTimeouts(inner, timeouts) {
+export function withLLMStreamTimeouts(inner, timeouts, resume) {
     const base = inner ?? streamSimple;
-    if (timeouts.firstEventTimeoutMs <= 0 && timeouts.idleTimeoutMs <= 0)
+    if (timeouts.firstEventTimeoutMs <= 0 && timeouts.idleTimeoutMs <= 0 && !resume)
         return base;
     return (async (model, context, options) => {
-        const watchdog = new StreamWatchdog(model, options?.signal, timeouts);
+        const watchdog = new StreamWatchdog(model, options?.signal, timeouts, resume);
         let opened;
         try {
             opened = await watchdog.untilTimeout(Promise.resolve(base(model, context, { ...(options ?? {}), signal: watchdog.signal })));
@@ -56,6 +63,7 @@ class StreamWatchdog {
     model;
     callerSignal;
     timeouts;
+    resume;
     controller = new AbortController();
     timedOut;
     resolveTimedOut;
@@ -63,10 +71,14 @@ class StreamWatchdog {
     settled = false;
     lastPartial;
     timeoutMessage;
-    constructor(model, callerSignal, timeouts) {
+    unsubscribeResume;
+    /** A resume hint arrived and no provider event has proved the connection alive since. */
+    resumePending = false;
+    constructor(model, callerSignal, timeouts, resume) {
         this.model = model;
         this.callerSignal = callerSignal;
         this.timeouts = timeouts;
+        this.resume = resume;
         this.timedOut = new Promise((resolve) => {
             this.resolveTimedOut = resolve;
         });
@@ -77,6 +89,7 @@ class StreamWatchdog {
         }
         callerSignal?.addEventListener('abort', this.onCallerAbort, { once: true });
         this.arm(timeouts.firstEventTimeoutMs, 'first');
+        this.unsubscribeResume = resume?.onResume(this.onResume);
     }
     get signal() {
         return this.controller.signal;
@@ -88,6 +101,8 @@ class StreamWatchdog {
         this.settled = true;
         this.clearTimer();
         this.callerSignal?.removeEventListener('abort', this.onCallerAbort);
+        this.unsubscribeResume?.();
+        this.unsubscribeResume = undefined;
     }
     timedOutStream() {
         const out = createAssistantMessageEventStream();
@@ -112,7 +127,7 @@ class StreamWatchdog {
         try {
             for (;;) {
                 if (receivedFirst)
-                    this.arm(this.timeouts.idleTimeoutMs, 'idle');
+                    this.armBetweenEvents();
                 const next = await this.untilTimeout(iterator.next());
                 if (next === TIMED_OUT) {
                     releaseIterator(iterator);
@@ -121,6 +136,7 @@ class StreamWatchdog {
                     return;
                 }
                 this.clearTimer();
+                this.resumePending = false;
                 if (next.done) {
                     completed = true;
                     return;
@@ -145,6 +161,19 @@ class StreamWatchdog {
         this.clearTimer();
         this.controller.abort(this.callerSignal?.reason);
     };
+    /** Until the next provider event, every wait on the provider uses the resume bound. */
+    onResume = () => {
+        if (!this.resume || this.settled)
+            return;
+        this.resumePending = true;
+        this.arm(this.resume.stallMs, 'resume');
+    };
+    armBetweenEvents() {
+        if (this.resumePending && this.resume)
+            this.arm(this.resume.stallMs, 'resume');
+        else
+            this.arm(this.timeouts.idleTimeoutMs, 'idle');
+    }
     arm(ms, phase) {
         this.clearTimer();
         if (ms <= 0 || this.settled || this.callerSignal?.aborted)
@@ -156,6 +185,20 @@ class StreamWatchdog {
     fire(phase, ms) {
         if (this.settled || this.callerSignal?.aborted)
             return;
+        if (phase === 'resume') {
+            // A connection that did not survive a system sleep is a network loss, not
+            // a stream-layer timeout: no failure marker, so it classifies as network.
+            const message = resumeStallMessage(ms);
+            this.timeoutMessage = {
+                ...snapshot(this.lastPartial, this.model),
+                stopReason: 'error',
+                errorMessage: message,
+            };
+            this.settle();
+            this.resolveTimedOut(TIMED_OUT);
+            this.controller.abort(new Error(message));
+            return;
+        }
         const message = timeoutMessage(phase, ms);
         const kind = timeoutKind(phase);
         // The marker lets a host lease tell a watchdog timeout from a provider failure
@@ -208,6 +251,9 @@ function timeoutMessage(phase, ms) {
             `Raise it with ${LLM_FIRST_EVENT_TIMEOUT_ENV} (milliseconds, 0 disables) or the host's per-model firstEventTimeoutMs.`
         : `${LLM_STREAM_TIMEOUT_MESSAGE_PREFIX}: the provider stream was idle for ${ms}ms. ` +
             `Raise it with ${LLM_STREAM_IDLE_TIMEOUT_ENV} (milliseconds, 0 disables) or the host's per-model streamIdleTimeoutMs.`;
+}
+function resumeStallMessage(ms) {
+    return `${LLM_RESUME_STALL_MESSAGE_PREFIX}: no provider event within ${ms}ms after the system resumed.`;
 }
 function partialOf(event) {
     if (event.type === 'done')

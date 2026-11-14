@@ -1,4 +1,5 @@
-import { and, asc, desc, eq, gt, gte, inArray, lt, lte, placeholder, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, lt, lte, or, placeholder, sql } from 'drizzle-orm';
+import { MsgType } from '@mavis/agent-core/protocol/agent-message';
 import { runWithWriteLock, WriteLockWaitAbortedError, } from '../../../../infra/db/write-transaction.js';
 import { legacyMessages, messageRowMigrations, messageRows, sessionAssetIndexState, sessionAssets, } from '../../../../infra/db/schema/messages.js';
 import { replaceMessageAssets } from '../asset-index.js';
@@ -6,9 +7,26 @@ import { decodeDisplayMessage, decodeMessageSource, normalizeDisplayMessage } fr
 import { MessageDataCorruptionError, MessageWriteWaitAbortedError, UNDELIVERED_USER_MESSAGE_KIND, UserMessageCommitAdmissionError, UserMessageCommitConflictError, } from './contract.js';
 import { ensureMessageRowsReadyInTransaction } from './readiness.js';
 import { syncMessageSourceProjection } from './source-projection.js';
+import { MessageWriteObservers } from './write-observers.js';
 const INPUT_REJECTED_DISPLAY_KIND = 'input_rejected';
 export function createMessageRepository(options) {
     return new DrizzleMessageRepository(options);
+}
+/**
+ * Size of the rows this read returned, taken from the stored JSON the query
+ * already materialized. Opening a long conversation is dominated by how many
+ * bytes come back, so the history read logs these three numbers.
+ */
+function rowStats(rows) {
+    let bytes = 0;
+    let maxBytes = 0;
+    for (const row of rows) {
+        const size = Buffer.byteLength(row.dataJson, 'utf8');
+        bytes += size;
+        if (size > maxBytes)
+            maxBytes = size;
+    }
+    return { rows: rows.length, bytes, maxBytes };
 }
 function prepareMessageRead(db) {
     return db
@@ -30,9 +48,11 @@ const turnReads = new WeakMap();
 class DrizzleMessageRepository {
     options;
     nowMs;
+    writes;
     constructor(options) {
         this.options = options;
         this.nowMs = options.nowMs ?? Date.now;
+        this.writes = options.writeObservers ?? new MessageWriteObservers();
     }
     async get(sessionId, msgId) {
         this.ensureReady(sessionId);
@@ -48,12 +68,14 @@ class DrizzleMessageRepository {
     async list(sessionId, options = {}) {
         this.ensureReady(sessionId);
         const anchorId = options.before ? this.messageRowId(sessionId, options.before) : undefined;
+        if (missingQueryAnchor(options, anchorId))
+            return { messages: [], hasMore: false };
         const afterId = this.visibleBoundaryId(sessionId, options.afterMessageId);
         const limit = normalizeLimit(options.limit, 0);
         const query = this.options.db
             .select()
             .from(messageRows)
-            .where(and(eq(messageRows.sessionId, sessionId), anchorId === undefined ? undefined : lt(messageRows.id, anchorId), afterId === undefined ? undefined : gt(messageRows.id, afterId)))
+            .where(messageListFilter(sessionId, options, anchorId, afterId))
             .orderBy(desc(messageRows.id));
         const rows = limit > 0 ? query.limit(limit + 1).all() : query.all();
         const hasMore = limit > 0 && rows.length > limit;
@@ -62,6 +84,7 @@ class DrizzleMessageRepository {
             messages: selected.map(decodeDisplayMessage),
             hasMore,
             ...(hasMore && selected[0] ? { nextCursor: selected[0].messageId } : {}),
+            rowStats: rowStats(selected),
         };
     }
     async listAfter(sessionId, afterMsgId, visibleAfterMessageId) {
@@ -261,6 +284,7 @@ class DrizzleMessageRepository {
                 tx.delete(sessionAssets)
                     .where(and(eq(sessionAssets.sessionId, sessionId), eq(sessionAssets.messageId, messageId)))
                     .run();
+                this.writes.deleted(tx, { sessionId, messageIds: [messageId] });
                 return { status: 'deleted' };
             }
             // Same row, same position: only its display data changes. Provenance stays.
@@ -379,6 +403,7 @@ class DrizzleMessageRepository {
             tx.delete(sessionAssets)
                 .where(and(eq(sessionAssets.sessionId, input.sessionId), inArray(sessionAssets.messageId, deletedMessageIds)))
                 .run();
+            this.writes.deleted(tx, { sessionId: input.sessionId, messageIds: deletedMessageIds });
             this.markSessionAssetIndexCurrent(tx, input.sessionId);
             return { deletedMessageIds };
         }, { behavior: 'immediate' });
@@ -404,6 +429,7 @@ class DrizzleMessageRepository {
             tx.delete(sessionAssets)
                 .where(and(eq(sessionAssets.sessionId, input.sessionId), inArray(sessionAssets.messageId, [...ids])))
                 .run();
+            this.writes.deleted(tx, { sessionId: input.sessionId, messageIds: [...ids] });
         });
     }
     async resolveTurnSource(sessionId, turnId) {
@@ -413,6 +439,23 @@ class DrizzleMessageRepository {
             .from(messageRows)
             .where(and(eq(messageRows.sessionId, sessionId), eq(messageRows.turnId, turnId), eq(messageRows.role, 'user')))
             .orderBy(asc(messageRows.id))
+            .limit(1)
+            .get();
+        return row ? decodeMessageSource(row) : undefined;
+    }
+    async resolveLatestUserSource(sessionId, filter) {
+        this.ensureReady(sessionId);
+        const matches = [
+            ...(filter.sources.length > 0 ? [inArray(messageRows.source, [...filter.sources])] : []),
+            ...(filter.sourcePrefixes ?? []).map((prefix) => sql `substr(${messageRows.source}, 1, ${prefix.length}) = ${prefix}`),
+        ];
+        if (matches.length === 0)
+            return undefined;
+        const row = this.options.db
+            .select()
+            .from(messageRows)
+            .where(and(eq(messageRows.sessionId, sessionId), eq(messageRows.role, 'user'), sql `coalesce(json_extract(${messageRows.dataJson}, '$.kind'), '') NOT IN (${INPUT_REJECTED_DISPLAY_KIND}, ${UNDELIVERED_USER_MESSAGE_KIND})`, or(...matches)))
+            .orderBy(desc(messageRows.id))
             .limit(1)
             .get();
         return row ? decodeMessageSource(row) : undefined;
@@ -510,6 +553,7 @@ class DrizzleMessageRepository {
                 .run();
             tx.delete(messageRows).where(eq(messageRows.sessionId, sessionId)).run();
             tx.delete(messageRowMigrations).where(eq(messageRowMigrations.sessionId, sessionId)).run();
+            this.writes.deleted(tx, { sessionId, sessionDataDeleted: true });
             const legacy = tx
                 .select({ piHistoryJson: legacyMessages.piHistoryJson })
                 .from(legacyMessages)
@@ -591,6 +635,7 @@ class DrizzleMessageRepository {
             syncMessageSourceProjection(db, sessionId, message, this.nowMs());
         }
         replaceMessageAssets(db, sessionId, message, this.nowMs());
+        this.writes.written(db, sessionId, message.msgId);
     }
     normalizeReplacementBatch(messages, startIndex) {
         return messages.map((message, index) => normalizeDisplayMessage(message, {
@@ -606,6 +651,7 @@ class DrizzleMessageRepository {
                 tx.delete(sessionAssetIndexState)
                     .where(eq(sessionAssetIndexState.sessionId, sessionId))
                     .run();
+                this.writes.deleted(tx, { sessionId });
             }
             messages.forEach((message) => this.write(tx, sessionId, message));
             this.markSessionAssetIndexCurrent(tx, sessionId);
@@ -736,5 +782,30 @@ function isForkOriginMessage(message) {
 }
 function normalizeLimit(value, fallback) {
     return Number.isFinite(value) && (value ?? 0) > 0 ? Math.floor(value) : fallback;
+}
+function messageListFilter(sessionId, options, anchorId, afterId) {
+    return and(eq(messageRows.sessionId, sessionId), options.role ? eq(messageRows.role, options.role) : undefined, queryRootFilter(options.queryRootKey), anchorId === undefined ? undefined : lt(messageRows.id, anchorId), systemEventFilter(options.systemEventsOnly), afterId === undefined ? undefined : gt(messageRows.id, afterId));
+}
+function missingQueryAnchor(options, anchorId) {
+    return (options.queryRootKey !== undefined && options.before !== undefined && anchorId === undefined);
+}
+function queryRootFilter(queryRootKey) {
+    if (queryRootKey === undefined)
+        return undefined;
+    const queryKey = sql `json_extract(${messageRows.dataJson}, '$.query_key')`;
+    const steeringPrefix = `${queryRootKey}:s:`;
+    return or(eq(queryKey, queryRootKey), eq(sql `substr(${queryKey}, 1, ${steeringPrefix.length})`, steeringPrefix));
+}
+function systemEventFilter(systemEventsOnly) {
+    // Some older sessions stored the event JSON as ordinary message content.
+    const content = sql `coalesce(json_extract(${messageRows.dataJson}, '$.msgContent'),
+    json_extract(${messageRows.dataJson}, '$.msg_content'))`;
+    return systemEventsOnly
+        ? sql `(coalesce(json_extract(${messageRows.dataJson}, '$.msgType'),
+                json_extract(${messageRows.dataJson}, '$.msg_type'),
+                json_extract(${messageRows.dataJson}, '$.messageType'),
+                json_extract(${messageRows.dataJson}, '$.message_type')) = ${MsgType.SystemEvent}
+                or (case when json_valid(${content}) then json_type(${content}, '$.eventType') end) = 'text')`
+        : undefined;
 }
 //# sourceMappingURL=drizzle.js.map

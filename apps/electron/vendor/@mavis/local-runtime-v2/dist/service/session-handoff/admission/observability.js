@@ -9,30 +9,15 @@ export function handoffConfirmationStages(ports, identity) {
         }
     });
 }
-/** Only allowlisted diagnostics; never serialize the exception, query, paths or credentials. */
+/**
+ * One log line per observation; only allowlisted diagnostics, never the exception, query,
+ * paths or credentials. Handoff reports no metrics.
+ */
 export function observeHandoff(ports, observation) {
     try {
         const logger = ports.logger;
         const write = observation.outcome === 'failed' ? (logger?.error ?? logger?.info) : logger?.info;
         write?.call(logger, { ...observation }, '[handoff-attempt]');
-    }
-    catch {
-        /* Diagnostic only. */
-    }
-    try {
-        ports.metrics?.counter(`handoff.${observation.event}`, 1, {
-            attempt_type: observation.attemptType,
-            stage: observation.stage,
-            outcome: observation.outcome,
-            ...(observation.code ? { error_code: observation.code } : {}),
-            ...(observation.diagnostic ? { reason: observation.diagnostic.reason } : {}),
-        });
-        if (observation.durationMs !== undefined)
-            ports.metrics?.histogram?.('handoff.duration_ms', observation.durationMs, {
-                attempt_type: observation.attemptType,
-                stage: observation.stage,
-                outcome: observation.outcome,
-            });
     }
     catch {
         /* Diagnostic only. */

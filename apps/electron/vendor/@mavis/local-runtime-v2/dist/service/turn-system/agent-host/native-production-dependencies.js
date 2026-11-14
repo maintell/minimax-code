@@ -1,5 +1,5 @@
 import { createAgentRuntime } from '@mavis/agent-runtime';
-import { createDesktopPtcResultProjection, getLocalBashEnvironment, projectDesktopPtcEvidenceInput, } from '@mavis/agent-tools';
+import { createDesktopPtcResultProjection, disposeToolSearchSession, getLocalBashEnvironment, projectDesktopPtcEvidenceInput, } from '@mavis/agent-tools';
 import { redactSecretText } from '@mavis/shared/logging/redact-log-secret';
 import { sanitizeObservabilityText } from '@mavis/shared/local-runtime-diagnostics/redaction';
 import { buildLocalTurnToolCatalog, } from './assembly/local-turn-tool-catalog.js';
@@ -8,7 +8,8 @@ import { createLocalTurnToolCatalogInput, } from './assembly/local-turn-tool-cat
 import { NativeLocalTurnExecutionPreparationSource, } from './assembly/local-turn-execution-preparation.js';
 import { LocalTurnInputPreparer, } from './assembly/local-turn-input-preparation.js';
 import {} from './execution/executor.js';
-import { resetPtcPrefixBaseline } from './runner/policy/ptc-prefix-fingerprint.js';
+import { disposePtcCompactionReminderSession } from './execution/ptc/compaction-reminder.js';
+import { resetPtcPrefixBaseline } from './runner/observability/ptc-prefix-fingerprint.js';
 import { LocalAgentConfigBuilder, LocalAgentPreparationService, } from './preparation/index.js';
 import { observeAgentTurnSetupStage } from './preparation/turn-preflight.js';
 import { createAgentHostProductionDependencies, } from './production-dependencies.js';
@@ -28,7 +29,11 @@ export async function createNativeAgentHostProductionDependencies(options) {
     });
     const normal = {
         async assembleModelContext(context, desktopCapabilities) {
-            const seed = await toolCatalog.build(createLocalTurnToolCatalogInput(context, desktopCapabilities));
+            // A standalone compaction's catalog: same prefix window, but no Turn announces anything.
+            const seed = await toolCatalog.build({
+                ...createLocalTurnToolCatalogInput(context, desktopCapabilities),
+                commitWindow: false,
+            });
             return normalRuntime.assembleModelContext(context, seed);
         },
         async assembleTurn(context, desktopCapabilities) {
@@ -69,6 +74,7 @@ function createNativeAgentHostDependencies(options, normal, runtime, executionPr
         ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
         ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
         promptSuggestion: options.promptSuggestion,
+        turnTiming: options.turnTiming,
         canonicalHistory: options.canonicalHistory,
         ...(options.runner.logger ? { logger: options.runner.logger } : {}),
         ...(options.usage ? { usage: options.usage } : {}),
@@ -84,6 +90,7 @@ function createNativeAgentHostDependencies(options, normal, runtime, executionPr
                 projectResultRef: projectNativePtcResultRef,
                 projectRetainedFacts: (projection) => collector.read(projection.childToolCallId),
             }),
+            ...childDisplayArtifactWriter(options.toolCatalog.writePtcReturnArtifact),
             ...(permissionMutations
                 ? {
                     clearPluginHookSessionPermissions: (sessionId) => permissionMutations.clearSession(sessionId),
@@ -95,6 +102,14 @@ function createNativeAgentHostDependencies(options, normal, runtime, executionPr
             ? { isRuntimeErrorRetryable: options.isRuntimeErrorRetryable }
             : {}),
     });
+}
+/**
+ * The same writer and Session directory as the run_code return-value spill, so
+ * a shortened child display copy points the UI at the full text there. A host
+ * that wires no writer gets none here either.
+ */
+function childDisplayArtifactWriter(writer) {
+    return writer ? { writePtcChildDisplayArtifact: writer } : {};
 }
 function projectNativePtcResultRef(input) {
     if (input.source !== 'builtin' || input.toolName !== 'bash')
@@ -143,18 +158,29 @@ function createPermissionGateOptions(options) {
 }
 /** Builds the shared native config/model preparation used by AgentHost and title calls. */
 export function createNativeLocalAgentPreparation(options) {
+    // The process has one preparation (production-composition). It reads the
+    // platform, OS and shell once: they sit in the cached system prompt prefix,
+    // so a read that fails or answers differently later must not change a Turn.
+    let environment;
     return new LocalAgentPreparationService({
         configBuilder: new LocalAgentConfigBuilder({
             ...options.configBuilder,
-            environment: options.configBuilder.environment ?? getLocalBashEnvironment,
+            environment: options.configBuilder.environment ??
+                (() => {
+                    environment ??= getLocalBashEnvironment();
+                    return environment;
+                }),
         }),
         modelResolver: options.modelResolver,
+        ...(options.logger ? { logger: options.logger } : {}),
     });
 }
 export function createAgentHostRuntimeLifecycle(runtime, mutations) {
     return {
         async disposeSession(sessionId) {
             resetPtcPrefixBaseline(sessionId);
+            disposeToolSearchSession(sessionId);
+            disposePtcCompactionReminderSession(sessionId);
             await Promise.all([
                 disposeRuntimeSession(runtime, sessionId),
                 mutations?.clearSession(sessionId) ?? Promise.resolve(),
@@ -178,7 +204,12 @@ function createToolCatalogSource(options) {
 }
 async function buildToolCatalog(options, input) {
     const sources = await options.resolveSources(toolCatalogSourceInput(input));
-    const catalog = buildLocalTurnToolCatalog({
+    // Product memory tools belong to a trusted profile that declares that memory pipeline.
+    const memoryTools = input.agentProfile?.trustedBuiltin === true &&
+        input.agentProfile.coordination?.memoryPipeline !== undefined
+        ? (options.coordinatorMemoryTools?.(input) ?? [])
+        : [];
+    const built = buildLocalTurnToolCatalog({
         sessionId: input.sessionId,
         turnId: input.turnId,
         agentName: input.agentName,
@@ -186,8 +217,11 @@ async function buildToolCatalog(options, input) {
         llmModel: input.llmModel,
         effectivePluginSkills: input.effectivePluginSkills,
         userText: input.userText,
+        ...(input.commitWindow === false ? { commitWindow: false } : {}),
         ...toolCatalogBuildOptions(options, input),
+        appendedDirectToolNames: memoryTools.map((tool) => tool.def.name),
     });
+    const catalog = { ...built, tools: [...built.tools, ...memoryTools] };
     // Rendered into the first user message only, which history then keeps: later
     // Turns neither inject nor read these Skills again.
     const preload = input.sessionFirstTurn
@@ -215,6 +249,9 @@ function toolCatalogSourceInput(input) {
 }
 function agentProfileSourceOptions(profile) {
     return {
+        ...(profile?.trustedBuiltin === true && profile.coordination
+            ? { coordination: profile.coordination }
+            : {}),
         ...(profile?.excludeAgentResources ? { excludeAgentResources: true } : {}),
         ...(profile?.skipAgentResolution ? { skipAgentResolution: true } : {}),
         ...(profile?.expectedAgentInstanceId
@@ -233,7 +270,7 @@ function toolCatalogBuildOptions(options, input) {
         ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
         ...(input.modelCapabilities ? { modelCapabilities: input.modelCapabilities } : {}),
         ...(input.agentProfile ? { agentProfile: input.agentProfile } : {}),
-        ...(input.ptcEnabled ? { ptcEnabled: true } : {}),
+        ...turnBindingOptions(input),
         ...(options.config ? { config: options.config } : {}),
         ...(options.env ? { env: options.env } : {}),
         ...(options.emitDiagnostic ? { emitDiagnostic: options.emitDiagnostic } : {}),
@@ -242,6 +279,24 @@ function toolCatalogBuildOptions(options, input) {
             ? { hostCapabilityRegistry: options.hostCapabilityRegistry }
             : {}),
         writePtcReturnArtifact: options.writePtcReturnArtifact,
+        ...(options.ptcSessionStore ? { ptcSessionStore: options.ptcSessionStore } : {}),
+        ...ptcScriptCatalogOptions(options, input),
+    };
+}
+/** The script directories follow this Turn's own workspace and Agent. */
+function ptcScriptCatalogOptions(options, input) {
+    return {
+        ...(options.ptcScripts ? { ptcScripts: options.ptcScripts } : {}),
+        ...(input.workspaceDir ? { workspaceDir: input.workspaceDir } : {}),
+        ...(input.agentName ? { agentName: input.agentName } : {}),
+        ...(input.isDefaultWorkspace ? { isDefaultWorkspace: true } : {}),
+    };
+}
+/** Frozen per-Turn facts that decide which tools this Turn offers (PTC, advisor). */
+function turnBindingOptions(input) {
+    return {
+        ...(input.ptcEnabled ? { ptcEnabled: true } : {}),
+        ...(input.advisorBound ? { advisorBound: true } : {}),
     };
 }
 //# sourceMappingURL=native-production-dependencies.js.map

@@ -1,5 +1,16 @@
 import { isMiniAppHostAccess } from './miniapp-host.js';
 export * from './miniapp-host.js';
+export function isMiniAppPageSnapshot(value) {
+    if (!value || typeof value !== 'object')
+        return false;
+    const snapshot = value;
+    return (typeof snapshot.dataUrl === 'string' &&
+        snapshot.dataUrl.length <= 500_000 &&
+        /^data:image\/jpeg;base64,[A-Za-z0-9+/]+={0,2}$/.test(snapshot.dataUrl) &&
+        typeof snapshot.capturedAt === 'number' &&
+        Number.isFinite(snapshot.capturedAt) &&
+        snapshot.capturedAt >= 0);
+}
 /**
  * Why the Host will not put a running Mini App to sleep on its own right now. `visible`: a page
  * is on screen; `in_use`: the current turn depends on it (an @ reference, or the main Agent called

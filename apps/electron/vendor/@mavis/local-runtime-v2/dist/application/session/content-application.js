@@ -1,10 +1,13 @@
+import { logger } from '@mavis/shared/local-runtime-logging';
+import { isAssignmentOrigin } from '../../service/assignment/index.js';
+import { projectBunnyGreetingOrigin } from '../../service/bunny/index.js';
 import { isCloudSessionRead, readCloudSession } from './session-read-source.js';
 import { deriveMediaKind, inferAssetMimeType } from '@mavis/shared';
 import { getCloudDriveNodeId, isCommitIdTransportId } from '@mavis/shared/asset-markup';
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
 import { isSideChatSendOrigin } from '@mavis/shared/sidechat-send-origin';
 import { DriveNodeSource, DriveNodeType, InstalledPluginSource, PluginCapabilityType, } from '@mavis/thrift-gen/generated/desktop-service/types';
-import { MessageQueryServiceError, PeekContextServiceError, SessionInputSummaryServiceError, SessionUsageServiceError, SessionSourceQueryServiceError, isInlineDisplayDataUrl, } from '../../service/session-system/index.js';
+import { ArtifactCatalogError, SpaceContextConflictError, MessageQueryServiceError, PeekContextServiceError, SessionInputSummaryServiceError, SessionUsageServiceError, SessionSourceQueryServiceError, isInlineDisplayDataUrl, } from '../../service/session-system/index.js';
 import { AppError } from '../errors.js';
 import { queryCollapseSteeringProjection } from '../conversation/query-collapse-identity.js';
 import { projectPeerMessageOrigin } from '../conversation/peer-message-origin.js';
@@ -25,9 +28,11 @@ export class SessionContentApplication {
                 sessionId: request.id,
                 ...(request.limit !== undefined ? { limit: request.limit } : {}),
                 ...(request.before ? { before: request.before } : {}),
+                ...(request.systemEventsOnly ? { systemEventsOnly: true } : {}),
             });
             // The copy a retried undelivered message delivered is never shown; the
             // retried row itself stays the visible message (spec 4.3).
+            logHistoryRead(request.id, page.rowStats);
             const displayed = page.messages.filter((message) => !isUndeliveredRetryCopy(message));
             const queryCollapseViews = await this.readQueryCollapseViews(request.id, displayed);
             const messages = await this.toSessionMessageViews(request.id, displayed);
@@ -84,6 +89,50 @@ export class SessionContentApplication {
             if (error instanceof SessionSourceQueryServiceError) {
                 throw sourceHistoryApplicationError(error);
             }
+            throw error;
+        }
+    }
+    async getArtifactSpace(_context, request) {
+        return this.artifactMutation(() => this.options.artifactCatalog.library.getSpace(request.id));
+    }
+    async linkArtifactSpaceSession(_context, request) {
+        return this.artifactMutation(() => this.options.artifactCatalog.library.linkSession(request));
+    }
+    async getArtifactSpaceContext(_context, request) {
+        return this.artifactMutation(() => this.options.artifactCatalog.library.readContext(request.id));
+    }
+    /** Rewrites context.md's `<summary>`; a stale revision is a 409 SPACE_CONTEXT_CONFLICT. */
+    async writeArtifactSpaceContext(_context, request) {
+        return this.artifactMutation(() => this.options.artifactCatalog.library.writeContext(request));
+    }
+    async saveArtifactSpace(_context, request) {
+        return this.artifactMutation(() => this.options.artifactCatalog.library.saveSpace(request));
+    }
+    async deleteArtifactSpace(_context, request) {
+        return this.artifactMutation(() => this.options.artifactCatalog.library.deleteSpace(request.id));
+    }
+    async importArtifact(_context, request) {
+        return this.artifactMutation(() => this.options.artifactCatalog.library.importFile(request));
+    }
+    async artifactMutation(mutate) {
+        try {
+            return await mutate();
+        }
+        catch (error) {
+            if (error instanceof SpaceContextConflictError)
+                throw new AppError(409, error.code, error.message);
+            if (error instanceof ArtifactCatalogError)
+                throw new AppError(error.status, 'INVALID_ARTIFACT_OPERATION', error.message);
+            throw error;
+        }
+    }
+    async listArtifacts(_context, request) {
+        try {
+            return await this.options.artifactCatalog.list(request);
+        }
+        catch (error) {
+            if (error instanceof ArtifactCatalogError)
+                throw new AppError(400, 'INVALID_ARTIFACT_QUERY', error.message);
             throw error;
         }
     }
@@ -328,18 +377,24 @@ export function toSessionMessageView(message, forkOriginPresentation) {
 /**
  * The generated view has no slots for request timing, context usage or derived
  * steered provenance. Preserve those facts through the opaque rawJson channel.
+ *
+ * Only the metadata clients read back is projected. The view already carries
+ * content, thinking and every tool call payload, so serializing the whole
+ * record here duplicated each history page (a busy session's page was ~2.2x
+ * the messages themselves). Stored legacy raw payloads still pass through
+ * untouched so old rows keep whatever they carried.
  */
 function toSessionMessageRawJson(message, queryKey) {
     const steering = queryCollapseSteeringProjection(queryKey);
     let raw;
     if (steering.steered) {
-        raw = jsonStringOrString({ ...message, ...steering });
+        raw = jsonStringOrString({ ...sessionMessageRawMetadata(message), ...steering });
     }
     else if (isRecord(firstDefined([message.contextUsage, message.context_usage])) ||
         (isRecord(message.usage) &&
             (message.usage.request_duration_ms !== undefined ||
                 message.usage.decode_duration_ms !== undefined))) {
-        raw = jsonStringOrString(message);
+        raw = jsonStringOrString(sessionMessageRawMetadata(message));
     }
     else {
         raw = jsonStringOrString(firstDefined([message.rawJson, message.raw_json]));
@@ -358,6 +413,56 @@ function toSessionMessageRawJson(message, queryKey) {
     }
     return raw;
 }
+/**
+ * The metadata projection carried by rawJson: exactly the fields the Desktop
+ * renderer and the TUI read back out of it (generation timing, context usage,
+ * steered provenance, PTC parent tool calls, queue identity, preparation
+ * failure, turn/query identity and query mode).
+ */
+function sessionMessageRawMetadata(message) {
+    const usage = sessionMessageRawUsage(message.usage);
+    const contextUsage = firstDefined([message.contextUsage, message.context_usage]);
+    const toolCalls = sessionMessageRawParentToolCalls(message);
+    const preparationError = message.preparation_error;
+    return {
+        ...(usage ? { usage } : {}),
+        ...(isRecord(contextUsage) ? { context_usage: contextUsage } : {}),
+        ...(toolCalls ? { tool_calls: toolCalls } : {}),
+        ...rawStringField('source_message_id', firstDefined([message.sourceMessageId, message.source_message_id])),
+        ...(isRecord(preparationError) ? { preparation_error: preparationError } : {}),
+        ...rawStringField('turn_id', firstDefined([message.turnId, message.turn_id])),
+        ...rawStringField('query_key', firstDefined([message.queryKey, message.query_key])),
+        ...rawStringField('mode', message.mode),
+    };
+}
+/** Timing and the output sample clients match against; the view carries the rest. */
+function sessionMessageRawUsage(value) {
+    if (!isRecord(value))
+        return undefined;
+    const usage = {};
+    for (const field of RAW_USAGE_FIELDS) {
+        if (value[field] !== undefined)
+            usage[field] = value[field];
+    }
+    return Object.keys(usage).length > 0 ? usage : undefined;
+}
+const RAW_USAGE_FIELDS = ['output_tokens', 'request_duration_ms', 'decode_duration_ms'];
+/** A PTC child call's parent run_code id has no slot in the generated tool call view. */
+function sessionMessageRawParentToolCalls(message) {
+    const parents = asArray(firstDefined([message.toolCalls, message.tool_calls])).flatMap((value) => {
+        const toolCall = asRecord(value);
+        const toolCallId = nonEmptyString(firstDefined([toolCall.toolCallId, toolCall.tool_call_id, toolCall.id]));
+        const parentToolCallId = nonEmptyString(firstDefined([toolCall.parentToolCallId, toolCall.parent_tool_call_id]));
+        return toolCallId && parentToolCallId
+            ? [{ tool_call_id: toolCallId, parent_tool_call_id: parentToolCallId }]
+            : [];
+    });
+    return parents.length > 0 ? parents : undefined;
+}
+function rawStringField(key, value) {
+    const stringValue = maybeString(value);
+    return stringValue === undefined ? {} : { [key]: stringValue };
+}
 function toQueryCollapseView(state) {
     return {
         queryKey: state.queryKey,
@@ -374,15 +479,18 @@ function toQueryCollapseView(state) {
  * legacy UI origin contract without exposing routing context.
  */
 function toSessionMessageOriginJson(message) {
+    return jsonStringOrString(projectBunnyGreetingOrigin(message, sessionMessageOrigin(message)));
+}
+function sessionMessageOrigin(message) {
     const explicitOrigin = firstDefined([message.originJson, message.origin_json, message.origin]);
     if (explicitOrigin !== undefined)
-        return jsonStringOrString(explicitOrigin);
+        return explicitOrigin;
     const sourceContext = firstDefined([message.sourceContext, message.source_context]);
     if (carriesSourceContextOrigin(message, sourceContext))
-        return jsonStringOrString(sourceContext.origin);
+        return sourceContext.origin;
     const peerOrigin = projectPeerMessageOrigin(message);
     if (peerOrigin)
-        return jsonStringOrString(peerOrigin);
+        return peerOrigin;
     if (maybeString(message.source) !== 'cron')
         return undefined;
     if (!isRecord(sourceContext))
@@ -391,12 +499,12 @@ function toSessionMessageOriginJson(message) {
     if (!cronId)
         return undefined;
     const runId = nonEmptyString(firstDefined([sourceContext.runId, sourceContext.run_id]));
-    return jsonStringOrString({
+    return {
         rawMeta: {
             cronId,
             ...(runId ? { runId } : {}),
         },
-    });
+    };
 }
 /** Approved machine-owned message sources may carry their UI origin in sourceContext. */
 function carriesSourceContextOrigin(message, sourceContext) {
@@ -404,6 +512,7 @@ function carriesSourceContextOrigin(message, sourceContext) {
         return false;
     return (maybeString(message.source) === 'background-task' ||
         isSideChatSendOrigin(sourceContext.origin) ||
+        isAssignmentOrigin(sourceContext.origin) ||
         (message.source === 'questionnaire' &&
             isOrdinaryQuestionnaireResponseOrigin(sourceContext.origin)));
 }
@@ -701,6 +810,27 @@ function isRecord(value) {
 }
 function maybeString(value) {
     return typeof value === 'string' ? value : undefined;
+}
+/**
+ * How much one history read actually returned. Opening a long conversation is
+ * dominated by these bytes, and until now there was no way to see them; a
+ * run_code child whose display copy was shortened shows up here directly.
+ * Counts and sizes only, never content.
+ */
+function logHistoryRead(sessionId, stats) {
+    if (!stats)
+        return;
+    try {
+        logger.info({
+            session_id: sessionId,
+            rows: stats.rows,
+            rows_bytes: stats.bytes,
+            max_row_bytes: stats.maxBytes,
+        }, 'session history read');
+    }
+    catch {
+        // Diagnostics must not fail the read.
+    }
 }
 function nonEmptyString(value) {
     const stringValue = maybeString(value)?.trim();

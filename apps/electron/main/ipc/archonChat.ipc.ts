@@ -6,7 +6,7 @@
 import { ipcMain } from "electron";
 import { IPC_CHANNELS } from "../config/constants";
 import { windowManager } from "../windows";
-import { getLocalRuntimeFailReason, isLocalRuntimeReady, setLocalRuntimeRunawayGuardConfig, setLocalRuntimePromptSuggestionPolicy, setLocalRuntimeToolResultCompactionConfig, setLocalRuntimeCollectionPolicyConfig, createLocalAsrNativeSession, parseLocalAsrNativeControlFrame } from "../modules/local-runtime";
+import { getLocalRuntimeFailReason, isLocalRuntimeReady, setLocalRuntimeRunawayGuardConfig, setLocalRuntimePromptSuggestionPolicy, setLocalRuntimeBunnyPolicy, setLocalRuntimeToolResultCompactionConfig, setLocalRuntimeBunnyContextConfig, setLocalRuntimeCollectionPolicyConfig, createLocalAsrNativeSession, parseLocalAsrNativeControlFrame } from "../modules/local-runtime";
 import { connectRendererToUtilityRuntime, disconnectRendererFromUtilityRuntime } from "../modules/local-runtime/utility";
 import { getDeviceInfo } from "../utils/device-info";
 import { getCategoryLogger } from "../utils/logger";
@@ -61,8 +61,16 @@ export function setupArchonChatIPC(runtimeTransportMode) {
         setLocalRuntimePromptSuggestionPolicy(config);
         return { success: true };
     });
+    ipcMain.handle(IPC_CHANNELS.RUNTIME_SET_BUNNY_POLICY, (_event, config) => {
+        setLocalRuntimeBunnyPolicy(config);
+        return { success: true };
+    });
     ipcMain.handle(IPC_CHANNELS.RUNTIME_SET_TOOL_RESULT_COMPACTION_CONFIG, (_event, config) => {
         setLocalRuntimeToolResultCompactionConfig(config);
+        return { success: true };
+    });
+    ipcMain.handle(IPC_CHANNELS.RUNTIME_SET_BUNNY_CONTEXT_CONFIG, (_event, config) => {
+        setLocalRuntimeBunnyContextConfig(config);
         return { success: true };
     });
     ipcMain.handle(IPC_CHANNELS.RUNTIME_SET_COLLECTION_POLICY_CONFIG, (_event, config) => {

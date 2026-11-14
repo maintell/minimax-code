@@ -7,7 +7,7 @@ const GEMINI_MODELS_PAGE_SIZE = 1000;
 export function buildProviderHeaders(input) {
     const defaults = defaultProviderHeaders(input.api, input.apiKey);
     const headers = new Headers(defaults);
-    const attributedHeaders = withMiniMaxCodeUserAgent(withOpenCodeGoHeaders(input.baseUrl, withOpenRouterAttributionHeaders(input.baseUrl, input.headers)));
+    const attributedHeaders = withMiniMaxCodeUserAgent(withOpenCodeGoHeaders(input.baseUrl, withOpenRouterAttributionHeaders(input.baseUrl, input.headers), input.sessionId));
     for (const [name, value] of Object.entries(attributedHeaders)) {
         headers.set(name, value);
     }

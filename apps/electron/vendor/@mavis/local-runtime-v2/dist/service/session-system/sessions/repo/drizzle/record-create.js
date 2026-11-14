@@ -10,6 +10,7 @@ export function recordFromCreate(input, nowMs) {
         ...recordModelFields(input),
         ...recordProvenanceFields(input, nowMs),
         ...(input.toolCallMode ? { toolCallMode: input.toolCallMode } : {}),
+        ...(input.advisor ? { advisor: input.advisor } : {}),
     };
 }
 function recordIdentityFields(input, sessionType) {
@@ -27,6 +28,7 @@ function recordIdentityFields(input, sessionType) {
         originCronId: input.originCronId,
         miniAppOrigin: input.miniAppOrigin,
         isDefaultWorkspace: input.isDefaultWorkspace,
+        projectWorkspaceDir: input.projectWorkspaceDir,
         runLocation: input.runLocation,
         ...appModeFields(sessionType, input.appMode),
     };

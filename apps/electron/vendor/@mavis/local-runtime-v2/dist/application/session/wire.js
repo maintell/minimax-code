@@ -1,5 +1,7 @@
 import { SessionKind as DesktopSessionKind, SessionInteractionModeView, SessionStatusView, SessionTypeView, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { logger } from '@mavis/shared/local-runtime-logging';
 import { CURRENT_SESSION_DATA_VERSION, effectiveSessionMemoryPolicy, isConversationMutationEligibleSession, } from '../../service/session-system/index.js';
+import { advisorSelectionToView } from './model-provider-advisor.js';
 const SESSION_KIND_TO_DESKTOP = {
     unknown: DesktopSessionKind.Unknown,
     conversation: DesktopSessionKind.Conversation,
@@ -8,7 +10,43 @@ const SESSION_KIND_TO_DESKTOP = {
     channel: DesktopSessionKind.Channel,
     cron: DesktopSessionKind.Cron,
 };
-export function toSessionInfoView(session, relation) {
+/**
+ * The task marks of Session views. A mark is decoration from the Bunny store:
+ * a row that cannot be read loses only its own mark, read again one by one,
+ * and never fails the list, tree, search or project view it belongs to.
+ */
+export async function readSessionAssignments(lookup, sessions) {
+    const ids = sessions.flatMap((session) => (session ? [session.sessionId] : []));
+    if (!lookup || !ids.length)
+        return new Map();
+    try {
+        return await lookup.getMany(ids);
+    }
+    catch (error) {
+        logger.warn({ sessions: ids.length, error: error instanceof Error ? error.message : String(error) }, 'Session task marks could not be read together; reading them one by one');
+    }
+    const read = new Map();
+    if (!lookup.get)
+        return read;
+    for (const id of ids) {
+        try {
+            const assignment = await lookup.get(id);
+            if (assignment)
+                read.set(id, assignment);
+        }
+        catch (error) {
+            logger.warn({ sessionId: id, error: error instanceof Error ? error.message : String(error) }, 'Skipped an unreadable session task mark');
+        }
+    }
+    return read;
+}
+export function toAssignmentStateView({ session, assignment, ...status }) {
+    const view = toSessionInfoView(session, undefined, assignment);
+    if (view.assignment)
+        view.assignment = { ...view.assignment, worklineId: status.worklineId };
+    return { ...status, session: view };
+}
+export function toSessionInfoView(session, relation, assignment) {
     const model = toSessionModelInfoView(session);
     return {
         sessionId: session.sessionId,
@@ -43,7 +81,30 @@ export function toSessionInfoView(session, relation) {
             ? { sideChat: { mainSessionId: relation.mainSessionId, createdAtMs: relation.createdAtMs } }
             : {}),
         sideChatOrigin: session.sideChatOrigin,
+        ...optionalSessionAdvisor(session.advisor),
+        assignment: toSessionAssignmentView(assignment),
     };
+}
+function toSessionAssignmentView(assignment) {
+    if (!assignment)
+        return undefined;
+    return {
+        completion: assignment.completion,
+        assignerSessionId: assignment.assignerSessionId,
+        assignerAgentName: assignment.assignerAgentName,
+        reportBack: assignment.reportBack,
+        assignedAt: assignment.assignedAt,
+        via: assignment.via,
+        depth: assignment.depth,
+    };
+}
+/**
+ * The stored selection as written, the same rule as the main model's `model` above: SessionInfo
+ * reports what was saved, and ListModels(session_id) reports what a Turn would run, without the
+ * settings the model no longer accepts.
+ */
+function optionalSessionAdvisor(advisor) {
+    return advisor ? { advisor: advisorSelectionToView(advisor) } : {};
 }
 function toSessionMemoryPolicyView(session) {
     const policy = effectiveSessionMemoryPolicy(session.memoryPolicy);

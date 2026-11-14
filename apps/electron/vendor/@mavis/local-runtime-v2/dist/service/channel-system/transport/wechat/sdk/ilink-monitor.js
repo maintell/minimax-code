@@ -57,15 +57,14 @@ export class ILinkMonitor extends EventEmitter {
     }
     /** Start the long-polling loop. Returns when stopped or aborted. */
     async start() {
-        if (this.running)
+        if (this.running || this.externalAbortSignal?.aborted)
             return;
         this.running = true;
         // Create a fresh AbortController so stop() → start() works correctly.
         this.abortController = new AbortController();
         // Listen for external abort
-        if (this.externalAbortSignal) {
-            this.externalAbortSignal.addEventListener('abort', () => this.stop(), { once: true });
-        }
+        const onExternalAbort = () => this.stop();
+        this.externalAbortSignal?.addEventListener('abort', onExternalAbort, { once: true });
         this.emitStatus('polling');
         this.emit('connected');
         let consecutiveFailures = 0;
@@ -88,6 +87,7 @@ export class ILinkMonitor extends EventEmitter {
                 await this.sleep(RETRY_DELAY_MS);
             }
         }
+        this.externalAbortSignal?.removeEventListener('abort', onExternalAbort);
         this.running = false;
         this.emitStatus('stopped');
         this.emit('disconnected', 'stopped');
@@ -102,10 +102,11 @@ export class ILinkMonitor extends EventEmitter {
         // listener of this round, not from the request, so it is no verdict.
         let answered = false;
         try {
-            const resp = await this.client.getUpdates(this.getUpdatesBuf, this.nextPollTimeoutMs);
+            const resp = await this.client.getUpdates(this.getUpdatesBuf, this.nextPollTimeoutMs, this.abortController.signal);
+            if (!this.running || this.abortController.signal.aborted)
+                return 'stop';
             answered = true;
-            const isApiError = (resp.ret !== undefined && resp.ret !== 0) ||
-                (resp.errcode !== undefined && resp.errcode !== 0);
+            const isApiError = this.isApiError(resp);
             if (isApiError)
                 return this.handleApiError(resp);
             this.adoptPollState(resp);
@@ -122,6 +123,10 @@ export class ILinkMonitor extends EventEmitter {
             this.emit('error', error);
             return 'failed';
         }
+    }
+    isApiError(resp) {
+        return ((resp.ret !== undefined && resp.ret !== 0) ||
+            (resp.errcode !== undefined && resp.errcode !== 0));
     }
     /**
      * The server answered with ret / errcode 0. After a failure streak the
@@ -208,12 +213,18 @@ export class ILinkMonitor extends EventEmitter {
     }
     sleep(ms) {
         return new Promise((resolve) => {
-            const timer = setTimeout(resolve, ms);
-            const onAbort = () => {
+            const signal = this.abortController.signal;
+            if (signal.aborted) {
+                resolve();
+                return;
+            }
+            const finish = () => {
                 clearTimeout(timer);
+                signal.removeEventListener('abort', finish);
                 resolve();
             };
-            this.abortController.signal.addEventListener('abort', onAbort, { once: true });
+            const timer = setTimeout(finish, ms);
+            signal.addEventListener('abort', finish, { once: true });
         });
     }
 }

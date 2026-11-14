@@ -1,3 +1,4 @@
+import { createBusyTimeAccumulator, observeMetric, } from '../../../../infra/logging/metrics.js';
 /**
  * Starts a process-wide CPU/RSS sample and returns its reader.
  *
@@ -19,19 +20,25 @@ export function beginWorkspaceIndexingLocalCost() {
         };
     };
 }
-/**
- * Windows and macOS differ enough in filesystem walk cost and noise volume
- * that a shared series hides both. `local_runtime` default labels carry no
- * platform, so this domain adds its own bounded `os` dimension rather than
- * changing the shared reporter for every other metric.
- */
-const KNOWN_METRIC_PLATFORMS = { darwin: true, linux: true, win32: true };
+const KNOWN_METRIC_PLATFORMS = {
+    darwin: 'darwin',
+    linux: 'linux',
+    win32: 'win32',
+};
 export class WorkspaceIndexingMetrics {
     sink;
+    nowMs;
     os;
-    constructor(sink, platform = process.platform) {
+    busyTime;
+    latestBacklog;
+    constructor(sink, platform = process.platform, nowMs = Date.now) {
         this.sink = sink;
-        this.os = Object.hasOwn(KNOWN_METRIC_PLATFORMS, platform) ? platform : 'other';
+        this.nowMs = nowMs;
+        this.os = Object.hasOwn(KNOWN_METRIC_PLATFORMS, platform)
+            ? (KNOWN_METRIC_PLATFORMS[platform] ?? 'other')
+            : 'other';
+        this.busyTime = createBusyTimeAccumulator('workspace_indexing_busy_ms_total', { sink, nowMs });
+        sink?.onCollect?.(() => this.collect());
     }
     /**
      * One physical attempt: every retry, cancellation, and poll counts once.
@@ -139,33 +146,37 @@ export class WorkspaceIndexingMetrics {
             // Weak dependency.
         }
     }
+    /** Operations now in flight for a stage; their busy time accrues per report. */
     inflight(stage, value) {
-        const sink = this.sink;
-        if (!sink)
-            return;
-        try {
-            sink.gauge('workspace_indexing_inflight', value, { stage, os: this.os });
-        }
-        catch {
-            // Weak dependency.
-        }
+        this.busyTime.set({ stage, os: this.os }, value);
     }
     /**
-     * Depth and head-of-line age of the durable remote queue. `oldestAgeMs` is
-     * the age of the oldest due Revision, which is what turns a silent backlog
-     * into an alertable signal.
+     * Depth and head-of-line age of the durable remote queue at the latest poll.
+     * `oldestAgeMs` is the age of the oldest due Revision, which is what turns a
+     * silent backlog into an alertable signal. Each report observes the latest
+     * value once while it is fresh, for `freshForMs` after the poll that read it
+     * (the poller passes two of its cycles): a poller that stopped leaves no
+     * value behind to repeat.
      */
-    backlog(pending, oldestAgeMs) {
-        const sink = this.sink;
-        if (!sink)
+    backlog(pending, oldestAgeMs, freshForMs) {
+        this.latestBacklog = { pending, oldestAgeMs, freshUntilMs: this.nowMs() + freshForMs };
+    }
+    /** Indexing is off or the poller closed: there is no backlog to observe. */
+    clearBacklog() {
+        this.latestBacklog = undefined;
+    }
+    collect() {
+        const backlog = this.latestBacklog;
+        if (!backlog)
             return;
-        try {
-            sink.gauge('workspace_indexing_backlog', pending, { os: this.os });
-            sink.gauge('workspace_indexing_backlog_oldest_age_ms', oldestAgeMs, { os: this.os });
+        if (this.nowMs() > backlog.freshUntilMs) {
+            this.latestBacklog = undefined;
+            return;
         }
-        catch {
-            // Weak dependency.
-        }
+        observeMetric(this.sink, 'workspace_indexing_backlog_items', backlog.pending, { os: this.os });
+        observeMetric(this.sink, 'workspace_indexing_backlog_head_age_ms', backlog.oldestAgeMs, {
+            os: this.os,
+        });
     }
 }
 /**

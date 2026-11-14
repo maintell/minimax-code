@@ -1,4 +1,5 @@
 import { getCategoryLogger } from "../../utils/logger";
+import { isInternalBuild } from "../../config/env";
 const logger = getCategoryLogger('update');
 // ============================================
 // 状态变量
@@ -154,14 +155,14 @@ export function resetUpdateCache() {
 // Apollo 自动安装控制
 // ============================================
 /**
- * Whether Apollo agentConfig.autoUpdateDesktopVersion is enabled.
- * When true, downloaded updates are silently installed on app quit.
- * When false (default), updates are only installed when the user
- * explicitly clicks "Install Update".
+ * Whether downloaded updates are silently installed on app quit.
+ * Internal builds always install on quit; other builds follow Apollo
+ * agentConfig.autoUpdateDesktopVersion (default false), and otherwise only
+ * install when the user explicitly clicks "Install Update".
  */
 let autoUpdateEnabled = false;
 export function isAutoUpdateEnabled() {
-    return autoUpdateEnabled;
+    return autoUpdateEnabled || isInternalBuild;
 }
 export function setAutoUpdateEnabled(value) {
     autoUpdateEnabled = value;

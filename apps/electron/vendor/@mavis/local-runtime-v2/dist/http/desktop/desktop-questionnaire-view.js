@@ -1,5 +1,5 @@
 import { QuestionnairePurpose as DesktopQuestionnairePurpose, QuestionnaireSelectionMode, QuestionnaireStatus, QuestionnaireReopenReason, } from '@mavis/thrift-gen/generated/desktop-service/types';
-import { getQuestionnaireCountdownSeconds } from '../../service/questionnaire/index.js';
+import { getQuestionnaireCountdownSeconds, projectPluginPreparationOutcome, } from '../../service/questionnaire/index.js';
 /**
  * DesktopService projections for questionnaire rows, split out of the
  * service adapter to keep it inside the local-runtime layout budget.
@@ -25,7 +25,8 @@ export function toDesktopQuestionnaireResponse(record) {
  * rows; `answeredAt` / `injectedAt` are projected for legacy rows too whenever
  * the columns are set (additive optional fields, older clients ignore them).
  */
-export function toDesktopRequestView(record) {
+export function toDesktopRequestView(source) {
+    const record = projectPluginPreparationOutcome(source);
     const request = record.request;
     return {
         schemaVersion: request.schemaVersion,
@@ -53,23 +54,7 @@ export function toDesktopRequestView(record) {
             ...answer,
             selectedOptionIds: [...answer.selectedOptionIds],
         })),
-        ...(request.modePayload
-            ? {
-                modePayload: {
-                    ...(request.modePayload.featureKey
-                        ? { featureKey: request.modePayload.featureKey }
-                        : {}),
-                    ...(request.modePayload.planReview
-                        ? {
-                            planReview: {
-                                markdown: request.modePayload.planReview.markdown,
-                                path: request.modePayload.planReview.path,
-                            },
-                        }
-                        : {}),
-                },
-            }
-            : {}),
+        ...(request.modePayload ? { modePayload: toDesktopModePayload(request.modePayload) } : {}),
         ...toDesktopAskUserV2Fields(record),
     };
 }
@@ -132,5 +117,24 @@ function toDesktopStatus(value) {
         default:
             return QuestionnaireStatus.Pending;
     }
+}
+function toDesktopModePayload(payload) {
+    const preparation = payload.pluginPreparation;
+    return {
+        ...(payload.featureKey ? { featureKey: payload.featureKey } : {}),
+        ...(payload.planReview
+            ? { planReview: { markdown: payload.planReview.markdown, path: payload.planReview.path } }
+            : {}),
+        ...(preparation
+            ? {
+                pluginPreparation: {
+                    pluginName: preparation.pluginName,
+                    reason: preparation.reason,
+                    ...(preparation.requiredApps ? { requiredApps: [...preparation.requiredApps] } : {}),
+                    ...(preparation.outcome ? { outcome: preparation.outcome } : {}),
+                },
+            }
+            : {}),
+    };
 }
 //# sourceMappingURL=desktop-questionnaire-view.js.map

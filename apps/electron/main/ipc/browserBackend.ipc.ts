@@ -1,6 +1,7 @@
 import path from "node:path";
 import { app, net, ipcMain } from "electron";
 import { DOMAIN_URL, IPC_CHANNELS } from "../config/constants.js";
+import { isStaging } from "../config/env.js";
 import { browserBackendPolicy } from "../modules/browser/browser-backend-policy.js";
 import { createFileBrowserBackendPolicyStore, fetchBrowserBackendRemotePolicy } from "../modules/browser/browser-backend-policy-store.js";
 import { getEmbeddedBrowserBackendDiagnostics } from "../modules/browser/embedded-browser-manager.js";
@@ -29,6 +30,7 @@ function defaultPolicySources() {
             origin: DOMAIN_URL,
             fetchImpl: (input, init) => net.fetch(input instanceof URL ? input.href : input, init),
             signal,
+            readsPreKeys: isStaging,
         }),
     };
 }

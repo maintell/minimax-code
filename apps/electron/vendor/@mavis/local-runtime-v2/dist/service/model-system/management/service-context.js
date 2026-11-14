@@ -254,13 +254,20 @@ export class ModelProviderServiceContext {
     }
     async testResolvedTarget(resolved) {
         const dedupKey = `${resolved.cacheKey}@${resolved.fingerprint}`;
-        if (resolved.minimaxM3ThinkingModes?.length) {
-            return runConnectionTestCases(this.deps.tester, minimaxThinkingTestCases(resolved, dedupKey));
+        // One check is one conversation: every Think Effort case carries the same
+        // id, as a turn does when its effort changes. Added after the fingerprint,
+        // so the cached status still follows the configuration only.
+        const check = {
+            ...resolved,
+            target: { ...resolved.target, sessionId: crypto.randomUUID() },
+        };
+        if (check.minimaxM3ThinkingModes?.length) {
+            return runConnectionTestCases(this.deps.tester, minimaxThinkingTestCases(check, dedupKey));
         }
-        if (resolved.effortOptions?.length) {
-            return runConnectionTestCases(this.deps.tester, effortTestCases(resolved, dedupKey));
+        if (check.effortOptions?.length) {
+            return runConnectionTestCases(this.deps.tester, effortTestCases(check, dedupKey));
         }
-        return this.deps.tester.test(dedupKey, resolved.target);
+        return this.deps.tester.test(dedupKey, check.target);
     }
     resolveTestTarget(providerId, modelId, options = {}) {
         const config = this.deps.configGetter();

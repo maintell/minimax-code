@@ -24,7 +24,10 @@ export function encodeSessionRow(record, options) {
         originCronId: nullable(record.originCronId),
         parentSessionId: nullable(record.parentSessionId),
         workspaceDir: record.workspaceDir,
-        projectWorkspaceDir: nullable(canonicalProjectWorkspaceDir(record.workspaceDir, record.runLocation)),
+        // An explicit Project wins: an assignment running inside a registered Project keeps the
+        // Project root here, so the trigger never registers the sub directory as its own Project.
+        projectWorkspaceDir: nullable(record.projectWorkspaceDir ??
+            canonicalProjectWorkspaceDir(record.workspaceDir, record.runLocation)),
         isDefaultWorkspace: booleanBit(record.isDefaultWorkspace === true),
         title: nullable(record.title),
         createdAtMs: record.createdAtMs,
@@ -98,6 +101,9 @@ export function sessionExtraDataFromRecord(record) {
         agentShell: record.agentShell,
         agentShellPreference: record.agentShellPreference,
         titleSource: record.titleSource,
+        titleReviewState: record.titleReviewState,
+        titleReviewTurnId: record.titleReviewTurnId,
+        projectWorkspaceDir: record.projectWorkspaceDir,
         runLocation: record.runLocation,
         appMode: record.sessionType === 'branch' ? record.appMode : undefined,
         toolCallMode: record.toolCallMode,
@@ -111,12 +117,15 @@ export function sessionExtraDataFromRecord(record) {
         effectiveModelThinking: record.effectiveModelThinking,
         effectiveModelContextWindow: record.effectiveModelContextWindow,
         effectiveModelMaxOutputTokens: record.effectiveModelMaxOutputTokens,
+        // `null` is the update clear sentinel; storage keeps only a present selection.
+        advisor: record.advisor ?? undefined,
         scratchpadPath: record.scratchpadPath,
         origin: record.origin,
         sideChatOrigin: record.sideChatOrigin,
         sessionDataVersion: record.sessionDataVersion,
         sessionOrigin: record.sessionOrigin,
         miniAppOrigin: record.miniAppOrigin,
+        bunnyGreeting: record.bunnyGreeting,
         createdBySessionId: record.createdBySessionId,
     });
 }
@@ -136,7 +145,10 @@ export function parseSessionExtraData(raw) {
     const runLocation = readRunLocation(record);
     return compactExtraData({
         runLocation,
+        projectWorkspaceDir: readOptionalString(record, 'projectWorkspaceDir', 'extra_data_json'),
         sideChatOrigin: readSideChatOrigin(record),
+        titleReviewState: readOptionalEnum(record, 'titleReviewState', ['pending', 'deferred', 'completed'], 'extra_data_json'),
+        titleReviewTurnId: readOptionalString(record, 'titleReviewTurnId', 'extra_data_json'),
         titleSource: readOptionalEnum(record, 'titleSource', ['default', 'auto', 'manual'], 'extra_data_json'),
         appMode: readOptionalEnum(record, 'appMode', ['coding', 'work'], 'extra_data_json'),
         interactionMode: readOptionalEnum(record, 'interactionMode', ['plan', 'goal'], 'extra_data_json'),
@@ -158,9 +170,36 @@ export function parseSessionExtraData(raw) {
         sessionDataVersion: readOptionalSafeInteger(record, 'sessionDataVersion', 'extra_data_json'),
         sessionOrigin: readOptionalEnum(record, 'sessionOrigin', ['local-runtime', 'legacy-opencode', 'unknown'], 'extra_data_json'),
         miniAppOrigin: readMiniAppOrigin(record.miniAppOrigin),
+        bunnyGreeting: readBunnyGreeting(record.bunnyGreeting),
         toolCallMode: readToolCallMode(record.toolCallMode),
+        advisor: readAdvisorSelection(record.advisor),
         createdBySessionId: readOptionalString(record, 'createdBySessionId', 'extra_data_json'),
     });
+}
+function readBunnyGreeting(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isPlainObject(value))
+        throw new Error('bunnyGreeting must be an object');
+    const result = (data) => {
+        if (data === undefined)
+            return undefined;
+        if (!isPlainObject(data) ||
+            typeof data.greeting !== 'string' ||
+            !Array.isArray(data.prompts) ||
+            !data.prompts.every((prompt) => typeof prompt === 'string'))
+            throw new Error('Invalid bunnyGreeting result');
+        return { greeting: data.greeting, prompts: data.prompts };
+    };
+    return {
+        status: requireEnum(readRequiredString(value, 'status', 'bunnyGreeting'), ['queued', 'running', 'ready', 'failed', 'skipped'], 'bunnyGreeting.status'),
+        attempt: requireSafeInteger(value.attempt, 'bunnyGreeting.attempt'),
+        requestId: readOptionalString(value, 'requestId', 'bunnyGreeting'),
+        turnId: readOptionalString(value, 'turnId', 'bunnyGreeting'),
+        error: readOptionalString(value, 'error', 'bunnyGreeting'),
+        result: result(value.result),
+        candidate: result(value.candidate),
+    };
 }
 /**
  * Lenient like the Mini App origin: a value this build does not know (written by a newer
@@ -184,6 +223,53 @@ function readMiniAppOrigin(value) {
         ...(typeof hostSessionId === 'string' && hostSessionId.length > 0 ? { hostSessionId } : {}),
     };
 }
+/**
+ * Lenient like the Mini App origin: a malformed or newer-shaped advisor selection reads as
+ * absent (advisor off) instead of making the whole Session undecodable.
+ */
+function readAdvisorSelection(value) {
+    if (!isPlainObject(value) || !hasAdvisorScalars(value))
+        return undefined;
+    const { enabled, model, contextWindow } = value;
+    let thinking;
+    try {
+        thinking = readOptionalModelThinkingSelection(value, 'thinking', 'extra_data_json.advisor');
+    }
+    catch {
+        return undefined;
+    }
+    return {
+        enabled,
+        ...(model === undefined ? {} : { model }),
+        ...(thinking ? { thinking } : {}),
+        ...(contextWindow === undefined ? {} : { contextWindow }),
+    };
+}
+function hasAdvisorScalars(value) {
+    return (typeof value.enabled === 'boolean' &&
+        (value.model === undefined || isAdvisorModelKey(value.model)) &&
+        (value.contextWindow === undefined || isPositiveSafeInteger(value.contextWindow)));
+}
+function validateAdvisorSelection(selection, field) {
+    if (typeof selection.enabled !== 'boolean')
+        throw new Error(`${field}.enabled must be a boolean`);
+    if (selection.model !== undefined && !isAdvisorModelKey(selection.model)) {
+        throw new Error(`${field}.model must be a providerId/modelId string`);
+    }
+    assertOptionalPositiveSafeInteger(selection.contextWindow, `${field}.contextWindow`);
+    if (selection.thinking)
+        validateModelThinkingSelection(selection.thinking, `${field}.thinking`);
+}
+/** `providerId/modelId`; the model id may itself contain `/`. */
+function isAdvisorModelKey(value) {
+    if (typeof value !== 'string')
+        return false;
+    const slash = value.indexOf('/');
+    return slash > 0 && slash < value.length - 1;
+}
+function isPositiveSafeInteger(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
 function validateExtraData(data) {
     if (data.runLocation) {
         assertSafeInteger(data.runLocation.createdAt, 'extra_data_json.runLocation.createdAt');
@@ -199,6 +285,8 @@ function validateExtraData(data) {
     if (data.memoryPolicy) {
         readSessionMemoryPolicy(data.memoryPolicy, 'extra_data_json.memoryPolicy');
     }
+    if (data.advisor)
+        validateAdvisorSelection(data.advisor, 'extra_data_json.advisor');
 }
 function readOptionalSessionMemoryPolicy(record, key, field) {
     const value = record[key];

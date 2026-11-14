@@ -3,6 +3,32 @@ import { isInputSafetyDecision } from '../../content-safety/index.js';
 import { parsePeerSessionOrigin } from './contracts.js';
 import { captureSemanticSnapshot } from './history/semantic-identity.js';
 const USER_MESSAGE_ID_RE = /^msg-user-v1-[A-Za-z0-9_-]+$/u;
+/**
+ * 投递来源是否由用户本人撰写。它决定 genuine user query text 与 AskUser 等待是否结束。
+ *
+ * `communication` 被刻意排除：它是另一个 Agent 的 session send，不是本人；`cron`、
+ * `background-task` 与 `questionnaire` 同样不是（2026-09-24 与产品确认）。
+ *
+ * 与 `isUserQueueInput` 的差别：后者在这一条之外还排除问卷答复的 origin，那是 AskUser
+ * 等待专用——避免一句还没被消费的答复提前结束等待。答复正文确实是本人写的，所以按来源
+ * 判定时它算本人输入；以 `api` 重排的问卷答复同理。
+ */
+export function isUserAuthoredSource(source) {
+    return (source === 'api' ||
+        source === 'code_review' ||
+        source === 'channel' ||
+        source.startsWith('channel:'));
+}
+/**
+ * 这个来源发起的 Turn 是否可以授权写入用户自己的产物（目前是记忆摘要的请求行）。
+ *
+ * 在 `isUserAuthoredSource` 之外把 `conversation-mutation` 也算进来：用户编辑并重发自己
+ * 的消息走的就是这个来源，内容仍然是本人写的。`turn-execution` 的 `isForegroundTurn`
+ * 用的是同一口径。
+ */
+export function isUserAuthoredTurnSource(source) {
+    return source === 'conversation-mutation' || isUserAuthoredSource(source);
+}
 export class AgentHostUserInputValidationError extends TypeError {
     reason;
     name = 'AgentHostUserInputValidationError';
@@ -60,6 +86,7 @@ const REQUEST_FIELDS = [
     'queueItemIds',
     'clientIntent',
     'executionMode',
+    'continuationAfterFailedTurn',
 ];
 /**
  * Establishes the one closed, detached public execution request accepted by
@@ -106,6 +133,7 @@ export function captureAgentHostExecutionRequest(request) {
         ...(queueItemIds ? { queueItemIds } : {}),
         ...clientIntent,
         ...executionMode,
+        ...snapshotContinuationAfterFailedTurn(snapshot.continuationAfterFailedTurn),
     }).value;
 }
 function snapshotExecutionDeadlineField(value) {
@@ -173,6 +201,13 @@ function snapshotExecutionMode(value) {
         throw new AgentHostUserInputValidationError('invalid-request');
     }
     return value;
+}
+function snapshotContinuationAfterFailedTurn(value) {
+    if (value === undefined)
+        return {};
+    if (value !== true)
+        throw new AgentHostUserInputValidationError('invalid-request');
+    return { continuationAfterFailedTurn: true };
 }
 function snapshotGenuineUserQueryText(value) {
     if (typeof value !== 'string') {

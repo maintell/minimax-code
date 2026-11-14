@@ -1,8 +1,9 @@
 import { withEffectivePromptSuggestion } from '@mavis/config';
 /**
- * Fills the effective prompt-suggestion opt-in into a host's config read
- * boundary: its getter and its updater's answer. The runtime switch and the
- * GET/PUT `/config` answers all read these two, so every reader sees one value.
+ * Fills the effective opt-ins of the prompt-suggestion policy (the suggestion
+ * and the Next Step card) into a host's config read boundary: its getter and
+ * its updater's answer. The runtime switches and the GET/PUT `/config` answers
+ * all read these two, so every reader sees one value.
  */
 export function withEffectivePromptSuggestionConfig(boundary) {
     const effective = (config) => withEffectivePromptSuggestion(config, boundary.getPromptSuggestionPolicy?.());

@@ -10,7 +10,9 @@
  *   from `@mavis/protocol`).
  */
 export * from './agent-message.js';
+export * from './stream-reset.js';
 export * from './agent-event.js';
 export * from './context-usage.js';
 export * from './runtime-event.js';
+export * from './user-message-origin.js';
 //# sourceMappingURL=index.js.map

@@ -1,5 +1,5 @@
-import { getConfig, resolveBetaFeature } from '@mavis/config';
-import { json, readFirstString, readJsonBody, sanitizeConfig, sanitizeProviderConfig, splitModelId } from '../../../infra/transport/host-http.js';
+import { getConfig, resolveBetaFeature, resolveEffectivePtc } from '@mavis/config';
+import { json, readFirstString, readJsonBody, sanitizeConfig, sanitizeProviderConfig, splitModelId, } from '../../../infra/transport/host-http.js';
 import { buildPermissionModeOptionsResponse, isLocalPermissionModeString, normalizePermissionModeConfigBody, } from '../../../service/permission/index.js';
 import { listLocalRuntimeModels } from '../host-support.js';
 import { isPeekEnabled } from '../../../service/turn-system/index.js';
@@ -30,7 +30,14 @@ async function routeConfigMethods(deps, request, method, parts) {
     if (method === 'GET' && parts[1] === 'permission-mode-options') {
         return json({ options: buildPermissionModeOptionsResponse() });
     }
-    if (method === 'POST' && parts[1] === 'api-key') {
+    if (method === 'POST')
+        return routeConfigPost(deps, request, parts[1]);
+    return undefined;
+}
+async function routeConfigPost(deps, request, part) {
+    if (part === 'ptc-remote-apply')
+        return handlePtcRemoteApply(deps, request);
+    if (part === 'api-key') {
         return routeLocalApiKeySave({
             body: await readJsonBody(request),
             configGetter: deps.configGetter,
@@ -47,12 +54,47 @@ async function routeConfigMethods(deps, request, method, parts) {
  * also honors the live runtime config's explicit opt-out.
  */
 function handleLocalConfigGet(deps) {
-    const config = deps.configGetter();
-    return json({
-        ...sanitizeConfig(config),
-        beta: resolvedLocalConfigBeta(config),
+    return json(localConfigBody(deps, deps.configGetter()));
+}
+/** The body GET and PUT share. `beta.ptc` is the effective value, the one new Sessions take. */
+function localConfigBody(deps, config) {
+    const { explicitPtc, ...publicConfig } = config;
+    void explicitPtc;
+    const ptc = resolveEffectivePtc(config);
+    return {
+        ...sanitizeConfig(publicConfig),
+        beta: { ...resolvedLocalConfigBeta(config), ptc: ptc.mode === 'ptc' },
+        ptcSource: ptc.source,
+        ptcUserCohort: deps.ptcDefault?.cohort() ?? 'unknown',
+        ptcRemoteApplied: deps.ptcDefault?.applied() ?? false,
         models: listLocalRuntimeModels(deps.configGetter()),
-    });
+    };
+}
+/**
+ * POST /config/ptc-remote-apply — the renderer's single Apollo answer for this device. The runtime
+ * writes `beta.ptc` when the account is inside the rollout and then marks the device, so every
+ * later read is local. Never fails the caller: an apply that could not land leaves the device
+ * undecided and the next launch looks again.
+ */
+async function handlePtcRemoteApply(deps, request) {
+    try {
+        const body = await readJsonBody(request);
+        const apply = await deps.ptcDefault?.applyRemoteDefault({
+            configured: body.configured === true,
+            ...(typeof body.value === 'boolean' ? { value: body.value } : {}),
+            ...(typeof body.hit === 'boolean' ? { hit: body.hit } : {}),
+            ...(typeof body.version === 'string' ? { version: body.version } : {}),
+            readExplicitPtc: () => deps.configGetter().explicitPtc,
+            writeBetaPtc: async (value) => {
+                await deps.configUpdater({ field: 'beta.ptc', set: value });
+            },
+        });
+        return json({ apply: apply ?? 'none' });
+    }
+    catch {
+        // The remote default must never break the login path that calls it.
+        return json({ apply: 'failed' });
+    }
 }
 /**
  * PUT /config — applies the request body via configUpdater, then (when the
@@ -86,12 +128,7 @@ async function handleLocalConfigPut(deps, request) {
                 payload: { permissionMode: requestedPermissionMode },
             });
         }
-        return json({
-            success: true,
-            ...sanitizeConfig(config),
-            beta: resolvedLocalConfigBeta(config),
-            models: listLocalRuntimeModels(deps.configGetter()),
-        });
+        return json({ success: true, ...localConfigBody(deps, config) });
     }
     catch (err) {
         const message = err instanceof Error ? err.message : String(err);

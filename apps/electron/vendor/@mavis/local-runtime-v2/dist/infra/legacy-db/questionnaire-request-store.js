@@ -2,7 +2,7 @@ import { markQuestionnaireInjected } from './questionnaire-delivery.js';
 import { runInImmediateTransaction, withLocalRuntimeDb } from './db.js';
 import {} from './database-contracts.js';
 import { isOwnedActionRequestJson, parseQuestionnaireOriginChannelContext, } from './questionnaire-row-codec.js';
-import { SqliteQuestionnaireRequestQueries } from './questionnaire-request-queries.js';
+import { PLUGIN_PREPARATION_ROW_SQL, SESSION_GATING_PENDING_SQL, SqliteQuestionnaireRequestQueries, } from './questionnaire-request-queries.js';
 import { deleteUnresolvedQuestionnairesForRewind, findUnresolvedQuestionnairesForRewind, } from './questionnaire-rewind.js';
 export class SqliteQuestionnaireRequestStore {
     dataDir;
@@ -16,6 +16,14 @@ export class SqliteQuestionnaireRequestStore {
     }
     async beginPendingWithPolicy(input) {
         return this.withDb((db) => runInImmediateTransaction(db, () => {
+            // Plugin preparation cards are inline suggestions: creating one never
+            // conflicts with or retires another row.
+            if (input.policy === 'coexist') {
+                this.writeRecord(db, input.record);
+                return { status: 'created', supersededRequestIds: [] };
+            }
+            // Existing Plugin preparation rows are invisible to the one-pending
+            // invariant below: they neither conflict nor get superseded.
             const rows = db
                 .prepare(`
             SELECT request_id, request_json, response_mode
@@ -23,6 +31,7 @@ export class SqliteQuestionnaireRequestStore {
             WHERE session_id = ?
               AND status = 'pending'
               AND created_at >= ?
+              AND NOT ${PLUGIN_PREPARATION_ROW_SQL}
             ORDER BY created_at ASC, request_id ASC
           `)
                 .all(input.record.sessionId, input.createdAtCutoff);
@@ -94,7 +103,7 @@ export class SqliteQuestionnaireRequestStore {
             FROM questionnaire_requests
             WHERE session_id = ?
               AND status = 'pending'
-              AND response_mode IS NULL
+              AND ${SESSION_GATING_PENDING_SQL}
               AND request_id != ?
           `)
                 .all(record.sessionId, record.requestId);
@@ -103,7 +112,7 @@ export class SqliteQuestionnaireRequestStore {
           SET status = 'superseded'
           WHERE session_id = ?
             AND status = 'pending'
-            AND response_mode IS NULL
+            AND ${SESSION_GATING_PENDING_SQL}
             AND request_id != ?
         `).run(record.sessionId, record.requestId);
             return {
@@ -188,6 +197,7 @@ export class SqliteQuestionnaireRequestStore {
                 FROM questionnaire_requests latest
                 WHERE latest.session_id = ?
                   AND latest.status = 'pending'
+                  AND NOT ${PLUGIN_PREPARATION_ROW_SQL}
                 ORDER BY latest.created_at DESC, latest.rowid DESC
                 LIMIT 1
               )
@@ -215,6 +225,21 @@ export class SqliteQuestionnaireRequestStore {
               status = 'pending'
               OR (status = 'answered' AND injected_at IS NULL)
             )
+        `)
+                .run(dismissedAt, requestId);
+            return Number(result.changes ?? 0) > 0;
+        });
+    }
+    async markV2Skipped(requestId, dismissedAt) {
+        return this.withDb((db) => {
+            const result = db
+                .prepare(`
+          UPDATE questionnaire_requests
+          SET dismissed_at = ?
+          WHERE request_id = ?
+            AND response_mode IS NOT NULL
+            AND status = 'pending'
+            AND dismissed_at IS NULL
         `)
                 .run(dismissedAt, requestId);
             return Number(result.changes ?? 0) > 0;
@@ -259,9 +284,8 @@ export class SqliteQuestionnaireRequestStore {
             FROM questionnaire_requests
             WHERE session_id = ?
               AND status = 'pending'
-              AND response_mode IS NULL
+              AND ${SESSION_GATING_PENDING_SQL}
               AND request_id != ?
-              AND response_mode IS NULL
           `)
                 .all(sessionId, keepRequestId);
             if (rows.length === 0)
@@ -271,9 +295,8 @@ export class SqliteQuestionnaireRequestStore {
           SET status = 'superseded'
           WHERE session_id = ?
             AND status = 'pending'
-            AND response_mode IS NULL
+            AND ${SESSION_GATING_PENDING_SQL}
             AND request_id != ?
-            AND response_mode IS NULL
         `).run(sessionId, keepRequestId);
             return rows.flatMap((row) => (row.request_id ? [row.request_id] : []));
         }));
@@ -313,6 +336,9 @@ export class SqliteQuestionnaireRequestStore {
     }
     async findLatestBySession(sessionId) {
         return this.queries.findLatestBySession(sessionId);
+    }
+    async listByMode(sessionId, mode) {
+        return this.queries.listByMode(sessionId, mode);
     }
     async findLatestPlanReviewBySession(sessionId, createdAtCutoff = Number.MIN_SAFE_INTEGER) {
         return this.queries.findLatestPlanReviewBySession(sessionId, createdAtCutoff);

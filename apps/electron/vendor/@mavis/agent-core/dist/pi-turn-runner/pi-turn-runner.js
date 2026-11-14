@@ -37,7 +37,7 @@ export class PiTurnRunner {
         this.messageIdAllocator = options.messageIdAllocator ?? defaultMessageIdAllocator;
         this.now = options.nowMs ?? defaultNowMs;
         this.metricsClient = options.metricsClient;
-        this.metrics = newPiTurnMetrics(options.metricsClient, this.now, options.onLLMRequestFailure, options.observeLLMRequest);
+        this.metrics = newPiTurnMetrics(options.metricsClient, this.now, options.onLLMRequestFailure, options.observeLLMRequest, options.registryMetrics);
         this.logger = { ...noopLogger, ...(options.logger ?? {}) };
         this.toolContextSizeEstimator = options.toolContextSizeEstimator;
         this.llmCaptureFactory = options.llmCaptureFactory;
@@ -51,16 +51,23 @@ export class PiTurnRunner {
      */
     async runTurn(input) {
         // Metrics recorder spans the whole turn; `finish` runs in the outer
-        // `finally` so turn totals / the active-turns gauge stay balanced on every
-        // exit path (completed / failed / aborted / thrown). `termination` staying
+        // `finally` so turn totals and busy time stay balanced on every exit path
+        // (completed / failed / aborted / thrown). `termination` staying
         // undefined means runTurn threw before reaching a terminal frame.
         const recorder = this.metrics.beginTurn(input.caller, input.llm.model, {
             sessionId: input.sessionId,
             turnId: input.turnId,
             logger: this.logger,
             ...(this.toolContextSizeEstimator ? { estimator: this.toolContextSizeEstimator } : {}),
+        }, {
+            route: input.llm.route,
+            timing: input.turnTiming,
+            agentKind: input.agentKind,
+            wake: input.wake,
+            visibleText: input.turnVisibleText,
         });
         let termination;
+        let thrown;
         let llmCapture;
         let unsubscribeCaptureRelay;
         // Set only when an Inspector capture recorder exists for this Turn.
@@ -85,6 +92,7 @@ export class PiTurnRunner {
             // 步骤 2 —— 宣告 turn 进入 running。写出第一帧 `session.status`
             // RuntimeEvent，让订阅方在任何 LLM / tool 输出到达之前就能看到 turn 启动。
             await emitRunning(turn);
+            recorder.markRunning();
             // 步骤 3 —— 构造 pi Agent（注入 system prompt、model、tools 和历史消息），
             // 以及一个 history cursor，用来记录 `agent.state.messages` 已经通知到
             // onHistoryChanged hook 的位置。
@@ -130,6 +138,11 @@ export class PiTurnRunner {
                 // PTC child events go through the serialized dispatch, not
                 // agent.subscribe, so the capture relay needs them separately.
                 ...(relayToCapture ? { observeChildLifecycle: relayToCapture } : {}),
+                // Host hook over the child display copy only; the program's own value
+                // and the model-visible result never pass through it.
+                ...(input.toolConfig.context.shapePtcChildDisplayResult
+                    ? { shapePtcChildDisplayResult: input.toolConfig.context.shapePtcChildDisplayResult }
+                    : {}),
             });
             input.toolConfig.context.ptcExecutor = ptcExecutor;
             // 步骤 6 —— 接好取消逻辑。如果 caller 的 signal 已经 aborted，就根本不启动
@@ -153,10 +166,14 @@ export class PiTurnRunner {
             // 返回 undefined。无论是否抛错，都在 `finally` 里 unsubscribe，确保 listener
             // 被解绑。
             let reason;
+            const unbindPreemption = input.llmPreemption?.bind({
+                preempt: () => (turn.preemption.active?.preempt() ? 'preempted' : 'not-streaming'),
+            });
             try {
                 reason = await runAgent(agent, turn, events.convergeAtIdle);
             }
             finally {
+                unbindPreemption?.();
                 events.unsubscribe();
             }
             // 步骤 8 —— Agent 不再产生事件后做收尾：
@@ -169,6 +186,10 @@ export class PiTurnRunner {
             await history.flushTail();
             termination = reason ?? events.forcedTermination() ?? { kind: 'completed' };
             await emitTerminal(turn, termination);
+        }
+        catch (error) {
+            thrown = error;
+            throw error;
         }
         finally {
             if (input.toolConfig.context.ptcExecutor === ptcExecutor) {
@@ -185,7 +206,7 @@ export class PiTurnRunner {
                 }
             }
             await recorder.settle();
-            recorder.finish(termination, input.signal?.reason);
+            recorder.finish(termination, input.signal?.reason, thrown);
         }
     }
 }

@@ -16,7 +16,13 @@
  * Adding a new bucket: append to `LLM_ERROR_REASONS`, update the matching
  * branch in `classifyLLMError`, and bump the
  * `metrics-runtime.test.ts > schema enum sync` snapshot if needed.
+ *
+ * Local resource exhaustion (`local-resource-errors.ts`) is not a reason:
+ * retry decisions, protocol codes and retry events never carry it. Only the
+ * failure metrics read it, through {@link toLLMFailureErrorKind}.
  */
+import { classifyLocalResourceError, } from './local-resource-errors.js';
+import { USER_SEND_RESTRICTED_ERROR_CODE } from './platform-error-codes.js';
 export const LLM_ERROR_REASONS = [
     'abort',
     'timeout',
@@ -42,15 +48,52 @@ export const LLM_RETRY_REASONS = [
     'tpm_rate_limited',
     'overloaded',
 ];
+/** A retry caused by the connection itself (no answer or a broken transport), not by the provider's verdict. */
+export function isLLMTransportRetryReason(reason) {
+    return reason === 'network' || reason === 'timeout';
+}
 /**
- * Model-side safety classifier decline (Messages API `stop_reason: "refusal"`). Providers surface it
- * as an error message carrying this token; the remaining text is provider-controlled and must not
- * feed status/network heuristics.
+ * Model-side safety classifier decline. Providers surface it in their own wording; the remaining
+ * text is provider-controlled and must not feed status/network heuristics.
+ *
+ * - Anthropic Messages ends the stream with `stop_reason: "refusal"`.
+ * - OpenAI Chat Completions declines the prompt in its safety layer before the model runs. It
+ *   reports `invalid_prompt` as the error code, and gateways that flatten the body into prose keep
+ *   the usage-policy sentence. Resending the identical prompt is rejected again, so this must not
+ *   be retried either.
  */
-const PROVIDER_REFUSAL_MESSAGE_RE = /\bstop_reason:\s*refusal\b/i;
+const PROVIDER_REFUSAL_MESSAGE_RES = [
+    /\bstop_reason:\s*refusal\b/i,
+    /\bflagged as potentially violating our usage policy\b/i,
+    /["'](?:code|type)["']\s*:\s*["'](?:invalid_prompt|content_policy_violation)["']/i,
+    /^(?:(?:\[Error\]|Error:)\s*)?(?:[45]\d\d[: ]\s*)?(?:invalid_prompt|content_policy_violation)(?:\s*:|\s*$)/i,
+];
 /** True when an LLM error message reports a provider safety refusal; it must not be retried. */
 export function isLLMProviderRefusalMessage(message) {
-    return typeof message === 'string' && PROVIDER_REFUSAL_MESSAGE_RE.test(message);
+    if (typeof message !== 'string')
+        return false;
+    const detail = providerErrorDetail(message);
+    return (detail !== undefined && PROVIDER_REFUSAL_MESSAGE_RES.some((pattern) => pattern.test(detail)));
+}
+/** BYOK attribution contains user-chosen provider IDs, which are not error signals. */
+function providerErrorDetail(message) {
+    let detail = message.trim();
+    const prefix = 'BYOK upstream error:';
+    if (detail.startsWith(prefix)) {
+        // Error extraction may truncate the envelope after its first message field.
+        // Decode complete string fields without requiring the trailing JSON to survive.
+        const encodedDetail = detail.match(/"errorDetail"\s*:\s*("(?:[^"\\]|\\.)*")/u)?.[1] ??
+            detail.match(/"message"\s*:\s*("(?:[^"\\]|\\.)*")/u)?.[1];
+        if (!encodedDetail)
+            return undefined;
+        try {
+            detail = JSON.parse(encodedDetail);
+        }
+        catch {
+            return undefined;
+        }
+    }
+    return (detail.match(/^BYOK provider .+? upstream error:\s*([\s\S]*)$/u)?.[1] ?? detail).trim();
 }
 /**
  * pi-ai's Messages stream completeness guard for a provider stream that ended
@@ -72,6 +115,8 @@ const EMPTY_FACTS = () => ({
 const SAFE_NETWORK_CODES = new Set([
     'ECONNREFUSED',
     'ECONNRESET',
+    'UND_ERR_SOCKET',
+    'ERR_STREAM_PREMATURE_CLOSE',
     'ENOTFOUND',
     'ETIMEDOUT',
     'ESOCKETTIMEDOUT',
@@ -101,6 +146,13 @@ const TRANSIENT_NETWORK_MESSAGE_RE = /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|fet
 const SAFE_TRANSPORT_NETWORK_MESSAGE_RE = /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed)\b/i;
 const CHROMIUM_NETWORK_MESSAGE_RE = /\bnet::ERR_(?:CONNECTION_(?:RESET|CLOSED|REFUSED)|NETWORK_IO_SUSPENDED|NETWORK_CHANGED|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED|ADDRESS_UNREACHABLE|PROXY_CONNECTION_FAILED|HTTP2_PROTOCOL_ERROR|SSL_BAD_RECORD_MAC_ALERT)\b/i;
 const CHROMIUM_TIMEOUT_MESSAGE_RE = /\bnet::ERR_(?:TIMED_OUT|CONNECTION_TIMED_OUT)\b/i;
+// Stable transport codes and premature-EOF diagnostics emitted by our Pi
+// providers. The provider-name prefix varies, so only the fixed EOF phrase is
+// matched. Do not treat bare "terminated" or arbitrary "closed" as network
+// failures: those can also describe cancellation or application errors. The
+// Messages `without message_start` / `before message_stop` guards keep their
+// own (unclassified) handling, like `without stop_reason` above.
+const STREAM_DISCONNECT_MESSAGE_RE = /\b(?:UND_ERR_SOCKET|ERR_STREAM_PREMATURE_CLOSE|socket hang up)\b|\bstream ended without any message events\b|\bStream ended without finish_reason\b|\bWebSocket stream closed before response\.completed\b/i;
 /**
  * Provider rejected the request for carrying too many images, e.g.
  * `Too many images in request: 31 > 30` (#425). Re-sending the same history
@@ -109,6 +161,12 @@ const CHROMIUM_TIMEOUT_MESSAGE_RE = /\bnet::ERR_(?:TIMED_OUT|CONNECTION_TIMED_OU
 const LLM_IMAGE_LIMIT_MESSAGE_RE = /\btoo many images\b|\b(?:max|maximum) (?:number of |of \d+ )?images\b|\bnumber of images\b[^.]{0,40}\bexceed|\bimages? (?:count |limit )?exceed(?:s|ed)?\b|\bat most \d+ images?\b/i;
 /** Common provider error type for a request the provider will never accept as sent. */
 const LLM_INVALID_REQUEST_MESSAGE_RE = /\binvalid_request_error\b/i;
+/**
+ * Gateway rejection of the request shape itself, reported inside a 5xx: e.g.
+ * `500 upstream error (invalid_argument): There is an issue with this request,
+ * please try a different model.` Resending the same body fails identically.
+ */
+const LLM_INVALID_ARGUMENT_MESSAGE_RE = /\binvalid_argument\b|\bthere is an issue with this request\b/i;
 /**
  * The request is over a provider or client size limit: HTTP 413 bodies
  * (`request_too_large`, "Request Entity Too Large", "Payload Too Large"), the
@@ -141,6 +199,48 @@ const LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODE_RE = /\b(?:2056|2067)\b/u;
 // keyword, so recognise the provider code itself.
 const LLM_TIMEOUT_UPSTREAM_STATUS_CODE = 2066;
 const LLM_TIMEOUT_UPSTREAM_STATUS_CODE_RE = /\b2066\b/u;
+/**
+ * 已输出后可以安全重发的临时流中断证据，只用既有 signal，不新增宽松匹配：
+ * - `stream_interval_timeout` — 上游「输出分片间隔超时」（715 known shape）；
+ * - `stream_socket_closed` — 传输层 typed code `UND_ERR_SOCKET`（连接中途断开）；
+ * - `network` — 明确的传输层中断（ECONNRESET / socket 错误 / fetch failed）；
+ * - `incomplete_stream` — provider 流在没有 stop_reason 的情况下截断；
+ * - `facts.timeout` — provider 或本地 watchdog 判定的流超时。
+ * 普通 unknown 错误没有任何一条，保持 fail closed。
+ */
+const RECOVERABLE_STREAM_INTERRUPTION_SIGNALS = [
+    'stream_interval_timeout',
+    'stream_socket_closed',
+    'network',
+    'incomplete_stream',
+];
+/** 出现任一即视为确定性拒绝，断流恢复必须让位（额度/参数/大小/上下文/安全）。 */
+const DETERMINISTIC_STREAM_RECOVERY_SIGNALS = [
+    'usage_limit',
+    'credits_exhausted',
+    'content_filter',
+    'refusal',
+    'image_limit',
+    'invalid_request',
+    'request_too_large',
+    'context_overflow',
+];
+/**
+ * 上游「输出分片间隔超时」：网关把 provider 的 715 包装成 `1000 unknown error,715`
+ * 后再映射为 50113，文本里没有英文 timeout 关键字。只认这两种 known shape，
+ * 不用裸 `\b715\b`——耗时、计数或其他错误码里出现的 715 不构成临时证据。
+ * 该 signal 只供「已输出后的断流恢复」判断使用，不参与通用 retry/metric 分类，
+ * 因此不会改变 cloud-runtime 等既有路径的行为。
+ */
+const LLM_STREAM_INTERVAL_TIMEOUT_MESSAGE_RE = /\bunknown error,\s*715\b|\boutput chunk interval timeout\b/i;
+/**
+ * 传输层「连接中途被关闭」的 typed code：undici 在 socket 被断开时给的是
+ * `UND_ERR_SOCKET`，而正文只有 `terminated`，没有任何可用的英文关键字。
+ * 只按 typed code 精确识别，不做裸 `terminated` 之类的宽泛匹配；
+ * 该 signal 只供「已输出后的断流恢复」判定使用，不参与通用 retry/metric 分类，
+ * 因此不会改变 cloud-runtime 等既有路径的行为。
+ */
+const LLM_STREAM_SOCKET_CLOSED_CODES = new Set(['UND_ERR_SOCKET']);
 function isLLMUsageLimitUpstreamStatusCode(statusCode) {
     return statusCode !== undefined && LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODE_SET.has(statusCode);
 }
@@ -155,6 +255,9 @@ export function normalizeLLMError(input) {
         if (input.finishReason === 'content-filter' || input.finishReason === 'content_filter') {
             signals.add('content_filter');
         }
+        const localResource = classifyLocalResourceError(input.raw !== undefined ? input.raw : input.providerError);
+        if (localResource)
+            facts.localResource = localResource;
         const extracted = safeExtract(input.raw);
         facts.httpStatus ??= validHttpStatus(input.statusCode) ?? extracted.httpStatus;
         facts.upstreamStatusCode ??= extracted.upstreamStatusCode;
@@ -164,6 +267,8 @@ export function normalizeLLMError(input) {
         facts.timeout ||= extracted.timeout === true;
         if (extracted.network)
             signals.add('network');
+        if (extracted.socketClosed)
+            signals.add('stream_socket_closed');
         const visibleMessage = extracted.message ?? input.errorMessage;
         if (isLLMProviderRefusalMessage(visibleMessage)) {
             signals.add('refusal');
@@ -191,6 +296,8 @@ export function normalizeLLMError(input) {
                 signals.add('image_limit');
             if (LLM_INVALID_REQUEST_MESSAGE_RE.test(boundedVisible))
                 signals.add('invalid_request');
+            if (LLM_INVALID_ARGUMENT_MESSAGE_RE.test(boundedVisible))
+                signals.add('invalid_argument');
             if (isLLMRequestTooLargeMessage(boundedVisible))
                 signals.add('request_too_large');
             if (LLM_CONTEXT_OVERFLOW_MESSAGE_RE.test(boundedVisible))
@@ -240,7 +347,8 @@ export function classifyLLMRequestRejectionMessage(message) {
 }
 /**
  * A provider rejection that repeats identically for the same request: an image
- * count limit, or an HTTP 400 that names `invalid_request_error`.
+ * count limit, an HTTP 400 that names `invalid_request_error`, or a gateway
+ * `invalid_argument` rejection (reported by some gateways as a 500).
  *
  * BYOK retries every pre-output failure because custom gateways report
  * transient errors inconsistently. These rejections are the exception: the
@@ -253,7 +361,14 @@ export function isLLMDeterministicRequestRejection(normalized) {
     if (facts.explicitAbort || facts.timeout || facts.signals.has('network'))
         return false;
     const status = effectiveHttpStatus(facts);
-    if (status !== undefined && (status === 408 || status === 429 || status >= 500))
+    if (status === 408 || status === 429)
+        return false;
+    // Named argument rejection: the gateway refused this exact body, whatever
+    // outer status it chose (often 500). Only `invalid_argument` crosses the 5xx
+    // boundary; a bare `invalid_request_error` inside a 5xx stays retryable.
+    if (facts.signals.has('invalid_argument') && status !== 503 && status !== 529)
+        return true;
+    if (status !== undefined && status >= 500)
         return false;
     if (facts.signals.has('image_limit')) {
         return status === undefined || status === 400 || status === 413 || status === 422;
@@ -261,6 +376,58 @@ export function isLLMDeterministicRequestRejection(normalized) {
     if (isLLMRequestOversized(normalized))
         return true;
     return status === 400 && facts.signals.has('invalid_request');
+}
+/**
+ * 已产生可见输出之后的断流是否可安全恢复：只认明确的上游流中断证据
+ * （见 {@link RECOVERABLE_STREAM_INTERRUPTION_SIGNALS} 与 `facts.timeout`）。
+ *
+ * abort 与确定性拒绝（鉴权、额度、请求/上下文超限、参数、安全拒绝）优先级更高，
+ * 一律不恢复；普通 unknown 50113 不带任何证据时保持 fail closed。
+ */
+export function isLLMRecoverableStreamInterruption(normalized) {
+    const { facts } = normalized;
+    const transient = facts.timeout ||
+        RECOVERABLE_STREAM_INTERRUPTION_SIGNALS.some((signal) => facts.signals.has(signal));
+    if (!transient)
+        return false;
+    // abort 与用户取消优先级最高。
+    if (facts.explicitAbort)
+        return false;
+    return !isLLMDeterministicStreamRefusal(normalized);
+}
+/**
+ * 确定性拒绝：把同一个请求原样重发只会再被拒一次——鉴权、额度/余额、参数、
+ * 请求过大、上下文超限、安全拒绝。
+ *
+ * abort 不在此列：那是用户意图，不是「被拒绝」。判定同时服务两处：断流恢复是否
+ * 可以重发，以及恢复路径内后续 attempt 的重试决策。后者必须让确定性拒绝最终
+ * 否决，否则正文里出现的临时单词（例如 `invalid_request_error: timeout
+ * parameter must be positive`）会把 4xx 翻回可重试，白白再发一次请求。
+ *
+ * 这里不复用 isLLMDeterministicRequestRejection：它只覆盖 image_limit / 超限 /
+ * 400+invalid_request，鉴权与额度会漏。
+ */
+export function isLLMDeterministicStreamRefusal(normalized) {
+    const { facts } = normalized;
+    if (DETERMINISTIC_STREAM_RECOVERY_SIGNALS.some((signal) => facts.signals.has(signal))) {
+        return true;
+    }
+    // 鉴权与额度不一定带 message signal：网关可以把 typed code 放进 `errorCode`
+    // 而正文只有包装后的文本。只看 signals 会漏挡，必须按 typed code 判定。
+    // LLM_UPSTREAM_ERROR（=50113，本次事故码）不在此列，它是通用上游错误。
+    switch (facts.existingProtocolCode) {
+        case LLM_ERROR_CODES.USAGE_LIMIT_EXCEEDED:
+        case LLM_ERROR_CODES.LLM_CREDITS_EXHAUSTED:
+        case LLM_ERROR_CODES.LLM_AUTH_ERROR:
+            return true;
+    }
+    if (isLLMUsageLimitUpstreamStatusCode(facts.upstreamStatusCode))
+        return true;
+    const status = effectiveHttpStatus(facts);
+    if (status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+        return true;
+    }
+    return isLLMRequestOversized(normalized);
 }
 /**
  * The request is too big to be accepted as sent: an HTTP 413, a size-limit
@@ -342,6 +509,14 @@ export function toLLMMetricErrorKind(facts) {
     }
 }
 /**
+ * The metric kind, except that a call which ran out of a local resource names
+ * that resource. Cancellation still reports `abort`.
+ */
+export function toLLMFailureErrorKind(facts) {
+    const kind = toLLMMetricErrorKind(facts);
+    return kind !== 'abort' && facts.localResource ? facts.localResource : kind;
+}
+/**
  * Strict transport-retry policy shared by all hosts that opt into framework retry.
  *
  * Product quota, credits, auth and explicit cancellation always win over an outer
@@ -395,8 +570,7 @@ export function toLLMProtocolClassification(normalized) {
         const { facts, sanitizedMessage } = normalized;
         const httpStatus = effectiveHttpStatus(facts);
         let code;
-        if (facts.existingProtocolCode &&
-            Object.values(LLM_ERROR_CODES).includes(facts.existingProtocolCode)) {
+        if (facts.existingProtocolCode && isClassifiedErrorStatusCode(facts.existingProtocolCode)) {
             code = facts.existingProtocolCode;
         }
         else if (facts.signals.has('credits_exhausted')) {
@@ -471,6 +645,9 @@ function safeExtract(raw) {
             out.network = true;
             if (isLLMTransportTimeoutCode(code))
                 out.timeout = true;
+        }
+        if (typeof code === 'string' && LLM_STREAM_SOCKET_CLOSED_CODES.has(code)) {
+            out.socketClosed = true;
         }
         const statusCode = validHttpStatus(value('statusCode')) ?? validHttpStatus(value('status'));
         out.httpStatus ??= statusCode;
@@ -579,14 +756,20 @@ function applyMessageSignals(message, facts, signals) {
         facts.timeout = true;
     if (CONNECTION_ERROR_MESSAGE_RE.test(message) ||
         TRANSIENT_NETWORK_MESSAGE_RE.test(message) ||
+        STREAM_DISCONNECT_MESSAGE_RE.test(message) ||
         CHROMIUM_NETWORK_MESSAGE_RE.test(message))
         signals.add('network');
+    if (LLM_STREAM_INTERVAL_TIMEOUT_MESSAGE_RE.test(message)) {
+        signals.add('stream_interval_timeout');
+    }
     if (/\bempty.?response/i.test(message))
         signals.add('empty_response');
     if (LLM_IMAGE_LIMIT_MESSAGE_RE.test(message))
         signals.add('image_limit');
     if (LLM_INVALID_REQUEST_MESSAGE_RE.test(message))
         signals.add('invalid_request');
+    if (LLM_INVALID_ARGUMENT_MESSAGE_RE.test(message))
+        signals.add('invalid_argument');
     if (isLLMRequestTooLargeMessage(message))
         signals.add('request_too_large');
     if (LLM_CONTEXT_OVERFLOW_MESSAGE_RE.test(message))
@@ -623,6 +806,7 @@ export function classifyFinishStepError(input) {
         }
         if (CONNECTION_ERROR_MESSAGE_RE.test(errorMessage) ||
             TRANSIENT_NETWORK_MESSAGE_RE.test(errorMessage) ||
+            STREAM_DISCONNECT_MESSAGE_RE.test(errorMessage) ||
             CHROMIUM_NETWORK_MESSAGE_RE.test(errorMessage)) {
             return 'network';
         }
@@ -701,6 +885,7 @@ export function classifyLLMError(err) {
         (err instanceof Error &&
             (CONNECTION_ERROR_MESSAGE_RE.test(err.message) ||
                 TRANSIENT_NETWORK_MESSAGE_RE.test(err.message) ||
+                STREAM_DISCONNECT_MESSAGE_RE.test(err.message) ||
                 CHROMIUM_NETWORK_MESSAGE_RE.test(err.message)))) {
         return 'network';
     }
@@ -775,6 +960,10 @@ export const LLM_ERROR_STATUS_CODES = {
 };
 // Backward-compatible name for UI typed-match imports.
 export const LLM_ERROR_CODES = LLM_ERROR_STATUS_CODES;
+function isClassifiedErrorStatusCode(code) {
+    return (code === USER_SEND_RESTRICTED_ERROR_CODE ||
+        Object.values(LLM_ERROR_CODES).includes(code));
+}
 export const LLM_TPM_RATE_LIMIT_MESSAGE_CODES = [2045, 2046, 2047, 1039, 1041];
 const LLM_TPM_RATE_LIMIT_MESSAGE_CODE_RE = /\b(?:2045|2046|2047|1039|1041)\b/u;
 export function isLLMTpmRateLimitMessage(message) {
@@ -998,8 +1187,7 @@ export function classifyLLMErrorToCode(err) {
     const extracted = tryExtractFromPayload(normalized);
     // 1. typed errorCode
     if (extracted.errorCode !== undefined) {
-        const allowed = new Set(Object.values(LLM_ERROR_CODES));
-        if (allowed.has(extracted.errorCode)) {
+        if (isClassifiedErrorStatusCode(extracted.errorCode)) {
             return {
                 status_code: extracted.errorCode,
                 message: extracted.message ?? fallbackMessage(err),
@@ -1099,6 +1287,7 @@ function isLLMTransportTimeoutSignal(message) {
 }
 function isLLMTransportNetworkSignal(message) {
     return (CONNECTION_ERROR_MESSAGE_RE.test(message) ||
+        STREAM_DISCONNECT_MESSAGE_RE.test(message) ||
         CHROMIUM_NETWORK_MESSAGE_RE.test(message) ||
         SAFE_TRANSPORT_NETWORK_MESSAGE_RE.test(message));
 }

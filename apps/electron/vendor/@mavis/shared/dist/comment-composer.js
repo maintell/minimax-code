@@ -137,8 +137,7 @@ export const COMMENT_COMPOSER_SPEC = {
         disableEmptySubmit: true,
         escapeCancels: true,
         focusOnOpen: true,
-        createEnterSubmitsWithShift: true,
-        editShiftEnterCreatesNewline: true,
+        shiftEnterCreatesNewline: true,
     },
 };
 export function createCommentComposerState(input) {
@@ -186,9 +185,45 @@ export function resolveCommentInputAutoGrow(input) {
         wrapped: input.contentHeight > input.minHeight + epsilon,
     };
 }
-export function shouldSubmitCommentComposerOnEnter(mode, shiftKey) {
-    if (mode === 'create')
-        return COMMENT_COMPOSER_SPEC.behavior.createEnterSubmitsWithShift;
-    return !(shiftKey && COMMENT_COMPOSER_SPEC.behavior.editShiftEnterCreatesNewline);
+/**
+ * Size an auto-growing input to its text. Measured rather than derived from the
+ * character count: wrapping depends on the resolved font, the live box width,
+ * and the user's font-size preference.
+ *
+ * Returns null and leaves the input as it was when it has no layout (jsdom, or
+ * a `display: none` box).
+ *
+ * Self-contained by requirement, like `resolveCommentInputAutoGrow`, which is
+ * why that function comes in as an argument: the injected bridges serialise
+ * both through `toString()`, where module bindings do not exist.
+ */
+export function fitCommentInputHeight(input, bounds, resolve) {
+    const previousHeight = input.style.height;
+    const previousOverflowY = input.style.overflowY;
+    // Collapse before measuring so deleting text shrinks the box too, and hide the
+    // scrollbar so a visible one can't narrow the measured line and inflate
+    // `scrollHeight`. Both writes land in the same layout pass.
+    input.style.overflowY = 'hidden';
+    input.style.height = '0px';
+    const contentHeight = input.scrollHeight;
+    if (contentHeight <= 0) {
+        // Put back everything the probe touched: leaving `overflow-y` hidden would
+        // strand the edit box, which is scrollable from the start, without its
+        // scrollbar.
+        input.style.height = previousHeight;
+        input.style.overflowY = previousOverflowY;
+        return null;
+    }
+    const next = resolve({
+        contentHeight,
+        minHeight: bounds.minHeight,
+        maxHeight: bounds.maxHeight,
+    });
+    input.style.height = `${next.height}px`;
+    input.style.overflowY = next.overflowY;
+    return next;
+}
+export function shouldSubmitCommentComposerOnEnter(shiftKey) {
+    return !(shiftKey && COMMENT_COMPOSER_SPEC.behavior.shiftEnterCreatesNewline);
 }
 //# sourceMappingURL=comment-composer.js.map

@@ -482,27 +482,57 @@ node_archive_sha256() {
   esac
 }
 
+directory_resolved_path() {
+  local directory
+  directory="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s' "$directory" "$(basename "$1")"
+}
+
+# Homebrew installs every Node formula into a versioned keg
+# (<prefix>/Cellar/<formula>/<version>/...) that `brew upgrade` deletes, while
+# the formula-managed <prefix>/opt/<formula> symlink tracks the installed keg.
+# The prefix differs per platform and user (/opt/homebrew, /usr/local,
+# /home/linuxbrew/.linuxbrew, custom prefixes), so derive it from the Cellar
+# segment. Every Node or npm path that outlives this run (launchers and the
+# install receipt) goes through this mapping.
+homebrew_stable_path() {
+  local file="$1" prefix rest formula candidate resolved
+  case "$file" in
+    */Cellar/node/*/*|*/Cellar/node@*/*/*) ;;
+    *) printf '%s' "$file"; return 0 ;;
+  esac
+  prefix="${file%%/Cellar/*}"
+  rest="${file#"$prefix"/Cellar/}"
+  formula="${rest%%/*}"
+  rest="${rest#*/}"
+  candidate="$prefix/opt/$formula/${rest#*/}"
+  resolved="$(directory_resolved_path "$file")" || resolved=''
+  if [[ -n "$resolved" && -x "$candidate" && "$(directory_resolved_path "$candidate")" == "$resolved" ]]; then
+    printf '%s' "$candidate"
+  else
+    printf '%s' "$file"
+  fi
+}
+
 # Launchers and receipts must pin one Node executable. Version managers
 # (nvm/volta/asdf/mise) expose moving symlinks over per-version directories, so
-# they pin the resolved real path. Homebrew instead resolves its stable
-# bin/node symlink into a versioned Cellar keg that `brew upgrade` deletes, so
-# keep the formula-managed symlink itself.
+# they pin the resolved real path. Homebrew kegs are deleted by `brew upgrade`,
+# so a keg path is mapped to the formula's opt path; without one, a non-keg
+# symlink that the user selected is still more stable than the keg itself.
 pin_node_executable() {
-  local selected="$1" resolved
+  local selected="$1" resolved stable
   resolved="$("$selected" -p 'process.execPath' 2>/dev/null)" || resolved="$selected"
-  case "$resolved" in
-    */Cellar/node/*/bin/node|*/Cellar/node@*/*/bin/node) ;;
-    *) printf '%s' "$resolved"; return 0 ;;
-  esac
-  case "$selected" in
-    */homebrew/bin/node|*/homebrew/opt/node@*/bin/node|/usr/local/bin/node|/usr/local/opt/node@*/bin/node)
-      if [[ "$selected" != "$resolved" && -x "$selected" ]]; then
-        printf '%s' "$selected"
-        return 0
-      fi
-      ;;
-  esac
-  printf '%s' "$resolved"
+  stable="$(homebrew_stable_path "$resolved")"
+  if [[ "$stable" == "$resolved" ]]; then
+    case "$resolved" in
+      */Cellar/node/*/bin/node|*/Cellar/node@*/*/bin/node)
+        if [[ "$selected" != "$resolved" && "$selected" != */Cellar/* && -x "$selected" ]]; then
+          stable="$selected"
+        fi
+        ;;
+    esac
+  fi
+  printf '%s' "$stable"
 }
 
 node_is_supported() {
@@ -767,13 +797,27 @@ verify_native_sqlite() {
 }
 
 read_installed_node() {
+  read_installed_executable nodeExecutable
+}
+
+read_installed_executable() {
   "$NODE_EXECUTABLE" -e '
     const fs = require("node:fs");
     const path = require("node:path");
-    const node = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).nodeExecutable;
-    if (typeof node !== "string" || !path.isAbsolute(node) || !fs.existsSync(node)) process.exit(1);
-    process.stdout.write(node);
-  ' "$MCODE_INSTALL_DIR/install.json" 2>/dev/null
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))[process.argv[2]];
+    if (typeof value !== "string" || !path.isAbsolute(value) || !fs.existsSync(value)) process.exit(1);
+    process.stdout.write(value);
+  ' "$MCODE_INSTALL_DIR/install.json" "$1" 2>/dev/null
+}
+
+# Older installers recorded Homebrew keg paths; repair them while the keg still
+# exists instead of waiting for `brew upgrade` to break the launcher.
+installed_toolchain_is_stable() {
+  local field value
+  for field in nodeExecutable npmExecutable; do
+    value="$(read_installed_executable "$field")" || return 1
+    [[ "$(homebrew_stable_path "$value")" == "$value" ]] || return 1
+  done
 }
 
 legacy_installation_is_healthy() {
@@ -842,7 +886,12 @@ classify_install_action() {
   local current_launcher="$MCODE_INSTALL_DIR/bin/mcode" current_receipt="$MCODE_INSTALL_DIR/install.json"
   if installation_is_healthy; then
     comparison="$(compare_versions "$INSTALLED_VERSION" "$MCODE_PACKAGE_VERSION")"
-    if [[ "$comparison" == '0' ]]; then INSTALL_ACTION='current'
+    if [[ "$comparison" == '0' ]]; then
+      INSTALL_ACTION='current'
+      if ! installed_toolchain_is_stable; then
+        warn 'The installed launchers pin a Homebrew Cellar path that brew upgrade removes; repairing them.'
+        INSTALL_ACTION='repair'
+      fi
     elif [[ "$comparison" == '1' ]]; then INSTALL_ACTION='ahead'
     else INSTALL_ACTION='update'
     fi
@@ -1086,7 +1135,7 @@ install_mcode() {
 
 write_install_receipt() {
   local npm_executable receipt_file
-  npm_executable="$(cd "$(dirname "$NPM_EXECUTABLE")" && pwd -P)/$(basename "$NPM_EXECUTABLE")"
+  npm_executable="$(homebrew_stable_path "$(directory_resolved_path "$NPM_EXECUTABLE")")"
   receipt_file="$MCODE_INSTALL_DIR/install.json"
   "$NODE_EXECUTABLE" -e '
     const fs = require("node:fs");

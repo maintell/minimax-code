@@ -19,9 +19,11 @@
 export { attachProgrammaticErrorData, attachProgrammaticErrorRaw, readImageEncodedContent, readProgrammaticErrorData, readProgrammaticErrorRaw, recordImageEncodedContent, withProgrammaticResult, } from './programmatic.js';
 export { createPtcToolFactCollector, PTC_DEFAULT_WALL_CLOCK_MS, PTC_MAX_WALL_CLOCK_MS, readPtcChildExecutionDetails, readPtcExecutionDetails, readPtcToolCallRecords, resolvePtcWallClock, } from './ptc.js';
 export { defineRuntimeTool } from './define.js';
+export { isToolSteerInterruption } from './steer-interruption.js';
 export { bindTool, toRuntimeTool } from './bind.js';
 export { prepareEditArguments } from './edit-prepare-arguments.js';
-export { coerceRuntimeToolInput, isRuntimeToolInputValid, validateRuntimeToolInput, } from './input-validation.js';
-export { TURN_TERMINATING_TOOL_RESULT_DETAIL, isTurnTerminatingToolResultDetails, } from './turn-termination.js';
+export { isRuntimeToolInputValid, repairRuntimeToolInput, validateRuntimeToolInput, } from './input-validation.js';
+export { TURN_STOPPING_TOOL_RESULT_DETAIL, TURN_TERMINATING_TOOL_RESULT_DETAIL, isTurnClosedByTerminatingTools, isTurnClosedByTerminatingToolsAt, isTurnStoppingToolResultDetails, isTurnTerminatingToolResultDetails, } from './turn-termination.js';
+export { toolResultIsError } from './result-error.js';
 export { ReadToolDef, WriteToolDef, EditToolDef, BashToolDef, GrepToolDef, GlobToolDef, TodoWriteToolDef, TaskToolDef, } from './builtin-defs.js';
 //# sourceMappingURL=index.js.map

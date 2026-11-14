@@ -11,20 +11,28 @@ export function hostOutputTokenCap(resolver, input) {
             resolveHostMaxOutputTokens: () => resolver?.resolveOutputTokenCap(context) ?? 0,
         };
 }
+/**
+ * Whether a model's traffic goes to content review: managed models only, narrowed by the product
+ * policy. It decides a Turn's input and output review, and the advisor's input and advice review
+ * by the advisor's own model. Prompt suggestions and archive titles still apply their own
+ * managed-only check.
+ */
+export function isModelOutputReviewed(managedProvider, policy) {
+    return (managedProvider && !(policy.tuiProductPolicy === true && policy.contentReviewEnabled === false));
+}
 export function contentReviewOptions(input, options) {
-    const managedProvider = input.preparation.llm.managedProvider === true;
+    const reviewed = isModelOutputReviewed(input.preparation.llm.managedProvider === true, options);
     if (options.tuiProductPolicy === true) {
-        const contentReviewRequired = options.contentReviewEnabled !== false && managedProvider;
         return {
-            contentReviewRequired,
-            ...(contentReviewRequired ? {} : { streamUnreviewedOutput: true }),
+            contentReviewRequired: reviewed,
+            ...(reviewed ? {} : { streamUnreviewedOutput: true }),
         };
     }
     if (options.cliProductPolicy === true)
-        return { contentReviewRequired: managedProvider };
+        return { contentReviewRequired: reviewed };
     // Desktop：BYOK（含自定义 Provider、Codex OAuth）不送 MiniMax 内容审核，输出直接流式下发；
     // 托管模型保持原有审核归属。
-    return managedProvider ? {} : { contentReviewRequired: false, streamUnreviewedOutput: true };
+    return reviewed ? {} : { contentReviewRequired: false, streamUnreviewedOutput: true };
 }
 /**
  * Retry options, plus the request barrier and step stop of a Turn its owner
@@ -49,16 +57,20 @@ export async function requestControlledRunOptions(input, options) {
 async function resolveLlmRetryOptions(input, options) {
     return (await options.resolveLlmRetry?.(input)) ?? {};
 }
-export function attachCommittedFacts(outcome, fileChangeObservation, backgroundTaskReadCandidates) {
+export function attachCommittedFacts(outcome, fileChangeObservation, backgroundTaskReadCandidates, savedPtcScripts = new Map()) {
     const confirmedCandidates = outcome.status === 'completed' ? [...backgroundTaskReadCandidates] : [];
-    if (!fileChangeObservation && confirmedCandidates.length === 0)
+    // Saved scripts are already on disk, so a failed or aborted Turn reports them too.
+    const savedScripts = [...savedPtcScripts.values()];
+    if (!fileChangeObservation && confirmedCandidates.length === 0 && savedScripts.length === 0) {
         return outcome;
+    }
     const committedFacts = {
         ...outcome.committedFacts,
         ...(fileChangeObservation ? { fileChangeObservation } : {}),
         ...(confirmedCandidates.length > 0
             ? { backgroundTaskReadCandidates: confirmedCandidates }
             : {}),
+        ...(savedScripts.length > 0 ? { savedPtcScripts: savedScripts } : {}),
     };
     return { ...outcome, committedFacts };
 }
@@ -111,5 +123,17 @@ export function ackCommittedToolResultTailClaims(messages, pendingClaims, input)
         input.control.ackToolResultTail(message.toolCallId);
         pendingClaims.delete(message.toolCallId);
     });
+}
+/** Ends the `preparing` stage right before the runner takes the turn. */
+export function preparedTurnTiming(timing, nowMs = Date.now) {
+    return timing ? { turnTiming: { ...timing, preparedAtMs: nowMs() } } : {};
+}
+export function describeUnknownError(error) {
+    try {
+        return error instanceof Error ? error.message : String(error);
+    }
+    catch {
+        return 'unknown error';
+    }
 }
 //# sourceMappingURL=turn-execution-policy.js.map

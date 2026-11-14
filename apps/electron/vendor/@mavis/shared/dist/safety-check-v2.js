@@ -25,6 +25,7 @@ export const SAFETY_CHECK_V2_SCENE = {
     UserProfile: 219,
     HookConfig: 220,
     CodeReviewRules: 221,
+    MiniAppRequirements: 222,
 };
 /** biz-gateway V2 HTTP verdicts; these values are not chat-server RPC actions. */
 export const GATEWAY_SAFETY_CHECK_V2_HTTP_ACTION = {

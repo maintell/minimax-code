@@ -6,7 +6,7 @@ import { buildPermissionCard, extractPermissionActionValue, } from './cards/feis
 import { FeishuSender, } from './outbound/feishu-sender.js';
 import { enrichFeishuSenderName } from './outbound/feishu-sender-name.js';
 import { makeFeishuWsAttachmentDownloader, removeAckReaction, startFeishuEventDispatcher, } from './feishu-ws.js';
-import { errorMessage, isUsableFeishuBinding, normalizeMode, pickString, } from './feishu-adapter-utils.js';
+import { errorMessage, isUsableFeishuBinding, sameWsCredentials, validateFeishuBindCredentials, pickString, } from './feishu-adapter-utils.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 import { buildFeishuSdkLoggerBridge, clearFeishuWsError, describeFeishuWsStatus, transitionFeishuWsStatus, } from './feishu-sdk-logger.js';
 import { summarizeFeishuSdkMessage } from './feishu-sdk-message-summary.js';
@@ -40,6 +40,9 @@ export class FeishuPlatformAdapter {
     sender;
     senderForCredentials;
     wsClient;
+    wsForCredentials;
+    wsClientPromise;
+    wsGeneration = 0;
     /** Last detached WS close; observable for tests/drain, never awaited inline. */
     wsClosePromise;
     /**
@@ -112,46 +115,9 @@ export class FeishuPlatformAdapter {
         this.wsBridgeRetirers.set(client, sdkBridge.retire);
         return client;
     }
-    /** Credential + mode gates for bind(); mock mode is rejected outright. */
-    validateBindCredentials(credentials) {
-        const appId = pickString(credentials, ['appId', 'app_id']);
-        const appSecret = pickString(credentials, ['appSecret', 'app_secret']);
-        if (!appId || !appSecret) {
-            return {
-                error: {
-                    ok: false,
-                    clientName: this.clientName,
-                    error: 'appId and appSecret are required',
-                    code: 'VALIDATION_ERROR',
-                },
-            };
-        }
-        const requestedMode = pickString(credentials, ['mode'])?.toLowerCase();
-        if (requestedMode === 'mock') {
-            return {
-                error: {
-                    ok: false,
-                    clientName: this.clientName,
-                    error: 'mock channel mode is not supported',
-                    code: 'CHANNEL_MOCK_MODE_UNSUPPORTED',
-                },
-            };
-        }
-        if (requestedMode && !['webhook', 'websocket', 'ws'].includes(requestedMode)) {
-            return {
-                error: {
-                    ok: false,
-                    clientName: this.clientName,
-                    error: 'unsupported channel mode',
-                    code: 'VALIDATION_ERROR',
-                },
-            };
-        }
-        return { appId, appSecret, mode: normalizeMode(requestedMode) };
-    }
     async bind(input) {
         const credentials = input.credentials ?? {};
-        const validated = this.validateBindCredentials(credentials);
+        const validated = validateFeishuBindCredentials(credentials, this.clientName);
         if ('error' in validated)
             return validated.error;
         const { appId, appSecret, mode } = validated;
@@ -673,6 +639,7 @@ export class FeishuPlatformAdapter {
     async startWebSocket(input) {
         // Track the live transport state so status APIs stop echoing only the
         // persisted `connected: true` (which is bind-time, not transport-time).
+        const attempt = { generation: this.wsGeneration };
         const prevStatus = this.ws.status;
         logger.info({ agentName: this.agentName, platform: 'feishu', prevStatus }, 'Feishu WS start attempt');
         // A new attempt starts clean so an error from a previous attempt is
@@ -680,14 +647,18 @@ export class FeishuPlatformAdapter {
         clearFeishuWsError(this.ws);
         this.transitionWs('connecting', 'start_requested');
         const record = await this.readStartableWsRecord();
-        if (!record)
+        if (!record || attempt.generation !== this.wsGeneration)
             return false;
+        const source = { clientName: this.clientName, appId: record.appId };
         const sender = this.ensureSender(record);
         try {
-            this.wsClient = await startFeishuEventDispatcher({
+            const startedClient = await startFeishuEventDispatcher({
                 record,
-                clientFactory: () => this.ensureWsClient(record),
-                normalizeInbound: (data) => this.normalizeInbound({ clientName: this.clientName, raw: data }),
+                clientFactory: () => this.ensureWsClient(record, attempt),
+                normalizeInbound: async (data) => {
+                    const envelope = await this.normalizeInbound({ clientName: this.clientName, raw: data });
+                    return { ...envelope, ctx: { ...envelope.ctx, feishuWsSource: source } };
+                },
                 dispatchInbound: input.dispatchInbound,
                 ...(input.preflightInbound ? { preflightInbound: input.preflightInbound } : {}),
                 sender,
@@ -697,13 +668,18 @@ export class FeishuPlatformAdapter {
                 ...(this.wsAttachmentDownloader
                     ? { attachmentDownloader: this.wsAttachmentDownloader }
                     : {}),
-                ...(input.onCardAction ? { onCardAction: input.onCardAction } : {}),
+                onCardAction: (data) => input.onCardAction?.(data, source),
             });
+            if (this.wsClient !== startedClient) {
+                this.wsBridgeRetirers.get(startedClient)?.();
+                await this.closeWsQuietly(startedClient);
+                return false;
+            }
         }
         catch (err) {
             // Record the failure for `getWsStatus` and re-throw — callers own the
             // error logging (host-channels `startFeishuWs` / `onBindingChanged`).
-            this.recordWsStartFailure(err);
+            this.recordWsStartFailure(err, attempt.generation);
             throw err;
         }
         // No status write here on purpose: the SDK logger bridge owns the verdict
@@ -713,7 +689,9 @@ export class FeishuPlatformAdapter {
         logger.info({ agentName: this.agentName, platform: 'feishu', status: this.ws.status }, 'Feishu WS start dispatched');
         return true;
     }
-    recordWsStartFailure(err) {
+    recordWsStartFailure(err, generation) {
+        if (generation !== this.wsGeneration)
+            return;
         // Raw text for the status API, safe summary for logs / UI — written
         // together, like every other error write.
         this.ws.lastError = errorMessage(err);
@@ -745,6 +723,9 @@ export class FeishuPlatformAdapter {
      * credentials.
      */
     invalidateTransport() {
+        this.wsGeneration += 1;
+        this.wsForCredentials = undefined;
+        this.wsClientPromise = undefined;
         if (this.sender) {
             this.sender.invalidateToken();
         }
@@ -831,19 +812,53 @@ export class FeishuPlatformAdapter {
         this.senderForCredentials = { appId: record.appId, appSecret: record.appSecret };
         return this.sender;
     }
-    async ensureWsClient(record) {
-        if (!isUsableFeishuBinding(record)) {
-            throw new Error('feishu binding is not configured');
+    async ensureWsClient(record, attempt) {
+        if (!isUsableFeishuBinding(record) || this.wsClientFactory === false) {
+            throw new Error('feishu WS binding is unavailable');
         }
+        const current = await this.store.get(this.agentName);
+        if (!sameWsCredentials(current, record) ||
+            (attempt && attempt.generation !== this.wsGeneration)) {
+            throw new Error('feishu WS binding changed before client creation');
+        }
+        this.prepareWsCredentials(record, attempt);
         if (this.wsClient)
             return this.wsClient;
-        if (this.wsClientFactory === false) {
-            throw new Error('feishu WS client factory is disabled');
+        if (this.wsClientPromise)
+            return this.wsClientPromise;
+        const pending = this.createCredentialBoundWsClient(record, this.wsGeneration, this.wsClientFactory);
+        this.wsClientPromise = pending;
+        try {
+            return await pending;
         }
-        const client = await this.wsClientFactory({
-            appId: record.appId,
-            appSecret: record.appSecret,
-        });
+        finally {
+            if (this.wsClientPromise === pending)
+                this.wsClientPromise = undefined;
+        }
+    }
+    /** Select the credential epoch without resetting a first connection's pending status. */
+    prepareWsCredentials(record, attempt) {
+        if (sameWsCredentials(this.wsForCredentials, record))
+            return;
+        if (this.wsForCredentials) {
+            this.invalidateTransport();
+            if (attempt) {
+                attempt.generation = this.wsGeneration;
+                this.transitionWs('connecting', 'start_requested');
+            }
+        }
+        this.wsForCredentials = { appId: record.appId, appSecret: record.appSecret };
+    }
+    async createCredentialBoundWsClient(record, generation, factory) {
+        const client = await factory({ appId: record.appId, appSecret: record.appSecret });
+        const current = await this.store.get(this.agentName);
+        if (generation !== this.wsGeneration ||
+            !isUsableFeishuBinding(current) ||
+            !sameWsCredentials(current, record)) {
+            this.wsBridgeRetirers.get(client)?.();
+            await this.closeWsQuietly(client);
+            throw new Error('feishu WS binding changed during client creation');
+        }
         this.wsClient = client;
         return client;
     }

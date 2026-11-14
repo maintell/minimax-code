@@ -79,6 +79,7 @@ async function checkLocalPermission(ctx, request) {
         agentName,
         sessionId,
         permissionModeOverride: permissionMode,
+        ...agentHomeGrant(ctx, agentName),
     });
     if (decision.behavior === 'deny' || decision.behavior === 'allow') {
         return json({ behavior: decision.behavior, reason: decision.reason });
@@ -103,6 +104,11 @@ async function checkLocalPermission(ctx, request) {
         });
     }
     return json({ behavior: decision.behavior, reason: decision.reason });
+}
+/** The Agent's homes, granted as its Turns grant them. */
+function agentHomeGrant(ctx, agentName) {
+    const homes = agentName ? (ctx.agentHomeDirectories?.(agentName) ?? []) : [];
+    return homes.length > 0 ? { sessionOwnedReadablePaths: homes } : {};
 }
 async function replyLocalPermissionBatch(ctx, request) {
     const body = await readJsonBody(request);

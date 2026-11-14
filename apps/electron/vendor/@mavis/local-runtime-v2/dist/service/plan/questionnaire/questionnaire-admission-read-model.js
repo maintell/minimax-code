@@ -1,5 +1,6 @@
 import { and, eq, gte, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { questionnaireRequests } from '../../../infra/db/schema/questionnaire.js';
+import { SESSION_GATING_PENDING_SQL } from '../../../infra/legacy-db/questionnaire-request-queries.js';
 /** Typed, read-only Plan projection over the shared Questionnaire table. */
 export function createPlanQuestionnaireAdmissionReadModel() {
     const safeMode = sql `CASE
@@ -16,10 +17,11 @@ export function createPlanQuestionnaireAdmissionReadModel() {
     ELSE NULL
   END`;
     return {
-        // Legacy rows only (response_mode IS NULL). An unanswered AskUser v2
-        // question stays pending for up to 24h and can be answered any time, so it
-        // must not block Plan entry or a Plan card (both call through here).
-        hasAnyPendingInTransaction: (db, input) => hasRow(db, and(eq(questionnaireRequests.sessionId, input.sessionId), eq(questionnaireRequests.status, 'pending'), gte(questionnaireRequests.createdAt, input.createdAtCutoff), isNull(questionnaireRequests.responseMode))),
+        // Session-gating rows only (legacy, not Plugin preparation). An unanswered
+        // AskUser v2 question stays pending for up to 24h and can be answered any
+        // time, and a Plugin preparation card is an inline suggestion, so neither
+        // blocks Plan entry or a Plan card (both call through here).
+        hasAnyPendingInTransaction: (db, input) => hasRow(db, and(eq(questionnaireRequests.sessionId, input.sessionId), eq(questionnaireRequests.status, 'pending'), gte(questionnaireRequests.createdAt, input.createdAtCutoff), sql.raw(SESSION_GATING_PENDING_SQL))),
         hasIncompletePlanLifecycleInTransaction: (db, input) => hasRow(db, and(eq(questionnaireRequests.sessionId, input.sessionId), eq(safeMode, 'plan'), input.excludeRequestId
             ? ne(questionnaireRequests.requestId, input.excludeRequestId)
             : undefined, isNull(questionnaireRequests.injectedAt), or(and(eq(questionnaireRequests.status, 'pending'), gte(questionnaireRequests.createdAt, input.createdAtCutoff)), inArray(questionnaireRequests.status, ['answered', 'dismissed'])))),

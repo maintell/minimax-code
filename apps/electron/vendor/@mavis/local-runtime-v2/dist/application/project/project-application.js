@@ -1,7 +1,7 @@
 import { SidebarQueryError, ProjectServiceError, sessionTreeFilterFromRequest, } from '../../service/session-system/index.js';
 import { AppError } from '../errors.js';
 import { publishBestEffort } from '../events.js';
-import { toSessionInfoView, toSessionTreeChildView } from '../session/wire.js';
+import { readSessionAssignments, toSessionInfoView, toSessionTreeChildView, } from '../session/wire.js';
 import { toProjectDetail, toProjectReference } from './wire.js';
 export class ProjectApplication {
     options;
@@ -14,14 +14,15 @@ export class ProjectApplication {
             const scope = await this.sidebarScope(req.scope);
             const page = sidebar.projects({ ...req, scope, bindingIds, cronTargetIds });
             const children = await this.options.sidebarChildren?.(page.groups.flatMap((g) => [...g.entries, ...(g.activeEntry ? [g.activeEntry] : [])].map((e) => e.session.sessionId)));
+            const assignments = await readSessionAssignments(this.options.assignments, page.groups.flatMap((g) => [...g.entries, ...(g.activeEntry ? [g.activeEntry] : [])].map((e) => e.session)));
             return {
                 ...page,
                 groups: page.groups.map((group) => ({
                     ...group,
                     project: toProjectDetail(group.project, group.matchedCount),
-                    entries: group.entries.map((value) => this.sidebarEntry(value, children)),
+                    entries: group.entries.map((value) => this.sidebarEntry(value, children, assignments)),
                     activeEntry: group.activeEntry
-                        ? this.sidebarEntry(group.activeEntry, children)
+                        ? this.sidebarEntry(group.activeEntry, children, assignments)
                         : undefined,
                 })),
             };
@@ -42,7 +43,11 @@ export class ProjectApplication {
                 cronTargetIds,
             });
             const children = await this.options.sidebarChildren?.(page.entries.map((e) => e.session.sessionId));
-            return { ...page, entries: page.entries.map((value) => this.sidebarEntry(value, children)) };
+            const assignments = await readSessionAssignments(this.options.assignments, page.entries.map((e) => e.session));
+            return {
+                ...page,
+                entries: page.entries.map((value) => this.sidebarEntry(value, children, assignments)),
+            };
         });
     }
     async querySidebarAgents(_context, req) {
@@ -67,7 +72,8 @@ export class ProjectApplication {
             const { sidebar, bindingIds, cronTargetIds } = await this.sidebarContext();
             const value = sidebar.get(req.sessionId ?? '', bindingIds, cronTargetIds);
             const children = await this.options.sidebarChildren?.([value.session.sessionId]);
-            return { entry: this.sidebarEntry(value, children) };
+            const assignments = await readSessionAssignments(this.options.assignments, [value.session]);
+            return { entry: this.sidebarEntry(value, children, assignments) };
         });
     }
     async sidebarScope(scope) {
@@ -95,9 +101,9 @@ export class ProjectApplication {
             cronTargetIds: this.options.sidebarCronTargets(),
         };
     }
-    sidebarEntry(value, children) {
+    sidebarEntry(value, children, assignments) {
         return {
-            session: toSessionInfoView(value.session),
+            session: toSessionInfoView(value.session, undefined, assignments?.get(value.session.sessionId)),
             types: value.types,
             done: value.done,
             childSessions: (children?.get(value.session.sessionId) ?? []).map(toSessionTreeChildView),
@@ -112,8 +118,9 @@ export class ProjectApplication {
             cursor: req.cursor,
             sessionLimit: req.sessionLimit,
         }));
+        const assignments = await readSessionAssignments(this.options.assignments, page.projects.flatMap((group) => group.sessions));
         return {
-            projects: page.projects.map(toProjectSessionGroup),
+            projects: page.projects.map((group) => toProjectSessionGroup(group, assignments)),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
@@ -125,8 +132,9 @@ export class ProjectApplication {
             limit: req.limit,
             cursor: req.cursor,
         }));
+        const assignments = await readSessionAssignments(this.options.assignments, page.sessions);
         return {
-            sessions: toProjectSessionPage(page),
+            sessions: toProjectSessionPage(page, assignments),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
@@ -258,20 +266,20 @@ async function archiveSessionsBestEffort(sessionIds, sessions) {
     }
     return { archivedSessionIds, failedSessionIds };
 }
-function toProjectSessionGroup(group) {
+function toProjectSessionGroup(group, assignments) {
     return {
         project: toProjectDetail(group.project, group.sessionCount),
         sessions: group.sessions.map((session) => ({
-            session: toSessionInfoView(session),
+            session: toSessionInfoView(session, undefined, assignments.get(session.sessionId)),
             childSessions: (group.childrenByParent.get(session.sessionId) ?? []).map(toSessionTreeChildView),
         })),
         hasMoreSessions: group.hasMoreSessions,
         ...(group.nextSessionCursor ? { nextSessionCursor: group.nextSessionCursor } : {}),
     };
 }
-function toProjectSessionPage(page) {
+function toProjectSessionPage(page, assignments) {
     return page.sessions.map((session) => ({
-        session: toSessionInfoView(session),
+        session: toSessionInfoView(session, undefined, assignments.get(session.sessionId)),
         childSessions: (page.childrenByParent.get(session.sessionId) ?? []).map(toSessionTreeChildView),
     }));
 }

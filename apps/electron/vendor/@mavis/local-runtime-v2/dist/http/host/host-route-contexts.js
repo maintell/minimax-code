@@ -11,6 +11,7 @@
 import { resolveLocalPermissionService, } from '../../service/permission/index.js';
 import { QuestionnaireSyncWaitRegistry } from '../../infra/legacy-db/questionnaire-sync-wait-registry.js';
 import { settleInBackground } from '../../service/plugin-system/index.js';
+import { agentHomeDirectories } from '../../application/session/agent-homes.js';
 // preview_train read this from the v1 agent templates module, which the Agent
 // cutover deletes. `resolveLocalRuntimeLocale` is the surviving byte-identical
 // implementation.
@@ -79,6 +80,9 @@ export function createHostRouteContext(host) {
         get messageStore() {
             return host.messageStore;
         },
+        get coordinatorRoster() {
+            return host.coordinatorRoster;
+        },
         get permissionRules() {
             return host.permissionRules;
         },
@@ -133,6 +137,9 @@ export function buildPermissionRouteContext(host) {
         nowMs: host.nowMs,
         permissionRules: host.permissionRules,
         permissionService: resolveLocalPermissionService(host),
+        agentHomeDirectories: (agentName) => host.coordinatorRoster
+            ? agentHomeDirectories(host.coordinatorRoster, host.configGetter().dataDir, agentName)
+            : [],
         approvalService: host.permissionApprovalService,
         publishGlobalEvent: (event) => host.publishGlobalEvent(event),
         channelPermissionOutbound: host.channelPermissionBridge,

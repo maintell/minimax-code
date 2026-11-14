@@ -13,8 +13,8 @@ import { clearOwnerAllConventions } from '../../../binding/storage/owner-store.j
 import { isUsableTelegramBinding, telegramClientId, } from '../../../transport/telegram/telegram-store.js';
 import { extractTelegramAttachmentRefs, parseLocalTelegramUpdate, } from '../../../transport/telegram/telegram-events.js';
 import { TelegramAttachmentDownloader } from '../../../transport/telegram/telegram-attachment-downloader.js';
-import { TelegramSender } from '../../../transport/telegram/telegram-sender.js';
-import { LocalTelegramChannelClient, } from '../../../transport/telegram/telegram-outbound-client.js';
+import { TelegramSender } from '../../../transport/telegram/outbound/telegram-sender.js';
+import { LocalTelegramChannelClient, } from '../../../transport/telegram/outbound/telegram-outbound-client.js';
 import { json, readFirstString, readJsonBody } from '../http-helpers.js';
 import { collectTransportClients } from './connection-transport.js';
 export class LocalTelegramChannelApi {

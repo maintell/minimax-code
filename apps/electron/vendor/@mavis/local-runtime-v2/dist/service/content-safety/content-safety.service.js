@@ -1,3 +1,4 @@
+import { getRuntimeRegion } from '@mavis/config';
 import { reviewBlocks } from '@mavis/shared/local-runtime-safety';
 import { createHash } from 'node:crypto';
 import {} from './contracts.js';
@@ -34,13 +35,28 @@ export class ContentSafetyService {
     }
 }
 export { reviewBlocks } from '@mavis/shared/local-runtime-safety';
+/**
+ * A product host's content review switches for model output: only the TUI narrows review, and
+ * only outside the CN region. Turn output and advisor advice both read it.
+ */
+export function productOutputReviewPolicy(runtimeOwnerKind) {
+    return runtimeOwnerKind === 'tui'
+        ? { tuiProductPolicy: true, contentReviewEnabled: getRuntimeRegion() === 'cn' }
+        : {};
+}
+export function inputReviewDisposition(result) {
+    if (result.action === 'replace' && result.suggestion?.trim()) {
+        return { kind: 'replace', replacement: result.suggestion };
+    }
+    if (result.action === 'guide') {
+        const guidance = result.guide_prompt?.trim();
+        return guidance ? { kind: 'proceed', guidance } : { kind: 'proceed' };
+    }
+    return reviewBlocks(result) ? { kind: 'block' } : { kind: 'proceed' };
+}
 /** Review can be regenerated and a valid fixed answer can be delivered without the model. */
 export function reviewBlocksInput(result) {
-    if (result.action === 'guide')
-        return false;
-    if (result.action === 'replace' && result.suggestion?.trim())
-        return false;
-    return reviewBlocks(result);
+    return inputReviewDisposition(result).kind === 'block';
 }
 export function digestSafetyInput(input) {
     const serialized = JSON.stringify(canonicalValue(input)) ?? 'undefined';

@@ -1,13 +1,15 @@
 import { clearRootSessionReference, setRootSessionReference } from './root-reference.js';
 import { isTrustedBuiltinCreationSource, resolveCanonicalSubagentRole, toAgentRequestRef, } from '@mavis/agent-tools/desktop/subagent-roles';
+import { usesSegmentContextProfile } from '@mavis/shared/agent-coordination';
 import { BuiltinAgentCatalog, canonicalBuiltinName, } from '../builtin/catalog.js';
 import { AgentServiceError } from '../errors.js';
 import { collectAgentListCandidates, paginateSettledViews, readAgentViewReferences, toAgentView, } from './listing/index.js';
 import { readFrozenTaskOwner } from './frozen-task-owner.js';
 import { asAgentConfigServiceError, createAgentPromptSelection, buildAgentGreetingReminder, readCanonicalAgentConfig, readCanonicalCustomAvatar, readBuiltinAgentContent, renderAgentProfile, renderFrozenAgentProfile, resolveAgentProfileRenderContext, } from './agent-profile.js';
 import { parseCanonicalAgentMarkdown, } from '../storage/canonical-agent-config.js';
+import { readOwnerDispatchable, readOwnerSurfaceFlags } from './config/surface-flags.js';
 import { deleteAgentAllowingInvalidConfig } from './agent-delete-recovery.js';
-import { rebuildBuiltinCanonicalFiles, reseedMissingBuiltinCanonicalFile, } from './config/builtin-canonical-files.js';
+import { rebuildBuiltinCanonicalFiles, repairCorruptedBuiltinCanonicalFileAtUseTime, reseedMissingBuiltinCanonicalFile, } from './config/builtin-canonical-files.js';
 import { AgentConfigDocuments } from './config/agent-config-documents.js';
 import { toConfiguredModelSelection } from './config/config-document.js';
 import { convergeLegacyPrimaryProfile, detachLegacyBuiltinIdentities, } from './_migration-legacy-identity-detach.js';
@@ -131,21 +133,23 @@ export class LocalAgentService extends AgentConfigDocuments {
         const now = input.nowMs ?? this.nowMs();
         const insert = toAgentInsert(input, name, now);
         try {
-            await this.withDisplayNameLock(async () => {
-                const existing = await this.options.repository.get(name);
-                if (existing) {
-                    if (await this.options.repository.reconcileCanonicalCustomAgent?.(insert))
-                        return;
-                    throw new AgentServiceError('AGENT_NAME_CONFLICT', `Agent name "${name}" already exists`);
-                }
-                await this.assertDisplayNameIsAvailable(insert.displayName ?? name);
-                await this.options.repository.insert(insert);
+            return await this.options.repository.withCreationLock(name, async () => {
+                await this.withDisplayNameLock(async () => {
+                    const existing = await this.options.repository.get(name);
+                    if (existing) {
+                        if (await this.options.repository.reconcileCanonicalCustomAgent?.(insert))
+                            return;
+                        throw new AgentServiceError('AGENT_NAME_CONFLICT', `Agent name "${name}" already exists`);
+                    }
+                    await this.assertDisplayNameIsAvailable(insert.displayName ?? name);
+                    await this.options.repository.insert(insert);
+                });
+                return this.get(name);
             });
         }
         catch (error) {
             throw asAgentConfigServiceError(error);
         }
-        return this.get(name);
     }
     async update(input) {
         validateUpdateInput(input);
@@ -500,6 +504,10 @@ export class LocalAgentService extends AgentConfigDocuments {
             throw notFound(exact);
         return exact;
     }
+    /** Read from the current canonical `agent.md`, so a user edit applies without a restart. */
+    async resolveAgentDispatchable(exactOwnerName) {
+        return readOwnerDispatchable(this.options.repository, exactOwnerName, (meta) => this.isBuiltin(meta));
+    }
     async resolveAgentExecutionTarget(exactOwnerName) {
         try {
             const exact = parseExplicitNameOrStable(exactOwnerName);
@@ -573,6 +581,23 @@ export class LocalAgentService extends AgentConfigDocuments {
         if (!definition)
             return;
         await reseedMissingBuiltinCanonicalFile({ ...this.builtinSeedInput(), definition });
+    }
+    /**
+     * Emergency rebuild spec 8: the Turn system calls this when a Turn's
+     * preparation failed with `BUILTIN_AGENT_CONFIG_BROKEN` naming `name`, then
+     * prepares the Turn again. Archives and rewrites the corrupted Builtin source
+     * of a coordinator whose root conversations use the segment profile, keeping
+     * its valid model group. No other Builtin has a use-time repair
+     * (`not_coordinator`); see renderBuiltinProfile.
+     */
+    async repairCorruptedCoordinatorConfig(name) {
+        const definition = await this.definitionFor(name);
+        if (!definition)
+            throw notFound(name);
+        if (!usesSegmentContextProfile(definition.coordination)) {
+            return { status: 'skipped', reason: 'not_coordinator' };
+        }
+        return repairCorruptedBuiltinCanonicalFileAtUseTime({ ...this.builtinSeedInput(), definition });
     }
     listBuiltinDefinitions() {
         return this.catalog.listDefinitions();
@@ -802,6 +827,10 @@ export class LocalAgentService extends AgentConfigDocuments {
             : canonicalViewName;
         const { identity, config, canonicalOwner } = await readAgentViewReferences(this.options.repository, meta, canonical, exactOwnerName);
         const resolvedAgentName = canonicalOwner && this.isBuiltin(canonicalOwner) ? canonical : exactOwnerName;
+        const builtin = this.isBuiltin(meta);
+        // Never a startup snapshot: a user edit must reach the next list. The
+        // physical owner resolves the row; readOwnerSurfaceFlags canonicalises the file.
+        const surfaceFlags = await readOwnerSurfaceFlags(this.options.repository, exactOwnerName, (owner) => this.isBuiltin(owner));
         return toAgentView({
             meta,
             canonical,
@@ -810,10 +839,11 @@ export class LocalAgentService extends AgentConfigDocuments {
             identity,
             config,
             definition,
-            builtin: this.isBuiltin(meta),
+            builtin,
             primary: this.isPrimary(meta),
             primaryDisplayName: this.primaryDisplayName,
             agentConfigDir: this.options.repository.getAgentDir(meta.name),
+            surfaceFlags,
         });
     }
     isBuiltin(meta) {

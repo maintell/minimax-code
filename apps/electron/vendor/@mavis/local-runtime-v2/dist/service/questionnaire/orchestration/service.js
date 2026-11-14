@@ -12,7 +12,8 @@ import { QuestionnaireV2Lifecycle } from '../response-mode/v2-lifecycle.js';
 import { isV2Questionnaire } from '../response-mode/v2-state.js';
 import { isQuestionnaireAgentAllowed, QuestionnaireRequestLifecycle, } from '../lifecycle/request-lifecycle.js';
 import { QuestionnaireServiceSupport } from './service-support.js';
-import { projectQuestionnaireRecord } from './request-view.js';
+import { projectPluginPreparationOutcome, projectQuestionnaireRecord } from './request-view.js';
+import { PLUGIN_PREPARATION_MODE } from '../lifecycle/plugin-preparation.js';
 /** @internal Re-exported only for focused integration tests. */
 export { QUESTIONNAIRE_TTL_MS };
 export { LocalQuestionnaireError };
@@ -137,7 +138,7 @@ export class LocalQuestionnaireService extends QuestionnaireServiceSupport {
     }
     async dismiss(input) {
         const candidate = await this.deps.store.get(input.requestId);
-        // v2 skip/close never marks the row dismissed; it only ends a sync wait.
+        // v2 skip/close only records the skip; the row stays pending and answerable.
         if (candidate && isV2Questionnaire(candidate))
             return this.v2Lifecycle.dismiss(input);
         const record = await this.requireDismissibleRecord(input.requestId, input.agentName);
@@ -275,6 +276,10 @@ export class LocalQuestionnaireService extends QuestionnaireServiceSupport {
     }
     async getLatestPlanReview(input) {
         return this.requestLifecycle.getLatestPlanReview(input);
+    }
+    /** Every Plugin preparation card row of the session, oldest first. */
+    async listPluginPreparations(sessionId) {
+        return (await this.deps.store.listByMode(sessionId, PLUGIN_PREPARATION_MODE)).map(projectPluginPreparationOutcome);
     }
     /** Recover unowned requests; the work owner recovers its own (see `ownedOperations`). */
     async recoverOnStartup(options = {}) {

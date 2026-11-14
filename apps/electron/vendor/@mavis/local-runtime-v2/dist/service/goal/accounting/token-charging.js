@@ -71,8 +71,8 @@ export class GoalTokenCharging {
     }
     /**
      * The recorder of a Turn whose requests a Goal is charged for: every request
-     * of an attributed round, or the automatic compaction of a bound Goal Turn
-     * (its own requests go through the request ledger).
+     * of an attributed round, or the automatic compaction and advisor requests of
+     * a bound Goal Turn (its own requests go through the request ledger).
      */
     usageRecorderFor(turn) {
         if (!this.deps.isEnabled())
@@ -95,15 +95,16 @@ export class GoalTokenCharging {
     }
     recorder(goalId, turn, base) {
         const charge = async (input) => {
-            // A Goal Turn's own requests are the ledger's; only its compaction is charged here.
-            if (base === 'compaction' && input.scope !== 'compaction')
+            const source = chargeSource(base, input.scope);
+            // A Goal Turn's own requests are the ledger's.
+            if (!source)
                 return;
             const result = await this.deps.store().chargeTokens({
                 requestId: input.callId,
                 goalId,
                 sessionId: turn.sessionId,
                 turnId: turn.turnId,
-                source: input.scope === 'compaction' ? 'compaction' : base,
+                source,
                 attempts: input.attempts,
                 ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
             });
@@ -135,5 +136,14 @@ export class GoalTokenCharging {
             settle: (input) => chargeOrReport(input),
         };
     }
+}
+/**
+ * The source a request of this Turn is charged under. Compaction and advisor requests keep their
+ * own source in a round too; a bound Goal Turn's agent requests belong to the request ledger.
+ */
+function chargeSource(base, scope) {
+    if (scope === 'compaction' || scope === 'advisor')
+        return scope;
+    return base === 'sub_session' && scope === 'agent' ? 'sub_session' : undefined;
 }
 //# sourceMappingURL=token-charging.js.map

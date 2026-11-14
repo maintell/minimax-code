@@ -35,6 +35,9 @@ export function createBuiltinPromptContext(input, featurePrompts) {
         // online prompts are shared by every client version, older contexts have
         // no `ptc`, and strict mode throws on `ptc.enabled` when it is missing.
         ptc: { enabled: input.ptc !== undefined, section: input.ptc?.section ?? '' },
+        // Always present (strict mode throws on a missing field): the PTC section reads it
+        // to decide whether to name `store`, and no other template uses it.
+        ptcStore: input.ptcStoreRequested === true,
         DATA_DIR: input.dataDirToken ?? '{{DATA_DIR}}',
         ROLE_DIRECTORY: roleDirectoryText(),
     };

@@ -15,6 +15,11 @@ const MAX_ACKNOWLEDGED_TASKS = 2_048;
 const deliverySchedulers = new WeakMap();
 const deliveryBursts = new WeakMap();
 const closedHosts = new WeakSet();
+const closedTaskRoutes = new WeakMap();
+/** Bound once the task owner exists; until then every result takes the ordinary delivery. */
+export function bindClosedTaskBackgroundRoute(host, route) {
+    closedTaskRoutes.set(host, route);
+}
 export function closeLocalBackgroundTaskDelivery(host) {
     closedHosts.add(host);
     deliverySchedulers.get(host)?.close();
@@ -81,6 +86,10 @@ async function deliverBatch(host, ownerSessionId, previews, taskIds) {
         // retry would say the same thing, so `skipped` (no reschedule) is correct.
         if (closedHosts.has(host) || tasks.length === 0)
             return 'skipped';
+        // A closed task's late results are recorded and handed to its assigner, never
+        // delivered as a new round in the task (Bunny spec 6.1). A failure retries the batch.
+        if (await routeToClosedTask(host, ownerSessionId, tasks, candidates))
+            return 'skipped';
         // Gate 1 again, after every await above. This catches a stop early and avoids
         // an unnecessary ingress call. The pre-delivery hook below is the final
         // guarantee: a window there stays `busy`; known targets become `skipped` only
@@ -118,6 +127,22 @@ async function deliverBatch(host, ownerSessionId, previews, taskIds) {
         if (!delivered)
             reservation.delivered = Math.max(0, reservation.delivered - 1);
     }
+}
+async function routeToClosedTask(host, ownerSessionId, previews, candidates) {
+    const route = closedTaskRoutes.get(host);
+    if (!route)
+        return false;
+    const full = new Map(candidates.flatMap((task) => (task ? [[task.taskId, task]] : [])));
+    // The full task carries its output and child Session; the preview's description is bounded.
+    const tasks = previews.map((preview) => ({
+        ...(full.get(preview.taskId) ?? preview),
+        ...(preview.description === undefined ? {} : { description: preview.description }),
+    }));
+    if (!(await route.deliver(ownerSessionId, tasks)))
+        return false;
+    // Consumed: the task Session's next round does not report them again.
+    await host.backgroundTaskService.markDelivered(ownerSessionId, tasks.map((task) => task.taskId));
+    return true;
 }
 function recordDeliverySuppressed(host, reason, count = 1) {
     try {

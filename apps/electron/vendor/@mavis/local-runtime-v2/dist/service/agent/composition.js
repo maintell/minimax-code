@@ -335,6 +335,8 @@ function errorMessage(error) {
  * edits were replaced by the bundled content. A use-time reseed is the only trace that another
  * process deleted a Builtin file while this runtime was running. A skipped repair
  * records that a file judged corrupted was fixed or deleted before it was archived.
+ * Bunny's use-time repair of its corrupted file logs the same archive, skip and
+ * failure events with `trigger: 'use_time'`; startup events carry no trigger.
  * Fields stay bounded: the archive is named by file name only, and no dataDir path or
  * prompt content reaches runtime logs.
  */
@@ -361,6 +363,7 @@ function reportBuiltinAgentConfigRepair(event) {
             agent_name: event.agentName,
             error_code: event.errorCode,
             archive_file: event.archiveFile,
+            ...(event.trigger ? { trigger: event.trigger } : {}),
         }, 'V2 Builtin Agent config archived before repair');
         return;
     }
@@ -370,6 +373,7 @@ function reportBuiltinAgentConfigRepair(event) {
             agent_name: event.agentName,
             error_code: event.errorCode,
             reason: event.reason,
+            ...(event.trigger ? { trigger: event.trigger } : {}),
         }, 'V2 Builtin Agent config repair skipped; the file was fixed or deleted before it ran');
         return;
     }
@@ -378,6 +382,7 @@ function reportBuiltinAgentConfigRepair(event) {
         agent_name: event.agentName,
         error_code: event.errorCode,
         stage: event.stage,
+        ...(event.trigger ? { trigger: event.trigger } : {}),
     }, 'V2 Builtin Agent config repair failed');
 }
 function reportBuiltinNameConflictConfigDiagnostic(report, agentName, errorCode, reason) {

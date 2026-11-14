@@ -1,3 +1,4 @@
+import { RECALL_POINTERS_HEADING, WAKE_LINE_PREFIX, } from '../../execution/turn-state-layer/state-delta-message.js';
 /**
  * Recent-conversation context for the next-message suggestion.
  *
@@ -29,7 +30,7 @@ export function latestUserText(messages) {
         const message = messages[index];
         if (message?.role !== 'user')
             continue;
-        const text = cleanUserText(readText(message.content));
+        const text = userWords(message.content);
         if (text)
             return text;
     }
@@ -45,7 +46,7 @@ function groupTurns(messages) {
     for (const raw of messages) {
         const message = raw;
         if (message?.role === 'user') {
-            const text = cleanUserText(readText(message.content));
+            const text = userWords(message.content);
             const current = turns.at(-1);
             if (!current || current.answered)
                 turns.push({ users: [], reply: '', answered: false });
@@ -93,6 +94,19 @@ function renderWithinBudget(turns) {
         rendered = render();
     }
     return rendered;
+}
+/**
+ * What the user said in a user-role message; empty for Bunny's hidden host
+ * messages (delta block, wake line, recall pointers). The request this reads
+ * is already projected for the model, where those have lost their custom type
+ * and are plain user text, so they are told apart by how they begin.
+ */
+function userWords(content) {
+    const raw = readText(content);
+    const head = raw.trimStart();
+    if (head.startsWith(WAKE_LINE_PREFIX) || head.startsWith(RECALL_POINTERS_HEADING))
+        return '';
+    return cleanUserText(raw);
 }
 function readText(content) {
     if (typeof content === 'string')

@@ -11,6 +11,7 @@ export const LANGUAGE_RULES = 'Follow explicit user language instructions. Other
     'use appLocale when no language preference is established.';
 export const ENVIRONMENT_RULES = [
     'Use the working directory unless the user specifies another path.',
+    'Write shell commands for the Shell and OS Version above: use the utilities, flags and Bash features that release ships instead of assuming GNU/Linux or a newer Bash, and check with `command -v` before relying on an optional tool.',
     'Resolve runtime-owned files (config, MCP configuration, agents, skills, memory, logs) from activeDataDir; older paths in context may belong to an inactive profile. This does not override workspace files, external skill paths, or explicit user paths.',
 ].join('\n');
 export const FILE_OPERATION_RULES = [

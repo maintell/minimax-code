@@ -47,6 +47,9 @@ class SchedulerBackedCronService {
             ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
         };
     }
+    targetsMainConversation(agentName) {
+        return this.deps.lifecycle.targetsMainConversation(agentName);
+    }
     getDefinition(cronId) {
         const definition = this.deps.definitions.get(cronId, true);
         if (!definition)

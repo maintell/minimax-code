@@ -48,6 +48,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     return useValue ? value : void 0;
 };
 import { bindTool } from '@mavis/agent-core/tools';
+import { ThinkingLevel } from '@mavis/protocol';
 import { normalizeMavisCommand } from '../../shared/mavis-operation-classifier.js';
 import { isMavisTeamCommand, teamDisabledFailure } from './commands/team.js';
 import { dispatchDofld } from './dispatcher.js';
@@ -152,12 +153,26 @@ let DofldTool = (() => {
     return DofldTool = _classThis;
 })();
 export { DofldTool };
+/**
+ * 冻结当前 Turn 的模型与思考选择。档位只有 runtime 知道，archon-server
+ * 无法事后恢复；未设置 thinking_level 时不写 variant，交给服务端继承。
+ */
 export function currentCloudCronModel(ctx) {
-    const providerId = ctx.parentAgentConfig?.model?.provider?.trim();
-    const modelId = ctx.parentAgentConfig?.model?.model_id?.trim();
+    const model = ctx.parentAgentConfig?.model;
+    if (!model)
+        return undefined;
+    const providerId = model.provider?.trim();
+    const modelId = model.model_id?.trim();
     if (!providerId || !modelId)
         return undefined;
-    return { provider_id: providerId, model_id: modelId };
+    const selection = { provider_id: providerId, model_id: modelId };
+    const level = model.thinking_level;
+    if (level == null)
+        return selection;
+    if (level === ThinkingLevel.OFF)
+        return { ...selection, variant: 'none-thinking' };
+    const effort = model.thinking_effort?.trim();
+    return { ...selection, variant: 'thinking', ...(effort ? { thinking: { effort } } : {}) };
 }
 export { CLOUD_MAVIS_COMMANDS, MavisBaseToolDef, MavisBaseToolDefWithoutTeam, } from './mavis-tool-def.js';
 //# sourceMappingURL=index.js.map

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { and, desc, eq, gt, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, lt, sql } from 'drizzle-orm';
 import { sessionLocks, isDeletionOwnerKind, turnIngress, turnIngressClientRequests, turnIngressSequences, } from '../../../infra/db/schema/turn.js';
 import { COMPACTION_DELETING_OWNER_KIND, DELETION_FENCE_EXPIRES_AT_MS, MAINTENANCE_DELETING_OWNER_KIND, MAINTENANCE_OWNER_KIND, recoverDeadLegacyOwnerInTransaction, recoverExpiredInTransaction, recoverProcessRestartInTransaction, shouldRecoverStalledLegacyTurnLease, SESSION_DELETION_OWNER_KIND, TURN_DELETING_OWNER_KIND, } from './turn-lease-recovery.js';
 import { pendingSettlementOf, recoverAdmissionPendingSettlementInTransaction, recoverPendingSettlementInTransaction, releaseOrPromoteDeletionFence, samePendingSettlement, } from './pending-settlement-recovery.js';
@@ -132,6 +132,7 @@ export function createTurnRepository(options) {
         findReceipt: (turnId) => findTurnReceipt(options, turnId),
         findActiveTurn: async (sessionId) => findActiveTurn(options.db, sessionId, nowMs(), (ownerId) => isOwnedByOtherLiveRuntime(ownerId, { isLeaseOwnerAlive, isLeaseOwnerCurrent })),
         findLatestTurnActivity: async (sessionId) => findLatestTurnActivity(options.db, sessionId),
+        findPreviousTurnStartedAt: async (sessionId, turnId) => findPreviousTurnStartedAt(options.db, sessionId, turnId),
         ...pluginHookSessionPersistence,
         findSteeringReceipt: (input) => findSteeringReceipt(options, input),
         reserveSteeringReceipt: (input) => reserveSteeringReceipt(options, input),
@@ -185,6 +186,22 @@ async function admitRepositoryTurn(options, input, dependencies) {
     }
     publishQueueFacts(options, committed.facts);
     return committed.result;
+}
+function findPreviousTurnStartedAt(db, sessionId, turnId) {
+    const current = db
+        .select({ sequence: turnIngress.acceptedSequence })
+        .from(turnIngress)
+        .where(and(eq(turnIngress.sessionId, sessionId), eq(turnIngress.turnId, turnId)))
+        .get();
+    if (!current || current.sequence === null)
+        return undefined;
+    return db
+        .select({ startedAt: turnIngress.acceptedAtMs })
+        .from(turnIngress)
+        .where(and(eq(turnIngress.sessionId, sessionId), lt(turnIngress.acceptedSequence, current.sequence)))
+        .orderBy(desc(turnIngress.acceptedSequence))
+        .limit(1)
+        .get()?.startedAt;
 }
 function findLatestTurnActivity(db, sessionId) {
     const latest = db

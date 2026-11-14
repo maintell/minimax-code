@@ -1,5 +1,7 @@
 import { getQuickJS } from 'quickjs-emscripten';
-import { ptcToolCallLimitRefusal, } from '../../execution/ptc/contracts.js';
+import { PTC_STORE_MAX_KEY_LENGTH, ptcStoreKeyMessage, ptcToolCallLimitRefusal, } from '../../execution/ptc/contracts.js';
+import { PtcScriptLoadError, ptcScriptError } from './script/errors.js';
+import { loadPtcScript, normalizePtcScriptSpecifier } from './script/loader.js';
 /**
  * Applies the console byte budget in the Worker: lines are forwarded while
  * they fit, then the part that still fits goes out once with `truncated` and
@@ -27,8 +29,108 @@ export function createPtcConsoleSink(maxBytes, emit) {
         emit(fitted, true);
     };
 }
+/**
+ * Lets the guest `import()` the allowed PTC script directories. The loader and
+ * the normalizer are synchronous because QuickJS resolves modules while the
+ * guest is on the stack, so the file has to be read here in the Worker.
+ */
+function installPtcScriptModuleLoader(runtime, input, roots, measureCompute) {
+    // QuickJS retries with an empty name after a refused dynamic import; that is
+    // the same attempt, so only the first refusal is counted.
+    const reportRejected = (status) => {
+        input.onScriptRejected?.(status);
+    };
+    // The specifier the program wrote, kept from the last normalization. QuickJS
+    // asks the normalizer first and then the loader, so the retry below knows
+    // what was refused even though its own name is empty.
+    let lastRequested = '';
+    runtime.setModuleLoader((moduleName) => {
+        if (!moduleName.trim()) {
+            // The retry of a refused import. The program never wrote an empty
+            // path, so the refusal names what it did write instead of reporting a
+            // not-found with nothing after the colon.
+            throw ptcScriptError(`run_code script import was refused: ${lastRequested || 'an unnamed module'}.`, roots);
+        }
+        let script;
+        try {
+            script = measureCompute(() => loadPtcScript(moduleName, roots));
+        }
+        catch (error) {
+            reportRejected(error instanceof PtcScriptLoadError ? error.status : 'rejected');
+            throw error;
+        }
+        input.onScriptLoaded?.({ path: script.path, scope: script.scope, sha256: script.sha256 });
+        return script.source;
+    }, (base, requested) => {
+        // A blank request is QuickJS asking again after a refusal, not a new
+        // import, so it neither replaces the specifier nor counts again.
+        if (requested.trim())
+            lastRequested = requested.trim();
+        try {
+            return normalizePtcScriptSpecifier(base, requested, roots);
+        }
+        catch (error) {
+            if (requested.trim()) {
+                reportRejected(error instanceof PtcScriptLoadError ? error.status : 'rejected');
+            }
+            throw error;
+        }
+    });
+}
 /** At most this many dropped-field paths travel to the host; the outer line lists up to 5. */
 const MAX_REPORTED_DROPPED_PATHS = 5;
+/**
+ * The guest compute clock. Calls nest: only the outermost one opens the
+ * window, so a nested call neither restarts the clock, charges its time a
+ * second time, nor reports the guest idle while an outer one is still on the
+ * stack.
+ *
+ * Nesting happens for real: the module loader runs inside the window the job
+ * pump opened, and the guest runs a module's top-level code right after the
+ * loader returns. Closing the window there cleared the clock and told the host
+ * the guest was idle, so an imported module whose top level loops ran on with
+ * nothing left to stop it, and the host cleared its own compute timer on the
+ * same signal.
+ */
+function createComputeClock(onActivityChange) {
+    let elapsedMs = 0;
+    let startedAtMs;
+    let depth = 0;
+    return {
+        currentMs() {
+            return elapsedMs + (startedAtMs === undefined ? 0 : performance.now() - startedAtMs);
+        },
+        measure(operation) {
+            depth += 1;
+            if (depth > 1) {
+                try {
+                    return operation();
+                }
+                finally {
+                    depth -= 1;
+                }
+            }
+            const startedAt = performance.now();
+            startedAtMs = startedAt;
+            onActivityChange?.(true);
+            try {
+                return operation();
+            }
+            finally {
+                depth -= 1;
+                elapsedMs += performance.now() - startedAt;
+                startedAtMs = undefined;
+                onActivityChange?.(false);
+            }
+        },
+    };
+}
+/** Bounded so a lost runtime cannot flood the log. */
+const DISPOSE_FAILURE_MESSAGE_MAX_CHARS = 200;
+function disposeFailureMessage(error) {
+    const text = error instanceof Error ? error.message : String(error);
+    return text.slice(0, DISPOSE_FAILURE_MESSAGE_MAX_CHARS);
+}
 /** Runs one untrusted async function body in a fresh QuickJS runtime. */
 export async function executePtcQuickJsProgram(input) {
     const quickJs = await getQuickJS();
@@ -45,21 +147,20 @@ export async function executePtcQuickJsProgram(input) {
     // ran; see resolveDecoded.
     let decodeHandle;
     let stopped = input.signal.aborted;
-    let computeElapsedMs = 0;
-    let computeStartedAtMs;
+    const compute = createComputeClock(input.onActivityChange);
     let callCount = 0;
     let pumping = false;
     const checkInterrupted = () => {
         if (stopped || input.signal.aborted)
             return true;
-        return currentComputeMs() >= input.maxComputeMs;
+        return compute.currentMs() >= input.maxComputeMs;
     };
     const pump = () => {
         if (pumping || stopped)
             return;
         pumping = true;
         try {
-            measureCompute(() => {
+            compute.measure(() => {
                 const result = runtime.executePendingJobs();
                 if ('error' in result && result.error)
                     result.error.dispose();
@@ -85,6 +186,9 @@ export async function executePtcQuickJsProgram(input) {
     };
     runtime.setMemoryLimit(input.maxHeapBytes);
     runtime.setInterruptHandler(checkInterrupted);
+    if (input.scriptRoots) {
+        installPtcScriptModuleLoader(runtime, input, input.scriptRoots, compute.measure);
+    }
     input.signal.addEventListener('abort', abort, { once: true });
     try {
         const names = new Set(input.tools.map((tool) => tool.name));
@@ -146,13 +250,16 @@ export async function executePtcQuickJsProgram(input) {
         });
         context.setProp(context.global, '__ptcConsole', consoleCallback);
         consoleCallback.dispose();
-        const setup = measureCompute(() => evaluate(context, createToolsSetup(input.tools.map((tool) => tool.name)), 'ptc_runtime.js'));
+        const withStore = typeof input.storeValue === 'function';
+        if (withStore)
+            bindStore(context, input);
+        const setup = compute.measure(() => evaluate(context, createToolsSetup(input.tools.map((tool) => tool.name), input.directOnlyTools ?? [], withStore), 'ptc_runtime.js'));
         setup.dispose();
         // The setup script leaves its decoder on the global object only long
         // enough for the host to take a handle; guest code never sees it.
         decodeHandle = context.getProp(context.global, '__ptcDecodeForHost');
         evaluate(context, 'delete globalThis.__ptcDecodeForHost;', 'ptc_runtime.js').dispose();
-        rootHandle = measureCompute(() => evaluate(context, wrapCode(input.code), 'run_code.js'));
+        rootHandle = compute.measure(() => evaluate(context, wrapCode(input.code), 'run_code.js'));
         const rootResult = context.resolvePromise(rootHandle);
         pump();
         const resolved = await rootResult;
@@ -171,7 +278,7 @@ export async function executePtcQuickJsProgram(input) {
     catch (error) {
         return {
             ok: false,
-            error: guestFailure(error, stopped || input.signal.aborted, currentComputeMs() >= input.maxComputeMs),
+            error: guestFailure(error, stopped || input.signal.aborted, compute.currentMs() >= input.maxComputeMs),
             pendingRequestIds: [...pending.keys()],
         };
     }
@@ -190,8 +297,12 @@ export async function executePtcQuickJsProgram(input) {
             if (deferred.alive)
                 deferred.dispose();
         refusals.clear();
-        context.dispose();
-        runtime.dispose();
+        // WASM memory grows inside the job queue while large modules compile, and
+        // JS_FreeRuntime then aborts the process ("Assertion failed:
+        // list_empty(&rt->gc_obj_list)") after the program already produced its
+        // result. The result is already computed here, so a failed teardown must
+        // not replace it with a lost one; only the reason is reported.
+        disposeGuest(context, runtime, input.onRuntimeDisposeFailed);
     }
     /**
      * Delivers a refused call's result after the guest call returned (see the
@@ -215,7 +326,16 @@ export async function executePtcQuickJsProgram(input) {
         pending.delete(requestId);
         if (stopped || !deferred.alive)
             return;
-        measureCompute(() => resolveDecoded(context, decodeHandle, deferred, resultJson));
+        // Copying the host result into QuickJS and parsing it is host work, so it
+        // is not charged to the guest compute budget: two multi-megabyte reads
+        // spent about a second there without running one line of guest code, and
+        // the program was killed with compute_budget_exceeded.
+        const decoded = decodeResult(context, decodeHandle, resultJson);
+        // Settling stays inside the budget: resolving looks up `then` on the
+        // result, which guest code can define as an accessor (see the refusal
+        // branch in __ptcCall), so moving this out too would let a guest loop
+        // there with only the wall clock left to stop it.
+        compute.measure(() => settleDecoded(deferred, decoded));
         deferred.dispose();
         queueMicrotask(pump);
     }
@@ -229,63 +349,222 @@ export async function executePtcQuickJsProgram(input) {
         deferred.dispose();
         queueMicrotask(pump);
     }
-    function measureCompute(operation) {
-        const startedAt = performance.now();
-        computeStartedAtMs = startedAt;
-        input.onActivityChange?.(true);
-        try {
-            return operation();
+}
+/**
+ * Binds the two host halves of `store` and `load` before the setup script
+ * wraps them in the guest-visible functions. `__ptcLoadValue` hands back the
+ * value's JSON text so the guest parses it with the JSON.parse saved before
+ * guest code ran; `__ptcStore` receives the text the guest encoded with
+ * `__ptcToJsonData`, so both sides follow one encoding rule.
+ */
+function bindStore(context, input) {
+    const countLoad = context.newFunction('__ptcCountLoad', () => {
+        input.onStoreLoad?.();
+    });
+    context.setProp(context.global, '__ptcCountLoad', countLoad);
+    countLoad.dispose();
+    const countRejected = context.newFunction('__ptcCountRejected', () => {
+        input.onStoreRejected?.();
+    });
+    context.setProp(context.global, '__ptcCountRejected', countRejected);
+    countRejected.dispose();
+    const store = context.newFunction('__ptcStore', (keyHandle, valueHandle, descHandle) => {
+        const key = readStoreKey(context, keyHandle, 'store');
+        // The guest always sends JSON text. Anything else must not be read as
+        // text: a value that encoded to nothing arrives as undefined, and reading
+        // it would store the word "undefined", which the next load cannot parse.
+        if (context.typeof(valueHandle) !== 'string') {
+            throw new Error('PTC store value must be JSON text.');
         }
-        finally {
-            computeElapsedMs += performance.now() - startedAt;
-            computeStartedAtMs = undefined;
-            input.onActivityChange?.(false);
-        }
+        const valueJson = context.getString(valueHandle);
+        const desc = context.typeof(descHandle) === 'string' ? context.getString(descHandle) : undefined;
+        input.storeValue?.(key, valueJson, desc);
+    });
+    context.setProp(context.global, '__ptcStore', store);
+    store.dispose();
+    const load = context.newFunction('__ptcLoadValue', (keyHandle) => {
+        const key = readStoreKey(context, keyHandle, 'load');
+        const json = input.loadValue?.(key);
+        return json === undefined ? context.undefined : context.newString(json);
+    });
+    context.setProp(context.global, '__ptcLoadValue', load);
+    load.dispose();
+}
+/** Reads a guest key, refusing anything the host store would refuse. */
+function readStoreKey(context, handle, fn) {
+    const key = context.typeof(handle) === 'string' ? context.getString(handle) : '';
+    if (key.length === 0 || key.length > PTC_STORE_MAX_KEY_LENGTH) {
+        throw new Error(ptcStoreKeyMessage(fn));
     }
-    function currentComputeMs() {
-        return (computeElapsedMs +
-            (computeStartedAtMs === undefined ? 0 : performance.now() - computeStartedAtMs));
-    }
+    return key;
 }
 function evaluate(context, source, fileName) {
     return unwrap(context, context.evalCode(source, fileName));
 }
 /**
- * Settles a guest call with the parsed result. JSON.parse runs in a direct
- * host-to-guest call, not in a promise job (the former `.then(JSON.parse)`):
- * with quickjs-emscripten 0.31, parsing a string of about 4 MB or more inside
- * a job leaks QuickJS objects, so freeing the runtime aborts the Worker with
- * "Assertion failed: list_empty(&rt->gc_obj_list)" after the program already
- * finished and its result is lost. Sixteen parallel ~1 MiB glob results hit
- * it; the same parse in a direct call frees cleanly. The decoder calls the
- * JSON.parse saved before guest code ran, so decoding itself never runs guest
- * code. Only called from host microtasks, never inside a guest-to-host
- * callback: resolving with an object looks up `then` on it, and a guest
- * accessor there must not be able to re-enter the callback. The caller
- * measures compute time.
+ * Frees the guest at the end of a program without letting a teardown abort
+ * discard the result that was already computed.
+ *
+ * quickjs-emscripten 0.31 can reach `JS_FreeRuntime` with objects still on
+ * the runtime's GC list and abort on `list_empty(&rt->gc_obj_list)`: a program
+ * that allocates a few MiB or more after it awaited a host call leaves such
+ * objects behind (the allocation happens in a resumed job, after the host
+ * already handed a handle back). The abort used to propagate out of this
+ * `finally`, so a program that had already produced its return value lost it
+ * and the whole Worker died. The guest is unreachable from here either way,
+ * and the Worker is terminated right after, so swallowing the abort only
+ * gives up memory the process is about to release anyway.
+ *
+ * Both calls are attempted: `context.dispose()` can throw the same way, and
+ * skipping `runtime.dispose()` after it would leak the whole runtime. Either
+ * failure is reported through the same callback, with its own code, so a
+ * context that could not be freed leaves the same trace a lost runtime does.
  */
-function resolveDecoded(context, decoder, deferred, resultJson) {
+function disposeGuest(context, runtime, onRuntimeDisposeFailed) {
+    try {
+        context.dispose();
+    }
+    catch (error) {
+        // Teardown aborts are not the program's outcome; see the comment above.
+        onRuntimeDisposeFailed?.({
+            code: 'context_dispose_failed',
+            message: disposeFailureMessage(error),
+        });
+    }
+    try {
+        runtime.dispose();
+    }
+    catch (error) {
+        // The Worker is torn down right after this anyway, so the result stands
+        // and only the reason is reported.
+        onRuntimeDisposeFailed?.({
+            code: 'runtime_dispose_failed',
+            message: disposeFailureMessage(error),
+        });
+    }
+}
+/**
+ * Parses a host result and returns the handle to settle the guest call with.
+ * JSON.parse runs in a direct host-to-guest call, not in a promise job (the
+ * former `.then(JSON.parse)`): with quickjs-emscripten 0.31, parsing a string
+ * of about 4 MB or more inside a job leaks QuickJS objects, so freeing the
+ * runtime aborts the Worker with "Assertion failed:
+ * list_empty(&rt->gc_obj_list)" after the program already finished and its
+ * result is lost. Sixteen parallel ~1 MiB glob results hit it; the same parse
+ * in a direct call frees cleanly. The decoder calls the JSON.parse saved
+ * before guest code ran, so decoding itself never runs guest code. Only
+ * called from host microtasks, never inside a guest-to-host callback:
+ * settling with an object looks up `then` on it, and a guest accessor there
+ * must not be able to re-enter the callback.
+ *
+ * The caller does not measure compute time here. This step only copies bytes
+ * into QuickJS and runs the saved JSON.parse, and a multi-megabyte result
+ * takes long enough on a loaded machine to exhaust the budget on its own; the
+ * wall clock still covers it.
+ */
+function decodeResult(context, decoder, resultJson) {
     if (!decoder)
         throw new Error('PTC result decoder is not ready.');
     const text = context.newString(resultJson);
-    let decoded;
     try {
-        decoded = context.callFunction(decoder, context.undefined, text);
+        const decoded = context.callFunction(decoder, context.undefined, text);
+        return 'value' in decoded ? { value: decoded.value } : { error: decoded.error };
     }
     finally {
         text.dispose();
     }
+}
+/**
+ * Settles a guest call with an already parsed result. The caller measures
+ * compute time here, unlike the decode step: `resolve` looks up `then` on
+ * the result and the guest can define that as an accessor, so this is guest
+ * code and has to stay inside the compute budget.
+ *
+ * Invalid JSON, or the guest heap or compute budget running out while
+ * parsing, rejects only this call: the guest sees that error here, as with
+ * the former promise-job parse, and the program decides what to do with it.
+ */
+function settleDecoded(deferred, decoded) {
     if ('value' in decoded) {
         deferred.resolve(decoded.value);
         decoded.value.dispose();
         return;
     }
-    // Invalid JSON, or the guest heap or compute budget running out while
-    // parsing: the guest sees that error on this call, as with the former
-    // promise-job parse, and the program decides what to do with it.
     deferred.reject(decoded.error);
     decoded.error.dispose();
 }
+/**
+ * `store` and `load`, added only when the host gave this program a store.
+ *
+ * Both are synchronous. `store` encodes with the same rule as a return value
+ * (`__ptcToJsonData`), so a value that could be returned can be stored, and
+ * refuses `undefined` — and a value whose encoding is `undefined`, such as one
+ * whose `toJSON` returns it — because the store has no delete: storing `null`
+ * over a key only appends another record, it does not free the bytes already
+ * written.
+ * `load` returns whatever `__ptcLoadValue` holds, or
+ * undefined when the Session never stored that key; the parse uses the
+ * JSON.parse saved before guest code ran, so a program that replaced JSON
+ * still gets its real stored values, and the result is always a fresh copy.
+ */
+const STORE_SETUP = `
+const __ptcStoreSink = globalThis.__ptcStore;
+const __ptcLoadSink = globalThis.__ptcLoadValue;
+const __ptcCountLoadSink = globalThis.__ptcCountLoad;
+const __ptcCountRejectedSink = globalThis.__ptcCountRejected;
+const __ptcStoreKey = (key, fn) => {
+  if (typeof key !== "string" || key.length === 0 || key.length > ${PTC_STORE_MAX_KEY_LENGTH}) {
+    throw new TypeError(fn === "load" ? ${JSON.stringify(ptcStoreKeyMessage('load'))} : ${JSON.stringify(ptcStoreKeyMessage('store'))});
+  }
+  return key;
+};
+// One catch per entry point counts the refusal exactly once, whatever raised
+// it: the key rules, an undefined value, a desc that is not a string, anything
+// __ptcToJsonData refuses (cycles, BigInt, Map/Set, class instances) and the
+// bridge's own size limit. Counting at each throw site instead would miss the
+// encoder's failures and double-count the ones the host also sees.
+globalThis.store = (key, value, desc) => {
+  try {
+    __ptcStoreKey(key, "store");
+    if (value === undefined) {
+      throw new TypeError("PTC store cannot delete a key: store(key, undefined) is not supported.");
+    }
+    if (desc !== undefined && typeof desc !== "string") {
+      throw new TypeError("PTC store desc must be a string.");
+    }
+    const encoded = __ptcToJsonData(value, "PTC stored value is");
+    if (encoded.value === __ptcSkipped) {
+      throw new TypeError("PTC stored value is not JSON-serializable at $: a function is not JSON data");
+    }
+    // JSON.stringify of this symbol is undefined, which the host sink would
+    // otherwise read as the text "undefined" and the next load could not
+    // parse. A return value treats the same encoding as "no value"; the store
+    // cannot, because it has no delete.
+    if (encoded.value === __ptcUndefined) {
+      throw new TypeError("PTC store cannot delete a key: this value encodes to undefined, e.g. its toJSON returned undefined.");
+    }
+    __ptcStoreSink(key, JSON.stringify(encoded.value), desc);
+  } catch (error) {
+    __ptcCountRejectedSink();
+    throw error;
+  }
+};
+globalThis.load = (key) => {
+  __ptcCountLoadSink();
+  try {
+    __ptcStoreKey(key, "load");
+    const json = __ptcLoadSink(key);
+    return json === undefined ? undefined : __ptcJsonParse(json);
+  } catch (error) {
+    __ptcCountRejectedSink();
+    throw error;
+  }
+};
+delete globalThis.__ptcStore;
+delete globalThis.__ptcLoadValue;
+delete globalThis.__ptcCountLoad;
+delete globalThis.__ptcCountRejected;
+`;
 /** Shown instead of a console line that was not a primitive string. */
 const DROPPED_CONSOLE_LINE = '[PTC dropped a console line that was not a string]';
 /**
@@ -311,9 +590,25 @@ function unwrap(context, result) {
         failure.dispose();
     }
 }
-function createToolsSetup(names) {
+/**
+ * The error of tools.<name> for a tool this Turn offers only as a direct call.
+ * The Chinese sentence is the product wording the model and the user read; the
+ * English one says what to do instead.
+ */
+function ptcDirectOnlyToolError(name) {
+    return `${name} 只能直接调用，不能在 run_code 里调用。Call ${name} as a top-level tool call outside run_code.`;
+}
+function createToolsSetup(names, directOnly, withStore = false) {
+    const callable = new Set(names);
     const definitions = names
         .map((name) => `Object.defineProperty(__ptcTools, ${JSON.stringify(name)}, { enumerable: true, value: (args) => __ptcCall(${JSON.stringify(name)}, __ptcEncodeArgs(args)) });`)
+        .join('\n');
+    // Not enumerable: Object.keys(tools) still lists only what a program can call.
+    // The throw stops the program like the "not a function" it replaces, so no
+    // later call of the same program runs on a wrong assumption.
+    const directOnlyStubs = [...new Set(directOnly)]
+        .filter((name) => !callable.has(name))
+        .map((name) => `Object.defineProperty(__ptcTools, ${JSON.stringify(name)}, { enumerable: false, value: () => { throw new TypeError(${JSON.stringify(ptcDirectOnlyToolError(name))}); } });`)
         .join('\n');
     // The JSON boundary follows JSON.stringify (undefined fields dropped, array
     // holes/undefined/NaN/Infinity become null, functions dropped, toJSON
@@ -446,6 +741,7 @@ const __ptcJsonParse = JSON.parse;
 // results are parsed by a direct host call, never in a promise job.
 globalThis.__ptcDecodeForHost = (json) => __ptcJsonParse(json);
 ${definitions}
+${directOnlyStubs}
 Object.freeze(__ptcTools);
 globalThis.tools = __ptcTools;
 globalThis.console = Object.freeze({ log: __ptcLog, info: __ptcLog, warn: __ptcLog, error: __ptcLog, debug: __ptcLog });
@@ -459,6 +755,7 @@ globalThis.console = Object.freeze({ log: __ptcLog, info: __ptcLog, warn: __ptcL
 // Deliberately not in the run_code description or PTC section.
 globalThis.text = __ptcLog;
 globalThis.image = (value) => value;
+${withStore ? STORE_SETUP : ''}
 delete globalThis.__ptcConsole;
 delete globalThis.process;
 delete globalThis.require;

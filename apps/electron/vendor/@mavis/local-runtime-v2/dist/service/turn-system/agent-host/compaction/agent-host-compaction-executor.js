@@ -1,5 +1,5 @@
-import { composeStreamFn, recordPiLLMCallMetrics, withLLMRetry, } from '@mavis/agent-core/pi-turn-runner';
-import { readSessionAgentExecutionSnapshot } from '../preparation/session-agent-execution-snapshot.js';
+import { composeStreamFn, recordPiLLMCallMetrics, withLLMRetry, withTurnRequestPhase, } from '@mavis/agent-core/pi-turn-runner';
+import { readSessionAgentExecutionSnapshot } from '../preparation/config/session-agent-execution-snapshot.js';
 import { createSecretFreeModelContextAssemblyContext } from '../assembly-context.js';
 import { AgentHostDependencyUnavailableError } from '../empty-dependencies.js';
 import { hasAcceptedLeaseIdentity, isAbortSignalLike } from '../accepted-lease.js';
@@ -8,6 +8,7 @@ import { AgentHostCommittedHistoryWriter } from '../history/committed-history-wr
 import { captureSemanticSnapshot } from '../history/semantic-identity.js';
 import { captureContextCompactionResult, ContextCompactionAttemptFactory, ContextCompactionResultValidationError, createCompactionTokenUsageAccumulator, describeUnknownError, logCheckpointGeneratedBestEffort, logCompactionFailureBestEffort, observeCompactionBestEffort, recordCheckpointAttemptBestEffort, } from './context-compaction.js';
 import { recordSharedPrefixFallbackBestEffort, resolveCheckpointRequestShape, } from './checkpoint-request-shape.js';
+import { segmentCompactionRoute, withSegmentSessionIdentity } from './segment-turn.js';
 import { createCompactionLifecycleMetadata, createManualCompactionChange, } from './compaction-history.js';
 import { joinPrompt, readPreparedContextUsagePromptRanges, readPreparedSystemPrompt, resolveProviderContextMode, } from '../execution/prompt.js';
 import { loadLocalConfigHooks, localPluginHookCoordinator, } from '../assembly/local-turn-plugin-hooks.js';
@@ -227,6 +228,7 @@ export class AgentHostCompactionExecutor {
                 compaction: prepared.value.compaction,
                 change: prepared.value.change,
             });
+            await runSegmentFollowUp(outcome, prepared.value.afterCommit);
             return this.finishCommittedPluginCompaction({
                 input,
                 hooks,
@@ -251,13 +253,13 @@ export class AgentHostCompactionExecutor {
             if (agent.agentName !== session.agentName) {
                 throw new AgentCompactionAssociationError('agentName');
             }
-            const preparation = await compactionDependencies.preparation.prepareCompaction({
+            const preparation = withSegmentSessionIdentity(await compactionDependencies.preparation.prepareCompaction({
                 turnId: input.lease.turnId,
                 session,
                 agent,
                 history,
                 ...(desktopCapabilities ? { desktopCapabilities } : {}),
-            });
+            }), await compactionDependencies.segments?.providerSessionId?.(input.lease.sessionId));
             const { thinkingLevel = 'off' } = preparation.llm;
             state.thinkingLevel = thinkingLevel;
             const assemblyContext = createSecretFreeModelContextAssemblyContext({
@@ -269,13 +271,15 @@ export class AgentHostCompactionExecutor {
                 history: piHistory,
             });
             const assembly = await this.dependencies.assembleModelContext(assemblyContext, desktopCapabilities);
-            const streamFn = withLLMRetry(composeStreamFn(preparation.llm), {
+            // Like automatic compaction, every request of a manual one carries the
+            // compaction phase; the host names the header for the managed route only.
+            const streamFn = withTurnRequestPhase(withLLMRetry(composeStreamFn(preparation.llm), {
                 sessionId: input.lease.sessionId,
                 turnId: input.lease.turnId,
                 scope: 'compaction',
                 lifecycle: preparation.llm.callLifecycle,
-                onCallSettled: (event) => recordPiLLMCallMetrics(compactionDependencies.metricsClient, 'compact', event),
-            });
+                onCallSettled: (event) => recordPiLLMCallMetrics(compactionDependencies.metricsClient, 'compact', event, preparation.llm.route),
+            }), () => 'compaction', preparation.llm.turnPhaseHeader);
             const payloadTransform = this.dependencies.buildRequestPayloadTransform?.({
                 agentConfig: preparation.agentConfig,
                 llm: preparation.llm,
@@ -293,6 +297,50 @@ export class AgentHostCompactionExecutor {
                 })),
                 ...(contextUsagePromptRanges === undefined ? {} : { contextUsagePromptRanges }),
             }, 'compaction');
+            let started = false;
+            const observeStarted = () => {
+                if (started)
+                    return;
+                started = true;
+                observeCompactionBestEffort(compactionDependencies.observer, {
+                    context,
+                    attemptId,
+                    status: 'started',
+                    reason: 'manual',
+                });
+            };
+            const segmentCommit = await compactionDependencies.segments?.compactManual({
+                sessionId: input.lease.sessionId,
+                turnId: input.lease.turnId,
+                route: segmentCompactionRoute({
+                    llm: preparation.llm,
+                    sessionId: input.lease.sessionId,
+                    turnId: input.lease.turnId,
+                    ...(payloadTransform ? { payloadTransform } : {}),
+                    compaction: compactionDependencies,
+                }),
+                expectedMessageCount: history.messages.length,
+                systemPrompt: providerContext.systemPrompt,
+                tools: [...providerContext.tools],
+                signal: input.lease.signal,
+                onStarted: observeStarted,
+            });
+            if (segmentCommit) {
+                // Bunny profile (spec 12.4): the segment is rebuilt instead of the default checkpoint.
+                const captured = captureContextCompactionResult(segmentCommit.result, history.messages.length);
+                if (captured.status === 'unchanged') {
+                    throw new ContextCompactionResultValidationError('manualStatus');
+                }
+                const completed = requireManualCompletedCompaction(captured);
+                const change = createManualCompactionChange(input, history.messages, completed, attemptId);
+                validateCanonicalHistoryChange(change, 'replace');
+                return {
+                    status: 'completed',
+                    compaction: completed,
+                    change,
+                    afterCommit: segmentCommit.afterCommit,
+                };
+            }
             const compaction = captureContextCompactionResult(await compactionDependencies.manual.compactManual(createManualCompactionRequest({
                 input,
                 messages: piHistory,
@@ -305,12 +353,7 @@ export class AgentHostCompactionExecutor {
                 contextUsagePromptRanges: providerContext.contextUsagePromptRanges,
                 checkpointRequestShape: resolveCheckpointRequestShape(preparation.llm, compactionDependencies.checkpointSharedPrefixEnabled),
             }), {
-                onStarted: () => observeCompactionBestEffort(compactionDependencies.observer, {
-                    context,
-                    attemptId,
-                    status: 'started',
-                    reason: 'manual',
-                }),
+                onStarted: observeStarted,
                 onCheckpointGenerated: (metadata) => {
                     state.checkpoint = logCheckpointGeneratedBestEffort(this.dependencies.logger, {
                         context,
@@ -498,6 +541,17 @@ async function updateManualCompactionHookTranscript(transcript, runtimeContext, 
         return { ...runtimeContext, transcriptPath: null, codexTranscriptPath: null };
     }
 }
+/** Segment profile follow-up of a committed manual compaction; it never fails the outcome. */
+async function runSegmentFollowUp(outcome, afterCommit) {
+    if (outcome.status !== 'completed' || !afterCommit)
+        return;
+    try {
+        await afterCommit();
+    }
+    catch {
+        // Media descriptions, delivery baseline and traces are best effort.
+    }
+}
 function requireManualCompletedCompaction(result) {
     if (result.status !== 'completed') {
         throw new ContextCompactionResultValidationError('manualStatus');
@@ -530,13 +584,27 @@ export function captureAcceptedCompactionInput(input) {
     });
     const reason = normalizeOptionalText(Reflect.get(input, 'reason'));
     const customInstructions = normalizeOptionalText(Reflect.get(input, 'customInstructions'));
+    const contextReset = captureContextReset(Reflect.get(input, 'contextReset'));
     const captured = Object.freeze({
         lease,
         ...(reason ? { reason } : {}),
         ...(customInstructions ? { customInstructions } : {}),
+        ...(contextReset ? { contextReset } : {}),
     });
     validateCompactionInput(captured);
     return captured;
+}
+function captureContextReset(value) {
+    if (!value || typeof value !== 'object')
+        return undefined;
+    const requestedAtMs = Reflect.get(value, 'requestedAtMs');
+    return Object.freeze({
+        hadRunningTurn: Reflect.get(value, 'hadRunningTurn') === true,
+        forcedStop: Reflect.get(value, 'forcedStop') === true,
+        requestedAtMs: typeof requestedAtMs === 'number' && Number.isFinite(requestedAtMs)
+            ? requestedAtMs
+            : Date.now(),
+    });
 }
 function validateCompactionInput(input) {
     const { lease } = input;

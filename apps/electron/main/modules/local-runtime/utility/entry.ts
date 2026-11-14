@@ -38,6 +38,7 @@ import { UtilityMiniAppSurfaceClient } from "./miniapp-surface-broker";
 import { UtilityMiniAppToolBroker } from "./miniapp-tool-broker";
 import { createUtilityProxyFetch } from "./proxy-fetch";
 import { resolveElectronNetFetch } from "../electron-net-fetch";
+import { resolveElectronDeviceOnline } from "./device-online";
 import { createNetworkServiceAwareFetch, isRuntimeNetworkServiceGoneMessage } from "./network-service-fetch";
 import { UtilityRuntimeMemoryMonitor } from "./runtime-memory-monitor";
 import { createReconnectingComputerUseClient, UtilityComputerUseBrokerClient } from "./computer-use-broker";
@@ -84,6 +85,24 @@ function readUtilityDataContributionEnabled(runtime) {
     catch {
         return DATA_CONTRIBUTION_DEFAULT_ENABLED;
     }
+}
+/** Chromium's online state for the offline wait; logs once when it is unavailable. */
+function electronDeviceOnlineOption() {
+    let isDeviceOnline;
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        isDeviceOnline = process.versions.electron
+            ? resolveElectronDeviceOnline(require('electron'))
+            : undefined;
+    }
+    catch {
+        isDeviceOnline = undefined;
+    }
+    if (!isDeviceOnline) {
+        warn('Chromium online state unavailable; offline detection uses network interfaces only');
+        return {};
+    }
+    return { isDeviceOnline };
 }
 function importEsm(specifier) {
     if (useVitestImport) {
@@ -201,7 +220,9 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     let contextWindowUsageEnabled = init.contextWindowUsageEnabled !== false;
     let runawayGuardConfig = init.runawayGuardConfig ?? {};
     let promptSuggestionPolicy = init.promptSuggestionPolicy ?? {};
+    let bunnyPolicy = init.bunnyPolicy ?? {};
     let toolResultCompactionConfig = init.toolResultCompactionConfig ?? {};
+    let bunnyContextConfig = init.bunnyContextConfig ?? {};
     // Main only ever sends a complete, validated policy. An older main that sends
     // none leaves the built-in policy in force — never an empty one.
     let collectionPolicy = init.collectionPolicy ?? DEFAULT_COLLECTION_POLICY;
@@ -273,7 +294,10 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         isContextWindowUsageEnabled: () => contextWindowUsageEnabled,
         getRunawayGuardConfig: () => runawayGuardConfig,
         getPromptSuggestionPolicy: () => promptSuggestionPolicy,
+        ...electronDeviceOnlineOption(),
+        getBunnyPolicy: () => bunnyPolicy,
         getToolResultCompactionConfig: () => toolResultCompactionConfig,
+        getBunnyContextConfig: () => bunnyContextConfig,
         getCollectionPolicy: () => collectionPolicy,
         createWorkspaceIndexingObservationSink: () => {
             const ownerUserId = authContext?.realUserID;
@@ -285,6 +309,7 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
                 event,
             });
         },
+        onPowerDemandChanged: brokers.reportPowerDemand,
         ...(proxyFetch ? { fetchImpl: proxyFetch.fetch } : {}),
         ...(init.evalCapture
             ? {
@@ -378,8 +403,14 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         handleRequest: (request) => host.apiHost.handleRequest(request),
         createTransportHost: runtime.createRuntimeTransportHost,
         createStreamCoordinator: runtime.createRuntimeTransportStreamCoordinator,
-        collectSessionReport: async (sessionId) => {
+        collectSessionReport: async (sessionId, scope) => {
             const diagnostics = host.application?.diagnostics;
+            if (scope === 'bunny') {
+                if (!diagnostics?.collectBunnyFeedbackReport) {
+                    throw new Error('bunny_feedback_capability_unavailable');
+                }
+                return (await diagnostics.collectBunnyFeedbackReport(sessionId));
+            }
             if (!diagnostics?.collectSessionReport) {
                 throw new Error('session_report_capability_unavailable');
             }
@@ -426,8 +457,14 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
         setPromptSuggestionPolicy: (policy) => {
             promptSuggestionPolicy = policy;
         },
+        setBunnyPolicy: (policy) => {
+            bunnyPolicy = policy;
+        },
         setToolResultCompactionConfig: (config) => {
             toolResultCompactionConfig = config;
+        },
+        setBunnyContextConfig: (config) => {
+            bunnyContextConfig = config;
         },
         setCollectionPolicy: (policy) => {
             collectionPolicy = policy;
@@ -564,6 +601,15 @@ if (parentPort) {
                     }
                     catch {
                         // Product observation must not affect capture or search.
+                    }
+                },
+                reportPowerDemand: (active) => {
+                    try {
+                        const message = { type: 'runtime-power-demand', active };
+                        parentPort.postMessage(message);
+                    }
+                    catch {
+                        // Power policy must not affect Turn or Scheduler behavior.
                     }
                 },
             }, ports);

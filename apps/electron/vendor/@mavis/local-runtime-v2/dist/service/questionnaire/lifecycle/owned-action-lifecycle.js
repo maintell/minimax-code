@@ -1,3 +1,4 @@
+import { isDeferredPluginContinuation, OwnedActionDeferredError } from './owned-action-deferral.js';
 export class QuestionnaireOwnedActionLifecycle {
     deps;
     injectReply;
@@ -8,12 +9,22 @@ export class QuestionnaireOwnedActionLifecycle {
     async reconcile(dispatch) {
         let completed = 0;
         const failures = [];
+        const deferred = [];
         for (const record of await this.deps.store.findOwnedActionsPendingCompletion()) {
+            // A host without the Plugin owner (TUI on the same data dir) leaves these to the Desktop.
+            if (record.request.mode === 'plugin-preparation' &&
+                !this.deps.ownedActionHandler?.handles(record)) {
+                continue;
+            }
             try {
                 await this.completePersistedAction(record, dispatch);
                 completed += 1;
             }
             catch (error) {
+                if (isDeferredPluginContinuation(record, error)) {
+                    deferred.push(record.requestId);
+                    continue;
+                }
                 failures.push(error);
                 this.deps.emitBusEvent('questionnaire.recovery_inject_failed', {
                     requestId: record.requestId,
@@ -25,6 +36,9 @@ export class QuestionnaireOwnedActionLifecycle {
         if (failures.length > 0) {
             throw new AggregateError(failures, 'Owned Questionnaire action reconciliation remains incomplete');
         }
+        // Still owed, so the owner keeps retrying, but nothing failed.
+        if (deferred.length > 0)
+            throw new OwnedActionDeferredError(deferred);
         return completed;
     }
     async completePersistedAction(record, dispatch) {
@@ -76,6 +90,15 @@ export class QuestionnaireOwnedActionLifecycle {
     }
     route(record, action, dispatch) {
         return this.requireHandler(record).route({ record, action, dispatch });
+    }
+    /**
+     * Owner precondition for a live reply; runs before the answer is persisted.
+     * Without a bound owner the reply keeps the existing persisted-then-recover path.
+     */
+    async validateReply(record, reply) {
+        const handler = this.deps.ownedActionHandler;
+        if (handler?.handles(record))
+            await handler.validateReply?.(record, reply);
     }
     requireHandler(record) {
         const handler = this.deps.ownedActionHandler;

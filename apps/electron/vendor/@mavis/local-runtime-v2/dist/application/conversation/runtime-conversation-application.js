@@ -33,6 +33,7 @@ export function createRuntimeConversationApplication(options) {
         sideChats: options.sessionSystem.sideChats,
         attachmentRegistration: options.attachmentRegistration,
         threadGoal: { pauseActiveForAbort: options.pauseActiveForAbort },
+        noteUserMessageAccepted: options.noteUserMessageAccepted,
         steer: (input) => options.runtimeConversation.ingress.steer(input),
         queueSteer,
         ...(options.undeliveredMessages ? { undeliveredMessages: options.undeliveredMessages } : {}),

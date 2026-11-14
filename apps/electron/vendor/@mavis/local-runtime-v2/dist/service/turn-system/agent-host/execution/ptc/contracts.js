@@ -1,5 +1,37 @@
+/**
+ * The PTC child tool whose settled results the host reads to record a save.
+ * Kept equal to `SAVE_PTC_SCRIPT_NAME` in `@mavis/agent-tools`
+ * (desktop/ptc-script-save.ts): the Worker and the orchestration core may not
+ * import that package, so the name is spelled out on both sides.
+ */
+export const PTC_SCRIPT_SAVE_TOOL_NAME = 'save_run_code_script';
+/**
+ * One line: control characters and newlines become spaces and runs of
+ * whitespace collapse. Same rule as `ptcScriptSingleLine` in
+ * `@mavis/agent-tools` (desktop/ptc-script-text.ts), repeated here for the same
+ * reason as the tool name above.
+ */
+export function ptcScriptDescriptionText(value) {
+    return value
+        .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+        .replace(/\s+/gu, ' ')
+        .trim();
+}
+export function ptcScriptInvocation(args) {
+    if (!args || typeof args !== 'object' || Array.isArray(args))
+        return { kind: 'inline' };
+    const value = args.path;
+    if (value === undefined || value === null)
+        return { kind: 'inline' };
+    if (typeof value !== 'string')
+        return { kind: 'invalid', value };
+    const path = value.trim();
+    return path === '' ? { kind: 'inline' } : { kind: 'script', path };
+}
 export const PTC_LIMITS = {
-    maxCodeBytes: 64 * 1024,
+    // Program source length is deliberately not budgeted: nothing here refuses a
+    // call for how long its code is. The heap, compute, wall clock and bridge
+    // limits below are what bound a program.
     maxHeapBytes: 64 * 1024 * 1024,
     maxComputeMs: 1_000,
     // Default only. run_code passes the time left until the Agent Core batch
@@ -95,6 +127,58 @@ export function ptcToolCallLimitRefusal(requestId, maxToolCalls) {
         },
     };
 }
+/**
+ * Longest key `store` and `load` accept. The guest's setup script, the Worker
+ * and the host store all read it from here, so the three cannot drift.
+ */
+export const PTC_STORE_MAX_KEY_LENGTH = 256;
+/** The key rule's message; `fn` names the entry point that refused the call. */
+export function ptcStoreKeyMessage(fn) {
+    return `PTC ${fn} key must be a string of 1 to ${PTC_STORE_MAX_KEY_LENGTH} characters.`;
+}
+/**
+ * The whole write rule in one place: key shape, encoded size and desc type.
+ * The Worker applies it to what the guest sends and the host store applies it
+ * again to what it stages, so both refuse the same writes with the same text.
+ */
+export function validatePtcStoreWrite(write, maxValueBytes) {
+    if (typeof write.key !== 'string' || write.key.length === 0) {
+        throw new Error('PTC store key must be a non-empty string.');
+    }
+    if (write.key.length > PTC_STORE_MAX_KEY_LENGTH) {
+        throw new Error(`PTC store key is longer than ${PTC_STORE_MAX_KEY_LENGTH} characters.`);
+    }
+    if (typeof write.valueJson !== 'string') {
+        throw new Error('PTC store value must be JSON text.');
+    }
+    const bytes = new TextEncoder().encode(write.valueJson).byteLength;
+    if (bytes > maxValueBytes) {
+        throw new Error(`PTC stored value is ${bytes} bytes, over the ${maxValueBytes}-byte limit; store a smaller value.`);
+    }
+    // A long desc is not an error: it is only a reminder label, so it is cut
+    // when the record is written instead of failing the program's store call.
+    if (write.desc !== undefined && typeof write.desc !== 'string') {
+        throw new Error('PTC store desc must be a string.');
+    }
+}
+/**
+ * The shared memory one blocked `load` is answered through: `Int32Array(buffer,
+ * 0, 2)` is `[state, bytesWritten]` and the value starts at `headerBytes`. The
+ * Worker allocates it and parks on it, the host writes the answer into it; both
+ * sides read the layout from here so the two cannot disagree.
+ */
+export const PTC_STORE_LOAD = {
+    /** The Worker is parked and the host has not answered yet. */
+    pending: 0,
+    /** The host answered; `bytesWritten` is the value's length, or `missing`. */
+    ready: 1,
+    /** The execution stopped while the Worker was parked. */
+    stopped: 2,
+    /** Size of the two control words before the value. */
+    headerBytes: 8,
+    /** `bytesWritten` of an answer that found no value under the key. */
+    missing: -1,
+};
 export function mergedPtcLimits(overrides = {}) {
     return { ...PTC_LIMITS, ...overrides };
 }

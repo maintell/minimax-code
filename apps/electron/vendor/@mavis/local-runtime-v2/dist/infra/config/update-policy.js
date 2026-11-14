@@ -1,4 +1,4 @@
-import { isAskUserContextPolicy, isAskUserPolicy } from '@mavis/config';
+import { isAskUserContextPolicy, isAskUserPolicy, isPluginRecommendationPluginName, PLUGIN_RECOMMENDATION_DISMISSED_MAX, } from '@mavis/config';
 import { LocalConfigValidationError } from './raw-config.js';
 // BYOK trees ('minimax_api', 'custom_provider') are intentionally excluded
 // from both whitelists below: they hold plaintext API keys and must only be
@@ -23,6 +23,10 @@ const LOCAL_CONFIG_MUTABLE_FIELDS = new Set([
     'dataContribution',
     'askUser',
     'promptSuggestion',
+    'quotaAutoResume',
+    'nextStepBox',
+    'bunny',
+    'pluginRecommendation',
     'subagent',
 ]);
 // Roots whose child keys are open-ended (model ids, agent names, beta flags…).
@@ -45,6 +49,10 @@ const EXACT_DOTTED_MUTABLE_ROOTS = new Set([
     'dataContribution',
     'askUser',
     'promptSuggestion',
+    'quotaAutoResume',
+    'nextStepBox',
+    'bunny',
+    'pluginRecommendation',
     'subagent',
 ]);
 // `askUser.enabled` 刻意不在白名单里：它决定是否给模型 ask_user 工具，属于
@@ -60,6 +68,11 @@ const EXACT_DOTTED_MUTABLE_FIELDS = new Set([
     'dataContribution.enabled',
     ...ASK_USER_POLICY_FIELDS,
     'promptSuggestion.enabled',
+    'quotaAutoResume.enabled',
+    'nextStepBox.enabled',
+    'bunny.enabled',
+    'pluginRecommendation.enabled',
+    'pluginRecommendation.dismissedPlugins',
     'subagent.maxConcurrentPerSession',
 ]);
 const LOCAL_PERMISSION_MODES = new Set([
@@ -73,10 +86,14 @@ export const DANGEROUS_CONFIG_PATH_SEGMENTS = new Set(['__proto__', 'prototype',
 export function isPlainRecord(value) {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
+const EXACT_MUTABLE_LEAVES = new Set([
+    'miniAppSuggestion.enabled',
+    'permission.policyOwner',
+    'permission.storageWriteVersion',
+    'permission.nativeDelete',
+]);
 export function assertMutableConfigField(field) {
-    if (field === 'permission.policyOwner' ||
-        field === 'permission.storageWriteVersion' ||
-        field === 'permission.nativeDelete')
+    if (EXACT_MUTABLE_LEAVES.has(field))
         return;
     const parts = field.split('.');
     const [root, ...children] = parts;
@@ -139,6 +156,10 @@ function validatePermissionConfigValue(field, value) {
 }
 const LOCAL_CONFIG_VALUE_VALIDATORS = new Map([
     [
+        'miniAppSuggestion.enabled',
+        (value) => validateBoolean(value, 'miniAppSuggestion.enabled must be a boolean'),
+    ],
+    [
         'worktreeRefreshBeforeCreate',
         (value) => validateBoolean(value, 'Invalid worktreeRefreshBeforeCreate'),
     ],
@@ -158,7 +179,38 @@ const LOCAL_CONFIG_VALUE_VALIDATORS = new Map([
         'promptSuggestion.enabled',
         (value) => validateBoolean(value, 'promptSuggestion.enabled must be a boolean'),
     ],
+    [
+        'quotaAutoResume.enabled',
+        (value) => validateBoolean(value, 'quotaAutoResume.enabled must be a boolean'),
+    ],
+    ['bunny.enabled', (value) => validateBoolean(value, 'bunny.enabled must be a boolean')],
+    ['bunny', (value, field) => validateBunnyConfigRecord(requireConfigRecord(field, value))],
+    [
+        'nextStepBox.enabled',
+        (value) => validateBoolean(value, 'nextStepBox.enabled must be a boolean'),
+    ],
+    [
+        'pluginRecommendation.enabled',
+        (value) => validateBoolean(value, 'pluginRecommendation.enabled must be a boolean'),
+    ],
+    ['pluginRecommendation.dismissedPlugins', (value) => validateDismissedPlugins(value)],
+    [
+        'pluginRecommendation',
+        (value, field) => validatePluginRecommendationConfigRecord(requireConfigRecord(field, value)),
+    ],
     ['askUser', (value, field) => validateAskUserConfigRecord(requireConfigRecord(field, value))],
+    [
+        'promptSuggestion',
+        (value, field) => validateEnabledOnlyConfigRecord(field, requireConfigRecord(field, value)),
+    ],
+    [
+        'quotaAutoResume',
+        (value, field) => validateEnabledOnlyConfigRecord(field, requireConfigRecord(field, value)),
+    ],
+    [
+        'nextStepBox',
+        (value, field) => validateEnabledOnlyConfigRecord(field, requireConfigRecord(field, value)),
+    ],
     ['subagent.maxConcurrentPerSession', (value) => validateSubagentMaxConcurrentPerSession(value)],
     ['subagent', (value, field) => validateSubagentConfigRecord(requireConfigRecord(field, value))],
 ]);
@@ -186,15 +238,55 @@ function validateModelVariant(value) {
     throw new LocalConfigValidationError(`Invalid defaultModelVariant "${String(value)}"`);
 }
 function validateDataContributionConfigRecord(value) {
+    return validateEnabledOnlyConfigRecord('dataContribution', value);
+}
+/** Sections that hold only the user's `enabled` choice (dataContribution, promptSuggestion, nextStepBox). */
+export function validateEnabledOnlyConfigRecord(field, value) {
     const invalidKey = Object.keys(value).find((key) => key !== 'enabled');
     if (invalidKey) {
-        throw new LocalConfigValidationError(`Local runtime cannot update config field "dataContribution.${invalidKey}"`);
+        throw new LocalConfigValidationError(`Local runtime cannot update config field "${field}.${invalidKey}"`);
     }
-    if (Object.prototype.hasOwnProperty.call(value, 'enabled') &&
-        typeof value.enabled !== 'boolean') {
-        throw new LocalConfigValidationError(`Invalid dataContribution.enabled "${String(value.enabled)}"`);
+    if (Object.prototype.hasOwnProperty.call(value, 'enabled')) {
+        return {
+            enabled: validateBoolean(value.enabled, `Invalid ${field}.enabled "${String(value.enabled)}"`),
+        };
     }
-    return { ...value };
+    return {};
+}
+/** The Bunny beta switch only stores the user's explicit `enabled` choice. */
+export function validateBunnyConfigRecord(value) {
+    const invalidKey = Object.keys(value).find((key) => key !== 'enabled');
+    if (invalidKey) {
+        throw new LocalConfigValidationError(`Local runtime cannot update config field "bunny.${invalidKey}"`);
+    }
+    return Object.prototype.hasOwnProperty.call(value, 'enabled')
+        ? { enabled: validateBoolean(value.enabled, 'bunny.enabled must be a boolean') }
+        : {};
+}
+export function validatePluginRecommendationConfigRecord(value) {
+    const invalidKey = Object.keys(value).find((key) => key !== 'enabled' && key !== 'dismissedPlugins');
+    if (invalidKey) {
+        throw new LocalConfigValidationError(`Local runtime cannot update config field "pluginRecommendation.${invalidKey}"`);
+    }
+    const next = {};
+    if (Object.prototype.hasOwnProperty.call(value, 'enabled')) {
+        next.enabled = validateBoolean(value.enabled, 'pluginRecommendation.enabled must be a boolean');
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'dismissedPlugins')) {
+        next.dismissedPlugins = validateDismissedPlugins(value.dismissedPlugins);
+    }
+    return next;
+}
+/** Canonical plugin names, at most 200; duplicates collapse keeping first order. */
+function validateDismissedPlugins(value) {
+    if (!Array.isArray(value) || value.length > PLUGIN_RECOMMENDATION_DISMISSED_MAX) {
+        throw new LocalConfigValidationError(`pluginRecommendation.dismissedPlugins must be an array of at most ${PLUGIN_RECOMMENDATION_DISMISSED_MAX} plugin names`);
+    }
+    const invalid = value.find((name) => !isPluginRecommendationPluginName(name));
+    if (invalid !== undefined) {
+        throw new LocalConfigValidationError(`Invalid pluginRecommendation.dismissedPlugins entry "${String(invalid)}"`);
+    }
+    return [...new Set(value)];
 }
 /**
  * 只接受三个策略字段，并逐项校验取值。非法值直接报错而不是回落默认值：

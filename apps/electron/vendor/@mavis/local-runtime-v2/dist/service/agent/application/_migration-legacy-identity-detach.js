@@ -3,14 +3,8 @@ import { join } from 'node:path';
 import { resolveAgentCapabilities } from '@mavis/config';
 import { isTrustedBuiltinCreationSource } from '@mavis/agent-tools/desktop/subagent-roles';
 import { createBuiltinPromptContext, parseFrontmatter, renderBuiltinTemplate, } from '../builtin/prompt-renderer.js';
-import { LEGACY_PRIMARY_AGENT_NAME } from '../domain/names.js';
+import { DETACHABLE_LEGACY_BUILTIN_NAMES, LEGACY_PRIMARY_AGENT_NAME } from '../domain/names.js';
 import { assertTrustedPrimaryFamily, planLegacyProfileOverlay, toPrimaryFamilyMembers, } from '../domain/primary-identity.js';
-/**
- * Historic built-in Agents that become ordinary manual Agents on upgrade. They
- * are matched by exact stable name only; a same-named manual or unknown row is
- * left untouched.
- */
-const DETACHABLE_LEGACY_BUILTIN_NAMES = ['general', 'coder'];
 /** Frozen, roster-excluded asset root. See assets/agents/_migration/README.md. */
 const MIGRATION_ASSET_DIR = '_migration';
 const SYSTEM_PROMPT_TEMPLATE = 'system-prompt.md.hbs';

@@ -145,9 +145,6 @@ export class SandboxObservability {
         }));
         this.safeMetric(() => this.#metrics?.histogram('local_sandbox_operation_duration_ms', durationMs, { kind }));
     }
-    activeInvocations(value) {
-        this.safeMetric(() => this.#metrics?.gauge('local_sandbox_active_invocations', value));
-    }
     #recordViolation(raw) {
         this.pruneAttribution();
         const entry = raw.commandId ? this.#attribution.get(raw.commandId) : undefined;

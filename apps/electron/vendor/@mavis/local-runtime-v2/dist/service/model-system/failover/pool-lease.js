@@ -1,6 +1,6 @@
 import { settleInBackground } from '../../../infra/async/settle.js';
 import { readLLMStreamFailureKind, } from '@mavis/agent-core/pi-turn-runner';
-import { classifyGenericFailure, contentRefused, edgeBlocked, effortRefused, failureEvidence, firstTokenTimeout, plainForbidden, proxyDown, signInRevokedSaid, FAILOVER_DEFAULT_COOLDOWN_MS, } from './failure-rules.js';
+import { classifyGenericFailure, contentRefused, edgeBlocked, effortRefused, failureEvidence, plainForbidden, proxyDown, signInRevokedSaid, FAILOVER_DEFAULT_COOLDOWN_MS, accountVerdict, ERROR_KIND, genericSwitch, } from './failure-rules.js';
 import { readModelAccessMetadata } from '../model-access/projection.js';
 import { failoverPlan } from './pool-config.js';
 import { availableMembers, earliestRecovery, probeMember, } from './pool-selector.js';
@@ -101,18 +101,6 @@ export function createModelAccessFailoverPort(deps, state = new FailoverPoolStat
         ...(deps.ready ? { ready: deps.ready } : {}),
     };
 }
-const ERROR_KIND = {
-    quota: 'usage_limit',
-    credit: 'credits_exhausted',
-    'rate-limit': 'rate_limited',
-    restricted: 'usage_limit',
-    slow: 'timeout',
-    model: 'not_found',
-    reauth: 'auth',
-    unavailable: 'unknown',
-};
-/** A provider code for an account the vendor restricted (canonical `<id>_account_restricted`). */
-const RESTRICTED_CODE = /(^|_)account_restricted$/u;
 /** A provider code for a sign-in the vendor revoked. */
 const REVOKED_CODE = /revoked/u;
 /** The member's sign-in marked as needing a new one, at its stored binding stamp. */
@@ -157,32 +145,6 @@ function revokedSignIn(error, classified, failure) {
         (failure !== undefined && signInRevokedSaid(failureEvidence(failure))));
 }
 /**
- * What a provider-classified failure means for the account (shared by pools and single
- * accounts). Undefined: the request, not the account.
- */
-function accountVerdict(classified, failure, base, now) {
-    const generic = () => classifyGenericFailure(failureEvidence(failure), now);
-    switch (classified?.category) {
-        case 'quota':
-        case 'rate-limit':
-            return accountSwitch(classified, generic(), now);
-        case 'model':
-            return { kind: 'model', retryAt: later(now, classified.retryAfterMs) };
-        case 'identity':
-            return { kind: 'reauth' };
-        case 'credential':
-            // The member's own recovery runs first; only a credential it cannot recover leaves.
-            return base.kind === 'recover' ? undefined : { kind: 'reauth' };
-        case undefined:
-        case 'request':
-        case 'network':
-            return genericSwitch(generic(), failure);
-        default:
-            // refusal, dependency, platform: the request, not the account.
-            return undefined;
-    }
-}
-/**
  * One logical call over a pool. Exactly one member call is open at a time; a switch decided in
  * classifyFailure/recover is carried out by the next attempt (old call closed before the new one
  * opens), so every switch spends agent-core's own retry budget. A committed attempt never comes
@@ -197,45 +159,6 @@ async function observe(promise) {
         /* Swallowed on purpose. */
     }
 }
-function later(now, ms) {
-    return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? now + ms : undefined;
-}
-/** A used-up or rate-limited account; credit when the words or the code say money. */
-function accountSwitch(classified, generic, now) {
-    let kind = 'rate-limit';
-    if (RESTRICTED_CODE.test(classified.code) || generic.kind === 'restricted')
-        kind = 'restricted';
-    else if (classified.category === 'quota')
-        kind = generic.kind === 'credit' || /credit/u.test(classified.code) ? 'credit' : 'quota';
-    return { kind, retryAt: later(now, classified.retryAfterMs) ?? generic.retryAtMs };
-}
-/**
- * The generic rules only ever add an account-level reason, and only where the status itself
- * says so: 402 / 429 for quota, credit or rate limits, a 5xx carrying a quota code, 403 / 404
- * for a model the account does not serve. A 400-class error that merely mentions a limit, or a
- * failure with no status, stays on the account (an unsure verdict never moves the call).
- */
-function genericSwitch(generic, failure) {
-    // No first token within agent-core's watchdog: the next member is asked;
-    // from the second in a row the member's model rests (pool-state slowStart).
-    if (failure && firstTokenTimeout(failure))
-        return { kind: 'slow' };
-    const statuses = ACCOUNT_STATUS[generic.kind];
-    if (!statuses || !statuses(generic.status))
-        return undefined;
-    const kind = generic.kind;
-    return { kind, ...(generic.retryAtMs ? { retryAt: generic.retryAtMs } : {}) };
-}
-const usedUpStatus = (status) => status === 402 || status === 429 || (status !== undefined && status >= 500);
-/** Which statuses let a generic verdict move the call to another account. */
-const ACCOUNT_STATUS = {
-    // The rule itself already needs an error status or MCode's own restricted marker.
-    restricted: () => true,
-    quota: usedUpStatus,
-    credit: usedUpStatus,
-    'rate-limit': usedUpStatus,
-    model: (status) => status === 403 || status === 404,
-};
 export class ModelAccessFailoverLease {
     input;
     signal;

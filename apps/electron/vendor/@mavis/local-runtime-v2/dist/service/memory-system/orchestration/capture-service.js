@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { countTokens } from 'gpt-tokenizer/encoding/o200k_base';
 import { estimateCaptureTokens } from '../contracts/token-estimate.js';
+import { isCompatibleLegacyArtifactContract } from '../policies/artifact-contract.js';
 import { computeOutputDigest, renderSessionMirror, validateDocumentEnvelope, } from './session-doc.js';
 export class MemoryCaptureService {
     deps;
@@ -78,11 +79,11 @@ export class MemoryCaptureService {
         if (existingState?.exclusionReason)
             return { status: 'ineligible' };
         const contract = await this.deps.model.resolveContract('capture');
-        const sourceDigest = computeSourceDigest(candidate.sessionId, candidate.sourceRevision, contract.contractId);
-        // 未变化短路只看状态水位；镜像缺失由 Reconciler 补物化，不构成重抽理由(§2.3)。
-        if (existingState && existingState.sourceDigest === sourceDigest) {
+        // 镜像缺失由 Reconciler 补物化，不构成重抽理由（§2.3）。
+        if (isCurrentCapture(existingState, candidate, contract.artifactContractId, config.maxSessionDocBytes)) {
             return { status: 'unchanged' };
         }
+        const sourceDigest = computeSourceDigest(candidate.sessionId, candidate.sourceRevision, contract.artifactContractId);
         // 旧文档与遗忘规则随请求一并发送，先从合同的输入上限里扣除，剩余额度才分给历史。
         const historyBudget = Math.max(0, contract.maxInputTokens -
             estimateCaptureTokens(existingState?.content ?? '') -
@@ -166,7 +167,7 @@ export class MemoryCaptureService {
                 sessionCreatedAtMs: snapshot.sessionCreatedAtMs,
                 sourceRevision: candidate.sourceRevision,
                 sourceDigest,
-                captureContractId: contract.contractId,
+                captureContractId: contract.artifactContractId,
                 outputDigest,
                 content,
                 agentName: ctx.canonicalAgentName,
@@ -213,6 +214,20 @@ function mapModelFailure(result) {
         case 'stale-contract':
             return { status: 'deferred', reason: 'model-unavailable' };
     }
+}
+/** 当前产物合同或兼容的旧合同都可复用；旧合同另查信封，避免接续无效文档。 */
+function isCurrentCapture(state, candidate, artifactContractId, maxDocBytes) {
+    if (!state)
+        return false;
+    if (state.sourceDigest ===
+        computeSourceDigest(candidate.sessionId, candidate.sourceRevision, artifactContractId))
+        return true;
+    if (!state.captureContractId)
+        return false;
+    return (isCompatibleLegacyArtifactContract(state.captureContractId, artifactContractId) &&
+        state.sourceDigest ===
+            computeSourceDigest(candidate.sessionId, candidate.sourceRevision, state.captureContractId) &&
+        validateDocumentEnvelope(state.content ?? '', maxDocBytes).status !== 'invalid');
 }
 function computeSourceDigest(sessionId, sourceRevision, contractId) {
     return createHash('sha256')

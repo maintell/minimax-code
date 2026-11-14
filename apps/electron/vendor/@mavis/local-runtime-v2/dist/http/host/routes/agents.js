@@ -241,13 +241,17 @@ export class LocalApiAgentRoutes {
         const location = await this.resolveSessionLocation(body, agent.localAgent);
         if (location instanceof Response)
             return location;
+        const modelSelection = readSessionModelSelection(this.configGetter(), body.model);
+        if (!modelSelection.ok) {
+            return json({ error: modelSelection.message, code: modelSelection.code }, { status: 400 });
+        }
         const session = await this.createSession({
             agentName: agent.agentName,
             ...location,
             title: readString(body, 'title') ?? null,
             visibility: readVisibility(body),
             purpose: readString(body, 'purpose'),
-            ...readSessionModelSelection(body.model),
+            ...modelSelection.fields,
         });
         return json({ sessionId: session.sessionId, session: await this.serializeSession(session) }, { status: 201 });
     }

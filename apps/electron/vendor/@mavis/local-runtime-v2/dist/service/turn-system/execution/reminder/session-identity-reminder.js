@@ -5,7 +5,7 @@ import { fitsReminderInFinalRequest } from './reminder-admission.js';
  * so compaction that summarizes that history away must restore the ID.
  */
 export function createSessionIdentityReminderHook(usageAnchor) {
-    return (input) => {
+    return async (input) => {
         if (!input.sessionId || messagesCarrySessionId(input.messages, input.sessionId)) {
             return undefined;
         }

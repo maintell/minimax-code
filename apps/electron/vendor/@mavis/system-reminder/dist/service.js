@@ -147,9 +147,13 @@ export class SystemReminderService {
                 : this.registry.resolve(session.frameworkType);
             const allowlist = data.systemReminders;
             const allowedNames = allowlist ? new Set(allowlist.map((e) => e.name)) : null;
-            const namedProviders = allowedNames
-                ? baseProviders.filter((np) => allowedNames.has(stripProviderSuffix(np.name)))
-                : baseProviders;
+            const sessionAllowlist = session.reminderAllowlist;
+            const namedProviders = baseProviders.filter((np) => {
+                const name = stripProviderSuffix(np.name);
+                if (allowedNames && !allowedNames.has(name))
+                    return false;
+                return !sessionAllowlist || sessionAllowlist.has(name);
+            });
             const blocks = [];
             const providerDiagnostics = [];
             for (const np of namedProviders) {

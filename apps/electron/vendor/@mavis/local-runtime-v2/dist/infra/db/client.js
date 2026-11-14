@@ -11,7 +11,7 @@ export class DatabaseClient {
     options;
     constructor(options) {
         this.options = options;
-        this.dbPath = join(options.dataDir, DB_RELATIVE_PATH);
+        this.dbPath = join(options.dataDir, options.relativePath ?? DB_RELATIVE_PATH);
     }
     get db() {
         if (!this.drizzleDb)

@@ -82,6 +82,10 @@ export class SessionTitleService {
         this.pending.set(sessionId, operation);
         await operation;
     }
+    /** A reply can finish while the initial title is still being generated. */
+    async waitForGeneration(sessionId) {
+        await this.pending.get(sessionId);
+    }
     close() {
         if (this.closePromise)
             return this.closePromise;
@@ -112,35 +116,54 @@ export class SessionTitleService {
             const session = await this.readEligibleSession(sessionId, expectedTitle);
             if (!session || budget.remainingMs === 0)
                 return;
-            let candidate = await this.generateCandidate(sessionId, session, cleanInput, budget);
-            if (!this.canCommitTitle(budget, callerSignal))
-                return;
-            if (!candidate.title) {
-                this.observe(candidate.outcome);
-                return;
-            }
-            const fresh = await this.readEligibleSession(sessionId, session.title);
-            if (!this.canCommitTitle(budget, callerSignal))
-                return;
-            if (!fresh) {
-                this.observe('skipped_race');
-                return;
-            }
-            if (this.shutdown.signal.aborted) {
-                candidate = { title: fallbackSessionTitle(cleanInput), outcome: 'provider_error' };
-            }
-            await this.commitCandidate(sessionId, candidate.title, session.title ?? null, candidate.outcome);
+            const candidate = await this.generateCandidate(sessionId, session, cleanInput, budget);
+            await this.commitGeneratedTitle({
+                sessionId,
+                session,
+                candidate,
+                cleanInput,
+                budget,
+                callerSignal,
+            });
         }
         finally {
             budget.dispose();
             this.pending.delete(sessionId);
         }
     }
+    /** Applies the fencing rules to a finished candidate and writes it back when it still may. */
+    async commitGeneratedTitle(input) {
+        const { sessionId, session, candidate, cleanInput, budget, callerSignal } = input;
+        const fallback = candidate.outcome !== 'success';
+        if (!this.canCommitTitle(budget, callerSignal, fallback))
+            return;
+        // A provider that keeps failing must not walk the title onto the newest message: the fallback
+        // already on the Session describes the message that opened it.
+        if (fallback && session.title) {
+            this.observe(candidate.outcome);
+            return;
+        }
+        if (!candidate.title) {
+            this.observe(candidate.outcome);
+            return;
+        }
+        const fresh = await this.readEligibleSession(sessionId, session.title);
+        if (!this.canCommitTitle(budget, callerSignal, fallback))
+            return;
+        if (!fresh) {
+            this.observe('skipped_race');
+            return;
+        }
+        const committable = this.shutdown.signal.aborted
+            ? { title: fallbackSessionTitle(cleanInput), outcome: 'provider_error' }
+            : candidate;
+        await this.commitCandidate(sessionId, committable.title, session.title ?? null, committable.outcome);
+    }
     async commitCandidate(sessionId, title, expectedTitle, outcome) {
         if (!title)
             return;
         try {
-            await this.options.commitTitle(sessionId, title, expectedTitle);
+            await this.options.commitTitle(sessionId, title, expectedTitle, outcome);
             this.observe(outcome);
         }
         catch (error) {
@@ -156,8 +179,17 @@ export class SessionTitleService {
             }
         }
     }
-    canCommitTitle(budget, callerSignal) {
-        if (callerSignal?.aborted || Date.now() >= budget.deadlineAt)
+    /**
+     * A caller cancellation retires the whole request. An expired budget only retires the model
+     * result: `fallback` is deterministic truncation of already-committed input, so it cannot be a
+     * late answer, and it leaves the Session on `default` for the next message to retry.
+     */
+    canCommitTitle(budget, callerSignal, fallback) {
+        if (callerSignal?.aborted)
+            return false;
+        if (fallback)
+            return true;
+        if (Date.now() >= budget.deadlineAt)
             return false;
         return budget.remainingMs > 0 || this.shutdown.signal.aborted;
     }
@@ -190,6 +222,7 @@ export class SessionTitleService {
         let invalidAttempts = 0;
         let providerRetries = 0;
         let outcome = 'invalid_output';
+        let expired = false;
         while (budget.remainingMs > 0) {
             try {
                 const title = normalizeSessionTitleCandidate(await this.options.model.summarize({
@@ -201,8 +234,11 @@ export class SessionTitleService {
                     deadlineAt: budget.deadlineAt,
                     signal: budget.signal,
                 }));
-                if (budget.remainingMs === 0)
+                if (budget.remainingMs === 0) {
+                    // The budget ran out before the model answered: the result is void, not invalid output.
+                    expired = true;
                     break;
+                }
                 outcome = 'invalid_output';
                 if (title)
                     return { title, outcome: 'success' };
@@ -219,7 +255,10 @@ export class SessionTitleService {
                     break;
             }
         }
-        return { title: fallbackSessionTitle(userMessage), outcome };
+        return {
+            title: fallbackSessionTitle(userMessage),
+            outcome: expired ? 'provider_error' : outcome,
+        };
     }
     observe(outcome) {
         try {

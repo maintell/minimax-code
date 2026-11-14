@@ -1,5 +1,5 @@
 import { and, eq, isNull, ne, or } from 'drizzle-orm';
-import { MsgType, Role } from '@mavis/agent-core/protocol';
+import { isAbandonedStreamClosingMessage, MsgType, Role } from '@mavis/agent-core/protocol';
 import { classifySessionClioSource, EvalCaptureOrigin } from '@mavis/shared/session-clio';
 import { messageRows } from '../../infra/db/schema/messages.js';
 import { queueItems } from '../../infra/db/schema/queue.js';
@@ -137,6 +137,8 @@ function isApprovedAssistantAnswer(row) {
     if (row.role !== Role.Assistant)
         return false;
     if (row.kind !== undefined)
+        return false;
+    if (isAbandonedStreamClosingMessage(row))
         return false;
     if (Reflect.get(row, 'safety_review_unknown') === true)
         return false;

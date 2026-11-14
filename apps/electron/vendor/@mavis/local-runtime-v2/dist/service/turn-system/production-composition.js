@@ -1,77 +1,47 @@
-import { mutableTitleContext } from './agent-host/preparation/config/title-context.js';
+import { mutableTitleContext } from './agent-host/preparation/config/text-completion.js';
+import { resolveSegmentContextBudget } from '@mavis/shared/segment-context-budget';
+import { overridesGenericReminders, readTrustedAgentProfileCoordination, } from '@mavis/shared/agent-coordination';
+import { scopeSegmentCompaction } from './agent-host/compaction/segment-turn.js';
 import { createProductionRunawayGuardExtension } from './runaway-guard/extension.js';
 import { streamSimple } from '@earendil-works/pi-ai';
 import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExtension, toolOutputBudgetExtension, webSearchContentBudgetExtension, } from '@mavis/agent-extension';
 import { withLLMRetry } from '@mavis/agent-core/pi-turn-runner';
 import { describeLocalBrowserToolInput } from '@mavis/agent-tools/desktop';
+import { combineAgentEventObservers } from './lifecycle/production-event-observers.js';
+import { adaptCanonicalHistory } from './lifecycle/canonical-history.adapter.js';
+import { createHostPtcWiring } from './lifecycle/ptc-session-store-composition.js';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
-import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, SessionTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
+import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
 import { isPeekSession } from '../session-system/index.js';
-import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, LocalAgentHost, } from './agent-host/index.js';
-import { validateCanonicalHistoryMessages } from './agent-host/history/canonical-history-validation.js';
-import { readCompactionCommitMetadata } from './agent-host/compaction/compaction-commit-metadata.js';
+import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, LocalAgentHost, PtcSessionStore, } from './agent-host/index.js';
 import { createContextCompactors } from './compaction/execution/production-context-compactors.js';
-import { createMainRequestProjection } from './compaction/execution/request-projection.js';
+import { createMainRequestProjection, } from './compaction/execution/request-projection.js';
 import { ContextUsageAnchorState } from './compaction/execution/usage-anchor.js';
 import { CheckpointImageFileWriter } from './compaction/algorithm/checkpoint-image-file-writer.js';
-import { createFileApiUploadStoreSource } from './persistence/file-api-upload.repository.js';
+import { createFileApiRuntime } from './persistence/file-api-upload.repository.js';
+import { createSegmentCompactionCoordinator } from './compaction/segment/composition.js';
 import { ToolOutputArtifactRepository } from './persistence/tool-output-artifact.repository.js';
-import { compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './agent-host/runner/policy/session-readable-grants.js';
+import { productionEmergencyFilesGrant, productionEmergencyPorts, segmentProfileSessions, } from './runtime/emergency/production.js';
+import { fenceForceReleasedTurns } from './agent-host/events/released-turn-fence.js';
+import { productionContextResetPort } from './runtime/emergency/context-reset.js';
+import { agentHomeGrantSource, assignmentSpaceGrantSource, compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './agent-host/runner/policy/session-readable-grants.js';
+import { pluginReadGrantSources } from './agent-host/runner/policy/plugin-grant-sources.js';
 import { isProductionRuntimeErrorRetryable } from './runtime-error-retry-policy.js';
 import { createTodoCadenceReminderHook } from './execution/reminder/todo-cadence-reminder.js';
 import { createHostTurnReminders } from './execution/reminder/host-turn-reminders.js';
 import { createSessionIdentityReminderHook } from './execution/reminder/session-identity-reminder.js';
 import { hasPtcTurnChildTodoWrite } from './agent-host/execution/ptc/catalog.js';
-import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/session-agent-execution-snapshot.js';
+import { projectTurnRequestContext } from './agent-host/execution/ptc/compaction-reminder.js';
+import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/config/session-agent-execution-snapshot.js';
 import { McpToolResultHistoryExternalizer } from './agent-host/execution/mcp-tool-result-history-externalizer.js';
 import { createBrowserHostCapabilityAdapter } from './agent-host/assembly/host-capability/browser.js';
 import { createComputerUseHostCapabilityAdapter } from './agent-host/assembly/host-capability/computer.js';
 import { HostCapabilityRegistry } from './agent-host/assembly/host-capability/registry.js';
 export { createGlobalMemoryModelCompletion } from '../memory-system/index.js';
+export { combineAgentEventObservers, createSessionLLMRetryEventObserver, createContentReviewSlowEventObserver, } from './lifecycle/production-event-observers.js';
 /** Creates the one process-local AgentConfig/model preparation shared by title and AgentHost. */
 export function createProductionAgentPreparation(options) {
     return createNativeLocalAgentPreparation(options);
-}
-/** Uses the same product Agent/config/model resolution as normal native AgentHost turns. */
-export function createProductionSessionTitleModel(product, nowMs) {
-    const { preparation } = product;
-    return new SessionTitleModelAdapter({
-        buildAgentConfig: async (session) => {
-            const agent = await readSessionAgentExecutionSnapshot(product.agents, session);
-            if (!agent)
-                throw new Error(`Session title Agent not found: ${session.agentName}`);
-            return preparation.buildAgentConfig({
-                session,
-                agent,
-                isSessionFirstTurn: true,
-            });
-        },
-        resolveModel: async (input) => {
-            const resolved = await preparation.resolveModel(input);
-            const resolvedStream = resolved.callLifecycle
-                ? withLLMRetry(resolved.streamFn ?? streamSimple, {
-                    sessionId: input.sessionId,
-                    turnId: input.turnId,
-                    scope: 'title',
-                    lifecycle: resolved.callLifecycle,
-                })
-                : resolved.streamFn;
-            return {
-                model: resolved.model,
-                ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
-                ...(resolved.headers ? { headers: resolved.headers } : {}),
-                ...(resolved.fetch ? { fetch: resolved.fetch } : {}),
-                ...(resolved.thinkingLevel ? { thinkingLevel: resolved.thinkingLevel } : {}),
-                ...(resolvedStream
-                    ? {
-                        stream: (model, context, options) => resolvedStream(model, mutableTitleContext(context), options),
-                    }
-                    : {}),
-            };
-        },
-        stream: (model, context, options) => streamSimple(model, mutableTitleContext(context), options),
-        ...(nowMs ? { nowMs } : {}),
-    });
 }
 /** Reuses the native Agent/model preparation and product safety checker for archived Root titles. */
 export function createProductionRootArchiveTitleModel(product, nowMs) {
@@ -122,6 +92,10 @@ export function createProductionRootArchiveTitleModel(product, nowMs) {
  * A Mini App Agent session's ask waits only while its run has a listener to answer it.
  */
 function createHostPermissionPolicy(options, toolOutputArtifacts) {
+    const pluginGrants = pluginReadGrantSources(options.turnCapabilities, {
+        // Read on use: a host without the repositories still composes.
+        getSessionAgentDefinition: (sessionId) => options.sessions.repositories.sessions.getSessionAgentDefinition(sessionId),
+    });
     return {
         ...options.product.permission,
         sideSessions: {
@@ -143,25 +117,130 @@ function createHostPermissionPolicy(options, toolOutputArtifacts) {
                 runtimeWorkspaceGrantSource({
                     dataDir: () => options.product.preparation.configBuilder.config().dataDir,
                 }),
+                assignmentSpaceGrantSource({
+                    spaceDirectory: async (sessionId) => {
+                        // Only a coordinator's task Session works in a space: zero reads for every other one.
+                        if (!options.sessions.coordinatorOwnership.isAssignedTask(sessionId))
+                            return undefined;
+                        const session = await options.sessions.sessions.repository.get(sessionId);
+                        if (!session || session.archived)
+                            return undefined;
+                        const library = options.sessions.artifactCatalog.library;
+                        return library.directory(library.sessionSpace(sessionId) ?? 'default');
+                    },
+                    spacesRoot: () => options.sessions.artifactCatalog.library.spacesRoot(),
+                }),
+                productionEmergencyFilesGrant(options.sessions),
                 ...(options.product.sessionAssets
                     ? [sessionAttachmentGrantSource(options.product.sessionAssets)]
                     : []),
+                ...(options.product.agentHomeDirectories
+                    ? [agentHomeGrantSource({ homeDirectories: options.product.agentHomeDirectories })]
+                    : []),
+                ...pluginGrants,
             ],
             ...(options.product.permission.logger ? { logger: options.product.permission.logger } : {}),
         }),
         ...(options.miniAppApprovals ? { miniAppApprovals: options.miniAppApprovals } : {}),
     };
 }
+function createHostToolCatalog(options, toolOutputArtifacts, ptc) {
+    return {
+        // Read per Turn: the coordination owners bind their extension after the Host exists.
+        coordinatorMemoryTools: (input) => options.coordinatorExtension?.()?.memoryTools?.(input) ?? [],
+        hostCapabilityRegistry: createHostCapabilityRegistry(options.cliProductPolicy),
+        resolveSources: async (input) => {
+            const session = await requireExecutionSession(options.sessions, input);
+            return options.product.toolSources.resolve({
+                session,
+                turnId: input.turnId,
+                resourceAgentName: input.resourceAgentName,
+                ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
+                ...(input.skipAgentResolution ? { skipAgentResolution: true } : {}),
+                ...(input.expectedAgentInstanceId
+                    ? { expectedAgentInstanceId: input.expectedAgentInstanceId }
+                    : {}),
+                ...(input.builtinCapabilities ? { builtinCapabilities: input.builtinCapabilities } : {}),
+                toolsDisabled: process.env.MAVIS_LOCAL_RUNTIME_DISABLE_TOOLS === '1',
+                computerUseActive: input.computerUseActive,
+                ...(input.agentMemoryEnabled === undefined
+                    ? {}
+                    : { agentMemoryEnabled: input.agentMemoryEnabled }),
+                ...(input.agentMemoryReadNames === undefined
+                    ? {}
+                    : { agentMemoryReadNames: input.agentMemoryReadNames }),
+                ...optionalTurnCapabilitySources(input),
+            });
+        },
+        config: options.product.preparation.configBuilder.config().mcpToolSearch,
+        env: process.env,
+        // run_code saves a return value over 64 KiB where oversized results are externalized.
+        writePtcReturnArtifact: (input) => toolOutputArtifacts.write(input),
+        ...ptc,
+    };
+}
+/** Turn-frozen capability views forwarded to tool sources only when present. */
+function optionalTurnCapabilitySources(input) {
+    return {
+        ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
+        ...(input.coordination ? { coordination: input.coordination } : {}),
+    };
+}
+/** The segment compaction profile (spec 11) over the production ports. */
+function createProductionSegmentCompaction(options, isSideChat, mainRequest) {
+    const { logger, evalReporterFactory, metricsClient } = options.product.runner;
+    const coordinator = createSegmentCompactionCoordinator({
+        history: options.sessions.canonicalHistory,
+        foregroundBudget: resolveSegmentContextBudget,
+        mainRequestMessages: mainRequest.project,
+        ...(options.segmentMediaDescriptions
+            ? { mediaDescriptions: options.segmentMediaDescriptions }
+            : {}),
+        ...(options.getSegmentContextConfig ? { getConfig: options.getSegmentContextConfig } : {}),
+        ...productionEmergencyPorts({
+            sessions: options.sessions,
+            getImageEncoding: () => requestImageEncoding(createRequestMediaConfigGetter(options)().image),
+            configRepair: options.product.coordinatorConfigRepair,
+            metrics: metricsClient,
+        }),
+        contextReset: productionContextResetPort(options.sessions, () => options.coordinatorExtension?.()?.segmentReset),
+        // The coordinator's trace records it for Developer Tools and projects it to Session Clio (spec 17.1).
+        reportRuntimeEvent: (sessionId, event) => {
+            const trace = options.coordinatorExtension?.()?.segmentTrace;
+            return trace
+                ? trace.reportRuntimeEvent?.(sessionId, event)
+                : evalReporterFactory?.reportRuntimeEvent?.(sessionId, event);
+        },
+        ...(logger ? { logger } : {}),
+        // Each feature left unbound runs with an empty stand-in.
+        features: () => options.coordinatorExtension?.()?.segmentFeatures,
+        ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+    });
+    const segments = scopeSegmentCompaction(coordinator, segmentProfileSessions(options.sessions, isSideChat));
+    const prefixLength = (id) => segments.onProfile(id) ? coordinator.segmentPrefixLength(id) : undefined;
+    return { segments, segmentPrefixLength: prefixLength };
+}
+/**
+ * The memory block that closes the system prompt of an Agent with a coordination memory pipeline,
+ * read per Turn from the coordinator extension. A Host composed without that capability keeps the
+ * preparation's own provider.
+ */
+function bindCoordinatorMemoryPrompt(options) {
+    const extension = options.coordinatorExtension;
+    if (!extension)
+        return;
+    options.preparation.bindCoordinatorMemoryProvider((context) => extension()?.memoryPrompt?.(context) ?? Promise.resolve(''));
+}
 /** Connects the native v2 AgentHost only to injected product, owner and observer ports. */
 export async function createLocalAgentHost(options) {
     const isSideChat = (sessionId) => options.sessions.sideChats.relation(sessionId) !== undefined;
     const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
     const contextUsageAnchor = new ContextUsageAnchorState();
-    // One request-only projection: installed in the main request's hook chain and
-    // repeated by the shared-prefix checkpoint request, so both send the same messages.
-    const mainRequest = createMainRequestProjection((sessionId, messages) => isSideChat(sessionId)
-        ? messages
-        : messages.filter((message) => !isSideChatModeMessage(message)));
+    // PTC store/load values, their temp tree, and the saved-script pieces.
+    const ptc = createHostPtcWiring(options);
+    // One request-only projection: installed in the main request's hook chain and repeated by
+    // the shared-prefix checkpoint request, with the Turn's Tool Search context and PTC reminder.
+    const mainRequest = createMainRequestProjection((sessionId, messages) => isSideChat(sessionId) ? messages : messages.filter((m) => !isSideChatModeMessage(m)), projectTurnRequestContext);
     const toolOutputArtifacts = new ToolOutputArtifactRepository({
         resolveSessionReportsDirectory: (id) => options.sessions.artifacts.ensureReportsDirectory(id),
         inspectSessionReportsDirectory: (id) => options.sessions.artifacts.inspectReportsDirectory(id),
@@ -173,6 +252,8 @@ export async function createLocalAgentHost(options) {
         writeImageArtifact: (input) => toolOutputArtifacts.writeImage(input),
         logger: options.product.runner.logger,
     });
+    const segmentCompaction = createProductionSegmentCompaction(options, isSideChat, mainRequest);
+    bindCoordinatorMemoryPrompt(options);
     const mcpToolResultHistoryExternalizer = createMcpToolResultHistoryExternalizer(options, toolOutputArtifacts, getToolResultCompactionConfig);
     const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding);
     const dependencies = await createNativeAgentHostProductionDependencies({
@@ -184,36 +265,7 @@ export async function createLocalAgentHost(options) {
         ...optionalPromptReadDependencies(options.product),
         turnRuntimeFacts: options.product.turnRuntimeFacts,
         preparation: options.preparation,
-        toolCatalog: {
-            hostCapabilityRegistry: createHostCapabilityRegistry(options.cliProductPolicy),
-            resolveSources: async (input) => {
-                const session = await requireExecutionSession(options.sessions, input);
-                return options.product.toolSources.resolve({
-                    session,
-                    turnId: input.turnId,
-                    resourceAgentName: input.resourceAgentName,
-                    ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
-                    ...(input.skipAgentResolution ? { skipAgentResolution: true } : {}),
-                    ...(input.expectedAgentInstanceId
-                        ? { expectedAgentInstanceId: input.expectedAgentInstanceId }
-                        : {}),
-                    ...(input.builtinCapabilities ? { builtinCapabilities: input.builtinCapabilities } : {}),
-                    toolsDisabled: process.env.MAVIS_LOCAL_RUNTIME_DISABLE_TOOLS === '1',
-                    computerUseActive: input.computerUseActive,
-                    ...(input.agentMemoryEnabled === undefined
-                        ? {}
-                        : { agentMemoryEnabled: input.agentMemoryEnabled }),
-                    ...(input.agentMemoryReadNames === undefined
-                        ? {}
-                        : { agentMemoryReadNames: input.agentMemoryReadNames }),
-                    ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
-                });
-            },
-            config: options.product.preparation.configBuilder.config().mcpToolSearch,
-            env: process.env,
-            // run_code saves a return value over 64 KiB where oversized results are externalized.
-            writePtcReturnArtifact: (input) => toolOutputArtifacts.write(input),
-        },
+        toolCatalog: createHostToolCatalog(options, toolOutputArtifacts, ptc.catalog),
         inputPreparation: { ...options.product.inputPreparation, getImageEncoding },
         permission: createHostPermissionPolicy(options, toolOutputArtifacts),
         runner: {
@@ -221,23 +273,21 @@ export async function createLocalAgentHost(options) {
             resolveComputerUseCapture: options.resolveComputerUseCapture,
             reviewContent: options.safety.review,
             onSlowReview: options.onSlowReview,
+            ...(options.reviewOfflineWait ? { reviewOfflineWait: options.reviewOfflineWait } : {}),
         },
         ...optionalToolPolicyGuard(options.toolPolicyGuard),
         executor: {
             ...options.product.executor,
+            ...ptc.executor,
             nativeDelete: () => options.product.preparation.configBuilder.config().permission?.nativeDelete === true,
             logger: options.product.runner.logger,
-            ...createHostTurnReminders(contextUsageAnchor, options.memorySummaryContext),
-            fileApi: {
-                uploadStores: createFileApiUploadStoreSource({
-                    db: options.db,
-                    ...(options.nowMs ? { nowMs: options.nowMs } : {}),
-                }),
-                ...(options.product.fileApi?.fetchImpl
-                    ? { fetchImpl: options.product.fileApi.fetchImpl }
-                    : {}),
-                ...(options.product.fileApi?.logger ? { logger: options.product.fileApi.logger } : {}),
-            },
+            ...createHostTurnReminders(contextUsageAnchor, options.memorySummaryContext, options.ptcScriptCatalog, options.ptcScriptCatalogInjected),
+            suppressExecutionReminders: (_session, agentConfig) => overridesGenericReminders(readTrustedAgentProfileCoordination(agentConfig.agent_profile)),
+            fileApi: createFileApiRuntime({
+                db: options.db,
+                nowMs: options.nowMs,
+                product: options.product.fileApi,
+            }),
             attemptRecall: options.sessions.agentProjection.attemptRecall,
             ...(options.nowMs ? { nowMs: options.nowMs } : {}),
             cliProductPolicy: options.cliProductPolicy,
@@ -253,8 +303,8 @@ export async function createLocalAgentHost(options) {
             },
             preparePluginHookSessionOwnership: options.pluginHookSessionOwnership.prepare,
             activatePluginHookSessionOwnership: options.pluginHookSessionOwnership.activate,
-            afterCompactionBeforeLlmCallHooks: [
-                ...mainRequest.hooks,
+            afterCompactionBeforeLlmCallHooks: [...mainRequest.hooks],
+            genericExecutionReminderHooks: [
                 createSessionIdentityReminderHook(contextUsageAnchor),
                 createTodoCadenceReminderHook(contextUsageAnchor, hasPtcTurnChildTodoWrite),
             ],
@@ -263,6 +313,9 @@ export async function createLocalAgentHost(options) {
             resolveLlmRetry: options.resolveLlmRetry,
             ...optionalTurnAccounting(options.product),
             ...(options.outputTokenCap ? { outputTokenCap: options.outputTokenCap } : {}),
+            turnStateLayer: () => options.coordinatorExtension?.()?.turnState,
+            segmentPrefixLength: segmentCompaction.segmentPrefixLength,
+            ...(options.turnFaults ? { turnFaults: options.turnFaults } : {}),
         },
         ...optionalNormalExtensions(normalExtensions),
         turnControl: options.turnControl,
@@ -292,6 +345,7 @@ export async function createLocalAgentHost(options) {
                 ? { metricsClient: options.product.runner.metricsClient }
                 : {}),
             usageAnchor: contextUsageAnchor,
+            segments: segmentCompaction.segments,
         },
         usage: {
             projector: options.sessions.usage.projector,
@@ -314,7 +368,14 @@ export async function createLocalAgentHost(options) {
         },
         isRuntimeErrorRetryable: isProductionRuntimeErrorRetryable,
     });
-    return { host: new LocalAgentHost(dependencies), lifecycle: dependencies.lifecycle };
+    // A Turn ended by force never writes again (context reset spec 3.2).
+    const host = new LocalAgentHost(fenceForceReleasedTurns(dependencies));
+    return {
+        host,
+        // Bound by the Runtime composition so a committed context reset reaches it.
+        ...(ptc.store.store ? { ptcSessionStore: ptc.store.store } : {}),
+        lifecycle: ptc.store.bindLifecycle(dependencies.lifecycle),
+    };
 }
 function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding) {
     return mergeNormalExtensions([
@@ -593,47 +654,12 @@ function optionalNormalExtensions(normalExtensions) {
 /** Optional per-Turn seams; absent ones are omitted rather than set to undefined. */
 function optionalTurnHooks(options) {
     return {
+        ...(options.turnTiming ? { turnTiming: options.turnTiming } : {}),
         ...(options.askUserPolicy ? { askUserPolicy: options.askUserPolicy } : {}),
         ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
         ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
         ...(options.promptSuggestion ? { promptSuggestion: options.promptSuggestion } : {}),
     };
-}
-export function combineAgentEventObservers(...observers) {
-    const active = observers.filter((observer) => observer !== undefined);
-    if (active.length === 0)
-        return undefined;
-    if (active.length === 1)
-        return active[0];
-    return {
-        observeRuntimeEvent: (input) => observeAll(active, (observer) => observer.observeRuntimeEvent?.(input)),
-        observeHistoryCommitted: (input) => observeAll(active, (observer) => observer.observeHistoryCommitted?.(input)),
-        observeHistoryFailure: (input) => observeAll(active, (observer) => observer.observeHistoryFailure?.(input)),
-    };
-}
-/** Projects transient provider retry state from Turn execution onto the product event stream. */
-export function createSessionLLMRetryEventObserver(publish) {
-    return (event) => {
-        // Only foreground/compaction retries belong to the Session retry UI wire contract.
-        if (event.scope !== 'agent' && event.scope !== 'compaction')
-            return;
-        publish({
-            type: 'session.llm_retry',
-            payload: { schemaVersion: 1, ...event, scope: event.scope },
-        });
-    };
-}
-/** 把运行器的慢送审通知投到产品事件流，界面据此在输入框上方提示检查电脑负荷。 */
-export function createContentReviewSlowEventObserver(publish) {
-    return ({ sessionId, turnId }) => publish({ type: 'content.review.slow', payload: { sessionId, turnId } });
-}
-async function observeAll(observers, observe) {
-    const results = await Promise.allSettled(observers.map((observer) => observe(observer)));
-    const failures = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
-    if (failures.length === 1)
-        throw failures[0];
-    if (failures.length > 1)
-        throw new AggregateError(failures, 'Agent event observers failed');
 }
 async function requireExecutionSession(sessions, input) {
     const session = await sessions.sessions.repository.get(input.sessionId);
@@ -643,109 +669,6 @@ async function requireExecutionSession(sessions, input) {
         throw new Error(`AgentHost tool source Session mismatch: ${input.sessionId}`);
     }
     return session;
-}
-function adaptCanonicalHistory(provider, mutation) {
-    return {
-        read: async (sessionId) => {
-            const snapshot = await provider.read(sessionId);
-            validateCanonicalHistoryMessages(snapshot.messages);
-            return {
-                revision: snapshot.revision,
-                messages: snapshot.messages,
-                identityVector: snapshot.identityVector,
-            };
-        },
-        readActive: async (sessionId) => {
-            const snapshot = await provider.readActive(sessionId);
-            validateCanonicalHistoryMessages(snapshot.messages);
-            return {
-                revision: snapshot.revision,
-                messages: snapshot.messages,
-                identityVector: snapshot.identityVector,
-            };
-        },
-        append: async (change) => {
-            const committed = await provider.append(requireHistoryOperation(change));
-            validateCanonicalHistoryMessages(committed.messages);
-            return { ...committed, messages: committed.messages };
-        },
-        replace: async (change) => {
-            const committed = await provider.replace(requireHistoryOperation(change));
-            validateCanonicalHistoryMessages(committed.messages);
-            return { ...committed, messages: committed.messages };
-        },
-        compact: async (change) => {
-            const operation = requireHistoryOperation(change);
-            if (operation.reason !== 'replaceMessages' || operation.operation.kind !== 'compaction') {
-                throw new TypeError('Typed canonical compaction requires a compaction operation.');
-            }
-            const metadata = readCompactionCommitMetadata(operation.metadata);
-            if (!metadata)
-                throw new TypeError('Canonical compaction metadata is invalid.');
-            const committed = await provider.compact({
-                ...operation,
-                reason: 'replaceMessages',
-                operation: { id: operation.operation.id, kind: 'compaction' },
-                method: metadata.method,
-                compactionId: metadata.compactionId,
-                summary: metadata.summary,
-                ...(metadata.currentUserSourceIndex === undefined
-                    ? {}
-                    : {
-                        currentUserSourceIndex: metadata.currentUserSourceIndex,
-                        ...(metadata.placedMarkerCount === undefined
-                            ? {}
-                            : { placedMarkerCount: metadata.placedMarkerCount }),
-                    }),
-            });
-            validateCanonicalHistoryMessages(committed.messages);
-            return { ...committed, messages: committed.messages };
-        },
-        settleTurnTail: async (input) => {
-            if (!mutation.settleTurnTail) {
-                throw new TypeError('SessionSystem settleTurnTail capability is unavailable.');
-            }
-            const committed = await mutation.settleTurnTail({
-                sessionId: input.sessionId,
-                turnId: input.turnId,
-                operationId: input.operation.id,
-                mode: input.mode,
-                approvedContent: input.approvedContent,
-            });
-            validateCanonicalHistoryMessages(committed.messages);
-            return {
-                revision: committed.revision,
-                messages: committed.messages,
-                identityVector: committed.identityVector,
-                status: committed.status,
-                deletedMessageIds: committed.deletedMessageIds,
-            };
-        },
-        retractTurn: async (input) => {
-            if (!mutation.retractTurn) {
-                throw new TypeError('SessionSystem retractTurn capability is unavailable.');
-            }
-            const committed = await mutation.retractTurn({
-                sessionId: input.sessionId,
-                turnId: input.turnId,
-                operationId: input.operation.id,
-                reason: input.reason,
-            });
-            validateCanonicalHistoryMessages(committed.messages);
-            return {
-                revision: committed.revision,
-                messages: committed.messages,
-                identityVector: committed.identityVector,
-                status: committed.status,
-                deletedMessageIds: committed.deletedMessageIds,
-            };
-        },
-    };
-}
-function requireHistoryOperation(change) {
-    if (!change.operation)
-        throw new TypeError('Canonical history operation is required.');
-    return { ...change, operation: change.operation };
 }
 function describeError(error) {
     return error instanceof Error ? error.message : String(error);

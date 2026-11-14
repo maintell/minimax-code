@@ -27,6 +27,7 @@ export function createV1CronAgentCleanupBridge() {
 export function createV1MavisCronAdapterBridge() {
     let handleRequest;
     let reminders;
+    let mainConversation;
     const adapter = createLocalMavisCronAdapter(createDesktopServiceClient({
         baseUrl: 'http://local-runtime-v2.internal',
         fetch: (input, init) => {
@@ -48,9 +49,11 @@ export function createV1MavisCronAdapterBridge() {
                     throw new CronUnavailableError();
                 return reminders.cancel(request.sessionId);
             },
+            targetsMainConversation: (agentName) => mainConversation?.(agentName) === true,
         },
         bindSelfReminders(service) {
             reminders = service.selfReminders;
+            mainConversation = service.targetsMainConversation?.bind(service);
         },
         bindHandleRequest(next) {
             if (handleRequest)

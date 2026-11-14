@@ -1,6 +1,12 @@
+import { trustedPreviewHost, validPreviewTarget, validPreviewBounds } from "./preview-host-guard";
 import { ipcMain } from "electron";
+import { getRuntimeRegion, getRuntimeBuildEnv } from "@mavis/config";
+import { resolveLocalRuntimeDataDir } from "../modules/local-runtime/data-dir";
+import { miniAppPreviewCache } from "../modules/browser/miniapp-preview-cache";
 import { beginMiniAppNavigationRevocation } from "../modules/browser/miniapp-host-navigation-permissions.js";
 import { parseMiniAppPermissionId, parseMiniAppPermissionList, parseMiniAppWindowPatch } from "@mavis/shared/miniapp-surface";
+import { windowManager } from "../windows/manager";
+import { getMainWindow } from "../windows/mainWindow";
 import { IPC_CHANNELS } from "../config/constants";
 import { getEmbeddedBrowserManager, syncManagedMiniAppLoopbackCredential } from "../modules/browser/embedded-browser-manager";
 import { closeManagedMiniAppPages, readRunningMiniAppCredential, runManagedMiniAppStop, runManagedMiniAppLaunch, openManagedMiniAppSurface } from "../modules/browser/miniapp-surface";
@@ -11,7 +17,63 @@ const miniAppOpenLogger = getCategoryLogger('archon', 'miniapp-open');
 const miniAppControlLogger = getCategoryLogger('archon', 'miniapp-control');
 const MAX_DIAGNOSTIC_PLUGIN_ID_LENGTH = 80;
 const SAFE_DIAGNOSTIC_PLUGIN_ID = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/u;
+function isTrustedMiniAppPreviewTarget(event, params) {
+    const host = windowManager.getWindowByType('archon') || getMainWindow();
+    return Boolean(host &&
+        event.sender === host.webContents &&
+        trustedPreviewHost(event) &&
+        validPreviewTarget(params) &&
+        normalizeIdentifier(params?.pluginId));
+}
 export function setupMiniAppIPC() {
+    const observedHosts = new WeakSet();
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_PREVIEW_CACHE, async (event, request) => {
+        const host = windowManager.getWindowByType('archon') || getMainWindow();
+        if (!host || host.webContents !== event.sender || !trustedPreviewHost(event))
+            return {};
+        const { getUserInfo } = await import('./storage.ipc');
+        const isCurrent = () => Boolean(request?.accountId && getUserInfo().realUserID === request.accountId);
+        if (!isCurrent())
+            return {};
+        return miniAppPreviewCache(resolveLocalRuntimeDataDir(), `${getRuntimeRegion()}-${getRuntimeBuildEnv()}`, request, isCurrent);
+    });
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_PREVIEW, async (event, params) => {
+        if (!isTrustedMiniAppPreviewTarget(event, params))
+            return null;
+        try {
+            return await getEmbeddedBrowserManager().captureMiniAppPreview(params);
+        }
+        catch {
+            return null;
+        }
+    });
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_WIDGET, async (event, params) => {
+        if (!isTrustedMiniAppPreviewTarget(event, params) ||
+            typeof params.compact !== 'boolean' ||
+            (params.bounds !== null && !validPreviewBounds(params.bounds))) {
+            return { success: false, code: 'invalid_request' };
+        }
+        if (!observedHosts.has(event.sender)) {
+            observedHosts.add(event.sender);
+            const clearWidgets = () => getEmbeddedBrowserManager().destroyMiniAppWidgetsForHost(event.sender.id);
+            event.sender.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+                if (isMainFrame && !isInPlace)
+                    clearWidgets();
+            });
+            event.sender.once('destroyed', clearWidgets);
+        }
+        try {
+            await getEmbeddedBrowserManager().presentMiniAppWidget(params, {
+                coordinateSpace: 'host-renderer-css',
+                hostWebContentsId: event.sender.id,
+                hostZoomFactor: event.sender.getZoomFactor(),
+            });
+            return { success: true };
+        }
+        catch (error) {
+            return { success: false, code: normalizeErrorCode(error) };
+        }
+    });
     ipcMain.handle(IPC_CHANNELS.MINIAPP_LIST, async () => {
         try {
             const result = await requestUtilityMiniApp('list');
@@ -24,7 +86,13 @@ export function setupMiniAppIPC() {
                 : { success: false, code: 'start_failed' };
         }
         catch (error) {
-            return { success: false, code: normalizeErrorCode(error) };
+            const code = normalizeErrorCode(error);
+            miniAppControlLogger.warn({
+                msg: '[MiniAppList] failed',
+                event: 'miniapp_list_failed',
+                code,
+            });
+            return { success: false, code };
         }
     });
     ipcMain.handle(IPC_CHANNELS.MINIAPP_OPEN, (_event, params) => openMiniApp(params));
@@ -247,6 +315,7 @@ async function controlMiniApp(method, params) {
             return { success: true };
         }
         return await runManagedMiniAppStop(pluginId, async () => {
+            await manager.captureMiniAppPreviewBeforeStop(pluginId);
             stage = 'utility_stop';
             const result = await requestUtilityMiniApp('stop', pluginId);
             if (!('stopped' in result)) {

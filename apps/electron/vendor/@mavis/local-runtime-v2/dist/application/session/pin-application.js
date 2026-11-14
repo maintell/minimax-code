@@ -2,7 +2,7 @@ import { PinnedItemType, } from '@mavis/thrift-gen/generated/desktop-service/typ
 import { AppError } from '../errors.js';
 import { publishBestEffort } from '../events.js';
 import { toProjectDetail } from '../project/wire.js';
-import { toSessionInfoView } from './wire.js';
+import { readSessionAssignments, toSessionInfoView } from './wire.js';
 import { PinService, PinServiceError } from '../../service/pin/index.js';
 export class PinApplication {
     options;
@@ -12,11 +12,7 @@ export class PinApplication {
     async pinAgent(_context, req) {
         try {
             const result = await this.options.service.pinAgent(req.name, req.pinned, req.insertIndex);
-            return {
-                success: true,
-                ...(result.item ? { item: toPinnedItem(result.item) } : {}),
-                items: result.items.map(toPinnedItem),
-            };
+            return { success: true, ...(await this.pinnedResult(result)) };
         }
         catch (error) {
             throw mapPinError(error);
@@ -33,16 +29,10 @@ export class PinApplication {
                 payload: {
                     sessionId: req.sessionId,
                     pinned: req.pinned,
-                    ...(result.item?.session?.agentName
-                        ? { agentName: result.item.session.agentName }
-                        : {}),
+                    ...(result.item?.session?.agentName ? { agentName: result.item.session.agentName } : {}),
                 },
             });
-            return {
-                success: true,
-                ...(result.item ? { item: toPinnedItem(result.item) } : {}),
-                items: result.items.map(toPinnedItem),
-            };
+            return { success: true, ...(await this.pinnedResult(result)) };
         }
         catch (error) {
             throw mapPinError(error);
@@ -50,7 +40,7 @@ export class PinApplication {
     }
     async getPinnedItemsOrder(_context, _req) {
         try {
-            return { items: (await this.options.service.getOrder()).map(toPinnedItem) };
+            return { items: await this.pinnedItems(await this.options.service.getOrder()) };
         }
         catch (error) {
             throw mapPinError(error);
@@ -59,12 +49,23 @@ export class PinApplication {
     async putPinnedItemsOrder(_context, req) {
         try {
             return {
-                items: (await this.options.service.putOrder((req.items ?? []).map(fromPinnedItemRef))).map(toPinnedItem),
+                items: await this.pinnedItems(await this.options.service.putOrder((req.items ?? []).map(fromPinnedItemRef))),
             };
         }
         catch (error) {
             throw mapPinError(error);
         }
+    }
+    async pinnedResult(result) {
+        const assignments = await readSessionAssignments(this.options.assignments, [result.item, ...result.items].map((item) => item?.session));
+        return {
+            ...(result.item ? { item: toPinnedItem(result.item, assignments) } : {}),
+            items: result.items.map((item) => toPinnedItem(item, assignments)),
+        };
+    }
+    async pinnedItems(items) {
+        const assignments = await readSessionAssignments(this.options.assignments, items.map((item) => item.session));
+        return items.map((item) => toPinnedItem(item, assignments));
     }
 }
 function fromPinnedItemRef(ref) {
@@ -79,7 +80,7 @@ function fromPinnedItemRef(ref) {
             throw new PinServiceError('invalid-ref', `Unsupported pinned item type: ${String(ref.itemType)}`);
     }
 }
-function toPinnedItem(item) {
+function toPinnedItem(item, assignments) {
     const base = {
         itemType: toPinnedItemType(item.ref.type),
         id: item.ref.id,
@@ -97,8 +98,10 @@ function toPinnedItem(item) {
             },
         };
     }
-    if (item.session)
-        return { ...base, session: toSessionInfoView(item.session) };
+    if (item.session) {
+        const session = toSessionInfoView(item.session, undefined, assignments.get(item.session.sessionId));
+        return { ...base, session };
+    }
     if (item.project) {
         return { ...base, desktopProject: toProjectDetail(item.project, item.project.sessionCount) };
     }

@@ -6,7 +6,7 @@ const RECENT_SESSION_COUNT = 5;
 const MAX_SESSION_LOG_BYTES = 5 * 1024 * 1024;
 /**
  * Per-Session runtime log files, `<logsDir>/sessions/<sessionId>/runtime-MM-DD.log`.
- * A bundle about one Session takes that Session's files; any other bundle
+ * A bundle about given Sessions takes those Sessions' files; any other bundle
  * takes the five Sessions written to most recently. Files are chosen by
  * Session rather than by the bundle's time window (the directory keeps seven
  * days), and each file is capped to its last 5MB.
@@ -14,7 +14,8 @@ const MAX_SESSION_LOG_BYTES = 5 * 1024 * 1024;
  */
 export function createRuntimeSessionLogSource(logsDir, sessionId) {
     const dir = join(logsDir, SESSION_LOG_DIR);
-    const sessionIds = new Set(sessionId ? [sessionId] : recentSessionIds(dir));
+    const chosen = typeof sessionId === 'string' ? [sessionId] : (sessionId ?? []);
+    const sessionIds = new Set(chosen.length > 0 ? chosen : recentSessionIds(dir));
     return new FileDiagnosticArtifactSource({
         id: 'runtime-session-logs',
         label: 'Local runtime Session logs',
@@ -28,6 +29,38 @@ export function createRuntimeSessionLogSource(logsDir, sessionId) {
         sinceMs: 0,
         untilMs: Number.POSITIVE_INFINITY,
     });
+}
+/**
+ * Files and bytes the source above takes for these Sessions, so a caller can
+ * budget each Session's logs together with its other files.
+ */
+export function measureRuntimeSessionLogs(logsDir, sessionIds) {
+    let files = 0;
+    let bytes = 0;
+    for (const sessionId of new Set(sessionIds)) {
+        const sessionDir = join(logsDir, SESSION_LOG_DIR, sessionId);
+        let names;
+        try {
+            names = readdirSync(sessionDir);
+        }
+        catch {
+            continue;
+        }
+        for (const name of names) {
+            if (!isSessionLogFile(name))
+                continue;
+            try {
+                const { size } = statSync(join(sessionDir, name));
+                // A capped file also carries a short truncation marker.
+                bytes += size > MAX_SESSION_LOG_BYTES ? MAX_SESSION_LOG_BYTES + 64 : size;
+                files += 1;
+            }
+            catch {
+                // Removed by the retention sweep meanwhile.
+            }
+        }
+    }
+    return { files, bytes };
 }
 /** Latest write time across one Session's log files; undefined when none is readable. */
 function lastSessionLogWriteMs(sessionDir) {

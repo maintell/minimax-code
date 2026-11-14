@@ -61,6 +61,7 @@ export class LocalWeChatMonitorWire {
     monitor = null;
     /** botToken the live monitor was started with — detects rebind (token change). */
     startedToken = null;
+    startedBindingId;
     /** Last status emitted by the monitor — detects a dead (expired/stopped) loop. */
     lastStatus = null;
     /**
@@ -111,6 +112,7 @@ export class LocalWeChatMonitorWire {
             ...(record.baseUrl ? { baseUrl: record.baseUrl } : {}),
         });
         this.startedToken = record.botToken;
+        this.startedBindingId = record.registrationCreator?.bindingId;
         this.lastStatus = null;
         // A new attempt forgets the previous verdict, a held `session_expired`
         // included: only this loop's own getUpdates rounds may move it again.
@@ -125,7 +127,7 @@ export class LocalWeChatMonitorWire {
         if (record.getUpdatesBuf)
             createParams.getUpdatesBuf = record.getUpdatesBuf;
         const monitor = sdk.createMonitor(createParams);
-        this.attachListeners(monitor);
+        this.attachListeners(monitor, record.registrationCreator?.bindingId);
         this.monitor = monitor;
         try {
             const loop = monitor.start();
@@ -187,12 +189,12 @@ export class LocalWeChatMonitorWire {
      * token — callers must no-op then to avoid thrashing the long-poll on every
      * status poll.
      */
-    needsRestart(currentToken) {
+    needsRestart(currentToken, bindingId) {
         if (!this.monitor)
             return true;
         if (this.lastStatus === 'session_expired' || this.lastStatus === 'stopped')
             return true;
-        if (this.startedToken !== currentToken)
+        if (this.startedToken !== currentToken || this.startedBindingId !== bindingId)
             return true;
         return false;
     }
@@ -223,10 +225,10 @@ export class LocalWeChatMonitorWire {
         }
         return record;
     }
-    attachListeners(monitor) {
+    attachListeners(monitor, bindingId) {
         const { agentName, clientName } = this.options;
         this.messageListener = (msg) => {
-            detach(this.handleMessageLogged(msg, agentName, clientName));
+            detach(this.handleMessageLogged(msg, agentName, clientName, bindingId));
         };
         this.errorListener = (err) => {
             logger.error({ err, agentName, clientName }, 'WeChat monitor error event');
@@ -342,6 +344,7 @@ export class LocalWeChatMonitorWire {
         this.detachListeners();
         this.monitor = null;
         this.startedToken = null;
+        this.startedBindingId = undefined;
         this.lastStatus = null;
     }
     /**
@@ -350,9 +353,9 @@ export class LocalWeChatMonitorWire {
      * `messageListener` wrapper catches and logs anything that escapes.
      */
     /** Detached message dispatch; failures log and never kill the monitor. */
-    async handleMessageLogged(msg, agentName, clientName) {
+    async handleMessageLogged(msg, agentName, clientName, bindingId) {
         try {
-            await this.handleMessage(msg);
+            await this.handleMessage(msg, bindingId);
         }
         catch (err) {
             logger.error({ err, agentName, clientName }, 'WeChat monitor message handler failed');
@@ -370,7 +373,7 @@ export class LocalWeChatMonitorWire {
             logger.error({ err, agentName: this.options.agentName }, 'WeChat monitor cursor persist failed');
         }
     }
-    async handleMessage(msg) {
+    async handleMessage(msg, bindingId) {
         if (this.shouldDropMessage(msg))
             return;
         const parsed = await this.parseMonitorMessage(msg);
@@ -385,6 +388,7 @@ export class LocalWeChatMonitorWire {
         // user gets nothing back".
         const ctxWithToken = {
             ...parsed.envelope.ctx,
+            ...(bindingId ? { wechatPollBindingId: bindingId } : {}),
             ...(msg.context_token ? { contextToken: msg.context_token } : {}),
         };
         if (msg.context_token && this.options.onContextToken) {

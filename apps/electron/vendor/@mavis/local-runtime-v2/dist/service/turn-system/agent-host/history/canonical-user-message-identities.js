@@ -1,3 +1,5 @@
+import { isStateDeltaMessage } from '../execution/turn-state-layer/hidden-messages.js';
+import { stateDeltaMessageId } from '../execution/turn-state-layer/state-delta-message.js';
 /**
  * Correlates product-owned user identities with Pi's next user-message deltas.
  * Identity stays parallel to Pi payloads and assignments remain stable across
@@ -109,9 +111,15 @@ export class CanonicalUserMessageIdentityLane {
         });
     }
     claim(change) {
-        const userIndexes = change.messages.flatMap((message, index) => message.role === 'user' ? [index] : []);
-        return userIndexes.flatMap((index) => {
-            const messageId = this.claimNext(change.messages[index]);
+        return change.messages.flatMap((message, index) => {
+            if (isStateDeltaMessage(message)) {
+                // A delta block gets a host ID of its own, never a user message ID.
+                const messageId = stateDeltaMessageId(change.operation.id, index);
+                return [{ index, messageId, source: 'internal-new' }];
+            }
+            if (message.role !== 'user')
+                return [];
+            const messageId = this.claimNext(message);
             return messageId ? [{ index, messageId, source: 'display-user' }] : [];
         });
     }

@@ -29,6 +29,9 @@ export const sessions = sqliteTable('local_runtime_sessions', {
 }, (table) => [
     check('local_runtime_sessions_session_kind_check', sql `${table.sessionKind} IN ('conversation', 'task', 'peek', 'channel', 'cron', 'unknown')`),
     check('local_runtime_sessions_default_workspace_check', sql `${table.isDefaultWorkspace} IN (0, 1)`),
+    index('idx_local_runtime_sessions_hidden_purpose_v3')
+        .on(table.purpose)
+        .where(sql `${table.columnarVersion} = 3 AND ${table.archived} = 0 AND ${table.visibility} = 'hidden'`),
     index('idx_local_runtime_sessions_updated_at').on(desc(table.updatedAtMs)),
     index('idx_local_runtime_sessions_recency_v2').on(desc(table.updatedAtMs), desc(table.createdAtMs), asc(table.sessionId)),
     index('idx_local_runtime_sessions_agent_recency_v3')

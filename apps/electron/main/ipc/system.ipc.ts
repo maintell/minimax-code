@@ -7,7 +7,8 @@ import * as path from "path";
 import * as os from "os";
 import { app, ipcMain, nativeTheme, shell } from "electron";
 import { logger, isLogFile, getLogFilePath, getCategoryLogger, flushLogs, getLogDir } from "../utils";
-import { getExtraLogSources, resolveRuntimeLogsDir } from "../utils/extra-log-source";
+import { resolveRuntimeLogsDir, getExtraLogSources } from "../utils/extra-log-source";
+import { readDeviceHardwareInfo } from "../utils/device-hardware-info.js";
 import { getDesktopAppInstallDir } from "../utils/install-dir";
 import { ensureDefaultProjectDir } from "../utils/default-project-dir";
 import { importEsm } from "../utils/import-esm";
@@ -23,6 +24,7 @@ import { configureUtilityRuntimeDiagnosticsLogger, utilityRuntimeDiagnostics } f
 import { createRequiredUploadArtifact } from "../modules/diagnostics/required-upload-artifact";
 import { writeDiagnosticArchive } from "../modules/diagnostics/diagnostic-archive";
 import { collectDesktopEnvironment } from "../modules/diagnostics/desktop-environment";
+import { packBunnyFeedbackReport } from "../modules/diagnostics/bunny-feedback-bundle";
 import { orderSessionReportArtifacts } from "../modules/diagnostics/session-report-order";
 configureUtilityRuntimeDiagnosticsLogger(logger);
 const BROWSER_FEEDBACK_DIAGNOSTICS_FILE = 'browser-diagnostics.json';
@@ -57,6 +59,16 @@ const WORKSPACE_SNAPSHOT_MANIFEST_NAME = 'workspace/manifest.json';
 const WORKSPACE_SNAPSHOT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOG_WINDOW_MS = 2 * DAY_MS;
+/** Bunny 保留一周日志与独立的多会话文件预算。 */
+const BUNNY_FEEDBACK_MAX_FILES = 2048;
+const BUNNY_FEEDBACK_LOG_WINDOW_MS = 7 * DAY_MS;
+/**
+ * Room Bunny's report leaves for desktop-environment.json, bunny/collection.json
+ * and the sources taken after it (app logs, asset manifest, goal rows), which
+ * keep the existing per-file rules.
+ */
+const BUNNY_FEEDBACK_RESERVED_FILES = 128;
+const BUNNY_FEEDBACK_RESERVED_BYTES = 64 * 1024 * 1024;
 /**
  * The runtime disk log transports (`runtime-*.log` / `im-runtime-*.log`)
  * live inside the utility process, so flushing them requires a control-plane
@@ -133,6 +145,7 @@ async function collectUploadDiagnosticBundle(input) {
     catch {
         skippedArtifacts.push({ name: 'desktop-environment.json', reason: 'collection_failed' });
     }
+    const sessionLogs = runtime.createRuntimeSessionLogSource(resolveRuntimeLogsDir(), input.sessionId);
     for (const artifact of input.sessionReport?.required ?? []) {
         try {
             requiredArtifacts.push(await createRequiredUploadArtifact(artifact));
@@ -169,6 +182,7 @@ async function collectUploadDiagnosticBundle(input) {
                 new runtime.StaticDiagnosticArtifactSource('required-upload-artifacts', 'Required upload artifacts', requiredArtifacts),
             ]
             : []),
+        ...(input.sessionLogsFirst ? [sessionLogs] : []),
         new runtime.FileDiagnosticArtifactSource({
             id: 'electron-logs',
             label: 'Electron logs',
@@ -181,7 +195,7 @@ async function collectUploadDiagnosticBundle(input) {
         new runtime.LocalAssetManifestDiagnosticSource(resolveLocalRuntimeDataDir()),
         new goalDiagnostics.ThreadGoalDecisionDiagnosticSource((query) => goalDiagnostics.readGoalDiagnosticRows(runtimeDataDir, query)),
         ...getExtraLogSources().map((source) => toSharedFileSource(runtime, source)),
-        runtime.createRuntimeSessionLogSource(resolveRuntimeLogsDir(), input.sessionId),
+        ...(input.sessionLogsFirst ? [] : [sessionLogs]),
         ...(deferredArtifacts.length > 0
             ? [
                 new runtime.StaticDiagnosticArtifactSource(DEFERRED_SESSION_REPORT_SOURCE, 'Session report (history segments, tool outputs, child sessions)', deferredArtifacts),
@@ -198,7 +212,9 @@ async function collectUploadDiagnosticBundle(input) {
         sinceMs: input.sinceMs,
         ...(input.untilMs === undefined ? {} : { untilMs: input.untilMs }),
         limits: {
-            maxFiles: UPLOAD_LOG_MAX_FILES,
+            maxFiles: input.maxFiles === undefined
+                ? UPLOAD_LOG_MAX_FILES
+                : Math.max(input.maxFiles, requiredArtifacts.length),
             maxBytes: UPLOAD_LOG_MAX_BYTES,
         },
     });
@@ -324,6 +340,8 @@ export function setupSystemIPC(options = {}) {
     ipcMain.handle(IPC_CHANNELS.SYSTEM_GET_APP_INSTALL_DIR, () => {
         return getDesktopAppInstallDir();
     });
+    let hardwareInfo;
+    ipcMain.handle(IPC_CHANNELS.SYSTEM_GET_HARDWARE_INFO, () => (hardwareInfo ?? (hardwareInfo = readDeviceHardwareInfo())));
     // 安装包版本（同步，用于 preload 初始化 platformInfo.appVersion）
     ipcMain.on(IPC_CHANNELS.SYSTEM_GET_APP_VERSION_SYNC, (event) => {
         event.returnValue = app.getVersion();
@@ -564,6 +582,7 @@ export function sanitizeFeedbackLogRequest(raw) {
         ...(sessionId ? { sessionId } : {}),
         ...(conversationSource ? { conversationSource } : {}),
         ...(lastActiveAtMs ? { sessionLastActiveAtMs: lastActiveAtMs } : {}),
+        ...(raw.scope === 'bunny' ? { scope: 'bunny' } : {}),
         metadata: {
             feedback_text: typeof metadata.feedback_text === 'string' ? metadata.feedback_text : '',
             upload_time: typeof metadata.upload_time === 'string' ? metadata.upload_time : '',
@@ -616,12 +635,15 @@ function formatUploadMetaTime(date) {
  * - 会话问题 / 消息点踩 + 云端会话：本地没有会话文件，只带公共日志（最近 2 天），upload_meta 记会话 ID；
  * - App 问题 / 意见建议 / 不带会话：公共日志 + 最近会话的日志和 manifest，不带 message_list。
  * 内测版的本地会话反馈（消息点踩除外）另带该会话的工作区快照，排在最后一档。
+ * Bunny 反馈（scope = bunny）另按 writeBunnyFeedbackArchive 装包。
  */
 export async function writeFeedbackDiagnosticArchive(request, outputDir,
 /** nowMs：反馈时间。重启后补装包时传建单时间，日志范围仍按反馈当时算；不传用当前时间。 */
 options = {}) {
     await flushDiagnosticsForUpload();
     const nowMs = options.nowMs ?? Date.now();
+    if (request.scope === 'bunny')
+        return writeBunnyFeedbackArchive(request, outputDir, nowMs);
     const sessionId = feedbackSessionId(request);
     const localSessionId = sessionId && request.conversationSource !== 'cloud' ? sessionId : undefined;
     const window = resolveFeedbackLogWindow({
@@ -771,6 +793,68 @@ export class SessionReportTemporarilyUnavailableError extends Error {
     }
 }
 
+/**
+ * Bunny feedback: Bunny's recent Sessions and state from its main Session,
+ * a week of app logs and each collected Session's runtime logs. Collection is
+ * best-effort; whatever fails is described in `bunny/collection.json`, so a
+ * missing report never sends the task back to the queue for a retry.
+ */
+async function writeBunnyFeedbackArchive(request, outputDir, nowMs) {
+    const mainSessionId = request.sessionId ?? request.metadata.session_id;
+    let report;
+    let error;
+    try {
+        report = await collectBunnyFeedbackReport(mainSessionId);
+    }
+    catch (reason) {
+        error = reason instanceof Error ? reason.message : String(reason);
+        logger.warn(`[FeedbackLog] Bunny report unavailable; packing base diagnostics: ${error}`);
+    }
+    const uploadMeta = JSON.stringify({ ...request.metadata, session_id: mainSessionId, ticket_id: request.ticketId }, null, 2);
+    const runtime = await importEsm('@mavis/local-runtime-v2/diagnostics');
+    const packed = packBunnyFeedbackReport({
+        mainSessionId,
+        report,
+        error,
+        limits: {
+            maxFiles: BUNNY_FEEDBACK_MAX_FILES - 1 - BUNNY_FEEDBACK_RESERVED_FILES,
+            maxBytes: UPLOAD_LOG_MAX_BYTES -
+                Buffer.byteLength(uploadMeta, 'utf8') -
+                BUNNY_FEEDBACK_RESERVED_BYTES,
+        },
+        sessionLogCost: (sessionIds) => runtime.measureRuntimeSessionLogs(resolveRuntimeLogsDir(), sessionIds),
+    });
+    const sinceMs = nowMs - BUNNY_FEEDBACK_LOG_WINDOW_MS;
+    const bundle = await collectUploadDiagnosticBundle({
+        logDir: getLogDir(),
+        sinceMs,
+        extraFiles: [
+            { name: `upload_meta_${formatUploadMetaTime(new Date(nowMs))}.json`, content: uploadMeta },
+            ...packed.artifacts,
+        ],
+        sessionId: packed.sessionIds,
+        maxFiles: BUNNY_FEEDBACK_MAX_FILES,
+        sessionLogsFirst: true,
+    });
+    await fs.promises.mkdir(outputDir, { recursive: true });
+    const fileName = `logs_${formatArchiveDate(new Date(sinceMs))}-${formatArchiveDate(new Date(nowMs))}_${nowMs}.zip`;
+    const zipPath = path.join(outputDir, fileName);
+    const partialPath = `${zipPath}.partial`;
+    try {
+        await writeDiagnosticArchive(partialPath, bundle);
+        await fs.promises.rename(partialPath, zipPath);
+    }
+    catch (archiveError) {
+        await fs.promises.rm(partialPath, { force: true }).catch(() => undefined);
+        throw archiveError;
+    }
+    logger.info(`[FeedbackLog] Built Bunny ${fileName} for ticket ${request.ticketId} with ${bundle.artifacts.length} diagnostic artifacts`);
+    return { zipPath, fileName };
+}
+async function collectBunnyFeedbackReport(mainSessionId) {
+    const utility = await import('../modules/local-runtime/utility');
+    return utility.collectUtilityRuntimeBunnyFeedbackReport(mainSessionId);
+}
 /**
  * 取会话报告；会话不存在、报告格式不对等非暂时性错误时返回 undefined，只带公共日志。
  * runtime 暂时不可用时抛 SessionReportTemporarilyUnavailableError。

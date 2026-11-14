@@ -9,10 +9,16 @@ import { createSessionHistoryLocationResolver, } from './session-history-locatio
 import { ensureCanonicalHistoryMaterialized, } from './canonical-history-materializer.js';
 import { HistoryScannerError, verifyCompactionParent, } from './mutation/canonical-history-scanner.js';
 import { isUserMessageId } from '../../shared/user-message-id.js';
+import { readSegmentId } from './segment/segment-prefix.js';
+import { segmentReplacementEnvelopes } from './segment/segment-replacement.js';
 import { isSideChatModeMessage } from '../../shared/sidechat-mode.js';
 import { createSessionHistoryIoLane, } from './mutation/session-history-coordination.js';
+import { repairCorruptedCanonicalHistory, } from './mutation/canonical-history-repair.js';
+import { resetCanonicalHistory, restoreCanonicalHistoryResetBackup, } from './mutation/canonical-history-reset.js';
 const MAX_CANONICAL_WRITE_ATTEMPTS = 3;
 const CANONICAL_RETRY_DELAYS_MS = [25, 50];
+export { SegmentCheckpointConflictError, } from './segment/segment-checkpoint.js';
+export { CanonicalHistoryRepairError, } from './mutation/canonical-history-repair.js';
 function historySnapshot(records, useActiveRevision) {
     return {
         revision: useActiveRevision
@@ -21,6 +27,7 @@ function historySnapshot(records, useActiveRevision) {
         // The reader's records are deeply frozen and owned by it; share them instead of copying.
         messages: Object.freeze(records.map(({ message }) => message)),
         identityVector: records.map(({ message_id }) => message_id),
+        turnIdVector: records.map(({ turn_id }) => turn_id),
     };
 }
 function isMissingParentScannerError(error) {
@@ -52,6 +59,20 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
         read: (sessionId) => inLane(sessionId, () => readSnapshot(sessionId, false)),
         readActive: (sessionId) => inLane(sessionId, () => readSnapshot(sessionId, true)),
         inspectActive: (sessionId) => inLane(sessionId, () => inspectActiveSnapshot(sessionId)),
+        readSegment: (sessionId) => inLane(sessionId, async () => {
+            const paths = await ensureInitialized(sessionId);
+            const active = await files.readActiveStrict(paths.messages);
+            return {
+                segmentId: readSegmentId(active),
+                generation: activeGeneration(active),
+                // The reader's records are deeply frozen and owned by it; share them instead of copying.
+                records: active.map(({ message_id, turn_id, message }) => ({
+                    message_id,
+                    turn_id,
+                    message,
+                })),
+            };
+        }),
         initialize: (sessionId) => inLane(sessionId, async () => {
             await ensureInitialized(sessionId, 'allocate');
         }),
@@ -97,6 +118,14 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             options.activity?.notify(change.sessionId);
             return committed;
         }),
+        repairCorrupted: (sessionId, repairOptions) => inLane(sessionId, () => repairCorruptedCanonicalHistory({
+            files,
+            paths: () => ensureInitialized(sessionId),
+            read: () => readSnapshot(sessionId, false),
+            notify: () => options.activity?.notify(sessionId),
+        }, repairOptions)),
+        resetActive: (sessionId, input) => inLane(sessionId, () => resetCanonicalHistory(resetDependencies(sessionId), resetEnvelope(input))),
+        restoreResetBackup: (sessionId, backupFile) => inLane(sessionId, () => restoreCanonicalHistoryResetBackup(resetDependencies(sessionId), backupFile)),
         compact: (change) => inLane(change.sessionId, async () => {
             const paths = await ensureInitialized(change.sessionId);
             // The snapshot and the replacement rewrite the whole file, so start from a full disk read.
@@ -111,7 +140,7 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             const marker = {
                 schemaVersion: 1,
                 generation: generation + 1,
-                producedBy: change.method,
+                producedBy: persistedProducer(change.method),
                 parentSnapshot: {
                     generation,
                     compactionId,
@@ -173,6 +202,23 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
     async function inLane(sessionId, operation) {
         return ioLane.run(sessionId, operation);
     }
+    function resetDependencies(sessionId) {
+        const notify = () => options.activity?.notify(sessionId);
+        return { files, paths: () => ensureInitialized(sessionId), notify };
+    }
+}
+/** The handoff header a context reset leaves as the whole active history (context reset spec 4.1). */
+function resetEnvelope(input) {
+    const resetId = safeCompactionId(input.resetId);
+    const header = historyMessage(input.header);
+    return {
+        resetId,
+        header: {
+            message_id: messageIdFromSeed(`${resetId}:0:${JSON.stringify(header)}`),
+            turn_id: `${input.turnId}:compaction`,
+            message: header,
+        },
+    };
 }
 async function persistCanonical(operation, retryDelay, attempt = 1) {
     try {
@@ -383,6 +429,13 @@ function assertChange(change, reason) {
     }
 }
 function compactionReplacementEnvelopes(change, active) {
+    if (change.method === 'llm_segment_checkpoint') {
+        return segmentReplacementEnvelopes(change, active, {
+            create: (message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }),
+            keep: withoutHistoryArtifact,
+            roleOf: (message) => historyMessage(message).role,
+        });
+    }
     const currentUserTail = readCurrentUserTail(change, active);
     const baseMessages = currentUserTail?.baseMessages ?? change.messages;
     const replacement = baseMessages.map((message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }));
@@ -481,6 +534,15 @@ function markHistoryArtifact(replacement, marker) {
         const semanticEnvelope = withoutHistoryArtifact(record);
         return index === 0 ? { ...semanticEnvelope, history_artifact: marker } : semanticEnvelope;
     });
+}
+/**
+ * The producer written to disk. A segment checkpoint differs from a summary
+ * checkpoint only in how it is committed; on disk it is a summary at index 0,
+ * and readers find segments by that record, never by the producer. Writing the
+ * summary producer keeps the file readable by releases that predate segments.
+ */
+function persistedProducer(method) {
+    return method === 'llm_segment_checkpoint' ? 'llm_checkpoint' : method;
 }
 function withoutHistoryArtifact(record) {
     return {

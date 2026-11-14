@@ -32,8 +32,8 @@ export class MemoryV2ModelGateway {
         const prompt = kind === 'consolidation'
             ? `${basePrompt}\n\n本机时区（IANA）：${Intl.DateTimeFormat().resolvedOptions().timeZone}\n`
             : basePrompt;
-        // 配置指定的模型优先；未配置时回退运行时默认模型(§2.3)。
-        const configured = configuredModel(kind, config);
+        // 配置指定的记忆模型优先；未配置时回退运行时默认模型(§2.3)。
+        const configured = configuredMemoryModel(config);
         const model = await this.options.completion.resolveModel({
             kind,
             reasoningEffort: configuredEffort(kind, config),
@@ -45,32 +45,30 @@ export class MemoryV2ModelGateway {
         const maxInputTokens = Math.max(1, Math.min(contractInputLimit(kind, config), positiveInteger(model.maxInputTokens, 'model input token limit') -
             singleCallOverheadTokens(kind, prompt)));
         const maxOutputTokens = positiveInteger(model.maxOutputTokens, 'model output token limit');
-        // contractId 参与 digest：其中任何一项变化都必须触发重抽或重建(§5.4/§2.4)。
-        const contractId = sha256(stableStringify({
+        // prompt 更新只改变调用快照，不使历史产物失效。格式或协议不兼容时显式提升版本；
+        // 执行模型、推理强度与 token 容量仍从下一次调用起生效。
+        const canonicalInputVersion = kind === 'consolidation' ? 6 : CAPTURE_CANONICAL_INPUT_VERSION;
+        const artifactContract = {
             schemaVersion: 2,
             kind,
-            ...contractModelFields(kind, {
-                modelName,
-                reasoningEffort,
-                modelParameters: model.parameters,
-                maxInputTokens,
-                maxOutputTokens,
-            }),
-            promptSha256,
             outputSchemaVersion: OUTPUT_SCHEMA_VERSION,
             ...outputToolField(kind),
             ...contractConfigFields(kind, config),
-            canonicalInputVersion: kind === 'consolidation' ? 6 : CAPTURE_CANONICAL_INPUT_VERSION,
-        }));
+            canonicalInputVersion,
+        };
+        const contractId = sha256(stableStringify({ ...artifactContract, promptSha256 }));
+        const artifactContractId = `${kind}-v${OUTPUT_SCHEMA_VERSION}-input-v${canonicalInputVersion}:${sha256(stableStringify(artifactContract))}`;
         const contract = {
             kind,
             contractId,
+            artifactContractId,
             modelName,
             reasoningEffort,
             promptSha256,
             outputSchemaVersion: OUTPUT_SCHEMA_VERSION,
             maxInputTokens,
             maxOutputTokens,
+            contextWindow: positiveInteger(model.contextWindow, 'model context window'),
             prompt,
         };
         this.contracts.set(contractId, contract);
@@ -145,7 +143,7 @@ export class MemoryV2ModelGateway {
         const config = this.options.config();
         const model = await this.options.completion.resolveModel({
             kind,
-            modelName: configuredModel(kind, config),
+            modelName: configuredMemoryModel(config),
             reasoningEffort: configuredEffort(kind, config),
         });
         if (!model.managedProvider || !model.modelName.startsWith(`${MANAGED_MINIMAX_PROVIDER_ID}/`)) {
@@ -200,8 +198,12 @@ export class MemoryV2ModelGateway {
 function isMatchingContract(contract, kind) {
     return contract !== undefined && contract.kind === kind;
 }
-function configuredModel(kind, config) {
-    return kind === 'consolidation' ? config.consolidationModel : config.captureModel;
+/**
+ * 记忆只用一个模型：抽取、整理与迁移共用设置页维护的 consolidationModel；旧配置缺失该字段时
+ * 回退 captureModel。两者都未配置时回退运行时默认模型。
+ */
+function configuredMemoryModel(config) {
+    return config.consolidationModel ?? config.captureModel;
 }
 function configuredEffort(kind, config) {
     return kind === 'consolidation'
@@ -228,15 +230,6 @@ function contractInputLimit(kind, config) {
     if (kind === 'consolidation')
         return config.maxConsolidationInputTokens;
     return config.maxCaptureInputTokens;
-}
-/**
- * 执行模型的身份与容量。抽取的指纹只含会话修订、不含输入快照，模型或输入预算变化只能经合同
- * 触发重抽，因此全部进入抽取与迁移合同。整理合同只描述产物的格式与规则：选集变化由 inputDigest
- * 覆盖，换模型、调推理强度或 token 上限都不改变产物语义，不让已有 MEMORY.md 失效、触发全量 INIT；
- * 新模型从下一次整理起生效。
- */
-function contractModelFields(kind, fields) {
-    return kind === 'consolidation' ? {} : fields;
 }
 function contractConfigFields(kind, config) {
     if (kind === 'consolidation') {

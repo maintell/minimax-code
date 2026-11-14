@@ -107,7 +107,9 @@ function lastGoodLocalPackage(projection) {
         contentDigest: projection.contentDigest,
         id: projection.id,
         ownership: projection.ownership,
-        ...(projection.unavailableReason ? { unavailableReason: projection.unavailableReason } : {}),
+        ...(projection.unavailableReason === 'SOURCE_MISSING'
+            ? { unavailableReason: projection.unavailableReason }
+            : {}),
     };
 }
 /**

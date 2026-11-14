@@ -1,9 +1,10 @@
 import { pluginHookEffort } from '@mavis/plugin-hooks';
-import { hasAcceptedLeaseIdentity, isAbortSignalLike } from './accepted-lease.js';
-import { captureAgentHostExecutionRequest } from './canonical-user-input.js';
+import { AgentHostTurnLeaseError, AgentHostTurnSequenceError, captureAcceptedTurnLease, readUnknownProperty, } from './accepted-lease.js';
+import { captureAgentHostExecutionRequest, isUserAuthoredTurnSource, } from './canonical-user-input.js';
 import { AgentHostCompactionExecutor, AgentHostCompactionLeaseError, AgentCompactionCloseError, AgentCompactionAssociationError, AgentCompactionSnapshotError, captureAcceptedCompactionInput, } from './compaction/agent-host-compaction-executor.js';
 import { ContextCompactionAttemptFactory, createAutomaticContextCompactionHook, } from './compaction/context-compaction.js';
 import { resolveCheckpointRequestShape } from './compaction/checkpoint-request-shape.js';
+import { beginSegmentCompactionTurn, prepareSegmentTurn, resetContextOrSkip, segmentCompactionRoute, settleSegmentTurn, } from './compaction/segment-turn.js';
 import { assertAgentHostCapabilityAvailable, assertAgentHostCompactionDependenciesReady, assertAgentHostDependenciesReady, } from './empty-dependencies.js';
 import { buildHostFailedEvent } from './events/host-failed-event.js';
 import { AgentHostCommittedHistoryWriter } from './history/committed-history-writer.js';
@@ -11,32 +12,18 @@ import { createBackgroundTaskReadSettlement } from './history/background/task-re
 import { AgentHistoryOperationIdentityError } from './history/history-operation-replay.js';
 import { AgentTerminalConfirmationError, TurnCommitPipeline, commitHostFailedTerminal, } from './events/turn-commit-pipeline.js';
 import { AgentHostSessionReadError } from './preparation/session-read.js';
+import { resolveTurnWakeReasons } from './preparation/turn-wake-reasons.js';
 import { AgentEventAssociationError, AgentExecutionSnapshotNotFoundError, TurnPreflight, observeAgentTurnSetupStage, } from './preparation/turn-preflight.js';
 import { exactPluginMcpToolOwners } from './assembly/local-turn-plugin-capabilities.js';
 import { loadLocalConfigHooks, localPluginHookCoordinator, } from './assembly/local-turn-plugin-hooks.js';
+import { preemptionObserverOption } from './execution/user-steering-preemption.js';
 export class AgentEventIdentityError extends Error {
     name = 'AgentEventIdentityError';
     constructor(kind) {
         super(`Cannot derive a stable identity for ${kind}.`);
     }
 }
-export class AgentHostTurnSequenceError extends Error {
-    acceptedSequence;
-    name = 'AgentHostTurnSequenceError';
-    constructor(acceptedSequence) {
-        super('AgentHost acceptedSequence must be a finite positive integer.');
-        this.acceptedSequence = acceptedSequence;
-    }
-}
-export class AgentHostTurnLeaseError extends Error {
-    reason;
-    name = 'AgentHostTurnLeaseError';
-    constructor(reason) {
-        super(`AgentHost accepted Turn lease is invalid: ${reason}.`);
-        this.reason = reason;
-    }
-}
-export { AgentEventAssociationError, AgentExecutionSnapshotNotFoundError, AgentCompactionAssociationError, AgentCompactionCloseError, AgentHistoryOperationIdentityError, AgentCompactionSnapshotError, AgentHostCompactionLeaseError, AgentHostSessionReadError, AgentTerminalConfirmationError, };
+export { AgentEventAssociationError, AgentExecutionSnapshotNotFoundError, AgentCompactionAssociationError, AgentCompactionCloseError, AgentHistoryOperationIdentityError, AgentCompactionSnapshotError, AgentHostCompactionLeaseError, AgentHostSessionReadError, AgentHostTurnLeaseError, AgentHostTurnSequenceError, AgentTerminalConfirmationError, };
 /** Ordered, fail-closed adapter between Turn ownership and the Agent loop. */
 export class LocalAgentHost {
     dependencies;
@@ -78,8 +65,15 @@ export class LocalAgentHost {
         catch {
             /* An optional suggestion can never fail a Turn. */
         }
+        try {
+            this.dependencies.turnTiming?.hostStarted(context);
+        }
+        catch {
+            /* Latency checkpoints can never fail a Turn. */
+        }
     }
     async run(input) {
+        const hostStartedAtMs = Date.now();
         const lease = captureAcceptedTurnLease(readUnknownProperty(input, 'lease'));
         const control = scopeTurnControl(this.dependencies, lease);
         let context = createBaseAgentEventContext({ lease });
@@ -91,6 +85,7 @@ export class LocalAgentHost {
         };
         let capabilityLease;
         let configHooks = [];
+        let segmentTurn;
         try {
             let preflight;
             try {
@@ -105,6 +100,15 @@ export class LocalAgentHost {
                 assertAgentHostDependenciesReady(this.dependencies);
                 this.notifyTurnStarted(context);
                 setupLogContext.executionMode = acceptedInput.request.executionMode ?? 'activate';
+                // Segment profile commit point (spec 11.5): before this Turn reads its history.
+                segmentTurn = await beginSegmentCompactionTurn({
+                    compaction: this.dependencies.compaction,
+                    committedHistory: this.committedHistory,
+                    attempts: this.compactionAttempts,
+                    context,
+                    leaseId: acceptedInput.lease.leaseId,
+                    request: acceptedInput.request,
+                });
                 const turnCapabilities = this.dependencies.turnCapabilities;
                 capabilityLease = turnCapabilities
                     ? await observeAgentTurnSetupStage(this.dependencies.logger, setupLogContext, 'capability_acquisition', () => turnCapabilities.acquire({
@@ -117,7 +121,7 @@ export class LocalAgentHost {
                     : undefined;
                 if (!turnCapabilities)
                     acceptedInput.beforeCapabilityCapture?.();
-                const prepared = await this.preflight.prepare(acceptedInput, capabilityLease?.capabilities);
+                const prepared = await prepareSegmentTurn(() => this.preflight.prepare(acceptedInput, capabilityLease?.capabilities), segmentTurn);
                 const assembly = await observeAgentTurnSetupStage(this.dependencies.logger, setupLogContext, 'runtime_assembly', () => capabilityLease?.capabilities
                     ? this.dependencies.agentRuntimes.normal.assembleTurn(prepared.assemblyContext, capabilityLease.capabilities)
                     : this.dependencies.agentRuntimes.normal.assembleTurn(prepared.assemblyContext));
@@ -132,13 +136,13 @@ export class LocalAgentHost {
                 configHooks = await loadLocalConfigHooks(prepared.session);
             }
             catch (error) {
-                return this.fail({
+                return settleSegmentTurn(segmentTurn, await this.fail({
                     context,
                     control,
                     pipeline: undefined,
                     failures: [error],
                     message: 'Agent preflight failed.',
-                });
+                }));
             }
             const executionContext = {
                 ...context,
@@ -147,24 +151,30 @@ export class LocalAgentHost {
             };
             try {
                 await observeAgentTurnSetupStage(this.dependencies.logger, setupLogContext, 'turn_start_handlers', () => runTurnStartHandlers(preflight.assembly.turnStartHandlers, preflight.assemblyContext, acceptedInput.request.requiresInputReview === true &&
-                    acceptedInput.request.clientIntent !== 'retry-continuation'));
+                    acceptedInput.request.clientIntent !== 'retry-continuation', isUserAuthoredTurnSource(acceptedInput.request.provenance.source)));
             }
             catch (error) {
                 const lifecycleFailures = await collectTurnEndHandlerFailures(preflight.assembly.turnEndHandlers, preflight.assemblyContext, 'failed');
-                return this.fail({
+                return settleSegmentTurn(segmentTurn, await this.fail({
                     context: executionContext,
                     control,
                     pipeline: undefined,
                     failures: [error, ...lifecycleFailures],
                     message: 'Agent turn-start handling failed.',
-                });
+                }));
             }
             return await this.execute({ ...acceptedInput, session: preflight.session }, {
                 context: executionContext,
                 preflight,
                 control,
                 configHooks,
+                turnTiming: {
+                    acceptedAtMs: lease.acceptedAtMs,
+                    hostStartedAtMs,
+                    assembledAtMs: Date.now(),
+                },
                 ...(capabilityLease?.capabilities ? { capabilities: capabilityLease.capabilities } : {}),
+                segmentTurn,
             });
         }
         finally {
@@ -176,6 +186,10 @@ export class LocalAgentHost {
         const acceptedInput = captureAcceptedCompactionInput(input);
         localPluginHookCoordinator.beginSessionActivity(acceptedInput.lease.sessionId, acceptedInput.lease.turnId);
         try {
+            // The user's context reset of a Bunny main conversation runs instead, without a model request.
+            const reset = await resetContextOrSkip(this.dependencies.compaction, acceptedInput);
+            if (reset)
+                return reset;
             const capabilityLease = await this.dependencies.turnCapabilities?.acquire({
                 sessionId: acceptedInput.lease.sessionId,
                 turnId: acceptedInput.lease.turnId,
@@ -213,7 +227,70 @@ export class LocalAgentHost {
         const executionInput = this.createExecutionInput(input, scope, pipeline);
         const runnerResult = await capture(() => this.dependencies.executor.execute(executionInput));
         const laneResult = await capture(() => pipeline.drain());
-        return this.settleExecution(scope, pipeline, settleCapturedExecution(runnerResult, laneResult));
+        const outcome = await this.settleExecution(scope, pipeline, settleCapturedExecution(runnerResult, laneResult));
+        if (scope.segmentTurn && outcome.status !== 'failed')
+            this.endSegmentTurn(scope);
+        return settleSegmentTurn(scope.segmentTurn, outcome);
+    }
+    /**
+     * The final main request view goes to the segment profile for its shared
+     * prefix (11.2), and its preparation instant to Turn timing.
+     */
+    mainRequestObserver(segmentTurn) {
+        const segments = segmentTurn ? this.dependencies.compaction?.segments : undefined;
+        const timing = this.dependencies.turnTiming;
+        if (!segments && !timing)
+            return {};
+        return {
+            mainRequestObserver: (prepared) => {
+                try {
+                    timing?.mainRequestPrepared(prepared);
+                }
+                catch {
+                    /* Latency checkpoints can never fail a Turn. */
+                }
+                return segments?.observeMainRequest(prepared);
+            },
+        };
+    }
+    /** Hands the finished Turn's model route to background segment compaction (spec 11.3). */
+    endSegmentTurn(scope) {
+        try {
+            const segments = this.dependencies.compaction?.segments;
+            if (!segments)
+                return;
+            segments.endTurn({
+                sessionId: scope.context.sessionId,
+                turnId: scope.context.turnId,
+                route: this.segmentRoute(scope),
+            });
+        }
+        catch {
+            /* Background compaction can never fail a committed Turn. */
+        }
+    }
+    /**
+     * The Turn's model route for segment compaction that runs outside it: the
+     * background compaction a Turn end starts, or a rebuild a Turn started and
+     * stopped waiting for.
+     */
+    segmentRoute(scope) {
+        const { context, preflight } = scope;
+        const llm = preflight.preparation.llm;
+        const payloadTransform = llm.auxiliaryPayloadTransform ??
+            this.dependencies.buildRequestPayloadTransform?.({
+                agentConfig: preflight.preparation.agentConfig,
+                llm,
+                sessionId: context.sessionId,
+                signal: new AbortController().signal,
+            });
+        return segmentCompactionRoute({
+            llm,
+            sessionId: context.sessionId,
+            turnId: context.turnId,
+            ...(payloadTransform ? { payloadTransform } : {}),
+            compaction: this.dependencies.compaction,
+        });
     }
     createExecutionInput(input, scope, pipeline) {
         const { context, preflight, control } = scope;
@@ -232,6 +309,7 @@ export class LocalAgentHost {
             preflight,
             pluginHooks: effectivePluginHooks,
             pluginHookRuntimeContext,
+            segmentTurn: scope.segmentTurn,
         });
         return {
             lease: input.lease,
@@ -239,6 +317,7 @@ export class LocalAgentHost {
             session: input.session,
             agent: preflight.agent,
             preparation: preflight.preparation,
+            ...turnTimingField(scope.turnTiming),
             assemblyContext: preflight.assemblyContext,
             assembly: preflight.assembly,
             history: preflight.history,
@@ -261,6 +340,11 @@ export class LocalAgentHost {
             rearmPrimaryUserMessageIdAfterOutputRecall: pipeline.rearmPrimaryUserMessageIdAfterOutputRecall,
             resolveTerminalOutcome: (reconcile) => pipeline.resolveOutcome(reconcile),
             ...(contextCompactionHook ? { contextCompactionHook } : {}),
+            ...this.mainRequestObserver(scope.segmentTurn),
+            ...preemptionObserverOption(this.dependencies.turnTiming),
+            ...(scope.segmentTurn?.onTurnFailing
+                ? { turnFailureHook: scope.segmentTurn.onTurnFailing }
+                : {}),
             control,
         };
     }
@@ -416,6 +500,10 @@ export class LocalAgentHost {
             checkpointRequestShape: resolveCheckpointRequestShape(preflight.preparation.llm, this.dependencies.compaction.checkpointSharedPrefixEnabled),
             attempts: this.compactionAttempts,
             logger: this.dependencies.logger,
+            segmentTurn: options.segmentTurn,
+            ...(options.segmentTurn
+                ? { segmentRoute: () => this.segmentRoute({ context, preflight }) }
+                : {}),
             ...(pluginHooks.length
                 ? {
                     beforeCompaction: async () => {
@@ -615,7 +703,7 @@ function throwFailures(failures, message) {
         throw unique[0];
     throw new AggregateError(unique, message);
 }
-async function runTurnStartHandlers(handlers, context, isOrdinaryInputTurn) {
+async function runTurnStartHandlers(handlers, context, isOrdinaryInputTurn, isUserAuthoredInput) {
     await runSequential(handlers, (handler) => handler({
         sessionId: context.sessionId,
         turnId: context.turnId,
@@ -624,6 +712,7 @@ async function runTurnStartHandlers(handlers, context, isOrdinaryInputTurn) {
         history: context.history,
         userInput: context.userInput,
         isOrdinaryInputTurn,
+        isUserAuthoredInput,
     }, context));
 }
 async function collectTurnEndHandlerFailures(handlers, context, reason, index = 0) {
@@ -681,62 +770,16 @@ function createAgentEventContext(input) {
                 : {}),
             routingFingerprint: input.request.provenance.routingFingerprint,
         },
+        wakeReasons: resolveTurnWakeReasons(input.request),
         ...(input.request.clientRequestId ? { clientRequestId: input.request.clientRequestId } : {}),
     };
 }
-function validateAcceptedSequence(acceptedSequence) {
-    if (typeof acceptedSequence !== 'number' ||
-        !Number.isFinite(acceptedSequence) ||
-        !Number.isSafeInteger(acceptedSequence) ||
-        acceptedSequence <= 0) {
-        throw new AgentHostTurnSequenceError(acceptedSequence);
-    }
-}
-function captureAcceptedTurnLease(value) {
-    if (!value || typeof value !== 'object') {
-        throw new AgentHostTurnLeaseError('identity');
-    }
-    const candidate = {
-        sessionId: readUnknownProperty(value, 'sessionId'),
-        turnId: readUnknownProperty(value, 'turnId'),
-        leaseId: readUnknownProperty(value, 'leaseId'),
-        acceptedSequence: readUnknownProperty(value, 'acceptedSequence'),
-        acceptedAtMs: readUnknownProperty(value, 'acceptedAtMs'),
-        signal: readUnknownProperty(value, 'signal'),
-        busyReason: readUnknownProperty(value, 'busyReason'),
-    };
-    if (!hasAcceptedLeaseIdentity(candidate)) {
-        throw new AgentHostTurnLeaseError('identity');
-    }
-    if (candidate.busyReason !== 'turn') {
-        throw new AgentHostTurnLeaseError('busy-reason');
-    }
-    if (!isAcceptedAtMs(candidate.acceptedAtMs)) {
-        throw new AgentHostTurnLeaseError('identity');
-    }
-    if (!isAbortSignalLike(candidate.signal)) {
-        throw new AgentHostTurnLeaseError('signal');
-    }
-    validateAcceptedSequence(candidate.acceptedSequence);
-    return Object.freeze({
-        sessionId: candidate.sessionId,
-        turnId: candidate.turnId,
-        leaseId: candidate.leaseId,
-        acceptedSequence: candidate.acceptedSequence,
-        acceptedAtMs: candidate.acceptedAtMs,
-        signal: candidate.signal,
-        busyReason: candidate.busyReason,
-    });
-}
-function readUnknownProperty(value, key) {
-    return Reflect.get(value, key);
+function turnTimingField(turnTiming) {
+    return turnTiming ? { turnTiming } : {};
 }
 function uniqueTaskIds(values) {
     return [
         ...new Set(values.filter((value) => typeof value === 'string' && value.trim().length > 0)),
     ];
-}
-function isAcceptedAtMs(value) {
-    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 //# sourceMappingURL=local-agent-host.js.map

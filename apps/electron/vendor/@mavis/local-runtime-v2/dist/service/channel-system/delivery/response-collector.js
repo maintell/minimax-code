@@ -7,6 +7,7 @@
  * the legacy SSE execution path as delete-with-v1 (MR3); the v2 runner only
  * collects from `RuntimeConversation` committed display messages.
  */
+import { isAbandonedStreamClosingMessage } from '@mavis/agent-core/protocol';
 import { ToolCallStatus } from '@mavis/agent-core/protocol/agent-message';
 import { parseMediaTags } from '@mavis/shared';
 import { isTurnLifecycleMessageKind } from '@mavis/shared/turn-message-kind';
@@ -46,7 +47,8 @@ class CommittedMessageCollector {
     take(message) {
         if (message.role === 'user' ||
             message.role === 'system' ||
-            isTurnLifecycleMessageKind(message.kind)) {
+            isTurnLifecycleMessageKind(message.kind) ||
+            isAbandonedAttempt(message)) {
             return;
         }
         this.finalMessages += 1;
@@ -72,7 +74,9 @@ class CommittedMessageCollector {
         const previous = this.toolCalls.get(toolCall.tool_call_id);
         const mergedArgs = toolCall.tool_call_args || previous?.tool_call_args;
         this.toolCalls.set(toolCall.tool_call_id, { ...toolCall, tool_call_args: mergedArgs });
-        if (this.filter.mode === 'full' && toolCall.tool_call_status !== ToolCallStatus.Finished) {
+        if (toolCall.tool_name !== 'wrap_up' &&
+            this.filter.mode === 'full' &&
+            toolCall.tool_call_status !== ToolCallStatus.Finished) {
             const detail = extractToolDetail(toolCall.tool_name, mergedArgs);
             const label = detail ? `${toolCall.tool_name} → ${detail}` : toolCall.tool_name;
             this.body += `\n\n🔧 ${label}\n\n`;
@@ -97,5 +101,13 @@ class CommittedMessageCollector {
             ...(error ? { error } : {}),
         };
     }
+}
+/**
+ * The half answer of an attempt the runtime abandoned and resent. The resent
+ * attempt is a separate message in the same turn, so replying with both would
+ * send the IM user the half answer followed by the full one.
+ */
+function isAbandonedAttempt(message) {
+    return isAbandonedStreamClosingMessage(message.raw);
 }
 //# sourceMappingURL=response-collector.js.map

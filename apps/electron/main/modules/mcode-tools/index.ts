@@ -6,6 +6,9 @@ import { buildEnv, LOCALE } from "../../config/env";
 import { resolveLocalRuntimeDataDir } from "../local-runtime/data-dir";
 import logger from "../../utils/logger";
 import { prepareDevelopmentMcodeToolsResource } from "./dev-resource";
+import { normalizeMcodeToolsBuildEnv, resolveDesktopMcodeToolsHostBinDir } from "./host-bin-dir";
+export { resolveDesktopMcodeToolsHostBinDir } from "./host-bin-dir";
+
 let initialization = null;
 let activeIntegration = null;
 let disposal = null;
@@ -46,9 +49,9 @@ export function disposeMcodeToolsIntegration() {
 }
 async function initialize(options) {
     const paths = integrationPaths();
-    const expectedBuildEnv = normalizeBuildEnv(buildEnv);
+    const expectedBuildEnv = normalizeMcodeToolsBuildEnv(buildEnv);
     if (getConfig().beta.mcodeTools !== true) {
-        removeMcodeToolsLaunchers(paths.dataDir, paths.region);
+        removeMcodeToolsLaunchers(launcherOwnership(paths));
         logger.info(`[mcode-tools] integration disabled buildEnv=${expectedBuildEnv} platform=${process.platform}`);
         return;
     }
@@ -71,6 +74,10 @@ async function initialize(options) {
             executable: process.execPath,
             platform: process.platform,
             region: paths.region,
+            hostBinDir: paths.hostBinDir,
+            // Other Desktop packages default to the same dataDir; a fixed socket would let the
+            // later App's broker (and account) answer this App's launcher.
+            isolateBrokerInstance: true,
             session: options.sharedAuthSession,
             logger: logger,
         });
@@ -78,7 +85,7 @@ async function initialize(options) {
         logger.info(`[mcode-tools] shared-broker launcher ready buildEnv=${expectedBuildEnv} region=${paths.region} version=${integration.version}`);
     }
     catch (error) {
-        removeMcodeToolsLaunchers(paths.dataDir, paths.region);
+        removeMcodeToolsLaunchers(launcherOwnership(paths));
         throw error;
     }
 }
@@ -86,19 +93,29 @@ async function dispose(pendingInitialization) {
     await pendingInitialization?.catch(() => undefined);
     const integration = activeIntegration;
     activeIntegration = null;
-    // integration.dispose() removes <dataDir>/bin/mcode-tools*.cmd, and nothing
-    // reinstalls them until the next app start. Record the launcher before the
-    // removal so a disposal that runs without a matching re-init is attributable
-    // instead of silently leaving the bin directory without mcode-tools.
+    // integration.dispose() resets this App's launchers to fail-closed placeholders,
+    // and nothing reinstalls them until the next app start. Record the launcher
+    // before the reset so a disposal that runs without a matching re-init is
+    // attributable instead of silently leaving mcode-tools unavailable.
     logger.info(integration
-        ? `[mcode-tools] dispose removing launcher=${integration.launcherPath} broker=${integration.brokerEndpoint} version=${integration.version}`
+        ? `[mcode-tools] dispose resetting launcher=${integration.launcherPath} broker=${integration.brokerEndpoint} version=${integration.version}`
         : '[mcode-tools] dispose requested without an active integration');
     await integration?.dispose();
+}
+function launcherOwnership(paths) {
+    return {
+        dataDir: paths.dataDir,
+        executable: process.execPath,
+        region: paths.region,
+        hostBinDir: paths.hostBinDir,
+        platform: process.platform,
+    };
 }
 function integrationPaths() {
     const dataDir = resolveLocalRuntimeDataDir();
     return {
         dataDir,
+        hostBinDir: resolveDesktopMcodeToolsHostBinDir(dataDir),
         resourceDir: resolveMcodeToolsResourceDir({
             appIsPackaged: app.isPackaged,
             appPath: app.getAppPath(),
@@ -125,11 +142,6 @@ export function resolveMcodeToolsResourceDir(options) {
         return path.normalize(resourceDir);
     }
     return path.join(options.appPath, 'resources', 'mcode-tools');
-}
-function normalizeBuildEnv(value) {
-    if (value === 'staging' || value === 'prod')
-        return value;
-    return 'test';
 }
 function errorCategory(error) {
     if (!(error instanceof Error))

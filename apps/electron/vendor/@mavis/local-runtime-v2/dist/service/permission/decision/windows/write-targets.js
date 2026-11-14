@@ -52,6 +52,23 @@ const NATIVE_RM_SHELL_FAMILIES = new Set([
     'unknown',
 ]);
 const WINDOWS_MOVE_COMMANDS = new Set(['move', 'mv', 'move-item']);
+/**
+ * Built-in PowerShell aliases of Copy-Item / Move-Item. A bare alias resolves
+ * to the cmdlet; `cp.exe` or a path still runs the native program.
+ */
+const POWERSHELL_COPY_MOVE_ALIASES = new Map([
+    ['cp', 'copy-item'],
+    ['copy', 'copy-item'],
+    ['cpi', 'copy-item'],
+    ['mv', 'move-item'],
+    ['move', 'move-item'],
+    ['mi', 'move-item'],
+]);
+function readWindowsCommandName(program, shellFamily) {
+    const name = normalizeWindowsProgramName(program);
+    const isBareAlias = shellFamily === 'powershell' && program.toLowerCase() === name;
+    return { name, cmdlet: (isBareAlias && POWERSHELL_COPY_MOVE_ALIASES.get(name)) || name };
+}
 const WINDOWS_COPY_OR_MOVE_COMMANDS = new Set([
     'copy',
     'xcopy',
@@ -62,24 +79,45 @@ const WINDOWS_COPY_OR_MOVE_COMMANDS = new Set([
     'mv',
     'move-item',
 ]);
+/**
+ * PowerShell binds any unambiguous prefix of a parameter name, with an
+ * optional `:value`. `-Recurse:$false` is still treated as recursive.
+ */
+function powerShellParameterPrefix(parameter, minLength) {
+    const optionalTail = [...parameter.slice(minLength)].reduceRight((tail, char) => `(?:${char}${tail})?`, '');
+    return new RegExp(`^-${parameter.slice(0, minLength)}${optionalTail}(?::.*)?$`, 'i');
+}
+/** Copy-Item and Remove-Item have no other parameter starting with `r`. */
+const POWERSHELL_RECURSE = powerShellParameterPrefix('recurse', 1);
+/** A GNU cp short-option cluster with -r/-R. Case-sensitive, so `-Fr` (FromSession) is not one. */
+const GNU_CP_RECURSIVE_CLUSTER = /^-[abdfHilLnPpRrsStTuvxZ]*[rR][abdfHilLnPpRrsStTuvxZ]*$/;
 const RECURSIVE_WRITE_ARGUMENTS = new Map([
     ['rm', matchesAny(/^-\S*r/i)],
     ['rmdir', matchesAny(/^\/s$/i)],
     ['rd', matchesAny(/^\/s$/i)],
-    ['remove-item', matchesAny(/^(?:-recurse|-r)$/i)],
-    ['ri', matchesAny(/^(?:-recurse|-r)$/i)],
-    ['remove', matchesAny(/^(?:-recurse|-r)$/i)],
+    ['remove-item', matchesAny(POWERSHELL_RECURSE)],
+    ['ri', matchesAny(POWERSHELL_RECURSE)],
+    ['remove', matchesAny(POWERSHELL_RECURSE)],
     ['mavis-trash', matchesAny(/^-\S*r\S*$/i, /^--recursive$/i)],
     ['xcopy', matchesAny(/^\/(?:e|s|t)$/i)],
     ['robocopy', matchesAny(/^\/(?:e|s|mir|purge|move|mov)$/i)],
     ['cp', matchesAny(/^-[A-Za-z]*[rR][A-Za-z]*$/, /^(?:--recursive|-recurse)$/i)],
-    ['copy-item', matchesAny(/^-[A-Za-z]*[rR][A-Za-z]*$/, /^(?:--recursive|-recurse)$/i)],
 ]);
+/**
+ * Copy-Item takes whole-word parameters, so POSIX short-flag matching would
+ * read `-Force` or `-ErrorAction` as `-r`.
+ */
+const POWERSHELL_COPY_RECURSIVE_ARGUMENT = matchesAny(POWERSHELL_RECURSE, /^--recursive$/i);
+/**
+ * A profile can rebind the bare `cp` alias to a native cp, so its GNU
+ * recursive clusters (`-rf`, `-fr`) stay recursive as well.
+ */
+const POWERSHELL_CP_ALIAS_RECURSIVE_ARGUMENT = matchesAny(POWERSHELL_RECURSE, GNU_CP_RECURSIVE_CLUSTER, /^--recursive$/i);
 /**
  * PowerShell resolves del/erase/rd/rmdir to Remove-Item, so recursion is
  * -Recurse there; `/s` is kept as a conservative signal.
  */
-const POWERSHELL_NATIVE_RECURSIVE_ARGUMENT = matchesAny(/^(?:-recurse|-r|\/s)$/i);
+const POWERSHELL_NATIVE_RECURSIVE_ARGUMENT = matchesAny(POWERSHELL_RECURSE, /^\/s$/i);
 const NATIVE_OPERAND_COMMANDS = new Set(['mkdir', 'md', 'unlink', 'shred']);
 const POWERSHELL_WRITE_COMMANDS = new Set([
     'mkdir',
@@ -109,17 +147,27 @@ export function isRecursiveWindowsWriteCommand(command, shellFamily) {
     const [program, ...args] = tokenizeWindowsCommand(command, shellFamily);
     if (!program)
         return false;
-    const name = normalizeWindowsProgramName(program);
-    if (WINDOWS_MOVE_COMMANDS.has(name))
+    const commandName = readWindowsCommandName(program, shellFamily);
+    if (WINDOWS_MOVE_COMMANDS.has(commandName.cmdlet))
         return true;
-    const recursiveArgument = shellFamily === 'powershell' && WINDOWS_NATIVE_DELETE_COMMANDS.has(name)
-        ? POWERSHELL_NATIVE_RECURSIVE_ARGUMENT
-        : RECURSIVE_WRITE_ARGUMENTS.get(name);
+    const recursiveArgument = readRecursiveArgumentMatcher(commandName, shellFamily);
     return recursiveArgument !== undefined && args.some(recursiveArgument);
+}
+function readRecursiveArgumentMatcher({ name, cmdlet }, shellFamily) {
+    if (shellFamily === 'powershell' && WINDOWS_NATIVE_DELETE_COMMANDS.has(name)) {
+        return POWERSHELL_NATIVE_RECURSIVE_ARGUMENT;
+    }
+    if (cmdlet === 'copy-item') {
+        return name === 'cp'
+            ? POWERSHELL_CP_ALIAS_RECURSIVE_ARGUMENT
+            : POWERSHELL_COPY_RECURSIVE_ARGUMENT;
+    }
+    return RECURSIVE_WRITE_ARGUMENTS.get(name);
 }
 export function isWindowsWriteOrDeleteCommand(command, shellFamily) {
     const [program] = tokenizeWindowsCommand(command, shellFamily);
-    return !!program && WINDOWS_WRITE_OR_DELETE_COMMANDS.has(normalizeWindowsProgramName(program));
+    return (!!program &&
+        WINDOWS_WRITE_OR_DELETE_COMMANDS.has(readWindowsCommandName(program, shellFamily).cmdlet));
 }
 export function hasWindowsWriteOrDeleteCommand(command, shellFamily) {
     return expandWindowsCommandSurfacesWithShell(command, { shellFamily }).some((surface) => isWindowsWriteOrDeleteCommand(surface.command, surface.shellFamily));
@@ -212,10 +260,10 @@ export function readWindowsWriteTargets(command, shellFamily, recoverableRm) {
     const [program, ...args] = tokenizeWindowsCommand(command, shellFamily);
     if (!program)
         return undefined;
-    const name = normalizeWindowsProgramName(program);
-    return WINDOWS_COPY_OR_MOVE_COMMANDS.has(name)
-        ? readWindowsCopyTargets(program, args)
-        : readWindowsSimpleWriteTargets(name, args, shellFamily);
+    const commandName = readWindowsCommandName(program, shellFamily);
+    return WINDOWS_COPY_OR_MOVE_COMMANDS.has(commandName.cmdlet)
+        ? readWindowsCopyTargets(commandName, args)
+        : readWindowsSimpleWriteTargets(commandName.name, args, shellFamily);
 }
 /** Decide rm here unless PowerShell/unknown syntax falls through to the generic readers. */
 function readWindowsRmTargets(command, shellFamily, recoverableRm) {
@@ -339,9 +387,9 @@ function classifyPowerShellArgument(arg) {
         return 'other';
     return undefined;
 }
-function readWindowsCopyTargets(program, args) {
-    const name = normalizeWindowsProgramName(program);
-    const explicitDestination = readExplicitWindowsDestination(program, args);
+function readWindowsCopyTargets(command, args) {
+    const { name } = command;
+    const explicitDestination = readExplicitWindowsDestination(command, args);
     if (explicitDestination.explicit) {
         return explicitDestination.destination ? [explicitDestination.destination] : undefined;
     }
@@ -354,15 +402,16 @@ function readWindowsCopyTargets(program, args) {
     const destination = ['xcopy', 'robocopy'].includes(name) ? positional.at(1) : positional.at(-1);
     return destination ? [destination] : undefined;
 }
-function readWindowsMoveSourceTargets(command) {
+function readWindowsMoveSourceTargets(command, shellFamily) {
     const [program, ...args] = tokenizeWindowsCommand(command);
     if (!program)
         return undefined;
-    const name = normalizeWindowsProgramName(program);
-    if (!isWindowsMoveCommand(name, args))
+    const commandName = readWindowsCommandName(program, shellFamily);
+    const { name } = commandName;
+    if (!isWindowsMoveCommand(commandName.cmdlet, args))
         return [];
-    const explicitDestination = readExplicitWindowsDestination(program, args);
-    const positional = readWindowsMovePositionals(name, args);
+    const explicitDestination = readExplicitWindowsDestination(commandName, args);
+    const positional = readWindowsMovePositionals(commandName, args);
     if (name === 'robocopy')
         return positional[0] ? [positional[0]] : undefined;
     if (explicitDestination.explicit)
@@ -373,13 +422,13 @@ function isWindowsMoveCommand(name, args) {
     return (WINDOWS_MOVE_COMMANDS.has(name) ||
         (name === 'robocopy' && args.some((arg) => /^\/(?:move|mov)$/i.test(arg))));
 }
-function readWindowsMovePositionals(name, args) {
+function readWindowsMovePositionals(command, args) {
     const positional = [];
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
         if (arg === undefined)
             continue;
-        const skip = windowsMoveOptionSkip(name, arg);
+        const skip = windowsMoveOptionSkip(command, arg);
         if (skip === 'consume-next') {
             index += 1;
             continue;
@@ -390,14 +439,18 @@ function readWindowsMovePositionals(name, args) {
     }
     return positional;
 }
-function windowsMoveOptionSkip(name, arg) {
+/**
+ * A bare PowerShell `mv` is Move-Item but a profile can rebind it to a native
+ * mv, so both option spellings are honored.
+ */
+function windowsMoveOptionSkip({ name, cmdlet }, arg) {
     if (name === 'mv' && ['-t', '--target-directory'].includes(arg))
         return 'consume-next';
     if (name === 'mv' && /^(?:-t(?:=)?|--target-directory=)/i.test(arg))
         return 'skip';
-    if (name === 'move-item' && /^-destination$/i.test(arg))
+    if (cmdlet === 'move-item' && /^-destination$/i.test(arg))
         return 'consume-next';
-    if (name === 'move-item' && /^-destination(?::|=)/i.test(arg))
+    if (cmdlet === 'move-item' && /^-destination(?::|=)/i.test(arg))
         return 'skip';
     return isWindowsCopyOption(arg) ? 'skip' : undefined;
 }
@@ -410,7 +463,7 @@ export function readWindowsPathSafetyTargets(command, shellFamily, recoverableRm
     const writeTargets = readWindowsWriteTargets(command, shellFamily, recoverableRm);
     if (!writeTargets)
         return undefined;
-    const moveSourceTargets = readWindowsMoveSourceTargets(command);
+    const moveSourceTargets = readWindowsMoveSourceTargets(command, shellFamily);
     if (moveSourceTargets === undefined)
         return undefined;
     return [...writeTargets, ...moveSourceTargets];
@@ -420,13 +473,12 @@ export function readWindowsPathSafetyTargets(command, shellFamily, recoverableRm
  * destination. A missing or malformed explicit destination deliberately
  * returns `undefined` to the caller so the recursive write is fail-closed.
  */
-function readExplicitWindowsDestination(program, args) {
-    const name = normalizeWindowsProgramName(program);
+function readExplicitWindowsDestination(command, args) {
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
         if (!arg)
             continue;
-        const destination = readExplicitWindowsDestinationAt(name, arg, args[index + 1]);
+        const destination = readExplicitWindowsDestinationAt(command, arg, args[index + 1]);
         if (destination)
             return destination;
     }
@@ -438,7 +490,8 @@ function explicitWindowsDestination(nextArg) {
         ...(nextArg && !isWindowsCopyOption(nextArg) ? { destination: nextArg } : {}),
     };
 }
-function readExplicitWindowsDestinationAt(name, arg, nextArg) {
+/** A bare PowerShell cp/mv honors both the GNU `-t` and the cmdlet `-Destination` spellings. */
+function readExplicitWindowsDestinationAt({ name, cmdlet }, arg, nextArg) {
     if (['cp', 'mv'].includes(name)) {
         if (arg === '-t' || arg === '--target-directory') {
             return explicitWindowsDestination(nextArg);
@@ -449,7 +502,7 @@ function readExplicitWindowsDestinationAt(name, arg, nextArg) {
         if (destination !== undefined)
             return { explicit: true, destination };
     }
-    if (['copy-item', 'move-item'].includes(name)) {
+    if (['copy-item', 'move-item'].includes(cmdlet)) {
         if (/^-destination$/i.test(arg)) {
             return explicitWindowsDestination(nextArg);
         }

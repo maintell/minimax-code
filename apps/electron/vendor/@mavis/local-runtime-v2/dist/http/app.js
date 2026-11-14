@@ -1,3 +1,4 @@
+import { withMiniAppLaunchpadRequestParseErrorPolicy } from './routing/miniapp-launchpad-request-policy.js';
 import { Hono } from 'hono';
 import { createControllers } from './controllers/create.js';
 import { requestContextMiddleware } from './middleware/request-context.mw.js';
@@ -13,7 +14,10 @@ import { mountProviderAuthRoutes } from './routing/provider-auth.js';
 import { abortAllComputerUse, snapshotComputerUseState, } from '../service/computer-use/index.js';
 import { mountWorkspaceHtmlPreviewRoutes } from './routing/workspace-html-preview.js';
 import { mountBrowserTurnContextRoutes } from './routing/browser-turn-context.js';
+import { mountQuotaAutoResumeWakeRoute, } from './routing/quota-auto-resume-wake.js';
 import { mountChannelCompatRoutes } from './routing/channel-compat.js';
+import { mountBunnyMemoryDebugRoutes } from './routing/bunny-memory-debug.js';
+import { mountBunnyDebugRoutes } from './routing/bunny-debug.js';
 export { createV2AgentRuntimeManagementPort } from './controllers/agent-runtime-port.js';
 export { createLocalRuntimeHost } from './host/initialize.js';
 export { cleanupFailedV1Startup, createV1RuntimeCompatibility, withAgentStorageScope, } from './host/composition.js';
@@ -55,7 +59,7 @@ export function createLocalRuntimeV2FrontDoor(deps) {
 }
 function createFrontDoorAppDeps(deps, controllers, ownerCapabilities) {
     return {
-        bindings: filterBindings(withPreferenceRequestParseErrorPolicy(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(makeBindings(controllers)))), migratedMethodsForHost(ownerCapabilities)),
+        bindings: filterBindings(withPreferenceRequestParseErrorPolicy(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(withMiniAppLaunchpadRequestParseErrorPolicy(makeBindings(controllers))))), migratedMethodsForHost(ownerCapabilities)),
         logger: deps.logger,
         metrics: deps.metrics,
         forceLegacy: () => false,
@@ -63,8 +67,11 @@ function createFrontDoorAppDeps(deps, controllers, ownerCapabilities) {
         rejectLegacyCronWrites: ownerCapabilities.cron === true,
         workspaceHtmlPreview: deps.services?.workspace?.htmlPreview,
         browserUse: deps.services?.browserUse,
+        bunnyMemory: deps.services?.bunnyMemory,
+        bunnyDebug: deps.services?.bunnyDebug,
         ...(deps.services?.modelSystem?.oauth ? { codexOAuth: deps.services.modelSystem.oauth } : {}),
         ...(deps.services?.agentFavorites ? { agentFavorites: deps.services.agentFavorites } : {}),
+        ...(deps.services?.quotaAutoResume ? { quotaAutoResume: deps.services.quotaAutoResume } : {}),
         ...(deps.onLegacyFallback ? { onLegacyFallback: deps.onLegacyFallback } : {}),
         ...(deps.computerUseClient ? { computerUseClient: deps.computerUseClient } : {}),
         ...(deps.computerUsePreferences ? { computerUsePreferences: deps.computerUsePreferences } : {}),
@@ -110,6 +117,11 @@ export function ownerCapabilitiesForServices(services) {
         // 其余宿主回落 v1 的 memory-v2-disabled 降级实现。
         memoryV2: Boolean(services?.memoryV2),
         goal: Boolean(services?.goal),
+        bunny: Boolean(services?.bunny ||
+            services?.assignments ||
+            services?.workingState ||
+            services?.bunnyTrace ||
+            services?.bunnyTaskTelemetry),
         sessionActivity: Boolean(services?.sessionActivity),
     };
 }
@@ -143,9 +155,12 @@ function buildApp(deps) {
         mountProviderAuthRoutes(app, deps.codexOAuth);
     mountWorkspaceHtmlPreviewRoutes(app, deps.workspaceHtmlPreview);
     mountBrowserTurnContextRoutes(app, deps.browserUse);
+    mountBunnyMemoryDebugRoutes(app, deps.bunnyMemory);
+    mountBunnyDebugRoutes(app, deps.bunnyDebug);
     if (deps.computerUseClient) {
         mountComputerUseRoutes(app, deps.computerUseClient);
     }
+    mountQuotaAutoResumeWakeRoute(app, deps.quotaAutoResume);
     app.get('/mavis/api/preferences/starred-agents', async (c) => {
         if (!deps.agentFavorites) {
             return c.json({

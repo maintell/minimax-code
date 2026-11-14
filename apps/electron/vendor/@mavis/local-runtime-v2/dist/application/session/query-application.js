@@ -2,7 +2,7 @@ import { isCloudSessionRead, readCloudSession } from './session-read-source.js';
 import { logger } from '@mavis/shared/local-runtime-logging';
 import { SessionQueryServiceError, } from '../../service/session-system/index.js';
 import { AppError } from '../errors.js';
-import { toSessionInfoView, toSessionTreeChildView } from './wire.js';
+import { readSessionAssignments, toSessionInfoView, toSessionTreeChildView, } from './wire.js';
 /** Maps generated Session query contracts directly to the neutral Session read service. */
 export class SessionQueryApplication {
     options;
@@ -22,8 +22,9 @@ export class SessionQueryApplication {
             offset: req.offset,
             cursor: req.cursor,
         }));
+        const assignments = await readSessionAssignments(this.options.assignments, page.sessions);
         return {
-            sessions: page.sessions.map((session) => toSessionInfoView(session, this.options.sideChats.relation(session.sessionId))),
+            sessions: page.sessions.map((session) => this.view(session, assignments)),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
@@ -39,9 +40,10 @@ export class SessionQueryApplication {
             projectKeys: req.projectKeys,
             includeArchived: req.includeArchived,
         }));
+        const assignments = await readSessionAssignments(this.options.assignments, page.sessions);
         const sessionProjects = Object.entries(page.projectKeys ?? {}).map(([sessionId, projectKey]) => ({ sessionId, projectKey }));
         return {
-            sessions: page.sessions.map((session) => toSessionInfoView(session, this.options.sideChats.relation(session.sessionId))),
+            sessions: page.sessions.map((session) => this.view(session, assignments)),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
             ...(page.messageMatches?.length ? { messageMatches: [...page.messageMatches] } : {}),
@@ -60,9 +62,10 @@ export class SessionQueryApplication {
             limit: req.limit,
             cursor: req.cursor,
         }));
+        const assignments = await readSessionAssignments(this.options.assignments, page.sessions.map(({ session }) => session));
         return {
             sessions: page.sessions.map(({ session, children }) => ({
-                session: toSessionInfoView(session, this.options.sideChats.relation(session.sessionId)),
+                session: this.view(session, assignments),
                 childSessions: children.map(toSessionTreeChildView),
             })),
             hasMore: page.hasMore,
@@ -81,7 +84,11 @@ export class SessionQueryApplication {
                 cursor: req.sideChatsCursor,
             })
             : undefined;
-        const view = toSessionInfoView(session, this.options.sideChats.relation(session.sessionId));
+        const assignments = await readSessionAssignments(this.options.assignments, [
+            session,
+            ...(page?.sessions ?? []),
+        ]);
+        const view = this.view(session, assignments);
         const wait = this.options.backgroundTaskWait?.(session.sessionId);
         if (view.status && wait)
             view.status.backgroundTaskWait = wait;
@@ -90,7 +97,7 @@ export class SessionQueryApplication {
             ...(page
                 ? {
                     sideChats: {
-                        items: page.sessions.map((side) => toSessionInfoView(side, this.options.sideChats.relation(side.sessionId))),
+                        items: page.sessions.map((side) => this.view(side, assignments)),
                         hasMore: page.hasMore,
                         ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
                     },
@@ -129,14 +136,18 @@ export class SessionQueryApplication {
             hasMore: page.hasMore,
             agentNames: [...new Set(page.sessions.map(({ session }) => session.agentName))],
         }, '[local-runtime-v2] sidebar tree page served');
+        const assignments = await readSessionAssignments(this.options.assignments, page.sessions.map(({ session }) => session));
         return {
             sessions: page.sessions.map(({ session, children }) => ({
-                session: toSessionInfoView(session, this.options.sideChats.relation(session.sessionId)),
+                session: this.view(session, assignments),
                 childSessions: children.map(toSessionTreeChildView),
             })),
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
+    }
+    view(session, assignments) {
+        return toSessionInfoView(session, this.options.sideChats.relation(session.sessionId), assignments.get(session.sessionId));
     }
     async invoke(operation) {
         try {

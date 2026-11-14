@@ -199,18 +199,35 @@ export class PluginMiniAppPublicationController {
         const host = this.options.host;
         await host.runExclusive(async () => {
             throwIfAborted(input.signal);
-            const current = host.currentSnapshot;
-            if (!this.listAcceptedMiniApps().some(({ candidate }) => candidate.pluginId === input.pluginId)) {
+            const accepted = this.listAcceptedMiniApps().find(({ candidate }) => candidate.pluginId === input.pluginId);
+            if (!accepted) {
                 if (cancelledStart)
                     return;
                 throw new PluginSystemError('MINIAPP_NOT_ACCEPTED', 'Mini App definition is not accepted');
             }
-            const completion = deferred();
-            await participant.withStopRequest(input, () => this.prepareSnapshotPublication(current, {
-                completion,
-                requiredMiniAppPluginId: input.pluginId,
-                ...(input.signal ? { signal: input.signal } : {}),
-            }));
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                throwIfAborted(input.signal);
+                host.assertUsable();
+                const completion = deferred();
+                try {
+                    await participant.withStopRequest(input, () => this.prepareSnapshotPublication(host.currentSnapshot, {
+                        completion,
+                        requiredMiniAppPluginId: input.pluginId,
+                        ...(input.signal ? { signal: input.signal } : {}),
+                    }));
+                    return;
+                }
+                catch (error) {
+                    // The process can be proven cold while the subsequent MCP publication fails.
+                    // Reconcile once through the full transaction; cold state alone is not success.
+                    if (attempt !== 0 ||
+                        input.signal?.aborted ||
+                        !(error instanceof PluginSystemError) ||
+                        !['MINIAPP_PREPARATION_FAILED', 'PUBLICATION_SUPERSEDED'].includes(error.code) ||
+                        !participant.isAcceptedCandidateStopped(accepted.candidate))
+                        throw error;
+                }
+            }
         });
     }
     /**

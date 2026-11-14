@@ -1,6 +1,6 @@
 export { ContextManager } from './manager.js';
 export { computeCompactionTriggerAt, DEFAULT_CONTEXT_MANAGER_SETTINGS } from './settings.js';
-export { isValidCompactionTriggerSetting, resolveCompactionTokenBudget, resolveConfiguredCompactionTrigger, resolveDynamicMaxTokens, } from './provider-budget.js';
+export { isValidCompactionTriggerSetting, resolveCompactionTokenBudget, resolveConfiguredCompactionTrigger, resolveSegmentCompactionBudget, resolveDynamicMaxTokens, } from './provider-budget.js';
 export { BpeTokenEstimator, createDefaultContextTokenEstimator, createDefaultTokenEstimator, } from './token-estimator.js';
 export { renderLocalSkillsCatalogResult, } from './skill-catalog.js';
 export { buildCountTokensRequestBody, cjkFallbackTokens, cjkFallbackTokensForBody, estimateCharsToTokensCjkAware, } from './count-tokens-body.js';

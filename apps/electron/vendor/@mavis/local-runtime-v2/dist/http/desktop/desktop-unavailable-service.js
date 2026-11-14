@@ -1,5 +1,5 @@
 import { HTTPException } from 'hono/http-exception';
-import { DesktopMiniAppServiceBase } from './desktop-miniapp-service-base.js';
+import { DesktopWebsiteServiceBase } from './desktop-website-service-base.js';
 import { CronContractError } from '../../service/cron/index.js'; // desktop-service-boundary-skip: anchor=server-cron-contract owner=cron reason=legacy-cron-rpc-glue-before-facade; followup=desktop-service-domain-facades
 import { jsonError } from './desktop-service-support.js';
 /**
@@ -29,7 +29,30 @@ function sandboxUnsupported(method) {
     };
 }
 /** Preserves stable unavailable responses for methods owned by the V2 front door. */
-export class DesktopUnavailableServiceBase extends DesktopMiniAppServiceBase {
+export class DesktopUnavailableServiceBase extends DesktopWebsiteServiceBase {
+    ensureBunny = () => this.unimplementedGeneratedMethod('ensureBunny');
+    resetBunny = () => this.unimplementedGeneratedMethod('resetBunny');
+    reportBunnyViewState = () => this.unimplementedGeneratedMethod('reportBunnyViewState');
+    listAgentAssignments = () => this.unimplementedGeneratedMethod('listAgentAssignments');
+    setAssignmentCompletion = () => this.unimplementedGeneratedMethod('setAssignmentCompletion');
+    setBunnyPermissionMode = () => this.unimplementedGeneratedMethod('setBunnyPermissionMode');
+    setBunnyTaskModel = () => this.unimplementedGeneratedMethod('setBunnyTaskModel');
+    listBunnyBackups = () => this.unimplementedGeneratedMethod('listBunnyBackups');
+    restoreBunnyBackup = () => this.unimplementedGeneratedMethod('restoreBunnyBackup');
+    listWorkingStateEntries = () => this.unimplementedGeneratedMethod('listWorkingStateEntries');
+    addWorkingStateEntry = () => this.unimplementedGeneratedMethod('addWorkingStateEntry');
+    updateWorkingStateEntry = () => this.unimplementedGeneratedMethod('updateWorkingStateEntry');
+    closeWorkingStateEntry = () => this.unimplementedGeneratedMethod('closeWorkingStateEntry');
+    confirmWorkingStateEntry = () => this.unimplementedGeneratedMethod('confirmWorkingStateEntry');
+    listBunnyTraceEvents = () => this.unimplementedGeneratedMethod('listBunnyTraceEvents');
+    listArtifacts = () => this.unimplementedGeneratedMethod('listArtifacts');
+    getArtifactSpace = () => this.unimplementedGeneratedMethod('getArtifactSpace');
+    getArtifactSpaceContext = () => this.unimplementedGeneratedMethod('getArtifactSpaceContext');
+    writeArtifactSpaceContext = () => this.unimplementedGeneratedMethod('writeArtifactSpaceContext');
+    linkArtifactSpaceSession = () => this.unimplementedGeneratedMethod('linkArtifactSpaceSession');
+    saveArtifactSpace = () => this.unimplementedGeneratedMethod('saveArtifactSpace');
+    deleteArtifactSpace = () => this.unimplementedGeneratedMethod('deleteArtifactSpace');
+    importArtifact = () => this.unimplementedGeneratedMethod('importArtifact');
     // 后台任务、Session 活动、下一句建议、权限模式与 Goal 都由 local-runtime-v2
     // 前门持有；旧链路保持 fail closed，不再长出第二个 owner。
     async listBackgroundTasks() {
@@ -144,47 +167,6 @@ export class DesktopUnavailableServiceBase extends DesktopMiniAppServiceBase {
     }
     invalidateAllWorkspaceGitSnapshots(..._args) {
         return this.unimplementedGeneratedMethod('InvalidateAllWorkspaceGitSnapshots');
-    }
-    // Website management is contract-first in the current IDL. Legacy hosts
-    // keep the routes explicit and fail-closed until the owning implementation lands.
-    listDeployedWebsites(..._args) {
-        return this.unimplementedGeneratedMethod('ListDeployedWebsites');
-    }
-    getWebsiteTrafficStats(..._args) {
-        return this.unimplementedGeneratedMethod('GetWebsiteTrafficStats');
-    }
-    getWebsiteState(..._args) {
-        return this.unimplementedGeneratedMethod('GetWebsiteState');
-    }
-    cancelWebsiteDeployment(..._args) {
-        return this.unimplementedGeneratedMethod('CancelWebsiteDeployment');
-    }
-    unpublishWebsiteDeployment(..._args) {
-        return this.unimplementedGeneratedMethod('UnpublishWebsiteDeployment');
-    }
-    republishWebsiteDeployment(..._args) {
-        return this.unimplementedGeneratedMethod('RepublishWebsiteDeployment');
-    }
-    updateWebsiteWatermark(..._args) {
-        return this.unimplementedGeneratedMethod('UpdateWebsiteWatermark');
-    }
-    updateWebsiteDisplayName(..._args) {
-        return this.unimplementedGeneratedMethod('UpdateWebsiteDisplayName');
-    }
-    setWebsiteAlias(..._args) {
-        return this.unimplementedGeneratedMethod('SetWebsiteAlias');
-    }
-    checkWebsiteAliasAvailability(..._args) {
-        return this.unimplementedGeneratedMethod('CheckWebsiteAliasAvailability');
-    }
-    unbindWebsiteAlias(..._args) {
-        return this.unimplementedGeneratedMethod('UnbindWebsiteAlias');
-    }
-    removeWebsiteAlias(..._args) {
-        return this.unimplementedGeneratedMethod('RemoveWebsiteAlias');
-    }
-    getWebsiteProjectSourceDownloadURL(..._args) {
-        return this.unimplementedGeneratedMethod('GetWebsiteProjectSourceDownloadURL');
     }
     listMarketplacePlugins(..._args) {
         return this.unimplementedGeneratedMethod('ListMarketplacePlugins');
@@ -574,6 +556,13 @@ export class DesktopUnavailableServiceBase extends DesktopMiniAppServiceBase {
     requestSkillEvolveScan = () => this.unimplementedGeneratedMethod('requestSkillEvolveScan');
     revertSkillEvolve = () => this.unimplementedGeneratedMethod('revertSkillEvolve');
     mutateSkillEvolveLifecycle = () => this.unimplementedGeneratedMethod('mutateSkillEvolveLifecycle');
+    listBunnyTaskTelemetry = () => this.unimplementedGeneratedMethod('listBunnyTaskTelemetry');
+    ackBunnyTaskTelemetry = () => this.unimplementedGeneratedMethod('ackBunnyTaskTelemetry');
+    getSessionToolCallResult = () => this.unimplementedGeneratedMethod('getSessionToolCallResult');
+    beginWorkspaceFileUpload = () => this.unimplementedGeneratedMethod('beginWorkspaceFileUpload');
+    appendWorkspaceFileUpload = () => this.unimplementedGeneratedMethod('appendWorkspaceFileUpload');
+    commitWorkspaceFileUpload = () => this.unimplementedGeneratedMethod('commitWorkspaceFileUpload');
+    abortWorkspaceFileUpload = () => this.unimplementedGeneratedMethod('abortWorkspaceFileUpload');
     unimplementedGeneratedMethod(method) {
         throw new HTTPException(501, {
             res: jsonError(501, `DesktopService.${method} is not implemented by local-runtime.`, 'NOT_IMPLEMENTED'),

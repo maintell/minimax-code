@@ -187,11 +187,12 @@ export function createPtcToolExecutor(options) {
 }
 async function emitPtcChildTerminalEvent(options, terminal, request, outcome) {
     const rawResult = terminal?.result ?? unknownPtcChildResult(outcome);
+    const displayResult = withPtcChildExecutionDetails(rawResult, outcome);
     const event = {
         type: 'tool_execution_end',
         toolCallId: terminal?.toolCallId ?? request.toolCallId,
         toolName: terminal?.toolName ?? request.toolName,
-        result: withPtcChildExecutionDetails(rawResult, outcome),
+        result: await shapeChildDisplayResult(options, request, displayResult),
         isError: outcome.isError === true,
         parentToolCallId: terminal?.parentToolCallId ?? request.parentToolCallId,
     };
@@ -199,6 +200,46 @@ async function emitPtcChildTerminalEvent(options, terminal, request, outcome) {
     if (!terminal)
         options.observeChildLifecycle?.(event);
     await options.emit(event);
+}
+/**
+ * Applies the host hook to the display copy. A hook that throws must not
+ * change what the program received or stop the child from being recorded, so
+ * the untouched display copy is emitted and one warning line is written.
+ * What the hook returns is emitted as it is; agent-core does not inspect it.
+ */
+async function shapeChildDisplayResult(options, request, displayResult) {
+    const shape = options.shapePtcChildDisplayResult;
+    if (!shape)
+        return displayResult;
+    try {
+        const shaped = await shape({
+            childToolCallId: request.toolCallId,
+            parentToolCallId: request.parentToolCallId,
+            toolName: request.toolName,
+            args: request.args,
+            // Pi content blocks are the same TextContent / ImageContent shapes
+            // ToolResultContent names, plus a wider union agent-core does not model.
+            result: displayResult,
+        });
+        return shaped;
+    }
+    catch {
+        logChildDisplayShapingFailed(readTurnLogger(options.turn), request);
+        return displayResult;
+    }
+}
+/** One line per failed shaping; never logs arguments, content or file paths. */
+function logChildDisplayShapingFailed(logger, request) {
+    try {
+        logger?.warn?.({
+            child_tool_call_id: request.toolCallId,
+            parent_tool_call_id: request.parentToolCallId,
+            tool_name: request.toolName,
+        }, 'ptc child display copy shaping failed');
+    }
+    catch {
+        // Diagnostics must not change the child outcome.
+    }
 }
 function withPtcChildExecutionDetails(result, outcome) {
     const details = isRecord(result.details)

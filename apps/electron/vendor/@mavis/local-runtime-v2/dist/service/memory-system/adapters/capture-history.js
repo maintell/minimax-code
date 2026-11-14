@@ -1,3 +1,4 @@
+import { isTurnClosedByTerminatingToolsAt } from '@mavis/agent-core/tools';
 import { countTokens } from 'gpt-tokenizer/encoding/o200k_base';
 import { redactMemorySecrets } from '../secret-redactor.js';
 import { estimateCaptureTokens } from '../contracts/token-estimate.js';
@@ -12,7 +13,8 @@ export function prepareCaptureHistory(source) {
         effectiveTokens: 0,
     };
     for (const [index, eventId] of source.identityVector.entries()) {
-        if (!advanceCaptureHistory(state, eventId, source.messages[index]))
+        const closedByTool = isTurnClosedByTerminatingToolsAt(source.messages, index);
+        if (!advanceCaptureHistory(state, eventId, source.messages[index], closedByTool))
             return { status: 'invalid' };
     }
     return state.completeTurn && state.effectiveTokens >= 100
@@ -24,14 +26,17 @@ function validIdentityVector(source) {
         new Set(source.identityVector).size === source.identityVector.length &&
         source.identityVector.every((id) => typeof id === 'string' && id.trim().length > 0 && !id.includes('\0')));
 }
-function advanceCaptureHistory(state, eventId, message) {
+function advanceCaptureHistory(state, eventId, message, closedByTool) {
     if (!isRecord(message))
         return true;
     if (message.role === 'user')
         return advanceUserInput(state, eventId, message);
     if (!state.pendingUser)
         return true;
-    const event = mapMessage(eventId, state.events.length, message);
+    const candidate = captureCandidate(state, message, closedByTool);
+    if (!candidate)
+        return true;
+    const event = mapMessage(eventId, state.events.length, candidate, closedByTool);
     if (!event)
         return true;
     if (!validUtf8(event.content))
@@ -39,11 +44,27 @@ function advanceCaptureHistory(state, eventId, message) {
     if (event.role === 'assistant') {
         state.completeTurn ||= event.content.trim().length > 0;
         state.pendingUser = false;
+        state.stepAnswer = undefined;
         state.effectiveTokens += countBodyTokens(event.content);
     }
     if (event.content.length > 0)
         state.events.push(event);
     return true;
+}
+/**
+ * Text of an unfinished tool step is set aside, not captured. A Turn may close with a
+ * tool-only step right after the step that wrote the answer; that answer is captured then.
+ */
+function captureCandidate(state, message, closedByTool) {
+    const hasText = Boolean(visibleText(message.content).trim());
+    if (message.role === 'assistant' && message.stopReason !== 'stop' && !closedByTool) {
+        if (hasText)
+            state.stepAnswer = message.content;
+        return undefined;
+    }
+    return closedByTool && !hasText && state.stepAnswer !== undefined
+        ? { ...message, content: state.stepAnswer }
+        : message;
 }
 function advanceUserInput(state, eventId, message) {
     const text = genuineUserText(message);
@@ -65,16 +86,18 @@ function advanceUserInput(state, eventId, message) {
     if (!validUtf8(event.content))
         return false;
     state.pendingUser = true;
+    state.stepAnswer = undefined;
     state.effectiveTokens += countBodyTokens(event.content);
     state.events.push(event);
     return true;
 }
-function mapMessage(eventId, sequence, value) {
+/** `closedByTool`: this assistant message is the last step of a Turn a tool ended on purpose. */
+function mapMessage(eventId, sequence, value, closedByTool) {
     if (!isRecord(value) || typeof value.role !== 'string')
         return undefined;
     switch (value.role) {
         case 'assistant':
-            if (value.stopReason !== 'stop')
+            if (value.stopReason !== 'stop' && !closedByTool)
                 return undefined;
             return makeEvent({
                 eventId,

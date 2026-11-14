@@ -41,6 +41,7 @@ export function createMemoryAgentExtension(contribution, observer, nowMs = () =>
                         sessionId: event.sessionId,
                         turnId: event.turnId,
                         isOrdinaryInputTurn: event.isOrdinaryInputTurn === true,
+                        isUserAuthoredInput: event.isUserAuthoredInput === true,
                         startedAtMs: nowMs(),
                     });
                 }
@@ -113,6 +114,7 @@ function toRuntimeTool(tool) {
         execute: async (context, input) => toToolResult(tool.name, await tool.execute({ ...input, tool: tool.name }, {
             requestSessionId: context.sessionId,
             toolCallId: context.toolCallId ?? '',
+            turnId: context.turnId,
         })),
     });
 }

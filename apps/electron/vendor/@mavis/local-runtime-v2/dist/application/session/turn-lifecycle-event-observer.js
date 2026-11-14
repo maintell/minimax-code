@@ -1,4 +1,5 @@
 import { RuntimeEventStatus, RuntimeEventType, } from '@mavis/agent-core/protocol';
+import { readNextStepCard } from '@mavis/shared/next-step';
 export function createSessionTurnLifecycleEvents(input) {
     const { captureAfterTurn, ...options } = input;
     return new SessionTurnLifecycleEventObserver({
@@ -15,6 +16,26 @@ export function createSessionTurnLifecycleEvents(input) {
 export class SessionTurnLifecycleEventObserver {
     options;
     startedTurns = new Map();
+    nextSteps = new Map();
+    observeHistoryCommitted(input) {
+        if (!this.options.nextStepEnabled?.())
+            return;
+        const tail = input.change.committedMessages.at(-1);
+        const key = turnKey(input.context);
+        if (tail?.role !== 'toolResult') {
+            this.nextSteps.delete(key);
+            return;
+        }
+        const card = readNextStepCard({ details: tail.details });
+        const details = tail.details;
+        if (card)
+            this.nextSteps.set(key, { waitingForUser: card.blocked });
+        // The durable marker every waiting tool publishes (ask_user, Plan review, feature enable).
+        else if (details?.waiting_for_user === true)
+            this.nextSteps.set(key, { waitingForUser: true });
+        else
+            this.nextSteps.delete(key);
+    }
     constructor(options) {
         this.options = options;
     }
@@ -22,16 +43,33 @@ export class SessionTurnLifecycleEventObserver {
         const status = lifecycleStatus(input.event);
         if (!status)
             return;
-        const identity = await this.ensureStarted(input.context);
-        if (status === 'running')
-            return;
         try {
+            const identity = await this.ensureStarted(input.context);
+            if (status === 'running')
+                return;
             await this.recordTerminalMemory(input.context, identity, status, input.event);
-            this.publishTerminal(input.context, identity, status, input.event);
+            const turn = { context: input.context, agentName: identity.agentName, status };
+            this.publishTerminal(turn, identity, input.event);
+            this.notifyTerminal((terminal) => terminal.published(turn));
             await this.captureWorkspaceRevision(input.context.sessionId);
         }
         finally {
-            this.startedTurns.delete(turnKey(input.context));
+            if (status !== 'running') {
+                this.startedTurns.delete(turnKey(input.context));
+                this.nextSteps.delete(turnKey(input.context));
+            }
+        }
+    }
+    notifyTerminal(call) {
+        const terminal = this.options.terminal;
+        if (!terminal)
+            return undefined;
+        try {
+            return call(terminal);
+        }
+        catch {
+            // A product's part never changes how the Turn ends.
+            return undefined;
         }
     }
     async ensureStarted(context) {
@@ -99,8 +137,11 @@ export class SessionTurnLifecycleEventObserver {
             // Revision capture is best-effort and cannot affect the Turn outcome.
         }
     }
-    publishTerminal(context, identity, status, event) {
-        const common = {
+    nextStepPayload(context) {
+        return this.options.nextStepEnabled?.() ? this.nextSteps.get(turnKey(context)) : undefined;
+    }
+    terminalCommon(context, identity) {
+        return {
             sessionId: context.sessionId,
             agentName: identity.agentName,
             turnId: context.turnId,
@@ -113,10 +154,21 @@ export class SessionTurnLifecycleEventObserver {
                 ? {}
                 : identity.goal),
         };
+    }
+    publishTerminal(turn, identity, event) {
+        const { context, status } = turn;
+        const common = this.terminalCommon(context, identity);
         if (status === 'completed') {
+            const extras = this.notifyTerminal((terminal) => terminal.payload(turn));
             this.options.publish({
                 type: 'session.finish',
-                payload: { ...common, status: 'finished' },
+                payload: {
+                    ...common,
+                    status: 'finished',
+                    ...this.nextStepPayload(context),
+                    ...(extras?.silent ? { silent: true } : {}),
+                    ...(extras?.bunnyNotification ? { bunnyNotification: extras.bunnyNotification } : {}),
+                },
             });
             return;
         }

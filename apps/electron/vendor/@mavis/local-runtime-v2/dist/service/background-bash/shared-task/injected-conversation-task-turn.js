@@ -66,6 +66,12 @@ function projectConversationTaskResult(result, turnId, agentRole) {
         .join('\n')
         .trim();
     const verification = buildConversationVerification({ agentRole, finalText, result });
+    const savedPtcScripts = result.committedFacts?.savedPtcScripts?.map((script) => ({
+        path: script.path,
+        scope: script.scope,
+        ...(script.description ? { description: script.description } : {}),
+        overwritten: script.overwritten,
+    }));
     let status = 'failed';
     if (result.status === 'completed')
         status = 'succeeded';
@@ -76,6 +82,7 @@ function projectConversationTaskResult(result, turnId, agentRole) {
         subTurnId: turnId,
         ...(finalText ? { finalText } : {}),
         ...(verification ? { verification } : {}),
+        ...(savedPtcScripts?.length ? { savedPtcScripts } : {}),
         ...(result.status === 'completed'
             ? {}
             : { errorMessage: result.error ?? `Conversation turn ${result.status}` }),

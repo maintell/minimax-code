@@ -35,7 +35,7 @@ export function createV1CompatibleTurnSubmission(options) {
             return retainAcceptedRegistration(() => options.turns.resumeUserInput({
                 sessionId: input.sessionId,
                 input: toAgentInput(message, false),
-                provenance: { ...turnProvenance(input), source: 'questionnaire' },
+                provenance: questionnaireProvenance(input),
                 resume: {
                     kind: 'questionnaire',
                     requestId: input.requestId,
@@ -114,6 +114,16 @@ function toDeliveryOptions(message) {
 }
 function toDisplayAttachment(attachment) {
     return sanitizeDisplayAttachment(Object.fromEntries(Object.entries(attachment)));
+}
+/** A Goal-owned answer is marked so the Turn assembly can tell it from a person's answer. */
+function questionnaireProvenance(input) {
+    const provenance = { ...turnProvenance(input), source: 'questionnaire' };
+    if (input.owner?.kind !== 'thread-goal')
+        return provenance;
+    return {
+        ...provenance,
+        sourceContext: { ...(provenance.sourceContext ?? {}), questionnaireOwner: input.owner },
+    };
 }
 function turnProvenance(input) {
     const review = input.source === 'code_review' ? reviewOrigin(input.message.origin) : undefined;

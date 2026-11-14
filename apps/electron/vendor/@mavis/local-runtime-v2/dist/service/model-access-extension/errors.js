@@ -25,9 +25,4 @@ export function assertPackageOptions(options) {
 export function isUserTrust(trustSource) {
     return modelAccessOrigin(trustSource) !== 'official';
 }
-/** `@mavis/*` is the official namespace: a user or dev package may not claim it. */
-export function assertPackageNamespace(name, trustSource) {
-    if (isUserTrust(trustSource) && name.startsWith('@mavis/'))
-        throw new ModelAccessPackageError('package_name_reserved');
-}
 //# sourceMappingURL=errors.js.map

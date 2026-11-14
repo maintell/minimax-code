@@ -1,6 +1,24 @@
 import { resolveAgentCapabilities, } from '@mavis/config';
 export const PRIMARY_AGENT_NAME = 'mavis';
 const LEGACY_PRIMARY_AGENT_NAME = 'main';
+/**
+ * Surface / dispatch presets for built-in Agents that ship no `agent.md`
+ * frontmatter to declare them. Every switch otherwise defaults to true, and a
+ * bundled `agent.md` `x-mavis` value overrides the entry here.
+ *
+ * `mavis` is the primary Agent: it is never dispatched through the task tool
+ * and is not listed on the Agent management page, but it stays bindable in IM.
+ */
+const BUILTIN_SURFACE_FLAG_PRESETS = Object.freeze({
+    [PRIMARY_AGENT_NAME]: Object.freeze({
+        showInImBinding: true,
+        showInAgentList: false,
+        dispatchable: false,
+    }),
+});
+export function builtinSurfaceFlagPreset(canonical) {
+    return BUILTIN_SURFACE_FLAG_PRESETS[canonical];
+}
 export const BUILTIN_ROSTER_FILE = 'builtin-agents.json';
 export const FEATURE_FILES = {
     delegation: 'delegation.md.hbs',

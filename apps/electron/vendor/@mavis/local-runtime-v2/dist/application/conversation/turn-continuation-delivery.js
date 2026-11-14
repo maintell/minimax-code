@@ -5,11 +5,15 @@ export class TurnContinuationDeliveryService {
     constructor(options) {
         this.options = options;
     }
-    async open(sessionId) {
+    async open(sessionId, options) {
+        if (options?.signal?.aborted) {
+            return { accepted: false, reason: 'unavailable' };
+        }
         const reservation = this.options.stream.reserve(sessionId);
         try {
             const result = await this.options.turns.continueTurn({
                 sessionId,
+                ...(options?.signal ? { signal: options.signal } : {}),
                 onAccepted: async ({ turnId }) => {
                     reservation.bindTurn(turnId);
                     await startContinuationQuery(this.options, sessionId, turnId);

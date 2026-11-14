@@ -1,11 +1,18 @@
 import { settleInBackground } from '../../service/plugin-system/index.js';
 import { isLocalSourceProvenanceEnabled } from '@mavis/config';
+import { incrementMetric } from '@mavis/shared/local-runtime-logging/metrics';
+import { BUNNY_LIBRARY_ROOT_AGENTS, projectBunnyGreetingOrigin, bunnyTaskHistoryObserver, } from '../../service/bunny/index.js';
+import { inputReviewDisposition, productOutputReviewPolicy, SAFETY_SCENE, } from '../../service/content-safety/index.js';
 import { CUSTOM_PROVIDER_ID_PREFIX, ModelAccessRelist, initializeModelSystem, freezeManagedQueueModel, resolveRequestedSessionModel, LocalModelProviderError, resolveBuiltinAgentModelGroup, previewAgentModelSelection, resolveEffectiveAgentModelSelection, AgentModelSelectionError, } from '../../service/model-system/index.js';
 import { createSessionSystemPinBridge, initializePinService, } from '../../service/pin/index.js';
-import { createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, readSessionAdditionalWorkspaceRoots, } from '../../service/session-system/index.js';
-import { createProductionAgentPreparation, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionModelRepair, agentHostModelFromQueue, } from '../../service/turn-system/index.js';
+import { ArtifactLibraryService, createAssignmentTaskRepository, createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, readSessionAdditionalWorkspaceRoots, } from '../../service/session-system/index.js';
+import { createFileApiRuntime, createProductionAgentPreparation, createPtcStoreDecision, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionModelRepair, agentHostModelFromQueue, } from '../../service/turn-system/index.js';
+import { createBuiltinAgentSurfacePolicy } from '../agent/agent-surface-policy.js';
 import { createRuntimeAgentProduct } from '../agent/runtime-agent-product.js';
+import { bunnyMessageWriteObservers } from './bunny-message-writes.js';
+import { withAdvisorAgentProduct } from './advisor-agent-product.js';
 import { withGoalAgentProduct } from './goal-agent-product.js';
+import { withQuotaAutoResumeProduct } from './quota-auto-resume-product.js';
 import { createRuntimeGoalPort } from './runtime-goal-port.js';
 import { initializeGoalService, isGoalVerifierChildSession, } from '../../service/goal/index.js';
 import { createApplicationFactPorts, createCommittedModelProviderSessionPort, } from './fact-ports.js';
@@ -17,6 +24,12 @@ import { createRuntimeCompactionFactSink } from './runtime-compaction-facts.js';
 import { createSessionTitlePolicy } from './session-title-policy.js';
 import { describeError } from './turn-message-delivery.js';
 import { createQueueSubmissionRejectionDelivery, queryCollapseSteeringProjection, } from '../conversation/index.js';
+function createRuntimeToolCallModePolicy(input) {
+    return createSessionToolCallModePolicy(input.modelConfig.read, input.logger, {
+        ...(input.ptcDefault ? { ptcDefault: input.ptcDefault } : {}),
+        ...(input.metrics ? { metrics: input.metrics } : {}),
+    });
+}
 export function createProductionSessionComposition(input) {
     const visible = createVisibleModelConfig(input.modelConfig);
     const visibleInput = { ...input, modelConfig: visible.port };
@@ -49,7 +62,10 @@ export function createProductionSessionComposition(input) {
         modelAccessExtensionTool: input.modelAccess?.extensionTool,
     });
     const { goal, goalPort, bindGoalCronOwnerReader } = composeGoalOwner(input, baseProduct, () => executionSessionSystem?.queue.committed);
-    const product = withGoalAgentProduct(baseProduct, goal);
+    const product = composeAdvisorProduct(composeSessionProduct(baseProduct, goal, input.quotaAutoResume), input, {
+        preparation: () => preparation,
+        sessionSystem: () => executionSessionSystem,
+    });
     const modelSystem = createSessionModelSystem(input, product);
     visible.bind(() => modelSystem.providers.modelCatalogConfig?.());
     input.agentService.bindBuiltinModelGroupResolver(async ({ previous, bundled }) => resolveBuiltinAgentModelGroup({ config: visible.read(), previous, bundled }));
@@ -59,18 +75,28 @@ export function createProductionSessionComposition(input) {
         logger: input.logger,
     });
     const preparation = createProductionAgentPreparation({
-        configBuilder: product.preparation.configBuilder,
+        configBuilder: {
+            ...product.preparation.configBuilder,
+            // One decision for this whole assembly: the Agent Host's store and the PTC
+            // prompt line that names it read this same getter, so they cannot disagree.
+            ptcStoreRequested: createPtcStoreDecision(product.preparation.configBuilder.config()),
+        },
         modelResolver: modelSystem.resolver,
+        ...(input.logger ? { logger: input.logger } : {}),
     });
     const facts = createSessionFactPorts(input, goal);
     const archiveTitleModel = createProductionRootArchiveTitleModel({ agents: product.agents, preparation, safety: input.safety }, input.nowMs);
     const sessionPin = createSessionSystemPinBridge();
     const sessionSystem = initializeSessionSystem({
         db: input.db,
+        ...bunnyStoreRepositories(input),
+        ...(input.coordinatorRoster ? { coordinatorRoster: input.coordinatorRoster } : {}),
         sourceProjectionEnabled: isLocalSourceProvenanceEnabled(input.runtimeOwnerKind),
+        messageWriteObservers: bunnyMessageWriteObservers(input.bunnyDb),
         dataDir: input.dataDir,
         agents: input.agentSessionPorts.directory,
         rootAgents: input.agentSessionPorts.roots,
+        ...sessionSurfaceOptions(input),
         defaultWorkspaceDir: input.compatibility.workspace.defaultDirectory,
         titlePolicy: createSessionTitlePolicy({
             config: visible.read,
@@ -78,7 +104,7 @@ export function createProductionSessionComposition(input) {
             readDefinition: (sessionId) => sessionSystem.repositories.sessions.getSessionAgentDefinition(sessionId),
         }),
         resolveRequestedModel: (model) => resolveRequestedSessionModel(visible.read(), model),
-        toolCallMode: createSessionToolCallModePolicy(input.modelConfig.read, input.logger),
+        toolCallMode: createRuntimeToolCallModePolicy(input),
         backfillDiagnostics: createSessionBackfillDiagnostics({
             logger: input.logger,
             reportFailure: product.executor.reportFailure,
@@ -93,25 +119,15 @@ export function createProductionSessionComposition(input) {
             pruneTurnDiffs: input.compatibility.diff.pruneExpired,
             logger: input.logger,
         },
-        steeringProjection: (queryKey) => ({ ...queryCollapseSteeringProjection(queryKey) }),
         onPinnedSessionImported: sessionPin.onImported,
         pinnedProjectIds: sessionPin.pinnedProjectIds,
         facts: facts.session,
         conversationFacts: facts.conversation,
         queueFacts: facts.queue,
         resolveQueueModel: createQueueModelResolver(visibleInput, () => executionSessionSystem),
-        compactionFacts: createRuntimeCompactionFactSink(input.inspector, input.publishGlobalEvent),
+        ...createRuntimeEventSinks(input.inspector, input.publishGlobalEvent),
         ...(input.metrics ? { compactionMetrics: input.metrics } : {}),
-        title: {
-            model: createProductionSessionTitleModel({ agents: product.agents, preparation }, input.nowMs),
-            ...(input.metrics
-                ? {
-                    onOutcome: (outcome) => input.metrics?.counter('session_title_generation_total', 1, { outcome }),
-                }
-                : {}),
-            // Title failures stay Session-scoped diagnostics, never runtime turn failures.
-            onFailure: ({ stage, sessionId, error }) => input.logger.warn({ sessionId, stage, reason: `session_title_${stage}_failed:${describeError(error)}` }, 'session title generation failed'),
-        },
+        title: createSessionTitleOptions(input, { agents: product.agents, preparation }),
         nowMs: input.nowMs,
         runtimeOwnerIdentity: input.runtimeOwnerIdentity,
     });
@@ -141,25 +157,9 @@ export function createProductionSessionComposition(input) {
             onCommittedUpdate: modelUpdatedFactSink(facts),
         }),
         setDefaultModel: input.modelConfig.setDefaultModel,
+        setDefaultAdvisor: input.modelConfig.setDefaultAdvisor,
         refreshOfficialModels: input.refreshOfficialModels,
-        resolveChannelSelection: async ({ agentName }) => {
-            const selection = await previewChannelAgentModelSelection({
-                config: visible.read(),
-                agents: input.agentService,
-                agentName,
-            });
-            return selection
-                ? {
-                    providerId: selection.providerId,
-                    modelId: selection.modelId,
-                    ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
-                    ...(selection.contextWindow === undefined
-                        ? {}
-                        : { contextLimit: selection.contextWindow }),
-                    ...(selection.effort === undefined ? {} : { effort: selection.effort }),
-                }
-                : undefined;
-        },
+        resolveChannelSelection: ({ agentName }) => resolveChannelSelection(visibleInput, agentName),
         selectChannelModel: async ({ agentName, selection }) => await selectChannelAgentModel({
             config: visible.read(),
             agents: input.agentService,
@@ -185,6 +185,75 @@ export function createProductionSessionComposition(input) {
         bindGoalCronOwnerReader,
     };
 }
+/** Title generation for new Sessions. */
+function createSessionTitleOptions(input, owners) {
+    return {
+        model: createProductionSessionTitleModel(owners, input.nowMs),
+        reviewPromptSnapshots: input.promptSnapshots,
+        ...(input.metrics
+            ? {
+                onOutcome: (outcome) => input.metrics?.counter('session_title_generation_total', 1, { outcome }),
+                onReviewOutcome: (outcome) => incrementMetric(input.metrics, 'session_title_review_total', 1, { outcome }),
+            }
+            : {}),
+        // Title failures stay Session-scoped diagnostics, never runtime turn failures.
+        onFailure: ({ stage, sessionId, error }) => input.logger.warn({ sessionId, stage, reason: `session_title_${stage}_failed:${describeError(error)}` }, 'session title generation failed'),
+    };
+}
+/**
+ * What Session System applies without knowing who owns it: built-in Agent surface facts,
+ * steered provenance, origin markers and the roots that feed the artifact library.
+ */
+function sessionSurfaceOptions(input) {
+    return {
+        agentSurfaces: createBuiltinAgentSurfacePolicy({
+            agents: input.agentService,
+            dataDir: input.dataDir,
+        }),
+        steeringProjection: (queryKey) => ({ ...queryCollapseSteeringProjection(queryKey) }),
+        originProjection: projectBunnyGreetingOrigin,
+    };
+}
+/** The Session System's repositories over the Bunny store; it never holds that connection. */
+function bunnyStoreRepositories(input) {
+    return {
+        assignmentTasks: createAssignmentTaskRepository({
+            db: input.bunnyDb,
+            sessions: input.db,
+            storeHasData: () => input.bunnyStore.hasData(),
+            nowMs: input.nowMs,
+            // Bunny's task events are counted in its assignment metrics as they are written.
+            historyWritten: bunnyTaskHistoryObserver(input.runtimeOwnerKind, input.metrics, input.db),
+        }),
+        artifactLibrary: new ArtifactLibraryService(input.db, input.bunnyDb, input.dataDir, BUNNY_LIBRARY_ROOT_AGENTS),
+    };
+}
+/** Adds the advisor tool; its owners are late-bound and both exist before any Turn runs. */
+function composeAdvisorProduct(product, input, owners) {
+    return withAdvisorAgentProduct(product, {
+        preparation: owners.preparation,
+        sessions: () => {
+            const owner = owners.sessionSystem();
+            if (!owner)
+                throw new Error('Session system is unavailable for the advisor tool.');
+            return {
+                getExecutionSnapshot: (sessionId) => owner.sessions.execution.getExecutionSnapshot(sessionId),
+                recordUsage: (record) => owner.usage.projector.record(record),
+            };
+        },
+        // The same Files API wiring as the Turn executor's requests.
+        fileApi: createFileApiRuntime({ db: input.db, nowMs: input.nowMs, product: product.fileApi }),
+        logger: input.logger,
+        // A managed advisor is reviewed like a managed main model: the Turn's input and the output,
+        // with the same scenes, verdict rules and region policy.
+        contentReview: {
+            reviewInput: async (text) => inputReviewDisposition(await input.safety.review(text, SAFETY_SCENE.UserInput)),
+            blocksAdvice: (text) => input.safety.blocks(text, SAFETY_SCENE.MessageOutput),
+            policy: productOutputReviewPolicy(input.runtimeOwnerKind),
+        },
+        nowMs: input.nowMs,
+    });
+}
 /** 已提交事实的端口；撤回时经各自的服务重开问卷、删除目标。 */
 function createSessionFactPorts(input, goal) {
     return createApplicationFactPorts({
@@ -193,6 +262,14 @@ function createSessionFactPorts(input, goal) {
         goals: goal.service,
         logger: input.logger,
     });
+}
+/**
+ * The Turn product every Session runs on: the Goal wiring, plus the quota
+ * auto-resume feed only where a Desktop-owned Runtime supplies its owner.
+ */
+function composeSessionProduct(baseProduct, goal, quotaAutoResume) {
+    const goalProduct = withGoalAgentProduct(baseProduct, goal);
+    return quotaAutoResume ? withQuotaAutoResumeProduct(goalProduct, quotaAutoResume) : goalProduct;
 }
 /** Build the single Goal owner over the product it borrows turn infrastructure from. */
 function composeGoalOwner(input, baseProduct, committedQueue) {
@@ -306,6 +383,14 @@ function createChannelTurnAdmission(input, visibleInput, sessionSystem) {
         queueSubmissionRejections: createQueueSubmissionRejections(input, sessionSystem),
         // Channel input resolves against the visible model catalog (extension catalogs included).
         resolveChannelInputModel: createChannelInputModelResolver(visibleInput, sessionSystem),
+    };
+}
+/** Session-system facts the Runtime republishes as Global Events. */
+function createRuntimeEventSinks(inspector, publishGlobalEvent) {
+    return {
+        compactionFacts: createRuntimeCompactionFactSink(inspector, publishGlobalEvent),
+        // Advisory progress while a worktree is created; the create request result stays authoritative.
+        worktreeProgress: (progress) => publishGlobalEvent({ type: 'workspace.worktree.progress', payload: progress }),
     };
 }
 function createQueueModelResolver(input, getSessionSystem) {
@@ -636,5 +721,22 @@ function bindAgentConfigModelPorts(ports) {
             return { ok: false, reason: 'unavailable', detail: error.message };
         }
     });
+}
+/** The channel Agent's effective model selection, as the model provider application reads it. */
+async function resolveChannelSelection(input, agentName) {
+    const selection = await previewChannelAgentModelSelection({
+        config: input.modelConfig.read(),
+        agents: input.agentService,
+        agentName,
+    });
+    return selection
+        ? {
+            providerId: selection.providerId,
+            modelId: selection.modelId,
+            ...(selection.reasoning === undefined ? {} : { reasoning: selection.reasoning }),
+            ...(selection.contextWindow === undefined ? {} : { contextLimit: selection.contextWindow }),
+            ...(selection.effort === undefined ? {} : { effort: selection.effort }),
+        }
+        : undefined;
 }
 //# sourceMappingURL=runtime-session-composition.js.map

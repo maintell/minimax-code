@@ -1,8 +1,10 @@
+import { SessionTitleReviewService, } from './sessions/title/session-title-review-service.js';
 import path, { join } from 'node:path';
 import { deleteLegacyDaemonSessionMessages } from '../../infra/legacy-db/cleanup.js';
 import { createLegacyOpencodeReadonlySource } from '../../infra/legacy-db/readonly-source.js';
 import { createSessionSystemAgentProjection, } from './agent-projection.js';
 import { SessionFilesService } from './files/service.js';
+import { SessionArtifactsService } from './files/artifacts-service.js';
 import { createSideChatDataCapability } from './sessions/sidechat-data-capability.js';
 import { createSessionForkDataCapability } from './fork/index.js';
 import { createSessionAssetRepository } from './files/repo/assets.js';
@@ -10,6 +12,7 @@ import { createHistoryPersistenceRepository, createLegacyHistorySourceReader, Le
 import { createLegacySessionMigrationRepository } from './legacy-migration/repo/migration-repository.js';
 import { createReleasedSessionHistoryReader, createSessionHistoryActivity, createSessionHistoryIoLane, createSessionHistoryLocationResolver, createSessionSystemCanonicalHistoryProvider, createSessionHistoryMutationAdapter, createSessionRewindCapability, ConversationActionProjectionService, MessageQueryService, SessionSourceQueryService, SessionInputSummaryService, UserMessageCommitService, } from './messages/index.js';
 import { createMessageRepository } from './messages/repo/drizzle.js';
+import { MessageWriteObservers, } from './messages/repo/write-observers.js';
 import { createSessionSourceProjectionRepository } from './messages/repo/source-query.js';
 import { createQueryCollapseProjector } from './query-collapse-projector.js';
 import { createQueryCollapseState } from './query-collapse-state.js';
@@ -20,13 +23,14 @@ import { CommittedQueueService } from './queue/committed-service.js';
 import { QueueCommittedFactHub } from './queue/committed-fact-hub.js';
 import { createQueueDispatchCapability } from './queue/dispatch-capability.js';
 import { createQueueRepository } from './queue/repo/drizzle.js';
+import { EMPTY_COORDINATOR_ROSTER, createCoordinatorOwnership, } from './assignment-tasks/index.js';
 import { QueueService } from './queue/service.js';
 import { createQueueTurnAdmissionPriorityFence } from './queue/turn-priority-fence.js';
 import { initializeSessionDomain } from './sessions/initialize.js';
 import { createSessionInteractionModeCapability } from './sessions/interaction-mode-capability.js';
 import { createTaskExecutionAdmissionCapability } from './sessions/task-execution-admission.js';
 import { createSessionExecutionSource, createSessionStateWriter, } from './sessions/recovery/capabilities.js';
-import { createSessionRepository } from './sessions/repo/drizzle.js';
+import { createSessionRepository, readSessionAgentName } from './sessions/repo/drizzle.js';
 import { SessionActivationService } from './sessions/lifecycle/activation-service.js';
 import { createNativeSessionRecordService, } from './sessions/support/native-record-factory.js';
 import { SessionArtifactService } from './sessions/support/artifact-service.js';
@@ -47,28 +51,54 @@ import { formatRuntimeModelIdentity } from '../model-system/index.js';
 import { repairRootProjectHistory, } from './_migration-root-project-history-repair.js';
 import { repairLegacyDefaultProjectHistory, } from './projects/legacy-default-project-history-repair.js';
 import { applyArchivedProjectSidebarBaseline, } from './projects/archived-project-sidebar-baseline.js';
+/** The artifact catalog lists session deliveries from the shared database and the library's spaces and imports. */
+function createArtifactCatalog(options, files) {
+    return new SessionArtifactsService(options.db, files, options.artifactLibrary);
+}
+/** Every writer of the message rows shares one set of write observers. */
+function createSessionMessages(options, nowMs, deletionGate, sessions) {
+    const writeObservers = new MessageWriteObservers(options.messageWriteObservers);
+    const messages = createMessageRepository({
+        db: options.db,
+        writeObservers,
+        sourceProjectionEnabled: options.sourceProjectionEnabled,
+        nowMs,
+        userMessageAdmission: deletionGate.turnAdmission,
+    });
+    const rewind = createSessionRewindCapability({
+        db: options.db,
+        messages,
+        sessions,
+        nowMs,
+        writeObservers,
+    });
+    return { messages, rewind };
+}
+function createSidebarQueryService(options, nowMs) {
+    return new SidebarQueryService(options.db, nowMs, (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace'), () => options.assignmentTasks.bunnyCreatedSessionIds());
+}
 /** One production graph over the shared AppDb; repositories never own the connection. */
 export function initializeSessionSystem(options) {
     const nowMs = options.nowMs ?? Date.now;
     const { sessions, historyLocations, interactionMode, planDocuments } = createSessionMetadataCapabilities(options, nowMs);
     const taskExecutionAdmission = createTaskExecutionAdmissionCapability({ db: options.db });
     const deletionGate = new SessionDeletionGate({ db: options.db });
-    const messages = createMessageRepository({
-        db: options.db,
-        sourceProjectionEnabled: options.sourceProjectionEnabled,
-        nowMs,
-        userMessageAdmission: deletionGate.turnAdmission,
-    });
+    const { messages, rewind } = createSessionMessages(options, nowMs, deletionGate, sessions);
     const usage = createSessionUsageRepository({ db: options.db });
     const usageCommits = createSessionUsageCommitSignal();
-    const projects = createProjectRepository({ db: options.db });
+    const projects = createSessionProjectRepository(options);
     const assets = createSessionAssets(options, sessions);
     const operationIntents = createSessionOperationIntentRepository({ nowMs });
     const conversationMutationState = createConversationMutationState(options.db, operationIntents);
-    const rewind = createSessionRewindCapability({ db: options.db, messages, sessions, nowMs });
     const turnAdmission = createTurnAdmission(deletionGate, operationIntents);
     const queueAdmission = createQueueAdmission(deletionGate, operationIntents);
     const legacyMigrations = createLegacyMigrations(options.db, nowMs);
+    const assignmentStores = {
+        assignmentTasks: options.assignmentTasks,
+        // Session deletion and the startup sweep clean task rows up through the same repository.
+        assignmentCleanup: options.assignmentTasks,
+    };
+    const coordinatorOwnership = createOwnership(options, sessions);
     const queueRepository = createQueueRepository({
         db: options.db,
         nowMs,
@@ -113,6 +143,7 @@ export function initializeSessionSystem(options) {
     const roots = new RootSessionInvariantService({
         sessions,
         agents: options.rootAgents,
+        ...(options.agentSurfaces ? { agentSurfaces: options.agentSurfaces } : {}),
         creation: records,
         legacyRoot: legacy,
     });
@@ -122,11 +153,7 @@ export function initializeSessionSystem(options) {
         },
         facts: options.facts,
     });
-    const titles = new SessionTitleService({
-        sessions,
-        commitTitle: createTitleCommitter(records, options.facts),
-        ...options.title,
-    });
+    const { titles, titleReviews } = createSessionTitles(sessions, records, options);
     const sessionDomain = initializeSessionDomain({ repository: sessions, discovery: legacy });
     const projectDomain = initializeProjectDomain({ repository: projects, sessions, nowMs });
     const queue = new CommittedQueueService({
@@ -139,6 +166,7 @@ export function initializeSessionSystem(options) {
         facts: queueFacts,
     });
     const files = new SessionFilesService({ sessions, messages, assets, nowMs });
+    const artifactCatalog = createArtifactCatalog(options, files);
     const inputSummaries = createInputSummaries(options, sessions, legacy, files);
     const artifacts = new SessionArtifactService({
         queue,
@@ -163,7 +191,6 @@ export function initializeSessionSystem(options) {
         nowMs,
     });
     const usageProjector = createUsageProjector({ sessions, usage, usageCommits, nowMs });
-    let closePromise;
     return {
         repositories: {
             sessions,
@@ -174,6 +201,7 @@ export function initializeSessionSystem(options) {
             assets,
             legacyMigrations,
             operationIntents,
+            ...assignmentStores,
         },
         sessions: {
             ...sessionDomain,
@@ -202,9 +230,11 @@ export function initializeSessionSystem(options) {
         sideChats,
         projects: {
             ...projectDomain,
-            sidebar: new SidebarQueryService(options.db, nowMs, (agentName) => path.join(options.dataDir, 'agents', agentName, 'workspace')),
+            sidebar: createSidebarQueryService(options, nowMs),
         },
         files,
+        artifactCatalog,
+        coordinatorOwnership,
         queue: {
             repository: queueRepository,
             committed: queue,
@@ -224,6 +254,7 @@ export function initializeSessionSystem(options) {
             commits: usageCommits,
         },
         titles,
+        titleReviews,
         stream,
         canonicalHistory,
         historyLocations,
@@ -237,11 +268,15 @@ export function initializeSessionSystem(options) {
         queryCollapse: { state: queryCollapseState },
         ready: createSessionSystemReadyHandler(options, queryCollapseState),
         runStorageMaintenance: () => storageRetention.run(),
-        close: () => {
-            closePromise ??= closeSessionSystem(titles, stream);
-            return closePromise;
-        },
+        close: createSessionSystemCloser([titles, titleReviews], stream, artifactCatalog, coordinatorOwnership.roster),
     };
+}
+function createSessionProjectRepository(options) {
+    const surfaces = options.agentSurfaces;
+    return createProjectRepository({
+        db: options.db,
+        ...(surfaces ? { privateWorkspaceRoots: () => surfaces.privateWorkspaceRoots() } : {}),
+    });
 }
 function createSessionSystemReadyHandler(options, queryCollapseState) {
     let rootProjectHistoryRepair;
@@ -300,6 +335,8 @@ function createSessionRecordService(input) {
         ...(options.makeSessionId ? { makeSessionId: options.makeSessionId } : {}),
         ...(options.backfillDiagnostics ? { backfillDiagnostics: options.backfillDiagnostics } : {}),
         ...(options.toolCallMode ? { toolCallMode: options.toolCallMode } : {}),
+        ...(options.agentSurfaces ? { agentSurfaces: options.agentSurfaces } : {}),
+        ...(options.worktreeProgress ? { worktreeProgress: options.worktreeProgress } : {}),
         nowMs,
     });
 }
@@ -480,6 +517,7 @@ function createAgentCapabilities(input) {
         ...(input.options.steeringProjection
             ? { steeringProjection: input.options.steeringProjection }
             : {}),
+        ...(input.options.originProjection ? { originProjection: input.options.originProjection } : {}),
         compactionFacts: composeCompactionFactSink(input.llmCalls, input.options.compactionFacts),
         ...(input.options.compactionMetrics
             ? { compactionMetrics: input.options.compactionMetrics }
@@ -584,16 +622,63 @@ function isCanonicalHistoryMessage(value) {
     return (typeof Reflect.get(value, 'role') === 'string' &&
         typeof Reflect.get(value, 'timestamp') === 'number');
 }
-async function closeSessionSystem(titles, stream) {
-    const [titleResult] = await Promise.allSettled([titles.close()]);
-    stream.dispose();
-    if (titleResult?.status === 'rejected')
-        throw titleResult.reason;
+function createOwnership(options, sessions) {
+    return createCoordinatorOwnership({
+        roster: options.coordinatorRoster ?? EMPTY_COORDINATOR_ROSTER,
+        tasks: options.assignmentTasks,
+        sessions,
+        agentOf: (sessionId) => readSessionAgentName(options.db, sessionId),
+    });
+}
+function createSessionSystemCloser(titles, stream, artifactCatalog, roster) {
+    let closePromise;
+    async function close() {
+        roster.close?.();
+        const results = await Promise.allSettled([
+            ...titles.map((service) => service.close()),
+            artifactCatalog.close(),
+        ]);
+        stream.dispose();
+        for (const result of results) {
+            if (result.status === 'rejected')
+                throw result.reason;
+        }
+    }
+    return () => {
+        closePromise ??= close();
+        return closePromise;
+    };
 }
 function createTitleCommitter(records, facts) {
-    return async (sessionId, title, expectedTitle) => {
-        const updated = await records.mutateSession(sessionId, { title, titleSource: 'auto' }, undefined, { title: expectedTitle, source: 'default' });
+    return async (sessionId, title, expectedTitle, outcome) => {
+        // A fallback title is truncated user input, not a model summary. Keeping the Session on
+        // `default` lets the next accepted message retry generation; claiming `auto` would strand
+        // it on a title no model ever wrote. `titleSource` must stay explicit because a title
+        // mutation without one is normalized to `manual`.
+        const updated = await records.mutateSession(sessionId, outcome === 'success'
+            ? { title, titleSource: 'auto', titleReviewState: 'pending' }
+            : { title, titleSource: 'default' }, undefined, { title: expectedTitle, source: 'default' });
         facts.handle({ kind: 'title-updated', session: updated, title });
     };
+}
+function createSessionTitles(sessions, records, options) {
+    const titles = new SessionTitleService({
+        sessions,
+        commitTitle: createTitleCommitter(records, options.facts),
+        ...options.title,
+    });
+    const titleReviews = new SessionTitleReviewService({
+        sessions,
+        model: options.title.model,
+        promptSnapshots: options.title.reviewPromptSnapshots,
+        waitForGeneration: (sessionId) => titles.waitForGeneration(sessionId),
+        commitTitle: async (sessionId, title, expected) => {
+            const updated = await records.mutateSession(sessionId, { title, titleSource: 'auto' }, undefined, expected);
+            options.facts.handle({ kind: 'title-updated', session: updated, title });
+        },
+        onOutcome: options.title.onReviewOutcome,
+        onFailure: options.title.onFailure,
+    });
+    return { titles, titleReviews };
 }
 //# sourceMappingURL=owner.js.map

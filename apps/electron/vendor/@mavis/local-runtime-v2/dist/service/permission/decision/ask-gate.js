@@ -3,6 +3,8 @@
  * `bypassPermissions` ("始终允许") product invariant:
  *
  *   **bypassPermissions = the UI never surfaces a permission card.**
+ *   There is no exception to that, not even for an ask a checker marked
+ *   `bypassImmune`.
  *
  * The wider permission pipeline (agent-core `PermissionEngine`,
  * `path-capability`, `bash-permission`, `local-permission-checkers`,
@@ -42,6 +44,12 @@
  *       - `behavior === 'allow'` → unchanged.
  *       - `behavior === 'ask'` → **downgraded to `allow`**. The user
  *         has waived per-call review for this mode.
+ *       - Nothing survives that downgrade. `bypassImmune` is still set
+ *         upstream (`permission-core.ts:225`, `tools/path-capability.ts`,
+ *         `tools/bash-checker.ts`), but this gate does not consult it, so a
+ *         credential-path or safety ask is waived like any other once the
+ *         mode has waived per-call review. The dedicated outbound
+ *         Lark/Feishu send gate is gone as well.
  *
  * Whatever new ask sources land later, they automatically inherit
  * this invariant — no need to touch them. The invariant is also

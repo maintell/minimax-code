@@ -1,4 +1,4 @@
-export { createRuntimeServicesLifecycle, closeRuntimeServiceResources, closeRuntimeOwners, bindGoalConversation, startupRecoveryControls, startupRecoveryInputs, closeRuntimeServiceOwnersAfterFailure, createRuntimeServicesGlobalEventWriter, closeRuntimeTitles, composeModelAccessRuntimeLifecycle, createDisabledModelAccessComposition, createModelAccessComposition, createRuntimePluginAuthContextNotifier, createRuntimePluginSessionLifecycle, } from './session/runtime-services-lifecycle.js';
+export { createRuntimeServicesLifecycle, closeRuntimeOwners, bindGoalConversation, startupRecoveryControls, startupRecoveryInputs, closeRuntimeServiceOwnersAfterFailure, closeRuntimeTurnSystem, createRuntimeServicesGlobalEventWriter, closeRuntimeTitles, composeModelAccessRuntimeLifecycle, createDisabledModelAccessComposition, createModelAccessComposition, createRuntimePluginAuthContextNotifier, createRuntimePluginSessionLifecycle, } from './session/runtime-services-lifecycle.js';
 export { STARTUP_RECOVERY_STEP_NAMES, startupRecoveryFaultOption, } from './session/startup-recovery.js';
 export { configureRuntimePluginHooks, } from './session/runtime-plugin-hook-composition.js';
 export { AgentApplication, createAgentSessionPorts, createRuntimeAgentApplication, } from './agent/agent-application.js';
@@ -6,6 +6,7 @@ export { createV2AgentExecutionSource } from './agent/execution-source.js';
 export { createV2AgentProfileSource, isCommandLineRuntimeOwner } from './agent/profile-source.js';
 export { createRuntimeBrowserUseComposition, ownsElectronRuntimeCapabilities, ownsScheduledRuntimeCapabilities, } from './agent/runtime-browser-use-composition.js';
 export { bindImFollowUpHostPorts } from './channel/im-follow-up-host-ports.js';
+export { createRuntimePtcDefault } from './session/ptc-default-state.js';
 export { createGoalEvaluatorVerifier, } from './agent/goal-evaluator-verifier.js';
 export { createGoalSubagentVerifierRuntime, } from './agent/goal-subagent-verifier.js';
 export { AppError, NotImplementedError } from './errors.js';

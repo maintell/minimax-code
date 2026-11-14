@@ -1,3 +1,4 @@
+import { ELECTRON_BROWSER_PUBLIC_ACTIONS } from "./electron-browser-route-policy";
 import { serializeSemanticTreePage } from "@mavis/browser-core";
 const MAX_COMMENT_STYLE_CHANGES = 32;
 export function normalizeCommentStyleChanges(value) {
@@ -24,10 +25,14 @@ export let OFFSCREEN_BOUNDS = { x: -10000, y: -10000, width: 800, height: 600 };
 export let PENDING_COMMENT_EVENT_LIMIT = 500;
 export let COMMENT_KEY_MAX_ENTRIES = 500;
 export let COMMENT_KEY_MAX_LENGTH = 200;
-export let HIDDEN_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 export let HIDDEN_LOADING_GRACE_MS = 2 * 60 * 1000;
 export let HIDDEN_SWEEP_INTERVAL_MS = 60 * 1000;
-export let MAX_HIDDEN_TABS = 3;
+export let MAX_HIDDEN_TABS = 12;
+/**
+ * How long each session's selected tab stays alive after it was hidden, so
+ * returning to a conversation shows the same live page instead of a reload.
+ */
+export let SELECTED_TAB_PROTECTION_MS = 30 * 60 * 1000;
 /**
  * How long a tab stays protected from hidden-tab suspension and background
  * throttling after an agent tool operation settles. Suspending between two
@@ -45,29 +50,7 @@ export let MAX_AGENT_SNAPSHOT_PAGE_LIMIT = 200;
 // Reserve room for reading/safety guidance added by the outer Browser tool.
 export let MAX_AGENT_SNAPSHOT_PAGE_BYTES = 56 * 1024;
 export let AGENT_BROWSER_ACTIONS = new Set([
-    'inspect',
-    'query',
-    'navigate',
-    'open_tab',
-    'back',
-    'forward',
-    'reload',
-    'click',
-    'click_and_wait_for_navigation',
-    'double_click',
-    'triple_click',
-    'drag',
-    'hover',
-    'fill',
-    'type',
-    'press_key',
-    'check',
-    'uncheck',
-    'select_option',
-    'scroll',
-    'wait',
-    'screenshot',
-    'upload_files',
+    ...ELECTRON_BROWSER_PUBLIC_ACTIONS,
     'paste',
 ]);
 export function asRecord(value) {
@@ -105,6 +88,11 @@ export function normalizeBrowserTarget(target) {
 }
 export function nowMs() {
     return Date.now();
+}
+/** True while the tab's latest Agent operation is within AGENT_OPERATION_KEEPALIVE_MS. */
+export function isWithinAgentKeepalive(tab, now = nowMs()) {
+    return (tab.lastAgentOperationAt != null &&
+        now - tab.lastAgentOperationAt < AGENT_OPERATION_KEEPALIVE_MS);
 }
 export function safeError(error) {
     return error instanceof Error ? error.message : String(error);

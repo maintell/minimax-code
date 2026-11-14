@@ -46,15 +46,32 @@ export class LocalEvalReporterFactory {
             metricsClient: this.options.metricsClient,
         });
     }
+    /**
+     * The reporter that writes events without a Turn of their own — post-turn observations
+     * such as `bunny.turn_ended` or a compaction result, and events that arrive with no active
+     * Turn at all. It inherits the session fields of the session's own reporter, so these rows
+     * carry the same `extra` as the Turn's steps; the fields are copied from the snapshot that
+     * reporter already holds, never re-read from a store. Without a snapshot (no Turn has run
+     * in this process yet) the rows keep empty `extra`, as before.
+     */
     getRuntimeReporter(sessionId) {
         let reporter = this.runtimeReporters.get(sessionId);
-        if (reporter)
+        if (reporter) {
+            this.inheritSessionFields(reporter, sessionId);
             return reporter;
+        }
         if (this.runtimeReporters.size >= 128)
             this.runtimeReporters.values().next().value?.flushPending();
         reporter = this.createReporter({ sessionId, workspaceDir: '' });
         this.runtimeReporters.set(sessionId, reporter);
+        this.inheritSessionFields(reporter, sessionId);
         return reporter;
+    }
+    inheritSessionFields(reporter, sessionId) {
+        const source = this.reporters.get(sessionId);
+        if (!source)
+            return;
+        reporter.inheritSessionMetadata(source.lastSessionMetadata);
     }
     /**
      * 每次调用都重新求值的开关读取。

@@ -71,6 +71,8 @@ const DEFAULT_PROACTIVE_RECOVERY_COOLDOWN_MS = 60000;
 const MAX_PROACTIVE_RECOVERY_COOLDOWN_MS = 10 * 60000;
 const RUNTIME_MEMORY_MONITOR_REQUEST_TIMEOUT_MS = 10000;
 const SESSION_REPORT_REQUEST_TIMEOUT_MS = 30000;
+/** Bunny feedback waits at most 120 s; the runtime stops collecting earlier and returns what it has. */
+const BUNNY_FEEDBACK_REPORT_REQUEST_TIMEOUT_MS = 120000;
 /**
  * A feedback Workspace snapshot scans, hashes and zips up to 100k files / 1GB:
  * 93.6k files / 710MB took 72s on an M-series Mac, and slower disks or
@@ -284,6 +286,8 @@ export class LocalRuntimeUtilityProcessManager {
         this.rendererGenerations = new Map();
         this.activeAppVersion = 'unknown';
         this.pptQueries = new MainPptPreviewQueryClient();
+        /** The child whose local work keeps the computer awake; its exit releases the demand. */
+        this.powerDemandChild = null;
         this.miniAppBroker = new MainMiniAppBrokerClient();
         this.miniAppToolBroker = new MainMiniAppToolBroker({
             requestApproval: async (input) => (await this.options.requestMiniAppToolApproval?.(input)) ?? 'unavailable',
@@ -390,6 +394,13 @@ export class LocalRuntimeUtilityProcessManager {
         }
         const pid = state.child.pid;
         return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 ? pid : null;
+    }
+    /** Drops the power demand held by `child`, if any, and tells the host. */
+    releasePowerDemandOf(child) {
+        if (this.powerDemandChild !== child)
+            return;
+        this.powerDemandChild = null;
+        this.notifyHost('onRuntimePowerDemand', () => this.options.onRuntimePowerDemand?.(false));
     }
     /** True when `child` is the one the CURRENT state refers to. */
     ownsChild(child) {
@@ -749,6 +760,17 @@ export class LocalRuntimeUtilityProcessManager {
             (this.options.logger ?? noopLogger).warn('[UtilityRuntime] Runaway Guard config post failed');
         }
     }
+    setBunnyPolicy(policy) {
+        const state = this.state;
+        if (state.phase !== 'starting' && state.phase !== 'ready')
+            return;
+        try {
+            state.child.postMessage({ type: 'runtime-bunny-policy', policy });
+        }
+        catch {
+            (this.options.logger ?? noopLogger).warn('[UtilityRuntime] Bunny policy post failed');
+        }
+    }
     setPromptSuggestionPolicy(policy) {
         const state = this.state;
         if (state.phase !== 'starting' && state.phase !== 'ready')
@@ -784,6 +806,17 @@ export class LocalRuntimeUtilityProcessManager {
         }
         catch {
             (this.options.logger ?? noopLogger).warn('[UtilityRuntime] ToolResult compaction config post failed');
+        }
+    }
+    setBunnyContextConfig(config) {
+        const state = this.state;
+        if (state.phase !== 'starting' && state.phase !== 'ready')
+            return;
+        try {
+            state.child.postMessage({ type: 'runtime-bunny-context-config', config });
+        }
+        catch {
+            (this.options.logger ?? noopLogger).warn('[UtilityRuntime] Bunny context config post failed');
         }
     }
     setCollectionPolicy(policy) {
@@ -847,8 +880,15 @@ export class LocalRuntimeUtilityProcessManager {
             }
         });
     }
-    collectSessionReport(sessionId) {
-        return this.requestRuntimeReport((requestId) => ({ type: 'runtime-session-report-request', requestId, sessionId }), 'session_report', SESSION_REPORT_REQUEST_TIMEOUT_MS);
+    collectSessionReport(sessionId, scope) {
+        return this.requestRuntimeReport((requestId) => ({
+            type: 'runtime-session-report-request',
+            requestId,
+            sessionId,
+            ...(scope ? { scope } : {}),
+        }), 'session_report', scope === 'bunny'
+            ? BUNNY_FEEDBACK_REPORT_REQUEST_TIMEOUT_MS
+            : SESSION_REPORT_REQUEST_TIMEOUT_MS);
     }
     captureWorkspaceSnapshot(sessionId, outputDir) {
         return this.requestRuntimeReport((requestId) => ({
@@ -1192,6 +1232,9 @@ export class LocalRuntimeUtilityProcessManager {
         this.rejectAuthRotationsForChild(child, 'utility stopped before auth rotation completed');
         this.settleLogFlushesForChild(child);
         this.releaseChildCapabilities(child);
+        // A killed child whose exit is never confirmed must not keep the computer
+        // awake; quarantined children can no longer raise demand.
+        this.releasePowerDemandOf(child);
         const actualExit = new Promise((resolve) => {
             child.once('exit', () => resolve());
         });
@@ -1495,7 +1538,9 @@ export class LocalRuntimeUtilityProcessManager {
                 const miniAppSurfaceEnabled = this.isMiniAppSurfaceEnabled();
                 const runawayGuardConfig = this.options.getRunawayGuardConfig?.();
                 const promptSuggestionPolicy = this.options.getPromptSuggestionPolicy?.();
+                const bunnyPolicy = this.options.getBunnyPolicy?.();
                 const toolResultCompactionConfig = this.options.getToolResultCompactionConfig?.();
+                const bunnyContextConfig = this.options.getBunnyContextConfig?.();
                 const collectionPolicy = this.options.getCollectionPolicy?.();
                 const promptConfigKey = this.options.getPromptConfigKey?.();
                 const init = {
@@ -1514,11 +1559,16 @@ export class LocalRuntimeUtilityProcessManager {
                     contextWindowUsageEnabled: this.options.getContextWindowUsageEnabled?.() === true,
                     ...(runawayGuardConfig ? { runawayGuardConfig } : {}),
                     ...(promptSuggestionPolicy ? { promptSuggestionPolicy } : {}),
+                    ...(bunnyPolicy ? { bunnyPolicy } : {}),
                     ...(toolResultCompactionConfig &&
                         (toolResultCompactionConfig.maxInlineBytes !== undefined ||
                             toolResultCompactionConfig.mcpDetailsMaxInlineBytes !== undefined ||
                             toolResultCompactionConfig.checkpointSharedPrefix !== undefined)
                         ? { toolResultCompactionConfig }
+                        : {}),
+                    ...(bunnyContextConfig &&
+                        Object.values(bunnyContextConfig).some((value) => value !== undefined)
+                        ? { bunnyContextConfig }
                         : {}),
                     ...(collectionPolicy ? { collectionPolicy } : {}),
                     ...(this.routingContext ? { routingContext: this.routingContext } : {}),
@@ -1628,6 +1678,11 @@ export class LocalRuntimeUtilityProcessManager {
                 this.notifyHost('onWorkspaceIndexingObservation', () => this.options.onWorkspaceIndexingObservation?.(raw));
                 return;
             }
+            if (raw.type === 'runtime-power-demand') {
+                this.powerDemandChild = raw.active ? child : null;
+                this.notifyHost('onRuntimePowerDemand', () => this.options.onRuntimePowerDemand?.(raw.active));
+                return;
+            }
             if (raw.type === 'runtime-database-migration') {
                 if (state.phase === 'starting') {
                     this.notifyLifecycle({
@@ -1712,6 +1767,9 @@ export class LocalRuntimeUtilityProcessManager {
             }
         });
         child.on('exit', (code) => {
+            // Ahead of the ownership check: a crashed or discarded child cannot report
+            // its own demand ending, and only the child that raised it may release it.
+            this.releasePowerDemandOf(child);
             // A discarded child (init failure, replaced handle) must not touch
             // the state machine of whatever is running now.
             if (!this.ownsChild(child))

@@ -20,5 +20,7 @@ export * from './repo/contract.js';
 export * from './repo/source-query-contract.js';
 export * from './repo/source-query.js';
 export * from './rewind/index.js';
+export * from './search-index/index.js';
 export * from './repo/drizzle.js';
+export * from './repo/write-observers.js';
 //# sourceMappingURL=index.js.map

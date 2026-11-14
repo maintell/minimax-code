@@ -1,14 +1,17 @@
 import { constants as fsConstants } from 'node:fs';
 import { lstat, open, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { BUNNY_AGENT_NAME } from '@mavis/shared/agent-avatar';
+import { resolveBunnyHomeDir } from '@mavis/shared/local-runtime-paths';
 import { publishFileIfAbsent, replaceFileAtomically, } from '../../../infra/file/jsonl.js';
 import { AgentConfigRevisionConflictError, documentRevision, rawDigest, } from './agent-files.js';
-import { AgentConfigError, parseBuiltinCanonicalAgentMarkdown, readStableAgentMarkdown, serializeBuiltinCanonicalAgentConfig, validateAgentAvatar, } from './canonical-agent-config.js';
+import { AgentConfigError, parseBuiltinCanonicalAgentMarkdown, parseBuiltinModelGroup, readStableAgentMarkdown, serializeBuiltinCanonicalAgentConfig, validateAgentAvatar, } from './canonical-agent-config.js';
 const SYSTEM_PROMPT_FILE = 'agent.md';
 /**
  * Names the step that failed while repairing a corrupted Builtin source, so
- * startup can log where the repair stopped without exposing paths or content.
- * `archiveFile` is set once the original bytes are safely archived.
+ * the caller can log where the repair stopped without exposing paths or
+ * content. `template` is a replacement builder that failed before anything was
+ * archived; `archiveFile` is set once the original bytes are safely archived.
  */
 export class BuiltinAgentConfigRepairError extends Error {
     stage;
@@ -34,6 +37,12 @@ export class BuiltinAgentFiles {
     constructor(files, dataDir) {
         this.files = files;
         this.dataDir = dataDir;
+    }
+    /** Bunny's workspace is always its home directory; other Builtins read their config file. */
+    config(name) {
+        if (name !== BUNNY_AGENT_NAME)
+            return this.files.getConfig(name);
+        return Promise.resolve({ defaultWorkspaceDir: resolveBunnyHomeDir(this.dataDir) });
     }
     /**
      * Seeds a Builtin source only when its canonical file is absent. Reports
@@ -93,19 +102,22 @@ export class BuiltinAgentFiles {
         });
     }
     /**
-     * Startup-only repair for a Builtin source that exists but can no longer be
-     * read as a valid config. Before the bundled baseline replaces it, the exact
-     * bytes are copied beside it as `.agent.md.corrupted.<sha256>.raw` so user
-     * edits stay recoverable. If archiving fails the original is left untouched;
-     * if the file changed after it was archived, the newer bytes are not replaced.
-     * A source that is valid or missing again by the time the lock is held is
-     * left as it is (`skipped`).
+     * Repair for a Builtin source that exists but can no longer be read as a
+     * valid config: at startup for every Builtin, at use time for Bunny. Before
+     * the bundled baseline replaces it, the exact bytes are copied beside it as
+     * `.agent.md.corrupted.<sha256>.raw` so user edits stay recoverable. A
+     * replacement builder gets the model group of those same bytes and runs
+     * before the archive, so its failure leaves no archive behind. If archiving
+     * fails the original is left untouched; if the file changed after it was
+     * archived, the newer bytes are not replaced. A source that is valid or
+     * missing again by the time the lock is held is left as it is (`skipped`).
      */
-    repair(name, config) {
+    repair(name, replacement) {
         return this.files.withLock(`.builtin:${name}`, async () => {
             const agentDir = this.files.builtinAgentDir(name);
             const filePath = join(agentDir, SYSTEM_PROMPT_FILE);
             let raw;
+            let config;
             let archiveFile;
             try {
                 await this.files.ensureSafeAgentDirectory(agentDir);
@@ -113,6 +125,20 @@ export class BuiltinAgentFiles {
                 if (skipped)
                     return { skipped };
                 raw = await readRegularFileBytes(filePath);
+            }
+            catch (error) {
+                throw new BuiltinAgentConfigRepairError('archive', error);
+            }
+            try {
+                config =
+                    typeof replacement === 'function'
+                        ? await replacement(parseBuiltinModelGroup(raw))
+                        : replacement;
+            }
+            catch (error) {
+                throw new BuiltinAgentConfigRepairError('template', error);
+            }
+            try {
                 archiveFile = `.${SYSTEM_PROMPT_FILE}.corrupted.${rawDigest(raw)}.raw`;
                 await publishVerifiedRawArchive(join(agentDir, archiveFile), raw);
             }

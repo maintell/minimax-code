@@ -18,6 +18,7 @@ export function composeProcessLocalApplication(input) {
         workspace: { ...input.compatibility.peripherals.workspace },
         plan: { isEntryEnabled: input.planEntryEnabled },
         ...(input.sessionReports ? { sessionReports: input.sessionReports } : {}),
+        ...(input.bunnyFeedback ? { bunnyFeedback: input.bunnyFeedback } : {}),
         instructions: input.instructions,
         peripherals: { ...input.compatibility.peripherals, mcp: input.mcp, goals: input.goals },
         modelProvider: input.modelProvider,

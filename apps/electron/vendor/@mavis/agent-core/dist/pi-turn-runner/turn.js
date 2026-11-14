@@ -1,10 +1,16 @@
 import { EventBridge } from '../event-bridge/index.js';
 import { composeStreamFn, resolveHostOutputTokenCap } from './llm.js';
+import { withLLMCallPreemption } from './llm-preemption.js';
 import { withLLMRetry } from './llm-retry.js';
+import { LLM_RESUME_STALL_MS } from './llm-stream-timeout.js';
+import { withTurnRequestPhase } from './turn-timing.js';
 import { newTools } from './tools.js';
 export function newTurn(input, deps) {
     const resolved = input.llm;
-    const composedStreamFn = composeStreamFn(resolved);
+    const networkRecovery = input.llmRetry?.networkRecovery;
+    const composedStreamFn = composeStreamFn(resolved, networkRecovery
+        ? { onResume: (listener) => networkRecovery.onResume(listener), stallMs: LLM_RESUME_STALL_MS }
+        : undefined);
     const retryStream = (scope) => {
         const metricsStreamFn = deps.metrics
             ? deps.metrics.wrapStreamFn(composedStreamFn, { recordTerminalFailure: false })
@@ -49,8 +55,23 @@ export function newTurn(input, deps) {
         : deps.metrics
             ? deps.metrics.wrapStreamFn(composedStreamFn)
             : composedStreamFn;
-    const auxiliaryStreamFn = input.llmRetry || resolved.callLifecycle ? retryStream('compaction') : undefined;
+    const auxiliaryStreamFn = input.llmRetry || resolved.callLifecycle
+        ? withTurnRequestPhase(retryStream('compaction'), () => 'compaction', resolved.turnPhaseHeader)
+        : undefined;
     const syntheticResponse = {};
+    const preemption = {};
+    let logicalCalls = 0;
+    // A call resent because the host preempted the one in flight replaces it and
+    // keeps its phase: a preempted first request is resent as initial.
+    const mainPhase = () => {
+        const resent = preemption.resendPhase;
+        delete preemption.resendPhase;
+        return resent ?? (logicalCalls++ === 0 ? 'initial' : 'iteration');
+    };
+    // Outside retry, so a preempted call is never retried. Auxiliary calls stay unwrapped.
+    const preemptibleStreamFn = input.llmPreemption
+        ? withLLMCallPreemption(mainStreamFn, preemption, deps.nowMs, input.llmPreemption.wakeReasons, input.llmPreemption.interruptedUserMessage)
+        : mainStreamFn;
     let eventSeq = 0;
     let runtimeSeq = 0;
     const nextEventId = input.eventIdGenerator ?? ((kind) => `evt_${input.turnId}_${kind}_${++eventSeq}`);
@@ -90,6 +111,7 @@ export function newTurn(input, deps) {
         beforeLLM: input.hooks?.beforeLlmCallHook ?? [],
         onLLMPrepared: input.hooks?.onLlmCallPreparedHook ?? [],
         afterLLM: input.hooks?.afterLlmCallHook ?? [],
+        turnFailure: input.hooks?.turnFailureHook ?? [],
         beforeTool: input.hooks?.beforeToolCallHook ?? [],
         onToolExecutionStart: input.hooks?.onToolExecutionStartHook ?? [],
         afterTool: input.hooks?.afterToolCallHook ?? [],
@@ -107,7 +129,7 @@ export function newTurn(input, deps) {
         bridge,
         hooks,
         tools,
-        streamFn: withSyntheticResponse(withLlmCallPreparedObservers(mainStreamFn, {
+        streamFn: withSyntheticResponse(withLlmCallPreparedObservers(withTurnRequestPhase(preemptibleStreamFn, mainPhase, resolved.turnPhaseHeader), {
             input,
             llm: resolved,
             tools,
@@ -125,8 +147,9 @@ export function newTurn(input, deps) {
         blockedToolCalls: [],
         syntheticResponse,
         rejectedAssistantMessages: new Set(),
+        preemption,
         requestStoppedBeforeSend: false,
-        recovery: { used: false },
+        recovery: { used: false, turnFailureRecoveries: 0 },
         nextEventId,
         nextRuntimeSeq,
     };
@@ -138,10 +161,11 @@ function withLlmCallPreparedObservers(inner, options) {
     return (async (model, context, streamOptions) => {
         const phase = logicalCallCount === 0 ? 'initial' : 'iteration';
         logicalCallCount += 1;
+        const payloadObservers = [];
         for (const hook of options.hooks) {
             try {
                 const hostMaxOutputTokens = resolveHostOutputTokenCap(options.llm);
-                await hook({
+                const observation = await hook({
                     sessionId: options.input.sessionId,
                     turnId: options.input.turnId,
                     phase,
@@ -165,6 +189,8 @@ function withLlmCallPreparedObservers(inner, options) {
                     thinkingLevel: options.thinkingLevel,
                     ...(streamOptions?.signal ? { signal: streamOptions.signal } : {}),
                 });
+                if (observation?.onPayload)
+                    payloadObservers.push(observation.onPayload);
             }
             catch (error) {
                 try {
@@ -180,8 +206,29 @@ function withLlmCallPreparedObservers(inner, options) {
                 }
             }
         }
-        return inner(model, context, streamOptions);
+        return inner(model, context, withPayloadObservers(streamOptions, payloadObservers));
     });
+}
+/** The request's own payload transform runs first; the observers see what it returned. */
+function withPayloadObservers(streamOptions, observers) {
+    if (observers.length === 0)
+        return streamOptions;
+    const transform = streamOptions?.onPayload;
+    return {
+        ...streamOptions,
+        onPayload: async (payload, model) => {
+            const transformed = await transform?.(payload, model);
+            for (const observe of observers) {
+                try {
+                    observe(transformed ?? payload);
+                }
+                catch {
+                    // Observers never change the request.
+                }
+            }
+            return transformed;
+        },
+    };
 }
 function withSyntheticResponse(inner, state, nowMs) {
     return ((model, context, options) => {

@@ -1,12 +1,14 @@
 import { describeAgentPromptSnapshot } from '../../service/agent/index.js';
-import { isLegacyMemoryRecallEnabled, isLocalSourceProvenanceEnabled } from '@mavis/config';
+import { isBunnyMemoryEnabledInConfig, isLegacyMemoryRecallEnabled, isLocalSourceProvenanceEnabled, } from '@mavis/config';
 import { omitManagedSourceCitationInstructions, restoreLegacyFileReferenceInstructions, } from '@mavis/shared/source-provenance';
 import { resolveAgentPromptSurface } from '../../service/turn-system/index.js';
 import { isTaskSession, isCurrentSessionAgentDefinition, } from '../../service/session-system/index.js';
 export function createV2AgentProfileSource(agentService, configGetter, runtimeOwnerKind, capabilityProfile) {
+    // Frozen plugin tasks retain their definition, but startup policy still gates new turns.
+    const forbiddenPluginNames = new Set((configGetter().plugins?.forbidden ?? []).map((name) => name.trim().normalize('NFKC').toLocaleLowerCase('en-US')));
     return {
-        render: async ({ session, agent, agentBinding, promptRead, ptcRequested }) => {
-            const definition = requireCurrentDefinition(session, agentBinding);
+        render: async ({ session, agent, agentBinding, promptRead, ptcRequested, ptcStoreRequested, }) => {
+            const definition = requireCurrentDefinition(session, agentBinding, forbiddenPluginNames);
             const metadata = agent.metadata ?? {};
             // Freeze one config snapshot for the complete profile render so a live
             // preference update cannot mix capability, memory, and dataDir versions.
@@ -28,19 +30,31 @@ export function createV2AgentProfileSource(agentService, configGetter, runtimeOw
                 memoryEnabled: !isCommandLineRuntimeOwner(runtimeOwnerKind) &&
                     isLegacyMemoryRecallEnabled(config.memory, agent.agentName),
                 cronEnabled: !isCommandLineRuntimeOwner(runtimeOwnerKind),
+                ...bunnyPromptSwitches(config),
                 dataDirToken: config.dataDir,
-                ...turnScopedRequest(promptRead, ptcRequested),
+                ...turnScopedRequest(promptRead, ptcRequested, ptcStoreRequested),
             };
             const profile = await renderProfile(agentService, request, definition);
             return toLocalAgentExecutionProfile(applySourcePromptPolicy(profile, runtimeOwnerKind));
         },
     };
 }
+/**
+ * Bunny's local config.yaml switches, off by default; only Bunny's own profile reads them: the
+ * read-only helper paragraphs (`bunny.helperAgents`) and the memory paragraphs (`bunny.memory`).
+ */
+function bunnyPromptSwitches(config) {
+    return {
+        ...(config.bunny?.helperAgents === true ? { bunnyHelperAgents: true } : {}),
+        ...(isBunnyMemoryEnabledInConfig(config) ? { bunnyMemory: true } : {}),
+    };
+}
 /** Facts that belong to this one Turn, never to the Agent definition. */
-function turnScopedRequest(promptRead, ptcRequested) {
+function turnScopedRequest(promptRead, ptcRequested, ptcStoreRequested) {
     return {
         ...(promptRead ? { promptReadContext: promptRead } : {}),
         ...(ptcRequested ? { ptcRequested: true } : {}),
+        ...(ptcStoreRequested ? { ptcStoreRequested: true } : {}),
     };
 }
 function renderProfile(agentService, request, definition) {
@@ -57,7 +71,7 @@ function resolveConfiguredCapabilities(config, capabilityProfile) {
         features: { ...configured?.features, mavis: false },
     };
 }
-function requireCurrentDefinition(session, binding) {
+function requireCurrentDefinition(session, binding, forbiddenPluginNames) {
     if (!isTaskSession(session))
         return undefined;
     const { sessionId } = session;
@@ -67,6 +81,11 @@ function requireCurrentDefinition(session, binding) {
         throw new Error(`Session Agent definition owner mismatch: ${sessionId}`);
     if (!isCurrentSessionAgentDefinition(binding.definition)) {
         throw new Error(`Session Agent definition requires migration: ${sessionId}`);
+    }
+    const pluginName = binding.definition.pluginSource?.pluginName;
+    if (pluginName &&
+        forbiddenPluginNames.has(pluginName.trim().normalize('NFKC').toLocaleLowerCase('en-US'))) {
+        throw new Error(`Plugin forbidden by local config: ${pluginName}`);
     }
     return binding.definition;
 }
@@ -115,6 +134,7 @@ function toLocalAgentExecutionProfile(profile) {
         surfacePrompt: profile.surfacePrompt,
         ...(profile.configSelection ? { configSelection: profile.configSelection } : {}),
         capabilityCeiling: profile.capabilityCeiling,
+        ...(profile.coordination ? { coordination: profile.coordination } : {}),
         provenance: profile.provenance,
     };
 }

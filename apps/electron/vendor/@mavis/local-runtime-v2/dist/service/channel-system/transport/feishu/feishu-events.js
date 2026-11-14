@@ -78,6 +78,7 @@ function buildFeishuInboundCtx(input) {
         chatId,
         senderId,
         clientName,
+        ...(normalized.senderOpenId ? { feishuSenderOpenId: normalized.senderOpenId } : {}),
         ...(normalized.threadId ? { threadId: normalized.threadId } : {}),
         ...(normalized.messageId ? { sourceMessageId: normalized.messageId } : {}),
         ...(readFirstString(body, ['lane']) ? { lane: readFirstString(body, ['lane']) } : {}),
@@ -101,6 +102,9 @@ function normalizeFeishuMessageEvent(body) {
         chatId: readFirstString(message, ['chat_id', 'chatId']),
         chatType: readFirstString(message, ['chat_type', 'chatType']),
         senderId: readFeishuSenderId(event, sender),
+        senderOpenId: isRecord(sender.sender_id)
+            ? readFirstString(sender.sender_id, ['open_id'])
+            : undefined,
         senderName: readFeishuSenderName(event, message, sender),
         content: message.content,
         mentions: message.mentions,

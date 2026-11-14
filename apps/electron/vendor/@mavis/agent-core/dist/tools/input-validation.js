@@ -1,6 +1,5 @@
-import { validateToolArguments } from '@earendil-works/pi-ai';
 import { Kind } from '@sinclair/typebox';
-import { Value } from '@sinclair/typebox/value';
+import { Value, ValueErrorType } from '@sinclair/typebox/value';
 import { Compile } from 'typebox/compile';
 import * as Schema from 'typebox/schema';
 const validators = new WeakMap();
@@ -78,39 +77,41 @@ const SCHEMA_VALUES = new Set([
 ]);
 /** Checks the exact execution value; validation never coerces values or applies defaults. */
 export function validateRuntimeToolInput(schema, value) {
+    const verdict = checkRuntimeToolInput(schema, value);
+    if (verdict === 'valid')
+        return { valid: true };
+    if (verdict === 'unsupported')
+        return unsupported();
     try {
-        if (Schema.IsSchemaObject(schema) && Kind in schema) {
-            const native = schema;
-            if (Value.Check(native, value))
-                return { valid: true };
+        if (issueListingTooCostly(schema, value)) {
             return {
                 valid: false,
                 reason: 'invalid',
-                issues: [...Value.Errors(native, value)]
-                    .slice(0, 8)
-                    .map((issue) => `${issue.path}: ${issue.message}`),
+                issues: [': issues are not listed for recursive or very large schemas or values'],
+                paths: [undefined],
             };
         }
-        if (!Schema.IsSchema(schema))
-            return unsupported();
-        let validator = typeof schema === 'object' ? validators.get(schema) : undefined;
-        if (!validator) {
-            // The compiler ignores malformed keywords. Validate their shapes before compiling.
-            if (!isCompilableSchema(schema))
-                return unsupported();
-            validator = Compile(schema);
-            if (typeof schema === 'object')
-                validators.set(schema, validator);
+        if (Schema.IsSchemaObject(schema) && Kind in schema) {
+            const errors = [...Value.Errors(schema, value)].slice(0, 8);
+            return {
+                valid: false,
+                reason: 'invalid',
+                issues: errors.map((issue) => `${issue.path}: ${issue.message}`),
+                paths: errors.map((issue) => issue.type === ValueErrorType.ObjectAdditionalProperties ||
+                    issue.type === ValueErrorType.ObjectRequiredProperty
+                    ? undefined
+                    : issue.path),
+            };
         }
-        if (validator.Check(value))
-            return { valid: true };
+        const validator = compiledValidator(schema);
+        if (!validator)
+            return unsupported();
+        const errors = validator.Errors(value).slice(0, 8);
         return {
             valid: false,
             reason: 'invalid',
-            issues: validator
-                .Errors(value)
-                .slice(0, 8)
-                .map((issue) => `${issue.instancePath}: ${issue.message}`),
+            issues: errors.map((issue) => `${issuePath(issue)}: ${issue.message}`),
+            paths: errors.map(issueValuePath),
         };
     }
     catch {
@@ -118,57 +119,970 @@ export function validateRuntimeToolInput(schema, value) {
     }
 }
 /**
- * Applies the numeric subset of the coercion top-level Pi tool calls receive
- * (e.g. "2" -> 2 for an integer field) to a nested payload. The input is never
- * mutated and the coerced copy is returned only when it satisfies the schema,
- * so valid inputs and unrecoverable values are passed through unchanged for
- * strict validation to report.
+ * Enumerating issues explores every failed branch, which on recursive or
+ * heavily overlapping schemas grows exponentially while the plain check stays
+ * linear. Issues are listed only when the schema tree, with every reference
+ * expanded in place, is finite and has at most this many nodes. Real MCP tool
+ * schemas are never recursive and stay far below it (largest seen: 50).
  */
-export function coerceRuntimeToolInput(schema, value) {
-    if (validateRuntimeToolInput(schema, value).valid)
-        return value;
-    if (!Schema.IsSchemaObject(schema) || !isPlainRecord(value))
-        return value;
-    let candidate;
-    try {
-        // Pi's JSON Schema coercion only converts losslessly ("2.5" stays a string for
-        // an integer field). TypeBox schemas are projected to plain JSON Schema first
-        // because Pi skips that path for anything carrying TypeBox metadata.
-        candidate = validateToolArguments({ name: 'nested', description: '', parameters: plainJsonSchema(schema) }, { type: 'toolCall', id: 'nested', name: 'nested', arguments: value });
+const MAX_LISTABLE_SCHEMA_NODES = 1_000;
+/**
+ * Bounds the enumeration work: value nodes times expanded schema nodes, with
+ * `contains` subtrees weighted by {@link CONTAINS_WORK_FACTOR} per nesting
+ * level because the issue walk re-applies them per item for `contains`,
+ * `minContains` and `maxContains`. Each application of a non-pointer `$ref`
+ * also costs one walk of the whole raw schema (see {@link chargeReferenceWalks}).
+ */
+const MAX_ISSUE_LISTING_WORK = 200_000;
+const CONTAINS_WORK_FACTOR = 3;
+/**
+ * Listing `uniqueItems` issues hashes every item but copies the list of
+ * duplicate indexes once per duplicate, which is quadratic, so it is skipped
+ * when any array in the value is longer than this.
+ */
+const MAX_UNIQUE_ITEMS_LISTED = 256;
+/** Subschema maps keyed by property name or pattern; the keys are never keywords. */
+const APPLIED_SCHEMA_MAPS = ['properties', 'patternProperties', 'dependentSchemas'];
+const expandedSchemaCosts = new WeakMap();
+function issueListingTooCostly(schema, value) {
+    // Boolean schemas report one issue at the root.
+    if (schema === null || typeof schema !== 'object')
+        return false;
+    let cost = expandedSchemaCosts.get(schema);
+    if (cost === undefined) {
+        cost = expandedSchemaCost(schema);
+        expandedSchemaCosts.set(schema, cost);
     }
-    catch {
-        return value;
-    }
-    if (!onlyStringifiedNumbersChanged(value, candidate))
-        return value;
-    return validateRuntimeToolInput(schema, candidate).valid ? candidate : value;
+    if (cost.size > MAX_LISTABLE_SCHEMA_NODES)
+        return true;
+    return valueTooLarge(value, Math.floor(MAX_ISSUE_LISTING_WORK / cost.work), cost.uniqueItems ? MAX_UNIQUE_ITEMS_LISTED : Infinity);
 }
 /**
- * Narrows Pi's bidirectional coercion to the model-side encoding slip we accept
- * for nested payloads: a JSON string carrying a canonical number ("2"). Boolean
- * strings stay rejected (side-effecting switches such as cron enabled must be
- * explicit), as does any other rewrite (number -> string, null -> 0, wrapping).
+ * Weighted nodes of the schema tree with every `$ref` expanded in place,
+ * counted when queued so at most one past {@link MAX_LISTABLE_SCHEMA_NODES}
+ * nodes are ever pending. A reference cycle makes the tree infinite, so it
+ * always ends past the limit. References are resolved like the compiler does
+ * (`#` pointers against the innermost `$id` on the path, others against the
+ * root); unresolvable `$ref`s and the scope-dependent
+ * `$dynamicRef`/`$recursiveRef` count as past the limit. Only applicator
+ * keywords are walked: `$defs` matter only through references, and data such
+ * as `default`, `examples`, `enum` or `const` is never a schema. Non-pointer
+ * references also charge the raw schema size per application, and end past
+ * the limit once those walks alone exceed {@link MAX_ISSUE_LISTING_WORK}.
+ *
+ * @internal Exported for tests.
  */
-function onlyStringifiedNumbersChanged(before, after) {
-    if (Object.is(before, after))
+export function expandedSchemaCost(root) {
+    const pastLimit = {
+        size: MAX_LISTABLE_SCHEMA_NODES + 1,
+        work: MAX_LISTABLE_SCHEMA_NODES + 1,
+        uniqueItems: false,
+    };
+    const pending = [{ schema: root, base: root, weight: 1 }];
+    const walks = { applications: 0, rawNodes: undefined };
+    let count = 1;
+    let uniqueItems = false;
+    for (let entry = pending.pop(); entry; entry = pending.pop()) {
+        if (!isPlainRecord(entry.schema))
+            continue;
+        const node = entry.schema;
+        const base = typeof node.$id === 'string' ? node : entry.base;
+        if (node.$dynamicRef !== undefined || node.$recursiveRef !== undefined)
+            return pastLimit;
+        if (node.uniqueItems === true)
+            uniqueItems = true;
+        let overflow = false;
+        const push = (child, factor = 1) => {
+            const weight = entry.weight * factor;
+            count += weight;
+            if (count > MAX_LISTABLE_SCHEMA_NODES)
+                overflow = true;
+            else
+                pending.push({ schema: child, base, weight });
+        };
+        if (node.$ref !== undefined) {
+            if (!chargeReferenceWalks(root, node.$ref, entry.weight, walks))
+                return pastLimit;
+            const target = resolveReference(root, base, node.$ref);
+            if (target === undefined)
+                return pastLimit;
+            push(target);
+        }
+        forEachAppliedSchema(node, push);
+        if (overflow)
+            return pastLimit;
+    }
+    return { size: count, work: count + walks.applications * (walks.rawNodes ?? 0), uniqueItems };
+}
+/**
+ * TypeBox resolves `#` and `#/` pointers at the starting schema; any other
+ * reference (an `$anchor` or `$id`) walks every node of the root schema,
+ * `$defs` and data such as `enum` included, on each application. Charges one
+ * such walk per weighted application; false once the walks exceed the work bound.
+ */
+function chargeReferenceWalks(root, reference, weight, walks) {
+    if (typeof reference === 'string' && (reference === '#' || reference.startsWith('#/'))) {
         return true;
-    if (typeof before === 'string') {
-        return typeof after === 'number' && Number.isFinite(after) && String(after) === before.trim();
     }
-    if (Array.isArray(before)) {
-        return (Array.isArray(after) &&
-            after.length === before.length &&
-            before.every((item, index) => onlyStringifiedNumbersChanged(item, after[index])));
+    walks.applications += weight;
+    walks.rawNodes ??= jsonNodeCount(root, MAX_ISSUE_LISTING_WORK);
+    return walks.applications * walks.rawNodes <= MAX_ISSUE_LISTING_WORK;
+}
+/** Nodes of a JSON value, counting stopped one past `limit`. */
+function jsonNodeCount(value, limit) {
+    const pending = [value];
+    let count = 0;
+    while (pending.length > 0 && count <= limit) {
+        const current = pending.pop();
+        count += 1;
+        if (current === null || typeof current !== 'object')
+            continue;
+        for (const child of Object.values(current))
+            pending.push(child);
     }
-    if (isPlainRecord(before)) {
-        if (!isPlainRecord(after))
-            return false;
-        const keys = Object.keys(before);
-        if (keys.length !== Object.keys(after).length)
-            return false;
-        return keys.every((key) => Object.hasOwn(after, key) && onlyStringifiedNumbersChanged(before[key], after[key]));
+    return count;
+}
+function forEachAppliedSchema(node, push) {
+    for (const keyword of APPLIED_SCHEMA_MAPS) {
+        const map = node[keyword];
+        if (isPlainRecord(map))
+            for (const child of Object.values(map))
+                push(child);
+    }
+    if (isPlainRecord(node.dependencies)) {
+        // Array-valued entries list required properties, not schemas.
+        for (const child of Object.values(node.dependencies))
+            if (!Array.isArray(child))
+                push(child);
+    }
+    for (const keyword of SCHEMA_ARRAYS) {
+        const branches = node[keyword];
+        if (Array.isArray(branches))
+            for (const child of branches)
+                push(child);
+    }
+    for (const keyword of SCHEMA_VALUES) {
+        const child = node[keyword];
+        if (child === undefined)
+            continue;
+        // Draft-07 tuple `items`; other keywords hold a single schema.
+        if (!Array.isArray(child))
+            push(child, keyword === 'contains' ? CONTAINS_WORK_FACTOR : 1);
+        else if (keyword === 'items')
+            for (const item of child)
+                push(item);
+    }
+}
+function resolveReference(root, base, reference) {
+    if (typeof reference !== 'string')
+        return undefined;
+    try {
+        const target = Schema.Resolve.Ref((reference.startsWith('#') ? base : root), reference);
+        return target ?? undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function valueTooLarge(value, nodeLimit, arrayLengthLimit) {
+    const pending = [value];
+    let count = 0;
+    while (pending.length > 0) {
+        const current = pending.pop();
+        count += 1;
+        if (count > nodeLimit)
+            return true;
+        if (current === null || typeof current !== 'object')
+            continue;
+        if (Array.isArray(current) && current.length > arrayLengthLimit)
+            return true;
+        for (const child of Object.values(current))
+            pending.push(child);
     }
     return false;
+}
+/**
+ * Same verdict as {@link validateRuntimeToolInput} without enumerating issues,
+ * which can be exponential for recursive unions.
+ */
+function checkRuntimeToolInput(schema, value) {
+    try {
+        if (Schema.IsSchemaObject(schema) && Kind in schema) {
+            return Value.Check(schema, value) ? 'valid' : 'invalid';
+        }
+        const validator = compiledValidator(schema);
+        if (!validator)
+            return 'unsupported';
+        return validator.Check(value) ? 'valid' : 'invalid';
+    }
+    catch {
+        return 'unsupported';
+    }
+}
+/** Cached compiled validator for a plain JSON Schema; undefined when unsupported. */
+function compiledValidator(schema) {
+    if (!Schema.IsSchema(schema))
+        return undefined;
+    let validator = typeof schema === 'object' ? validators.get(schema) : undefined;
+    if (!validator) {
+        // The compiler ignores malformed keywords. Validate their shapes before compiling.
+        if (!isCompilableSchema(schema))
+            return undefined;
+        validator = Compile(schema);
+        if (typeof schema === 'object')
+            validators.set(schema, validator);
+    }
+    return validator;
+}
+/** Points property-set issues at the single property involved, when there is one. */
+function issuePath(issue) {
+    const properties = issue.keyword === 'required'
+        ? issue.params.requiredProperties
+        : issue.keyword === 'additionalProperties'
+            ? issue.params.additionalProperties
+            : [];
+    if (properties.length !== 1)
+        return issue.instancePath;
+    return `${issue.instancePath}/${properties[0].replaceAll('~', '~0').replaceAll('/', '~1')}`;
+}
+/** The value at fault; none for unexpected keys (the key is wrong) or missing ones. */
+function issueValuePath(issue) {
+    if (issue.keyword === 'additionalProperties' || issue.keyword === 'required')
+        return undefined;
+    return issuePath(issue);
+}
+/**
+ * Undoes lossless transport artifacts of free-form nested payloads (an XML ->
+ * JSON tool-call conversion without type information) by walking the value
+ * together with its schema. The input is never mutated. Only values whose JSON
+ * type the schema rejects at that location are touched:
+ * - array expected (object not allowed): `{"item": X}` -> X when X is an array,
+ *   else [X]; a string holding a JSON array -> that array;
+ * - object expected (string not allowed): a string holding a JSON object;
+ *   embedded JSON text is used only when all its number literals are exact
+ *   by the rule below;
+ * - integer/number expected (string not allowed): a JSON number literal of at
+ *   most 400 chars that the parsed double prints back as, so the value sent on
+ *   is the number the caller wrote ("25.7840" -> 25.784, "1e3" -> 1000,
+ *   "25.771371841430664" -> 25.771371841430664, a coordinate copied from an
+ *   earlier result); integer fields also need a safe integer ("2.0" -> 2,
+ *   "2.5" stays a string). Leading and trailing whitespace is trimmed first;
+ *   literals the double cannot reproduce ("12345678901234567890"), inner
+ *   whitespace, "+", hex, "Infinity" and "NaN" stay rejected;
+ * - boolean expected (string not allowed): exactly "true" or "false". These two
+ *   literals are the JSON spelling of the value, so mapping them is lossless and
+ *   cannot flip a side-effecting switch; any other spelling ("True", "yes",
+ *   "1") stays rejected so the caller must state it explicitly.
+ * `$ref` (into the root schema), `allOf`, `anyOf`/`oneOf`, `properties`,
+ * `patternProperties`, schema-valued `additionalProperties`, `items`,
+ * `prefixItems` and tuple `items` are followed.
+ *
+ * A union keeps the value when a branch accepts it. Otherwise it takes the
+ * most lossless repair some branch accepts, so a string the caller spelled
+ * out stays a string whenever a branch takes it: the union value's own JSON
+ * text parsed as written, else JSON text and `{"item": X}` wrappers undone
+ * throughout, else scalar literals mapped too. At the last two levels the
+ * first repair a branch accepts is used only when no later branch rejects it
+ * yet accepts a repair of its own; such a disagreement leaves the union value
+ * unchanged. A `oneOf` repair must satisfy exactly one branch. When a union
+ * preferred a lossless repair or gave up and its location (the root, an item
+ * or a property) is left invalid by a sibling keyword, an enclosing `allOf` or
+ * `oneOf`, the location is repaired again with every union candidate also
+ * required to satisfy the whole location schema.
+ * Repair work is bounded and memoized per call (equal JSON text is parsed
+ * once); past the budget the value is returned unrepaired.
+ *
+ * The result carries the validation of the returned value so callers report
+ * only the issues that remain after repair. Execution must use the repaired
+ * value only when that validation is valid.
+ */
+export function repairRuntimeToolInput(schema, value) {
+    // Issues are enumerated once, for the returned value only: enumeration can be
+    // exponential on recursive unions while the check itself is linear.
+    const verdict = checkRuntimeToolInput(schema, value);
+    if (verdict === 'valid')
+        return { value, validation: { valid: true } };
+    if (verdict === 'unsupported' || !Schema.IsSchemaObject(schema)) {
+        return { value, validation: validateRuntimeToolInput(schema, value) };
+    }
+    let repaired;
+    try {
+        // TypeBox schemas are projected to plain JSON Schema so `$ref` pointers and
+        // branch validation see the same keywords as plain MCP schemas.
+        const root = plainJsonSchema(schema);
+        if (Schema.IsSchemaObject(root)) {
+            const context = {
+                root,
+                work: 0,
+                contested: false,
+                repaired: { structure: new WeakMap(), full: new WeakMap() },
+                locatedRepairs: new WeakMap(),
+                located: new WeakMap(),
+                verdicts: new WeakMap(),
+                texts: new Map(),
+                artifacts: new WeakMap(),
+                refs: new Map(),
+                keyConstraints: new WeakMap(),
+                patterns: new Map(),
+                itemOwners: new WeakMap(),
+            };
+            repaired = repairLocation(context, root, value, 0, 'full');
+            // Equal JSON texts parse to one shared object; a copy gives every place of
+            // the arguments its own, so a tool that edits its input cannot alias them.
+            if (repaired !== value && context.texts.size > 0)
+                repaired = copyJsonTree(repaired);
+        }
+        else {
+            repaired = value;
+        }
+    }
+    catch {
+        // Includes an exhausted work budget: report the original value instead.
+        repaired = value;
+    }
+    return { value: repaired, validation: validateRuntimeToolInput(schema, repaired) };
+}
+const MAX_REPAIR_DEPTH = 128;
+/**
+ * Work a single repair may spend: each fresh container or combinator repair,
+ * fresh branch validation, and {@link JSON_TEXT_CHARS_PER_WORK} chars of
+ * fresh JSON text count one; memo hits are free. Twice the single-pass budget:
+ * a union also checks its agreed repair against every later branch, so the
+ * inputs a first-accepted-branch repair could afford still fit.
+ */
+const MAX_REPAIR_WORK = 200_000;
+const JSON_TEXT_CHARS_PER_WORK = 1024;
+const MAX_REPAIR_JSON_TEXT_LENGTH = 256 * 1024;
+const JSON_TEXT_START = /^\s*[[{]/;
+function spendRepairWork(context, amount = 1) {
+    context.work += amount;
+    if (context.work > MAX_REPAIR_WORK)
+        throw new Error('Repair work budget exhausted.');
+}
+/**
+ * Runs `compute` once per (schema, value). A re-entry while it runs, a
+ * `$ref`/`allOf` cycle at one location, gets `reentry`.
+ */
+function memoized(cache, schema, value, reentry, compute) {
+    let byValue = cache.get(schema);
+    if (!byValue) {
+        byValue = new Map();
+        cache.set(schema, byValue);
+    }
+    if (byValue.has(value))
+        return byValue.get(value);
+    byValue.set(value, reentry);
+    const result = compute();
+    byValue.set(value, result);
+    return result;
+}
+/**
+ * Repairs the value at one location of the input (the root, an item or a
+ * property). Unions there prefer their most lossless repair; when one did so
+ * (or gave up on disagreeing branches) and the location is left invalid, it
+ * is repaired again with union candidates checked against the whole location
+ * schema too, and that result is kept if valid.
+ */
+function repairLocation(context, schema, value, depth, pass) {
+    // Each location answers for its own unions only.
+    const outer = context.contested;
+    context.contested = false;
+    let repaired = repairNode(context, schema, value, depth, pass, undefined);
+    if (context.contested && pass === 'full') {
+        const location = schema;
+        const preferred = repaired;
+        repaired = memoized(context.located, location, value, preferred, () => {
+            if (branchVerdict(context, location, preferred) !== 'invalid')
+                return preferred;
+            const fallback = repairNode(context, location, value, depth, pass, location);
+            return fallback !== preferred && branchVerdict(context, location, fallback) === 'valid'
+                ? fallback
+                : preferred;
+        });
+    }
+    context.contested = outer;
+    return repaired;
+}
+function repairNode(context, schema, value, depth, pass, location) {
+    // Every schema hop and value level counts, so `$ref`/`allOf` cycles terminate.
+    if (depth > MAX_REPAIR_DEPTH || !Schema.IsSchemaObject(schema))
+        return value;
+    if (pass === 'structure' && !hasArtifacts(context, value, MAX_REPAIR_DEPTH - depth)) {
+        return value;
+    }
+    let memos = context.repaired;
+    if (location !== undefined) {
+        memos = context.locatedRepairs.get(location) ?? {
+            structure: new WeakMap(),
+            full: new WeakMap(),
+        };
+        context.locatedRepairs.set(location, memos);
+    }
+    const outer = context.contested;
+    context.contested = false;
+    const node = schema;
+    if ((value === null || typeof value !== 'object') &&
+        node.$ref === undefined &&
+        node.allOf === undefined &&
+        node.anyOf === undefined &&
+        node.oneOf === undefined) {
+        // A scalar at a plain node is O(1) to repair and cannot recurse: memoizing
+        // it would only grow with every distinct scalar the input holds.
+        const repaired = repairSchemaNode(context, node, value, depth, pass, location);
+        context.contested = outer || context.contested;
+        return repaired;
+    }
+    const entry = memoized(memos[pass], schema, value, { value, contested: false }, () => ({
+        value: repairSchemaNode(context, schema, value, depth, pass, location),
+        contested: context.contested,
+    }));
+    context.contested = outer || entry.contested;
+    return entry.value;
+}
+function repairSchemaNode(context, node, value, depth, pass, location) {
+    // Containers and combinators are what recursive schemas multiply; plain
+    // scalar leaves cost O(1) and are bounded by the input.
+    if ((value !== null && typeof value === 'object') ||
+        node.$ref !== undefined ||
+        node.allOf !== undefined ||
+        node.anyOf !== undefined ||
+        node.oneOf !== undefined) {
+        spendRepairWork(context);
+    }
+    let current = value;
+    if (typeof node.$ref === 'string') {
+        const target = resolveRef(context, node.$ref);
+        if (target !== undefined) {
+            current = repairNode(context, target, current, depth + 1, pass, location);
+        }
+    }
+    if (Array.isArray(node.allOf)) {
+        for (const branch of node.allOf) {
+            current = repairNode(context, branch, current, depth + 1, pass, location);
+        }
+    }
+    for (const keyword of ['anyOf', 'oneOf']) {
+        const branches = node[keyword];
+        if (Array.isArray(branches)) {
+            const union = { branches, exclusive: keyword === 'oneOf', location };
+            current = repairBranches(context, union, current, depth + 1, pass);
+        }
+    }
+    current = repairShape(context, node.type, current, pass);
+    if (Array.isArray(current))
+        return repairItems(context, node, current, depth + 1, pass);
+    if (isPlainRecord(current))
+        return repairProperties(context, node, current, depth + 1, pass);
+    return current;
+}
+function resolveRef(context, ref) {
+    if (!context.refs.has(ref))
+        context.refs.set(ref, Schema.Resolve.Ref(context.root, ref));
+    return context.refs.get(ref);
+}
+function repairItems(context, node, array, depth, pass) {
+    // 2020-12 `prefixItems` + `items`, or draft-07 tuple `items` + `additionalItems`.
+    const prefix = Array.isArray(node.prefixItems)
+        ? node.prefixItems
+        : Array.isArray(node.items)
+            ? node.items
+            : [];
+    const rest = Array.isArray(node.items) ? node.additionalItems : node.items;
+    let copy;
+    for (let index = 0; index < array.length; index += 1) {
+        const itemSchema = index < prefix.length ? prefix[index] : rest;
+        const item = array[index];
+        const repaired = repairLocation(context, itemSchema, item, depth, pass);
+        if (repaired === item)
+            continue;
+        copy ??= [...array];
+        copy[index] = repaired;
+    }
+    return copy ?? array;
+}
+function repairProperties(context, node, record, depth, pass) {
+    const properties = isPlainRecord(node.properties) ? node.properties : undefined;
+    const patterns = isPlainRecord(node.patternProperties)
+        ? Object.entries(node.patternProperties)
+        : [];
+    const additional = node.additionalProperties;
+    let copy;
+    for (const [key, child] of Object.entries(record)) {
+        const schemas = [];
+        const declared = properties !== undefined && Object.hasOwn(properties, key);
+        if (declared)
+            schemas.push(properties[key]);
+        let matchedPattern = false;
+        let unknownPattern = false;
+        for (const [pattern, patternSchema] of patterns) {
+            const regex = patternRegex(context, pattern);
+            if (!regex)
+                unknownPattern = true;
+            else if (regex.test(key)) {
+                matchedPattern = true;
+                schemas.push(patternSchema);
+            }
+        }
+        // A pattern we cannot evaluate might own this key; leave it untouched.
+        if (unknownPattern)
+            continue;
+        if (!declared && !matchedPattern)
+            schemas.push(additional);
+        let repaired = child;
+        for (const childSchema of schemas) {
+            repaired = repairLocation(context, childSchema, repaired, depth, pass);
+        }
+        if (repaired === child)
+            continue;
+        copy ??= { ...record };
+        // defineProperty keeps a literal "__proto__" key an own data property.
+        Object.defineProperty(copy, key, {
+            value: repaired,
+            enumerable: true,
+            writable: true,
+            configurable: true,
+        });
+    }
+    return copy ?? record;
+}
+function patternRegex(context, pattern) {
+    if (!context.patterns.has(pattern)) {
+        let regex;
+        try {
+            regex = new RegExp(pattern, 'u');
+        }
+        catch {
+            regex = undefined;
+        }
+        context.patterns.set(pattern, regex);
+    }
+    return context.patterns.get(pattern);
+}
+const NO_REPAIR = Symbol('no repair');
+function repairBranches(context, union, value, depth, pass) {
+    for (const branch of union.branches) {
+        // Already accepted, or not decidable: keep the value as sent.
+        const verdict = branchVerdict(context, branch, value);
+        if (verdict === 'unsupported')
+            return value;
+        if (verdict === 'valid' && satisfiesLocation(context, union, value))
+            return value;
+    }
+    const literal = typeof value === 'string' && JSON_TEXT_START.test(value)
+        ? parseJsonText(context, value.trim())
+        : undefined;
+    if (literal !== undefined &&
+        union.branches.some((branch) => unionAccepts(context, union, branch, literal))) {
+        context.contested = true;
+        return literal;
+    }
+    // The value as written; JSON text is parsed but nothing in it is changed.
+    const shape = literal ?? value;
+    // `{item: X}` is the value itself when a sibling object branch declares `item`;
+    // an array candidate can only come from unwrapping it.
+    const keepsItem = isPlainRecord(shape) &&
+        Object.keys(shape).length === 1 &&
+        Object.hasOwn(shape, 'item') &&
+        unionDeclaresItem(context, union.branches);
+    const structural = hasArtifacts(context, value, MAX_REPAIR_DEPTH)
+        ? agreedRepair(context, union, value, shape, depth, 'structure', keepsItem)
+        : NO_REPAIR;
+    if (structural !== NO_REPAIR) {
+        context.contested = true;
+        return structural;
+    }
+    if (pass === 'structure')
+        return value;
+    const full = agreedRepair(context, union, value, shape, depth, 'full', keepsItem);
+    if (full === value)
+        context.contested = true;
+    return full === NO_REPAIR ? value : full;
+}
+/**
+ * The first repair in `pass` the union accepts, unless a later branch rejects
+ * it yet accepts a repair of its own, which therefore differs: then `value`,
+ * as branches typing the same text differently would make the mapping a
+ * guess. {@link NO_REPAIR} when no repair is accepted.
+ */
+function agreedRepair(context, union, value, shape, depth, pass, keepsItem) {
+    let agreed = NO_REPAIR;
+    for (const branch of union.branches) {
+        if (excludesRepairs(context, branch, shape))
+            continue;
+        // Checking the agreed repair is cheaper than repairing for this branch.
+        if (agreed !== NO_REPAIR && branchVerdict(context, branch, agreed) === 'valid')
+            continue;
+        const candidate = repairNode(context, branch, value, depth, pass, union.location);
+        if (candidate === value || (keepsItem && Array.isArray(candidate)))
+            continue;
+        if (!unionAccepts(context, union, branch, candidate))
+            continue;
+        if (agreed !== NO_REPAIR)
+            return value;
+        agreed = candidate;
+    }
+    return agreed;
+}
+/**
+ * A branch requiring a key `value` lacks, or other string constants at a
+ * property `value` holds as a string, rejects the value and every repair of
+ * it: repairs keep the keys of an object other than `{"item": X}` and turn
+ * strings into other types, never into other strings. Skipping such branches
+ * keeps discriminated unions as cheap as stopping at the first accepted branch.
+ */
+function excludesRepairs(context, branch, value) {
+    if (!isPlainRecord(value))
+        return false;
+    if (Object.hasOwn(value, 'item') && Object.keys(value).length === 1)
+        return false;
+    return keyConstraints(context, branch).some(([key, allowed]) => {
+        if (!Object.hasOwn(value, key))
+            return allowed === undefined;
+        const property = value[key];
+        return allowed !== undefined && typeof property === 'string' && !allowed.has(property);
+    });
+}
+/**
+ * Required keys (no allowed set) and `const`/all-string `enum` properties of
+ * a branch and its `$ref` targets.
+ */
+function keyConstraints(context, branch) {
+    if (!isPlainRecord(branch))
+        return [];
+    let constraints = context.keyConstraints.get(branch);
+    if (constraints === undefined) {
+        const found = [];
+        const visited = new Set();
+        for (let node = branch; isPlainRecord(node) && !visited.has(node);) {
+            visited.add(node);
+            if (Array.isArray(node.required)) {
+                for (const key of node.required)
+                    if (typeof key === 'string')
+                        found.push([key, undefined]);
+            }
+            if (isPlainRecord(node.properties)) {
+                for (const [key, property] of Object.entries(node.properties)) {
+                    if (!isPlainRecord(property))
+                        continue;
+                    const values = Object.hasOwn(property, 'const') ? [property.const] : property.enum;
+                    if (Array.isArray(values) && values.every((entry) => typeof entry === 'string')) {
+                        found.push([key, new Set(values)]);
+                    }
+                }
+            }
+            node = typeof node.$ref === 'string' ? resolveRef(context, node.$ref) : undefined;
+        }
+        constraints = found;
+        context.keyConstraints.set(branch, constraints);
+    }
+    return constraints;
+}
+function unionAccepts(context, union, branch, candidate) {
+    return (branchVerdict(context, branch, candidate) === 'valid' &&
+        (!union.exclusive || acceptedByOneBranch(context, union.branches, candidate)) &&
+        satisfiesLocation(context, union, candidate));
+}
+function satisfiesLocation(context, union, value) {
+    return union.location === undefined || branchVerdict(context, union.location, value) === 'valid';
+}
+function acceptedByOneBranch(context, branches, value) {
+    let accepting = 0;
+    for (const branch of branches) {
+        if (branchVerdict(context, branch, value) !== 'invalid')
+            accepting += 1;
+        if (accepting > 1)
+            return false;
+    }
+    return accepting === 1;
+}
+/**
+ * Conservatively true for values nested deeper than `levels`, which repair
+ * never reaches anyway; the walk stays bounded on deep values.
+ */
+function hasArtifacts(context, value, levels) {
+    if (typeof value === 'string')
+        return JSON_TEXT_START.test(value);
+    if (value === null || typeof value !== 'object')
+        return false;
+    if (levels === 0)
+        return true;
+    let found = context.artifacts.get(value);
+    if (found === undefined) {
+        found = isPlainRecord(value) && Object.keys(value).length === 1 && Object.hasOwn(value, 'item');
+        for (const child of Object.values(value)) {
+            if (found)
+                break;
+            found = hasArtifacts(context, child, levels - 1);
+        }
+        context.artifacts.set(value, found);
+    }
+    return found;
+}
+/** Computed once per union and call, with one `visited` set shared by all branches. */
+function unionDeclaresItem(context, branches) {
+    let owns = context.itemOwners.get(branches);
+    if (owns === undefined) {
+        const visited = new Set();
+        owns = branches.some((branch) => declaresItemProperty(context.root, branch, visited));
+        context.itemOwners.set(branches, owns);
+    }
+    return owns;
+}
+/**
+ * The branch accepts an object declaring `item`, through `$ref`s and nested
+ * `allOf`/`anyOf`/`oneOf`; `visited` stops `$ref` cycles and repeated walks.
+ */
+function declaresItemProperty(root, branch, visited = new Set()) {
+    if (!isPlainRecord(branch) || visited.has(branch))
+        return false;
+    visited.add(branch);
+    if (ownsItemProperty(branch))
+        return true;
+    if (typeof branch.$ref === 'string' &&
+        declaresItemProperty(root, Schema.Resolve.Ref(root, branch.$ref), visited)) {
+        return true;
+    }
+    return ['allOf', 'anyOf', 'oneOf'].some((keyword) => {
+        const branches = branch[keyword];
+        return (Array.isArray(branches) &&
+            branches.some((nested) => declaresItemProperty(root, nested, visited)));
+    });
+}
+function ownsItemProperty(node) {
+    if (!isPlainRecord(node.properties) || !Object.hasOwn(node.properties, 'item'))
+        return false;
+    const types = Array.isArray(node.type) ? node.type : [node.type];
+    return node.type === undefined || types.includes('object');
+}
+function branchVerdict(context, branch, value) {
+    // Boolean schemas need no compile.
+    if (!Schema.IsSchemaObject(branch))
+        return checkRuntimeToolInput(branch, value);
+    // Spares compiling the branches of a discriminated union that do not match.
+    if (excludesRepairs(context, branch, value))
+        return 'invalid';
+    return memoized(context.verdicts, branch, value, 'unsupported', () => {
+        spendRepairWork(context);
+        return checkRuntimeToolInput(scopedBranch(context.root, branch), value);
+    });
+}
+const SCOPE_ROOT = 'mavisRepairRoot';
+const SCOPE_BRANCH = 'mavisRepairBranch';
+const scopes = new WeakMap();
+/**
+ * Makes a union branch checkable on its own. Branches whose `$ref`s stay inside
+ * `$defs`/`definitions` get the definitions they use in scope; the others stay
+ * out, as a compile costs every definition it is given. Other refs (`#`,
+ * `#/properties/...`, `$id` URIs) need the whole tool schema: root and branch
+ * move under `$defs` with their pointers rebased, which costs a compile of the
+ * root per such branch, so only those branches are wrapped.
+ */
+function scopedBranch(root, branch) {
+    if (!Schema.IsSchemaObject(branch))
+        return branch;
+    let scope = scopes.get(root);
+    if (!scope) {
+        scope = { branches: new WeakMap() };
+        scopes.set(root, scope);
+    }
+    let scoped = scope.branches.get(branch);
+    if (scoped === undefined) {
+        const definitions = usedDefinitions(root, branch);
+        if (definitions === undefined) {
+            scope.rebasedRoot ??= rebaseRefs(root);
+            scoped = {
+                $defs: { [SCOPE_ROOT]: scope.rebasedRoot, [SCOPE_BRANCH]: rebaseRefs(branch) },
+                $ref: `#/$defs/${SCOPE_BRANCH}`,
+            };
+        }
+        else {
+            scoped = Object.keys(definitions).length > 0 ? { ...definitions, ...branch } : branch;
+        }
+        scope.branches.set(branch, scoped);
+    }
+    return scoped;
+}
+/**
+ * The root `$defs`/`definitions` entries the branch uses, following their
+ * targets; a whole map when an entry name cannot be read from the pointer.
+ * Undefined when the branch refers outside them: a `#` inside a definition it
+ * uses refers to the root, so such a branch needs the root in scope too.
+ */
+function usedDefinitions(root, branch) {
+    const used = {};
+    const whole = new Set();
+    const visited = new Set();
+    const pending = [branch];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current === null || typeof current !== 'object' || visited.has(current))
+            continue;
+        visited.add(current);
+        if (Array.isArray(current)) {
+            for (const child of current)
+                pending.push(child);
+        }
+        else if (isPlainRecord(current)) {
+            const ref = current.$ref;
+            if (typeof ref === 'string') {
+                const keyword = definitionsKeyword(ref);
+                if (keyword === undefined)
+                    return undefined;
+                // Unwrapped, the branch's own definitions map wins over the root's.
+                const owner = Object.hasOwn(branch, keyword) ? branch : root;
+                const map = root[keyword];
+                if (owner === root && isPlainRecord(map) && !whole.has(keyword)) {
+                    const name = definitionName(ref, keyword);
+                    // What comes into scope is walked too: a pointer into a definition
+                    // brings the whole definition, whose other `$ref`s must resolve as well.
+                    if (name !== undefined && Object.hasOwn(map, name)) {
+                        (used[keyword] ??= {})[name] = map[name];
+                        pending.push(map[name]);
+                    }
+                    else {
+                        whole.add(keyword);
+                        used[keyword] = map;
+                        pending.push(map);
+                    }
+                }
+                pending.push(Schema.Resolve.Ref(owner, ref));
+            }
+            for (const child of Object.values(current))
+                pending.push(child);
+        }
+    }
+    return used;
+}
+function definitionName(ref, keyword) {
+    const segment = ref.slice(keyword.length + 3).split('/')[0];
+    try {
+        return decodeURIComponent(segment).replaceAll('~1', '/').replaceAll('~0', '~');
+    }
+    catch {
+        return undefined;
+    }
+}
+function definitionsKeyword(ref) {
+    if (ref.startsWith('#/$defs/'))
+        return '$defs';
+    return ref.startsWith('#/definitions/') ? 'definitions' : undefined;
+}
+function rebaseRefs(schema) {
+    if (Array.isArray(schema))
+        return schema.map(rebaseRefs);
+    if (!isPlainRecord(schema))
+        return schema;
+    return Object.fromEntries(Object.entries(schema).map(([key, child]) => [
+        key,
+        key === '$ref' && typeof child === 'string' && (child === '#' || child.startsWith('#/'))
+            ? `#/$defs/${SCOPE_ROOT}${child.slice(1)}`
+            : rebaseRefs(child),
+    ]));
+}
+function repairShape(context, type, value, pass) {
+    const types = new Set((Array.isArray(type) ? type : [type]).filter((entry) => typeof entry === 'string'));
+    if (types.size === 0)
+        return value;
+    if (typeof value === 'string') {
+        if (types.has('string'))
+            return value;
+        const text = value.trim();
+        if (types.has('array') && text.startsWith('[')) {
+            const parsed = parseJsonText(context, text);
+            if (Array.isArray(parsed))
+                return parsed;
+        }
+        if (types.has('object') && text.startsWith('{')) {
+            const parsed = parseJsonText(context, text);
+            if (isPlainRecord(parsed))
+                return parsed;
+        }
+        if (pass === 'structure')
+            return value;
+        if (types.has('integer') || types.has('number')) {
+            const parsed = jsonNumberLiteral(text, types.has('number'));
+            if (parsed !== undefined)
+                return parsed;
+        }
+        if (types.has('boolean') && (value === 'true' || value === 'false'))
+            return value === 'true';
+        return value;
+    }
+    if (isPlainRecord(value) && types.has('array') && !types.has('object')) {
+        const keys = Object.keys(value);
+        if (keys.length === 1 && keys[0] === 'item') {
+            return Array.isArray(value.item) ? value.item : [value.item];
+        }
+    }
+    return value;
+}
+const JSON_NUMBER_LITERAL = /^-?(0|[1-9]\d*)(?:\.(\d+))?([eE][+-]?\d+)?$/;
+/** Every finite normal double written out in full (at most ~330 chars) fits. */
+const MAX_JSON_NUMBER_LITERAL_LENGTH = 400;
+/** Significant digits and decimal exponent of a JSON number literal match; "" for zero. */
+function decimalValue(match) {
+    const integer = match[1];
+    const fraction = match[2] ?? '';
+    let digits = `${integer}${fraction}`;
+    let point = integer.length + Number(match[3]?.slice(1) ?? 0);
+    const leading = digits.length - digits.replace(/^0+/, '').length;
+    digits = digits.slice(leading).replace(/0+$/, '');
+    point -= leading;
+    return digits === '' ? '' : `${match[0].startsWith('-') ? '-' : ''}${digits}e${point}`;
+}
+function jsonNumberLiteral(text, allowFraction) {
+    if (text.length > MAX_JSON_NUMBER_LITERAL_LENGTH)
+        return undefined;
+    const match = JSON_NUMBER_LITERAL.exec(text);
+    if (!match)
+        return undefined;
+    const parsed = Number(text);
+    // Exact when the double prints back as the written number: the value sent on
+    // serializes to the caller's literal. Overflow, underflow and digits beyond
+    // the double's precision all print differently.
+    const printed = JSON_NUMBER_LITERAL.exec(String(parsed));
+    if (!printed || decimalValue(printed) !== decimalValue(match))
+        return undefined;
+    return allowFraction || Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+/**
+ * Parses embedded JSON text once per call, charging its length; rejects
+ * oversized text, `__proto__` keys and number literals whose double is not
+ * exact by the same rule as bare number strings. The reviver sees each
+ * literal's source text (Node >= 21); without it numbers cannot be verified
+ * and the text is rejected.
+ */
+function parseJsonText(context, text) {
+    if (text.length > MAX_REPAIR_JSON_TEXT_LENGTH)
+        return undefined;
+    if (context.texts.has(text))
+        return context.texts.get(text);
+    spendRepairWork(context, 1 + Math.floor(text.length / JSON_TEXT_CHARS_PER_WORK));
+    const parsed = decodeJsonText(text);
+    context.texts.set(text, parsed);
+    return parsed;
+}
+function decodeJsonText(text) {
+    let rejected = false;
+    const reviver = function (key, value, context) {
+        if (key === '__proto__' && isPlainRecord(this))
+            rejected = true;
+        else if (typeof value === 'number') {
+            const source = context?.source;
+            if (typeof source !== 'string' || jsonNumberLiteral(source, true) === undefined) {
+                rejected = true;
+            }
+        }
+        return value;
+    };
+    let parsed;
+    try {
+        parsed = JSON.parse(text, reviver);
+    }
+    catch {
+        return undefined;
+    }
+    return rejected ? undefined : parsed;
 }
 const plainSchemas = new WeakMap();
 function plainJsonSchema(schema) {
@@ -181,13 +1095,49 @@ function plainJsonSchema(schema) {
     }
     return plain;
 }
+/**
+ * Deep copy of a JSON value that, unlike `structuredClone`, gives every place its
+ * own object even where the source shares one. Iterative, so depth is no limit.
+ */
+function copyJsonTree(value) {
+    if (value === null || typeof value !== 'object')
+        return value;
+    const copyOf = (child, pending) => {
+        if (child === null || typeof child !== 'object')
+            return child;
+        const copied = Array.isArray(child) ? [] : {};
+        pending.push([child, copied]);
+        return copied;
+    };
+    const pending = [];
+    const root = copyOf(value, pending);
+    for (let next = pending.pop(); next; next = pending.pop()) {
+        const [source, target] = next;
+        if (Array.isArray(source)) {
+            // Index pushes keep a large array fast; JSON arrays have no holes.
+            for (const child of source)
+                target.push(copyOf(child, pending));
+            continue;
+        }
+        for (const key of Object.keys(source)) {
+            // defineProperty keeps a literal "__proto__" key an own data property.
+            Object.defineProperty(target, key, {
+                value: copyOf(source[key], pending),
+                enumerable: true,
+                writable: true,
+                configurable: true,
+            });
+        }
+    }
+    return root;
+}
 function isPlainRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 /** Revalidates a Hook-rewritten input against the authoritative runtime tool schema. */
 export function isRuntimeToolInputValid(tools, toolName, value) {
     const tool = tools.find((candidate) => candidate.def.name === toolName);
-    return Boolean(tool && validateRuntimeToolInput(tool.def.schema, value).valid);
+    return Boolean(tool && checkRuntimeToolInput(tool.def.schema, value) === 'valid');
 }
 function unsupported() {
     return { valid: false, reason: 'unsupported', issues: [] };

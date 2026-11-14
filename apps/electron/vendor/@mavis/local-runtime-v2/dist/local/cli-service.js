@@ -280,6 +280,88 @@ export class CliService {
     getRunningGoalTurnId(sessionId) {
         return this.requireCapability('goals', 'Goal').runningTurnId(sessionId);
     }
+    /** Ensures Bunny exists and returns its (hidden) root Session identity. */
+    async getBunnyRoot() {
+        const { bunny } = await this.requireBunny().ensure();
+        return { agentName: bunny.agentName, mainSessionId: bunny.mainSessionId };
+    }
+    getBunnyViewState() {
+        return this.requireBunny().viewState();
+    }
+    reportBunnyViewState(input) {
+        this.requireBunny().reportViewState(input.panelOpen && input.spaceId
+            ? { panelOpen: true, spaceId: input.spaceId }
+            : { panelOpen: false });
+    }
+    async listBunnySpaces() {
+        const worklines = this.options.worklines;
+        if (!worklines)
+            throw new Error('Runtime does not expose Bunny spaces.');
+        return (await worklines.list()).map(({ id, name, system }) => ({ id, name, system }));
+    }
+    /** Open (not yet completed) assignments created by `agentName`, open-first order. */
+    async listBunnyOpenAssignments(agentName, limit = 20) {
+        const assignments = this.options.assignments;
+        if (!assignments)
+            throw new Error('Runtime does not expose Bunny assignments.');
+        return (await assignments.list(agentName, limit))
+            .filter((status) => !status.assignment?.completion)
+            .map((status) => ({
+            sessionId: status.session.sessionId,
+            title: status.session.title?.trim() || status.session.sessionId,
+            state: status.state,
+            ...(status.worklineId ? { spaceId: status.worklineId } : {}),
+        }));
+    }
+    /**
+     * The coordinator Session that dispatched `sessionId`, or `undefined` when it
+     * runs no dispatched task.
+     *
+     * Answers `undefined` rather than throwing when the Runtime has no Bunny, so a
+     * caller that only wants "can I walk back out of here" degrades to its other
+     * links instead of failing.
+     */
+    async getDispatchedTaskAssigner(sessionId) {
+        const assignments = this.options.assignments;
+        if (!assignments)
+            return undefined;
+        return assignments.assignerSessionOf(sessionId);
+    }
+    /**
+     * Tasks the given coordinator Sessions dispatched, open first and newest
+     * assigned first, with the Session each one runs in.
+     */
+    async listDispatchedTaskSessions(assignerSessionIds, limit) {
+        const assignments = this.options.assignments;
+        if (!assignments)
+            throw new Error('Runtime does not expose Bunny assignments.');
+        return (await assignments.listDispatched(assignerSessionIds, limit)).map(({ sessionId, assignerSessionId, session, completionState }) => ({
+            sessionId,
+            assignerSessionId,
+            ...(completionState ? { assignmentCompletionState: completionState } : {}),
+            agentName: session.agentName,
+            ...(session.title ? { title: session.title } : {}),
+            sessionType: session.sessionType,
+            ...(session.sessionKind ? { sessionKind: session.sessionKind } : {}),
+            ...(session.purpose ? { purpose: session.purpose } : {}),
+            ...(session.archived === undefined ? {} : { archived: session.archived }),
+            ...(session.workspaceDir ? { workspaceDir: session.workspaceDir } : {}),
+            createdAtMs: session.createdAtMs,
+            updatedAtMs: session.updatedAtMs,
+            status: session.status,
+            ...(session.errorMessage ? { errorMessage: session.errorMessage } : {}),
+        }));
+    }
+    /**
+     * Delivered files, newest first. Omit both filters for the whole library,
+     * pass `spaceId` for one space, or `sessionId` for one Session's deliveries.
+     */
+    async listArtifacts(query = {}) {
+        const catalog = this.options.sessionSystem?.artifactCatalog;
+        if (!catalog)
+            throw new Error('Runtime does not expose the artifact catalog.');
+        return catalog.list(query);
+    }
     getWorkspaceGitMetadata(workspaceDir) {
         return this.requireCapability('workspace', 'Workspace').git.getMetadata(workspaceDir);
     }
@@ -391,6 +473,13 @@ export class CliService {
     selectModel(input) {
         return this.requireCapability('models', 'Model').select(input);
     }
+    /** The advisor ListModels carries: the Session's with `sessionId`, else the default. */
+    getAdvisor(input) {
+        return this.requireCapability('models', 'Model').getAdvisor(input);
+    }
+    selectAdvisor(input) {
+        return this.requireCapability('models', 'Model').selectAdvisor(input);
+    }
     /** Resolves false when the host has no model-favorite store. */
     async setModelFavorite(input) {
         const models = this.requireCapability('models', 'Model');
@@ -459,6 +548,13 @@ export class CliService {
     listRuntimeSkills(input) {
         return this.options.application.skills.listRuntimeSkills(input);
     }
+    /** Quiescence snapshot of a session tree, the same evaluation contract the Desktop route serves. */
+    getSessionActivity(req, ctx = {}) {
+        const activity = this.options.sessionActivity;
+        if (!activity)
+            throw new Error('Runtime does not expose Session Activity.');
+        return activity.getSessionActivity(ctx, req);
+    }
     listBackgroundTasks(input) {
         return this.requireCapability('backgroundTasks', 'Background Task').list(input);
     }
@@ -468,6 +564,12 @@ export class CliService {
         return mcp.listMcpCapabilities
             ? mcp.listMcpCapabilities({ keyword: input.keyword, context })
             : mcp.listLocalMcpServers(input);
+    }
+    requireBunny() {
+        const bunny = this.options.bunny;
+        if (!bunny)
+            throw new Error('Runtime does not expose Bunny.');
+        return bunny;
     }
     requireQuestionnaires() {
         const questionnaires = this.options.application.questionnaires;

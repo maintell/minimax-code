@@ -17,6 +17,7 @@ export class LocalWeChatChannelStore {
     nowMs;
     loaded = false;
     bindings = new Map();
+    pendingCreatorWrites = new Set();
     familyHook;
     constructor(dataDir, nowMs) {
         this.dataDir = dataDir;
@@ -82,10 +83,12 @@ export class LocalWeChatChannelStore {
         // it proves neither a credential nor a transport and must never become a
         // family winner before the confirmation write below.
         const primaryFamily = input.suppressFamilyMutation !== true && (await this.isPrimaryFamilyAgent(agentName));
+        this.assertPendingSession(clientId, input.expectedPendingSessionId);
         const record = {
             clientId,
             agentName,
             botToken,
+            ...(input.registrationCreator ? { registrationCreator: input.registrationCreator } : {}),
             ...readTrimmedBindOptionals(input),
             connected: input.connected ?? false,
             enabled: !pending && !primaryFamily,
@@ -93,8 +96,7 @@ export class LocalWeChatChannelStore {
             createdAt: existing?.createdAt ?? now,
             updatedAt: now,
         };
-        this.bindings.set(clientId, record);
-        await this.save();
+        await this.saveBinding(record, existing);
         // Pending QR creation still resolved the trusted family above (so a manual
         // reserved primary name fails closed), but does not reconcile/activate a
         // placeholder. The confirmed write is the first mutation that may start a
@@ -103,6 +105,35 @@ export class LocalWeChatChannelStore {
             await this.familyHook?.afterMutation({ agentName, kind: 'bind' });
         }
         return { ...(this.bindings.get(clientId) ?? record) };
+    }
+    assertPendingSession(clientId, expectedSessionId) {
+        if (!expectedSessionId)
+            return;
+        const current = this.bindings.get(clientId);
+        if (current?.bindSessionId !== expectedSessionId ||
+            !isPendingWeChatBindingToken(current.botToken)) {
+            throw new Error('WeChat authorization changed. Please use the current QR code.');
+        }
+    }
+    async saveBinding(record, existing) {
+        const { clientId } = record;
+        this.pendingCreatorWrites.add(record);
+        this.bindings.set(clientId, record);
+        try {
+            await this.save();
+        }
+        catch (error) {
+            if (this.bindings.get(clientId) === record) {
+                if (existing)
+                    this.bindings.set(clientId, existing);
+                else
+                    this.bindings.delete(clientId);
+            }
+            throw error;
+        }
+        finally {
+            this.pendingCreatorWrites.delete(record);
+        }
     }
     async unbind(agentName, options) {
         await this.load();
@@ -149,6 +180,22 @@ export class LocalWeChatChannelStore {
         this.bindings.set(clientId, updated);
         await this.save();
         return true;
+    }
+    async checkCreator(ctx, mode) {
+        await this.load();
+        const record = this.bindings.get(ctx.clientName);
+        if (ctx.platform !== 'wechat' ||
+            ctx.chatType !== 'p2p' ||
+            !isUsableWeChatBinding(record) ||
+            [...this.pendingCreatorWrites].some((pending) => pending.clientId === ctx.clientName))
+            return false;
+        const creator = record.registrationCreator;
+        if (!creator ||
+            creator.botId !== record.ilinkBotId ||
+            ctx.chatId !== creator.userId ||
+            ctx.senderId !== creator.userId)
+            return false;
+        return mode === 'delivery' || ctx.wechatPollBindingId === creator.bindingId;
     }
     async get(agentName) {
         await this.load();

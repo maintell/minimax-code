@@ -8,7 +8,7 @@ import { readBashCommand, gitBashCommandName } from './bash-command.js';
 import { splitCommand, findHeredocBodyRanges } from './bash-split.js';
 import { extractSourceTarget } from './bash-permission.js';
 import { isDiscardSinkTarget } from './bash-write-target.js';
-import { FS_UMBRELLA_TOOL_NAME, READ_ONLY_TOOLS, isDangerousRemovalPath, isPathAllowed, isPublicKeyFile, isTempDirectory, matchPathRule, } from './fs-permission.js';
+import { FS_UMBRELLA_TOOL_NAME, READ_ONLY_TOOLS, containsPathTraversal, isDangerousRemovalPath, isPathAllowed, isPublicKeyFile, isTempDirectory, matchPathRule, } from './fs-permission.js';
 export function pathActionToToolName(action) {
     switch (action) {
         case 'read':
@@ -110,7 +110,10 @@ export function evaluatePathCapability(filePath, action, context, options = {}) 
             },
         };
     }
-    if (action === 'delete' && isDangerousRemovalPath(filePath, context.homeDir)) {
+    // A relative `..` operand can climb out of the workspace (`rm -rf ..`), so
+    // judge it at its session-resolved location rather than the daemon cwd.
+    const removalPath = containsPathTraversal(filePath) ? candidatePath : filePath;
+    if (action === 'delete' && isDangerousRemovalPath(removalPath, context.homeDir)) {
         return {
             behavior: 'deny',
             reason: { type: 'dangerousRemoval', path: candidatePath },
@@ -335,8 +338,10 @@ function ruleAllowsPathAction(rule, action) {
 }
 function resolveShellAwarePath(filePath, workingDirectory, homeDir) {
     const looksWindows = /^[A-Za-z]:[\\/]/.test(filePath) || filePath.includes('\\');
+    // Windows-shaped paths keep their raw form so HARD patterns see the Windows
+    // spelling, but `..` is still folded so `a\b\..\c` matches like `a\c`.
     if (looksWindows)
-        return filePath;
+        return containsPathTraversal(filePath) ? path.win32.normalize(filePath) : filePath;
     const homeResolvedPath = filePath === '~'
         ? homeDir
         : filePath.startsWith('~/') && homeDir
@@ -696,6 +701,33 @@ function extractApplyPatchText(input) {
 export const READ_PATH_COMMANDS = new Set(['cat', 'head', 'tail', 'less', 'more', 'nl', 'wc']);
 export const SEARCH_PATH_COMMANDS = new Set(['grep', 'rg']);
 const EXECUTE_SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
+const DIRECTORY_CHANGE_COMMANDS = new Set(['cd', 'pushd', 'popd']);
+/**
+ * Does any subcommand change the shell's working directory? Path intents are
+ * resolved against the session working directory, which is wrong after a
+ * `cd` / `pushd` / `popd`; callers use this to stop trusting relative `..`
+ * operands on such a line.
+ */
+export function commandChangesDirectory(command) {
+    for (const rawSubcommand of splitCommand(command)) {
+        const tokens = shellTokenize(maskHeredocBodies(rawSubcommand).trim());
+        const head = normalizeCommandToken(tokens[skipEnvPrefixes(tokens)]);
+        if (head && DIRECTORY_CHANGE_COMMANDS.has(head))
+            return true;
+    }
+    return false;
+}
+/**
+ * A relative operand containing `..`: its target depends on the shell's
+ * current directory. Absolute and home-relative operands do not.
+ */
+export function isRelativeTraversalOperand(operand) {
+    if (!containsPathTraversal(operand))
+        return false;
+    if (operand === '~' || operand.startsWith('~/'))
+        return false;
+    return !path.isAbsolute(operand) && !path.win32.isAbsolute(operand);
+}
 export function extractBashPathIntents(command, windowsPosix = false, options = {}) {
     // Hard safety needs unresolved operands; the default classifier delegates
     // those operands to its separate ASK policy.

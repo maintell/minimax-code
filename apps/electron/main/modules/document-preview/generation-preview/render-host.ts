@@ -10,6 +10,13 @@ const requests = new Map();
 let installed = false;
 let host;
 let rendererReady;
+let snapshotLookup;
+/** Startup wiring; registers open-version before any snapshot is prepared in this launch. */
+export function configurePptPreviewSnapshotLookup(lookup) {
+    snapshotLookup = lookup;
+    if (lookup)
+        setup();
+}
 function key(sessionId, snapshotId) {
     return JSON.stringify([sessionId, snapshotId]);
 }
@@ -32,7 +39,8 @@ function setup() {
             task.resolve({ slideCount: result.slideCount });
     });
     ipcMain.handle('ppt-preview:open-version', async (event, input) => {
-        const version = versions.get(key(input?.sessionId, input?.snapshotId));
+        const version = versions.get(key(input?.sessionId, input?.snapshotId)) ??
+            (await restoreReadyVersion(event, input));
         if (!version || version.artifactId !== input.artifactId)
             throw new Error('PPT snapshot is not prepared in this session');
         return openSource(event.sender, version);
@@ -119,7 +127,26 @@ async function openSource(sender, input) {
     }
     return opened.value;
 }
-export async function preparePptPreview(input, dataDir, signal) {
+/** Restores a ready snapshot from persisted state after verifying the immutable stored bytes. */
+async function restoreReadyVersion(event, input) {
+    const lookup = snapshotLookup;
+    if (!lookup ||
+        typeof input?.sessionId !== 'string' ||
+        typeof input.artifactId !== 'string' ||
+        typeof input.snapshotId !== 'string')
+        return undefined;
+    const artifact = (await lookup.listArtifacts(event, input.sessionId)).find((item) => item.sessionId === input.sessionId && item.artifactId === input.artifactId);
+    const snapshot = artifact
+        ? [...artifact.generations.flatMap((g) => g.snapshots), ...artifact.generation.snapshots].find((item) => item.snapshotId === input.snapshotId && item.renderState === 'ready')
+        : undefined;
+    if (!snapshot)
+        return undefined;
+    const version = { sessionId: input.sessionId, artifactId: input.artifactId, snapshot };
+    await verifyStoredSnapshot(version, lookup.dataDir());
+    versions.set(key(version.sessionId, snapshot.snapshotId), version);
+    return version;
+}
+async function verifyStoredSnapshot(input, dataDir) {
     const root = await realpath(path.join(dataDir, 'v2', 'ppt-preview'));
     const source = await realpath(input.snapshot.sourcePath);
     const relative = path.relative(root, source);
@@ -133,6 +160,9 @@ export async function preparePptPreview(input, dataDir, signal) {
     if (bytes.length !== input.snapshot.sizeBytes ||
         `sha256:${createHash('sha256').update(bytes).digest('hex')}` !== input.snapshot.contentHash)
         throw new Error('PPT snapshot integrity check failed');
+}
+export async function preparePptPreview(input, dataDir, signal) {
+    await verifyStoredSnapshot(input, dataDir);
     if (signal.aborted)
         throw new Error('PPT preparation canceled');
     const window = await windowHost();

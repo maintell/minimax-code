@@ -1,7 +1,7 @@
 /** Adapts owner-level state capabilities into the Application Fork participant. */
 export function createForkState(owners) {
     return {
-        copy: async ({ operationId, sourceSessionId, targetSessionId, latestBoundary, planState }) => {
+        copy: async ({ operationId, sourceSessionId, targetSessionId, latestBoundary, throughAssistantMessageId, planState, }) => {
             const planCopy = planState
                 ? await requirePlanOwner(owners).documents.copyForFork({
                     sourceSessionId,
@@ -27,12 +27,18 @@ export function createForkState(owners) {
                 }
             }
             await owners.permissions.copyForFork({ sourceSessionId, targetSessionId });
+            await owners.ptcStore?.copySession({
+                sourceSessionId,
+                targetSessionId,
+                ...(throughAssistantMessageId ? { throughAssistantMessageId } : {}),
+            });
         },
         compensate: async ({ targetSessionId }) => {
             await Promise.all([
                 owners.diff.deleteSession(targetSessionId),
                 owners.questionnaires.deleteSession(targetSessionId),
                 owners.permissions.deleteSession(targetSessionId),
+                owners.ptcStore?.deleteSession(targetSessionId) ?? Promise.resolve(),
             ]);
         },
     };

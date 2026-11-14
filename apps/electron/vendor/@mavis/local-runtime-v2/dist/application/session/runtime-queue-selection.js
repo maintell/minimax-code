@@ -2,7 +2,17 @@ import { isComputerUseReadyForQueuedTurn, } from '../../service/computer-use/ind
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
 import { composeQueuedItemClassifier } from '../../service/plan/index.js';
 import { settleInBackground } from '../../service/plugin-system/index.js';
+import { isChannelQueueSource, } from '../../service/session-system/index.js';
 import { hasPriorityUserQueueItem, isUserQueueInput, } from '../../service/turn-system/index.js';
+/**
+ * `QueueItem.source` is the wider `QueueMessageSource`, while the shared channel
+ * predicate is typed to the narrower `LocalQueuedMessageSource` the IM wire
+ * contract declares. The predicate only tests the `channel:` prefix, so narrowing
+ * at this boundary is safe for every source a queued item can carry.
+ */
+function isChannelQueuedItem(item) {
+    return isChannelQueueSource(item.source);
+}
 export function createRuntimeQueueSelection(input) {
     const countdown = createAsyncCountdownGate(input);
     return {
@@ -15,15 +25,23 @@ export function createRuntimeQueueSelection(input) {
                 if (isOrdinaryQuestionnaireResponseOrigin(item.message.origin))
                     return 'ready';
                 // A legacy questionnaire holds every queued message until it is
-                // resolved. An unanswered AskUser v2 question stays answerable while
-                // the conversation goes on; only an async one in its countdown holds
-                // the user's earlier messages (the countdown gate below).
-                const pendingQuestionnaire = await input.questionnaires.getPending({
-                    agentName: item.agentName,
-                    sessionId: item.sessionId,
-                    legacyOnly: true,
-                });
-                if (pendingQuestionnaire)
+                // resolved — except an IM-channel one. An IM user has no composer a
+                // question card replaces: their message is a new instruction for the
+                // agent, not an answer, and an IM ask_user always runs the legacy
+                // protocol, so holding it strands the conversation with no way
+                // forward. The questionnaire itself stays pending and stays
+                // answerable from the card, the buttons, the numbered reply or
+                // Desktop. An unanswered AskUser v2 question already stays answerable
+                // while the conversation goes on; only an async one in its countdown
+                // holds the user's earlier messages (the countdown gate below).
+                const pendingQuestionnaire = isChannelQueuedItem(item)
+                    ? undefined
+                    : await input.questionnaires.getPending({
+                        agentName: item.agentName,
+                        sessionId: item.sessionId,
+                        legacyOnly: true,
+                    });
+                if (pendingQuestionnaire && !(await input.legacyQuestionnaireHoldExempt?.(item.agentName)))
                     return 'defer';
                 if (await countdown.holds(item))
                     return 'defer';
@@ -46,13 +64,65 @@ export function createRuntimeQueueSelection(input) {
             lifecycleFence: input.lifecycleFence,
             entryEnabled: input.entryEnabled,
         }),
-        // GOAL-05 yield, applied at queue selection: a blocked Goal item would
+        // GOAL-05 yield, applied at queue selection: a blocked item would
         // otherwise hold the FIFO head and stall every message queued behind it.
-        // Only the autonomous Goal source yields, so an ordinary user item that a
-        // gate defers (an unresolved questionnaire) keeps blocking as before.
-        shouldYieldFifoPosition: async (item) => item.source === 'thread-goal' &&
-            hasPriorityUserQueueItem(await input.queue.list(item.sessionId)),
+        //
+        // Two sources yield. The autonomous Goal source yields whenever queued
+        // user work waits behind it. A non-IM item additionally yields while a
+        // pending legacy questionnaire is what defers it and an IM message is
+        // queued behind it: an IM user cannot see the card that replaces the
+        // composer, so their message must not wait behind a hold they can only
+        // clear from a surface they are not on. The yielded item is released,
+        // keeps its place and stays deferred — the questionnaire still holds it
+        // until it is answered. An IM item never yields (the questionnaire never
+        // defers it), and the item that takes the freed position still runs every
+        // other gate: countdown, Goal, Plan fence and Computer Use.
+        shouldYieldFifoPosition: async (item) => {
+            if (item.source === 'thread-goal') {
+                return hasPriorityUserQueueItem(await input.queue.list(item.sessionId));
+            }
+            if (isChannelQueuedItem(item))
+                return false;
+            // Cheapest check first: with no IM item queued nothing can be unblocked,
+            // so the questionnaire is not read at all.
+            const queued = await input.queue.list(item.sessionId);
+            if (!queued.some((candidate) => isChannelQueuedItem(candidate)))
+                return false;
+            const pendingQuestionnaire = await input.questionnaires.getPending({
+                agentName: item.agentName,
+                sessionId: item.sessionId,
+                legacyOnly: true,
+            });
+            if (!pendingQuestionnaire)
+                return false;
+            // An exempt Agent is never deferred by the questionnaire, so it has no
+            // position to give up.
+            return !(await input.legacyQuestionnaireHoldExempt?.(item.agentName));
+        },
         close: countdown.close,
+    };
+}
+/**
+ * Whether a Turn that ended waiting for the user wakes its Session's queue. Normally it
+ * does not: the user's earlier queued messages wait for the answer instead of running in
+ * front of the question. Three cases do: the question's reply is already queued (the user
+ * answered before the asking Turn released), an IM-channel message is queued (an IM user
+ * has no composer a question card replaces, so their message is a new instruction that
+ * must run; the questionnaire stays pending and answerable), and a coordinator's main
+ * conversation, which goes on while its question waits. A failed read wakes nothing.
+ */
+export function createWaitingForUserQueueWake(input) {
+    return async (sessionId) => {
+        const queued = await input.queue.list(sessionId);
+        if (queued.some((item) => isOrdinaryQuestionnaireResponseOrigin(item.message.origin)))
+            return true;
+        // An IM message queued while the question was being asked is a new
+        // instruction, not an answer; without this wake it would sit queued until
+        // the next inbound message arrives.
+        if (queued.some((item) => isChannelQueuedItem(item)))
+            return true;
+        const session = await input.sessions.get(sessionId);
+        return session !== undefined && (await input.isCoordinatorAgent(session.agentName));
     };
 }
 /**

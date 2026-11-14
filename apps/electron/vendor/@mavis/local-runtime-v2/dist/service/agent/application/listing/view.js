@@ -1,5 +1,6 @@
 import { isTrustedBuiltinCreationSource, toAgentRequestRef, } from '@mavis/agent-tools/desktop/subagent-roles';
 import { resolveCanonicalCapabilities, } from '../../builtin/catalog.js';
+import { DEFAULT_AGENT_SURFACE_FLAGS, } from '../../contracts.js';
 export function toBuiltinRenderInput(context, resolveLocale) {
     const { input } = context;
     return {
@@ -14,6 +15,8 @@ export function toBuiltinRenderInput(context, resolveLocale) {
         capabilities: context.capabilities,
         memoryEnabled: input.memoryEnabled,
         cronEnabled: input.cronEnabled,
+        ...(input.bunnyHelperAgents === true ? { bunnyHelperAgents: true } : {}),
+        ...(input.bunnyMemory === true ? { bunnyMemory: true } : {}),
         ...(input.dataDirToken === undefined ? {} : { dataDirToken: input.dataDirToken }),
     };
 }
@@ -37,6 +40,7 @@ export function toBuiltinProfile(context, rendered, resolveLocale, toCapabilityC
         corePrompt: rendered.corePrompt,
         surfacePrompt: rendered.surfacePrompt,
         capabilityCeiling: toCapabilityCeiling(capabilities),
+        ...(context.coordination ? { coordination: context.coordination } : {}),
         provenance: {
             source: context.exactOwnerName !== context.canonicalViewName ? 'legacy-read-through' : 'builtin',
             assetAgentName: rendered.assetAgentName,
@@ -68,7 +72,7 @@ function toAgentViewOptionalFields(input) {
 }
 /** Pure V2 Agent response projection. */
 export function toAgentView(input) {
-    const { meta, canonical, exactOwnerName, resolvedAgentName, identity, config, definition, builtin, primary, primaryDisplayName, agentConfigDir, } = input;
+    const { meta, canonical, exactOwnerName, resolvedAgentName, identity, config, definition, builtin, primary, primaryDisplayName, agentConfigDir, surfaceFlags = DEFAULT_AGENT_SURFACE_FLAGS, } = input;
     const viewName = builtin ? canonical : exactOwnerName;
     const displayName = primary && primaryDisplayName
         ? primaryDisplayName
@@ -89,6 +93,8 @@ export function toAgentView(input) {
         displayName,
         createdAtMs: meta.createdAtMs,
         updatedAtMs: meta.updatedAtMs,
+        showInImBinding: surfaceFlags.showInImBinding,
+        showInAgentList: surfaceFlags.showInAgentList,
         ...toAgentViewOptionalFields({
             meta,
             canonical,

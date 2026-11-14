@@ -10,7 +10,7 @@ import { resolveMemorySystemConfig, resolveMemoryV2Config } from './config.js';
 import { initializeMemorySystem } from './initialize.js';
 import { MemoryV2ModelGateway } from './adapters/model-gateway.js';
 import { SessionMemorySourceAdapter } from './adapters/session-source.js';
-import { MemorySubscriptionQuota, } from './adapters/quota/subscription-quota.js';
+import { MemorySubscriptionQuota, } from './model-call/memory-quota.js';
 import { createProductionSessionSystemPort, } from './adapters/session-source.production.js';
 /** kind 与 `assets/agents/memory-v2-*.md` 的固定对应。 */
 const PROMPT_ASSETS = {

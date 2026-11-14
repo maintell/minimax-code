@@ -19,7 +19,6 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
     const metricTags = {
         incr: (name, tags) => dependencies.metrics.counter(name, 1, tags ?? {}),
         latency: (name, durationMs, tags) => dependencies.metrics.histogram(name, durationMs, tags ?? {}),
-        gauge: (name, value, tags) => dependencies.metrics.gauge(name, value, tags ?? {}),
     };
     const deploymentGetter = () => `${getRuntimeRegion()}-${getRuntimeBuildEnv()}`;
     const officialAuthState = () => resolveOfficialPluginAuthState(dependencies.authContextGetter());
@@ -81,6 +80,7 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         onOfficialPluginRevoked: dependencies.onOfficialPluginRevoked,
         onCapabilitiesChanged: dependencies.onCapabilitiesChanged,
         mcpNames: dependencies.mcp.getRuntimeNameRegistry(),
+        forbiddenPluginNames: dependencies.configGetter().plugins?.forbidden,
         ...(dependencies.miniAppHostVersion
             ? { miniAppHostVersion: dependencies.miniAppHostVersion }
             : {}),
@@ -170,7 +170,7 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
             hostConnectorSystem.authContextChanged();
             system.authContextChanged();
         },
-        enabledHookPluginNames: () => new Set((system.currentSnapshot.turnCapabilities.hooks ?? []).map((handler) => handler.pluginName)),
+        enabledHookPluginNames: () => new Set(system.currentSnapshot.turnCapabilities.hooks?.map((handler) => handler.pluginName)),
         ready: () => {
             readyPromise ??= (async () => {
                 await system.initialize();

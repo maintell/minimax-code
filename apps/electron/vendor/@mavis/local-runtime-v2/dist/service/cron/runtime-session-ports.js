@@ -1,11 +1,13 @@
 import { decodeCronModel } from '@mavis/shared/cron-model';
-import { createCronSessionPurpose, formatCronRunTitle } from '@mavis/shared/cron-purpose';
+import { createCronSessionPurpose, formatCronRunTitle, isSelfReminderId, } from '@mavis/shared/cron-purpose';
 import { createHostCronSessionCreation } from './adapters/session-creation.adapter.js';
+import { NO_MAIN_CONVERSATION_AGENTS, } from './contracts.js';
 import { deliverRuntimeCron } from './runtime-delivery.js';
 import { CronDeliveryDeferredError } from './errors.js';
 /** Binds Cron's session ports to the V2 Agent, Session, and Turn capabilities. */
 export function createRuntimeCronSessionPorts(options) {
     const { agentSessionPorts, sessions, turns, reportFailure, lifecycle, deletion } = options;
+    const mainConversationAgents = options.mainConversationAgents ?? NO_MAIN_CONVERSATION_AGENTS;
     const sessionCreation = createHostCronSessionCreation({
         getAgent: async (agentName) => {
             const defaults = await agentSessionPorts.directory.get(agentName);
@@ -65,25 +67,29 @@ export function createRuntimeCronSessionPorts(options) {
         sessionCreation: {
             ...sessionCreation,
             async create(request) {
-                const result = await sessionCreation.create(request);
-                const model = request.model?.trim();
-                if (request.sessionTarget.mode === 'sessionId' &&
-                    request.sessionTarget.sessionId &&
-                    model) {
-                    const session = await sessions.sessions.repository.get(result.sessionId);
-                    const decoded = decodeCronModel(model);
-                    if (decoded.selection || session?.effectiveModel !== decoded.modelKey) {
-                        await lifecycle.mutateSession(result.sessionId, sessionModelFields(model));
-                    }
-                }
-                return result;
+                if (mainConversationAgents(request.agentName) && !isSelfReminderId(request.cronId))
+                    return {
+                        sessionId: (await sessions.sessions.root.getRootSessionByAgent(request.agentName))
+                            .sessionId,
+                    };
+                // A fixed target keeps its own model: borrowing the user's conversation must not rewrite
+                // what they selected in it. A conversation this run creates still takes the definition's
+                // model, applied by the adapter when it creates the Session.
+                return sessionCreation.create(request);
             },
             // Level-triggered: the Queue re-checks every gate on this wake.
             ownerReleased: (sessionId) => turns.dispatchQueue(sessionId),
         },
         delivery: {
-            deliver: (request) => deliverRuntimeCron(turns, {
+            deliver: async (request) => deliverRuntimeCron(turns, {
                 ...request,
+                text: options.mainConversationText && mainConversationAgents(request.agentName)
+                    ? options.mainConversationText(request.text)
+                    : request.text,
+                // A schedule into the busy main conversation waits for the running Turn.
+                deferWhileBusy: mainConversationAgents(request.agentName) &&
+                    request.sessionId ===
+                        (await sessions.sessions.root.getRootSessionByAgent(request.agentName)).sessionId,
                 beforeDelivery: async () => {
                     await request.beforeDelivery?.();
                     const snapshot = await sessions.queue.committed.snapshot(request.sessionId);

@@ -3,7 +3,7 @@ import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, lt, lte, ne,
 import { sessionAgentDefinitions, taskSessionBindings, sessionAgentState, sessions, } from '../../../../infra/db/schema/sessions.js';
 import { assertSessionModelSnapshot, normalizeSessionModelUpdate, syncSessionAgentDefinitionModel, } from './drizzle/model-update.js';
 import { isSameSessionAgentName } from '../agent-name.js';
-import { agentStateRow, assertAgentStateMutation, decideAgentState } from './agent-state.js';
+import { agentStateRow, agentTurnTerminal, assertAgentStateMutation, decideAgentState, } from './agent-state.js';
 import { decodeSessionRow, encodeSessionRow, withoutRootAppMode, } from './drizzle/codec.js';
 import { decodeSessionAgentDefinition, decodeTaskSessionBinding, isCurrentSessionAgentDefinition, serializeSessionAgentDefinition, serializeTaskSessionBinding, toLegacyTaskSessionBinding, } from './agent-binding.js';
 import { SessionRootSwapError, SessionTitleConflictError, SessionUniqueViolation, } from './contract.js';
@@ -17,6 +17,7 @@ import { recordFromCreate } from './drizzle/record-create.js';
 import { projects } from '../../../../infra/db/schema/projects.js';
 import { eligible } from '../../projects/sidebar/predicate.js';
 import { recordProjectRemoval, sessionNotRemovedFromProject, } from '../../shared/project-removal.js';
+export { compareAndSetSessionInteractionModeInTransaction, readSessionInteractionModeInTransaction, transitionSessionInteractionModeInTransaction, } from './drizzle/interaction-mode.js';
 const DEFAULT_TREE_FILTER = {
     archived: false,
     includeHidden: false,
@@ -30,57 +31,20 @@ function prepareSessionRead(db) {
         .prepare();
 }
 const sessionReads = new WeakMap();
-export function createSessionRepository(options) {
-    return new DrizzleSessionRepository(options);
-}
-export function readSessionInteractionModeInTransaction(db, sessionId) {
+/**
+ * A Session's Agent, read synchronously for a judgement that cannot wait; null
+ * when the Session is missing. The Agent is fixed when the Session is created.
+ */
+export function readSessionAgentName(db, sessionId) {
     const row = db
-        .select({ extraDataJson: sessions.extraDataJson })
+        .select({ agentName: sessions.agentName })
         .from(sessions)
         .where(and(eq(sessions.sessionId, sessionId), eq(sessions.columnarVersion, 3)))
         .get();
-    return row ? parseInteractionModeEnvelope(row.extraDataJson).mode : undefined;
+    return row ? (row.agentName ?? '') : null;
 }
-export function compareAndSetSessionInteractionModeInTransaction(db, input) {
-    return transitionSessionInteractionModeInTransaction(db, input) === 'updated';
-}
-export function transitionSessionInteractionModeInTransaction(db, input) {
-    const row = db
-        .select({ extraDataJson: sessions.extraDataJson })
-        .from(sessions)
-        .where(and(eq(sessions.sessionId, input.sessionId), eq(sessions.columnarVersion, 3)))
-        .get();
-    if (!row)
-        return 'not-found';
-    const envelope = parseInteractionModeEnvelope(row.extraDataJson);
-    if (envelope.mode === input.next) {
-        return alreadyInInteractionMode(input.next);
-    }
-    if (envelope.mode !== input.expected)
-        return 'conflict';
-    const nextExtraData = { ...envelope.data };
-    if (input.next === 'plan' || input.next === 'goal') {
-        nextExtraData.interactionMode = input.next;
-    }
-    else {
-        delete nextExtraData.interactionMode;
-    }
-    const updated = db
-        .update(sessions)
-        .set({
-        extraDataJson: JSON.stringify(nextExtraData),
-        updatedAtMs: input.updatedAtMs,
-    })
-        .where(and(eq(sessions.sessionId, input.sessionId), eq(sessions.columnarVersion, 3), eq(sessions.extraDataJson, row.extraDataJson)))
-        .run();
-    return updated.changes === 1 ? 'updated' : 'conflict';
-}
-function alreadyInInteractionMode(mode) {
-    if (mode === 'plan')
-        return 'already-plan';
-    if (mode === 'goal')
-        return 'already-goal';
-    return 'already-default';
+export function createSessionRepository(options) {
+    return new DrizzleSessionRepository(options);
 }
 class DrizzleSessionRepository {
     options;
@@ -274,11 +238,7 @@ class DrizzleSessionRepository {
             if (!row)
                 return undefined;
             const current = decodeSessionRow(row);
-            if (expectedTitle &&
-                ((current.title ?? null) !== expectedTitle.title ||
-                    (expectedTitle.source !== undefined && current.titleSource !== expectedTitle.source))) {
-                throw new SessionTitleConflictError();
-            }
+            assertSessionTitleExpectation(current, expectedTitle);
             assertSessionModelSnapshot(current, expectedModel);
             const modelFields = normalizeSessionModelUpdate(current, fields);
             const record = withoutRootAppMode(applySessionUpdate(current, modelFields, this.nowMs()));
@@ -399,6 +359,7 @@ class DrizzleSessionRepository {
             }
             const nextRoot = withoutRootAppMode(applySessionUpdate(next, {
                 sessionType: 'root',
+                ...(input.visibility ? { visibility: input.visibility } : {}),
                 parentSessionId: null,
                 archived: false,
                 title: 'Main',
@@ -445,6 +406,13 @@ class DrizzleSessionRepository {
                 .run();
             return { status: 'applied' };
         }, { behavior: 'immediate' });
+    }
+    async readAgentTurnTerminal(sessionId) {
+        return agentTurnTerminal(this.options.db
+            .select()
+            .from(sessionAgentState)
+            .where(eq(sessionAgentState.sessionId, sessionId))
+            .get());
     }
     async list(options = {}) {
         const limit = positiveInteger(options.limit);
@@ -739,27 +707,6 @@ class DrizzleSessionRepository {
         });
     }
 }
-function parseInteractionModeEnvelope(raw) {
-    let parsed;
-    try {
-        parsed = JSON.parse(raw);
-    }
-    catch (error) {
-        throw new Error('Session extra_data_json is not valid JSON', { cause: error });
-    }
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        throw new Error('Session extra_data_json must be an object');
-    }
-    const data = parsed;
-    const stored = data.interactionMode;
-    if (stored === undefined || stored === null)
-        return { data, mode: 'default' };
-    if (stored === 'plan')
-        return { data, mode: 'plan' };
-    if (stored === 'goal')
-        return { data, mode: 'goal' };
-    throw new Error(`Session has invalid interactionMode: ${String(stored)}`);
-}
 function scanLimitPredicate(db, value) {
     const limit = positiveInteger(value);
     if (limit === undefined)
@@ -834,5 +781,17 @@ function oldestUpdatedCursorPredicate(cursor) {
     if (!cursor)
         return undefined;
     return or(gt(sessions.updatedAtMs, cursor.updatedAtMs), and(eq(sessions.updatedAtMs, cursor.updatedAtMs), gt(sessions.sessionId, cursor.sessionId)));
+}
+function assertSessionTitleExpectation(current, expected) {
+    if (!expected)
+        return;
+    const matches = [
+        [current.title ?? null, expected.title],
+        [current.titleSource, expected.source],
+        [current.titleReviewState, expected.reviewState],
+        [current.titleReviewTurnId ?? null, expected.reviewTurnId],
+    ].every(([actual, wanted]) => wanted === undefined || actual === wanted);
+    if (!matches)
+        throw new SessionTitleConflictError();
 }
 //# sourceMappingURL=drizzle.js.map

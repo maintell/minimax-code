@@ -1,7 +1,7 @@
 import { decodeCronModel } from '@mavis/shared/cron-model';
 import { isSelfReminderId } from '@mavis/shared/cron-purpose';
 import { CRON_SCHEDULER_HANDLER_KEY, } from '../contracts.js';
-import { CronRepositoryError } from '../errors.js';
+import { CRON_DEFINITION_DELETED, CRON_DEFINITION_DELETED_ERROR, CRON_DEFINITION_PAUSED, CRON_DEFINITION_PAUSED_ERROR, CronRepositoryError, } from '../errors.js';
 import { toCronSchedule, toSchedulerSchedule } from './schedule.js';
 import { finishedSelfReminders, selfRemindersToCancel, unfinishedSelfReminders, } from './self-reminder-state.js';
 export class CronDataLifecycle {
@@ -9,7 +9,13 @@ export class CronDataLifecycle {
     constructor(dependencies) {
         this.dependencies = dependencies;
     }
-    create(input) {
+    targetsMainConversation(agentName) {
+        return this.dependencies.mainConversationAgents?.(agentName) === true;
+    }
+    create(request) {
+        const input = this.targetsMainConversation(request.agentName) && !isSelfReminderId(request.cronId)
+            ? { ...request, sessionTarget: { mode: 'sessionId' } }
+            : request;
         let schedulerId;
         try {
             return this.immediate(() => {
@@ -87,6 +93,7 @@ export class CronDataLifecycle {
                 return;
             }
             this.dependencies.definitions.tombstone(input.cronId, definition.revision, input.nowMs);
+            this.failPendingRuns(input.cronId, input.nowMs);
             this.dependencies.scheduler.cancel(definition.schedulerId);
         });
     }
@@ -97,6 +104,7 @@ export class CronDataLifecycle {
                 if (definition.deletedAtMs === undefined) {
                     this.dependencies.definitions.tombstone(definition.cronId, definition.revision, nowMs);
                 }
+                this.failPendingRuns(definition.cronId, nowMs);
             }
             return definitions;
         });
@@ -137,6 +145,22 @@ export class CronDataLifecycle {
             return this.dependencies.runs.insertPendingManualForDefinition(cronId, nowMs, requestId);
         });
     }
+    /**
+     * 撤回定义时一并结掉它还欠着的投递（排队中或等待重试）。否则这些 Run 会在之后
+     * 会话空闲时被接纳成 turn，再在接纳阶段被否决，把会话写成 error。
+     * 正在进行首次投递的 Run 保留并允许完成，仍由 beforeDelivery 兜底。
+     */
+    failPendingRuns(cronId, nowMs, reason = {
+        errorCode: CRON_DEFINITION_DELETED,
+        error: CRON_DEFINITION_DELETED_ERROR,
+    }) {
+        this.dependencies.runs.failPendingForCronId({
+            cronId,
+            failedAtMs: nowMs,
+            errorCode: reason.errorCode,
+            error: reason.error,
+        });
+    }
     assertReminderAvailable(cronId, target) {
         if (!isSelfReminderId(cronId))
             return;
@@ -149,7 +173,7 @@ export class CronDataLifecycle {
     }
     prepareReminderUpdate(definition, input) {
         if (!isSelfReminderId(definition.cronId))
-            return input;
+            return normalizeScheduleUpdate(input, this.targetsMainConversation(definition.agentName));
         const { sessionTarget, model, project, ...mutable } = input;
         if ((sessionTarget !== undefined &&
             !sameReminderTarget(sessionTarget, definition.sessionTarget)) ||
@@ -168,8 +192,18 @@ export class CronDataLifecycle {
         if (input.schedule !== undefined || (shouldBeActive && job.state !== 'active')) {
             this.dependencies.scheduler.reschedule(job.schedulerId, toSchedulerSchedule(schedule));
         }
-        if (!shouldBeActive)
+        if (!shouldBeActive) {
+            // 暂停必须立刻生效：先结清排队中和退避重试中的 Run，再停 timer。否则这些 Run
+            // 会在之后会话空闲时被接纳成 turn，暂停看起来停不下来。软删路径（delete）自己
+            // 已经结清过，这里不重复调用。
+            // The definition still exists — it was paused, not deleted — so run history must
+            // say so rather than telling the user their task was deleted.
+            this.failPendingRuns(input.cronId, input.nowMs, {
+                errorCode: CRON_DEFINITION_PAUSED,
+                error: CRON_DEFINITION_PAUSED_ERROR,
+            });
             this.dependencies.scheduler.cancel(job.schedulerId);
+        }
     }
     discardSchedulerJob(schedulerId) {
         try {
@@ -182,6 +216,9 @@ export class CronDataLifecycle {
     immediate(operation) {
         return this.dependencies.db.transaction(operation, { behavior: 'immediate' });
     }
+}
+function normalizeScheduleUpdate(input, targetsMainConversation) {
+    return targetsMainConversation ? { ...input, sessionTarget: { mode: 'sessionId' } } : input;
 }
 function mayOccupyReminderSlot(job, update) {
     return (update.schedule !== undefined ||

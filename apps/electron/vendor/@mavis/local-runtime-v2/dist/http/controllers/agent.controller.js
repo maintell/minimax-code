@@ -4,9 +4,11 @@ import { AppError, NotImplementedError } from '../errors.js';
 /** V2 Agent RPC adapter. All persistence and root sequencing stays in AgentApplication. */
 export class AgentController extends AgentControllerBase {
     application;
-    constructor(application) {
+    options;
+    constructor(application, options = {}) {
         super();
         this.application = application;
+        this.options = options;
     }
     async listAgents(ctx, req) {
         const application = this.requireApplication();
@@ -21,11 +23,10 @@ export class AgentController extends AgentControllerBase {
             const offset = Math.max(0, req.offset ?? 0);
             const limit = req.limit === undefined ? undefined : Math.max(0, req.limit);
             const page = filtered.slice(offset, limit === undefined ? undefined : offset + limit);
+            const withContent = include.persona || include.systemPrompt;
             const agents = await Promise.all(page.map(async (agent) => {
-                const detail = include.persona || include.systemPrompt
-                    ? await application.get(agent.requestRef, { includeContent: true })
-                    : agent;
-                return toAgentDetail(detail, include);
+                const detail = withContent ? await readListedContent(ctx, application, agent) : agent;
+                return toAgentDetail(detail, include, this.options);
             }));
             return { agents };
         });
@@ -68,7 +69,7 @@ export class AgentController extends AgentControllerBase {
             const agent = await application.get(name, {
                 includeContent: include.persona || include.systemPrompt,
             });
-            return { agent: toAgentDetail(agent, include) };
+            return { agent: toAgentDetail(agent, include, this.options) };
         });
     }
     async updateAgent(ctx, req) {
@@ -85,7 +86,7 @@ export class AgentController extends AgentControllerBase {
                 ...(req.avatar === undefined ? {} : { avatar: req.avatar }),
             });
             const detail = await application.get(updated.requestRef, { includeContent: true });
-            return { success: true, agent: toAgentDetail(detail, ALL_INCLUDE) };
+            return { success: true, agent: toAgentDetail(detail, ALL_INCLUDE, this.options) };
         });
     }
     async deleteAgent(ctx, req) {
@@ -148,7 +149,7 @@ export class AgentController extends AgentControllerBase {
                     : { acceptedIssueIds: [...req.acceptedIssueIds] }),
             });
             return {
-                agent: toAgentDetail(created.agent, ALL_INCLUDE),
+                agent: toAgentDetail(created.agent, ALL_INCLUDE, this.options),
                 config: toDesktopAgentConfigDocument(created.config),
             };
         });
@@ -161,8 +162,8 @@ export class AgentController extends AgentControllerBase {
 }
 /** Legacy/non-owner hosts keep the generated route fail-closed. */
 export const agentController = new AgentController();
-export function createAgentController(application) {
-    return new AgentController(application);
+export function createAgentController(application, options = {}) {
+    return new AgentController(application, options);
 }
 const ALL_INCLUDE = { identity: true, persona: true, systemPrompt: true };
 function readInclude(raw) {
@@ -187,13 +188,46 @@ function requireImportFormat(value) {
         return value;
     throw new AppError(400, 'VALIDATION_ERROR', 'format must be claude-code or codex');
 }
-function toAgentDetail(agent, include) {
+/**
+ * Reads persona/system prompt for one listed row. The roster itself already
+ * drops rows whose view cannot be built; one row whose content cannot be read
+ * must not fail the whole list either, so it is returned without content and
+ * the bounded failure code is logged.
+ */
+async function readListedContent(ctx, application, agent) {
+    try {
+        return await application.get(agent.requestRef, { includeContent: true });
+    }
+    catch (error) {
+        if (!(error instanceof AgentServiceError))
+            throw error;
+        try {
+            ctx.logger.ctxWarn(ctx, {
+                event: 'agent_list_content_unavailable',
+                agent_ref: redactedAgentRef(agent.requestRef),
+                error_code: error.code,
+            }, 'Listed Agent content is unavailable; returning the row without content');
+        }
+        catch {
+            // Fail-open logging: a broken sink must not change the list response.
+        }
+        return agent;
+    }
+}
+function toAgentDetail(agent, include, options) {
     return {
-        ...toAgentIdentity(agent, include),
+        ...toAgentIdentity(agent, include, options),
         ...toAgentContent(agent, include),
+        // Resolved from the Agent's current canonical file by the Agent service.
+        // `?? true` keeps the wire contract for any view that carries no switch.
+        // Assembled here rather than in `toAgentIdentity` so that helper stays within
+        // the Runtime complexity limit.
+        showInImBinding: agent.showInImBinding ?? true,
+        showInAgentList: agent.showInAgentList ?? true,
     };
 }
-function toAgentIdentity(agent, include) {
+function toAgentIdentity(agent, include, options) {
+    const defaultWorkspaceDir = agent.defaultWorkspaceDir ?? options.resolveDefaultWorkspaceDir?.();
     return {
         name: agent.name,
         displayName: agent.displayName,
@@ -202,12 +236,10 @@ function toAgentIdentity(agent, include) {
         ...(agent.agentConfigDir === undefined ? {} : { agentConfigDir: agent.agentConfigDir }),
         createdAt: agent.createdAtMs,
         updatedAt: agent.updatedAtMs,
+        ...(defaultWorkspaceDir === undefined ? {} : { defaultWorkspaceDir }),
         ...(agent.defaultWorkspaceDir === undefined
             ? {}
-            : {
-                defaultWorkspaceDir: agent.defaultWorkspaceDir,
-                userDefaultWorkspaceDir: agent.defaultWorkspaceDir,
-            }),
+            : { userDefaultWorkspaceDir: agent.defaultWorkspaceDir }),
         creationSource: toCreationSource(agent.creationSource),
         ...(include.identity
             ? {

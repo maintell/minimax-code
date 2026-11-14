@@ -1,6 +1,6 @@
 import { getRuntimeBuildEnv, isInternalBuild } from '@mavis/config';
 import { createLlmCaptureRecorder, wrapResolvedFetchForCapture, } from './capture-recorder.js';
-import { LlmContextInspectorHistoryStore } from './history-store.js';
+import { LlmContextInspectorHistoryStore } from './storage/history-store.js';
 import { LlmContextInspectorService } from './service.js';
 /** Internal Electron builds, plus explicitly opted-in TUI processes, can capture. */
 export function composeLlmContextInspector(options) {

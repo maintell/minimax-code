@@ -53,7 +53,9 @@
  */
 import { LLM_ERROR_CODES, classifyLLMErrorToCode } from '@mavis/shared/llm-error-classifier';
 import { InstalledPluginSource, PluginCapabilityType, } from '@mavis/protocol';
+import { markAbandonedStreamClosing, readAbandonedStreamAttempt, } from '../protocol/stream-reset.js';
 import { readPtcExecutionDetails } from '../tools/ptc.js';
+import { isTurnClosedByTerminatingTools } from '../tools/turn-termination.js';
 import { buildAbortedTerminalStatusEvent, buildCompletedAssistantMessage, buildCompletedTerminalStatusEvent, buildDebugTraceEvent, buildFailedTerminalStatusEvent, buildFinishChunk, buildTextDeltaChunk, buildThinkingDeltaChunk, buildToolCallChunk, extractAssistantErrorMessage, extractAssistantStopReason, extractAssistantText, extractAssistantThinking, extractAssistantToolCalls, extractAssistantUsage, extractDeltaUpdate, isAssistantError, } from './converters.js';
 const defaultNowMs = () => Date.now();
 /**
@@ -63,6 +65,23 @@ const defaultNowMs = () => Date.now();
  * been updated yet — the bridge logs once when this fallback fires so
  * observers can spot the misconfiguration.
  */
+/**
+ * `finish_reason` for an assistant message whose attempt was abandoned mid-stream.
+ *
+ * Chosen from the values the protocol already carries, by what a baseline
+ * consumer does with each:
+ * - `error` makes the desktop UI raise a terminal error
+ *   (`readTerminalAssistantCompleteError`) and TUI turn the message into an
+ *   `error` event (`stream-events.ts`), so the half answer would read as a
+ *   failure of the whole turn.
+ * - `aborted` makes both surfaces show an interruption / "Response cancelled".
+ * - `stop` maps to `success` but TUI's `delegation-flow` treats a `stop`
+ *   assistant as the latest turn's final answer.
+ * - `length` maps to `success` in the desktop UI (`finishReasonToQueryStatus`)
+ *   and has no special handling anywhere in TUI, so the message simply ends with
+ *   its content kept and no error or cancellation banner.
+ */
+const PARTIAL_STREAM_FINISH_REASON = 'length';
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 /**
  * UI typed session error 文案集合在 runtime 侧的镜像
@@ -287,7 +306,17 @@ export class EventBridge {
             // chunked streaming — pi emits them as single-shot frames.
             return { events: [] };
         }
-        // New assistant message — reset per-message state.
+        this.beginAssistantMessage();
+        return { events: [], requestAssistantMessageId: true };
+    }
+    /**
+     * Open a fresh assistant message: drop the per-message state and ask the host
+     * for a new `msg_id`.
+     *
+     * `chunkIndex` restarts at zero here, which is correct: the session stream
+     * de-duplicates per `msg_id`, so a new message has its own cursor.
+     */
+    beginAssistantMessage() {
         this.activeAssistantMessageId = undefined;
         this.chunkIndex = 0;
         this.thinkingStartMs = undefined;
@@ -303,9 +332,14 @@ export class EventBridge {
         this.toolStartMs = new Map();
         this.preparingToolCalls = new Map();
         this.pendingCompletedMessage = undefined;
-        return { events: [], requestAssistantMessageId: true };
     }
-    onMessageUpdate(event, observedAtMs) {
+    async onMessageUpdate(event, observedAtMs) {
+        // Checked before the delta narrowing below: the reset rides on a frame shape
+        // that carries no delta of its own.
+        const abandoned = readAbandonedStreamAttempt(event.assistantMessageEvent);
+        if (abandoned) {
+            return this.onStreamReset(abandoned);
+        }
         // Output usage includes thinking tokens even when their text is hidden.
         // Keep the timing boundary aligned with that usage, before queue delays.
         if (this.activeAssistantMessageId &&
@@ -386,6 +420,81 @@ export class EventBridge {
                 }),
             ],
         };
+    }
+    /**
+    /**
+     * A committed attempt broke on a transient stream interruption and the runtime
+     * is resending the request.
+     *
+     * The abandoned attempt is closed as its own assistant message: the text and
+     * thinking it already streamed stay exactly as rendered, its unexecuted tool
+     * cards are marked failed so no card is left on "preparing" / "prepared", and
+     * the message finishes. The resent attempt then streams under a fresh
+     * `msg_id`, handled exactly like a new assistant message.
+     *
+     * Nothing new goes on the wire: this reuses the existing finish chunk, the
+     * existing completed message and the existing `Failed` tool-call status, so a
+     * baseline consumer shows a finished half answer followed by a new message.
+     */
+    async onStreamReset(abandoned) {
+        const events = [];
+        const msgId = this.activeAssistantMessageId;
+        if (msgId) {
+            // The model never got to run these calls, so they end as failed rather
+            // than staying on the argument-streaming statuses.
+            const toolCalls = extractAssistantToolCalls(abandoned).map((toolCall) => ({
+                ...toolCall,
+                status: 'failed',
+            }));
+            for (const toolCall of toolCalls) {
+                events.push(markAbandonedStreamClosing(buildToolCallChunk({
+                    sessionId: this.ctx.sessionId,
+                    turnId: this.ctx.turnId,
+                    eventId: this.ctx.eventIdGenerator('coding_tool'),
+                    runtimeSeq: this.ctx.runtimeSeqGenerator(),
+                    msgId,
+                    chunkIndex: this.nextChunkIndex(),
+                    toolCall,
+                    nowMs: this.now(),
+                })));
+            }
+            const thinkingDurationMs = this.thinkingStartMs !== undefined
+                ? (this.thinkingEndMs ?? this.now()) - this.thinkingStartMs
+                : undefined;
+            // Ends the stream for this message without an error or abort banner.
+            events.push(markAbandonedStreamClosing(buildFinishChunk({
+                sessionId: this.ctx.sessionId,
+                turnId: this.ctx.turnId,
+                eventId: this.ctx.eventIdGenerator('coding_finish'),
+                runtimeSeq: this.ctx.runtimeSeqGenerator(),
+                msgId,
+                chunkIndex: this.nextChunkIndex(),
+                finishReason: PARTIAL_STREAM_FINISH_REASON,
+                ...(thinkingDurationMs !== undefined ? { thinkingDurationMs } : {}),
+                nowMs: this.now(),
+            })));
+            // Materialise the message so a consumer that missed deltas, and the
+            // message store, both keep the half answer that was already shown. Usage
+            // is left out on purpose: this attempt reported partial buckets, and the
+            // settlement ledger is where per-attempt usage actually lives.
+            events.push(markAbandonedStreamClosing(await buildCompletedAssistantMessage({
+                sessionId: this.ctx.sessionId,
+                turnId: this.ctx.turnId,
+                eventId: this.ctx.eventIdGenerator('coding_complete'),
+                runtimeSeq: this.ctx.runtimeSeqGenerator(),
+                msgId,
+                text: extractAssistantText(abandoned),
+                thinking: extractAssistantThinking(abandoned),
+                ...(toolCalls.length ? { toolCalls } : {}),
+                ...(thinkingDurationMs !== undefined ? { thinkingDurationMs } : {}),
+                finishReason: PARTIAL_STREAM_FINISH_REASON,
+                nowMs: this.now(),
+                ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
+            }, this.ctx.respDataTransform)));
+        }
+        // The resend continues as a new assistant message with its own id.
+        this.beginAssistantMessage();
+        return { events, requestAssistantMessageId: true };
     }
     /**
      * Model-side tool-call argument streaming (pi `toolcall_start` /
@@ -592,6 +701,7 @@ export class EventBridge {
             thinkingDurationMs,
             finishReason,
             usage,
+            assistant: event.message,
         };
         return { events: [finishEvent] };
     }
@@ -707,7 +817,7 @@ export class EventBridge {
         const toolCall = {
             tool_name: event.toolName,
             tool_call_id: event.toolCallId,
-            ...(event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id
+            ...((event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id)
                 ? {
                     parent_tool_call_id: event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id,
                 }
@@ -735,7 +845,7 @@ export class EventBridge {
                 attrs: {
                     tool_name: event.toolName,
                     tool_call_id: event.toolCallId,
-                    ...(event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id
+                    ...((event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id)
                         ? {
                             parent_tool_call_id: event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id,
                         }
@@ -798,7 +908,10 @@ export class EventBridge {
             const text = 'PTC child outcome is unknown after bounded cleanup. The operation may still have side effects; do not replay it automatically.';
             const retainedFacts = ptc.retained_facts.filter((fact) => 'child_tool_call_id' in fact && fact.child_tool_call_id === record.child_tool_call_id);
             if (!retainedFacts.some((fact) => fact.kind === 'outcome_unknown')) {
-                retainedFacts.push({ kind: 'outcome_unknown', child_tool_call_id: record.child_tool_call_id });
+                retainedFacts.push({
+                    kind: 'outcome_unknown',
+                    child_tool_call_id: record.child_tool_call_id,
+                });
             }
             const closed = {
                 ...started,
@@ -868,6 +981,7 @@ export class EventBridge {
         if (!pending)
             return undefined;
         const toolCalls = Array.from(this.completedToolCalls.values());
+        const finishReason = closingFinishReason(pending, toolCalls);
         const event = await buildCompletedAssistantMessage({
             sessionId: this.ctx.sessionId,
             turnId: this.ctx.turnId,
@@ -881,7 +995,7 @@ export class EventBridge {
             ...(pending.thinkingDurationMs !== undefined
                 ? { thinkingDurationMs: pending.thinkingDurationMs }
                 : {}),
-            ...(pending.finishReason ? { finishReason: pending.finishReason } : {}),
+            ...(finishReason ? { finishReason } : {}),
             usage: pending.usage,
             nowMs: this.now(),
             logger: this.ctx.logger,
@@ -1048,5 +1162,23 @@ function normalizePluginProvenances(input) {
     return [...unique.values()].sort((left, right) => left.plugin_name.localeCompare(right.plugin_name, 'en-US') ||
         (left.plugin_version ?? '').localeCompare(right.plugin_version ?? '', 'en-US') ||
         left.capability_name.localeCompare(right.capability_name, 'en-US'));
+}
+/**
+ * A tool batch whose every result ended the Turn on purpose is the Turn's last
+ * model step: pi never asks the model again. Persist that message as `stop`,
+ * so history readers see a normally finished Turn instead of an interrupted
+ * tool step. The finish chunk was already sent at message_end, before any tool
+ * ran, and keeps `toolUse`; the completed message emitted here replaces it.
+ */
+function closingFinishReason(pending, toolCalls) {
+    if (pending.finishReason !== 'toolUse')
+        return pending.finishReason;
+    const results = toolCalls.map((call) => ({
+        toolCallId: call.tool_call_id,
+        details: typeof call.result === 'object' && call.result !== null
+            ? call.result.details
+            : undefined,
+    }));
+    return isTurnClosedByTerminatingTools(pending.assistant, results) ? 'stop' : 'toolUse';
 }
 //# sourceMappingURL=bridge.js.map

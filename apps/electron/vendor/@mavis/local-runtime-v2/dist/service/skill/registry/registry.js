@@ -2,7 +2,7 @@ import {} from '@mavis/skills';
 import { readConfiguredSkillRoots } from './roots.js';
 import { deleteRegistrySkill, getRegistrySkillDetail, hasRegistryLocationUri, inferAgentNameFromConfiguredLocationUri, listRegistryRuntimeSkills, listRegistrySkillFiles, listRegistrySkillSummaries, readRegistrySkillByName, readRegistrySkillFile, resolveRegistrySkillIdentity, renderLocalRegistrySkillsCatalog, } from './registry-operations.js';
 import { createRegistryHandle, inheritedRuntimeReadBetaFlags, normalizeAgentName, } from './registry-handle.js';
-import { createAgentResourceScopeReader } from './registry-agent-scope.js';
+import { createAgentResourceScopeReader, withoutAgentResourceRoots, } from './registry-agent-scope.js';
 // The provider is process-scoped while workspace roots are session-scoped.
 // Keep recent registries warm without retaining every historical session.
 const MAX_CACHED_REGISTRY_HANDLES = 16;
@@ -45,7 +45,7 @@ export function createLocalSkillRegistryProvider(configGetter, rootsGetter, diag
         const configuredRoots = rootsGetter?.(resolvedAgentName, workspaceDir, compatibleAgentNames) ??
             readConfiguredSkillRoots(configGetter(), resolvedAgentName, workspaceDir, compatibleAgentNames);
         const roots = excludeAgentResources
-            ? configuredRoots.filter((root) => root.kind !== 'agent' && !(root.kind === 'builtin' && root.scope))
+            ? withoutAgentResourceRoots(configuredRoots)
             : configuredRoots;
         const rootsKey = JSON.stringify([expectedAgentInstanceId, roots]);
         let handle = handles.get(rootsKey);

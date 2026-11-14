@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createModelAccessFailoverPort } from './failover/pool-lease.js';
 import { FailoverPoolState } from './failover/pool-state.js';
 import { FailoverFileStateStore } from './failover/state-store.js';
-import { compareAndSetLocalModelContext, getConfig, removeLocalProviderConfig, updateLocalByokConfig, updateLocalModelSelection, } from '@mavis/config';
+import { compareAndSetLocalModelContext, getConfig, removeLocalProviderConfig, updateLocalAdvisorSelection, updateLocalByokConfig, updateLocalModelSelection, } from '@mavis/config';
 import { LocalModelCache } from './catalog/model-cache.js';
 import { isModelAccessProvider } from './model-access/projection.js';
 import { ProviderPresetCatalog } from './catalog/provider-presets/provider-presets.service.js';
@@ -24,6 +24,9 @@ export function createLocalModelSystemConfigPort(read = getConfig) {
                 ...selection,
                 ...(variant !== undefined ? { variant } : {}),
             });
+        },
+        setDefaultAdvisor: async (selection) => {
+            await updateLocalAdvisorSelection(selection);
         },
         removeProvider: removeLocalProviderConfig,
     };

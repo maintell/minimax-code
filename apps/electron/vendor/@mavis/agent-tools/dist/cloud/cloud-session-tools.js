@@ -21,7 +21,6 @@ const sessionUpdateSchema = Type.Object({
     session_id: idString,
     title: Type.Optional(Type.String({ description: 'New title.' })),
     extra_data_json: Type.Optional(Type.String({ description: 'Replace the metadata blob with this JSON string.' })),
-    agent_name: Type.Optional(Type.String({ description: 'Re-home the session to another agent (display name).' })),
     archived: Type.Optional(Type.Boolean({ description: 'Archive or unarchive.' })),
 }, { additionalProperties: false });
 const sessionMessagesSchema = Type.Object({
@@ -55,7 +54,7 @@ const SESSION_TOOL_DEFS = [
     {
         name: 'session_update',
         loading: 'on_demand',
-        description: 'Patch session metadata the Cloud backend already supports: title, extra_data_json, agent_name, archived. ' +
+        description: 'Patch session metadata the Cloud backend already supports: title, extra_data_json, archived. ' +
             'Only supplied fields change.',
         schema: sessionUpdateSchema,
         command: 'session update',

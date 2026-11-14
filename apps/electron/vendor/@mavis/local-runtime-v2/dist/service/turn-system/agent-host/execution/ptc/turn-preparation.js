@@ -1,15 +1,37 @@
 import { createPtcToolFactCollector, } from '@mavis/agent-core/tools';
 import { applyProcessLocalToolResultPolicy } from '../../runner/policy/process-local-tool-result-policy.js';
-import { observePtcAdmission } from '../../runner/policy/ptc-admission-observability.js';
-import { createPtcToolLabeler, createPtcTurnObserver } from '../../runner/ptc/ptc-observability.js';
+import { observePtcAdmission } from '../../runner/observability/ptc-admission-observability.js';
+import { createPtcToolLabeler, createPtcTurnObserver, } from '../../runner/ptc/ptc-observability.js';
 import { isNativeTaskOutputTool, readPtcChildTools, readPtcNativeCatalog, readPtcTurnReminder, registerPtcTurnChildTodoWrite, } from './catalog.js';
+import { createPtcChildDisplayPreview } from './child/child-display-preview.js';
 import { createPtcCompactionReminderRestorer, } from './compaction-reminder.js';
+import { ptcStoredValuesBlock } from './session-store/index.js';
 /** The PTC reminder restorer for a Turn; undefined when the Turn has no PTC reminder. */
 export function createPtcTurnCompactionReminder(input, options) {
-    return createPtcCompactionReminderRestorer(readPtcReminderForRestore(input, options.logger), 
+    const store = options.ptcSessionStore;
+    return createPtcCompactionReminderRestorer(input.lease.sessionId, readPtcReminderForRestore(input, options.logger), 
     // Production binds this to fitsReminderInFinalRequest, a generic
     // "does this marker still fit the final request" check.
-    options.canAppendExecutionBudgetReminder, options.logger);
+    options.canAppendExecutionBudgetReminder, {
+        ...(options.logger ? { logger: options.logger } : {}),
+        // Read once per compaction generation, at restore time.
+        ...(store ? { storedValues: () => readStoredValues(store, input.lease.sessionId) } : {}),
+    });
+}
+/**
+ * The Session's stored-values block for one compaction generation.
+ *
+ * A Session that still owes a rebuild may be holding keys a rewind is about to
+ * drop, so this generation lists none: the block sits after the summary, and a
+ * list that changes once the rebuild lands would change the whole prefix
+ * behind it. The next compaction reads the filtered list.
+ *
+ * @internal Exported for focused tests.
+ */
+export function readStoredValues(store, sessionId) {
+    if (store.needsRebuild(sessionId))
+        return undefined;
+    return ptcStoredValuesBlock(store.index(sessionId));
 }
 /**
  * buildPtcCatalog registers the reminder on the run_code it creates, and the
@@ -38,7 +60,10 @@ export function preparePtcExecution(tools, nativeTools, options, input) {
     const ptcFactCollector = createPtcToolFactCollector();
     const ptcResultProjection = options.createPtcResultProjection?.(ptcFactCollector);
     // Only PTC Turns get an observer, so only they report program-level metrics.
-    const ptcObserver = ptcTools ? createTurnObserver(input, options) : undefined;
+    const labelTool = createPtcToolLabeler(input.desktopCapabilities?.runtimeToolBindings);
+    const ptcObserver = ptcTools ? createTurnObserver(input, options, labelTool) : undefined;
+    // Only a PTC Turn has children, so only it shortens a child display copy.
+    const childDisplay = ptcTools ? createChildDisplayPreview(input, options, labelTool) : undefined;
     return {
         ptcTools,
         canConsumeNativeTaskOutput: (ptcTools ?? nativeTools).some(isNativeTaskOutputTool),
@@ -49,6 +74,12 @@ export function preparePtcExecution(tools, nativeTools, options, input) {
             // Only PTC turns get the logger: run_code and direct calls of its children use it.
             ...(ptcTools && options.logger ? { ptcLogger: options.logger } : {}),
             ...(ptcObserver ? { ptcObserver } : {}),
+            ...(childDisplay
+                ? {
+                    shapePtcChildDisplayResult: childDisplay.shape,
+                    ptcChildDisplayStats: childDisplay.stats,
+                }
+                : {}),
         },
     };
 }
@@ -67,14 +98,32 @@ export function observePtcTurnAdmission(input, ptc, options, prefix) {
         nativeCatalog: readPtcNativeCatalog(input.assembly.tools) ?? input.assembly.tools,
     });
 }
-function createTurnObserver(input, options) {
+/** The child display-copy preview for this Turn; PTC Turns only. */
+function createChildDisplayPreview(input, options, labelTool) {
+    return createPtcChildDisplayPreview({
+        sessionId: input.lease.sessionId,
+        turnId: input.lease.turnId,
+        labelTool,
+        ...(options.writePtcChildDisplayArtifact
+            ? { writeArtifact: options.writePtcChildDisplayArtifact }
+            : {}),
+        ...(options.logger ? { logger: options.logger } : {}),
+        ...(options.metricsClient ? { metrics: options.metricsClient } : {}),
+    });
+}
+function createTurnObserver(input, options, labelTool) {
     return createPtcTurnObserver({
         sessionId: input.lease.sessionId,
         turnId: input.lease.turnId,
         ...(options.logger ? { logger: options.logger } : {}),
         ...(options.metricsClient ? { metricsClient: options.metricsClient } : {}),
         ...(options.ptcSurface ? { surface: options.ptcSurface } : {}),
-        labelTool: createPtcToolLabeler(input.desktopCapabilities?.runtimeToolBindings),
+        // A child Agent runs in its own Session, so its Turn labels its own saves.
+        // Only a Task sub-Agent Session counts: Peek, side chat and fork Sessions
+        // carry a parentSessionId too, but they are the user's own conversation, so
+        // their saves belong to the root caller.
+        scriptCaller: input.session.sessionKind === 'task' ? 'subagent' : 'root',
+        labelTool,
     });
 }
 //# sourceMappingURL=turn-preparation.js.map

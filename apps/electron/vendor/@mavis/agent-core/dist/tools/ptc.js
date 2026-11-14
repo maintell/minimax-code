@@ -58,6 +58,10 @@ export function readPtcExecutionDetails(message) {
     }
     const childCalls = ptc.child_calls.filter(isPtcToolCallRecord);
     const retainedFacts = ptc.retained_facts.filter(isPtcRetainedFact);
+    // Best effort, unlike the two lists above: an unreadable `sources`, or one
+    // entry this build does not know, must not cost the caller its child calls
+    // and retained facts as well.
+    const sources = readPtcScriptSources(ptc.sources);
     if (childCalls.length !== ptc.child_calls.length ||
         retainedFacts.length !== ptc.retained_facts.length) {
         return undefined;
@@ -66,10 +70,28 @@ export function readPtcExecutionDetails(message) {
         version: 1,
         child_calls: childCalls,
         retained_facts: retainedFacts,
+        ...(sources && sources.length > 0 ? { sources } : {}),
         ...(typeof ptc.host_forced_content === 'string'
             ? { host_forced_content: ptc.host_forced_content }
             : {}),
     };
+}
+/**
+ * The entries this build understands, or undefined when there is no list to
+ * read. An entry whose scope is unknown is dropped instead of failing the
+ * whole envelope: a scope a newer Host added must not take the child calls
+ * and retained facts down with it.
+ */
+function readPtcScriptSources(value) {
+    if (!Array.isArray(value))
+        return undefined;
+    return value.filter(isPtcScriptSourceRecord);
+}
+function isPtcScriptSourceRecord(value) {
+    return (isRecord(value) &&
+        isNonEmptyString(value.path) &&
+        (value.scope === 'project' || value.scope === 'user' || value.scope === 'skill') &&
+        isNonEmptyString(value.sha256));
 }
 export function readPtcToolCallRecords(message) {
     return readPtcExecutionDetails(message)?.child_calls ?? [];

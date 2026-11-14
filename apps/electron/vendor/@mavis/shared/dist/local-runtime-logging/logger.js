@@ -95,17 +95,26 @@ export async function shutdownLocalRuntimeLogging() {
     baseLogger = wrapTraceContextLogger(createStructuredLogger());
 }
 /**
- * Permission records that name a Session go to that Session's file instead of
+ * Permission and Bunny records that name a Session go to that Session's file instead of
  * the terminal and the hourly runtime log; warnings and errors go to both.
  */
 function write(level, fields, message) {
-    const isPermission = message.startsWith('permission.') || message.startsWith('[permission] ');
-    if (sessionLogger && isPermission && readLogSessionId(fields)) {
+    if (sessionLogger && isSessionRecord(message) && readLogSessionId(fields)) {
         sessionLogger[level](fields, message);
         if (level === 'info')
             return;
     }
     baseLogger[level](fields, message);
+}
+/**
+ * Records kept with their Session: permission decisions and Bunny's own lines (`bunny.*`,
+ * `bunny_context_config`).
+ */
+function isSessionRecord(message) {
+    return (message.startsWith('permission.') ||
+        message.startsWith('[permission] ') ||
+        message.startsWith('bunny.') ||
+        message === 'bunny_context_config');
 }
 export const logger = {
     info(fields, message) {

@@ -48,7 +48,7 @@ export class ILinkClient {
      * Long-poll for new messages. Server holds the connection up to `longPollTimeoutMs`.
      * On client-side timeout (AbortError) returns an empty response with ret=0.
      */
-    async getUpdates(getUpdatesBuf, timeoutMs) {
+    async getUpdates(getUpdatesBuf, timeoutMs, signal) {
         try {
             const text = await this.apiFetch({
                 endpoint: 'ilink/bot/getupdates',
@@ -58,6 +58,7 @@ export class ILinkClient {
                 },
                 timeoutMs: timeoutMs ?? this.longPollTimeoutMs,
                 label: 'getUpdates',
+                signal,
             });
             return JSON.parse(text);
         }
@@ -138,6 +139,11 @@ export class ILinkClient {
         const headers = buildHeaders({ token: this.token, body: bodyStr });
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), params.timeoutMs);
+        const onAbort = () => controller.abort();
+        if (params.signal?.aborted)
+            onAbort();
+        else
+            params.signal?.addEventListener('abort', onAbort, { once: true });
         try {
             const res = await ilinkFetch(url.toString(), {
                 method: 'POST',
@@ -145,16 +151,15 @@ export class ILinkClient {
                 body: bodyStr,
                 signal: controller.signal,
             });
-            clearTimeout(timer);
             const rawText = await res.text();
             if (!res.ok) {
                 throw new Error(`${params.label} ${res.status}: ${rawText}`);
             }
             return rawText;
         }
-        catch (err) {
+        finally {
             clearTimeout(timer);
-            throw err;
+            params.signal?.removeEventListener('abort', onAbort);
         }
     }
 }

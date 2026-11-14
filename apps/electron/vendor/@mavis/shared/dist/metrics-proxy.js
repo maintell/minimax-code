@@ -1,3 +1,6 @@
+/** Self-report of points the client gave up on, registered in the metric registry. */
+export const METRICS_CLIENT_DROPPED_POINTS_METRIC = 'metrics_client_dropped_points_total';
+export const METRICS_DROP_REASONS = ['non_retryable_status', 'series_limit'];
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_BATCH_SIZE = 1_000;
 const DEFAULT_MAX_SERIES = 50_000;
@@ -10,7 +13,18 @@ const DEFAULT_RETRY = {
     maxDelayMs: 5_000,
     maxRetryBatches: 100,
     maxRetryMetrics: 100_000,
+    maxCarryOverSeries: 10_000,
 };
+// The first wait is one flush interval and the cap a minute, so an outage costs
+// each client at most one request a minute and a recovered network is used
+// again within a minute.
+const DEFAULT_CARRY_OVER = {
+    maxCarryOverSeries: 10_000,
+    baseDelayMs: 5_000,
+    maxDelayMs: 60_000,
+};
+/** Statuses carry-over delivery sends again; any other answer is final (as OTLP exporters do). */
+const CARRY_OVER_RETRY_STATUSES = new Set([429, 502, 503, 504]);
 const METRIC_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9_:]*$/;
 const DEFAULT_METRICS_BATCH_PATH = '/archon/internal/api/v1/metrics/batch';
 export const DESKTOP_METRICS_BATCH_PATH = '/matrix/api/v1/metrics/batch';
@@ -98,6 +112,8 @@ export class MetricsClient {
     histogramBucketsByName;
     stickyGauge;
     retry;
+    /** Set for carry-over delivery; the retry queue is used otherwise. */
+    carryOver;
     onError;
     now;
     setTimer;
@@ -107,8 +123,18 @@ export class MetricsClient {
     histograms = new Map();
     metricNameSeriesCounts = new Map();
     retryBuffer = [];
+    droppedPoints = new Map();
+    collectors = new Set();
+    collecting = false;
+    /** Series put back since the last snapshot, merged ones included. */
+    carriedKeys = new Set();
+    consecutiveFailures = 0;
+    retryAt = 0;
     flushTimer;
-    flushInFlight;
+    /** Flushes run one at a time in call order; the tail of that chain. */
+    flushChain = Promise.resolve();
+    /** Flushes queued or running. */
+    flushesPending = 0;
     closed = false;
     constructor(options) {
         this.reporter = options.reporter;
@@ -126,6 +152,7 @@ export class MetricsClient {
         ]));
         this.stickyGauge = options.stickyGauge ?? false;
         this.retry = { ...DEFAULT_RETRY, ...(options.retry ?? {}) };
+        this.carryOver = carryOverPolicy(options.delivery);
         this.onError = options.onError;
         this.now = options.now ?? Date.now;
         this.setTimer = options.setTimer ?? setTimeout;
@@ -198,24 +225,72 @@ export class MetricsClient {
         }
         this.flushWhenFull();
     }
+    /**
+     * Run `collect` right before every snapshot, so a module can report what
+     * accrued since the previous one, such as busy time or a queue's depth. What
+     * it reports joins that snapshot and never starts a flush of its own.
+     * Returns the function that removes it.
+     */
+    onCollect(collect) {
+        this.collectors.add(collect);
+        return () => {
+            this.collectors.delete(collect);
+        };
+    }
+    /** Send now; carry-over delivery does not wait for its backoff to end. */
     async flush() {
-        if (this.flushInFlight) {
-            await this.flushInFlight;
-        }
-        this.flushInFlight = this.flushOnce().finally(() => {
-            this.flushInFlight = undefined;
-        });
-        await this.flushInFlight;
+        await this.flushSerialized(true);
     }
     async close() {
-        this.closed = true;
         if (this.flushTimer) {
             this.clearTimer(this.flushTimer);
             this.flushTimer = undefined;
         }
-        await this.flush();
+        // Collect while points are still accepted; the final flush below skips it.
+        this.runCollectors();
+        this.closed = true;
+        await this.flushSerialized(true);
     }
-    async flushOnce() {
+    runCollectors() {
+        if (this.closed || this.collecting)
+            return;
+        this.collecting = true;
+        try {
+            for (const collect of this.collectors) {
+                try {
+                    collect();
+                }
+                catch (error) {
+                    this.onError?.(error);
+                }
+            }
+        }
+        finally {
+            this.collecting = false;
+        }
+    }
+    /**
+     * Flushes never overlap: an idle client starts at once, as it always did,
+     * and a flush asked for while one runs waits for it. Collectors report inside
+     * the flush, so they cannot start another one (see flushWhenFull).
+     */
+    flushSerialized(force) {
+        this.flushesPending += 1;
+        const run = this.flushesPending === 1
+            ? this.flushOnce(force)
+            : this.flushChain.then(() => this.flushOnce(force));
+        const settled = run.finally(() => {
+            this.flushesPending -= 1;
+        });
+        this.flushChain = settled.catch(() => undefined);
+        return settled;
+    }
+    async flushOnce(force) {
+        if (this.carryOver) {
+            await this.flushCarryingOver(force, this.carryOver);
+            return;
+        }
+        this.runCollectors();
         const snapshot = this.takeSnapshot();
         if (snapshot.length === 0 && this.retryBuffer.length === 0)
             return;
@@ -241,11 +316,16 @@ export class MetricsClient {
             await this.reporter.reportBatch(request);
         }
         catch (error) {
-            if (isRetryableError(error) && attempts + 1 < this.retry.maxAttempts) {
+            if (!isRetryableError(error)) {
+                // The endpoint refused the batch itself; sending it again cannot succeed.
+                this.onError?.(error);
+            }
+            else if (attempts + 1 < this.retry.maxAttempts) {
                 this.pushRetryBatch({ request, attempts: attempts + 1 });
             }
             else {
                 this.onError?.(error);
+                this.carryOverGivenUp(request.metrics);
             }
         }
     }
@@ -260,10 +340,215 @@ export class MetricsClient {
             this.onError?.(new MetricsReportError('Metrics retry buffer exceeded its limit; dropped oldest batch', {
                 retryable: false,
             }));
+            this.carryOverGivenUp(dropped.request.metrics);
         }
+    }
+    /**
+     * Retry queue delivery: a batch that will not be sent again puts its counter
+     * and histogram deltas back into the pending series, so the next flush sends
+     * them once. New series that do not fit are dropped and reported.
+     */
+    carryOverGivenUp(metrics) {
+        const dropped = this.putBack(metrics, false, this.retry.maxCarryOverSeries);
+        if (dropped === 0)
+            return;
+        this.onError?.(new MetricsReportError(`Metrics carry-over limit reached; dropped ${dropped} series`, {
+            retryable: false,
+        }));
+    }
+    /**
+     * Carry-over delivery: send the pending series in batches of `maxBatchSize`,
+     * in order. A retryable failure ends the round: that batch and the ones not
+     * sent yet go back into the pending series and the client backs off. The
+     * dropped-points report follows the data in a request of its own.
+     */
+    async flushCarryingOver(force, policy) {
+        // While backing off, points keep adding up per series; only flush() and close() send.
+        if (!force && this.now() < this.retryAt)
+            return;
+        this.runCollectors();
+        const batches = chunk(this.takeSnapshot(), this.maxBatchSize);
+        for (const [index, metrics] of batches.entries()) {
+            if (!(await this.sendCarryingOver(metrics))) {
+                let dropped = this.putBack(metrics, false, policy.maxCarryOverSeries);
+                for (const unsent of batches.slice(index + 1))
+                    dropped += this.putBack(unsent, true, policy.maxCarryOverSeries);
+                if (dropped > 0)
+                    this.countDropped('series_limit', dropped);
+                this.backOff(policy);
+                return;
+            }
+        }
+        await this.sendDroppedPoints(policy);
+    }
+    /** Returns false when the batch is to be sent again. */
+    async sendCarryingOver(metrics) {
+        try {
+            await this.reporter.reportBatch({
+                service: this.serviceName,
+                timestamp: this.now(),
+                metrics,
+            });
+        }
+        catch (error) {
+            if (isCarryOverRetryable(error))
+                return false;
+            this.countDropped('non_retryable_status', metrics.length);
+            this.onError?.(error);
+            return true;
+        }
+        this.deliveryRecovered();
+        return true;
+    }
+    /** A retryable failure keeps the counts for the next round; any other drops them. */
+    async sendDroppedPoints(policy) {
+        if (this.droppedPoints.size === 0)
+            return;
+        const metrics = this.takeDroppedPoints();
+        try {
+            await this.reporter.reportBatch({
+                service: this.serviceName,
+                timestamp: this.now(),
+                metrics,
+            });
+        }
+        catch (error) {
+            if (isCarryOverRetryable(error)) {
+                this.restoreDroppedPoints(metrics);
+                this.backOff(policy);
+            }
+            else {
+                this.onError?.(error);
+            }
+            return;
+        }
+        this.deliveryRecovered();
+    }
+    /**
+     * Put an undelivered batch back into the pending series. Counter and
+     * histogram deltas add to what was recorded since; a gauge comes back only
+     * from a batch never sent, and only when no newer value is pending. A series
+     * put back counts toward `maxCarryOverSeries` until the next snapshot, and one
+     * not pending is dropped past it or past `maxSeries`; returns how many were
+     * dropped. Closing does not stop it: what a flush still in flight puts back
+     * goes out with the final flush.
+     */
+    putBack(metrics, keepGauges, maxCarryOverSeries) {
+        let dropped = 0;
+        for (const metric of metrics) {
+            const labels = metric.labels ?? {};
+            const key = buildMetricKey(metric.type, metric.name, labels);
+            if (metric.type === 'gauge') {
+                if (!keepGauges || this.gauges.has(key))
+                    continue;
+                if (this.carriedKeys.size >= maxCarryOverSeries || this.seriesCount() >= this.maxSeries) {
+                    dropped += 1;
+                    continue;
+                }
+                this.gauges.set(key, {
+                    name: metric.name,
+                    labels,
+                    value: metric.value,
+                    updatedAt: metric.updatedAt ?? this.now(),
+                });
+                this.carriedKeys.add(key);
+                continue;
+            }
+            const pending = metric.type === 'counter' ? this.counters.has(key) : this.histograms.has(key);
+            if (!pending &&
+                (this.carriedKeys.size >= maxCarryOverSeries || this.seriesCount() >= this.maxSeries)) {
+                dropped += 1;
+                continue;
+            }
+            this.carriedKeys.add(key);
+            if (metric.type === 'counter')
+                this.carryCounter(key, metric, labels);
+            else
+                this.carryHistogram(key, metric, labels);
+        }
+        return dropped;
+    }
+    carryCounter(key, metric, labels) {
+        const existing = this.counters.get(key);
+        if (existing) {
+            existing.value += metric.value;
+            return;
+        }
+        this.counters.set(key, {
+            name: metric.name,
+            labels,
+            value: metric.value,
+            updatedAt: metric.updatedAt ?? this.now(),
+        });
+    }
+    carryHistogram(key, metric, labels) {
+        let point = this.histograms.get(key);
+        if (!point) {
+            const buckets = normalizeBuckets(Object.keys(metric.buckets).map(Number));
+            point = {
+                name: metric.name,
+                labels,
+                buckets,
+                bucketCounts: buckets.map(() => 0),
+                count: 0,
+                sum: 0,
+                updatedAt: metric.updatedAt ?? this.now(),
+            };
+            this.histograms.set(key, point);
+        }
+        point.count += metric.count;
+        point.sum += metric.sum;
+        point.buckets.forEach((bucket, index) => {
+            point.bucketCounts[index] =
+                (point.bucketCounts[index] ?? 0) + (metric.buckets[String(bucket)] ?? 0);
+        });
+    }
+    /** Wait base × 2^(failures − 1), stretched by up to half for jitter, at most maxDelayMs. */
+    backOff(policy) {
+        this.consecutiveFailures += 1;
+        const sample = policy.random();
+        const jitter = Number.isFinite(sample) ? Math.min(1, Math.max(0, sample)) : 0;
+        const doubled = policy.baseDelayMs * 2 ** (this.consecutiveFailures - 1);
+        this.retryAt = this.now() + Math.min(policy.maxDelayMs, doubled * (1 + jitter / 2));
+    }
+    deliveryRecovered() {
+        if (this.consecutiveFailures === 0)
+            return;
+        this.consecutiveFailures = 0;
+        this.retryAt = 0;
+        // A forced flush ended the backoff: the timer waiting for it is too late now.
+        if (this.flushTimer && !this.closed) {
+            this.clearTimer(this.flushTimer);
+            this.scheduleFlush();
+        }
+    }
+    countDropped(reason, points) {
+        this.droppedPoints.set(reason, (this.droppedPoints.get(reason) ?? 0) + points);
+    }
+    takeDroppedPoints() {
+        const points = [...this.droppedPoints].map(([reason, value]) => ({
+            type: 'counter',
+            name: METRICS_CLIENT_DROPPED_POINTS_METRIC,
+            labels: normalizeLabels({ ...this.defaultLabels, reason }),
+            value,
+            updatedAt: this.now(),
+        }));
+        this.droppedPoints.clear();
+        return points;
+    }
+    restoreDroppedPoints(points) {
+        for (const point of points) {
+            const reason = point.labels?.reason;
+            if (point.type === 'counter')
+                this.countDropped(reason, point.value);
+        }
+    }
+    seriesCount() {
+        return this.counters.size + this.gauges.size + this.histograms.size;
     }
     takeSnapshot() {
         const points = [];
+        this.carriedKeys.clear();
         for (const point of this.counters.values()) {
             points.push({
                 type: 'counter',
@@ -326,8 +611,7 @@ export class MetricsClient {
         if (this.counters.has(key) || this.gauges.has(key) || this.histograms.has(key)) {
             return true;
         }
-        const currentSeries = this.counters.size + this.gauges.size + this.histograms.size;
-        if (currentSeries >= this.maxSeries) {
+        if (this.seriesCount() >= this.maxSeries) {
             return false;
         }
         let nameSeries = this.metricNameSeriesCounts.get(name);
@@ -339,21 +623,35 @@ export class MetricsClient {
         return true;
     }
     flushWhenFull() {
-        const series = this.counters.size + this.gauges.size + this.histograms.size;
-        if (series >= this.maxBatchSize) {
-            void this.flush().catch((error) => this.onError?.(error));
+        // A collector reports inside a flush, which sends its points itself.
+        if (this.collecting)
+            return;
+        // One flush at a time: a waiting flush takes these points with its snapshot, and after a
+        // running one the next point, the interval or close() sends them. Queueing one per point
+        // would resend every kept batch per point while the endpoint is down.
+        if (this.flushesPending > 0)
+            return;
+        // Carry-over delivery leaves a backoff alone; the next due flush sends.
+        if (this.carryOver && this.now() < this.retryAt)
+            return;
+        // Carried-over series wait for the next due flush, so an outage never flushes per call.
+        if (this.seriesCount() - this.carriedKeys.size >= this.maxBatchSize) {
+            void this.flushSerialized(false).catch((error) => this.onError?.(error));
         }
     }
     scheduleFlush() {
+        // Backing off, carry-over delivery waits for the backoff instead of the interval.
+        const wait = Math.max(this.flushIntervalMs, this.retryAt - this.now());
         this.flushTimer = this.setTimer(() => {
-            void this.flush()
+            this.flushTimer = undefined;
+            void this.flushSerialized(false)
                 .catch((error) => this.onError?.(error))
                 .finally(() => {
-                if (!this.closed) {
+                if (!this.closed && !this.flushTimer) {
                     this.scheduleFlush();
                 }
             });
-        }, this.flushIntervalMs);
+        }, wait);
         this.flushTimer.unref?.();
     }
 }
@@ -416,6 +714,27 @@ function resolveDesktopDomainUrl(options) {
 }
 function isRetryableError(error) {
     return error instanceof MetricsReportError ? error.retryable : true;
+}
+/**
+ * Carry-over delivery sends again what got no response (network error,
+ * timeout, or an error that is not a report failure) or 429, 502, 503, 504.
+ */
+function isCarryOverRetryable(error) {
+    if (!(error instanceof MetricsReportError))
+        return true;
+    if (error.status === undefined)
+        return error.retryable;
+    return CARRY_OVER_RETRY_STATUSES.has(error.status);
+}
+function carryOverPolicy(delivery) {
+    if (delivery?.mode !== 'carry_over')
+        return undefined;
+    return {
+        maxCarryOverSeries: delivery.maxCarryOverSeries ?? DEFAULT_CARRY_OVER.maxCarryOverSeries,
+        baseDelayMs: delivery.baseDelayMs ?? DEFAULT_CARRY_OVER.baseDelayMs,
+        maxDelayMs: delivery.maxDelayMs ?? DEFAULT_CARRY_OVER.maxDelayMs,
+        random: delivery.random ?? Math.random,
+    };
 }
 function chunk(items, size) {
     const chunks = [];

@@ -6,7 +6,6 @@ export const MAX_EVALUATOR_TAIL_CHARS = 32_000;
 export const MAX_EVALUATOR_TAIL_MESSAGES = 20;
 export const MAX_TRANSCRIPT_FALLBACK_CHARS = 512_000;
 export const MAX_TRANSCRIPT_FALLBACK_MESSAGES = 200;
-const MAX_OBJECTIVE_CHARS = 4_000;
 const MAX_CLAIM_CHARS = 2_000;
 const MAX_CHANGE_CHARS = 4_000;
 const MAX_CHANGE_ITEMS = 100;
@@ -25,11 +24,8 @@ export function assembleVerificationEvidence(input) {
     const changes = extractChanges(messages);
     const indexes = evidenceIndexes(messages);
     const brief = {
-        version: 1,
-        objective: {
-            text: truncate(input.objective, MAX_OBJECTIVE_CHARS),
-            digest: input.objectiveDigest,
-        },
+        version: 2,
+        objective: { digest: input.objectiveDigest },
         claim: truncate(input.claim?.trim() || 'No explicit completion claim was supplied.', MAX_CLAIM_CHARS),
         changes,
         ...(input.baselineRef?.trim() ? { baselineRef: truncate(input.baselineRef.trim(), 128) } : {}),
@@ -37,8 +33,7 @@ export function assembleVerificationEvidence(input) {
         ...indexes,
         coverage: {
             sourceMessageCount: messages.length,
-            briefTruncated: input.objective.length > MAX_OBJECTIVE_CHARS ||
-                (input.claim?.length ?? 0) > MAX_CLAIM_CHARS ||
+            briefTruncated: (input.claim?.length ?? 0) > MAX_CLAIM_CHARS ||
                 (input.baselineRef?.trim().length ?? 0) > 128 ||
                 changes.truncated ||
                 messages.length > MAX_RECENT_TAIL_MESSAGES ||
@@ -91,14 +86,6 @@ function fitBrief(brief) {
     if (serialized.length > MAX_VERIFICATION_BRIEF_CHARS) {
         const overflow = serialized.length - MAX_VERIFICATION_BRIEF_CHARS;
         brief.claim = truncate(brief.claim, Math.max(1, brief.claim.length - overflow));
-        serialized = safeJsonStringify(brief);
-    }
-    if (serialized.length > MAX_VERIFICATION_BRIEF_CHARS) {
-        const overflow = serialized.length - MAX_VERIFICATION_BRIEF_CHARS;
-        brief.objective = {
-            ...brief.objective,
-            text: truncate(brief.objective.text, Math.max(1, brief.objective.text.length - overflow)),
-        };
         serialized = safeJsonStringify(brief);
     }
     if (serialized.length > MAX_VERIFICATION_BRIEF_CHARS) {

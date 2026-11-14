@@ -251,6 +251,8 @@ function readMarketplaceSummary(value) {
         enabled: requireBoolean(record, 'enabled', 'enabled'),
         ...optionalNumberProjection(record, 'category', 'category', 'category'),
         installationPolicy: readInstallationPolicy(record),
+        ...optionalRecommendationProjection(record),
+        ...optionalArrayProjection(record, ['example_queries', 'exampleQueries'], 'exampleQueries', requireStringValue),
     };
 }
 function readInstalledResponse(value) {
@@ -508,6 +510,19 @@ function readPluginTag(value) {
     return {
         key: requireString(record, 'key', 'key'),
         displayName: requireString(record, 'display_name', 'displayName'),
+    };
+}
+/** OFFICIAL ops metadata; absent means not recommendable and no brand keywords. */
+function optionalRecommendationProjection(record) {
+    const value = field(record, 'recommendation', 'recommendation');
+    if (value == null)
+        return {};
+    const recommendation = requireRecord(value, 'Plugin recommendation');
+    return {
+        recommendation: {
+            enabled: requireBoolean(recommendation, 'enabled', 'enabled'),
+            brandKeywords: readArray(recommendation, 'brand_keywords', 'brandKeywords').map(requireStringValue),
+        },
     };
 }
 //# sourceMappingURL=registry-client.js.map

@@ -1,5 +1,6 @@
 import { Worker } from 'node:worker_threads';
-import { mergedPtcLimits, parsePtcToolArgs, PTC_RESULT_TOO_LARGE, ptcResultTooLargeFailure, ptcToolCallLimitRefusal, ptcUnconsumedResultsTooLargeFailure, PtcSerializationError, serializePtcValue, } from '../../execution/ptc/contracts.js';
+import { mergedPtcLimits, parsePtcToolArgs, PTC_RESULT_TOO_LARGE, PTC_STORE_LOAD, ptcResultTooLargeFailure, ptcToolCallLimitRefusal, ptcUnconsumedResultsTooLargeFailure, PtcSerializationError, serializePtcValue, } from '../../execution/ptc/contracts.js';
+import { isScriptMessage, } from './script/records.js';
 import { ptcWorkerUrl } from './worker-path.js';
 /**
  * Shortest wait before the wall clock checks a paused deadline again. The
@@ -10,9 +11,9 @@ const PAUSED_DEADLINE_RECHECK_MS = 1_000;
 /** The host owns time limits, bridge admission and every execution record. */
 export async function executePtcQuickJs(input) {
     const limits = mergedPtcLimits(input.limits);
-    if (new TextEncoder().encode(input.code).byteLength > limits.maxCodeBytes) {
-        return failed('invalid_code', `PTC source exceeds the ${limits.maxCodeBytes}-byte limit.`, false, [{ kind: 'budget_exceeded', budget: 'code' }]);
-    }
+    // No source size pre-check: PTC does not budget program length, so the
+    // Worker starts whatever the caller passed. The heap, compute, wall clock
+    // and bridge limits are what stop a program.
     return await new PtcQuickJsExecution(input, limits).run();
 }
 /** One concrete Worker lifetime; no state is shared with another guest program. */
@@ -37,9 +38,27 @@ class PtcQuickJsExecution {
     maxChildResultBytes = 0;
     /** Children that failed with PTC_RESULT_TOO_LARGE, for the run_code log. */
     oversizedChildren = 0;
+    /** Files the guest imported, in load order; recorded even when it fails. */
+    scriptSources = [];
+    /** Every `import()` attempt in order, successful or refused; memory only. */
+    scriptLoads = [];
     consoleText = '';
     consoleBytes = 0;
     consoleTruncated = false;
+    /** Values this program persisted; undefined until it commits. */
+    storeWrites;
+    /**
+     * The outcome the program itself reached, recorded as soon as it is known.
+     * A stop that lands after the store commit is published cannot undo it, so it
+     * keeps this outcome instead of reporting a cancellation the stored values
+     * would contradict.
+     */
+    guestResult;
+    storeLoads = 0;
+    /** Writes the guest refused, as counted in the Worker. */
+    storeRejected = 0;
+    /** Extra refusals only this host saw (the Worker already refused the rest). */
+    storeHostRejected = 0;
     finished = false;
     acceptingCalls = true;
     stopReason;
@@ -93,11 +112,31 @@ class PtcQuickJsExecution {
         this.stop('wall_clock_exceeded');
     };
     onMessage = (message) => {
-        if (this.ignoreMessage(message))
+        // A teardown diagnostic carries no state and never changes the result, so
+        // it is logged even after a stop or a finished program: the interesting case
+        // is a runtime lost while the program was being torn down.
+        if (message.type === 'diagnostic') {
+            this.logDiagnostic(message);
             return;
+        }
+        // The prelude covers the ignored messages and the script load records.
+        if (this.takePreludeMessage(message))
+            return;
+        if (message.type === 'store_count') {
+            this.readGuestStoreCounts(message);
+            return;
+        }
+        if (message.type === 'store_load' || message.type === 'store_write') {
+            this.handleStoreMessage(message);
+            return;
+        }
+        this.dispatchGuestMessage(message);
+    };
+    /** The state-carrying guest messages, once the prelude has had its say. */
+    dispatchGuestMessage(message) {
         switch (message.type) {
             case 'ready':
-                this.startGuest();
+                this.startWork(this.startGuest());
                 break;
             case 'activity':
                 this.observeComputeActivity(message.active);
@@ -117,29 +156,71 @@ class PtcQuickJsExecution {
                 this.refusedToolCalls += 1;
                 break;
             case 'completed':
-                this.completeGuest(message);
+                this.startWork(this.completeGuest(message));
                 break;
             case 'failed':
-                this.failGuest(message);
+                this.startWork(this.failGuest(message));
                 break;
         }
-    };
-    failGuest(message) {
+    }
+    async failGuest(message) {
         const pending = message.pendingRequestIds.length > 0;
-        this.endGuest({
+        // Recorded before the commit: a stop that arrives while the commit runs has
+        // to know the program had already ended (see stop()).
+        this.guestResult = {
             status: failureStatus(message.error.code),
             error: message.error,
             childCalls: [],
             details: emptyDetails(),
             media: [],
             incomplete: pending,
-        }, pending ? 'guest_finished_with_pending_calls' : undefined);
+        };
+        // Only the program's own throw commits. A cancelled, timed-out,
+        // budget-exceeded or crashed program keeps nothing, and the Worker reports
+        // those through the same message, so the code decides, not the channel.
+        await this.commitStore(message.error.code === 'guest_error');
+        this.endGuest(this.guestResult, pending ? 'guest_finished_with_pending_calls' : undefined);
+    }
+    /**
+     * A QuickJS teardown that failed after the program already produced its
+     * result. Logged so a lost runtime leaves a trace; nothing else changes. The
+     * text is the runtime's own assertion, bounded by the Worker, and carries no
+     * script body and no path.
+     */
+    logDiagnostic(message) {
+        const logContext = this.input.logContext;
+        if (!logContext)
+            return;
+        try {
+            logContext.ptcLogger?.warn?.({
+                session_id: logContext.sessionId,
+                turn_id: logContext.turnId,
+                code: message.code,
+                message: message.message,
+            }, 'ptc runtime dispose failed');
+        }
+        catch {
+            // Diagnostics must not change the run_code result.
+        }
+    }
+    /** Handles the messages the switch does not own; true means nothing is left to dispatch. */
+    takePreludeMessage(message) {
+        if (this.ignoreMessage(message))
+            return true;
+        if (!isScriptMessage(message))
+            return false;
+        this.recordScriptMessage(message);
+        return true;
     }
     ignoreMessage(message) {
         // Console lines printed before a stop are still shown, like the facts of
-        // children that settled before it.
+        // children that settled before it. Store counts are kept for the same
+        // reason: the program really did make those calls before it was stopped.
         return (this.finished ||
-            Boolean(this.stopReason && message.type !== 'activity' && message.type !== 'console'));
+            Boolean(this.stopReason &&
+                message.type !== 'activity' &&
+                message.type !== 'console' &&
+                message.type !== 'store_count'));
     }
     /** The Worker enforces the console budget; this host-side cap holds even if it did not. */
     appendConsole(text, truncated) {
@@ -177,18 +258,150 @@ class PtcQuickJsExecution {
         if (hostCall)
             this.pendingHostCalls.set(work, pending);
     }
-    startGuest() {
+    /**
+     * One source entry per file, so a module imported twice is listed once; the
+     * load record still counts every attempt, because the metric asks how often
+     * `import()` runs, not how many distinct files exist.
+     */
+    recordScriptSource(source) {
+        this.scriptLoads.push({ scope: source.scope, status: 'ok' });
+        if (this.scriptSources.some((known) => known.path === source.path))
+            return;
+        this.scriptSources.push(source);
+    }
+    /** A refusal has no scope: the loader rejects the specifier before it can tell. */
+    recordScriptMessage(message) {
+        if (message.type === 'script_rejected') {
+            this.scriptLoads.push({ scope: 'unknown', status: message.status });
+            return;
+        }
+        this.recordScriptSource(message.source);
+    }
+    async startGuest() {
+        // A rewind or a Fork may have left records of Turns this Session no longer
+        // has; the rebuild happens here, the one awaited point before the program
+        // reads the index.
+        await this.input.store?.prepare();
         this.worker.postMessage({
             type: 'start',
             code: this.input.code,
             toolNames: this.input.bridge.toolNames,
+            ...(this.input.scriptRoots ? { scriptRoots: this.input.scriptRoots } : {}),
+            ...(this.input.directOnlyToolNames?.length
+                ? { directOnlyToolNames: this.input.directOnlyToolNames }
+                : {}),
+            ...(this.input.store ? { storeIndex: this.input.store.index() } : {}),
             limits: {
                 maxHeapBytes: this.limits.maxHeapBytes,
                 maxComputeMs: this.limits.maxComputeMs,
                 maxToolCalls: this.limits.maxToolCalls,
                 maxConsoleBytes: this.limits.maxConsoleBytes,
+                maxBridgeMessageBytes: this.limits.maxBridgeMessageBytes,
             },
         });
+    }
+    /**
+     * Answers one blocked `load`. The Worker is parked on the shared memory, so
+     * the value goes in as bytes and the wait is released; a key the Session no
+     * longer holds answers with the missing marker.
+     */
+    async handleStoreLoad(message) {
+        const control = new Int32Array(message.buffer, 0, 2);
+        if (this.stopReason || this.finished) {
+            this.releaseLoad(control, PTC_STORE_LOAD.stopped, 0);
+            return;
+        }
+        try {
+            const json = await this.input.store?.read(message.key);
+            if (json === undefined) {
+                this.releaseLoad(control, PTC_STORE_LOAD.ready, PTC_STORE_LOAD.missing);
+                return;
+            }
+            const encoded = new TextEncoder().encode(json);
+            const capacity = message.buffer.byteLength - PTC_STORE_LOAD.headerBytes;
+            if (encoded.byteLength > capacity) {
+                // The index said the value was smaller than it is; the program cannot
+                // use a partial value, so it is told the key holds nothing.
+                this.releaseLoad(control, PTC_STORE_LOAD.ready, PTC_STORE_LOAD.missing);
+                return;
+            }
+            new Uint8Array(message.buffer, PTC_STORE_LOAD.headerBytes).set(encoded);
+            this.releaseLoad(control, PTC_STORE_LOAD.ready, encoded.byteLength);
+        }
+        catch {
+            // A read failure must not park the program forever.
+            this.releaseLoad(control, PTC_STORE_LOAD.ready, PTC_STORE_LOAD.missing);
+        }
+    }
+    releaseLoad(control, state, bytes) {
+        Atomics.store(control, 1, bytes);
+        Atomics.store(control, 0, state);
+        Atomics.notify(control, 0);
+    }
+    handleStoreMessage(message) {
+        if (message.type === 'store_load')
+            this.startWork(this.handleStoreLoad(message));
+        else if (message.type === 'store_write')
+            this.stageStoreWrite(message);
+    }
+    /**
+     * The Worker's running `store` / `load` tally. It arrives as the calls happen,
+     * not with the terminal message, so a program that is stopped or killed still
+     * reports what it really did; the values are absolute, so replaying one is
+     * harmless and a terminal message cannot double-count.
+     */
+    readGuestStoreCounts(message) {
+        this.storeLoads = message.loads;
+        this.storeRejected = message.rejected;
+    }
+    /** Stages one guest write; the host store applies the same rules again. */
+    stageStoreWrite(message) {
+        try {
+            this.input.store?.stage({
+                key: message.key,
+                valueJson: message.valueJson,
+                ...(message.desc === undefined ? {} : { desc: message.desc }),
+            });
+        }
+        catch {
+            // A host-side refusal the Worker did not already count; kept apart from
+            // the Worker's own count so a healthy program reports it once.
+            this.storeHostRejected += 1;
+        }
+    }
+    /**
+     * Persists this program's staged writes; only its own end commits them.
+     *
+     * `programEnded` is false for every host stop (cancel, wall clock, compute
+     * budget, Worker crash), which discards instead. The commit itself is also
+     * abandonable: a stop that arrives while the bytes are going out rolls the
+     * write back, so a cancelled result never leaves visible values behind.
+     */
+    async commitStore(programEnded = true) {
+        if (!this.input.store || this.storeWrites)
+            return;
+        if (!programEnded) {
+            this.input.store.discard();
+            return;
+        }
+        try {
+            this.storeWrites = await this.input.store.commit(() => this.isStoreCommitAllowed());
+            // A commit that decided not to publish reports nothing; keep the result
+            // field undefined so the outer result does not claim stored values.
+            this.storeWrites = this.input.store.published();
+        }
+        catch {
+            // A store failure must not change the program's own outcome.
+            this.storeRejected += 1;
+        }
+    }
+    /**
+     * False once this execution stopped or finished; asked before the commit's
+     * bytes go out and again in the same synchronous block that publishes the
+     * index, so a stop either rolls the write back or finds nothing to roll back.
+     */
+    isStoreCommitAllowed() {
+        return !this.stopReason && !this.finished;
     }
     consumeReply(requestId) {
         const bytes = this.pendingReplyBytes.get(requestId);
@@ -203,7 +416,7 @@ class PtcQuickJsExecution {
      * than discarding all of it. Only values the bridge could carry are parsed
      * to validate them; larger ones are only ever shown as a text prefix.
      */
-    completeGuest(message) {
+    async completeGuest(message) {
         const pending = message.pendingRequestIds.length > 0;
         const reason = pending ? 'guest_finished_with_pending_calls' : undefined;
         const valueJson = typeof message.valueJson === 'string' ? message.valueJson : undefined;
@@ -214,11 +427,14 @@ class PtcQuickJsExecution {
                 value = JSON.parse(valueJson);
             }
             catch {
-                this.endGuest(failed('guest_error', 'PTC returned invalid JSON.', pending), reason);
+                this.guestResult = failed('guest_error', 'PTC returned invalid JSON.', pending);
+                this.endGuest(this.guestResult, reason);
                 return;
             }
         }
-        this.endGuest({
+        // Recorded before the commit: a stop that arrives while the commit runs has
+        // to know the program had already ended (see stop()).
+        this.guestResult = {
             status: 'completed',
             value,
             ...(valueJson === undefined ? {} : { valueJson }),
@@ -227,9 +443,18 @@ class PtcQuickJsExecution {
             media: [],
             incomplete: pending,
             ...returnValueDrops(message),
-        }, reason);
+        };
+        await this.commitStore();
+        this.endGuest(this.guestResult, reason);
     }
     endGuest(result, reason) {
+        if (this.stopReason) {
+            // A stop is already in flight and owns the outcome: its own drain decides
+            // between the cancelled result and the program's own (when the store
+            // commit was already published). Finishing here would let a completion
+            // that only just learned it was stopped win the race.
+            return;
+        }
         this.startWork(this.finishAfterDrain(result, reason));
     }
     async finishAfterDrain(result, reason) {
@@ -280,7 +505,14 @@ class PtcQuickJsExecution {
             return;
         this.acceptingCalls = false;
         this.stopReason = reason;
-        this.resultAfterGrace = plannedResult;
+        // A stopped, timed-out or crashed program keeps nothing it stored, unless
+        // its commit was already published: then the values are visible and the
+        // only self-consistent answer is the outcome the program itself reached.
+        // `published()` is set in the same synchronous block as the store's index
+        // update, so this never sees "not stored yet" for values already visible.
+        const stored = this.input.store?.published() ?? this.storeWrites;
+        this.resultAfterGrace = plannedResult ?? (stored ? this.guestResult : undefined);
+        this.input.store?.discard();
         this.controller.abort(reason);
         try {
             this.worker.postMessage({ type: 'stop', reason });
@@ -576,6 +808,11 @@ class PtcQuickJsExecution {
             : [];
         return {
             ...result,
+            ...(this.storeWrites && this.storeWrites.keys.length > 0
+                ? { storeWrites: this.storeWrites }
+                : {}),
+            storeLoads: this.storeLoads,
+            storeRejected: this.storeRejected + this.storeHostRejected,
             refusedToolCalls: this.refusedToolCalls,
             maxChildResultBytes: this.maxChildResultBytes,
             oversizedChildren: this.oversizedChildren,
@@ -600,7 +837,11 @@ class PtcQuickJsExecution {
                     ...this.globalFacts,
                     ...refusalFacts,
                 ].map((fact) => ({ ...fact })),
+                ...(this.scriptSources.length > 0
+                    ? { sources: this.scriptSources.map((source) => ({ ...source })) }
+                    : {}),
             },
+            ...(this.scriptLoads.length > 0 ? { scriptLoads: this.scriptLoads } : {}),
             media: [...childIds.flatMap((id) => this.mediaByChild.get(id) ?? []), ...this.unownedMedia],
         };
     }

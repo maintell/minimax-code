@@ -1,4 +1,11 @@
 /**
+ * Inbound-hub helpers split from `channel-bridge-infra.ts` (file-size
+ * budget). Migration copies (MR1) of the module-level helpers of v1
+ * `channels/infra.ts`; `buildEnqueueChannelContext` is the extracted
+ * channelContext literal of the v1 enqueue call.
+ */
+import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
+/**
  * Translate a non-`allow` `checkChannelAccess` decision into the runner's
  * inbound shape. We deliberately do NOT send a chat reply on `deny`:
  *   - Group hard-block: any reply would surface inside the group, which
@@ -35,7 +42,7 @@ export function channelPrefersZh(platform) {
     return platform !== 'telegram';
 }
 /** Two-stage `/compact` "started" line — sent only when a compaction genuinely begins. */
-export function compactionStartReply(zh) {
+function compactionStartReply(zh) {
     return zh ? '🔄 正在压缩上下文…' : '🔄 Compacting context…';
 }
 /**
@@ -44,7 +51,7 @@ export function compactionStartReply(zh) {
  * failure codes fall back to the generic "unsupported" copy so the sender is
  * never left without feedback.
  */
-export function compactionReply(code, zh) {
+function compactionReply(code, zh) {
     switch (code) {
         case 'OK':
             return zh ? '✨ 上下文已压缩' : '✨ Context compacted.';
@@ -88,6 +95,113 @@ export function enqueueOutcomeFields(queued) {
         ...(queued.ahead !== undefined ? { queueAhead: queued.ahead } : {}),
         ...(queued.position !== undefined ? { queuePosition: queued.position } : {}),
         ...(queued.queueReason ? { queueReason: queued.queueReason } : {}),
+    };
+}
+/** Execute /compact after the ingress hub has authorized the current channel. */
+export async function handleChannelCompactCommand(input) {
+    const { ctx, command, lane, extras } = input;
+    // ── `/compact` handler ──
+    // Out-of-band compaction request for the active session. We do NOT
+    // touch the routing table here — `/compact` runs on whichever session
+    // the route resolver currently points at (typically a branch task
+    // session for short-lived work, or the agent root for the main chat).
+    //
+    // Stages:
+    //   1. resolve route (skip cleanly if blocked / unrouteable),
+    //   2. defensive check: refuse to crash if host omitted
+    //      `requestCompaction` (some test scaffolding + the legacy
+    //      HTTP-only boot path),
+    //   3. invoke the compaction core. The core itself may return
+    //      `SESSION_BUSY` / `UNSUPPORTED` / `SUCCESS` etc. — we mirror
+    //      the code through the localized reply copy.
+    //
+    // Note: `args` here are the user's `/compact <custom instructions>`
+    // payload. Like the dispatcher we log `argsLength` not the contents.
+    const baseFields = {
+        scope: 'channel.slash',
+        op: 'compact',
+        command: 'compact',
+        lane,
+        platform: ctx.platform,
+        clientName: ctx.clientName,
+        chatId: ctx.chatId,
+        senderId: ctx.senderId,
+        argsLength: command.args.length,
+    };
+    const startedAt = Date.now();
+    const route = await input.routeResolver.resolve(ctx);
+    if (route.blocked || !route.sessionId) {
+        logger.warn({
+            ...baseFields,
+            ...(route.agentName ? { agentName: route.agentName } : {}),
+            outcome: 'no_route',
+            durationMs: Date.now() - startedAt,
+        }, 'Channel /compact skipped — route resolver returned blocked or no sessionId');
+        return { handled: true, command: 'compact', reply: 'No active route.', route, lane };
+    }
+    const zh = channelPrefersZh(ctx.platform);
+    // Defensive: host did not wire the compaction core. Never crash the inbound
+    // path — surface the "unsupported" copy so the sender gets feedback.
+    if (!input.requestCompaction) {
+        logger.warn({
+            ...baseFields,
+            agentName: route.agentName,
+            sessionId: route.sessionId,
+            outcome: 'unsupported',
+            durationMs: Date.now() - startedAt,
+        }, 'Channel /compact ignored — host did not wire requestCompaction');
+        return {
+            handled: true,
+            command: 'compact',
+            reply: compactionReply('COMPACTION_UNSUPPORTED', zh),
+            route,
+            sessionId: route.sessionId,
+            lane,
+        };
+    }
+    const customInstructions = command.args.trim() || undefined;
+    const outcome = await input.requestCompaction({
+        sessionId: route.sessionId,
+        agentName: route.agentName,
+        ...(customInstructions ? { customInstructions } : {}),
+        reason: 'im_request',
+        // The two-stage "started" line only fires once the core has passed its
+        // busy/lock guards and is genuinely about to compact. A busy session
+        // returns SESSION_BUSY before this runs, so no "started" line is sent.
+        onStarted: extras.onProgress
+            ? async () => {
+                await extras.onProgress?.(compactionStartReply(zh));
+            }
+            : undefined,
+    });
+    const isSuccess = outcome.code === 'SUCCESS';
+    if (isSuccess) {
+        logger.info({
+            ...baseFields,
+            agentName: route.agentName,
+            sessionId: route.sessionId,
+            outcome: 'ok',
+            compactionCode: outcome.code,
+            durationMs: Date.now() - startedAt,
+        }, 'Channel /compact completed');
+    }
+    else {
+        logger.warn({
+            ...baseFields,
+            agentName: route.agentName,
+            sessionId: route.sessionId,
+            outcome: 'failed',
+            compactionCode: outcome.code,
+            durationMs: Date.now() - startedAt,
+        }, 'Channel /compact did not succeed — surfacing localized reply to sender');
+    }
+    return {
+        handled: true,
+        command: 'compact',
+        reply: compactionReply(outcome.code, zh),
+        route,
+        sessionId: route.sessionId,
+        lane,
     };
 }
 //# sourceMappingURL=channel-inbound-helpers.js.map

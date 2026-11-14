@@ -4,6 +4,7 @@ import { mkdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { generateDefaultWorktreeBranch } from '../../workspace/index.js';
+import { excludeManagedWorktrees } from '../../../infra/git/worktree-exclude.js';
 const execFile = promisify(execFileCallback);
 export class LocalRunLocationError extends Error {
     code;
@@ -105,6 +106,7 @@ async function resolveSafeWorktreeParent(workspaceDir) {
     const workspaceReal = await realpath(workspaceDir);
     const worktreeParentDir = join(workspaceDir, '.worktrees');
     await mkdir(worktreeParentDir, { recursive: true });
+    await excludeManagedWorktrees(workspaceDir);
     const worktreeParentReal = await realpath(worktreeParentDir);
     if (!isPathInside(workspaceReal, worktreeParentReal)) {
         throw new LocalRunLocationError(`Refusing to create worktree outside workspace: ${worktreeParentDir}`, 'RUN_LOCATION_WORKTREE_PARENT_ESCAPES');

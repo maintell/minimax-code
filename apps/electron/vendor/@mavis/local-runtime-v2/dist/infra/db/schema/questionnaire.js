@@ -7,6 +7,8 @@ import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 export const questionnaireRequests = sqliteTable('questionnaire_requests', {
     requestId: text('request_id').primaryKey(),
     sessionId: text('session_id').notNull(),
+    /** v1 migration 21: the asking Agent, nullable on rows from before it was recorded. */
+    agentName: text('agent_name'),
     requestJson: text('request_json').notNull(),
     status: text('status').notNull(),
     createdAt: integer('created_at').notNull(),

@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { normalizeAbortSource } from '@mavis/agent-core/pi-turn-runner';
-import { digestTurnInput } from './turn-input-identity.js';
-import { isUserAuthoredSource } from './message-query-authorship.js';
+import { admissionInput, compactionAdmission, compactionInput, digestTurnInput, hostRequest, isQueueSubmission, submissionProvenance, } from './turn-input-identity.js';
+import { contextResetRoute } from './context-reset/requests.js';
 /** Durable admission, in-process ownership, and AgentHost execution only. */
 export function createTurnExecutionService(options) {
     const nowMs = options.nowMs ?? Date.now;
     const makeTurnId = options.makeTurnId ?? (() => `turn_${randomUUID()}`);
     const pending = new PendingSubmissions();
     const context = { options, nowMs, makeTurnId, pending };
+    const resetContext = contextResetRoute(options, nowMs, makeTurnId);
     return {
         submit: async (input) => {
             const admission = options.controller.tryEnterAdmission();
@@ -39,6 +40,9 @@ export function createTurnExecutionService(options) {
             }
         },
         requestCompaction: async (input) => {
+            const reset = await resetContext?.(input);
+            if (reset)
+                return reset;
             const admission = options.controller.tryEnterAdmission();
             if (!admission)
                 return runtimeDrainingRejection();
@@ -273,12 +277,25 @@ async function isOwnedByOtherRuntime(options, sessionId) {
  */
 class PendingSubmissions {
     submissions = new Set();
-    enroll(sessionId, turnId) {
-        const submission = { sessionId, turnId, stopped: false };
+    enroll(sessionId, turnId, signal) {
+        const submission = {
+            sessionId,
+            turnId,
+            stopped: signal?.aborted === true,
+        };
+        if (signal && !signal.aborted) {
+            const onAbort = () => {
+                submission.stopped = true;
+                submission.onStop?.();
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+            submission.cleanupSignal = () => signal.removeEventListener('abort', onAbort);
+        }
         this.submissions.add(submission);
         return submission;
     }
     release(submission) {
+        submission.cleanupSignal?.();
         this.submissions.delete(submission);
     }
     /** An abort without a `turnId` stops whatever this Session is currently starting. */
@@ -420,12 +437,17 @@ async function waitForHandoffDrain(drained) {
 async function submitTurn(context, input, policy = {}, pendingSubmission) {
     const { options } = context;
     const turnId = input.requestedTurnId ?? context.makeTurnId();
-    const submission = pendingSubmission ?? context.pending.enroll(input.sessionId, turnId);
+    const submission = pendingSubmission ??
+        context.pending.enroll(input.sessionId, turnId, !isQueueSubmission(input) ? input.signal : undefined);
     try {
+        if (submission.stopped)
+            return STOPPED_BEFORE_ADMISSION;
         // Enroll before the first asynchronous check so an early stop is not lost.
         const unavailable = await sessionUnavailable(options, input.sessionId);
         if (unavailable)
             return unavailable;
+        if (submission.stopped)
+            return STOPPED_BEFORE_ADMISSION;
         const admission = await admitTurnWithSubmissionPreparation({
             options,
             input,
@@ -733,206 +755,10 @@ async function sessionUnavailable(options, sessionId) {
     }
     return undefined;
 }
-function admissionInput(input, values) {
-    const base = admissionBase(input, values);
-    if (isQueueSubmission(input)) {
-        return {
-            ...base,
-            priority: queueAdmissionPriority(input, values.candidateCreatedAtMs),
-            queueIngress: input.ingress,
-            ...(input.ingress.clientRequestId ? { clientRequestId: input.ingress.clientRequestId } : {}),
-            ...(input.ingress.clientRequestId && input.ingress.receiptAliases?.length
-                ? { receiptAliases: input.ingress.receiptAliases }
-                : {}),
-        };
-    }
-    return {
-        ...base,
-        priority: directAdmissionPriority(input, values.candidateCreatedAtMs),
-        ...(input.resume ? { userInputResume: input.resume } : {}),
-        ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}),
-        ...(input.clientRequestId && input.receiptAliases?.length
-            ? { receiptAliases: input.receiptAliases }
-            : {}),
-    };
-}
-function admissionBase(input, values) {
-    const foreground = isForegroundTurn(input);
-    return {
-        sessionId: input.sessionId,
-        turnId: values.turnId,
-        busyReason: 'turn',
-        inputDigest: digestTurnInput(input.input, input.clientIntent),
-        inputMetadata: {
-            ...metadata(input.input),
-            source: isQueueSubmission(input) ? input.ingress.provenance.source : input.provenance.source,
-        },
-        candidateCreatedAtMs: values.candidateCreatedAtMs,
-        ...genuineUserAdmission(input),
-        ...(foreground ? { foreground: true } : {}),
-        ...(consumesQueuePause(input, foreground) ? { consumeQueuePause: true } : {}),
-        ...(input.clientIntent ? { clientIntent: input.clientIntent } : {}),
-        ...(values.bypassPriorityFence ? { bypassPriorityFence: true } : {}),
-        ...(values.bypassSessionMutation ? { bypassSessionMutation: true } : {}),
-    };
-}
-function queueAdmissionPriority(input, candidateCreatedAtMs) {
-    if (input.queueSelection === 'exact') {
-        return { kind: 'selected-queue-item', queueClaimId: input.ingress.claimId };
-    }
-    // An exact claim already bypasses queue order, so the yield only has to reach
-    // the two fenced selections.
-    const yielded = input.yieldedQueueItemIds && input.yieldedQueueItemIds.length > 0
-        ? { yieldedQueueItemIds: input.yieldedQueueItemIds }
-        : {};
-    if (input.queueSelection === 'continued-fifo') {
-        return { kind: 'continued-queue-head', queueClaimId: input.ingress.claimId, ...yielded };
-    }
-    return { kind: 'fifo', candidateCreatedAtMs, queueClaimId: input.ingress.claimId, ...yielded };
-}
-function directAdmissionPriority(input, candidateCreatedAtMs) {
-    if (input.admissionPriority)
-        return input.admissionPriority;
-    if (isPausedQueueSend(input.clientIntent))
-        return { kind: 'paused-queue-send' };
-    return { kind: 'fifo', candidateCreatedAtMs };
-}
-function consumesQueuePause(input, foreground) {
-    if (isQueueSubmission(input))
-        return input.queueSelection === 'continued-fifo';
-    return (foreground &&
-        input.clientIntent !== 'retry-continuation' &&
-        input.clientIntent !== 'cloud-handoff');
-}
-function isForegroundTurn(input) {
-    if (!isQueueSubmission(input)) {
-        if (input.executionMode === 'continuation')
-            return true;
-        if (input.resume)
-            return false;
-        if (isPausedQueueSend(input.clientIntent))
-            return true;
-    }
-    const source = submissionProvenance(input).source;
-    return source === 'conversation-mutation' || isUserAuthoredSource(source);
-}
-function isPausedQueueSend(clientIntent) {
-    return clientIntent === 'paused-queue-keep' || clientIntent === 'paused-queue-clear';
-}
-function genuineUserAdmission(input) {
-    return isGenuineUserMessage(input) ? { genuineUserMessage: true } : {};
-}
-function isGenuineUserMessage(input) {
-    if (input.genuineUserQueryText.length > 0)
-        return true;
-    if (!input.input.attachments?.length)
-        return false;
-    const source = isQueueSubmission(input)
-        ? input.ingress.provenance.source
-        : input.provenance.source;
-    return isUserAuthoredSource(source);
-}
-function compactionAdmission(input, turnId, candidateCreatedAtMs) {
-    return {
-        sessionId: input.sessionId,
-        turnId,
-        busyReason: 'compaction',
-        inputDigest: digestTurnInput({
-            text: input.reason ?? '',
-            origin: input.customInstructions ?? '',
-        }),
-        inputMetadata: { attachmentCount: 0, hasContent: Boolean(input.reason) },
-        candidateCreatedAtMs,
-        priority: { kind: 'fifo', candidateCreatedAtMs },
-    };
-}
-function compactionInput(lease, input) {
-    return {
-        lease,
-        ...(input.reason ? { reason: input.reason } : {}),
-        ...(input.customInstructions ? { customInstructions: input.customInstructions } : {}),
-    };
-}
-function hostRequest(input) {
-    const common = commonHostRequest(input);
-    if (isQueueSubmission(input)) {
-        const userMessageId = queueUserMessageId(input);
-        return {
-            ...common,
-            provenance: input.ingress.provenance,
-            queueItemIds: [input.ingress.itemId],
-            ...(input.ingress.clientRequestId ? { clientRequestId: input.ingress.clientRequestId } : {}),
-            ...(userMessageId ? { userMessageId } : {}),
-        };
-    }
-    return {
-        ...common,
-        provenance: input.provenance,
-        ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}),
-        ...(input.userMessageId ? { userMessageId: input.userMessageId } : {}),
-        ...(input.executionMode ? { executionMode: input.executionMode } : {}),
-    };
-}
-function commonHostRequest(input) {
-    return {
-        input: input.input,
-        ...(!isQueueSubmission(input) && input.outputContract
-            ? { outputContract: input.outputContract }
-            : {}),
-        ...(!isQueueSubmission(input) && input.executionDeadlineAtMs !== undefined
-            ? { executionDeadlineAtMs: input.executionDeadlineAtMs }
-            : {}),
-        ...(input.immediateSendBatch
-            ? {
-                immediateSendBatch: {
-                    id: input.immediateSendBatch.id,
-                    members: input.immediateSendBatch.members.map((member) => ({
-                        input: {
-                            text: member.message.content,
-                            attachments: member.message.attachments,
-                            ...(member.message.quotedMessage
-                                ? { quotedMessage: member.message.quotedMessage }
-                                : {}),
-                        },
-                        genuineUserQueryText: member.message.displayContent ?? member.message.content,
-                        userMessageId: member.userMessageId,
-                        messageKey: member.messageKey,
-                        createdAt: member.createdAt,
-                        provenance: member.provenance,
-                    })),
-                },
-            }
-            : {}),
-        genuineUserQueryText: input.genuineUserQueryText,
-        ...(input.inputSafetyDecision ? { inputSafetyDecision: input.inputSafetyDecision } : {}),
-        ...(input.requiresInputReview ? { requiresInputReview: true } : {}),
-        ...(input.clientIntent ? { clientIntent: input.clientIntent } : {}),
-    };
-}
-function queueUserMessageId(input) {
-    if (input.userMessageId &&
-        input.ingress.userMessageId &&
-        input.userMessageId !== input.ingress.userMessageId) {
-        throw new Error('Queue user message identity changed before AgentHost execution');
-    }
-    return input.userMessageId ?? input.ingress.userMessageId;
-}
-function isQueueSubmission(input) {
-    return 'ingress' in input;
-}
-function submissionProvenance(input) {
-    return isQueueSubmission(input) ? input.ingress.provenance : input.provenance;
-}
 function rejection(input) {
     if (input.status === 'duplicate') {
         return { accepted: false, reason: 'duplicate', turnId: input.turnId };
     }
     return { accepted: false, reason: input.reason };
-}
-function metadata(input) {
-    return {
-        attachmentCount: input.attachments?.length ?? 0,
-        hasContent: input.text.length > 0,
-    };
 }
 //# sourceMappingURL=turn-execution.service.js.map

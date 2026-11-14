@@ -1,6 +1,6 @@
 import { streamSimple } from '@earendil-works/pi-ai';
 import { LLM_RETRY_CALL_IDENTITY } from '@mavis/agent-core/pi-turn-runner';
-import { createDefaultTokenEstimator, resolveDynamicMaxTokens } from '@mavis/context-manager';
+import { createDefaultTokenEstimator, resolveCompactionTokenBudget, resolveDynamicMaxTokens, } from '@mavis/context-manager';
 const MIN_OUTPUT_TOKENS = 1_024;
 const EMERGENCY_OUTPUT_TOKENS = 1;
 const PI_DEFAULT_THINKING_BUDGETS = {
@@ -18,6 +18,16 @@ function estimatePiContextTokens(context) {
     const toolTokens = (context.tools ?? []).reduce((tokens, tool) => tokens +
         estimator.estimateTextTokens([tool.name ?? '', tool.description ?? '', safeJson(tool.parameters)].join('\n')), 0);
     return estimator.estimateMessages(messages) + systemTokens + toolTokens;
+}
+/**
+ * Hard input admission limit of a model window, the same value automatic
+ * compaction and reminder admission use for a request to that model.
+ */
+export function resolveProviderInputLimit(input) {
+    return resolveCompactionTokenBudget({
+        contextWindow: input.contextWindow,
+        configuredMaxOutputTokens: input.maxOutputTokens,
+    }).providerInputLimit;
 }
 /**
  * Keeps the v2 provider request consistent with the 16k reserve used by its

@@ -1,5 +1,5 @@
 import { detectReferencedOfficialHostCapabilityPlugins } from './local-turn-plugin-capabilities.js';
-import { createCanonicalAgentHostSteeringInput, createCanonicalAgentHostUserInput, } from '../canonical-user-input.js';
+import { createCanonicalAgentHostSteeringInput, createCanonicalAgentHostUserInput, isUserAuthoredSource, } from '../canonical-user-input.js';
 import { createBackgroundTaskHostMetadata } from '../history/background/host-metadata.js';
 import { assertAgentHostCapabilityAvailable } from '../empty-dependencies.js';
 import { messagesCarrySessionId } from '../compaction/session-identity.js';
@@ -38,6 +38,7 @@ export class LocalTurnInputPreparer {
         const attachmentBlock = buildAttachmentReminder(attachments, selectedMedia.inlinedKeys, capabilities, selectedMedia.dimensionNotes);
         const skillBlock = buildSlashSkillReminder(canonicalUserInput, input.preparation.agentConfig);
         const channelContext = canonicalUserInput.messages.find((message) => message.channelContext)?.channelContext;
+        const agentKind = await this.classifyAgentKind(input.session);
         return {
             ...(batchInputs
                 ? {
@@ -68,12 +69,25 @@ export class LocalTurnInputPreparer {
                 ...backgroundTaskOrigin(canonicalUserInput.messages),
             },
             caller: mapCaller(input.provenance.source, channelContext),
+            ...(agentKind ? { agentKind } : {}),
             browserAssets: toBrowserAssets(attachments),
             reminderBlocks: [systemBlock, attachmentBlock, skillBlock].filter((block) => Boolean(block)),
             loadBackgroundReminder: async () => validateBackgroundReminder(await this.options.reminders.buildBackground({ session: input.session })),
             ...(channelContext ? { channelContext } : {}),
             ...(system.diagnostic !== undefined ? { systemReminderDiagnostic: system.diagnostic } : {}),
         };
+    }
+    /** The host's `agentKind` classification; never fails the Turn. */
+    async classifyAgentKind(session) {
+        const resolveAgentKind = this.options.resolveAgentKind;
+        if (!resolveAgentKind)
+            return undefined;
+        try {
+            return await resolveAgentKind(session);
+        }
+        catch {
+            return undefined;
+        }
     }
     async prepareInitialPromptBatch(input, projectAgentReferences) {
         const batchInputs = input.immediateSendBatch?.members.map((member) => createCanonicalAgentHostUserInput({
@@ -265,12 +279,6 @@ function shouldProjectUserMessage(message, index, genuineUserQueryText) {
         return false;
     return index > 0 || genuineUserQueryText.length > 0;
 }
-function isUserAuthoredSource(source) {
-    return (source === 'api' ||
-        source === 'code_review' ||
-        source === 'channel' ||
-        source.startsWith('channel:'));
-}
 async function resolveProjectedAgentReference(projection, requestRef) {
     return await projection.resolveAgentReference(requestRef);
 }
@@ -329,7 +337,18 @@ function peerSessionEnvelope(messages, text) {
         ...(device ? [`from_device="${escapeXmlAttribute(device)}"`] : []),
     ];
     const envelope = `<cross-session-message ${attributes.join(' ')}>\n${neutralizeEnvelope(text)}\n</cross-session-message>`;
-    return origin.remote === true ? `${envelope}\n${REMOTE_SENDER_REPLY_NOTE}` : envelope;
+    return origin.remote === true
+        ? `${envelope}\n${REMOTE_SENDER_REPLY_NOTE}`
+        : `${envelope}\n${localSenderReplyNote(origin.fromSession)}`;
+}
+/**
+ * Local sessions answer each other by sending back, so the receiver has to be
+ * told the answer does not travel on its own. The last sentence stops the
+ * acknowledgement ping-pong the 2026-11 cross-session eval (M3.1-Flash, M78)
+ * saw: a reply is itself a cross-session message and carries this note too.
+ */
+function localSenderReplyNote(fromSession) {
+    return `If this message needs an answer, send it with session send to session_id ${fromSession}; text you write here does not reach the sender. Do not send thanks or acknowledgments.`;
 }
 /** A remote sender cannot be reached from this runtime; its reply is read back from here. */
 const REMOTE_SENDER_REPLY_NOTE = 'The sender is a session on another device, so session send cannot reach it. Reply directly in this conversation; the sender reads your reply from here.';

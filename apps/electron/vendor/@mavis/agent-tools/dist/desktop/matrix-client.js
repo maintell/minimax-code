@@ -59,16 +59,24 @@ export class DesktopMatrixClient {
         return normalizeMatrixToolResponse(response);
     }
     async postGatewayJson(pathname, body, signal, timeoutMs) {
+        return this.requestGatewayJson({ method: 'POST', pathname, body, signal, timeoutMs });
+    }
+    /** Reads a JSON document from the same backend, e.g. an archon_biz config endpoint. */
+    async getGatewayJson(pathname, signal, timeoutMs) {
+        return this.requestGatewayJson({ method: 'GET', pathname, signal, timeoutMs });
+    }
+    async requestGatewayJson(request) {
+        const { method, pathname, body, signal, timeoutMs } = request;
         const requestTimeoutMs = timeoutMs ?? this.timeoutMs;
         const scoped = createScopedAbortSignal(signal, requestTimeoutMs);
         try {
             const init = {
-                method: 'POST',
+                method,
                 headers: {
-                    ...this.buildHeaders({ 'Content-Type': 'application/json' }),
+                    ...this.buildHeaders(body ? { 'Content-Type': 'application/json' } : {}),
                     ...(this.managedEndpoint ? (this.routingHeadersGetter?.() ?? {}) : {}),
                 },
-                body: JSON.stringify(body),
+                ...(body ? { body: JSON.stringify(body) } : {}),
                 signal: scoped.signal,
             };
             const dispatcher = buildLongRequestDispatcher(requestTimeoutMs, this.dispatcherFactory);

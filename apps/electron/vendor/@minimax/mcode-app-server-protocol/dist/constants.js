@@ -71,6 +71,14 @@ export const APP_SERVER_DESKTOP_SERVICE_CAPABILITIES = {
  */
 export const APP_SERVER_FEATURE_PROJECT_ICON_UPDATE = 'project.icon.update';
 /**
+ * Per-Session advisor model selection through DesktopService `SelectAdvisorModel`,
+ * `ListModelsResp.advisor` and `SessionInfoView.advisor`. Declared only when the
+ * app-server's package ships the advisor (`beta.advisor`, internal-only), so it is not
+ * part of the static `APP_SERVER_FEATURES`. Desktop reads the same value as
+ * `RUNTIME_FEATURE_SESSION_ADVISOR`.
+ */
+export const APP_SERVER_FEATURE_SESSION_ADVISOR = 'session.advisor';
+/**
  * Additive business features declared in `initialize.capabilities.features`.
  * New features extend this list without changing the protocol version.
  */

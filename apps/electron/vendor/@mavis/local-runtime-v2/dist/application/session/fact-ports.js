@@ -10,13 +10,20 @@ export function createCommittedModelProviderSessionPort(input) {
             input.onCommittedUpdate(updated, notice?.replacedFrom);
             return updated;
         },
+        // SessionInfo carries the advisor selection, so clients refresh the Session on the same event.
+        updateAdvisor: async (sessionId, advisor) => {
+            const updated = await input.update(sessionId, { advisor });
+            input.onCommittedUpdate(updated);
+            return updated;
+        },
     };
 }
 export function publishSessionCompactionFact(publish, fact) {
+    const display = fact.display === false ? { display: false } : {};
     if (fact.kind === 'started') {
         publish({
             type: 'session.compaction.started',
-            payload: { sessionId: fact.sessionId, compactionId: fact.attemptId },
+            payload: { sessionId: fact.sessionId, compactionId: fact.attemptId, ...display },
         });
         return;
     }
@@ -31,6 +38,7 @@ export function publishSessionCompactionFact(publish, fact) {
                 tokensBefore: fact.tokensBefore,
                 tokensAfter: fact.tokensAfter,
                 ...(fact.tokenUsage === undefined ? {} : { tokenUsage: fact.tokenUsage }),
+                ...display,
             },
         });
         return;
@@ -41,6 +49,7 @@ export function publishSessionCompactionFact(publish, fact) {
             sessionId: fact.sessionId,
             compactionId: fact.attemptId,
             ...(fact.tokenUsage === undefined ? {} : { tokenUsage: fact.tokenUsage }),
+            ...display,
         },
     });
 }

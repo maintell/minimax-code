@@ -72,7 +72,10 @@
  *
  * cmd dedupe: 5-min LRU on command owner + cmd.id — a duplicate re-sends the cached ack/err
  * and never re-invokes downstream (protocol §5; prevents double send/create).
- * While the original is still in flight the duplicate is dropped (logged).
+ * While the original is still in flight the duplicate is dropped (logged). A
+ * reply too large to cache leaves only a "completed" marker: read-only
+ * commands re-run, everything else is answered with PAYLOAD_TOO_LARGE so the
+ * phone fails fast instead of waiting for the gateway's ack timeout.
  *
  * Failures map to err.<domain>.<action> {code, message, retryable} with
  * in_reply_to = cmd.id; codes are UPPER_SNAKE domain codes aligned to the
@@ -80,10 +83,41 @@
  * DAEMON_UNAVAILABLE, …).
  */
 import { ackTypeForCmd, errTypeForCmd, makeFrame } from './frame-codec.js';
+import { boundHistoryPage, isPayload, truncationNotice } from './session-history-bounds.js';
 /** V1 agent scoping (plan §4 defaultAgent): list/create fall to 'mavis'. */
 export const DEFAULT_AGENT_NAME = 'mavis';
 export const CMD_DEDUP_TTL_MS = 5 * 60 * 1000;
 export const CMD_DEDUP_MAX_ENTRIES = 512;
+/**
+ * Largest ack/err frame (encoded UTF-8 bytes) the dedupe cache keeps verbatim.
+ *
+ * Anything bigger only leaves a "completed" marker: caching a whole
+ * `cmd.session.history` page kept the Electron main process holding ~76MB per
+ * reply (audit 2026-11-07), and 512 unbounded entries reached ~1.5GB before
+ * V8 OOM. The marker still answers "did this command already run?" so a
+ * reconnect duplicate never replays a side effect.
+ */
+export const REPLY_CACHE_MAX_FRAME_BYTES = 64 * 1024;
+export { RC_HISTORY_PAGE_MAX_BYTES, RC_HISTORY_TOOL_FIELD_MAX_BYTES, } from './session-history-bounds.js';
+/**
+ * Commands whose ack is a pure read of local-runtime state. Only these may be
+ * re-executed when a duplicate arrives for a reply too large to cache — the
+ * re-run has no side effect, so protocol §5 dedupe still holds. Everything
+ * else (send / new / stop / permission.respond / pin / reorder / update /
+ * delete) is answered with PAYLOAD_TOO_LARGE instead: the side effect must not
+ * be replayed, but the phone must not be left waiting for the gateway's ack
+ * timeout either.
+ */
+const READ_ONLY_COMMAND_TYPES = new Set([
+    'cmd.session.list',
+    'cmd.session.history',
+    'cmd.session.get',
+    'cmd.workspace.list',
+    'cmd.model.list',
+    'cmd.projects.list',
+    'cmd.pinned.list',
+    'cmd.skill.list',
+]);
 /** Synthetic origin for in-process Requests — routing is pathname-only. */
 const LOCAL_ORIGIN = 'http://rc-bridge.local';
 const DESKTOP_API = '/minimax-desktop/api/v1';
@@ -94,29 +128,72 @@ const RC_FILE_CONTENT_MAX_BYTES_HEADER = 'X-MCode-Remote-Control-File-Content-Ma
 const ROUTE_HEADER_ALLOWLIST = new Set([RC_FILE_CONTENT_MAX_BYTES_HEADER.toLowerCase()]);
 export function createCommandRouter(deps) {
     const nowMs = deps.nowMs ?? Date.now;
-    // owner + cmd.id → cached reply frame (ack or err), 5min TTL LRU (Map keeps
-    // insertion order; refreshed entries are re-inserted at the tail).
+    // owner + cmd.id → cached reply, 5min TTL LRU (Map keeps insertion order;
+    // refreshed entries are re-inserted at the tail). Small replies keep the
+    // whole frame; oversized ones keep only the "already completed" fact.
     const replyCache = new Map();
     const inFlight = new Set();
-    function cacheReply(cmdId, frame) {
-        replyCache.delete(cmdId);
-        replyCache.set(cmdId, { frame, expiresAtMs: nowMs() + CMD_DEDUP_TTL_MS });
+    /** Sum of `bytes` over every cached frame — reported on evict/purge. */
+    let cachedFrameBytes = 0;
+    function forgetEntry(key) {
+        const entry = replyCache.get(key);
+        if (!entry)
+            return undefined;
+        replyCache.delete(key);
+        if (entry.kind === 'frame')
+            cachedFrameBytes -= entry.bytes;
+        return entry;
+    }
+    /**
+     * Drop TTL-expired entries oldest-first. Every entry shares one TTL, so
+     * insertion order is also expiry order and the scan can stop at the first
+     * live entry. Called on each write because expiry was previously only
+     * observed when the same cmd.id came back — i.e. effectively never.
+     */
+    function purgeExpiredEntries() {
+        const now = nowMs();
+        let purged = 0;
+        for (const [key, entry] of replyCache) {
+            if (entry.expiresAtMs > now)
+                break;
+            forgetEntry(key);
+            purged += 1;
+        }
+        return purged;
+    }
+    function cacheReply(commandKey, frame) {
+        const purged = purgeExpiredEntries();
+        // Encoded size is the cache criterion, so measure the frame exactly as
+        // frame-codec would. One transient serialization per reply; the bounded
+        // page size from RC_HISTORY_PAGE_MAX_BYTES keeps that copy small.
+        const bytes = Buffer.byteLength(JSON.stringify(frame), 'utf8');
+        forgetEntry(commandKey);
+        replyCache.set(commandKey, bytes <= REPLY_CACHE_MAX_FRAME_BYTES
+            ? { kind: 'frame', frame, bytes, expiresAtMs: nowMs() + CMD_DEDUP_TTL_MS }
+            : { kind: 'completed', expiresAtMs: nowMs() + CMD_DEDUP_TTL_MS });
+        if (bytes <= REPLY_CACHE_MAX_FRAME_BYTES)
+            cachedFrameBytes += bytes;
+        let evicted = 0;
         while (replyCache.size > CMD_DEDUP_MAX_ENTRIES) {
             const oldest = replyCache.keys().next().value;
             if (oldest === undefined)
                 break;
-            replyCache.delete(oldest);
+            forgetEntry(oldest);
+            evicted += 1;
+        }
+        if (purged > 0 || evicted > 0) {
+            deps.logger.info(`[rc.router] event=reply_cache_evict purged=${purged} evicted=${evicted} entries=${replyCache.size} cached_bytes=${cachedFrameBytes}`);
         }
     }
-    function cachedReply(cmdId) {
-        const entry = replyCache.get(cmdId);
+    function cachedReply(commandKey) {
+        const entry = replyCache.get(commandKey);
         if (!entry)
             return undefined;
         if (entry.expiresAtMs <= nowMs()) {
-            replyCache.delete(cmdId);
+            forgetEntry(commandKey);
             return undefined;
         }
-        return entry.frame;
+        return entry.kind === 'frame' ? { kind: 'frame', frame: entry.frame } : { kind: 'completed' };
     }
     return {
         async handleCommand(cmd, reply, context) {
@@ -142,16 +219,44 @@ export function createCommandRouter(deps) {
                 outcome: 'started',
             });
             const cached = cachedReply(commandKey);
-            if (cached) {
+            if (cached?.kind === 'frame') {
                 logRcCase(deps.logger, 'info', {
                     ...caseBase,
                     stage: 'command_deduplicated',
                     outcome: 'cached_reply',
                     elapsed_ms: Math.max(0, nowMs() - startedAtMs),
                 });
-                deps.logger.info(`[rc.router] duplicate cmd id=${cmd.id} → re-sending cached ${cached.type}`);
-                reply(cached);
+                deps.logger.info(`[rc.router] duplicate cmd id=${cmd.id} → re-sending cached ${cached.frame.type}`);
+                reply(cached.frame);
                 return;
+            }
+            if (cached?.kind === 'completed') {
+                // The original reply was too large to keep. A read-only command can
+                // simply run again; anything else must not replay its side effects,
+                // but it still owes the phone an answer — staying silent leaves it
+                // waiting for RGW's ack timeout and then re-issuing the same command.
+                if (!isReadOnlyCommand(cmd)) {
+                    logRcCase(deps.logger, 'warn', {
+                        ...caseBase,
+                        stage: 'command_deduplicated',
+                        outcome: 'completed_drop',
+                        elapsed_ms: Math.max(0, nowMs() - startedAtMs),
+                    });
+                    deps.logger.warn(`[rc.router] duplicate cmd id=${cmd.id} type=${cmd.type} completed earlier with an oversized reply → answered PAYLOAD_TOO_LARGE (no cached frame, side effects never replayed)`);
+                    reply(makeFrame(errTypeForCmd(cmd.type), {
+                        code: 'PAYLOAD_TOO_LARGE',
+                        message: 'the command already ran; its reply was too large to keep, refresh to read the result',
+                        retryable: false,
+                    }, { inReplyTo: cmd.id, traceId }));
+                    return;
+                }
+                logRcCase(deps.logger, 'info', {
+                    ...caseBase,
+                    stage: 'command_deduplicated',
+                    outcome: 'completed_reexecute',
+                    elapsed_ms: Math.max(0, nowMs() - startedAtMs),
+                });
+                deps.logger.info(`[rc.router] duplicate cmd id=${cmd.id} type=${cmd.type} completed earlier with an oversized reply → re-running read-only command`);
             }
             if (inFlight.has(commandKey)) {
                 logRcCase(deps.logger, 'warn', {
@@ -273,6 +378,18 @@ export function createCommandRouter(deps) {
             }
         },
     };
+}
+/**
+ * True when re-running `cmd` is observationally free: the switch-driven read
+ * commands, plus any generic-channel route whose HTTP method cannot mutate.
+ * Drives the oversized-reply duplicate policy (see REPLY_CACHE_MAX_FRAME_BYTES).
+ */
+function isReadOnlyCommand(cmd) {
+    if (cmd.route) {
+        const method = cmd.route.method.toUpperCase();
+        return method === 'GET' || method === 'HEAD';
+    }
+    return READ_ONLY_COMMAND_TYPES.has(cmd.type);
 }
 async function dispatch(deps, cmd, context) {
     const payload = cmd.payload ?? {};
@@ -485,14 +602,22 @@ async function sessionHistory(deps, cmd, payload) {
     const response = await invokeLocal(deps, cmd, new Request(url));
     if (!response.ok)
         return { kind: 'err', err: await toErrShape(response, 'session') };
-    const body = await readJson(response);
-    const messages = Array.isArray(body.messages) ? body.messages : [];
-    deps.logger.info(`[rc.router] ${cmd.type} id=${cmd.id} route=${routeForLog(url)} status=${response.status} count=${messages.length}`);
+    // Read the body as text: the untruncated page size is then free
+    // (Buffer.byteLength allocates nothing), instead of costing a second full
+    // serialization of the message array just for the original_bytes log field.
+    const rawBody = await response.text();
+    const body = parseJsonPayload(rawBody);
+    const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+    const originalBytes = Buffer.byteLength(rawBody, 'utf8');
+    const bounded = boundHistoryPage(rawMessages, truncationNotice(deps.getAppLocale?.()));
+    deps.logger.info(`[rc.router] ${cmd.type} id=${cmd.id} route=${routeForLog(url)} status=${response.status} count=${bounded.messages.length} bytes=${bounded.bytes} truncated_fields=${bounded.truncatedFields} dropped_messages=${bounded.droppedMessages} original_bytes=${originalBytes}`);
     // GetMessages pages come back ascending/chronological — the sqlite reader
     // (listDisplayMessageRows) selects newest-first then reverses, and sets
     // its own nextCursor to messages[0].msg_id. So the page's oldest row is
     // messages[0]; its msg_id is the IDL oldest_msg_id (next before_msg_id).
-    const first = messages[0];
+    // Bounding only ever drops from that oldest end, so the cursor keeps
+    // pointing at a real row and the phone's next `before` page loses nothing.
+    const first = bounded.messages[0];
     const oldestMsgId = first && typeof first === 'object' && !Array.isArray(first)
         ? (readString(first.msg_id) ?? readString(first.msgId))
         : undefined;
@@ -501,12 +626,23 @@ async function sessionHistory(deps, cmd, payload) {
         payload: {
             // AgentMessageProtocol[] passed through verbatim — rgw re-embeds
             // messages_json byte-for-byte into `messages`; individual message
-            // objects are never reshaped here.
-            messages_json: JSON.stringify(messages),
-            has_more: readBoolean(body.has_more) ?? readBoolean(body.hasMore) ?? false,
+            // objects are never reshaped here, only bounded in size.
+            messages_json: bounded.messagesJson,
+            has_more: bounded.droppedMessages > 0
+                ? true
+                : (readBoolean(body.has_more) ?? readBoolean(body.hasMore) ?? false),
             oldest_msg_id: oldestMsgId ?? '',
         },
     };
+}
+function parseJsonPayload(text) {
+    try {
+        const parsed = JSON.parse(text);
+        return isPayload(parsed) ? parsed : {};
+    }
+    catch {
+        return {};
+    }
 }
 // ─── 3. cmd.session.send (SSE; disposition sent|queued) ────────────────
 async function sessionSend(deps, cmd, payload) {
@@ -1674,9 +1810,6 @@ function toDesktopAttachment(file, sourceMeta) {
             file_path: file.filePath,
         },
     };
-}
-function isPayload(value) {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 /** Downloaded attachment → legacy /mavis/api flat, dual-alias wire. */
 function toLegacyAttachment(file) {

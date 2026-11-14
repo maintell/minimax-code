@@ -1,6 +1,7 @@
 import { getConfig } from '@mavis/config';
 import { LocalRuntimeApiHost } from './host.js';
 import { copyV2LayoutMigrationReceipt } from '../../infra/legacy-db/v2-migration.js';
+import { withEffectiveBunnyConfig } from '../../infra/config/effective-bunny.js';
 import { withEffectivePromptSuggestionConfig } from '../../infra/config/effective-prompt-suggestion.js';
 import { updateLocalConfigFile } from '../../infra/config/update.js';
 import { logger } from '../../infra/logging/logger.js';
@@ -24,7 +25,7 @@ export function createLocalRuntimeHost(options) {
     // (Electron, CLI, daemon).
     process.env.MINIMAX_DATA_DIR = dataDir;
     const { observability, telemetry, metricsClient, evalReporterFactory, errorReporter, llmRequestFailureHook, bashCompletionCorrelation, metricsReporter, } = createHostTelemetry(options);
-    const { configGetter, configUpdater } = resolveHostConfig(options);
+    const { configGetter, configUpdater } = resolveHostConfig(options, metricsClient);
     // Agent state is owned by the composed Agent service. This compatibility
     // factory only constructs Session/queue and other local runtime stores.
     const messageStore = new SqliteLocalMessageStore(dataDir);
@@ -109,6 +110,7 @@ export function createLocalRuntimeHost(options) {
         metricsReporter,
         metricsClient,
         getCollectionPolicy: options.getCollectionPolicy,
+        ptcDefault: options.ptcDefault,
         createWorkspaceIndexingObservationSink: options.createWorkspaceIndexingObservationSink,
         ...(options.mcpRuntime ? { mcpService: options.mcpRuntime } : {}),
         ...(options.wechatRuntimeSdk ? { wechatRuntimeSdk: options.wechatRuntimeSdk } : {}),
@@ -137,20 +139,32 @@ export function createLocalRuntimeHost(options) {
         ...(evalReporterFactory ? { evalReporterFactory } : {}),
     };
 }
-function resolveHostConfig(options) {
-    // Every config this host hands out carries the effective prompt-suggestion opt-in.
-    const config = withEffectivePromptSuggestionConfig({
-        configGetter: options.configGetter ?? (() => getConfig()),
-        configUpdater: options.configUpdater ?? updateLocalConfigFile,
-        getPromptSuggestionPolicy: options.getPromptSuggestionPolicy,
+function resolveHostConfig(options, metricsClient) {
+    // Every config this host hands out carries the effective prompt-suggestion
+    // and Next Step opt-ins and the effective Bunny beta switch.
+    const config = withEffectiveBunnyConfig({
+        ...withEffectivePromptSuggestionConfig({
+            configGetter: options.configGetter ?? (() => getConfig()),
+            configUpdater: options.configUpdater ?? updateLocalConfigFile,
+            getPromptSuggestionPolicy: options.getPromptSuggestionPolicy,
+        }),
+        getBunnyPolicy: options.getBunnyPolicy,
+        getUserId: () => options.authContextGetter?.()?.realUserID,
+        ...(options.bunnyBuildVariant ? { buildVariant: options.bunnyBuildVariant } : {}),
+        metricsClient,
     });
     // Read the warnings off the config this host actually runs on, not off the
     // global `getConfig()`. Both product entries derive their getter from
     // `getConfig()`, so a clamped `goal` key still surfaces here; tests that
     // inject a hand-built config carry no warnings and stay silent without this
     // needing to know whether the getter was injected.
-    for (const warning of config.configGetter().goalWarnings ?? []) {
+    const parsed = config.configGetter();
+    for (const warning of parsed.goalWarnings ?? []) {
         logger.warn({ warning }, 'Goal config fell back to a safe default');
+    }
+    // The shared config parser cannot log (the interactive TUI draws on the same terminal).
+    for (const warning of parsed.agents?.warnings ?? []) {
+        logger.warn({ warning }, 'Agent capability config ignored unknown IDs');
     }
     return config;
 }

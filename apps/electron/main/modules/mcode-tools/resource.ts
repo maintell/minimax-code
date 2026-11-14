@@ -1,2 +1,2 @@
-export { installMcodeToolsLauncher, removeMcodeToolsLaunchers, renderPosixLauncher, renderWindowsLauncher, validateMcodeToolsResource } from "@mavis/mcode-tools-host";
+export { installMcodeToolsLauncher, isMcodeToolsLauncherOwnedBy, removeMcodeToolsLaunchers, resolveMcodeToolsHostBinDir, renderPosixLauncher, renderWindowsLauncher, validateMcodeToolsResource } from "@mavis/mcode-tools-host";
 

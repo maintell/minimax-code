@@ -5,7 +5,8 @@ import { isTaskSession } from '../repo/drizzle/normalization.js';
 import { isAgentNotFoundError, reportDeletedAgentBackfillSkip, } from './backfill-diagnostics.js';
 import { SessionServiceError } from '../errors.js';
 import { isDefaultProjectWorkspace } from '../../shared/project-workspace.js';
-import { appModeFields, assertNativeMutation, assertTaskParent, createDefaultWorkspaceIdentity, errorMessage, internalDefaultWorkspaceIdentity, internalExplicitWorkspaceDir, resolveRequestedRunLocation, metadataSessionKind, modelFieldsFromDefinition, modelKey, nonEmpty, normalizeAppMode, normalizeSessionMutation, optionalModelVariant, sessionCaptureCandidate, sessionNotFound, taskMemoryPolicyFor, taskWorkspaceFor, visibilityForInternalKind, visibilityForKind, whenDefined, whenPresent, } from './record-service-fields.js';
+import { decideToolCallMode } from '../support/tool-call-mode.js';
+import { assertNativeMutation, assertPluginAgentTaskSession, assertTaskParent, createDefaultWorkspaceIdentity, errorMessage, internalDefaultWorkspaceIdentity, internalExplicitWorkspaceDir, resolveRequestedRunLocation, modelKey, nonEmpty, normalizeAppMode, normalizeSessionMutation, optionalModelVariant, sessionCaptureCandidate, sessionNotFound, taskAdvisorFor, taskMemoryPolicyFor, taskWorkspaceFor, toInternalMetadataCreateInput, toMetadataCreateInput, visibilityForInternalKind, visibilityForKind, whenPresent, } from './record-service-fields.js';
 export class SessionRecordService {
     deps;
     captureAgentShell;
@@ -134,7 +135,7 @@ export class SessionRecordService {
         return { ...input, model: this.deps.resolveRequestedModel(input.model) };
     }
     async prepareSessionCreate(requested) {
-        const sessionId = this.makeSessionId();
+        const sessionId = requested.sessionId ?? this.makeSessionId();
         const agent = await this.requireAgentDefaults(requested.agentName);
         const parent = await this.resolveParent(requested.parentSessionId);
         const input = this.resolveCreateModel(requested);
@@ -156,6 +157,7 @@ export class SessionRecordService {
             runLocation,
             explicitWorkspaceDir,
             requested: input.isDefaultWorkspace,
+            preserveRequested: input.preserveDefaultWorkspaceIdentity === true,
         });
         const taskCapture = await this.captureSessionAgentDefinition({
             agentName: input.agentName,
@@ -184,10 +186,12 @@ export class SessionRecordService {
             requestedWorkspaceDir: workspace.workspaceDir,
             appMode,
             runLocation,
+            ...(input.projectWorkspaceDir ? { projectWorkspaceDir: input.projectWorkspaceDir } : {}),
             taskWorkspace: workspace.taskWorkspace,
             isDefaultWorkspace,
             parentVisibility: parent?.visibility,
             taskMemoryPolicy: taskMemoryPolicyFor(sessionKind, parent),
+            taskAdvisor: taskAdvisorFor(sessionKind, parent),
             taskCapture,
         };
     }
@@ -233,6 +237,7 @@ export class SessionRecordService {
             taskWorkspace,
             workspace,
             taskMemoryPolicy: taskMemoryPolicyFor(sessionKind, parent),
+            taskAdvisor: taskAdvisorFor(sessionKind, parent),
             workspaceDir,
             isDefaultWorkspace,
             ...definition,
@@ -306,6 +311,7 @@ export class SessionRecordService {
             requested: input.isDefaultWorkspace,
             workspace,
         });
+        const hidden = await this.deps.agentSurfaces?.hidesRootSessions(input.agentName);
         return this.createRecord({
             sessionId,
             agentName: input.agentName,
@@ -314,6 +320,7 @@ export class SessionRecordService {
             sessionType: 'root',
             sessionKind: 'conversation',
             title: 'Main',
+            visibility: hidden ? 'hidden' : 'visible',
             titleSource: 'auto',
             parentSessionId: null,
             origin: 'root-repair',
@@ -461,14 +468,14 @@ export class SessionRecordService {
     }
     async createRecord(input) {
         const capture = await this.captureAgentShell?.(input.parentSessionId);
-        const toolCallMode = input.toolCallMode ?? this.deps.toolCallMode?.current();
+        const toolCallMode = decideToolCallMode(this.deps.toolCallMode, input.toolCallMode);
         const created = await this.deps.metadata.create({
             ...input,
             ...(capture?.agentShell ? { agentShell: capture.agentShell } : {}),
             ...(capture?.agentShellPreference
                 ? { agentShellPreference: capture.agentShellPreference }
                 : {}),
-            ...(toolCallMode ? { toolCallMode } : {}),
+            ...toolCallMode.fields,
         });
         try {
             await this.deps.artifacts?.initialize(created.sessionId);
@@ -477,7 +484,7 @@ export class SessionRecordService {
             await this.compensateCreate(created.sessionId, error);
         }
         this.deps.facts.handle({ kind: 'created', session: created });
-        return created;
+        return toolCallMode.recorded(created);
     }
     async compensateCreate(sessionId, original) {
         const failures = await this.cleanupCreatedSession(sessionId);
@@ -522,122 +529,5 @@ export class SessionRecordService {
             throw new SessionServiceError('run-location-invalid', errorMessage(error), code);
         }
     }
-}
-function toMetadataCreateInput(context) {
-    const requestedKind = metadataSessionKind(context.input);
-    return {
-        ...metadataIdentityFields(context, requestedKind),
-        sessionType: 'branch',
-        sessionKind: requestedKind,
-        ...whenDefined('memoryPolicy', context.taskMemoryPolicy),
-        ...metadataModelFields(context.input, context.taskCapture),
-        ...metadataBindingFields(context.taskCapture),
-        origin: 'user',
-    };
-}
-function toInternalMetadataCreateInput(context) {
-    const sessionType = context.input.sessionType ?? 'branch';
-    return {
-        ...internalIdentityFields(context),
-        sessionType,
-        sessionKind: context.sessionKind,
-        ...whenDefined('memoryPolicy', context.taskMemoryPolicy),
-        ...internalMetadataFields(context, sessionType),
-        ...internalModelFields(context.input, context.taskCapture, context.forkedAgentDefinition),
-        ...internalBindingFields(context.taskCapture, context.forkedAgentDefinition),
-        origin: context.input.origin ?? 'user',
-        ...whenPresent('createdBySessionId', context.input.createdBySessionId),
-        ...whenPresent('toolCallMode', context.input.toolCallMode),
-    };
-}
-function metadataIdentityFields(context, sessionKind) {
-    const { input, taskWorkspace, runLocation } = context;
-    return {
-        sessionId: context.sessionId,
-        agentName: input.agentName,
-        workspaceDir: taskWorkspace ?? runLocation?.resolvedDir ?? context.requestedWorkspaceDir,
-        isDefaultWorkspace: context.isDefaultWorkspace,
-        title: input.title ?? null,
-        parentSessionId: input.parentSessionId ?? null,
-        visibility: visibilityForKind(sessionKind, input.visibility, context.parentVisibility) ?? 'visible',
-        ...whenPresent('purpose', nonEmpty(input.purpose)),
-        ...whenPresent('runLocation', runLocation),
-        appMode: context.appMode,
-    };
-}
-function metadataModelFields(input, taskCapture) {
-    const effectiveModel = modelKey(input.model?.providerId, input.model?.modelId);
-    return {
-        ...whenPresent('effectiveModel', taskCapture?.effectiveModel ?? effectiveModel),
-        ...metadataVariantField(input, taskCapture),
-        ...whenDefined('effectiveModelThinking', taskCapture ? taskCapture.effectiveModelThinking : input.model?.thinking),
-        ...whenDefined('effectiveModelContextWindow', taskCapture?.effectiveModelContextWindow ??
-            input.model?.contextLimit ??
-            input.effectiveModelContextWindow),
-        ...whenDefined('effectiveModelMaxOutputTokens', taskCapture?.effectiveModelMaxOutputTokens ?? input.effectiveModelMaxOutputTokens),
-    };
-}
-function metadataVariantField(input, taskCapture) {
-    if (taskCapture)
-        return whenDefined('effectiveModelVariant', taskCapture.effectiveModelVariant);
-    return whenDefined('effectiveModelVariant', optionalModelVariant(input.model?.variant));
-}
-function metadataBindingFields(taskCapture) {
-    if (!taskCapture)
-        return {};
-    return {
-        agentDefinition: taskCapture.agentDefinition,
-        taskAgentBinding: taskCapture.taskAgentBinding,
-    };
-}
-function internalIdentityFields(context) {
-    const { input } = context;
-    return {
-        sessionId: context.sessionId,
-        agentName: input.agentName,
-        workspaceDir: context.workspaceDir,
-        isDefaultWorkspace: context.isDefaultWorkspace,
-        title: input.title ?? null,
-        titleSource: input.titleSource ?? (input.title?.trim() ? 'auto' : 'default'),
-        parentSessionId: input.parentSessionId ?? null,
-    };
-}
-function internalMetadataFields(context, sessionType) {
-    const { input, parent, sessionKind } = context;
-    const visibility = visibilityForInternalKind(sessionKind, input.visibility, parent?.visibility);
-    return {
-        ...whenPresent('visibility', visibility),
-        ...whenPresent('purpose', input.purpose),
-        ...whenPresent('originCronId', input.originCronId),
-        ...whenPresent('miniAppOrigin', input.miniAppOrigin),
-        ...whenPresent('runLocation', input.runLocation),
-        ...appModeFields(sessionType, input.appMode ?? parent?.appMode),
-    };
-}
-function internalModelFields(input, taskCapture, forkedAgentDefinition) {
-    if (forkedAgentDefinition)
-        return modelFieldsFromDefinition(forkedAgentDefinition.definition);
-    return {
-        ...whenPresent('effectiveModel', taskCapture?.effectiveModel ?? input.effectiveModel),
-        ...internalVariantField(input, taskCapture),
-        ...whenDefined('effectiveModelThinking', taskCapture?.effectiveModelThinking ?? input.effectiveModelThinking),
-        ...whenDefined('effectiveModelContextWindow', taskCapture?.effectiveModelContextWindow ?? input.effectiveModelContextWindow),
-        ...whenDefined('effectiveModelMaxOutputTokens', taskCapture?.effectiveModelMaxOutputTokens ?? input.effectiveModelMaxOutputTokens),
-    };
-}
-function internalVariantField(input, taskCapture) {
-    if (taskCapture)
-        return whenDefined('effectiveModelVariant', taskCapture.effectiveModelVariant);
-    return whenDefined('effectiveModelVariant', input.effectiveModelVariant);
-}
-function assertPluginAgentTaskSession(session, pluginAgent) {
-    if (pluginAgent && !isTaskSession(session)) {
-        throw new SessionServiceError('invalid-session-kind', 'Plugin Agent requires a Task Session');
-    }
-}
-function internalBindingFields(taskCapture, forkedAgentDefinition) {
-    if (forkedAgentDefinition)
-        return { agentDefinition: forkedAgentDefinition };
-    return metadataBindingFields(taskCapture);
 }
 //# sourceMappingURL=record-service.js.map

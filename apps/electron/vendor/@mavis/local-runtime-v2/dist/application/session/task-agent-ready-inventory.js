@@ -1,3 +1,4 @@
+import { createDispatchModelLoginCheck } from './dispatch-model-login-check.js';
 import { createTaskAgentBindingCaptureCoordinator, } from './task-agent-binding-capture.js';
 /** Binds the ready-inventory Task capture after plugin and MCP owners exist. */
 export function bindTaskAgentBindingCapture(input, services, diagnostics) {
@@ -11,6 +12,7 @@ export function bindTaskAgentBindingCapture(input, services, diagnostics) {
             mcp: services.mcp,
         }),
         diagnostics,
+        modelLoginCheck: createDispatchModelLoginCheck(input.preparation),
         ...(input.options.runtimeOwnerKind
             ? { runtimeOwnerKind: input.options.runtimeOwnerKind }
             : {}),

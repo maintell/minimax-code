@@ -5,17 +5,20 @@ import { buildPermissionResolvedCard, extractPermissionActionValue, } from '../t
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 export function createFeishuCardActionHandler(input) {
     const inFlightQuestionnaires = new Set();
-    return async (body) => {
-        const rawBody = (body ?? {});
+    return async (body, source) => {
+        const rawBody = normalizeCardBody(body);
         const payload = (rawBody.action && typeof rawBody.action === 'object' ? rawBody : { action: rawBody });
         // Dispatch on the button `value.kind` FIRST: a permission card and a
         // questionnaire card share this endpoint but carry disjoint discriminators
         // (`permission_action` vs `questionnaire_submit`), so neither branch can
         // ever eat the other's click.
         const permissionValue = extractPermissionActionValue(rawBody);
+        const submitValue = extractQuestionnaireSubmitValue(rawBody);
+        if (!(await authorizePendingCard(input, rawBody, source))) {
+            return json({ ok: false, code: 'CHANNEL_COORDINATOR_CREATOR_REQUIRED' }, { status: 403 });
+        }
         if (permissionValue)
             return handlePermissionAction({ ...input, rawBody, payload, permissionValue });
-        const submitValue = extractQuestionnaireSubmitValue(rawBody);
         if (submitValue)
             return handleFormSubmit({
                 ...input,
@@ -48,6 +51,56 @@ export function createFeishuCardActionHandler(input) {
         input.metrics?.incr('channel_ask_user_total', { channel: 'feishu', phase: 'replied' });
         return json({ ok: true, requestId: decoded.token.r });
     };
+}
+async function authorizePendingCard(input, body, source) {
+    if (!input.authorizeCardAction)
+        return true;
+    const requestId = extractPermissionActionValue(body)?.requestId ??
+        extractQuestionnaireSubmitValue(body)?.requestId ??
+        decodeCardAction(body).token?.r;
+    // Legacy tokens without an originating pending card are not authorization proof.
+    if (!requestId)
+        return false;
+    const permission = input.feishuPendingPermissions.get(requestId);
+    const questionnaire = input.feishuPendingQuestionnaires.get(requestId);
+    const pending = permission ?? questionnaire;
+    if (!pending || (source && source.clientName !== pending.clientName))
+        return false;
+    const sessionId = permission?.renderable.sessionId ?? questionnaire?.request.requester?.sessionId;
+    return input.authorizeCardAction({ ...cardActorContext(body, pending.clientName), feishuWsSource: source }, sessionId);
+}
+/** SDK v2 wraps operator/context; keep legacy typed open_id callbacks readable too. */
+function normalizeCardBody(body) {
+    const event = objectRecord(body.event) ?? body;
+    const operator = objectRecord(event.operator);
+    const context = objectRecord(event.context);
+    return {
+        ...event,
+        open_id: operator?.open_id ?? event.open_id,
+        open_chat_id: context?.open_chat_id ?? event.open_chat_id,
+        open_message_id: context?.open_message_id ?? event.open_message_id,
+    };
+}
+/** Provider typed actor/context only: neither user_id nor card action values authenticate a user. */
+function cardActorContext(body, clientName) {
+    const event = objectRecord(body.event) ?? body;
+    const operator = objectRecord(event.operator);
+    const context = objectRecord(event.context);
+    const openId = typeof operator?.open_id === 'string' ? operator.open_id : event.open_id;
+    const chatId = typeof context?.open_chat_id === 'string' ? context.open_chat_id : event.open_chat_id;
+    return {
+        platform: 'feishu',
+        chatType: 'p2p',
+        clientName,
+        chatId: typeof chatId === 'string' ? chatId : '',
+        senderId: typeof openId === 'string' ? openId : '',
+        feishuSenderOpenId: typeof openId === 'string' ? openId : undefined,
+    };
+}
+function objectRecord(value) {
+    return value && typeof value === 'object' && !Array.isArray(value)
+        ? value
+        : undefined;
 }
 /**
  * Shared pending-card lookup for both card kinds: find the requestId-keyed

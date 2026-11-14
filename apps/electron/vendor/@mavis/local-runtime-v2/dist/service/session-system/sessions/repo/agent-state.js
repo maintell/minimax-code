@@ -1,4 +1,20 @@
 import { sessionAgentState } from '../../../../infra/db/schema/sessions.js';
+const AGENT_TERMINAL_OUTCOMES = [
+    'completed',
+    'failed',
+    'aborted',
+];
+/**
+ * Reads the durable Agent terminal fact, narrowing the free-form
+ * `terminal_outcome` column to the domain value. A row without a terminal
+ * write carries `null`, which is not one of the outcomes and yields undefined.
+ */
+export function agentTurnTerminal(row) {
+    if (!row)
+        return undefined;
+    const outcome = AGENT_TERMINAL_OUTCOMES.find((candidate) => candidate === row.terminalOutcome);
+    return outcome ? { turnId: row.turnId, outcome } : undefined;
+}
 export function decideAgentState(current, input) {
     if (!current)
         return 'apply';

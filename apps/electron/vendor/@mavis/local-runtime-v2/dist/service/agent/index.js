@@ -8,6 +8,7 @@ export { createRuntimeAgentComposition, } from './composition.js';
 export { LocalPromptSnapshotSource } from './prompt-snapshot-source.js';
 export { redactedAgentRef, redactedErrorFacts } from './diagnostics.js';
 export { readPromptWithBuiltinFallback } from './prompt-template.js';
+export { renderBunnyHelperAgentSections, renderBunnyMemorySections, } from './builtin/bunny-prompt.js';
 export { AgentImportService, } from './application/agent-import.js';
 export { emitSubagentTelemetry } from './runtime/subagent-telemetry.js';
 export { roleClass } from './runtime/subagent-telemetry.js';

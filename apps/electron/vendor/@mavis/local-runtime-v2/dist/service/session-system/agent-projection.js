@@ -1,13 +1,22 @@
-import { CONTEXT_USAGE_COMPONENT_KINDS, RuntimeEventStatus, RuntimeStopReasonType, RuntimeEventType, } from '@mavis/agent-core/protocol';
+import { RuntimeEventStatus, RuntimeStopReasonType, RuntimeEventType, } from '@mavis/agent-core/protocol';
 import { RespDataType, Role } from '@mavis/agent-core/protocol/agent-message';
-import { projectCanonicalAssistantBoundaries, } from './messages/query/canonical-assistant-boundaries.js';
+import { CanonicalAssistantBoundaryLinker, } from './messages/query/canonical-assistant-boundaries.js';
+import { readPostCompactionContextUsage, } from './messages/compaction-context-usage.js';
+import { streamMessageOrigin } from './messages/source.js';
 import { mergePtcDisplayToolCalls, ptcToolCallDisplayMessage, } from './messages/ptc/display-tool-calls.js';
 import { projectPtcSafetyDisplay } from './messages/ptc/safety-reconcile.js';
 import { describeRetractedInput } from './messages/retracted-input.js';
+import { stopSourceOf } from './sessions/recovery/capabilities.js';
 import { refreshToolCallModeAfterCompaction, } from './sessions/support/tool-call-mode.js';
+import { compactionTokenUsageMetadata, readCompactionMethod, recordCompletedCompactionMetrics, recordTerminalCompactionMetrics, terminalCompactionTokenUsageMetadata, } from './sessions/support/compaction-metrics.js';
 export function createSessionSystemAgentProjection(options) {
     const compactionLane = createCompactionProjectionLane();
+    const assistantBoundaries = new CanonicalAssistantBoundaryLinker(options);
     const startedCompactions = new Map();
+    // Attempts without display records (started quietly, or committed/failed as a hidden
+    // rebuild), until their terminal observation publishes the fact.
+    const hiddenCompactions = new Set();
+    const shown = (input) => !hiddenCompactions.has(input.attemptId) && !isHiddenCompaction(input.metadata);
     return {
         preparation: {
             projectStarted: async (input) => {
@@ -26,6 +35,7 @@ export function createSessionSystemAgentProjection(options) {
                 if (message && !isTerminalAssistantDisplayError(message)) {
                     const queryKey = await queryKeyForTurn(options, input.context);
                     const merged = await mergePtcDisplayToolCalls(options.messages, input.context.sessionId, message);
+                    const kept = await assistantBoundaries.keptIdentity(input.context.sessionId, merged);
                     await options.messages.upsert({
                         sessionId: input.context.sessionId,
                         turnId: input.context.turnId,
@@ -33,6 +43,7 @@ export function createSessionSystemAgentProjection(options) {
                             ...merged,
                             turn_id: input.context.turnId,
                             ...(queryKey ? { query_key: queryKey } : {}),
+                            ...kept,
                         },
                         source: input.context.provenance?.source ?? 'agent',
                         ...(input.context.provenance?.sourceContext
@@ -44,11 +55,13 @@ export function createSessionSystemAgentProjection(options) {
                     merged.tool_calls?.length || merged.finish_reason === 'aborted'
                         ? undefined
                         : { signal: input.signal });
+                    if (merged.role === Role.Assistant)
+                        await assistantBoundaries.displayWritten(input.context);
                 }
                 await projectQueryCollapse(() => options.queryCollapse?.projectRuntimeEvent(input));
             },
             projectHistoryCommitted: async (input) => {
-                await projectCanonicalAssistantBoundaries(options, input);
+                await assistantBoundaries.committed(input);
                 await projectCommittedConversation(options, input);
                 await projectQueryCollapse(() => options.queryCollapse?.projectHistoryCommitted({
                     context: input.context,
@@ -57,7 +70,10 @@ export function createSessionSystemAgentProjection(options) {
             },
         },
         attemptRecall: {
-            recallAssistantAttempt: (input) => recallAssistantAttempt(options, input),
+            recallAssistantAttempt: (input) => {
+                assistantBoundaries.recalled(input);
+                return recallAssistantAttempt(options, input);
+            },
         },
         stream: {
             projectRuntimeEvent: async (input) => {
@@ -105,7 +121,7 @@ export function createSessionSystemAgentProjection(options) {
                     outcome: status,
                     ...(status === 'failed'
                         ? { errorMessage, errorSource: publicFailure?.code ?? 'turn-system' }
-                        : {}),
+                        : stopSourceOf(input.error)),
                 });
                 assertStateWrite(result.status);
                 await projectQueryCollapse(() => options.queryCollapse?.projectFailure(input));
@@ -129,14 +145,27 @@ export function createSessionSystemAgentProjection(options) {
         },
         compactionLifecycle: {
             completeCommittedHistory: (input) => compactionLane.run(input.attemptId, async () => {
-                await writeCompactionFact(options, input, 'compaction');
+                if (isHiddenCompaction(input.metadata))
+                    hiddenCompactions.add(input.attemptId);
+                // A background segment rebuild commits silently: no "context compacted" card.
+                if (!isBackgroundCompaction(input.metadata) && shown(input)) {
+                    await writeCompactionFact(options, input, 'compaction');
+                }
                 recordCompletedCompactionMetrics(options, input, startedCompactions.get(input.attemptId));
                 // Reached only after AgentHost durably committed the replacement history (automatic
                 // and manual alike); failed, skipped or deferred compactions never get here. The mode
                 // follows the switch only when the method is a summary (`llm_checkpoint`).
                 await refreshToolCallModeAfterCompaction(options.toolCallMode, input.context.sessionId, readCompactionMethod(input.metadata));
             }),
-            failCommittedHistory: (input) => compactionLane.run(input.attemptId, () => writeCompactionFact(options, input, 'compaction_failed')),
+            failCommittedHistory: (input) => compactionLane.run(input.attemptId, async () => {
+                // A quiet attempt can fail before it started, so it is marked here too.
+                if (isHiddenCompaction(input.metadata) || input.display === false) {
+                    hiddenCompactions.add(input.attemptId);
+                }
+                if (!shown(input))
+                    return;
+                await writeCompactionFact(options, input, 'compaction_failed');
+            }),
         },
         compactionObserver: {
             observe: (input) => compactionLane.run(input.attemptId, async () => {
@@ -151,7 +180,7 @@ export function createSessionSystemAgentProjection(options) {
                         // Best-effort like this observation path (no logger here); never block the display.
                     }
                 }
-                await projectCompactionObservation(options, startedCompactions, input);
+                await projectCompactionObservation(options, { started: startedCompactions, hidden: hiddenCompactions }, input);
             }),
         },
     };
@@ -251,29 +280,22 @@ async function projectCommittedConversation(options, input) {
         ...slowNetworkRead,
     });
 }
-async function projectCompactionObservation(options, startedCompactions, input) {
+async function projectCompactionObservation(options, attempts, input) {
     const nowMs = options.nowMs ?? Date.now;
+    const startedCompactions = attempts.started;
     if (input.status === 'started') {
-        if (startedCompactions.has(input.attemptId))
-            return;
-        startedCompactions.set(input.attemptId, {
-            startedAtMs: nowMs(),
-            trigger: input.reason === 'automatic' ? 'auto' : 'manual',
-        });
-        await writeCompactionFact(options, input, 'compaction_start');
-        await options.compactionFacts?.handle({
-            kind: 'started',
-            sessionId: input.context.sessionId,
-            attemptId: input.attemptId,
-        });
+        await projectCompactionStart(options, attempts, input);
         return;
     }
+    const hidden = attempts.hidden.delete(input.attemptId);
+    const display = hidden ? { display: false } : {};
     if (input.status === 'completed') {
         startedCompactions.delete(input.attemptId);
         await options.compactionFacts?.handle({
             kind: 'completed',
             sessionId: input.context.sessionId,
             attemptId: input.attemptId,
+            ...display,
             snapshotId: input.compactionId,
             messagesBefore: input.messagesBefore,
             messagesAfter: input.messagesAfter,
@@ -288,7 +310,7 @@ async function projectCompactionObservation(options, startedCompactions, input) 
     startedCompactions.delete(input.attemptId);
     recordTerminalCompactionMetrics(options, input, started, nowMs());
     if (input.status === 'unchanged') {
-        if (!started)
+        if (!started || hidden)
             return;
         await writeCompactionFact(options, {
             context: input.context,
@@ -300,174 +322,27 @@ async function projectCompactionObservation(options, startedCompactions, input) 
         kind: 'failed',
         sessionId: input.context.sessionId,
         attemptId: input.attemptId,
+        ...display,
         ...terminalCompactionTokenUsageMetadata(input),
     });
 }
-function recordCompletedCompactionMetrics(options, input, started) {
-    const metrics = options.compactionMetrics;
-    const metadata = readCompactionMetricMetadata(input.metadata);
-    if (!metrics || !metadata)
+async function projectCompactionStart(options, attempts, input) {
+    if (attempts.started.has(input.attemptId))
         return;
-    const { phase, method, tokensBefore, tokensAfter, bytesBefore, bytesAfter, hmidOverflowRecovered, tokenUsage, } = metadata;
-    const trigger = phase === 'manual' ? 'manual' : 'auto';
-    try {
-        metrics.counter('compact_outcome_total', 1, { trigger, outcome: 'completed', method });
-        if (hmidOverflowRecovered) {
-            metrics.counter('compact_hmid_overflow_recovery_total', 1, { trigger });
-        }
-        if (started) {
-            metrics.histogram('compact_duration_ms', (options.nowMs ?? Date.now)() - started.startedAtMs, {
-                trigger,
-            });
-        }
-        const ratioLabels = { trigger, method };
-        if (tokensBefore > 0) {
-            metrics.histogram('compact_saved_ratio', 1 - tokensAfter / tokensBefore, {
-                ...ratioLabels,
-                dimension: 'tokens',
-            });
-        }
-        if (bytesBefore > 0) {
-            metrics.histogram('compact_saved_ratio', 1 - bytesAfter / bytesBefore, {
-                ...ratioLabels,
-                dimension: 'serialized_bytes',
-            });
-        }
-        recordCompactionTokenUsage(metrics, tokenUsage, { trigger, outcome: 'completed' });
-    }
-    catch {
-        // Metrics must never change projection or Host outcomes.
-    }
-}
-function recordTerminalCompactionMetrics(options, input, started, terminalAtMs) {
-    const metrics = options.compactionMetrics;
-    if (!metrics)
-        return;
-    const trigger = started?.trigger ?? fallbackCompactionTrigger(input);
-    const outcome = terminalCompactionOutcome(input);
-    try {
-        metrics.counter('compact_outcome_total', 1, { trigger, outcome, method: 'none' });
-        if (started) {
-            metrics.histogram('compact_duration_ms', terminalAtMs - started.startedAtMs, { trigger });
-        }
-        recordCompactionTokenUsage(metrics, terminalCompactionTokenUsage(input), { trigger, outcome });
-    }
-    catch {
-        // Metrics must never change projection or Host outcomes.
-    }
-}
-function fallbackCompactionTrigger(input) {
-    return input.status === 'unchanged' ? 'auto' : 'unknown';
-}
-function terminalCompactionOutcome(input) {
-    if (input.status !== 'unchanged')
-        return input.status;
-    return input.reason === 'internal-context-filter' ? 'filter_only' : 'below_trigger';
-}
-function readCompactionMethod(value) {
-    if (!isRecord(value))
-        return undefined;
-    return value.method === 'llm_checkpoint' ? 'llm_checkpoint' : undefined;
-}
-function readCompactionMetricMetadata(value) {
-    if (!isRecord(value))
-        return undefined;
-    const phase = value.phase;
-    if (phase !== 'initial' && phase !== 'iteration' && phase !== 'manual')
-        return undefined;
-    const method = readCompactionMethod(value);
-    if (!method)
-        return undefined;
-    const counts = readCompactionMetricCounts(value);
-    const tokenUsage = readCompactionTokenUsage(value.tokenUsage);
-    return counts
-        ? {
-            phase,
-            method,
-            ...counts,
-            ...compactionTokenUsageMetadata(tokenUsage),
-            hmidOverflowRecovered: Reflect.get(value, 'hmidOverflowRecovered') === true,
-        }
-        : undefined;
-}
-function compactionTokenUsageMetadata(tokenUsage) {
-    if (tokenUsage === undefined)
-        return {};
-    return { tokenUsage };
-}
-function terminalCompactionTokenUsage(input) {
-    if (input.status === 'unchanged')
-        return undefined;
-    return input.tokenUsage;
-}
-function terminalCompactionTokenUsageMetadata(input) {
-    return compactionTokenUsageMetadata(terminalCompactionTokenUsage(input));
-}
-function recordCompactionTokenUsage(metrics, tokenUsage, labels) {
-    if (!metrics || !tokenUsage)
-        return;
-    for (const [kind, value] of [
-        ['input', tokenUsage.inputTokens],
-        ['output', tokenUsage.outputTokens],
-        ['cache_read', tokenUsage.cacheReadTokens],
-        ['cache_write', tokenUsage.cacheWriteTokens],
-    ]) {
-        try {
-            metrics.counter('compact_provider_tokens_total', value, { ...labels, kind });
-        }
-        catch {
-            // Metrics must never change projection or Host outcomes.
-        }
-    }
-    if (tokenUsage.incomplete) {
-        try {
-            metrics.counter('compact_provider_token_usage_incomplete_total', 1, labels);
-        }
-        catch {
-            // Metrics must never change projection or Host outcomes.
-        }
-    }
-}
-function readCompactionTokenUsage(value) {
-    if (!isRecord(value))
-        return undefined;
-    const inputTokens = readNonNegativeNumber(value.inputTokens);
-    const outputTokens = readNonNegativeNumber(value.outputTokens);
-    const cacheReadTokens = readNonNegativeNumber(value.cacheReadTokens);
-    const cacheWriteTokens = readNonNegativeNumber(value.cacheWriteTokens);
-    const totalTokens = readNonNegativeNumber(value.totalTokens);
-    if (inputTokens === undefined ||
-        outputTokens === undefined ||
-        cacheReadTokens === undefined ||
-        cacheWriteTokens === undefined ||
-        totalTokens === undefined ||
-        typeof value.incomplete !== 'boolean' ||
-        totalTokens !== inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens) {
-        return undefined;
-    }
-    return {
-        inputTokens,
-        outputTokens,
-        cacheReadTokens,
-        cacheWriteTokens,
-        totalTokens,
-        incomplete: value.incomplete,
-    };
-}
-function readCompactionMetricCounts(value) {
-    const tokensBefore = readNonNegativeNumber(value.tokensBefore);
-    const tokensAfter = readNonNegativeNumber(value.tokensAfter);
-    const bytesBefore = readNonNegativeNumber(value.serializedBytesBefore);
-    const bytesAfter = readNonNegativeNumber(value.serializedBytesAfter);
-    if (tokensBefore === undefined)
-        return undefined;
-    if (tokensAfter === undefined)
-        return undefined;
-    if (bytesBefore === undefined)
-        return undefined;
-    if (bytesAfter === undefined)
-        return undefined;
-    return { tokensBefore, tokensAfter, bytesBefore, bytesAfter };
+    attempts.started.set(input.attemptId, {
+        startedAtMs: (options.nowMs ?? Date.now)(),
+        trigger: input.reason === 'automatic' ? 'auto' : 'manual',
+    });
+    if (input.display === false)
+        attempts.hidden.add(input.attemptId);
+    else
+        await writeCompactionFact(options, input, 'compaction_start');
+    await options.compactionFacts?.handle({
+        kind: 'started',
+        sessionId: input.context.sessionId,
+        attemptId: input.attemptId,
+        ...(input.display === false ? { display: false } : {}),
+    });
 }
 async function projectSessionRuntime(options, input) {
     const identity = eventIdentity(input);
@@ -481,6 +356,7 @@ async function projectSessionRuntime(options, input) {
             ...(error?.code !== undefined ? { errorCode: error.code } : {}),
             ...(error?.errorSource ? { errorSource: error.errorSource } : {}),
             ...(error?.details ? { errorDetail: error.details } : {}),
+            ...(terminal === 'aborted' && !error ? stopSourceOf(input.signal?.reason) : {}),
         });
         assertStateWrite(result.status);
         return { terminal: true, outcome: terminal };
@@ -575,7 +451,7 @@ function streamProjectionData(options, input, queryKey) {
     return JSON.stringify({
         ...response,
         [messageField]: {
-            ...response[messageField],
+            ...streamMessageOrigin(response[messageField], input.context.provenance, options),
             turn_id: input.context.turnId,
             ...(queryKey ? { query_key: queryKey } : {}),
             ...(queryKey ? (options.steeringProjection?.(queryKey) ?? {}) : {}),
@@ -635,6 +511,13 @@ function finishReason(message) {
     const value = Reflect.get(message, 'finishReason');
     return typeof value === 'string' ? value : undefined;
 }
+function isBackgroundCompaction(metadata) {
+    return isRecord(metadata) && metadata.background === true;
+}
+/** An attempt that shows no display record at all, committed or failed (an emergency rebuild). */
+function isHiddenCompaction(metadata) {
+    return isRecord(metadata) && metadata.hidden === true;
+}
 async function writeCompactionFact(options, input, kind) {
     const contextUsage = readCommittedContextUsage(input, kind);
     const message = {
@@ -670,50 +553,8 @@ async function writeCompactionFact(options, input, kind) {
 }
 function readCommittedContextUsage(input, kind) {
     return kind === 'compaction' && isRecord(input.metadata)
-        ? readContextUsage(input.metadata.contextUsage)
+        ? readPostCompactionContextUsage(input.metadata.contextUsage)
         : undefined;
-}
-function readContextUsage(value) {
-    if (!isRecord(value))
-        return undefined;
-    const contextWindowTokens = readNonNegativeNumber(value.contextWindowTokens);
-    const usedTokens = readNonNegativeNumber(value.usedTokens);
-    if (contextWindowTokens === undefined ||
-        usedTokens === undefined ||
-        value.totalCountSource !== 'LOCAL_ESTIMATE') {
-        return undefined;
-    }
-    const components = readContextUsageComponents(value.components);
-    if (!components)
-        return undefined;
-    return {
-        contextWindowTokens,
-        usedTokens,
-        totalCountSource: 'LOCAL_ESTIMATE',
-        components,
-    };
-}
-function readContextUsageComponents(value) {
-    if (!Array.isArray(value) || value.length !== CONTEXT_USAGE_COMPONENT_KINDS.length) {
-        return undefined;
-    }
-    const components = value.flatMap((component) => {
-        if (!isRecord(component) || !isContextUsageComponentKind(component.kind))
-            return [];
-        const tokens = readNonNegativeNumber(component.tokens);
-        return tokens === undefined ? [] : [{ kind: component.kind, tokens }];
-    });
-    return components.length === CONTEXT_USAGE_COMPONENT_KINDS.length &&
-        new Set(components.map((component) => component.kind)).size ===
-            CONTEXT_USAGE_COMPONENT_KINDS.length
-        ? components
-        : undefined;
-}
-function readNonNegativeNumber(value) {
-    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
-}
-function isContextUsageComponentKind(value) {
-    return CONTEXT_USAGE_COMPONENT_KINDS.some((kind) => kind === value);
 }
 function createCompactionProjectionLane() {
     const tails = new Map();

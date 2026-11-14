@@ -1,6 +1,10 @@
 // Contract admission rules: ./global-events/README.md
 export const GLOBAL_EVENT_TYPES = [
+    'miniapp.launchpad.updated',
     'background_task.updated',
+    'bunny.greeting.updated',
+    'assignment.updated',
+    'workline.updated',
     'agent.created',
     'agent.updated',
     'project.icon_updated',
@@ -42,6 +46,7 @@ export const GLOBAL_EVENT_TYPES = [
     'thread_goal.cleared',
     'thread_goal.objective_updated_steering',
     'workspace.git.changed',
+    'workspace.worktree.progress',
     'model_access.dev_requests_updated',
     'mcp.auth_updated',
     'mcp.auth_required',

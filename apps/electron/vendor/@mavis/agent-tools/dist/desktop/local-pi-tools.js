@@ -43,6 +43,8 @@ import { basename, extname, isAbsolute, relative, resolve as resolvePath, sep } 
 import { homedir, release } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { resolveBashDescription } from './local-bash-input.js';
 import { DEFAULT_FOREGROUND_BASH_SOFT_YIELD_MS, resolveLocalBashTiming, validateBashCommand, withLocalBashTiming, } from './local-bash-timing.js';
 import { localBashResultFromError, localBashResultFromPi, readBashExecutionOutcome, } from './local-bash-result.js';
@@ -65,6 +67,12 @@ import { withCompatibleBashToolResponseFromPiDetails, withCompatibleEditToolResp
 import { buildWriteToolResult, createCapturingWriteOperations } from '../shared/write-capture.js';
 import { assertOverwriteAllowed, isRememberedVersionCurrent, observeFileVersion, rememberCurrentFileVersion, rememberFileVersion, WriteGuardRejectedError, writeGuardRejectedResult, } from '../shared/file-read-ledger.js';
 import { applyDesktopTextLimit, DESKTOP_BASH_MAX_BYTES, DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, DESKTOP_READ_TEXT_MAX_BYTES, isPtcChildCall, limitDesktopHeadTailLines, limitDesktopPrefixLines, PTC_CHILD_FULL_OUTPUT_MAX_BYTES, withDesktopOutputContinuation, } from './output-limit.js';
+/**
+ * Platform, OS release and shell as this machine states them now. Each call
+ * reads them again; the prompt keeps the first answer of its process
+ * (createNativeLocalAgentPreparation), since these facts sit in the cached
+ * system prompt prefix.
+ */
 export function getLocalBashEnvironment() {
     let shell = 'unavailable';
     try {
@@ -72,17 +80,74 @@ export function getLocalBashEnvironment() {
         // Pi's synchronous auto-discovery. Unix keeps the existing executor choice.
         if (process.platform !== 'win32') {
             const selected = getShellConfig();
-            shell = `${selected.type} (${selected.shell})`;
+            const version = selected.type === 'bash' ? bashVersion(selected.shell) : undefined;
+            shell = `${selected.type}${version ? ` ${version}` : ''} (${selected.shell})`;
         }
     }
     catch {
         // Missing shell support must not prevent turns using other tools.
     }
+    const kernel = `${process.platform} ${release()} ${process.arch}`;
+    const name = osReleaseName();
     return {
         platform: process.platform,
-        osVersion: `${process.platform} ${release()} ${process.arch}`,
+        osVersion: name ? `${name} (${kernel})` : kernel,
         shell,
     };
+}
+/**
+ * The OS release the model knows, read from the system's own version file.
+ * Which commands and flags exist (BSD or GNU tools, BusyBox on Alpine) follows
+ * from the release, which a kernel version such as `darwin 25.5.0` does not
+ * name. An unreadable file leaves the kernel facts alone, as before.
+ */
+function osReleaseName() {
+    if (process.platform === 'darwin') {
+        try {
+            const plist = readFileSync('/System/Library/CoreServices/SystemVersion.plist', 'utf8');
+            const value = (key) => plist.match(new RegExp(`<key>${key}</key>\\s*<string>([^<]+)</string>`, 'u'))?.[1]?.trim();
+            const product = value('ProductName');
+            const version = value('ProductVersion');
+            return product && version ? `${product} ${version}` : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    if (process.platform === 'linux') {
+        for (const path of ['/etc/os-release', '/usr/lib/os-release']) {
+            let text;
+            try {
+                text = readFileSync(path, 'utf8');
+            }
+            catch {
+                continue;
+            }
+            return text.match(/^PRETTY_NAME=(["']?)(.*)\1$/mu)?.[2]?.trim() || undefined;
+        }
+    }
+    return undefined;
+}
+/**
+ * The version Bash itself reports: Bash 3.2 (macOS /bin/bash) lacks what Bash
+ * 4+ scripts assume. The executable holds no version string to read (macOS
+ * builds it from `3.2` and patch 57 at run time), so Bash runs without startup
+ * files or environment. A second attempt and a generous limit keep one slow
+ * start from leaving the version out of this process's prompt while the next
+ * process states it.
+ */
+function bashVersion(shellPath) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const probe = spawnSync(shellPath, ['--noprofile', '--norc', '-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8', env: {}, timeout: 5_000 });
+        const version = probe.status === 0 ? probe.stdout.match(/^\d+(?:\.\d+)+/u)?.[0] : undefined;
+        if (version)
+            return version;
+        // A missing or non-executable file gives the same answer on every attempt.
+        const code = probe.error?.code;
+        if (code === 'ENOENT' || code === 'EACCES')
+            return undefined;
+    }
+    return undefined;
 }
 /**
  * Pi's read tool for one call, recording in `piRead` the file it opens.

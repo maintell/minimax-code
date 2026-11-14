@@ -1,7 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, realpath, lstat, rm, writeFile, rename, readdir, copyFile, chmod, readlink, cp, symlink, stat as promisesStat, readFile } from "node:fs/promises";
 import path from "node:path";
-import properLockfile from "proper-lockfile";
+/**
+ * proper-lockfile is loaded lazily, never at module scope: it pulls in
+ * signal-exit, whose module-level onExit() registers a process-wide SIGTRAP
+ * handler. In the Electron main process that turns V8's OOM `brk #0` crash
+ * into an endless trap loop (the process spins at 100% CPU instead of dying),
+ * and local-runtime/index.ts imports this module on every normal startup.
+ *
+ * `import()` yields a namespace; the CJS module object — what a default import
+ * returns, and what callers monkey-patch — is its `default`. Prefer that so
+ * existing spies on proper-lockfile keep applying.
+ */
+async function loadLockfile() {
+    const imported = await import('proper-lockfile');
+    return imported.default ?? imported;
+}
 const MANIFEST_FILE = '.local-runtime-test-isolation.json';
 const MANIFEST_VERSION = 3;
 const COPY_POLICY = 'persistent-data-dir-v3-symlinks-skip-ipc';
@@ -37,7 +51,8 @@ export async function prepareLocalRuntimeTestDataIsolation(options) {
     const dataDir = path.join(bucketRoot, 'current');
     assertManagedChild(managedRoot, bucketRoot);
     assertManagedChild(bucketRoot, dataDir);
-    const releasePreparationLock = await properLockfile
+    const lockfile = await loadLockfile();
+    const releasePreparationLock = await lockfile
         .lock(bucketRoot, {
         stale: 5000,
         update: 1000,

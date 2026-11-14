@@ -26,6 +26,8 @@ export function buildHostChannelFacadePort(input) {
         notifyTurnEnd: (ctx) => runner.notifyTurnEnd(channelContextFromMessageContext(ctx)),
         sendQuestionnaireMessage: async ({ ctx, text, questionnaire, sessionId }) => {
             const converted = channelContextFromMessageContext(ctx);
+            if (!(await infra.canDeliverToChannel(converted, sessionId)))
+                return 'unavailable';
             const client = runner.clients.get(converted);
             if (!client?.sendMessage)
                 return 'unavailable';
@@ -33,6 +35,8 @@ export function buildHostChannelFacadePort(input) {
             return 'sent';
         },
         sendChannelText: async ({ ctx, text, sessionId }) => {
+            if (!(await infra.canDeliverToChannel(ctx, sessionId)))
+                return;
             await runner.clients.get(ctx).sendText({
                 ctx,
                 text,

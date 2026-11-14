@@ -5,6 +5,23 @@ import { SessionRecordService, } from '../lifecycle/record-service.js';
 import { SessionUniqueViolation } from '../repo/contract.js';
 import { applyLocalRunLocation, readLocalRunLocationInput } from './run-location.js';
 import { CURRENT_SESSION_DATA_VERSION } from './version.js';
+/**
+ * The Project a new Session belongs to.
+ *
+ * A creator that names the registered Project (`projectWorkspaceDir`, set by an assignment
+ * running in a directory inside it) has that Project looked up, never created: the directory
+ * the task runs in must not become a Project of its own. When the named Project is not
+ * registered (only linked to a space, or removed meanwhile) the Project root itself is
+ * resolved, still never the sub directory. Every other creator keeps the existing
+ * directory-is-a-Project behaviour, so a user opening a conversation in a sub directory
+ * still registers it.
+ */
+async function resolveSessionProject(projects, input, nowMs) {
+    const named = input.projectWorkspaceDir;
+    if (!named)
+        return projects.ensureByWorkspaceDir(input.workspaceDir, nowMs());
+    return (await projects.getByWorkspaceDir(named)) ?? projects.ensureByWorkspaceDir(named, nowMs());
+}
 export function createNativeSessionRecordService(options) {
     const { sessionRepository, projectRepository, agentDirectory, nowMs = Date.now } = options;
     return new SessionRecordService({
@@ -15,12 +32,13 @@ export function createNativeSessionRecordService(options) {
                 try {
                     const project = input.isDefaultWorkspace
                         ? await projectRepository.ensureDefault(nowMs())
-                        : await projectRepository.ensureByWorkspaceDir(input.workspaceDir, nowMs());
+                        : await resolveSessionProject(projectRepository, input, nowMs);
                     if (!project) {
                         throw new SessionServiceError('workspace-required', 'Session Project could not be resolved');
                     }
                     return await sessionRepository.create({
                         ...input,
+                        ...(project.projectKind === 'default' ? { isDefaultWorkspace: true } : {}),
                         projectId: project.projectId,
                         runtime: 'pi-agent',
                         status: 'idle',
@@ -51,7 +69,10 @@ export function createNativeSessionRecordService(options) {
             resolve: async (value, workspaceDir) => {
                 const input = readLocalRunLocationInput(value);
                 return input
-                    ? applyLocalRunLocation(input, workspaceDir, nowMs, getConfig().worktreeRefreshBeforeCreate)
+                    ? applyLocalRunLocation(input, workspaceDir, nowMs, {
+                        refreshBeforeCreate: getConfig().worktreeRefreshBeforeCreate,
+                        ...(options.worktreeProgress ? { onWorktreeProgress: options.worktreeProgress } : {}),
+                    })
                     : undefined;
             },
         },
@@ -76,6 +97,7 @@ export function createNativeSessionRecordService(options) {
         ...(options.makeSessionId ? { makeSessionId: options.makeSessionId } : {}),
         ...(options.backfillDiagnostics ? { backfillDiagnostics: options.backfillDiagnostics } : {}),
         ...(options.toolCallMode ? { toolCallMode: options.toolCallMode } : {}),
+        agentSurfaces: options.agentSurfaces,
     });
 }
 //# sourceMappingURL=native-record-factory.js.map

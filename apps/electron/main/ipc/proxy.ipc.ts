@@ -108,6 +108,48 @@ function describeLogBody(value) {
     return `[${typeof value}]`;
 }
 const streamControllers = new Map();
+// IPC streams run in Main and survive renderer reloads unless Main cancels them.
+// Abandoned SSEs otherwise consume the origin's connection pool indefinitely,
+// leaving the next document's account bootstrap queued behind old event streams.
+const rendererStreams = new WeakMap();
+/** Called by the central renderer incident owner before recovery starts. */
+export function abortRendererProxyStreams(sender) {
+    for (const controller of rendererStreams.get(sender)?.controllers ?? [])
+        controller.abort();
+}
+function trackRendererStream(sender, controller) {
+    let owner = rendererStreams.get(sender);
+    if (!owner) {
+        const controllers = new Set();
+        const abortAll = () => {
+            for (const pending of controllers)
+                pending.abort();
+        };
+        const onNavigation = (_event, _url, isInPlace, isMainFrame) => {
+            if (isMainFrame && !isInPlace)
+                abortAll();
+        };
+        sender.on('did-start-navigation', onNavigation);
+        sender.on('destroyed', abortAll);
+        // One set of listeners per owner, removed with the last completed stream.
+        const cleanup = () => {
+            sender.removeListener('did-start-navigation', onNavigation);
+            sender.removeListener('destroyed', abortAll);
+            rendererStreams.delete(sender);
+        };
+        owner = { controllers, cleanup };
+        rendererStreams.set(sender, owner);
+    }
+    const { controllers, cleanup } = owner;
+    controllers.add(controller);
+    if (sender.isDestroyed())
+        controller.abort();
+    return () => {
+        controllers.delete(controller);
+        if (controllers.size === 0)
+            cleanup();
+    };
+}
 function unknownErrorMessage(error) {
     return error instanceof Error ? error.message : String(error);
 }
@@ -891,6 +933,7 @@ async function handleProxyStream(sender, options, setupOptions = {}, debugEmitte
         return;
     const controller = new AbortController();
     streamControllers.set(requestId, { controller, senderId: sender.id });
+    const releaseOwner = trackRendererStream(sender, controller);
     const timeoutMs = options.timeout === undefined ? 120000 : options.timeout;
     // 0 explicitly disables the total timeout for long-lived streams.
     const timeoutId = timeoutMs === 0 ? undefined : setTimeout(() => controller.abort(), timeoutMs);
@@ -911,6 +954,7 @@ async function handleProxyStream(sender, options, setupOptions = {}, debugEmitte
                 : {}),
         }, setupOptions, { sender, emitter: debugEmitter, requestKind: 'stream' }, 'stream');
         const { response } = fetched;
+        controller.signal.throwIfAborted();
         debugAttempt = fetched.debugAttempt;
         const headers = {};
         response.headers.forEach((value, key) => {
@@ -929,6 +973,7 @@ async function handleProxyStream(sender, options, setupOptions = {}, debugEmitte
             try {
                 while (true) {
                     const { done, value } = await reader.read();
+                    controller.signal.throwIfAborted();
                     if (done)
                         break;
                     if (value?.byteLength) {
@@ -985,6 +1030,7 @@ async function handleProxyStream(sender, options, setupOptions = {}, debugEmitte
     finally {
         clearTimeout(timeoutId);
         streamControllers.delete(requestId);
+        releaseOwner();
     }
 }
 /**

@@ -4,6 +4,7 @@ export * from './browser-action-targets.js';
 export * from './browser-actions.js';
 export * from './browser-constants.js';
 export * from './browser-core.js';
+export * from './browser-js-dialog.js';
 export * from './browser-extended-actions.js';
 export * from './browser-keyboard.js';
 export * from './clipboard.js';

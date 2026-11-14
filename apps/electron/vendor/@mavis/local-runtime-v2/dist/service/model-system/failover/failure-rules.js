@@ -294,6 +294,7 @@ function field(value, key) {
  * or `code` / `errorKind: 'timeout'` / `timeoutPhase` on the thrown error), else from the
  * watchdog's message prefix. Another stream-layer failure (empty reply, loop) is not slowness. Only uncommitted attempts reach the pool,
  * so an idle timeout seen here also stalled before any output.
+ * @internal Exported for focused tests.
  */
 export function firstTokenTimeout(failure) {
     const marked = markedStreamTimeout(failure.final);
@@ -490,4 +491,98 @@ export function classifyGenericFailure(evidence, nowMs) {
         ...(retryAtMs === undefined ? {} : { retryAtMs }),
     };
 }
+export const ERROR_KIND = {
+    quota: 'usage_limit',
+    credit: 'credits_exhausted',
+    'rate-limit': 'rate_limited',
+    restricted: 'usage_limit',
+    slow: 'timeout',
+    model: 'not_found',
+    reauth: 'auth',
+    unavailable: 'unknown',
+};
+/** A provider code for an account the vendor restricted (canonical `<id>_account_restricted`). */
+const RESTRICTED_CODE = /(^|_)account_restricted$/u;
+/**
+ * What a provider-classified failure means for the account (shared by pools and single
+ * accounts). Undefined: the request, not the account.
+ */
+export function accountVerdict(classified, failure, base, now) {
+    const generic = () => classifyGenericFailure(failureEvidence(failure), now);
+    switch (classified?.category) {
+        case 'quota':
+        case 'rate-limit':
+            return accountSwitch(classified, generic(), now);
+        case 'model':
+            return { kind: 'model', retryAt: later(now, classified.retryAfterMs) };
+        case 'identity':
+            return { kind: 'reauth' };
+        case 'credential':
+            // The member's own recovery runs first; only a credential it cannot recover leaves.
+            return base.kind === 'recover' ? undefined : { kind: 'reauth' };
+        case undefined:
+        case 'request':
+        case 'network':
+            return unnamedSwitch(generic(), failure);
+        default:
+            // refusal, dependency, platform: the request, not the account.
+            return undefined;
+    }
+}
+/**
+ * The account's upstream answered 408 or a 5xx that names nothing else (no quota, rate or model
+ * words, read first). As Magpie does (gateway.go: a failed candidate is passed for the next; the
+ * last one left is asked again, `passing`), the call moves to another member and this one backs
+ * off (1, 2, 4… minutes, at most 10), since such an answer is often the account's own (Devin's
+ * refusal said as a 502, a vendor out of seats for this account). With nobody else free the same
+ * account is retried, as without a pool. A single account never rests for it.
+ */
+function unnamedSwitch(generic, failure) {
+    return genericSwitch(generic, failure) ?? upstreamFailed(failure);
+}
+function upstreamFailed(failure) {
+    const status = failureEvidence(failure).status;
+    return status === 408 || (status !== undefined && status >= 500 && status <= 599)
+        ? { kind: 'unavailable' }
+        : undefined;
+}
+function later(now, ms) {
+    return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? now + ms : undefined;
+}
+/** A used-up or rate-limited account; credit when the words or the code say money. */
+function accountSwitch(classified, generic, now) {
+    let kind = 'rate-limit';
+    if (RESTRICTED_CODE.test(classified.code) || generic.kind === 'restricted')
+        kind = 'restricted';
+    else if (classified.category === 'quota')
+        kind = generic.kind === 'credit' || /credit/u.test(classified.code) ? 'credit' : 'quota';
+    return { kind, retryAt: later(now, classified.retryAfterMs) ?? generic.retryAtMs };
+}
+/**
+ * The generic rules only ever add an account-level reason, and only where the status itself
+ * says so: 402 / 429 for quota, credit or rate limits, a 5xx carrying a quota code, 403 / 404
+ * for a model the account does not serve. A 400-class error that merely mentions a limit, or a
+ * failure with no status, stays on the account (an unsure verdict never moves the call).
+ */
+export function genericSwitch(generic, failure) {
+    // No first token within agent-core's watchdog: the next member is asked;
+    // from the second in a row the member's model rests (pool-state slowStart).
+    if (failure && firstTokenTimeout(failure))
+        return { kind: 'slow' };
+    const statuses = ACCOUNT_STATUS[generic.kind];
+    if (!statuses || !statuses(generic.status))
+        return undefined;
+    const kind = generic.kind;
+    return { kind, ...(generic.retryAtMs ? { retryAt: generic.retryAtMs } : {}) };
+}
+const usedUpStatus = (status) => status === 402 || status === 429 || (status !== undefined && status >= 500);
+/** Which statuses let a generic verdict move the call to another account. */
+const ACCOUNT_STATUS = {
+    // The rule itself already needs an error status or MCode's own restricted marker.
+    restricted: () => true,
+    quota: usedUpStatus,
+    credit: usedUpStatus,
+    'rate-limit': usedUpStatus,
+    model: (status) => status === 403 || status === 404,
+};
 //# sourceMappingURL=failure-rules.js.map

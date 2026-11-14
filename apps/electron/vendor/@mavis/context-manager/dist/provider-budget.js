@@ -61,4 +61,38 @@ function outputFloor(configuredMaxTokens) {
 function positive(value) {
     return Number.isFinite(value) && value > 0 ? value : 0;
 }
+/** Segment rebuild budget split: parts of the rebuild budget B, in percent. */
+const SEGMENT_REBUILD_SHARE_PERCENT = {
+    summary: 30,
+    recentTurns: 22,
+    userWords: 20,
+    ledger: 10,
+    spaces: 10,
+    status: 8,
+};
+/**
+ * Segment compaction profile budget: the foreground lines plus the B split, and the default
+ * profile's own hard line and input limit; the global `compactionTriggerAt` setting never
+ * applies here.
+ */
+export function resolveSegmentCompactionBudget(input) {
+    const rebuildBudget = Math.max(0, input.foreground.rebuildBudget);
+    const shares = Object.fromEntries(Object.entries(SEGMENT_REBUILD_SHARE_PERCENT).map(([part, percent]) => [
+        part,
+        Math.floor((rebuildBudget * percent) / 100),
+    ]));
+    const { providerInputLimit, automaticTriggerAt } = resolveCompactionTokenBudget({
+        contextWindow: input.contextWindow,
+        configuredMaxOutputTokens: input.configuredMaxOutputTokens,
+    });
+    return {
+        effectiveWindow: input.foreground.effectiveWindow,
+        softLine: Math.max(1, input.foreground.softLine),
+        rebuildBudget,
+        segmentGrowth: input.foreground.segmentGrowth,
+        shares,
+        hardLine: automaticTriggerAt,
+        providerInputLimit,
+    };
+}
 //# sourceMappingURL=provider-budget.js.map

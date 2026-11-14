@@ -2,17 +2,14 @@ import { getRuntimeBuildEnv, getRuntimeRegion, isManagedRuntime } from '@mavis/c
 import { createPiTurnHistogramBucketsByName } from '@mavis/agent-core/pi-turn-runner';
 import { logger } from '../logging/logger.js';
 import { POST_BASH_GAP_HISTOGRAM_BUCKETS } from './bash-completion-correlation.js';
-import { createLocalRuntimeDesktopReporter, createLocalRuntimeMetricsClient, } from '../logging/metrics.js';
+import { createLocalRuntimeDesktopReporter, createLocalRuntimeMetricsClient, DESKTOP_METRICS_DELIVERY, LONG_TAIL_HISTOGRAM_BOUNDS, registeredHistogramBucketsByName, } from '../logging/metrics.js';
 /**
  * Long-tail latency series whose distributions exceed the shared default
- * histogram buckets. Keyed by BARE metric name (the server prepends the
- * `local_runtime_` service prefix on ingest). Buckets top out at 5 minutes
- * so multi-minute turns / compactions stay resolvable instead of collapsing
- * into a single +Inf bucket.
+ * histogram buckets, with the boundaries the registry keeps for the shipped
+ * Pi request histograms. Keyed by BARE metric name (the server prepends the
+ * `local_runtime_` service prefix on ingest).
  */
-const LONG_TAIL_HISTOGRAM_BUCKETS = [
-    100, 250, 500, 1000, 2500, 5000, 10000, 15000, 30000, 60000, 120000, 300000,
-];
+const LONG_TAIL_HISTOGRAM_BUCKETS = [...LONG_TAIL_HISTOGRAM_BOUNDS];
 const BASH_DURATION_HISTOGRAM_BUCKETS = [
     100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000,
     1_800_000, 3_600_000,
@@ -55,11 +52,13 @@ const COLLECTION_RSS_DELTA_BUCKETS = [
     268_435_456,
 ];
 const HISTOGRAM_BUCKETS_BY_NAME = {
+    // One signed-in user's web_fetch calls in one day; see service/web-fetch/local-state/daily-usage.ts.
+    web_fetch_user_daily_calls: [
+        0, 1, 2, 3, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1_000, 2_000,
+    ],
     pi_turn_duration_ms: LONG_TAIL_HISTOGRAM_BUCKETS,
     pi_loop_steps: PI_LOOP_STEPS_BUCKETS,
     output_safety_regenerations_per_user_turn: [0, 1, 2, 3],
-    pi_llm_first_token_ms: LONG_TAIL_HISTOGRAM_BUCKETS,
-    pi_llm_response_ms: LONG_TAIL_HISTOGRAM_BUCKETS,
     ...createPiTurnHistogramBucketsByName(),
     pi_llm_post_bash_gap_ms: POST_BASH_GAP_HISTOGRAM_BUCKETS,
     bash_duration_ms: BASH_DURATION_HISTOGRAM_BUCKETS,
@@ -97,6 +96,8 @@ const HISTOGRAM_BUCKETS_BY_NAME = {
     ptc_turn_programs: PTC_TURN_PROGRAMS_BUCKETS,
     ptc_run_code_duration_ms: LONG_TAIL_HISTOGRAM_BUCKETS,
     ptc_run_code_child_calls: PTC_RUN_CODE_CHILD_CALLS_BUCKETS,
+    // Registered metrics take their buckets from the metric registry only.
+    ...registeredHistogramBucketsByName(),
 };
 /**
  * Build the local-runtime MetricsClient. Under managed runtime (Electron or
@@ -120,6 +121,7 @@ export function buildLocalRuntimeMetricsClient(options) {
         ...(options.appVersion ? { appVersion: options.appVersion } : {}),
         histogramBucketsByName: HISTOGRAM_BUCKETS_BY_NAME,
         ...(reporter ? { reporter } : {}),
+        delivery: DESKTOP_METRICS_DELIVERY,
         onError,
     });
 }

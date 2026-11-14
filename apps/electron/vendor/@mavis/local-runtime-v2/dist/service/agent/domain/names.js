@@ -3,6 +3,12 @@ import { isTrustedBuiltinCreationSource, resolveCanonicalSubagentRole, } from '@
 import { AgentServiceError } from '../errors.js';
 export const PRIMARY_AGENT_NAME = 'mavis';
 export const LEGACY_PRIMARY_AGENT_NAME = 'main';
+/**
+ * Historic built-in Agents that become ordinary manual Agents on upgrade. They
+ * are matched by exact stable name only; a same-named manual or unknown row is
+ * left untouched. Until startup detaches them they stay visible as builtins.
+ */
+export const DETACHABLE_LEGACY_BUILTIN_NAMES = ['general', 'coder'];
 export function buildAgentReadScope(primaryAgentName, input) {
     return {
         requestedName: input.requestedName,

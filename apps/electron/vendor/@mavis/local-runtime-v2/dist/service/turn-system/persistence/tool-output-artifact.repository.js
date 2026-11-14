@@ -19,8 +19,10 @@ const READABLE_DIRECTORY_CACHE_LIMIT = 512;
 export class ToolOutputArtifactRepository {
     options;
     readableDirectories = new Map();
+    directoryName;
     constructor(options) {
         this.options = options;
+        this.directoryName = options.directoryName ?? TOOL_OUTPUT_DIRECTORY;
     }
     async write(input) {
         const canonicalDirectory = await this.resolveDirectory(input.sessionId);
@@ -74,7 +76,7 @@ export class ToolOutputArtifactRepository {
     }
     /** Where this Session's tool output is written; it may not exist yet. */
     async directory(sessionId) {
-        return join(await this.options.resolveSessionReportsDirectory(sessionId), TOOL_OUTPUT_DIRECTORY);
+        return join(await this.options.resolveSessionReportsDirectory(sessionId), this.directoryName);
     }
     /**
      * The Session's own tool-output directory, published to the permission layer
@@ -117,7 +119,7 @@ export class ToolOutputArtifactRepository {
         if (!inspect)
             return undefined;
         const reports = await inspect(sessionId);
-        return reports ? { reports, directory: join(reports, TOOL_OUTPUT_DIRECTORY) } : undefined;
+        return reports ? { reports, directory: join(reports, this.directoryName) } : undefined;
     }
     rememberReadableDirectory(sessionId, location) {
         // Refresh recency, then evict the least recently used entries.
@@ -132,7 +134,7 @@ export class ToolOutputArtifactRepository {
     }
     async resolveDirectory(sessionId) {
         const reportsDirectory = await this.options.resolveSessionReportsDirectory(sessionId);
-        const directory = join(reportsDirectory, TOOL_OUTPUT_DIRECTORY);
+        const directory = join(reportsDirectory, this.directoryName);
         await mkdir(directory, { recursive: true, mode: 0o700 });
         const [canonicalReportsDirectory, canonicalDirectory] = await Promise.all([
             realpath(reportsDirectory),

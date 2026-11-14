@@ -1,7 +1,9 @@
+import { isDeepStrictEqual } from 'node:util';
 import { streamSimple } from '@earendil-works/pi-ai';
 import { LLM_REQUEST_TIMEOUT_MS } from './defaults.js';
-import { resolveLLMStreamTimeouts, withLLMStreamTimeouts } from './llm-stream-timeout.js';
-export function composeStreamFn(resolved) {
+import { resolveLLMStreamTimeouts, withLLMStreamTimeouts, } from './llm-stream-timeout.js';
+import { isBackgroundTaskUserMessage } from '../protocol/user-message-origin.js';
+export function composeStreamFn(resolved, resume) {
     // Order matters: each wrapper only fills the option it owns, while
     // explicit per-call options from upstream wrappers still win. The host
     // ceiling is the exception and therefore the innermost link: it has to see
@@ -22,15 +24,21 @@ export function composeStreamFn(resolved) {
     return withLLMStreamTimeouts(requestBounded, resolveLLMStreamTimeouts({
         firstEventTimeoutMs: resolved.firstEventTimeoutMs,
         streamIdleTimeoutMs: resolved.streamIdleTimeoutMs,
-    }));
+    }), resume);
 }
 export function setLLMHook(agent, turn, history) {
-    if (turn.hooks.beforeLLM.length === 0 && turn.hooks.afterLLM.length === 0)
+    if (turn.hooks.beforeLLM.length === 0 &&
+        turn.hooks.afterLLM.length === 0 &&
+        turn.hooks.turnFailure.length === 0 &&
+        !turn.input.llmPreemption) {
         return;
+    }
     let checkpointCallCount = 0;
     agent.transformContext = async (messages, signal) => {
+        turn.recovery.lastRequestPrepared = false;
         const request = await prepareRequest(messages, signal);
         turn.recovery.lastRequest = [...request];
+        turn.recovery.lastRequestPrepared = true;
         return request;
     };
     const prepareRequest = async (messages, signal) => {
@@ -40,12 +48,19 @@ export function setLLMHook(agent, turn, history) {
             for (const message of rejectedMessages)
                 turn.rejectedAssistantMessages.delete(message);
         }
-        if (turn.hooks.beforeLLM.length === 0)
-            return messages;
-        const phase = checkpointCallCount === 0 ? 'initial' : 'iteration';
-        checkpointCallCount += 1;
         const recovery = turn.recovery.active;
         delete turn.recovery.active;
+        // A replayed recovery resends the failed request as it was sent: no hook
+        // may change it, and none runs.
+        if (recovery?.replay) {
+            checkpointCallCount += 1;
+            return [...recovery.requestMessages];
+        }
+        if (turn.hooks.beforeLLM.length === 0)
+            return messages;
+        // A call aborted before its request was prepared sent nothing: preparing
+        // it again (a turn-failure recovery) is still the Turn's initial call.
+        const phase = checkpointCallCount === 0 ? 'initial' : 'iteration';
         const checkpoint = await runBeforeLLM(turn, messages, phase, signal, recovery);
         if (checkpoint.type === 'abort') {
             turn.metrics.tryRecordTerminalFailure({
@@ -54,6 +69,7 @@ export function setLLMHook(agent, turn, history) {
             });
             throw new Error(`before_llm_checkpoint_aborted: ${checkpoint.reason}`);
         }
+        checkpointCallCount += 1;
         if (checkpoint.type === 'respond') {
             turn.syntheticResponse.pending = {
                 text: checkpoint.text,
@@ -80,6 +96,10 @@ export function setLLMHook(agent, turn, history) {
                 await history.replace(replacement.messages, previousMessages, replacement.metadata);
             }
             catch (err) {
+                // Nothing was replaced durably: the Turn goes on from the transcript
+                // it had, so a later history flush appends only this Turn's records.
+                messages.splice(0, messages.length, ...previousMessages);
+                agent.state.messages = previousMessages;
                 const message = err instanceof Error ? err.message : String(err);
                 throw new Error(`before_llm_checkpoint_persistence_failed: ${message}`);
             }
@@ -390,16 +410,9 @@ function captureInitialCurrentUser(messages, phase) {
     if (phase !== 'initial')
         return undefined;
     const candidate = messages.at(-1);
-    if (candidate?.role !== 'user' || isInternalUserMessage(candidate))
+    if (candidate?.role !== 'user' || isBackgroundTaskUserMessage(candidate))
         return undefined;
     return messages.filter((message) => message === candidate).length === 1 ? candidate : undefined;
-}
-function isInternalUserMessage(message) {
-    const hostMetadata = Reflect.get(message, 'hostMetadata');
-    if (typeof hostMetadata !== 'object' || hostMetadata === null || Array.isArray(hostMetadata)) {
-        return false;
-    }
-    return Object.hasOwn(hostMetadata, 'backgroundTaskOrigin');
 }
 function placeBeforeCurrentUser(input) {
     if (input.phase !== 'initial')
@@ -412,7 +425,7 @@ function placeBeforeCurrentUser(input) {
         // A continuation or an explicitly internal user at the tail has no real
         // user to precede. The ordinary tail path keeps the durable replacement
         // (e.g. a finished compaction) while still appending the marker.
-        if (tail?.role !== 'user' || isInternalUserMessage(tail))
+        if (tail?.role !== 'user' || isBackgroundTaskUserMessage(tail))
             return { type: 'tail' };
         return 'before-current-user could not locate one current real user';
     }
@@ -424,23 +437,31 @@ function placeBeforeCurrentUser(input) {
     if (input.durableReplacement.metadata.currentUserSourceIndex !== undefined) {
         return placeAfterEarlierPlacement({ ...input, durableReplacement: input.durableReplacement }, currentUser);
     }
+    const durable = input.durableReplacement.messages;
     const sourceIndexes = input.durableReplacement.metadata.replacementSourceIndexes;
-    const durableMatches = input.durableReplacement.messages.flatMap((message, index) => message === currentUser || sourceIndexes?.[index] === sourceIndex ? [index] : []);
+    const durableMatches = durable.flatMap((message, index) => message === currentUser || sourceIndexes?.[index] === sourceIndex ? [index] : []);
     if (new Set(durableMatches).size > 1) {
         return 'before-current-user located multiple replacement users';
     }
-    const durableUserIndex = durableMatches[0];
-    const currentMatches = input.currentMessages.flatMap((message, index) => message === currentUser || index === durableUserIndex ? [index] : []);
-    if (new Set(currentMatches).size > 1) {
-        return 'before-current-user located multiple request users';
-    }
-    const currentUserIndex = currentMatches[0];
+    const durableUserIndex = durableMatches[0] ?? lastIndexWhere(durable, (message) => isSameUser(message, currentUser));
+    const durableUser = durableUserIndex === undefined ? undefined : durable[durableUserIndex];
+    const currentUserIndex = locateRequestUser(input.currentMessages, {
+        currentUser,
+        durableUser,
+        durableMessages: durable,
+    });
+    if (typeof currentUserIndex === 'string')
+        return currentUserIndex;
     const requestBase = input.currentMessages.filter((_message, index) => index !== currentUserIndex);
-    const durableBase = input.durableReplacement.messages.filter((_message, index) => index !== durableUserIndex);
+    const located = currentUserIndex === undefined ? undefined : input.currentMessages[currentUserIndex];
+    // The compactor's copy leaves both views as the exact current user; anything
+    // else a hook put in the request is a request-only rewrite and stays there.
+    const requestUser = located === undefined || located === durableUser ? currentUser : located;
+    const durableBase = durable.filter((_message, index) => index !== durableUserIndex);
     const durableMessages = [...durableBase, input.marker, currentUser];
     return {
         type: 'placed',
-        messages: [...requestBase, input.marker, currentUser],
+        messages: [...requestBase, input.marker, requestUser],
         durableReplacement: {
             messages: durableMessages,
             metadata: withCurrentUserTailMetadata(input.durableReplacement.metadata, durableUserIndex, durableMessages.length, sourceIndex),
@@ -448,24 +469,71 @@ function placeBeforeCurrentUser(input) {
     };
 }
 /**
+ * Finds the current user in the request view. Durable positions say nothing
+ * here, because request-only hooks insert, drop and rewrite messages. The exact
+ * object (the initial user or the durable copy) wins. Otherwise only a message
+ * durable history does not hold can be the user: a clone with the same content
+ * and timestamp, or, while durable history still holds the user, a rewrite of
+ * it. A rewrite keeps the user's position, so only the last non-custom request
+ * message after the latest compaction summary qualifies; request-only user
+ * markers placed elsewhere (Tool Search catalog, PTC reminder) never do.
+ * Returns undefined when the request has none.
+ */
+function locateRequestUser(messages, known) {
+    const identityMatches = messages.flatMap((message, index) => message === known.currentUser || message === known.durableUser ? [index] : []);
+    if (identityMatches.length > 1)
+        return 'before-current-user located multiple request users';
+    if (identityMatches.length === 1)
+        return identityMatches[0];
+    const durable = new Set(known.durableMessages);
+    const clone = lastIndexWhere(messages, (message) => !durable.has(message) && isSameUser(message, known.currentUser));
+    if (clone !== undefined || !known.durableUser)
+        return clone;
+    const rewriteIndex = lastIndexWhere(messages, (message) => message.role !== 'custom');
+    if (rewriteIndex === undefined)
+        return undefined;
+    const summaryIndex = lastIndexWhere(messages, (message) => message.role === 'compactionSummary') ?? -1;
+    const rewrite = messages[rewriteIndex];
+    return rewriteIndex > summaryIndex &&
+        rewrite.role === 'user' &&
+        !durable.has(rewrite) &&
+        !isBackgroundTaskUserMessage(rewrite)
+        ? rewriteIndex
+        : undefined;
+}
+function isSameUser(message, user) {
+    return (message.role === 'user' &&
+        user.role === 'user' &&
+        message.timestamp === user.timestamp &&
+        isDeepStrictEqual(message.content, user.content));
+}
+function lastIndexWhere(messages, predicate) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (predicate(messages[index]))
+            return index;
+    }
+    return undefined;
+}
+/**
  * Places another marker once an earlier placement already put the exact
  * current user at the durable tail. Markers keep registration order, all
- * before the current user. In the request view the user is matched by
- * identity; if a request-only hook rewrote the user (e.g. a media guard
- * replacing an image block), the first placement's invariant — the current
- * user is the last request message — locates it instead.
+ * before the current user. In the request view `locateRequestUser` finds the
+ * user even if a request-only hook rewrote it since (e.g. a media guard
+ * replacing an image block).
  */
 function placeAfterEarlierPlacement(input, currentUser) {
     const durable = input.durableReplacement.messages;
     if (durable.at(-1) !== currentUser || durable.indexOf(currentUser) !== durable.length - 1) {
         return 'before-current-user lost the placed current user';
     }
-    const identityMatches = input.currentMessages.flatMap((message, index) => message === currentUser ? [index] : []);
-    if (identityMatches.length > 1)
-        return 'before-current-user located multiple request users';
-    const lastIndex = input.currentMessages.length - 1;
-    const requestUserIndex = identityMatches[0] ?? (input.currentMessages[lastIndex]?.role === 'user' ? lastIndex : -1);
-    if (requestUserIndex < 0)
+    const requestUserIndex = locateRequestUser(input.currentMessages, {
+        currentUser,
+        durableUser: currentUser,
+        durableMessages: durable,
+    });
+    if (typeof requestUserIndex === 'string')
+        return requestUserIndex;
+    if (requestUserIndex === undefined)
         return 'before-current-user lost the placed request user';
     const durableMessages = [...durable.slice(0, -1), input.marker, currentUser];
     return {
@@ -562,6 +630,15 @@ function withHeaders(inner, headers) {
             headers: mergedHeaders,
         });
     });
+}
+/**
+ * A request that carries a session identifier carries `resolve()` instead,
+ * read as it is sent; the Providers derive their cache key and affinity
+ * headers from it. A request without one (an isolated side request) keeps none.
+ */
+export function withSessionIdentity(inner, resolve) {
+    const base = inner ?? streamSimple;
+    return ((model, context, options) => base(model, context, options?.sessionId === undefined ? options : { ...options, sessionId: resolve() }));
 }
 function withFetch(inner, fetch) {
     const base = inner ?? streamSimple;

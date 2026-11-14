@@ -58,6 +58,9 @@ function resolveHostedSelection(scope, context) {
         builtinSkillNames: resolveFeatureAwareBuiltinSkillNames(capabilities, {
             computerUseActive: scope.computerUseActive === true,
             ...(scope.miniappAvailable === true ? { miniappAvailable: true } : {}),
+            ...(scope.pluginRecommendationAvailable === true
+                ? { pluginRecommendationAvailable: true }
+                : {}),
             canonicalRole: policy.canonicalRole,
             builtinAgent: policy.builtinAgent,
             disabledSkillNames: restrictions.disabledBuiltinSkillNames,

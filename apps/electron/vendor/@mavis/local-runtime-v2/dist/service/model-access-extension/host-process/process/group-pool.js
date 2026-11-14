@@ -58,7 +58,7 @@ function environmentKey(options) {
         .filter(([, value]) => value !== undefined)
         .sort(([a], [b]) => a.localeCompare(b, 'en'));
     return createHash('sha256')
-        .update(JSON.stringify([options.execPath, options.nodeArgs, options.entryPath, entries]))
+        .update(JSON.stringify([options.execPath, options.entryPath, entries]))
         .digest('hex')
         .slice(0, 16);
 }

@@ -98,7 +98,7 @@ export function cronToolDefinitions(idField) {
                 timezone,
                 enabled,
                 model: Type.Optional(nonblank(idField === 'cron_id'
-                    ? 'User-selected model name; omit to inherit the current model. Ambiguity returns candidates without creating a task.'
+                    ? 'User-selected model name; omit to inherit the current model. Applies to conversations the task creates; a task bound to an existing conversation runs on the model selected in that conversation. Ambiguity returns candidates without creating a task.'
                     : 'Exact provider/model_id. Omit to inherit the current model.')),
                 project: Type.Optional(nonblank(idField === 'cron_id'
                     ? 'Absolute workspace path on the execution host. An existing target session must already use this directory. Omit to retain defaults.'
@@ -135,7 +135,7 @@ export function cronToolDefinitions(idField) {
                             description: 'Absolute workspace path on the execution host; must match an existing target session. Omit to keep the override; empty string clears it.',
                         })),
                         model: Type.Optional(Type.String({
-                            description: 'Exact provider/model or model ID. Omit to keep the override; empty string clears it. Does not change shared settings.',
+                            description: 'Exact provider/model or model ID. Omit to keep the override; empty string clears it. Applies to conversations the task creates; a task bound to an existing conversation keeps the model selected in that conversation. Does not change shared settings.',
                         })),
                     }
                     : {}),
@@ -154,6 +154,24 @@ export function cronToolDefinitions(idField) {
             schema: Type.Object(identity, { additionalProperties: false }),
         },
     ];
+}
+/**
+ * cron_create of the coordinator whose schedules wake its main conversation (Bunny):
+ * the desktop cron_create plus `space`, the task space a schedule belongs to. Every
+ * other Agent keeps cron_create byte for byte, without `space`.
+ */
+export function withCoordinatorCronSpace(def) {
+    if (def.name !== 'cron_create')
+        return def;
+    const { cron_name, ...rest } = def.schema.properties;
+    return {
+        ...def,
+        schema: Type.Object({
+            cron_name: cron_name,
+            space: Type.Optional(nonblank('Bunny 定时关联的任务空间 ID；到点叫醒当前 Bunny 主对话')),
+            ...rest,
+        }, { additionalProperties: false }),
+    };
 }
 export const LocalSelfReminderToolDef = {
     name: 'self_reminder',

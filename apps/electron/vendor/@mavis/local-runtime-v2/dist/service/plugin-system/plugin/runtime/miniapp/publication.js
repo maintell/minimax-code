@@ -242,6 +242,21 @@ export class SupervisedMiniAppPublicationParticipant {
             .find(({ pluginId }) => pluginId === candidate.pluginId);
         return status?.phase === 'active' && sameRunningGeneration(status.active, accepted.target);
     }
+    /** A cold generation is reported only after Supervisor has proven process cleanup. */
+    isAcceptedCandidateStopped(candidate) {
+        if (this.closed)
+            return false;
+        const accepted = this.active.get(candidate.pluginId);
+        if (!accepted || !sameMiniAppCandidate(accepted.candidate, candidate))
+            return false;
+        const status = this.options.supervisor
+            .inspect(candidate.pluginId)
+            .find(({ pluginId }) => pluginId === candidate.pluginId);
+        return (status?.phase === 'cold' &&
+            Boolean(status.active &&
+                status.active.miniAppGeneration === accepted.target.miniAppGeneration &&
+                isStoppedTarget(accepted, status.active)));
+    }
     isAcceptedMcpEndpointCurrent(pluginId, identity) {
         const accepted = this.active.get(pluginId);
         return Boolean(accepted &&
@@ -659,8 +674,8 @@ async function rollbackState(state) {
 async function rollbackResources(resources) {
     await runAllFinally([...resources].reverse().map((resource) => () => resource.rollback()));
 }
-function assertStoppedTarget(accepted, target) {
-    if (target.pluginId === accepted.candidate.pluginId &&
+function isStoppedTarget(accepted, target) {
+    return (target.pluginId === accepted.candidate.pluginId &&
         target.packageRoot === accepted.candidate.packageRoot &&
         target.packageDigest === accepted.candidate.packageDigest &&
         target.clientDigest === accepted.candidate.clientDigest &&
@@ -668,10 +683,11 @@ function assertStoppedTarget(accepted, target) {
         target.nodeDigest === accepted.candidate.nodeDigest &&
         target.lifecycle === accepted.candidate.lifecycle &&
         !target.processGeneration &&
-        !target.origin) {
-        return;
-    }
-    throw publicationError('MINIAPP_STOP_TARGET_INVALID');
+        !target.origin);
+}
+function assertStoppedTarget(accepted, target) {
+    if (!isStoppedTarget(accepted, target))
+        throw publicationError('MINIAPP_STOP_TARGET_INVALID');
 }
 function stoppedAcceptedMiniApp(item, observed) {
     return {

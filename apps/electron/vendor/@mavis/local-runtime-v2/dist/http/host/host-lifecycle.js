@@ -31,6 +31,7 @@ export class HostResourceLifecycle {
             () => resources.globalEvents.close(),
             () => resources.workspaceIndexingRemoteWorker.close(),
             async () => resources.backgroundTaskRuntime?.drain(),
+            async () => resources.webFetchRouter?.flushState(),
             () => resources.errorReporter?.close(),
         ];
         for (const close of cleanups) {
