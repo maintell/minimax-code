@@ -9,16 +9,18 @@ a locally installed client.
 
 | | |
 | --- | --- |
-| Installed client | `MiniMax Code` 3.1.13, restored from the installed client (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
-| Application | `@mmx-agent/electron` 3.1.13, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
+| Installed client | `MiniMax Code` 3.1.15, restored from the installed client (`%LOCALAPPDATA%\Programs\MiniMax Code`) |
+| Application | `@mmx-agent/electron` 3.1.15, Electron 42.8.0 (Chromium 148), `buildEnv=prod`, locale `zh` |
 | Identity | appId `com.minimax.agent.cn`, runtime app name `MiniMax`, user data `%APPDATA%\MiniMax` |
-| Package | `resources/app.asar` (355 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
+| Package | `resources/app.asar` (351 MB), `resources/app.asar.unpacked`, `resources/resources/**` |
 
 Version history of this recovery:
 
 | App | Date | Notes |
 | --- | --- | --- |
-| 3.1.13 | 2026-11-10 | Current. Small maintenance release: a service fetch path for the utility process (`main/modules/local-runtime/utility/network-service-fetch.ts` plus its wiring), a refreshed elevated profile-import broker and session-transfer client, a new `pptx-core` wasm hash set (the previous hashes return alongside), and a changed prod-zh environment lane. No dependency drift. Main process: 423 files (was 422). |
+| 3.1.15 | 2026-11-15 | Current. Largest release since 3.1.10 for the main process: 16 new modules (`ipc/preview-host-guard.ts`, `ipc/uiMetrics.ipc.ts`, `lifecycle/quota-auto-resume-wake.ts`, `modules/browser/browser-js-dialog-{gate,registry}.ts`, `modules/browser/miniapp-{content-preview,preview-cache}.ts`, `modules/diagnostics/bunny-feedback-bundle.ts`, `modules/local-runtime/utility/{device-online,supervisor-metrics}.ts`, `modules/mcode-tools/host-bin-dir.ts`, `modules/observability/{desktop-metrics,main-memory-logger}.ts`, `sigtrap-guard.ts`, `utils/device-{hardware-info,manufacturer}.ts`) plus SSE stream ownership tracking in `ipc/proxy.ipc.ts`, per-request abort checks, and an updater lane refactor (`getUpdateServerUrl` now derives `releasePath` inline; `modules/updater/state.ts` installs on quit for internal builds). The Windows installer is now **split per architecture** (`MiniMax Code Setup <ver>-x64.exe`, payload only `app-64.7z`), so the download is 287 MB instead of 572 MB. New `pptx-core` wasm hash set, `installer-common.nsh` and `install-mcode-test.sh` changes, refreshed session-transfer client. 776 vendor files rebuilt with **no version drift** (48 packages). Main process: 439 files (was 423). |
+| 3.1.14 | 2026-11-11 | Maintenance release with no upstream change to the main process: the shipped `dist/main` is byte-identical to 3.1.13 (423 files). Renderer chunk rotation, a new `pptx-core` wasm hash set, refreshed abe-broker and session-transfer binaries, a changed prod-zh lane, and 11 vendor manifests gaining the `file:` edges the shipped build now declares. Offline mode was fixed here to keep the signed-in identity (see "Offline mode"). |
+| 3.1.13 | 2026-11-10 | A service fetch path for the utility process (`main/modules/local-runtime/utility/network-service-fetch.ts` plus its wiring), a refreshed elevated profile-import broker and session-transfer client, a new `pptx-core` wasm hash set (the previous hashes return alongside), and a changed prod-zh environment lane. No dependency drift. Main process: 423 files (was 422). |
 | 3.1.12 | 2026-11-09 | Mini-app hosting moves into the main process (`main/modules/browser/miniapp-host*.ts`, `main/ipc/miniAppHost.ipc.ts`), PowerPoint editing gains a full local pipeline (`main/modules/document-preview/pptx-edit/**`, `pptPreviewQuery`/`pptxEditing` IPC, `pptx-core` fonts and new wasm hashes) and browser-profile import ships a separate elevated broker (`resources/abe-broker/win32-x64`, `main/modules/browser-profile-import/**`). `resources/model-access-host/host-entry.mjs` and an updater test-branch switch are new. Vendor versions are unchanged (48 packages) but 319 runtime files were rebuilt. Main process: 422 files (was 388). |
 | 3.1.10 | 2026-11-03 | The v1 local runtime is gone: the shipped tree no longer carries `@mavis/local-runtime` (57 packages remain vendored), and `@mavis/local-runtime-v2` grows by ~700 files. Embedded browser rework in the main process — `native-browser-view`, `webview-browser-view`, guest registry/input, backend policy store, telemetry runtime plus a sanitizer, full-page capture and downloads (`main/modules/browser/**`, `main/ipc/browser*.ipc.ts`). New `main/modules/file-open-with/**` (Windows "打开方式" enhancement, with a generated text-type list), `main/modules/deeplink/workspace-open.ts`, `main/utils/default-project-dir.ts`, auth refresh diagnostics/environment, `data-dir-relocation-guard` and `cua-overlay-target`. `resources/file-associations.nsh` stops writing `OpenWithProgids` (it lists `SupportedTypes` instead), `pptx-core` moved to new content hashes, the session-transfer client was rebuilt, and the QuickJS wasm runtime (`quickjs-emscripten`, `quickjs-emscripten-core`, `@jitl/*`) joins the unpacked set. The new PTC worker resolves its own module URL against `app.asar.unpacked` (`.../runner/ptc/worker-path.js`), so `@mavis/local-runtime-v2`'s PTC modules and its `package.json` must be unpacked as well — leaving them in the archive fails at runtime with `Cannot find module ... quickjs-worker.js`. `@opentelemetry/*` is no longer a direct dependency (transitive only). Main process: 388 files (was 357). |
 | 3.1.6 | 2026-10-27 | Renderer assets moved out of `public/`: the shipped `public/` keeps only the six files the main process and the plugin pages load, and `out/assets/**` carries the images. New packaged Computer Use component (`resources/computer-use/0.34.1/win32-x64/**`) and the vendored `@mavis/computer-use` package it is driven by; mini-app speech/tool IPC, browser device-preview and permission-panel modules are new. `pptx-core` moved to a new content hash. Main process: 357 files (was 346). |
@@ -29,7 +31,7 @@ Version history of this recovery:
 
 | Part | Method | Fidelity |
 | --- | --- | --- |
-| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **407 of 423 files byte-identically**; six of the remaining sixteen differ only in the *order* of adjacent export-assignment statements (one of them additionally inlines an arrow function into its export assignment, 10 lines total, semantically inert), and the other ten carry this distribution's offline-mode and update-channel patches (see "Known deviations"). See "Verification" below. |
+| Main process (`main/**`) | The shipped `dist/main` is per-file `tsc` CommonJS output with comments preserved. `tools/restore/convert-main.mjs` reverses every emitted pattern (imports, re-exports, dynamic imports, declaration-form exports) back to TypeScript using the TypeScript compiler API and text-level replacement, keeping comments and formatting. | Recompiling the recovered sources with tsc 5.9.3 (`target: ES2022`, `module: commonjs`, `esModuleInterop`) reproduces **423 of 439 files byte-identically**; six of the remaining sixteen differ only in the *order* of adjacent export-assignment statements (one of them additionally inlines an arrow function into its export assignment, 10 lines total, semantically inert), and the other ten carry this distribution's offline-mode and update-channel patches (see "Known deviations"). See "Verification" below. |
 | Renderer (`out/**`) | Committed as the prebuilt static Next.js export. | Byte-identical to the shipped `out/`. The upstream UI sources are not part of this distribution and the build carries no source maps, so a source recovery is not possible. |
 | `public/**` | Committed as-is from the shipped app root. | Byte-identical. 3.1.6 moved the renderer images into `out/assets/**`, so only six files remain: the prompt-config key carriers the main process reads (`public/assets/img/breakDown.png`, `computer_use.png`, see `main/config/prompt-config-key.ts`) and four plugin/permission images the renderer loads. The directory stays a runtime dependency, not only renderer input. |
 | Model menu (`model-menu/**`) | Committed as the prebuilt Vite build output. | Byte-identical. |
@@ -43,7 +45,7 @@ Version history of this recovery:
 
 1. **Emit equivalence.** `tools/restore/verify-main.mjs` compiles `main/**` with
    the app `tsconfig.json` and diffs every emitted file against the shipped
-   `dist/main`. Result: 407/423 identical, 16 files differing:
+   `dist/main`. Result: 423/439 identical, 16 files differing:
    - six with export-order-only differences (`config/env.js`,
      `ipc/documentPreview.ipc.js`, `modules/desktop-appearance.js`,
      `modules/document-preview/artifact-protocol.js`,
@@ -92,7 +94,14 @@ Version history of this recovery:
 
 1. **Export-order-only diffs** — six of the sixteen files listed above; 10 lines
    total. The other ten carry this distribution's offline-mode and
-   update-channel patches by design.
+   update-channel patches by design. Since 3.1.15 two of them are a *merge*
+   rather than a replacement: upstream added SSE stream-ownership tracking to
+   `ipc/proxy.ipc.ts` and refactored `getUpdateServerUrl` in
+   `modules/updater/config.ts`, so the patch is re-inserted on top of the
+   shipped shape. `tools/restore/apply-local-patches.mjs` covers neither file —
+   a future upstream refactor of these two needs the same manual merge.
+   `modules/updater/state.ts` carries an upstream-only change (internal builds
+   install on quit) and is deliberately left as shipped.
 2. **Erased type annotations.** The shipped build erased all TypeScript types.
    The recovered sources compile to the same JavaScript but do not satisfy a
    full type check (`pnpm typecheck:strict` reports ≈5.3k diagnostics, dominated
@@ -116,7 +125,9 @@ Version history of this recovery:
    is load-bearing is repeated on its own (`@mavis/local-runtime-v2`'s PTC
    worker, which resolves itself against `app.asar.unpacked` and therefore
    cannot stay inside the archive). The installer artifact name uses
-   electron-builder's default.
+   electron-builder's default. Upstream splits installers per architecture as of
+   3.1.15 (`MiniMax Code Setup <ver>-x64.exe`); this distribution builds one x64
+   NSIS package.
 6. **Vendor manifest rewrites** — see below.
 7. **One vendored runtime file carries a deliberate local patch** — the fixed
    three-second retry cadence in `@mavis/agent-core`'s `llm-retry.js`; see
