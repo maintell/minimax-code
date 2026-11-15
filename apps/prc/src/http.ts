@@ -188,13 +188,17 @@ export function createHttpApi(deps: {
       // A header the caller sent still decides even when it matches nothing.
       const hasDeviceHeader = deviceHeader !== undefined;
       const binding = deps.store.findBindingByDevice(deviceId) ?? undefined;
-      const bindingId = binding?.id;
+      // The console learns its binding from /api/state and never sends a device
+      // header afterwards, so every route below shares one resolution: an
+      // explicit header decides, otherwise the sole binding answers.
+      const resolvedBinding = binding ?? (hasDeviceHeader ? undefined : deps.store.soleBinding());
+      const bindingId = resolvedBinding?.id;
 
       if (req.method === 'GET' && url.pathname === '/api/state') {
         // Discovery for a console that cannot send a device header on every
         // request: with no header and exactly one binding, that binding is the
         // answer; with several, only the header identifies which one.
-        const stateBinding = binding ?? (hasDeviceHeader ? undefined : deps.store.soleBinding());
+        const stateBinding = resolvedBinding;
         return send(res, 200, {
           binding: stateBinding
             ? { id: stateBinding.id, deviceId: stateBinding.deviceId, generation: stateBinding.producerGeneration }

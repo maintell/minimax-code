@@ -312,3 +312,22 @@ test('a malformed login body answers 500 and the server keeps serving', async ()
   assert.equal(health.status, 200);
   await server.close();
 });
+
+test('session routes reuse the sole-binding discovery without a device header', async () => {
+  const { server, store, calls } = await boot();
+  const { cookies } = await signIn(server);
+  const only = store.getOrCreateBinding('dev-only-2', '3.1.14');
+
+  const sessions = await fetch(`${server.url}/api/sessions`, { headers: { cookie: cookies } });
+  assert.equal(sessions.status, 200);
+  assert.equal((await sessions.json()).payload.sessions[0].id, 's1');
+  assert.equal(calls.at(-1)?.bindingId, only.id);
+
+  const history = await fetch(`${server.url}/api/sessions/s1/messages`, { headers: { cookie: cookies } });
+  assert.equal(history.status, 200);
+
+  store.getOrCreateBinding('dev-second', '3.1.14');
+  const ambiguous = await fetch(`${server.url}/api/sessions`, { headers: { cookie: cookies } });
+  assert.equal(ambiguous.status, 409);
+  await server.close();
+});
