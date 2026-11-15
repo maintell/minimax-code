@@ -31,3 +31,12 @@ test('the console scopes its socket to the binding and matches prefixed events',
   assert.match(script, /evt\.permission\.resolved/u);
   assert.match(script, /payload\??\.request_id/u);
 });
+
+test('the console renders machine records on both the history and live paths', async () => {
+  const script = await readFile(clientUrl, 'utf8');
+  assert.match(script, /from '\.\/events\.js'/u);
+  // The history replay and the live socket both have to recognise a record; a
+  // fix on one path only leaves the other printing JSON.
+  assert.match(script, /renderEventRecord\(message\)/u);
+  assert.match(script, /renderEventRecord\(msg\)/u);
+});

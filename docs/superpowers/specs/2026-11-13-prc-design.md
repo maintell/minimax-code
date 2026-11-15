@@ -281,7 +281,7 @@ its command allowlist must be explicit and versioned.
 | Frame | Payload | Console behaviour |
 | --- | --- | --- |
 | `evt.session.message_chunk` | `{session_id, chunk}` where `chunk` is the raw stream JSON | Append text; `RespData.type` 6 is a delta, 10 is a heartbeat and is ignored |
-| `evt.session.message` | `{session_id, msg}` complete message, including the `role=user` echo | Reconcile the optimistic bubble |
+| `evt.session.message` | `{session_id, msg}` complete message, including the `role=user` echo | Reconcile the optimistic bubble; a `msg_type` 3 record gets its own surface |
 | `evt.session.turn_end` | `{session_id, status, error_code?}` | Close the turn; `finished`, `aborted`, `error` |
 | `evt.permission.ask` | `{session_id, request_id, tool_name, tool_input, rule_contents?, reason?, ts_ms}` | Render an approval card |
 | `evt.permission.resolved` | `{session_id, request_id, decision}` | Close the card, including when resolved elsewhere |
@@ -292,6 +292,15 @@ Permission frames that belong to a remote-triggered turn carry `in_reply_to`;
 frames without it are broadcasts and must reach every tab. `tool_input` is
 redacted by the producer for logging only, not on the wire, so the console never
 writes payloads to its own logs.
+
+`msg_type` 3 (`SystemEvent`) marks a machine record persisted in the transcript,
+not prose: `msg_content` is one JSON object whose `eventType` names it.
+`todo_updated` carries `todos` (`content`, `status` of `pending`/`in_progress`/
+`completed`/`cancelled`, optional `priority`) and `runtime.warning` carries
+`message` with an optional `code`. The console renders the plan as a collapsible
+list — open while work remains, collapsed once every item is settled — and the
+warning as its sentence, and it consumes records it has no surface for. `msg_type`
+is the discriminator; a consumer that prints `msg_content` shows raw JSON.
 
 ## 10. Attachments
 

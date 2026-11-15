@@ -1,3 +1,4 @@
+import { eventRecord, summarizeTodos } from './events.js';
 import { backoffDelay, sameId } from './ids.js';
 import { chunkText, chunkThinking, messageText } from './text.js';
 
@@ -17,6 +18,11 @@ let quickCloses = 0;
 let openedAt = 0;
 let stableTimer;
 let streamingBubble = null;
+// The placeholder that says the session is empty stands only while it is true.
+let emptyNotice = null;
+// The plan is re-emitted after every step, so the same list can arrive twice for
+// one change; the key of the last card rendered keeps the transcript honest.
+let lastTodosKey = '';
 const pendingCommands = new Map();
 const permissionCards = new Map();
 
@@ -103,6 +109,7 @@ $('device').addEventListener('change', async () => {
   sessionStorage.setItem('prc.device', next);
   currentSession = null;
   streamingBubble = null;
+  emptyNotice = null;
   closeSocket();
   resetReconnect();
   $('transcript').replaceChildren();
@@ -143,6 +150,7 @@ async function refresh() {
     resetReconnect();
     $('status').textContent = 'no producer';
     renderSessions([]);
+    emptyNotice = null;
     $('transcript').replaceChildren(
       appendNotice('No producer is connected. Start the desktop app, then reload this page.'),
     );
@@ -208,6 +216,8 @@ function markActiveSession() {
 async function openSession(id) {
   currentSession = id;
   streamingBubble = null;
+  emptyNotice = null;
+  lastTodosKey = '';
   markActiveSession();
   const transcript = $('transcript');
   transcript.replaceChildren();
@@ -217,12 +227,16 @@ async function openSession(id) {
     if (!sameId(id, currentSession)) return;
     const messages = page.messages ?? [];
     for (const message of messages) {
+      if (renderEventRecord(message)) continue;
       const text = messageText(message);
       // History rows carry the role, so the operator's own turns align right
       // exactly like the optimistic bubble the composer prints.
       if (text) appendText(text, message?.role === 'user' ? 'me' : '');
     }
-    if (!messages.length) transcript.append(appendNotice('No messages yet.'));
+    if (!messages.length) {
+      emptyNotice = appendNotice('No messages yet.');
+      transcript.append(emptyNotice);
+    }
   } catch (error) {
     if (!sameId(id, currentSession)) return;
     transcript.append(appendNotice(`Could not load messages: ${error.message}`));
@@ -231,6 +245,7 @@ async function openSession(id) {
 }
 
 function appendText(text, extraClass = '') {
+  dismissEmptyNotice();
   const div = document.createElement('div');
   div.className = extraClass ? `bubble ${extraClass}` : 'bubble';
   div.textContent = text;
@@ -238,11 +253,86 @@ function appendText(text, extraClass = '') {
   return div;
 }
 
+// The session is no longer empty the moment anything else is written into it.
+function dismissEmptyNotice() {
+  if (emptyNotice === null) return;
+  emptyNotice.remove();
+  emptyNotice = null;
+}
+
 function appendNotice(text) {
   const div = document.createElement('div');
   div.className = 'notice';
   div.textContent = text;
   return div;
+}
+
+// The desktop's own vocabulary, so a plan reads the same in both surfaces.
+const TODO_MARKERS = { pending: '○', in_progress: '●', completed: '✓', cancelled: '–' };
+const TODO_STATUS_LABELS = {
+  pending: 'pending', in_progress: 'in progress', completed: 'completed', cancelled: 'cancelled',
+};
+
+// A machine record is rendered as what it describes, never as its own JSON.
+// `true` tells the caller the message was consumed, so it is not printed as
+// prose as well; a record with no reader is consumed and dropped.
+function renderEventRecord(message) {
+  const record = eventRecord(message);
+  if (record === null) return false;
+  if (record.kind === 'todos') appendTodoCard(record.todos);
+  else if (record.kind === 'warning') appendWarning(record.text, record.code);
+  return true;
+}
+
+function appendTodoCard(todos) {
+  const key = JSON.stringify(todos);
+  if (key === lastTodosKey) return;
+  lastTodosKey = key;
+  dismissEmptyNotice();
+
+  const counts = summarizeTodos(todos);
+  const card = document.createElement('details');
+  card.className = counts.remaining > 0 ? 'todos' : 'todos done';
+  // What the agent is working on is the point of the card, so an unfinished plan
+  // stands open; a finished one collapses to its summary line.
+  card.open = counts.remaining > 0;
+  const summary = document.createElement('summary');
+  summary.textContent = counts.remaining > 0
+    ? `Todo list ${counts.completed}/${counts.total} · ${counts.remaining} remaining`
+    : `Todo list ${counts.completed}/${counts.total} completed`;
+  card.append(summary);
+
+  const list = document.createElement('ol');
+  for (const todo of todos) {
+    const item = document.createElement('li');
+    item.className = `todo ${todo.status}`;
+    const marker = document.createElement('span');
+    marker.className = 'todo-marker';
+    marker.textContent = TODO_MARKERS[todo.status] ?? TODO_MARKERS.pending;
+    // The glyph is decoration; the status word is what a screen reader reads.
+    marker.setAttribute('aria-hidden', 'true');
+    const status = document.createElement('span');
+    status.className = 'sr-only';
+    status.textContent = `${TODO_STATUS_LABELS[todo.status] ?? 'pending'}: `;
+    const content = document.createElement('span');
+    content.className = 'todo-text';
+    content.textContent = todo.content;
+    item.append(marker, status, content);
+    list.append(item);
+  }
+  card.append(list);
+  $('transcript').append(card);
+}
+
+function appendWarning(text, code) {
+  dismissEmptyNotice();
+  const div = document.createElement('div');
+  div.className = 'warning';
+  div.setAttribute('role', 'status');
+  div.textContent = text;
+  // The code is what support would ask for; it stays out of the sentence.
+  if (code) div.title = code;
+  $('transcript').append(div);
 }
 
 $('composer').addEventListener('submit', async (event) => {
@@ -431,6 +521,7 @@ function handleMessage(raw) {
     // The composer already printed the operator's own message, so the user
     // echo of the same turn must not produce a second bubble.
     if (msg?.role === 'user') return;
+    if (renderEventRecord(msg)) return;
     const text = messageText(msg);
     if (!text) return;
     // The completed message repeats whatever the chunks streamed; replace the

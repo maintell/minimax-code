@@ -342,7 +342,9 @@ test('devices lists every binding with an online flag and drives the picker', as
 
   const response = await fetch(`${server.url}/api/devices`, { headers: { cookie: cookies } });
   assert.equal(response.status, 200);
-  const { devices } = await response.json();
+  const { devices } = (await response.json()) as {
+    devices: { deviceId: string; online: boolean; id: number }[];
+  };
   assert.equal(devices.length, 2);
   assert.deepEqual(devices.map((entry) => entry.deviceId), ['dev-a', 'dev-b']);
   assert.equal(devices[0].online, false);

@@ -216,6 +216,12 @@ Chunk payloads embed the raw streamed JSON byte for byte; the envelope is built
 by string templating so a re-serialisation cannot reorder fields or change
 number formatting.
 
+A complete agent message is not always prose. `msg_type` 3 (`SystemEvent`) marks a
+machine record whose `msg_content` is a single JSON object, and the `eventType`
+inside it names the record: `todo_updated` carries `todos`, `runtime.warning`
+carries `message` and an optional `code`. A consumer renders those from the payload
+and drops the records it has no surface for; printing `msg_content` shows raw JSON.
+
 Global runtime events are forwarded one to one: the frame type is the event
 type with an `evt.` prefix and the dots preserved (`session.start` becomes
 `evt.session.start`), the payload is shallow snake-cased and gains `ts_ms`.
