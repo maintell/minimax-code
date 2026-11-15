@@ -1,5 +1,5 @@
 import { backoffDelay, sameId } from './ids.js';
-import { chunkText, messageText } from './text.js';
+import { chunkText, chunkThinking, messageText } from './text.js';
 
 const $ = (id) => document.getElementById(id);
 const QUICK_CLOSE_MS = 5_000;
@@ -218,7 +218,9 @@ async function openSession(id) {
     const messages = page.messages ?? [];
     for (const message of messages) {
       const text = messageText(message);
-      if (text) appendText(text);
+      // History rows carry the role, so the operator's own turns align right
+      // exactly like the optimistic bubble the composer prints.
+      if (text) appendText(text, message?.role === 'user' ? 'me' : '');
     }
     if (!messages.length) transcript.append(appendNotice('No messages yet.'));
   } catch (error) {
@@ -248,7 +250,7 @@ $('composer').addEventListener('submit', async (event) => {
   const content = $('input').value.trim();
   if (!content || currentSession === null) return;
   $('input').value = '';
-  appendText(`me: ${content}`, 'me');
+  appendText(content, 'me');
   try {
     await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages`, {
       method: 'POST',
@@ -403,9 +405,23 @@ function handleMessage(raw) {
   if (message.type === 'evt.session.message_chunk') {
     if (!sameId(message.payload?.session_id, currentSession)) return;
     const text = chunkText(message.payload?.chunk);
-    if (!text) return;
-    if (streamingBubble === null) streamingBubble = appendText('', 'stream');
-    streamingBubble.textContent += text;
+    if (text) {
+      if (streamingBubble === null) streamingBubble = appendText('', 'stream');
+      // The placeholder must not survive into the answer.
+      if (streamingBubble.classList.contains('thinking')) {
+        streamingBubble.classList.remove('thinking');
+        streamingBubble.textContent = '';
+      }
+      streamingBubble.textContent += text;
+      $('status').textContent = 'streaming';
+      return;
+    }
+    // Reasoning-only chunks still mean the turn is alive; show that instead of
+    // leaving the transcript frozen until the answer lands.
+    if (chunkThinking(message.payload?.chunk) && streamingBubble === null) {
+      streamingBubble = appendText('thinking…', 'stream thinking');
+      $('status').textContent = 'thinking';
+    }
     return;
   }
 
@@ -416,7 +432,16 @@ function handleMessage(raw) {
     // echo of the same turn must not produce a second bubble.
     if (msg?.role === 'user') return;
     const text = messageText(msg);
-    if (text) appendText(text);
+    if (!text) return;
+    // The completed message repeats whatever the chunks streamed; replace the
+    // streaming bubble instead of appending a duplicate of the same answer.
+    if (streamingBubble !== null) {
+      streamingBubble.classList.remove('thinking');
+      streamingBubble.textContent = text;
+      streamingBubble = null;
+      return;
+    }
+    appendText(text);
     return;
   }
 

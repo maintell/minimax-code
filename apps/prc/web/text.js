@@ -4,6 +4,8 @@
 
 // `evt.session.message_chunk` carries a RespData envelope: the runtime's
 // AgentMessageChunk is type 6 and its text is `agent_message_chunk.msg_content`.
+// Reasoning arrives on the same frame as `thinking_content`; it is progress, not
+// the answer, so the transcript shows a placeholder instead of the raw trace.
 export function chunkText(chunk) {
   if (typeof chunk?.text === 'string') return chunk.text;
   const streamed = chunk?.agent_message_chunk?.msg_content;
@@ -13,6 +15,11 @@ export function chunkText(chunk) {
     return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('');
   }
   return '';
+}
+
+export function chunkThinking(chunk) {
+  const thinking = chunk?.agent_message_chunk?.thinking_content;
+  return typeof thinking === 'string' ? thinking : '';
 }
 
 // `evt.session.message` and stored history rows are AgentMessage objects, whose

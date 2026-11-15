@@ -79,6 +79,7 @@ section > header { display: flex; justify-content: space-between; align-items: c
 }
 .bubble.me { background: #243149; align-self: flex-end; max-width: 85%; }
 .bubble.stream { border-left: 3px solid #4c8de0; }
+.bubble.thinking { color: #8b93a7; font-style: italic; }
 
 #composer { display: flex; gap: 8px; align-items: flex-end; }
 #composer textarea { flex: 1; min-height: 64px; resize: vertical; }

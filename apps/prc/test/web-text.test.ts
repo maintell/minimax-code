@@ -1,6 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chunkText, messageText } from '../web/text.js';
+import { chunkText, chunkThinking, messageText } from '../web/text.js';
+
+test('reasoning chunks are progress, not answer text', () => {
+  const thinking = { type: 6, agent_message_chunk: { msg_id: 'm1', thinking_content: 'The user says' } };
+  assert.equal(chunkText(thinking), '');
+  assert.equal(chunkThinking(thinking), 'The user says');
+  // A chunk that carries only an answer has no reasoning to report.
+  assert.equal(chunkThinking({ type: 6, agent_message_chunk: { msg_content: 'hi' } }), '');
+});
 
 test('chunkText reads the runtime AgentMessageChunk a producer streams', () => {
   // RespData type 6 is what the bridge attaches to evt.session.message_chunk.
