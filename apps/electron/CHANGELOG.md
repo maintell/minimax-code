@@ -6,6 +6,25 @@ section for the released version, so a version without a section cannot be
 released. Keep entries user-facing; internal refactors, test-only changes and
 packaging changes that do not alter behavior do not need an entry.
 
+## 3.1.15 · 2026-11-15
+
+### Changed
+
+- Client 3.1.15: refreshed renderer bundle and model menu, a new `pptx-core`
+  wasm module set (`Pptx.Importer`, `Pptx.Importer.Wasm`, `Pptx.SafeOpc`), an
+  updated session-transfer client and rebuilt vendored native binaries.
+- The main process gains mini-app content preview, browser JavaScript-dialog
+  handling, a preview-host guard, UI metrics, a quota auto-resume wake, desktop
+  metrics and an extra crash guard.
+- The Windows installer is published per architecture from 3.1.15 on; this
+  release ships the x64 package (`MiniMax Code Setup 3.1.15-x64.exe`).
+
+### Fixed
+
+- Starting offline on a profile that had signed in before no longer stops on the
+  "account information unavailable" card: the offline path now keeps the account
+  identity already stored on the machine instead of substituting a local one.
+
 ## 3.1.14 · 2026-11-11
 
 ### Changed
