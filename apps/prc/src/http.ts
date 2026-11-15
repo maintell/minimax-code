@@ -70,6 +70,8 @@ export function createHttpApi(deps: {
   passwordHash: string;
   // Owned by the composition root, which holds the live producer registry.
   closeProducer?: (bindingId: number) => void;
+  // Lets the device list report whether a producer is actually attached.
+  isProducerOnline?: (bindingId: number) => boolean;
   nowMs?: () => number;
 }) {
   const now = deps.nowMs ?? Date.now;
@@ -204,6 +206,20 @@ export function createHttpApi(deps: {
             ? { id: stateBinding.id, deviceId: stateBinding.deviceId, generation: stateBinding.producerGeneration }
             : null,
         }), true;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/devices') {
+        // The picker's source of truth. `online` is advisory: a bound device
+        // with no live socket still lists, so the operator can see it is off.
+        const devices = deps.store.listBindings().map((entry) => ({
+          id: entry.id,
+          deviceId: entry.deviceId,
+          generation: entry.producerGeneration,
+          producerVersion: entry.producerVersion,
+          boundAt: entry.boundAtMs,
+          online: deps.isProducerOnline?.(entry.id) === true,
+        }));
+        return send(res, 200, { devices }), true;
       }
 
       if (req.method === 'GET' && url.pathname === '/api/sessions') {

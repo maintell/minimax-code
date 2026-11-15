@@ -11,6 +11,14 @@ test('the console shell declares the login form, transcript and composer', async
   assert.match(html, /id="sessions"/u);
   assert.match(html, /id="transcript"/u);
   assert.match(html, /id="composer"/u);
+  assert.match(html, /id="device"/u);
+});
+
+test('the console resolves devices and switches the binding with them', async () => {
+  const script = await readFile(clientUrl, 'utf8');
+  assert.match(script, /\/api\/devices/u);
+  assert.match(script, /\$\('device'\)\.addEventListener\('change'/u);
+  assert.match(script, /prc\.device/u);
 });
 
 test('the console scopes its socket to the binding and matches prefixed events', async () => {

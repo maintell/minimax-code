@@ -49,6 +49,11 @@ aside h2 {
   margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
   letter-spacing: 0.08em; color: #8b93a7;
 }
+#device {
+  width: 100%; margin-bottom: 10px; padding: 7px 9px;
+  background: #141821; border: 1px solid #2a3040; border-radius: 8px;
+}
+#device:disabled { opacity: 0.7; }
 #sessions { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 2px; }
 #sessions button {
   width: 100%; text-align: left; background: transparent; padding: 7px 9px;

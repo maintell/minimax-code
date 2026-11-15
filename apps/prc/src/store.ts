@@ -67,6 +67,14 @@ export function openStore(file: string) {
       const rows = db.prepare('SELECT * FROM binding LIMIT 2').all() as Array<Record<string, unknown>>;
       return rows.length === 1 ? toBinding(rows[0] as Record<string, unknown>) : undefined;
     },
+    // Device pickers read this: stable order so the first row is the oldest
+    // pairing, which is also the one a fresh console selects.
+    listBindings(): Binding[] {
+      const rows = db.prepare('SELECT * FROM binding ORDER BY bound_at_ms ASC, id ASC').all() as Array<
+        Record<string, unknown>
+      >;
+      return rows.map((row) => toBinding(row));
+    },
     getOrCreateBinding(deviceId: string, producerVersion: string): Binding {
       const existing = this.findBindingByDevice(deviceId);
       if (existing) {

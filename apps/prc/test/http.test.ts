@@ -16,6 +16,7 @@ interface BootOptions {
   publicUrl?: string;
   trustProxy?: boolean;
   request?: (bindingId: number, type: string, payload: Record<string, unknown>) => Promise<StubResult>;
+  online?: (bindingId: number) => boolean;
 }
 
 async function boot(options: BootOptions = {}) {
@@ -39,6 +40,7 @@ async function boot(options: BootOptions = {}) {
   const api = createHttpApi({
     auth: createAuth('secret'), store, router: router as never, config,
     passwordHash: hashPassword('pw'),
+    ...(options.online ? { isProducerOnline: options.online } : {}),
   });
   const server = await createServer({ config, api });
   return { server, store, calls };
@@ -329,5 +331,32 @@ test('session routes reuse the sole-binding discovery without a device header', 
   store.getOrCreateBinding('dev-second', '3.1.14');
   const ambiguous = await fetch(`${server.url}/api/sessions`, { headers: { cookie: cookies } });
   assert.equal(ambiguous.status, 409);
+  await server.close();
+});
+
+test('devices lists every binding with an online flag and drives the picker', async () => {
+  const { server, store } = await boot({ online: (bindingId) => bindingId === 2 });
+  const { cookies } = await signIn(server);
+  store.getOrCreateBinding('dev-a', '3.1.14');
+  const second = store.getOrCreateBinding('dev-b', '3.1.14');
+
+  const response = await fetch(`${server.url}/api/devices`, { headers: { cookie: cookies } });
+  assert.equal(response.status, 200);
+  const { devices } = await response.json();
+  assert.equal(devices.length, 2);
+  assert.deepEqual(devices.map((entry) => entry.deviceId), ['dev-a', 'dev-b']);
+  assert.equal(devices[0].online, false);
+  assert.equal(devices[1].online, true);
+  assert.equal(devices[1].id, second.id);
+
+  // The picker's choice must drive the other routes through the device header.
+  const sessions = await fetch(`${server.url}/api/sessions`, {
+    headers: { cookie: cookies, 'x-device-id': 'dev-b' },
+  });
+  assert.equal(sessions.status, 200);
+  const other = await fetch(`${server.url}/api/sessions`, {
+    headers: { cookie: cookies, 'x-device-id': 'dev-a' },
+  });
+  assert.equal(other.status, 200);
   await server.close();
 });

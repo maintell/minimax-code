@@ -7,6 +7,7 @@ const QUICK_CLOSE_MS = 5_000;
 let csrf = sessionStorage.getItem('prc.csrf') ?? readCsrfCookie();
 let bindingId = null;
 let deviceId = '';
+let devices = [];
 let currentSession = null;
 let socket;
 let socketBindingId = null;
@@ -95,10 +96,32 @@ $('login').addEventListener('submit', async (event) => {
   }
 });
 
+$('device').addEventListener('change', async () => {
+  const next = $('device').value;
+  if (!next || next === deviceId) return;
+  deviceId = next;
+  sessionStorage.setItem('prc.device', next);
+  currentSession = null;
+  streamingBubble = null;
+  closeSocket();
+  resetReconnect();
+  $('transcript').replaceChildren();
+  await refresh();
+});
+
 async function refresh() {
   let state;
+  let deviceList;
   try {
-    state = await api('/api/state');
+    // Devices first: the picker decides which binding every later call uses,
+    // and a fresh console keeps the device it last selected.
+    deviceList = await api('/api/devices');
+    devices = Array.isArray(deviceList?.devices) ? deviceList.devices : [];
+    const stored = sessionStorage.getItem('prc.device') ?? '';
+    const chosen = devices.find((entry) => entry.deviceId === stored) ?? devices[0];
+    deviceId = typeof chosen?.deviceId === 'string' ? chosen.deviceId : '';
+    renderDevices(chosen?.deviceId ?? '');
+    state = deviceId ? await api('/api/state') : null;
   } catch (error) {
     if (error.status === 401) {
       csrf = '';
@@ -111,7 +134,6 @@ async function refresh() {
     return;
   }
 
-  deviceId = typeof state?.binding?.deviceId === 'string' ? state.binding.deviceId : '';
   bindingId = state?.binding?.id ?? null;
   $('input').disabled = bindingId === null;
   $('stop').disabled = bindingId === null;
@@ -138,6 +160,19 @@ async function refresh() {
     renderSessions([]);
     $('status').textContent = error.status === 409 ? 'no producer' : 'sessions unavailable';
   }
+}
+
+function renderDevices(selectedDeviceId) {
+  const select = $('device');
+  select.replaceChildren(...devices.map((device) => {
+    const option = document.createElement('option');
+    option.value = device.deviceId;
+    option.textContent = `${device.deviceId.slice(-6)} · g${device.generation} · ${device.online ? 'online' : 'offline'}`;
+    if (device.deviceId === selectedDeviceId) option.selected = true;
+    return option;
+  }));
+  select.hidden = devices.length === 0;
+  select.disabled = devices.length < 2;
 }
 
 function renderSessions(sessions) {

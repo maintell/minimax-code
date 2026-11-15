@@ -59,6 +59,7 @@ const api = createHttpApi({
   config,
   passwordHash,
   closeProducer: (bindingId) => producers.get(bindingId)?.close('server_initiated_unbind'),
+  isProducerOnline: (bindingId) => producers.has(bindingId),
 });
 const server = await createServer({
   config,
