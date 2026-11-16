@@ -2,40 +2,71 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <title>PRC</title>
 <link rel="stylesheet" href="/app.css">
 </head>
-<body>
+<body data-view="sessions">
+
 <form id="login">
-  <h1>PRC console</h1>
+  <h1>PRC</h1>
   <label for="password">Operator password</label>
-  <div class="login-row">
-    <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
-    <button>Sign in</button>
-  </div>
+  <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
+  <button id="sign-in">Sign in</button>
   <p id="login-error" class="error" role="alert"></p>
 </form>
-<main id="console" hidden>
-  <aside>
-    <label class="sr-only" for="device">Producer device</label>
-    <select id="device" aria-label="Producer device"></select>
-    <h2>Sessions</h2>
+
+<div id="app" hidden>
+  <aside id="rail">
+    <header class="rail-head">
+      <h1>PRC</h1>
+    </header>
+    <button id="device" class="chip" type="button" aria-haspopup="dialog">
+      <span id="device-dot" class="dot"></span>
+      <span id="device-label">No device</span>
+      <svg class="chip-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+    </button>
+    <h2 class="section">Sessions</h2>
     <ul id="sessions"></ul>
   </aside>
-  <section>
-    <header>
-      <span id="status" aria-live="polite">offline</span>
-      <button id="stop" type="button">Stop</button>
+
+  <main id="room">
+    <header class="room-head">
+      <button id="back" class="round" type="button" aria-label="Sessions">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
+      <div class="room-title">
+        <h2 id="room-title">PRC</h2>
+        <p id="status" aria-live="polite">offline</p>
+      </div>
+      <button id="stop" class="round ghost" type="button" aria-label="Stop the turn" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="8" height="8" rx="1.5"/></svg>
+      </button>
     </header>
-    <div id="transcript" aria-live="polite"></div>
+    <div id="transcript"></div>
     <form id="composer">
       <label class="sr-only" for="input">Message</label>
-      <textarea id="input" rows="3" placeholder="Message the agent…"></textarea>
-      <button>Send</button>
+      <textarea id="input" rows="1" placeholder="Message the agent…" enterkeyhint="send"></textarea>
+      <button id="send" class="round solid" type="submit" aria-label="Send">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+      </button>
     </form>
-  </section>
-</main>
+  </main>
+</div>
+
+<div id="sheet" class="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+  <div class="sheet-body">
+    <header class="sheet-head">
+      <button id="sheet-close" class="round" type="button" aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+      <h2 id="sheet-title">Device</h2>
+    </header>
+    <ul id="sheet-list"></ul>
+  </div>
+</div>
+
 <div id="permissions"></div>
 <script type="module" src="/app.js"></script>
 </body>

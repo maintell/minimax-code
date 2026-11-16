@@ -1,15 +1,21 @@
-import { eventRecord, summarizeTodos } from './events.js';
+// Wiring for the console: authentication, the socket, and the two views. The
+// shapes live in render.js, the message semantics in view.js and events.js.
 import { backoffDelay, sameId } from './ids.js';
-import { chunkText, chunkThinking, messageText } from './text.js';
+import { notice, renderRow, streamingBubble } from './render.js';
+import { chunkText, chunkThinking } from './text.js';
+import { sessionStamp } from './view.js';
 
 const $ = (id) => document.getElementById(id);
 const QUICK_CLOSE_MS = 5_000;
+const STICK_PX = 80;
 
 let csrf = sessionStorage.getItem('prc.csrf') ?? readCsrfCookie();
-let bindingId = null;
-let deviceId = '';
+let deviceId = sessionStorage.getItem('prc.device') ?? '';
 let devices = [];
-let currentSession = null;
+let bindingId = null;
+let currentSession = sessionStorage.getItem('prc.session') ?? '';
+let sessionList = [];
+
 let socket;
 let socketBindingId = null;
 let reconnectTimer;
@@ -17,12 +23,13 @@ let reconnectAttempt = 0;
 let quickCloses = 0;
 let openedAt = 0;
 let stableTimer;
-let streamingBubble = null;
-// The placeholder that says the session is empty stands only while it is true.
+
+let stream = null;
 let emptyNotice = null;
-// The plan is re-emitted after every step, so the same list can arrive twice for
-// one change; the key of the last card rendered keeps the transcript honest.
-let lastTodosKey = '';
+let stickToBottom = true;
+// The stored session is restored once per page, not on every reconnect.
+let restored = false;
+
 const pendingCommands = new Map();
 const permissionCards = new Map();
 
@@ -57,24 +64,33 @@ async function api(path, init = {}) {
   return body;
 }
 
-function showConsole() {
-  $('login').hidden = true;
-  $('console').hidden = false;
+// Views -----------------------------------------------------------------
+
+function setView(view) {
+  document.body.dataset.view = view;
+  // The rail is the session list on a phone and a permanent column on a desktop;
+  // `data-view` is what tells the browser which of the two to show.
+  $('input').toggleAttribute('disabled', bindingId === null);
 }
 
 function showLogin(message = '') {
   closeSocket();
   resetReconnect();
   bindingId = null;
-  deviceId = '';
-  currentSession = null;
-  streamingBubble = null;
+  stream = null;
+  currentSession = '';
+  sessionStorage.removeItem('prc.session');
   for (const card of permissionCards.values()) card.remove();
   permissionCards.clear();
-  $('console').hidden = true;
+  $('app').hidden = true;
   $('login').hidden = false;
   $('login-error').textContent = message;
   $('password').focus();
+}
+
+function showApp() {
+  $('login').hidden = true;
+  $('app').hidden = false;
 }
 
 $('login').addEventListener('submit', async (event) => {
@@ -88,11 +104,11 @@ $('login').addEventListener('submit', async (event) => {
     csrf = body.csrf;
     sessionStorage.setItem('prc.csrf', csrf);
     $('password').value = '';
-    showConsole();
+    showApp();
+    setView('sessions');
     await refresh();
-    $('input').focus();
+    if (currentSession !== '') setView('conversation');
   } catch (error) {
-    // A rejected login leaves the form in place; only a successful one hides it.
     showLogin(error.status === 401
       ? 'Wrong password.'
       : error.status === 429
@@ -102,32 +118,77 @@ $('login').addEventListener('submit', async (event) => {
   }
 });
 
-$('device').addEventListener('change', async () => {
-  const next = $('device').value;
+$('back').addEventListener('click', () => setView('sessions'));
+
+$('device').addEventListener('click', () => openDeviceSheet());
+$('sheet-close').addEventListener('click', () => closeSheet());
+$('sheet').addEventListener('click', (event) => {
+  if (event.target === $('sheet')) closeSheet();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('sheet').hidden) closeSheet();
+});
+
+function openDeviceSheet() {
+  renderSheet();
+  $('sheet').hidden = false;
+  $('sheet-close').focus();
+}
+
+function closeSheet() {
+  $('sheet').hidden = true;
+  $('device').focus();
+}
+
+function renderSheet() {
+  const list = $('sheet-list');
+  list.replaceChildren(...devices.map((device) => {
+    const li = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('aria-current', device.deviceId === deviceId ? 'true' : 'false');
+    const dot = document.createElement('span');
+    dot.className = device.online ? 'dot on' : 'dot';
+    const label = document.createElement('span');
+    label.textContent = `${shortId(device.deviceId)} · gen ${device.generation}`;
+    const state = document.createElement('span');
+    state.className = 'section';
+    state.style.margin = '0 0 0 auto';
+    state.textContent = device.online ? 'online' : 'offline';
+    button.append(dot, label, state);
+    button.onclick = () => { void chooseDevice(device.deviceId); };
+    li.append(button);
+    return li;
+  }));
+}
+
+async function chooseDevice(next) {
+  closeSheet();
   if (!next || next === deviceId) return;
   deviceId = next;
   sessionStorage.setItem('prc.device', next);
-  currentSession = null;
-  streamingBubble = null;
-  emptyNotice = null;
+  currentSession = '';
+  sessionStorage.removeItem('prc.session');
+  stream = null;
   closeSocket();
   resetReconnect();
   $('transcript').replaceChildren();
   await refresh();
-});
+  setView('sessions');
+}
+
+// Discovery -------------------------------------------------------------
 
 async function refresh() {
   let state;
-  let deviceList;
   try {
-    // Devices first: the picker decides which binding every later call uses,
-    // and a fresh console keeps the device it last selected.
-    deviceList = await api('/api/devices');
+    // Devices first: the chip decides which binding every later call uses.
+    const deviceList = await api('/api/devices');
     devices = Array.isArray(deviceList?.devices) ? deviceList.devices : [];
-    const stored = sessionStorage.getItem('prc.device') ?? '';
-    const chosen = devices.find((entry) => entry.deviceId === stored) ?? devices[0];
+    const chosen = devices.find((entry) => entry.deviceId === deviceId) ?? devices[0];
     deviceId = typeof chosen?.deviceId === 'string' ? chosen.deviceId : '';
-    renderDevices(chosen?.deviceId ?? '');
+    if (deviceId) sessionStorage.setItem('prc.device', deviceId);
+    renderChip(chosen);
     state = deviceId ? await api('/api/state') : null;
   } catch (error) {
     if (error.status === 401) {
@@ -136,24 +197,21 @@ async function refresh() {
       showLogin('Session expired. Sign in again.');
       return;
     }
-    $('status').textContent = 'unavailable';
+    setStatus('unavailable');
     scheduleReconnect();
     return;
   }
 
   bindingId = state?.binding?.id ?? null;
   $('input').disabled = bindingId === null;
-  $('stop').disabled = bindingId === null;
-
   if (bindingId === null) {
     closeSocket();
     resetReconnect();
-    $('status').textContent = 'no producer';
-    renderSessions([]);
-    emptyNotice = null;
-    $('transcript').replaceChildren(
-      appendNotice('No producer is connected. Start the desktop app, then reload this page.'),
-    );
+    setStatus('no producer');
+    sessionList = [];
+    renderSessions();
+    resetTranscript();
+    $('transcript').append(notice('No producer is connected. Start the desktop app, then reload.'));
     return;
   }
 
@@ -161,205 +219,182 @@ async function refresh() {
 
   try {
     const list = await api('/api/sessions');
-    const sessions = list.payload?.sessions ?? [];
-    renderSessions(sessions);
-    if (currentSession === null && sessions[0]) await openSession(sessions[0].id);
+    sessionList = list.payload?.sessions ?? [];
+    renderSessions();
+    // Restore the session this browser last showed, once. A session the operator
+    // did not open is not opened for them: the app lands on its list.
+    if (!restored) {
+      restored = true;
+      const stored = sessionStorage.getItem('prc.session') ?? '';
+      const target = sessionList.find((session) => sameId(session.id, stored));
+      if (target) await openSession(target.id, { silent: true });
+      else if (currentSession !== '') {
+        currentSession = '';
+        sessionStorage.removeItem('prc.session');
+      }
+    }
   } catch (error) {
-    renderSessions([]);
-    $('status').textContent = error.status === 409 ? 'no producer' : 'sessions unavailable';
+    sessionList = [];
+    renderSessions();
+    setStatus(error.status === 409 ? 'no producer' : 'sessions unavailable');
   }
 }
 
-function renderDevices(selectedDeviceId) {
-  const select = $('device');
-  select.replaceChildren(...devices.map((device) => {
-    const option = document.createElement('option');
-    option.value = device.deviceId;
-    option.textContent = `${device.deviceId.slice(-6)} · g${device.generation} · ${device.online ? 'online' : 'offline'}`;
-    if (device.deviceId === selectedDeviceId) option.selected = true;
-    return option;
-  }));
-  select.hidden = devices.length === 0;
-  select.disabled = devices.length < 2;
+function shortId(value) {
+  return String(value ?? '').slice(-6) || 'unknown';
 }
 
-function renderSessions(sessions) {
+function renderChip(device) {
+  $('device-label').textContent = device
+    ? `${shortId(device.deviceId)} · gen ${device.generation}`
+    : 'No device';
+  $('device-dot').className = device?.online ? 'dot on' : 'dot';
+  $('device').title = device?.online ? 'Producer connected' : 'Producer offline';
+}
+
+function renderSessions() {
   const list = $('sessions');
-  list.replaceChildren(...sessions.map((session) => {
+  list.replaceChildren(...sessionList.map((session) => {
     const li = document.createElement('li');
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = session.title || session.id;
+    button.className = 'item';
     button.dataset.sessionId = String(session.id);
+    const title = document.createElement('span');
+    title.className = 'title';
+    title.textContent = session.title || session.id;
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = sessionStamp(session);
+    button.append(title, meta);
     button.onclick = () => { void openSession(session.id); };
     li.append(button);
     return li;
   }));
-  if (!sessions.length) {
+  if (sessionList.length === 0) {
     const li = document.createElement('li');
-    li.className = 'muted';
+    li.className = 'empty';
     li.textContent = 'No sessions.';
     list.append(li);
   }
-  markActiveSession();
+  markActive();
 }
 
-function markActiveSession() {
-  for (const button of $('sessions').querySelectorAll('button[data-session-id]')) {
-    const active = currentSession !== null && sameId(button.dataset.sessionId, currentSession);
+function markActive() {
+  for (const button of $('sessions').querySelectorAll('button.item')) {
+    const active = currentSession !== '' && sameId(button.dataset.sessionId, currentSession);
     button.classList.toggle('active', active);
     if (active) button.setAttribute('aria-current', 'true');
     else button.removeAttribute('aria-current');
   }
 }
 
-async function openSession(id) {
-  currentSession = id;
-  streamingBubble = null;
+// Transcript ------------------------------------------------------------
+
+function resetTranscript() {
+  stream = null;
   emptyNotice = null;
-  lastTodosKey = '';
-  markActiveSession();
-  const transcript = $('transcript');
-  transcript.replaceChildren();
+  stickToBottom = true;
+  $('transcript').replaceChildren();
+}
+
+async function openSession(id, { silent = false } = {}) {
+  currentSession = String(id);
+  sessionStorage.setItem('prc.session', currentSession);
+  const title = sessionList.find((session) => sameId(session.id, id))?.title;
+  $('room-title').textContent = title || currentSession;
+  if (!silent) setView('conversation');
+  markActive();
+  resetTranscript();
   try {
-    const page = await api(`/api/sessions/${encodeURIComponent(id)}/messages?limit=50`);
+    const page = await api(`/api/sessions/${encodeURIComponent(id)}/messages?limit=100`);
     // A slow history response must not overwrite the session opened after it.
     if (!sameId(id, currentSession)) return;
     const messages = page.messages ?? [];
-    for (const message of messages) {
-      if (renderEventRecord(message)) continue;
-      const text = messageText(message);
-      // History rows carry the role, so the operator's own turns align right
-      // exactly like the optimistic bubble the composer prints.
-      if (text) appendText(text, message?.role === 'user' ? 'me' : '');
-    }
-    if (!messages.length) {
-      emptyNotice = appendNotice('No messages yet.');
-      transcript.append(emptyNotice);
-    }
+    for (const message of messages) append(...renderRow(message));
+    if (messages.length === 0) showEmptyNotice();
+    scrollToLatest();
   } catch (error) {
     if (!sameId(id, currentSession)) return;
-    transcript.append(appendNotice(`Could not load messages: ${error.message}`));
+    $('transcript').append(notice(`Could not load messages: ${error.message}`));
   }
   connectSocket();
 }
 
-function appendText(text, extraClass = '') {
+function append(...nodes) {
+  if (nodes.length === 0) return;
   dismissEmptyNotice();
-  const div = document.createElement('div');
-  div.className = extraClass ? `bubble ${extraClass}` : 'bubble';
-  div.textContent = text;
-  $('transcript').append(div);
-  return div;
+  $('transcript').append(...nodes);
+  if (stickToBottom) scrollToLatest();
 }
 
-// The session is no longer empty the moment anything else is written into it.
+function scrollToLatest() {
+  const box = $('transcript');
+  box.scrollTop = box.scrollHeight;
+}
+
+function showEmptyNotice() {
+  emptyNotice = notice('No messages yet.');
+  $('transcript').append(emptyNotice);
+}
+
+// The session stops being empty the moment anything is written into it.
 function dismissEmptyNotice() {
   if (emptyNotice === null) return;
   emptyNotice.remove();
   emptyNotice = null;
 }
 
-function appendNotice(text) {
-  const div = document.createElement('div');
-  div.className = 'notice';
-  div.textContent = text;
-  return div;
+$('transcript').addEventListener('scroll', () => {
+  const box = $('transcript');
+  stickToBottom = box.scrollHeight - box.scrollTop - box.clientHeight < STICK_PX;
+});
+
+// Composer --------------------------------------------------------------
+
+function autogrow() {
+  const input = $('input');
+  input.style.height = 'auto';
+  input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
 }
 
-// The desktop's own vocabulary, so a plan reads the same in both surfaces.
-const TODO_MARKERS = { pending: '○', in_progress: '●', completed: '✓', cancelled: '–' };
-const TODO_STATUS_LABELS = {
-  pending: 'pending', in_progress: 'in progress', completed: 'completed', cancelled: 'cancelled',
-};
+$('input').addEventListener('input', autogrow);
 
-// A machine record is rendered as what it describes, never as its own JSON.
-// `true` tells the caller the message was consumed, so it is not printed as
-// prose as well; a record with no reader is consumed and dropped.
-function renderEventRecord(message) {
-  const record = eventRecord(message);
-  if (record === null) return false;
-  if (record.kind === 'todos') appendTodoCard(record.todos);
-  else if (record.kind === 'warning') appendWarning(record.text, record.code);
-  return true;
-}
-
-function appendTodoCard(todos) {
-  const key = JSON.stringify(todos);
-  if (key === lastTodosKey) return;
-  lastTodosKey = key;
-  dismissEmptyNotice();
-
-  const counts = summarizeTodos(todos);
-  const card = document.createElement('details');
-  card.className = counts.remaining > 0 ? 'todos' : 'todos done';
-  // What the agent is working on is the point of the card, so an unfinished plan
-  // stands open; a finished one collapses to its summary line.
-  card.open = counts.remaining > 0;
-  const summary = document.createElement('summary');
-  summary.textContent = counts.remaining > 0
-    ? `Todo list ${counts.completed}/${counts.total} · ${counts.remaining} remaining`
-    : `Todo list ${counts.completed}/${counts.total} completed`;
-  card.append(summary);
-
-  const list = document.createElement('ol');
-  for (const todo of todos) {
-    const item = document.createElement('li');
-    item.className = `todo ${todo.status}`;
-    const marker = document.createElement('span');
-    marker.className = 'todo-marker';
-    marker.textContent = TODO_MARKERS[todo.status] ?? TODO_MARKERS.pending;
-    // The glyph is decoration; the status word is what a screen reader reads.
-    marker.setAttribute('aria-hidden', 'true');
-    const status = document.createElement('span');
-    status.className = 'sr-only';
-    status.textContent = `${TODO_STATUS_LABELS[todo.status] ?? 'pending'}: `;
-    const content = document.createElement('span');
-    content.className = 'todo-text';
-    content.textContent = todo.content;
-    item.append(marker, status, content);
-    list.append(item);
-  }
-  card.append(list);
-  $('transcript').append(card);
-}
-
-function appendWarning(text, code) {
-  dismissEmptyNotice();
-  const div = document.createElement('div');
-  div.className = 'warning';
-  div.setAttribute('role', 'status');
-  div.textContent = text;
-  // The code is what support would ask for; it stays out of the sentence.
-  if (code) div.title = code;
-  $('transcript').append(div);
-}
+$('input').addEventListener('keydown', (event) => {
+  // Confirming an IME candidate must never send the message being composed.
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  $('composer').requestSubmit();
+});
 
 $('composer').addEventListener('submit', async (event) => {
   event.preventDefault();
   const content = $('input').value.trim();
-  if (!content || currentSession === null) return;
+  if (!content || currentSession === '') return;
   $('input').value = '';
-  appendText(content, 'me');
+  autogrow();
+  const echo = renderRow({ role: 'user', msg_content: content });
+  if (echo.length > 0) append(...echo);
+  setStatus('sending');
   try {
     await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages`, {
       method: 'POST',
       body: JSON.stringify({ content }),
     });
   } catch (error) {
-    $('transcript').append(appendNotice(`Message not sent: ${error.message}`));
+    append(notice(`Message not sent: ${error.message}`));
+    setStatus('idle');
   }
 });
 
 $('stop').addEventListener('click', () => {
-  if (currentSession === null) return;
+  if (currentSession === '') return;
   // The gateway exposes stop as a socket command; it has no HTTP abort route.
-  if (sendCommand('session.stop', { session_id: currentSession })) {
-    $('status').textContent = 'stopping…';
-  } else {
-    $('status').textContent = 'offline';
-  }
+  if (sendCommand('session.stop', { session_id: currentSession })) setStatus('stopping');
+  else setStatus('offline');
 });
+
+// Socket ----------------------------------------------------------------
 
 function nextRequestId() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
@@ -379,9 +414,9 @@ function settleCommand(message) {
   const type = pendingCommands.get(requestId);
   if (!type) return;
   pendingCommands.delete(requestId);
-  $('status').textContent = message.kind === 'err'
+  setStatus(message.kind === 'err'
     ? `${type} failed: ${message.message ?? message.code ?? 'error'}`
-    : 'idle';
+    : 'idle');
 }
 
 function connectSocket() {
@@ -394,20 +429,18 @@ function connectSocket() {
   const ws = new WebSocket(`${scheme}://${location.host}/ws?binding_id=${encodeURIComponent(bindingId)}`);
   socket = ws;
   socketBindingId = bindingId;
-  $('status').textContent = 'connecting';
+  setStatus('connecting');
 
   ws.onopen = () => {
     if (socket !== ws) return;
     openedAt = Date.now();
-    // A successful open clears the state-failure count. A connection that
-    // closes immediately is tracked separately so flapping still backs off.
     reconnectAttempt = 0;
     if (stableTimer !== undefined) clearTimeout(stableTimer);
     stableTimer = setTimeout(() => {
       stableTimer = undefined;
       if (socket === ws) quickCloses = 0;
     }, QUICK_CLOSE_MS);
-    $('status').textContent = 'connected';
+    setStatus('connected');
   };
   ws.onmessage = (event) => handleMessage(event.data);
   ws.onclose = () => {
@@ -422,7 +455,7 @@ function connectSocket() {
     socketBindingId = null;
     pendingCommands.clear();
     quickCloses = quick ? quickCloses + 1 : 0;
-    $('status').textContent = 'offline';
+    setStatus('offline');
     scheduleReconnect(quickCloses);
   };
   ws.onerror = () => {
@@ -465,7 +498,7 @@ function scheduleReconnect(extraAttempts = 0) {
   if (reconnectTimer !== undefined || !csrf) return;
   const delay = backoffDelay(reconnectAttempt + extraAttempts);
   reconnectAttempt += 1;
-  $('status').textContent = 'reconnecting…';
+  setStatus('reconnecting…');
   reconnectTimer = setTimeout(() => {
     reconnectTimer = undefined;
     // Re-read discovery before retrying: the binding may be gone or replaced.
@@ -474,11 +507,18 @@ function scheduleReconnect(extraAttempts = 0) {
         showLogin('Session expired. Sign in again.');
         return;
       }
-      $('status').textContent = 'offline';
+      setStatus('offline');
       scheduleReconnect();
     });
   }, delay);
 }
+
+function setStatus(text) {
+  $('status').textContent = text;
+  $('stop').hidden = text !== 'streaming' && text !== 'thinking' && text !== 'stopping';
+}
+
+// Events ----------------------------------------------------------------
 
 function handleMessage(raw) {
   let message;
@@ -494,23 +534,25 @@ function handleMessage(raw) {
 
   if (message.type === 'evt.session.message_chunk') {
     if (!sameId(message.payload?.session_id, currentSession)) return;
-    const text = chunkText(message.payload?.chunk);
+    const chunk = message.payload?.chunk;
+    const text = chunkText(chunk);
     if (text) {
-      if (streamingBubble === null) streamingBubble = appendText('', 'stream');
-      // The placeholder must not survive into the answer.
-      if (streamingBubble.classList.contains('thinking')) {
-        streamingBubble.classList.remove('thinking');
-        streamingBubble.textContent = '';
+      if (stream === null) stream = beginStream();
+      if (stream.dataset.state === 'thinking') {
+        stream.dataset.state = 'streaming';
+        stream.textContent = '';
       }
-      streamingBubble.textContent += text;
-      $('status').textContent = 'streaming';
+      stream.textContent += text;
+      setStatus('streaming');
+      if (stickToBottom) scrollToLatest();
       return;
     }
-    // Reasoning-only chunks still mean the turn is alive; show that instead of
-    // leaving the transcript frozen until the answer lands.
-    if (chunkThinking(message.payload?.chunk) && streamingBubble === null) {
-      streamingBubble = appendText('thinking…', 'stream thinking');
-      $('status').textContent = 'thinking';
+    // Reasoning-only chunks still mean the turn is alive.
+    if (chunkThinking(chunk) && stream === null) {
+      stream = beginStream();
+      stream.dataset.state = 'thinking';
+      stream.textContent = 'Thinking…';
+      setStatus('thinking');
     }
     return;
   }
@@ -518,29 +560,27 @@ function handleMessage(raw) {
   if (message.type === 'evt.session.message') {
     if (!sameId(message.payload?.session_id, currentSession)) return;
     const msg = message.payload?.msg;
-    // The composer already printed the operator's own message, so the user
-    // echo of the same turn must not produce a second bubble.
+    // The composer already printed the operator's own message.
     if (msg?.role === 'user') return;
-    if (renderEventRecord(msg)) return;
-    const text = messageText(msg);
-    if (!text) return;
-    // The completed message repeats whatever the chunks streamed; replace the
-    // streaming bubble instead of appending a duplicate of the same answer.
-    if (streamingBubble !== null) {
-      streamingBubble.classList.remove('thinking');
-      streamingBubble.textContent = text;
-      streamingBubble = null;
+    const nodes = renderRow(msg);
+    if (stream !== null) {
+      const placeholder = stream;
+      stream = null;
+      // The completed message repeats whatever streamed; it replaces the live
+      // row instead of appending a duplicate of the same answer.
+      placeholder.replaceWith(...nodes);
+      if (stickToBottom) scrollToLatest();
       return;
     }
-    appendText(text);
+    append(...nodes);
     return;
   }
 
   if (message.type === 'evt.session.turn_end') {
-    const endedSession = message.payload?.session_id;
-    if (endedSession !== undefined && endedSession !== null && !sameId(endedSession, currentSession)) return;
-    streamingBubble = null;
-    $('status').textContent = 'idle';
+    const ended = message.payload?.session_id;
+    if (ended !== undefined && ended !== null && !sameId(ended, currentSession)) return;
+    stream = null;
+    setStatus('idle');
     return;
   }
 
@@ -554,6 +594,18 @@ function handleMessage(raw) {
   }
 }
 
+function beginStream() {
+  const row = streamingBubble();
+  if (emptyNotice === null) $('transcript').append(row);
+  else {
+    emptyNotice.before(row);
+    dismissEmptyNotice();
+  }
+  return row;
+}
+
+// Permission sheet ------------------------------------------------------
+
 function renderPermission(card) {
   if (!card || typeof card.requestId !== 'string' || !card.requestId) return;
   for (const requestId of permissionCards.keys()) {
@@ -561,21 +613,19 @@ function renderPermission(card) {
   }
 
   const box = document.createElement('div');
-  box.id = `p-${card.requestId}`;
   box.className = 'permission';
+  box.id = `p-${card.requestId}`;
   box.setAttribute('role', 'dialog');
-  box.setAttribute('aria-label', `Permission request for ${card.toolName || 'a tool'}`);
+  box.setAttribute('aria-labelledby', `p-${card.requestId}-title`);
 
-  const title = document.createElement('strong');
+  const title = document.createElement('h3');
+  title.id = `p-${card.requestId}-title`;
   title.textContent = card.toolName || 'Tool';
   box.append(title);
 
-  if (card.reason) {
-    const reason = document.createElement('p');
-    reason.className = 'permission-reason';
-    reason.textContent = card.reason;
-    box.append(reason);
-  }
+  const reason = document.createElement('p');
+  reason.textContent = card.reason || 'The agent asks to use this tool.';
+  box.append(reason);
 
   if (card.toolInput) {
     const input = document.createElement('pre');
@@ -643,10 +693,15 @@ function removePermission(payload) {
 
 async function start() {
   if (!csrf) return;
+  showApp();
+  setView('sessions');
   await refresh();
   if (!csrf) return;
-  showConsole();
-  $('input').focus();
+  // Returning to the tab lands on the session it last showed, as the app does.
+  if (currentSession !== '' && sessionList.some((session) => sameId(session.id, currentSession))) {
+    setView('conversation');
+  }
+  autogrow();
 }
 
 void start();
