@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatSeconds, relativeTime, rowView, sessionStamp, stripProductMarkup } from '../web/view.js';
+import { formatSeconds, relativeTime, rowView, sessionStamp, stripProductMarkup, workspaceName } from '../web/view.js';
 
 // A row that is prose, narrowed for the type checker: the record branch carries
 // none of these fields.
@@ -93,5 +93,13 @@ test('session stamps read as age, not as iso strings', () => {
 test('a session without a usable timestamp shows nothing', () => {
   assert.equal(sessionStamp({ id: 's1' }), '');
   // Relative to the real clock: `sessionStamp` reads "now" from the running system.
-  assert.equal(sessionStamp({ id: 's1', updated_at: new Date(Date.now() - 3_600_000).toISOString() }), '1h');
+  assert.equal(sessionStamp({ id: 's1', last_msg_at_ms: Date.now() - 3_600_000 }), '1h');
+});
+
+test('a session is grouped by the folder it works in', () => {
+  assert.equal(workspaceName({ workspace_dir: 'D:\\weCom' }), 'weCom');
+  assert.equal(workspaceName({ workspace_dir: '/home/me/code/api/' }), 'api');
+  assert.equal(workspaceName({ workspace_dir: 'D:/' }), 'D:');
+  assert.equal(workspaceName({}), '');
+  assert.equal(workspaceName({ workspace_dir: 42 }), '');
 });

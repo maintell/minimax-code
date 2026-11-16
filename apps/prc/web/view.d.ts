@@ -32,3 +32,4 @@ export function thoughtSeconds(message: unknown): string | null;
 export function formatSeconds(ms: number): string;
 export function relativeTime(value: unknown, now?: number): string;
 export function sessionStamp(session: unknown): string;
+export function workspaceName(session: unknown): string;

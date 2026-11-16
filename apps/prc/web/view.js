@@ -87,13 +87,22 @@ export function relativeTime(value, now = Date.now()) {
 }
 
 export function sessionStamp(session) {
-  for (const key of ['updated_at', 'updatedAt', 'last_message_at', 'lastMessageAt', 'created_at', 'createdAt']) {
+  for (const key of ['last_msg_at_ms', 'last_message_at', 'updated_at', 'created_at', 'updatedAt', 'createdAt']) {
     const value = session?.[key];
     if (value === undefined || value === null) continue;
     const label = relativeTime(value);
     if (label) return label;
   }
   return '';
+}
+
+// Sessions are grouped the way the app groups projects: by the folder the agent
+// works in, so two sessions with the same title are still distinguishable.
+export function workspaceName(session) {
+  const dir = session?.workspace_dir;
+  if (typeof dir !== 'string') return '';
+  const parts = dir.split(/[\\/]+/u).filter((part) => part !== '');
+  return parts.at(-1) ?? '';
 }
 
 // The first line of the arguments that names the call; `code` and `command`

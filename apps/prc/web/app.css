@@ -240,7 +240,7 @@ body[data-view="sessions"] #back { visibility: hidden; }
 #composer {
   display: flex; align-items: flex-end; gap: 6px;
   margin: 0 14px calc(10px + env(safe-area-inset-bottom));
-  padding: 5px 5px 5px 14px;
+  padding: 7px 7px 7px 14px;
   border-radius: 24px; background: var(--surface);
 }
 #input {

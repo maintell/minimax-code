@@ -3,7 +3,7 @@
 import { backoffDelay, sameId } from './ids.js';
 import { notice, renderRow, streamingBubble } from './render.js';
 import { chunkText, chunkThinking } from './text.js';
-import { sessionStamp } from './view.js';
+import { sessionStamp, workspaceName } from './view.js';
 
 const $ = (id) => document.getElementById(id);
 const QUICK_CLOSE_MS = 5_000;
@@ -71,6 +71,7 @@ function setView(view) {
   // The rail is the session list on a phone and a permanent column on a desktop;
   // `data-view` is what tells the browser which of the two to show.
   $('input').toggleAttribute('disabled', bindingId === null);
+  autogrow();
 }
 
 function showLogin(message = '') {
@@ -254,30 +255,60 @@ function renderChip(device) {
 
 function renderSessions() {
   const list = $('sessions');
-  list.replaceChildren(...sessionList.map((session) => {
-    const li = document.createElement('li');
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'item';
-    button.dataset.sessionId = String(session.id);
-    const title = document.createElement('span');
-    title.className = 'title';
-    title.textContent = session.title || session.id;
-    const meta = document.createElement('span');
-    meta.className = 'meta';
-    meta.textContent = sessionStamp(session);
-    button.append(title, meta);
-    button.onclick = () => { void openSession(session.id); };
-    li.append(button);
-    return li;
-  }));
-  if (sessionList.length === 0) {
-    const li = document.createElement('li');
-    li.className = 'empty';
-    li.textContent = 'No sessions.';
-    list.append(li);
+  const pinned = sessionList.filter((session) => session.pinned === true);
+  const rest = sessionList.filter((session) => session.pinned !== true);
+  const nodes = [];
+  if (pinned.length > 0) nodes.push(sectionLabel('Pinned'), ...pinned.map(sessionRow));
+
+  // Grouped by the folder the agent works in, the way the app groups projects:
+  // sessions that share a title ("PRC full test" five times) stay distinguishable.
+  const groups = new Map();
+  for (const session of rest) {
+    const name = workspaceName(session) || 'Sessions';
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(session);
   }
+  for (const [name, sessions] of groups) {
+    nodes.push(sectionLabel(pinned.length > 0 || groups.size > 1 ? name : 'Sessions'));
+    nodes.push(...sessions.map(sessionRow));
+  }
+  if (sessionList.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = 'No sessions.';
+    nodes.push(empty);
+  }
+  list.replaceChildren(...nodes);
   markActive();
+}
+
+function sectionLabel(text) {
+  const item = document.createElement('li');
+  item.className = 'section';
+  item.setAttribute('role', 'presentation');
+  item.textContent = text;
+  return item;
+}
+
+function sessionRow(session) {
+  const li = document.createElement('li');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'item';
+  button.dataset.sessionId = String(session.id);
+  const title = document.createElement('span');
+  title.className = 'title';
+  title.textContent = session.title || session.id;
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  meta.textContent = sessionStamp(session);
+  button.append(title);
+  // An absent timestamp leaves no empty line behind the title.
+  if (meta.textContent !== '') button.append(meta);
+  button.title = session.title || session.id;
+  button.onclick = () => { void openSession(session.id); };
+  li.append(button);
+  return li;
 }
 
 function markActive() {
@@ -354,6 +385,9 @@ $('transcript').addEventListener('scroll', () => {
 
 function autogrow() {
   const input = $('input');
+  // A field in the hidden view measures as zero; freezing that height would
+  // collapse the composer the next time a conversation is shown.
+  if (input.scrollHeight === 0) return;
   input.style.height = 'auto';
   input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
 }
