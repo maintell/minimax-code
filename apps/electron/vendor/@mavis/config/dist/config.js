@@ -819,18 +819,13 @@ function ensureConfigFile() {
     });
     writePrivateConfigFileSync(configPath, content, true);
 }
-function readConfigFile(configPath = getConfigPath(), options = {}) {
-    let text;
+function readConfigFile(configPath = getConfigPath()) {
     try {
-        text = fs.readFileSync(configPath, 'utf-8');
+        return parseConfigText(fs.readFileSync(configPath, 'utf-8'));
     }
-    catch (error) {
-        if (options.strict && error.code !== 'ENOENT') {
-            throw new Error('Unable to read config.yaml');
-        }
+    catch {
         return {};
     }
-    return parseConfigText(text, options);
 }
 let _cached = null;
 // ── BYOK config parsing + required provider overrides: see ./byok-config.ts ──
@@ -873,7 +868,7 @@ export function getConfig() {
     // read, and the next call reads again. The other order could pair new content's signature
     // with old content and keep it until the file changed again.
     const readSignature = configFileSignature(getConfigPath());
-    _cached = resolveConfigFromRaw(readConfigFile(getConfigPath(), { strict: true }), getDataDir());
+    _cached = resolveConfigFromRaw(readConfigFile(), getDataDir());
     cachedConfigSignature = readSignature;
     return _cached;
 }
