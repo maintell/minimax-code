@@ -115,6 +115,8 @@ body[data-view="sessions"] #room { display: none; }
   font-size: 13px; font-weight: 500; color: var(--muted);
   margin: 14px 6px 6px; letter-spacing: 0.01em;
 }
+#sessions .section { display: flex; align-items: center; gap: 6px; }
+#sessions .section .folder { width: 15px; height: 15px; }
 
 #sessions { list-style: none; margin: 0; padding: 0 0 12px; overflow-y: auto; flex: 1; }
 #sessions button.item {

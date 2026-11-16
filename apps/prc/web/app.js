@@ -8,6 +8,7 @@ import { sessionStamp, workspaceName } from './view.js';
 const $ = (id) => document.getElementById(id);
 const QUICK_CLOSE_MS = 5_000;
 const STICK_PX = 80;
+const FOLDER_ICON = '<svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
 
 let csrf = sessionStorage.getItem('prc.csrf') ?? readCsrfCookie();
 let deviceId = sessionStorage.getItem('prc.device') ?? '';
@@ -269,7 +270,7 @@ function renderSessions() {
     groups.get(name).push(session);
   }
   for (const [name, sessions] of groups) {
-    nodes.push(sectionLabel(pinned.length > 0 || groups.size > 1 ? name : 'Sessions'));
+    nodes.push(sectionLabel(name));
     nodes.push(...sessions.map(sessionRow));
   }
   if (sessionList.length === 0) {
@@ -286,7 +287,9 @@ function sectionLabel(text) {
   const item = document.createElement('li');
   item.className = 'section';
   item.setAttribute('role', 'presentation');
-  item.textContent = text;
+  // A workspace group reads as a folder, the way the app labels a project.
+  if (text !== 'Pinned' && text !== 'Sessions') item.insertAdjacentHTML('beforeend', FOLDER_ICON);
+  item.append(document.createTextNode(text));
   return item;
 }
 
